@@ -17,9 +17,12 @@ pub struct Context<'a> {
     pub grants: BTreeSet<String>,
     /// `${parameter}` values, winning over declared defaults.
     pub params: BTreeMap<String, String>,
-    /// Runtime FACTS `when` conditions evaluate against (§5.2), alongside the
-    /// resolved parameters — e.g. `agent`, supplied by the consuming runtime
-    /// (this library assumes none).
+    /// Runtime FACTS `when` and `unless` conditions evaluate against (§5.2),
+    /// alongside the resolved parameters — the context keys `agent` (the
+    /// model FAMILY: `claude`, `gpt`, …), `model` (the model id), `host` (the
+    /// application the agent runs in), `environment` and `locale`, each
+    /// supplied by the consuming runtime when it knows it. This library
+    /// assumes none; a key it is not given keeps its content (rule 3).
     pub facts: BTreeMap<String, String>,
     /// Resolves an `::include{id|uri}` to the included document's source;
     /// `None` (or a `None` return) degrades the include to its visible note.

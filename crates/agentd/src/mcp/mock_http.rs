@@ -800,6 +800,12 @@ fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: Optio
 /// caller asks for `@next`, so a test can watch an apply boundary.
 const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
 const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+/// The registry's RESOLVED read of the mock document (`…?resolved=1`): text
+/// §3.5 already ran on for this reader. It is delivered text a second
+/// delivery would change — bold labels, an example quoting a rule fence and
+/// an author-note opener — so a consumer that delivers it again is caught
+/// byte for byte.
+pub const REGISTRY_RESOLVED_TEXT: &str = "# Mock registry agent\n\n**MUST:** Serve the mock.\n\n**EXAMPLE:**\nA rule is written as:\n\n:::must\nNever promise a refund.\n:::\n\n<!-- and a note like this -->\n\nWorkflow `mock-drain` is configured.\n";
 /// The fixed Ed25519 seed the mock signs with; a test derives the public key
 /// from it to pin the publisher.
 pub const MOCK_SIGN_SEED: [u8; 32] = [7u8; 32];
@@ -838,19 +844,24 @@ fn registry_contents(uri: &str) -> serde_json::Value {
         return json!({"contents": [{"uri": uri, "mimeType": "application/json",
             "text": mock_jwks()}]});
     }
-    let v2 = uri.ends_with("@next");
+    // A query selects the registry's resolution: `?resolved=1` serves the
+    // RESOLVED read, `?resolved=stale` the same text under the digest of
+    // something else. Everything else reads the reference before it.
+    let (base, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let resolved = query.starts_with("resolved=");
+    let v2 = base.ends_with("@next");
     // `@narrow` serves version one with a delivery attestation that caps
     // below the author's (`core` only): what a registry narrowing a
     // document for one reader serves, and a verifier that intersects only
     // the author's set would not see.
-    let narrow = uri.ends_with("@narrow");
+    let narrow = base.ends_with("@narrow");
     let version_id = if v2 { "ver_mock_2" } else { "ver_mock_1" };
     let mut text = (if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC }).to_string();
     // `@selfsigned` serves version one carrying its own author JWS in its
     // front matter — the transport-independent form a file or OCI source
     // carries. The author signs the §7.2 author digest, which excludes that
     // line, so the JWS signed over the bare document is the one it carries.
-    if uri.ends_with("@selfsigned")
+    if base.ends_with("@selfsigned")
         && let Some((author, _)) = mock_signatures(&text, version_id, MOCK_CAPABILITIES, 1)
     {
         text = text.replacen("---\n# ", &format!("signature: {author}\n---\n# "), 1);
@@ -860,23 +871,38 @@ fn registry_contents(uri: &str) -> serde_json::Value {
         "md.instruction/canonical": "instruction://ins_mock",
         "md.instruction/versionId": version_id,
         "md.instruction/revision": if v2 { 2 } else { 1 },
-        "md.instruction/ref": uri.rsplit_once('@').map_or("stable", |(_, r)| r),
+        "md.instruction/ref": base.rsplit_once('@').map_or("stable", |(_, r)| r),
         "md.instruction/spec": "1",
         "md.instruction/publisher": MOCK_PUBLISHER,
-        "md.instruction/resolution": "raw",
+        "md.instruction/resolution": if resolved { "resolved" } else { "raw" },
         "md.instruction/publisherKeys": "instruction://pub/mock/keys.json",
         "md.instruction/deliveryKeys": MOCK_DELIVERY_KEYS_URI,
     });
     let digest = instruction_core::digest(text.as_bytes());
     meta["md.instruction/digest"] = json!(digest);
     meta["md.instruction/deliveredDigest"] = json!(digest);
+    if resolved {
+        // The authored digest stays the document's; the delivered one is the
+        // resolved text's — or, for `stale`, the authored document's, which
+        // is what a registry serving one text under another's digest sends.
+        let delivered = if query == "resolved=stale" {
+            digest.clone()
+        } else {
+            instruction_core::digest(REGISTRY_RESOLVED_TEXT.as_bytes())
+        };
+        meta["md.instruction/deliveredDigest"] = json!(delivered);
+        // Unsigned: an author signature covers the AUTHORED text, and these
+        // bytes are not it.
+        return json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction",
+            "text": REGISTRY_RESOLVED_TEXT, "_meta": meta}]});
+    }
     let delivery_caps: &[&str] = if narrow { &["core"] } else { MOCK_CAPABILITIES };
     if let Some((author, delivery)) = mock_signatures(text, version_id, delivery_caps, 1) {
         meta["md.instruction/signature"] = json!(author);
         // `@reauthored` serves a second valid author signature over the same
         // document (signed a moment later), not the one its delivery chains
         // to.
-        if uri.ends_with("@reauthored")
+        if base.ends_with("@reauthored")
             && let Some((later, _)) = mock_signatures(text, version_id, delivery_caps, 2)
         {
             meta["md.instruction/signature"] = json!(later);

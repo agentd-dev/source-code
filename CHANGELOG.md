@@ -47,6 +47,15 @@ test that fails on the old code.
   two legs. `security.allow_trifecta` lifts it with every other trifecta
   gate. It is coarse and static, per stream and per server, not data-flow
   tracking; `docs/security.md` lists what it does not follow.
+- **A template param that opens an author note or adds end matter refuses
+  the spawn.** The spawn guard refused a param value that made machinery,
+  but a value carrying `\n<!--` opened a note — and an unclosed note runs to
+  the end of the text and is never refused, so every operator rule after the
+  param vanished from what the child's model read. A value that made a
+  trailing `---` block made end matter, the document's record rather than
+  its text. Both are now refused as "introduced directive machinery", judged
+  against the template's own delivered text, so a template that quotes a
+  `<!--` or ends in a `---` block of its own still spawns.
 - **A step's `servers:` is a cap.** With `security.policies` set, a tool a
   rule might touch was served through the supervisor's own connections and
   the step's plan still offered every server's tools, so a step held to
@@ -434,6 +443,43 @@ test that fails on the old code.
   text costs flat. A chain of bodies only delivery reads again — an alert
   quoted in an alert, a keyword's text opening with a keyword — is refused
   past 64.
+- **agentd answers `when` and `unless` with `host`, `model` and `agent`, and
+  `agent` is the model family.** Revision 1.1 made `agent` the model family
+  (`claude`, `gpt`, …), and agentd supplied `agent=agentd`. It now supplies
+  `host=agentd`; `model`, the model its turns use by default as the provider
+  receives it (`intelligence.default`, else `intelligence.model`, a tier
+  resolved to its `model`); and `agent`, that model's family when its id
+  names one (`claude-*`, `gpt-*` and `o1`/`o3`/`o4-…`, `gemini-*`,
+  `llama*`, `mistral*`, read from the id's last `/` segment with a Bedrock
+  `anthropic.` prefix removed). With a recognised model,
+  `:::when{agent="agentd"}` is now dropped and `:::when{agent="claude"}` is
+  kept for a Claude model; with an unrecognised one, `agent` is an unknown
+  key and both are kept (rule 3). The facts come from the operator's
+  intelligence section, read before the document's `:::!config` merges under
+  it, so a document cannot choose what its own variants are decided by.
+  `environment` and `locale` are not supplied. Subagent templates are now
+  folded with the same facts, where they were folded with none, and so are
+  an OCI re-pull and a registry read.
+- **Delivered text is never delivered twice.** Delivery is not idempotent: a
+  second pass turns `plain` labels back into bold, a fence or keyword line
+  quoted in an example into a live rule, and a quoted `<!--` into a note
+  that deletes what follows it.
+  - A registry read with `md.instruction/resolution: resolved` is text the
+    registry already delivered for this reader, and is used as served:
+    nothing is extracted from it and nothing folds. Its
+    `md.instruction/deliveredDigest` must be the digest of the bytes served,
+    or the read is refused and the running instruction kept ("registry
+    delivered text does not match its deliveredDigest"). A `raw` read, or one
+    with no resolution, is delivered by agentd as before: the registry stamps
+    `deliveredDigest` on every read, so the digest alone says nothing about
+    who delivered. `instruction.loaded` for a resource read gains
+    `resolution`.
+  - An instance-tier child's instruction is delivered once, by the parent.
+    The parent writes the template's delivered prose, params folded in, into
+    the child's config, and marks the child's environment with that prose's
+    digest; the child uses its instruction as written only when it is an
+    instance child and its instruction is exactly that text. The mark is
+    internal: no config path or `AGENTD_` alias reads it.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's

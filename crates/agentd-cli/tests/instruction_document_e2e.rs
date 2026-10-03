@@ -510,3 +510,56 @@ fn prose_degrades_into_the_delivered_instruction() {
     );
     assert!(valid, "{err}");
 }
+
+/// One variant per question agentd can answer about itself, revision 1.1:
+/// `host` is the application, `agent` the model FAMILY.
+const FACTS: &str = r#"---
+spec: "1"
+---
+Base.
+
+:::when{host="agentd"}
+HOST-AGENTD
+:::
+
+:::unless{host="agentd"}
+NOT-HOST-AGENTD
+:::
+
+:::when{agent="agentd"}
+AGENT-AGENTD
+:::
+
+:::when{agent="claude"}
+AGENT-CLAUDE
+:::
+"#;
+
+/// The delivered instruction for [`FACTS`] under `model`.
+fn delivered_for(model: &str) -> String {
+    let s = settings(
+        FACTS,
+        json!({"intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": model}}),
+    );
+    s.agent.instruction.expect("an instruction")
+}
+
+#[test]
+fn variants_are_decided_by_host_and_the_model_family() {
+    let claude = delivered_for("claude-sonnet-4-5");
+    assert!(claude.contains("HOST-AGENTD"), "{claude}");
+    assert!(!claude.contains("NOT-HOST-AGENTD"), "{claude}");
+    assert!(
+        !claude.contains("AGENT-AGENTD"),
+        "`agent` is the model family, not agentd's name:\n{claude}"
+    );
+    assert!(claude.contains("AGENT-CLAUDE"), "{claude}");
+
+    // An id that names no family: `agent` is an unknown key, so a condition
+    // on it keeps its content (rule 3) — both of them.
+    let unknown = delivered_for("my-finetune");
+    assert!(unknown.contains("HOST-AGENTD"), "{unknown}");
+    assert!(!unknown.contains("NOT-HOST-AGENTD"), "{unknown}");
+    assert!(unknown.contains("AGENT-AGENTD"), "{unknown}");
+    assert!(unknown.contains("AGENT-CLAUDE"), "{unknown}");
+}

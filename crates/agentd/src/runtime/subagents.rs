@@ -577,7 +577,7 @@ impl Runtime {
         let params = tpl::validate_params(&t.spec.params, o.get("params").unwrap_or(&Value::Null))
             .map_err(|e| format!("subagent.run: template '{tname}': {e}"))?;
         let folded = tpl::fold_params(&t.cleaned, &params);
-        if tpl::params_introduced_machinery(&folded) {
+        if tpl::params_introduced_machinery(&t.cleaned, &folded) {
             return Err(format!(
                 "subagent.run refused: params for template '{tname}' introduced directive machinery"
             ));

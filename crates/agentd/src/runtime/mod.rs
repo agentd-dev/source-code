@@ -1570,6 +1570,10 @@ pub(crate) struct FetchedInstruction {
     version_id: Option<String>,
     delivered_digest: Option<String>,
     canonical: Option<String>,
+    /// The read's `md.instruction/resolution` (RFC-0015): `resolved` when the
+    /// registry delivered the text for this reader, which is then used as
+    /// served; anything else was delivered here.
+    resolution: Option<String>,
 }
 
 /// An instruction resource reference split into the server it names (an
@@ -1651,9 +1655,11 @@ impl Runtime {
                         .filter(|c| attested.as_ref().is_none_or(|a| a.contains(c)))
                         .cloned()
                         .collect();
-                    let facts: std::collections::BTreeMap<String, String> =
-                        [("agent".to_string(), "agentd".to_string())].into();
-                    match crate::config::idoc::extract_with_facts(&raw, &granted, &facts) {
+                    match crate::config::idoc::extract_with_facts(
+                        &raw,
+                        &granted,
+                        &self.settings.agent.instruction_facts,
+                    ) {
                         Ok(ex) => ex.cleaned,
                         Err(errs) => {
                             return Err(format!(
@@ -2103,11 +2109,31 @@ impl Runtime {
                     let attested = self
                         .verify_registry_read(&c, res, &raw, &meta)
                         .map_err(|r| r.to_string())?;
-                    // Delivered text is the CLEANED document when it carries
-                    // machinery (resolution "raw" = resolve locally); the
-                    // machinery itself applies on reload/restart. A document
-                    // that no longer folds keeps the running text.
-                    let text = if crate::config::idoc::contains_blocks(&raw) {
+                    // A RESOLVED read is text the registry already ran §3.5 on
+                    // for this reader: delivering it again is not idempotent
+                    // (labels re-bolded, a keyword line quoted in an example
+                    // made a live rule, a quoted `<!--` made a note), so it is
+                    // used as served. The registry stamps `deliveredDigest`
+                    // on EVERY read, raw ones included, so the digest alone
+                    // says nothing about who delivered; the resolution does,
+                    // and the digest then binds it to these exact bytes. A
+                    // resolved read carries acknowledgements, not machinery:
+                    // nothing folds from it.
+                    let resolution = get_meta("resolution");
+                    let resolved = resolution.as_deref() == Some("resolved");
+                    if resolved
+                        && get_meta("deliveredDigest")
+                            .is_none_or(|d| d != instruction_core::digest(raw.as_bytes()))
+                    {
+                        return Err("registry delivered text does not match its deliveredDigest"
+                            .to_string());
+                    }
+                    // Otherwise (`raw`, the default, or no resolution at all)
+                    // delivered text is the CLEANED document when it carries
+                    // machinery; the machinery itself applies on
+                    // reload/restart. A document that no longer folds keeps
+                    // the running text. (`sealed` was decrypted above.)
+                    let text = if !resolved && crate::config::idoc::contains_blocks(&raw) {
                         let mut granted: std::collections::BTreeSet<String> = self
                             .settings
                             .agent
@@ -2120,9 +2146,11 @@ impl Runtime {
                         if let Some(caps) = &attested {
                             granted.retain(|g| caps.contains(g));
                         }
-                        let facts: BTreeMap<String, String> =
-                            [("agent".to_string(), "agentd".to_string())].into();
-                        match crate::config::idoc::extract_with_facts(&raw, &granted, &facts) {
+                        match crate::config::idoc::extract_with_facts(
+                            &raw,
+                            &granted,
+                            &self.settings.agent.instruction_facts,
+                        ) {
                             Ok(ex) => ex.cleaned,
                             Err(errs) => {
                                 return Err(format!(
@@ -2145,6 +2173,7 @@ impl Runtime {
                         version_id: get_meta("versionId"),
                         delivered_digest: get_meta("deliveredDigest"),
                         canonical: get_meta("canonical"),
+                        resolution,
                     });
                 }
                 Err(e) => last_err = e.to_string(),
@@ -2166,6 +2195,7 @@ impl Runtime {
             version_id,
             delivered_digest,
             canonical,
+            resolution,
         } = fetched;
         // Watched only where the server offers subscriptions. A server that
         // serves resources and no subscriptions is followed by the refresh
@@ -2206,7 +2236,7 @@ impl Runtime {
             version_id: version_id.clone(),
             delivered_digest: delivered_digest.clone(),
         };
-        self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version, "version_id": version_id}));
+        self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version, "version_id": version_id, "resolution": resolution}));
         // The APPLY boundary (RFC-0016 §6): a registry version
         // change is one log line, old → new, timestamped like
         // every line — the publish→applied latency measure.

@@ -323,3 +323,112 @@ fn an_unsigned_read_under_a_pinned_publisher_is_refused() {
         r.log
     );
 }
+
+/// Run the real daemon on a registry instruction, with the in-process mock
+/// intelligence echoing the system prompt it is sent and a context template
+/// that is the instruction alone — so a run's output is exactly the text the
+/// model received. A followed resource keeps the daemon from idling, so it is
+/// stopped once the run is done (or it exits on its own).
+fn run_echo(instruction: &str) -> String {
+    let mock = common::spawn_mock_mcp("mock://watched", false);
+    let cfg = json!({
+        "agent": {"name": "reg-resolved", "preflight": "never",
+                  "instruction": {"mcp": instruction}},
+        "mcp": {"servers": [{"name": "registry", "endpoint": format!("{}/mcp", mock.uri())}]},
+        "intelligence": {"endpoints": "mock:echo-system", "model": "mock"},
+        "context": {"template": "{{instruction}}"},
+        "store": {"kind": "memory"},
+        "observability": {"log_level": "info", "log_content": true},
+        "workflows": [{"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "a": {"kind": "agent", "depends_on": ["s"], "instruction": "go"},
+            "f": {"kind": "finish", "depends_on": ["a"], "status": "completed",
+                  "output": "{{steps.a.output}}"},
+        }}],
+    });
+    let cfg_path = common::unique_path("reg-resolved", "json");
+    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let err_path = common::unique_path("reg-resolved", "log");
+    let errf = std::fs::File::create(&err_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["-c", &cfg_path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(errf)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let log = std::fs::read_to_string(&err_path).unwrap_or_default();
+        if log.contains("\"run.done\"")
+            || log.contains("proc.exit")
+            || child.try_wait().is_ok_and(|s| s.is_some())
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the run neither finished nor exited:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(&err_path).unwrap_or_default();
+    for p in [cfg_path, err_path] {
+        let _ = std::fs::remove_file(&p);
+    }
+    log
+}
+
+/// A RESOLVED read (RFC-0015 `md.instruction/resolution: resolved`) is text
+/// the registry already delivered for this reader: it reaches the model byte
+/// for byte. Delivered again, its quoted `:::must` fence would become a live
+/// rule and its quoted `<!--` would become a note — what a consumer that
+/// keyed on `deliveredDigest` alone (stamped on every read, raw ones too)
+/// would also have done to a raw read's machinery, the other way round.
+#[test]
+fn a_resolved_read_reaches_the_model_as_served() {
+    let log = run_echo("instruction://ins_mock@stable?resolved=1");
+    let loaded = event(&log, "instruction.loaded")
+        .unwrap_or_else(|| panic!("no instruction.loaded:\n{log}"));
+    assert_eq!(loaded["resolution"], "resolved", "{loaded}");
+    let done = event(&log, "run.done").unwrap_or_else(|| panic!("no run.done:\n{log}"));
+    let resolved = agentd::mcp::mock_http::REGISTRY_RESOLVED_TEXT;
+    assert_eq!(
+        done["output"].as_str().map(str::trim_end),
+        Some(resolved.trim_end()),
+        "the model received the registry's delivered text unchanged:\n{log}"
+    );
+}
+
+/// A raw read is delivered here, as before: the model reads the cleaned
+/// document — its machinery acknowledged, never its fence.
+#[test]
+fn a_raw_read_is_still_delivered_here() {
+    let log = run_echo("instruction://ins_mock@stable");
+    let loaded = event(&log, "instruction.loaded")
+        .unwrap_or_else(|| panic!("no instruction.loaded:\n{log}"));
+    assert_eq!(loaded["resolution"], "raw", "{loaded}");
+    let done = event(&log, "run.done").unwrap_or_else(|| panic!("no run.done:\n{log}"));
+    let out = done["output"].as_str().unwrap_or_default();
+    assert!(out.contains("Serve the mock."), "{log}");
+    assert!(
+        !out.contains(":::!workflow"),
+        "a raw read's machinery never reaches the model:\n{out}"
+    );
+}
+
+/// A resolved read whose bytes are not the ones its `deliveredDigest` names
+/// is refused, not adopted: at boot the daemon does not start on it.
+#[test]
+fn a_resolved_read_under_another_digest_is_refused() {
+    let r = boot("instruction://ins_mock@stable?resolved=stale", json!([]));
+    assert!(!r.log.contains("proc.ready"), "must not start:\n{}", r.log);
+    assert!(
+        r.log
+            .contains("registry delivered text does not match its deliveredDigest"),
+        "the refusal names the mismatch:\n{}",
+        r.log
+    );
+}

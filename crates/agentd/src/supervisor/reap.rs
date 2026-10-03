@@ -121,6 +121,14 @@ pub use imp::{classify_status, is_init, set_child_subreaper};
 /// gracefully (SIGTERM → its own drain) instead of orphaning a daemon.
 pub const INSTANCE_CHILD_ENV: &str = "AGENTD_INSTANCE_CHILD";
 
+/// Set beside [`INSTANCE_CHILD_ENV`] by the spawning parent: the digest of the
+/// instruction prose the parent already DELIVERED into the child's composed
+/// config. The child's loader uses its instruction as written when it is that
+/// text exactly, rather than running the §3.5 pipeline on delivered text a
+/// second time (`config::settings::delivered_by_parent`). Internal, like its
+/// sibling — not a config key, and no `AGENTD_` path or alias names it.
+pub const INSTANCE_DELIVERED_ENV: &str = "AGENTD_INSTANCE_DELIVERED";
+
 /// PDEATHSIG(SIGTERM) for an instance-tier child — set post-exec by the child
 /// itself (the pre-exec value would not survive the execve), mirroring the
 /// subagent's SIGKILL install in `subagent::control`. SIGTERM, not SIGKILL:

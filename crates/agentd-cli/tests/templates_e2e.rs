@@ -180,6 +180,74 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
     );
 }
 
+/// The parent delivers an instance template's instruction once, at boot, and
+/// writes that prose, params folded in, as the child's instruction; the child
+/// uses it as written. Delivered a second time, the `plain` label would turn
+/// bold and the rule fence quoted in the example would become a live rule —
+/// so what the child's model receives (echoed back by the mock intelligence)
+/// is the template's delivered text, unchanged.
+#[cfg(feature = "a2a")]
+#[test]
+fn an_instance_childs_instruction_is_delivered_once_by_the_parent() {
+    let (code, log) = run_cfg(
+        "agent: { name: parent }\nstore: { kind: memory }\n\
+         intelligence: { endpoints: \"mock:echo-system\", model: mock }\n\
+         lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
+         observability: { log_level: info, log_content: true }\n\
+         subagents:\n\
+        \x20 templates:\n\
+        \x20   scribe:\n\
+        \x20     instruction: |\n\
+        \x20       ---\n\
+        \x20       spec: \"1\"\n\
+        \x20       delivery: {labels: plain}\n\
+        \x20       ---\n\
+        \x20       MUST: answer for {{params.id}}.\n\
+        \n\
+        \x20       ::::example\n\
+        \x20       MUST: is how a rule reads, and so is\n\
+        \n\
+        \x20       :::must\n\
+        \x20       Never promise a refund.\n\
+        \x20       :::\n\
+        \x20       ::::\n\
+        \n\
+        \x20       :::!workflow{name=on-ask}\n\
+        \x20       steps:\n\
+        \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
+        \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
+        \x20         f:   { kind: finish, depends_on: [a], status: completed, output: \"{{steps.a.output}}\" }\n\
+        \x20       :::\n\
+        \x20     params: { id: { type: string, required: true } }\n\
+        \x20     ttl: 4s\n\
+         workflows:\n  - name: caller\n    steps:\n\
+        \x20     s:     { kind: once }\n\
+        \x20     spawn: { kind: subagent, template: scribe, params: { id: inc-7 }, depends_on: [s] }\n\
+        \x20     ask:   { kind: a2a.delegate, depends_on: [spawn], peer: \"{{steps.spawn.output.peer}}\", command: scribe.ask, args: {}, timeout: 30s, retry: { max: 6, backoff: 1s } }\n\
+        \x20     nap:   { kind: sleep, depends_on: [ask], duration: 5s }\n\
+        \x20     f:     { kind: finish, depends_on: [nap], status: completed, output: \"{{steps.ask.output}}\" }\n",
+    );
+    assert_eq!(code, Some(0), "{log}");
+    let done = events(&log, "run.done");
+    let caller: Vec<&Value> = done.iter().filter(|e| e["workflow"] == "caller").collect();
+    assert_eq!(caller.len(), 1, "{log}");
+    assert_eq!(caller[0]["status"], "completed", "{log}");
+    // The child's model's system prompt, echoed.
+    let prompt = caller[0]["output"].as_str().unwrap_or("");
+    assert!(
+        prompt.contains("MUST: answer for inc-7.\n"),
+        "the plain label reached the child's model as delivered:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("EXAMPLE:\nMUST: is how a rule reads, and so is\n\n:::must\nNever promise a refund.\n:::"),
+        "the example's quoted rule stayed quoted:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("**MUST:**"),
+        "nothing was delivered a second time:\n{prompt}"
+    );
+}
+
 #[cfg(feature = "a2a")]
 #[test]
 fn a_singleton_instance_refuses_a_second_live_spawn() {

@@ -98,7 +98,7 @@ impl Runtime {
                 Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
             };
         let prose = fold_params(&t.cleaned, &params);
-        if params_introduced_machinery(&prose) {
+        if params_introduced_machinery(&t.cleaned, &prose) {
             return err(format!(
                 "subagent.run refused: params for template '{tname}' introduced directive machinery"
             ));
@@ -228,7 +228,7 @@ impl Runtime {
             dirty: true,
         };
         record.principal = self.spawn_principal(&record);
-        match self.spawn_instance_process(&config_path, &dir, &t.spec.limits) {
+        match self.spawn_instance_process(&config_path, &dir, &t.spec.limits, &prose) {
             Ok(pid) => {
                 record.pid = Some(pid);
                 record.status = "running".into();
@@ -473,12 +473,14 @@ impl Runtime {
     }
 
     /// Spawn the child daemon ([`instance_command`], logging to `<dir>/log`)
-    /// under the reaper.
+    /// under the reaper. `delivered` is the instruction prose the composed
+    /// config carries, already delivered here.
     fn spawn_instance_process(
         &mut self,
         config_path: &std::path::Path,
         dir: &std::path::Path,
         limits: &Option<Value>,
+        delivered: &str,
     ) -> Result<i32, String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let log_file = std::fs::OpenOptions::new()
@@ -486,7 +488,7 @@ impl Runtime {
             .append(true)
             .open(dir.join("log"))
             .map_err(|e| format!("open log: {e}"))?;
-        let mut cmd = instance_command(&exe, config_path, log_file, limits)?;
+        let mut cmd = instance_command(&exe, config_path, log_file, limits, delivered)?;
         let child =
             crate::supervisor::reaper::spawn_tracked_pid(&self.children.reap_sender(), || {
                 cmd.spawn()
@@ -621,13 +623,20 @@ impl Runtime {
     /// the child's identity and its state is durable, so the respawned daemon
     /// picks up where the dead one stopped.
     pub(crate) fn respawn_restored_instances(&mut self) {
-        let candidates: Vec<(String, String, Option<Value>)> = self
+        // The record keeps the prose the composed config was written with,
+        // so a respawned child is told it was delivered exactly as the first
+        // one was.
+        let candidates: Vec<(String, String, Option<Value>, String)> = self
             .subagents
             .values()
             .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
-            .filter_map(|s| s.config_path.clone().map(|c| (s.handle.clone(), c, None)))
+            .filter_map(|s| {
+                s.config_path
+                    .clone()
+                    .map(|c| (s.handle.clone(), c, None, s.instruction.clone()))
+            })
             .collect();
-        for (handle, config, limits) in candidates {
+        for (handle, config, limits, delivered) in candidates {
             let path = PathBuf::from(&config);
             let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
                 continue;
@@ -640,7 +649,7 @@ impl Runtime {
                 self.persist_subagent(&handle);
                 continue;
             }
-            match self.spawn_instance_process(&path, &dir, &limits) {
+            match self.spawn_instance_process(&path, &dir, &limits, &delivered) {
                 Ok(pid) => {
                     if let Some(s) = self.subagents.get_mut(&handle) {
                         s.pid = Some(pid);
@@ -990,11 +999,16 @@ impl Runtime {
 /// intelligence family passes through for credentials), own process group,
 /// template rlimits, stdout and stderr to `log_file` — and no other
 /// descriptor the process holds, however the process was started.
+///
+/// `delivered` is the instruction prose the composed config carries, which
+/// this parent already delivered: its digest rides beside the child marker so
+/// the child uses that text as written instead of delivering it again.
 fn instance_command(
     exe: &std::path::Path,
     config_path: &std::path::Path,
     log_file: std::fs::File,
     limits: &Option<Value>,
+    delivered: &str,
 ) -> Result<std::process::Command, String> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--config")
@@ -1012,6 +1026,10 @@ fn instance_command(
         }
     }
     cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
+    cmd.env(
+        crate::supervisor::reap::INSTANCE_DELIVERED_ENV,
+        instruction_core::digest(delivered.as_bytes()),
+    );
     let (memory_bytes, cpu_seconds) = parse_instance_rlimits(limits)?;
     #[cfg(unix)]
     {
@@ -1426,7 +1444,7 @@ mod tests {
         assert!(stray.held_in(&plain), "a plain spawn inherits it: {plain}");
         let log = exe.with_file_name("log");
         let file = std::fs::File::create(&log).unwrap();
-        let mut cmd = instance_command(&exe, std::path::Path::new("unused.yaml"), file, &None)
+        let mut cmd = instance_command(&exe, std::path::Path::new("unused.yaml"), file, &None, "")
             .expect("the command builds");
         assert!(run(&mut cmd).status.success());
         let fds = std::fs::read_to_string(&log).unwrap();

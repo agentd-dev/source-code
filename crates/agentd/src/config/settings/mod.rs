@@ -327,6 +327,14 @@ pub struct Agent {
     /// same grants as its inline machinery ([`document_route_refusals`]).
     #[serde(skip)]
     pub document_grants: std::collections::BTreeSet<String>,
+    /// The runtime facts the instruction's `when`/`unless` blocks were
+    /// decided by (`idoc::instruction_facts`) — DERIVED from the OPERATOR's
+    /// intelligence section before the document folds, never a config key.
+    /// Kept so every later delivery — a subagent template, an OCI re-pull, a
+    /// registry read — is judged by the same answers, and none of them by a
+    /// model the document's own `:::!config` chose.
+    #[serde(skip)]
+    pub instruction_facts: BTreeMap<String, String>,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
     /// config load, RFC 0040) — DERIVED: the runtime uses it to log
     /// `instruction.loaded` with its version pin and to arm the freshness
@@ -1355,6 +1363,41 @@ pub fn strip_front_matter(text: &str) -> (String, bool) {
     (text.to_string(), false)
 }
 
+/// Whether `instruction` is the text an instance-tier parent already
+/// delivered for this process, which the §3.5 pipeline must not run on twice.
+///
+/// The parent folds the template at boot, folds the params in at spawn and
+/// writes the DELIVERED prose as the child's `agent.instruction`. A second
+/// delivery is not idempotent: it turns `plain` labels back into bold, a
+/// keyword line quoted in an example into a live rule, and a quoted `<!--`
+/// into a note that deletes what follows. So the parent marks the child's
+/// environment with the digest of exactly that prose
+/// ([`crate::supervisor::reap::INSTANCE_DELIVERED_ENV`]), and the mark holds
+/// only for a process that is an instance child AND whose instruction is that
+/// text byte for byte: an edited or different instruction is delivered as
+/// any other. Skipping is fail-safe: delivered prose carries
+/// acknowledgements, not machinery, so nothing is activated by it.
+fn delivered_by_parent(instruction: &str) -> bool {
+    parent_delivered_digest_matches(
+        instruction,
+        std::env::var_os(crate::supervisor::reap::INSTANCE_CHILD_ENV).is_some(),
+        std::env::var(crate::supervisor::reap::INSTANCE_DELIVERED_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`delivered_by_parent`] over its inputs, so the rule is testable without
+/// touching the process environment.
+fn parent_delivered_digest_matches(
+    instruction: &str,
+    instance_child: bool,
+    delivered: Option<&str>,
+) -> bool {
+    instance_child
+        && delivered.is_some_and(|d| d == instruction_core::digest(instruction.as_bytes()))
+}
+
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
 /// URL to a web page… — any `<alpha><alnum+.->://` single token counts; the
 /// registry decides which server serves it.
@@ -1504,6 +1547,12 @@ impl Intelligence {
     /// else `model` (a literal or a tier name).
     pub fn default_reference(&self) -> Option<String> {
         self.default.clone().or_else(|| self.model.clone())
+    }
+
+    /// The model the agent's turns use when nothing names one, as sent to
+    /// the provider: [`Self::default_reference`] through [`Self::wire_model`].
+    pub fn default_wire_model(&self) -> Option<String> {
+        self.default_reference().map(|r| self.wire_model(&r))
     }
 
     /// Walk the fallback chain from `reference`, stopping at the first tier
@@ -4160,6 +4209,17 @@ impl Settings {
             attested
         };
 
+        // The facts are read from the intelligence section as it stands NOW,
+        // before the document's `:::!config` merges under it: a document
+        // cannot choose the facts its own variants are judged by. Typed from
+        // the raw subtree because the document is not deserialized yet; one
+        // that does not type gives no model, and the typing below reports it.
+        let instruction_facts = crate::config::idoc::instruction_facts(
+            doc.get("intelligence")
+                .and_then(|v| serde_json::from_value::<Intelligence>(v.clone()).ok())
+                .and_then(|i| i.default_wire_model())
+                .as_deref(),
+        );
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         let mut gate_channels = crate::config::humans::GateChannels::new();
         let mut document_workflows = std::collections::BTreeSet::new();
@@ -4171,6 +4231,7 @@ impl Settings {
             .map(str::to_string)
             && !looks_like_resource_uri(&instr)
             && crate::config::idoc::contains_blocks(&instr)
+            && !delivered_by_parent(&instr)
         {
             // The instruction is an Instruction Document — the single dialect,
             // and the ONLY surface extraction runs on (conversation text is
@@ -4196,10 +4257,6 @@ impl Settings {
             if let Some(attested) = &attested_capabilities {
                 granted.retain(|g| attested.contains(g));
             }
-            // The runtime supplies `agent` as a `when` fact (§5.2) — the
-            // one dimension agentd can always answer about itself.
-            let facts: std::collections::BTreeMap<String, String> =
-                [("agent".to_string(), "agentd".to_string())].into();
             // Parsed here and folded with the same arguments `extract_with_facts`
             // uses, rather than through it, because agentd needs the parsed
             // document once more after the fold: a gate addressed to one of its
@@ -4210,7 +4267,7 @@ impl Settings {
                     &parsed,
                     &granted,
                     &BTreeMap::new(),
-                    &facts,
+                    &instruction_facts,
                     &|_| None,
                 )?;
                 let channels =
@@ -4347,6 +4404,7 @@ impl Settings {
         settings.agent.document_gate_channels = gate_channels;
         settings.agent.document_workflows = document_workflows;
         settings.agent.document_grants = document_grants;
+        settings.agent.instruction_facts = instruction_facts;
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
         settings.agent.instruction_spec = instruction_spec;
@@ -11594,6 +11652,81 @@ mod tests {
         }
     }
 
+    /// The facts an instruction is judged by are the OPERATOR's model as the
+    /// provider receives it — a tier name resolved through `models` — and a
+    /// document's own `:::!config` cannot choose them.
+    #[test]
+    fn instruction_facts_come_from_the_operators_model() {
+        let doc = |intel: Value, instruction: &str| json!({"intelligence": intel, "agent": {"instruction": instruction}});
+        let variants = "---\nspec: \"1\"\n---\nBase.\n\n:::when{agent=\"claude\"}\nFOR-CLAUDE\n:::\n\n:::when{agent=\"gpt\"}\nFOR-GPT\n:::\n";
+        let s = Settings::from_document(
+            doc(
+                json!({"endpoints": ["https://llm.example/v1"], "model": "fast",
+                       "models": {"fast": {"model": "anthropic/claude-haiku-4-5"}}}),
+                variants,
+            ),
+            "t",
+        )
+        .unwrap();
+        let f = &s.agent.instruction_facts;
+        assert_eq!(f["host"], "agentd");
+        assert_eq!(
+            f["model"], "anthropic/claude-haiku-4-5",
+            "the tier's wire model"
+        );
+        assert_eq!(f["agent"], "claude");
+        let text = s.agent.instruction.as_deref().unwrap();
+        assert!(
+            text.contains("FOR-CLAUDE") && !text.contains("FOR-GPT"),
+            "{text}"
+        );
+
+        // No operator model: the document's `:::!config` names one, and it
+        // is NOT what its variants are decided by — `agent` stays unknown,
+        // so both are kept (rule 3).
+        let chooses = format!("{variants}\n:::!config\nintelligence: {{ model: gpt-5.1 }}\n:::\n");
+        let s = Settings::from_document(
+            doc(json!({"endpoints": ["https://llm.example/v1"]}), &chooses),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            s.intelligence.model.as_deref(),
+            Some("gpt-5.1"),
+            "the fragment applied"
+        );
+        assert_eq!(
+            s.agent.instruction_facts,
+            BTreeMap::from([("host".to_string(), "agentd".to_string())])
+        );
+        let text = s.agent.instruction.as_deref().unwrap();
+        assert!(
+            text.contains("FOR-CLAUDE") && text.contains("FOR-GPT"),
+            "{text}"
+        );
+    }
+
+    /// An instance child uses its instruction as written only when it IS an
+    /// instance child and the text is byte for byte what the parent delivered.
+    #[test]
+    fn a_parent_delivered_instruction_is_bound_to_its_digest() {
+        let text = "**MUST:** cite.\n";
+        let digest = instruction_core::digest(text.as_bytes());
+        assert!(parent_delivered_digest_matches(text, true, Some(&digest)));
+        assert!(
+            !parent_delivered_digest_matches(text, false, Some(&digest)),
+            "not an instance child"
+        );
+        assert!(
+            !parent_delivered_digest_matches(text, true, None),
+            "no mark"
+        );
+        assert!(
+            !parent_delivered_digest_matches("**MUST:** cite!\n", true, Some(&digest)),
+            "an edited instruction is delivered normally"
+        );
+    }
+
     /// The launcher's environment scrub reads the loader's own tables: every
     /// alias and every path's name, under the one prefix.
     #[test]
@@ -11623,6 +11756,10 @@ mod tests {
             "LLM_KEY",
             "AGENT_MODEL",
             "MODEL",
+            // The parent→instance-child markers are internal: no path and no
+            // alias names them, so the ENV layer never reads them as config.
+            crate::supervisor::reap::INSTANCE_CHILD_ENV,
+            crate::supervisor::reap::INSTANCE_DELIVERED_ENV,
         ] {
             assert!(one(ignored).is_empty(), "{ignored} is not the loader's");
         }

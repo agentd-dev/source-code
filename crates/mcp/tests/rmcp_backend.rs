@@ -163,12 +163,11 @@ impl Handler for Yes {
 }
 
 #[test]
-fn the_handshake_speaks_whatever_revision_the_sdk_supports() {
-    // Deliberately not pinned to a date: this backend follows rmcp's own
-    // `LATEST`, so it adopts the stateless revision on the release that
-    // promotes it — without a change here. Pinning our own constant would mean
-    // asking servers for a dialect the SDK may not fully implement.
-    let expected = ProtocolVersion::LATEST.to_string();
+fn the_handshake_offers_the_newest_revision_with_an_initialize() {
+    // rmcp's `LATEST` (and its default) is 2026-07-28, which has no
+    // `initialize`; a handshake that offered it would ask for a revision the
+    // handshake cannot be. agentd offers the newest one that still has one.
+    let expected = "2025-11-25";
     let seen: Shared = Arc::default();
     let ep = spawn_server(Arc::clone(&seen));
     let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
@@ -181,10 +180,13 @@ fn the_handshake_speaks_whatever_revision_the_sdk_supports() {
         .clone()
         .expect("no initialize seen");
     assert_eq!(init["protocolVersion"], expected, "handshake: {init}");
-    assert_eq!(client.protocol_version(), Some(expected.as_str()));
-    // …and agentd's mock server answers the same revision, so the SDK and the
-    // one constant this crate keeps cannot drift apart unnoticed.
-    assert_eq!(mcp::wire::PROTOCOL_VERSION, expected);
+    assert_eq!(client.protocol_version(), Some(expected));
+    // …and agentd's mock server answers the same revision, pinned to rmcp's
+    // constant, so the two cannot drift apart unnoticed.
+    assert_eq!(
+        mcp::wire::PROTOCOL_VERSION,
+        ProtocolVersion::LATEST_WITH_INITIALIZE.as_str()
+    );
 }
 
 #[test]
@@ -199,11 +201,8 @@ fn subscribing_uses_the_method_the_negotiated_revision_defines() {
     let later = "2027-03-01";
     assert!(ProtocolVersion::V_2026_07_28.as_str() < later);
     let cases: [(Option<&'static str>, bool); 4] = [
-        // rmcp's own `LATEST`, echoed back.
-        (
-            None,
-            ProtocolVersion::LATEST >= ProtocolVersion::V_2026_07_28,
-        ),
+        // The revision agentd offers in `initialize` (2025-11-25), echoed back.
+        (None, false),
         (Some(ProtocolVersion::V_2025_06_18.as_str()), false),
         (Some(ProtocolVersion::V_2026_07_28.as_str()), true),
         (Some(later), true),

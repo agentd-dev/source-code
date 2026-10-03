@@ -14,16 +14,15 @@
 //! [`RmcpBuilder::connect`]) and blocks on it, exposing synchronous methods.
 //! The runtime lives as long as the client and dies with it.
 //!
-//! **The protocol version is the SDK's to choose.** rmcp pins
-//! `ProtocolVersion::LATEST` at `2025-11-25` even though the newer stateless
-//! revision exists as a constant — that is upstream telling us what it is
-//! actually ready to speak. Overriding it would mean asking a server for a
-//! dialect the SDK may not fully implement, which is the opposite of why one
-//! adopts an SDK. So this backend speaks whatever rmcp says is current, and
-//! picks up the stateless revision automatically on the release that promotes
-//! it. Everything version-dependent here (notably [`RmcpClient::subscribe`])
-//! therefore branches on the *negotiated* version, compared against rmcp's own
-//! constants.
+//! **agentd chooses the revision it offers in `initialize`.** rmcp 3.5's
+//! `ProtocolVersion::default()` is its `LATEST`, 2026-07-28 — a revision with
+//! no `initialize` at all (its lifecycle moved into per-request `_meta`). A
+//! handshake that offered it would ask the server for something the handshake
+//! itself cannot be. So `initialize` offers `INITIALIZE_OFFER`, rmcp's
+//! `LATEST_WITH_INITIALIZE`, named in exactly one place. Everything
+//! version-dependent here (notably [`RmcpClient::subscribe`]) still branches on
+//! the *negotiated* version the server answered with, compared against rmcp's
+//! own constants.
 //!
 //! **No response cache.** SEP-2549 lets a client reuse a `resources/read` or
 //! list result for the server's `ttlMs`, and serve an expired one when a
@@ -45,13 +44,31 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult,
     ElicitationAction, ElicitationCapability, Implementation as RmcpImpl, ProtocolVersion,
     ReadResourceRequestParams, RequestMetaObject, SubscriptionFilter,
 };
 use rmcp::service::{RoleClient, RunningService, Subscription, SubscriptionEnd};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ServiceExt};
+
+/// The revision agentd offers in `initialize`, and the only place it is named.
+///
+/// The newest one that still has an `initialize`: from 2026-07-28 on the
+/// lifecycle is per-request `_meta`, so rmcp's `LATEST` (and its `default()`)
+/// is a revision no `initialize` can ask for.
+const INITIALIZE_OFFER: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
+
+/// What the client tells a server about itself in `initialize`, at `version`.
+/// The revision is a parameter, never the SDK's default, for the reason at
+/// [`INITIALIZE_OFFER`].
+fn client_config(
+    caps: ClientCapabilities,
+    implementation: RmcpImpl,
+    version: ProtocolVersion,
+) -> ClientConfig {
+    ClientConfig::new(caps, implementation).with_protocol_version(version)
+}
 
 /// Bridges rmcp's `ClientHandler` onto agentd: a server's elicitation reaches
 /// the host that can answer it, and a server's notifications reach the queue the
@@ -63,7 +80,7 @@ use rmcp::{ClientHandler, ServiceExt};
 /// agent idle forever, with nothing in any log to say why.
 #[derive(Clone)]
 struct Handler {
-    info: ClientInfo,
+    info: ClientConfig,
     /// The host's elicitation answerer; `None` when the capability is not
     /// declared, which is also what the handshake told the server.
     elicitation: Option<Arc<dyn inbound::Handler>>,
@@ -85,7 +102,7 @@ fn declined() -> ElicitResult {
 }
 
 impl ClientHandler for Handler {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.info.clone()
     }
 
@@ -370,11 +387,10 @@ impl RmcpBuilder {
 
         let handler = Handler {
             queue: Arc::clone(&notifications),
-            // `ClientInfo::new` already carries `ProtocolVersion::default()`,
-            // i.e. rmcp's `LATEST`. Left explicit so it is obvious this is a
-            // decision (follow the SDK) and not an omission.
-            info: ClientInfo::new(caps, implementation)
-                .with_protocol_version(ProtocolVersion::default()),
+            // Never `ClientConfig::new`'s own default: that is rmcp's `LATEST`,
+            // 2026-07-28, which has no `initialize`, so offering it here would
+            // ask for a revision this handshake cannot be.
+            info: client_config(caps, implementation, INITIALIZE_OFFER),
             elicitation: self.elicitation.clone(),
         };
 
@@ -981,14 +997,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_sdk_still_pins_a_revision_before_the_listen_one() {
-        // The backend deliberately asks for `ProtocolVersion::default()` —
-        // rmcp's `LATEST`, currently 2025-11-25 — so against a server that
-        // echoes it, subscriptions take the per-URI path. This records that
-        // the listen revision exists and still sorts after `LATEST`, so the day
-        // rmcp promotes it this test is the tripwire.
-        assert_eq!(ProtocolVersion::default(), ProtocolVersion::LATEST);
-        assert!(ProtocolVersion::LATEST < ProtocolVersion::V_2026_07_28);
+    fn the_handshake_offers_the_newest_revision_that_has_one() {
+        // `initialize` offers 2025-11-25 because it is the newest revision
+        // with an `initialize`, not because it is the SDK's default (that is
+        // 2026-07-28 now). The mock answers the revision agentd offers, so the
+        // two constants move together or this fails.
+        assert_eq!(INITIALIZE_OFFER, ProtocolVersion::LATEST_WITH_INITIALIZE);
+        assert_eq!(INITIALIZE_OFFER, ProtocolVersion::V_2025_11_25);
+        assert_eq!(crate::wire::PROTOCOL_VERSION, INITIALIZE_OFFER.as_str());
     }
 
     /// The SDK's own messages — a notification it sends, the answer to a

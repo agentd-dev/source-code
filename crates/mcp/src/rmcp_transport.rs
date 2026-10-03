@@ -97,15 +97,18 @@ impl StreamableHttpClient for AgentdHttp {
     /// So the blocking read runs on its own thread and forwards each frame as it
     /// arrives.
     ///
-    /// **A request does not hold the connection.** The SDK sends every message
-    /// from one worker that awaits this call before it sends the next, so
-    /// whatever this waits for, every later message on the connection waits for
-    /// too. For a request that is nothing: its stream is handed back at once,
-    /// and a slow tool — or one abandoned at its caller's bound and left running
-    /// to the socket's timeout — delays no call but its own. Only `initialize`
-    /// waits for its first frame, because the session it opens rides that
-    /// answer's head; and a notification, or our answer to a server's request,
-    /// waits for its `202`, which a server gives at once.
+    /// **A request does not hold the connection.** The SDK's worker runs up to
+    /// 16 ordinary POSTs at once, but `initialize`, `server/discover` and
+    /// `notifications/initialized` are ordering barriers it sends alone, and
+    /// whatever this waits for on one of those, every later message on the
+    /// connection waits for too. A full window holds the next POST the same
+    /// way. So a request's stream is handed back at once, and a slow tool — or
+    /// one abandoned at its caller's bound and left running to the socket's
+    /// timeout — holds no call but its own. Only `initialize` waits for its
+    /// first frame, because the session it opens rides that answer's head. A
+    /// notification, or our answer to a server's request, waits for its `202`,
+    /// which a server gives at once; the SDK bounds replies and cancellations
+    /// (its control POSTs) at 5 s.
     async fn post_message(
         &self,
         _uri: Arc<str>,

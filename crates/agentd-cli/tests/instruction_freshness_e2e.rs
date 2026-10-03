@@ -326,7 +326,25 @@ fn an_end_matter_only_edit_moves_the_version_id_not_the_instruction() {
             .filter(|e| e["uri"] == EM)
             .collect()
     };
-    let log = d.wait_for("the startup read and two polls", |l| reads(l).len() >= 3);
+    // A read is logged `instruction.loaded` the moment it is adopted, but its
+    // binding report is a further tools/call to the registry that lands in
+    // the log milliseconds later — so a log caught right after the third read
+    // can hold its `applied` without its `reported`. Wait until every read
+    // in the log has been reported (or a report failed), so the assertions
+    // below judge a settled log; a report that never comes times out here.
+    let settled = |l: &str| {
+        let reported = events(l, "instruction.binding.reported");
+        let r = reads(l);
+        !events(l, "instruction.binding.fail").is_empty()
+            || (r.len() >= 3
+                && r.iter()
+                    .all(|e| reported.iter().any(|p| p["version_id"] == e["version_id"])))
+    };
+    let log = d.wait_for("the startup read and two polls, reported", settled);
+    assert!(
+        events(&log, "instruction.binding.fail").is_empty(),
+        "a binding call failed:\n{log}"
+    );
     let loaded = reads(&log);
 
     // A new versionId on every read…

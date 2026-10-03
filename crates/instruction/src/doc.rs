@@ -195,19 +195,27 @@ pub fn schema_json() -> &'static str {
 }
 
 /// Whether a text must go through §3.5 delivery before a model reads it:
-/// whether it carries anything delivery renders or removes. That is a block
-/// (a container or set fence, a section heading, a sigiled or structural
-/// leaf), a keyword, alert or reason line (S12-S15: `MUST[x] (if c):` and
-/// `BECAUSE:` are rendered, not read raw), a column-0 author note (S9: never
-/// delivered), front matter at line 1, or end matter (S27: never delivered;
-/// malformed end matter too, so that parse refuses it). A loader that
+/// whether it carries anything delivery renders, removes or refuses. That
+/// is a block (a container or set fence, a section heading, a leaf of a
+/// registered kind or a sigiled one), a keyword, alert or reason line
+/// (S12-S15: `MUST[x] (if c):` and `BECAUSE:` are rendered, not read raw),
+/// an inline reference (§4.7: `[[kind/name]]` and `[Label](#kind/name)`
+/// degrade to their label, and a dangling one is a refusal), a column-0
+/// author note (S9: never delivered), front matter at line 1, or end matter
+/// (S27: never delivered; malformed end matter too, so that parse refuses
+/// it). A loader that
 /// delivers only when this is true hands plain prose — none of these —
-/// to the model byte for byte, and everything else through delivery.
+/// to the model as written, and everything else through delivery. What it
+/// skips is layout alone: delivery would collapse a run of blank lines and
+/// drop leading and trailing ones (§3.5 layout), nothing a model reads.
 ///
 /// The walk reads lines where [`parse`]'s top-level walk does: fenced code
 /// suspends all recognition, so a `MUST:` or a `<!--` in a code sample is
 /// content and no reason to deliver. Front matter and end matter are found
-/// as parse finds them, before the walk.
+/// as parse finds them, before the walk. A reference is found by the two
+/// functions delivery itself uses — the degradation and the resolution
+/// check's scan — so the gate cannot see fewer references than the pipeline
+/// acts on.
 pub fn needs_delivery(text: &str) -> bool {
     if front_matter_bounds(text).is_some()
         || !matches!(split_end_matter(text), Ok(s) if s.end_matter.is_none())
@@ -230,16 +238,31 @@ pub fn needs_delivery(text: &str) -> bool {
             || keyword_line(line).is_some()
             || reason_line(line).is_some()
             || alert_block_kind(line).is_some()
+            || has_inline_ref(line)
             || open_fence(line).is_some()
             || section_open(line).is_some()
-            || leaf_open(line).is_some_and(|lf| {
-                lf.sigil || lookup(&lf.kind).is_some_and(|k| k.disposition != Disposition::Prose)
-            })
+            // Any leaf of a registered kind: a prose one is rendered, and
+            // one that lacks the body its kind requires is refused.
+            || leaf_open(line).is_some_and(|lf| lf.sigil || lookup(&lf.kind).is_some())
         {
             return true;
         }
     }
     false
+}
+
+/// Whether a prose line holds an inline reference delivery acts on: one it
+/// degrades to its label ([`deliver::degrade_inline`] changes the line), or
+/// one of a registered kind, which the resolution check refuses when it
+/// dangles — inside a code span too, where degradation leaves it alone but
+/// [`check_inline_refs`] still reads it.
+fn has_inline_ref(line: &str) -> bool {
+    if !line.contains("[[") && !line.contains("](#") {
+        return false;
+    }
+    let mut refs = Vec::new();
+    scan_line_refs(line, &mut refs);
+    refs.iter().any(|(kind, _)| lookup(kind).is_some()) || deliver::degrade_inline(line) != line
 }
 
 impl Registry {
@@ -3429,8 +3452,9 @@ pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec
     fold(&doc, granted)
 }
 
-/// As [`extract`], with runtime FACTS for `when` selection (§5.2) — e.g. the
-/// consuming runtime's own `agent` name. The library itself assumes no facts.
+/// As [`extract`], with runtime FACTS for `when` selection (§5.2) — the
+/// context keys: `host` (the application), `model` (the model id) and
+/// `agent` (the model family). The library itself assumes no facts.
 pub fn extract_with_facts(
     text: &str,
     granted: &BTreeSet<String>,
@@ -7298,6 +7322,18 @@ steps:
             // End matter, well-formed and malformed (parse refuses that one).
             "Plain prose.\n\n---\nowner: me\n---\n",
             "Plain prose.\n\n---\nowner: [\n---\n",
+            // An inline reference: a wiki link, labelled or not, a fragment
+            // link to a registered kind, a wiki link of a kind no registry
+            // knows (degraded all the same), and a registered one in a code
+            // span (left as written, but refused when it dangles).
+            "Use [[skill/search]] now.\n",
+            "Ask [[human/lead|the lead]] before paging.\n",
+            "Ask [the lead](#human/lead) first.\n",
+            "Use [[foo/bar]] now.\n",
+            "Write `[[skill/search]]` to cite it.\n",
+            // A prose leaf of a registered kind: rendered, or refused when
+            // it lacks its body.
+            "Intro.\n\n::must\n",
         ] {
             assert!(needs_delivery(text), "{text:?} needs delivery");
         }
@@ -7311,6 +7347,10 @@ steps:
             "  MUST: indented is a quote of one\n",
             "Note: lower-case is prose.\n",
             "Inline <!-- html --> is prose.\n",
+            // Link shapes that are no reference: a heading anchor, a fragment
+            // naming no registered kind, brackets with no kind/name.
+            "See [the intro](#intro) and [docs](#foo/bar).\n",
+            "An [[aside]] in brackets.\n",
             // A thematic break that is not end matter.
             "Above.\n\n---\n\nBelow.\n",
             // Fenced code suspends recognition, notes and keywords included.
@@ -7320,16 +7360,17 @@ steps:
         }
     }
 
-    /// What needs_delivery sends through delivery, delivery changes: the gate
-    /// never routes prose through a pipeline that then hands it back as-is,
-    /// and never lets a construct through raw. Proven against `deliver`
-    /// itself, so the predicate cannot drift from what the pipeline touches.
+    /// For these texts, what needs_delivery sends through delivery, delivery
+    /// changes or refuses, and what it lets through raw, delivery would have
+    /// handed back byte for byte. The vendored corpus checks the second half
+    /// over every line of every conformance document (`tests/corpus.rs`).
     #[test]
     fn needs_delivery_agrees_with_what_delivery_changes() {
         for text in [
             "MUST[x] (if c): be kind\nBECAUSE: it matters\n",
             "Prose.\n<!-- the author's aside -->\nMore.\n",
             "Plain prose.\n\n---\nowner: me\n---\n",
+            "Use [[foo/bar]] now.\n",
         ] {
             assert!(needs_delivery(text));
             let delivered = extract_with_facts(text, &BTreeSet::new(), &BTreeMap::new())
@@ -7337,12 +7378,28 @@ steps:
                 .cleaned;
             assert_ne!(delivered, text, "delivery leaves {text:?} unchanged");
         }
+        // A dangling reference is not changed but refused: read raw, it
+        // would have failed open.
+        for text in [
+            "Ask [[human/lead|the lead]] before paging.\n",
+            "Ask [the lead](#human/lead) first.\n",
+        ] {
+            assert!(needs_delivery(text));
+            let refused = extract_with_facts(text, &BTreeSet::new(), &BTreeMap::new())
+                .err()
+                .unwrap_or_else(|| panic!("{text:?} delivered"));
+            assert!(
+                refused.iter().any(|r| r.code == "dangling-reference"),
+                "{refused:?}"
+            );
+        }
         // …and what it lets through raw, delivery would have handed back
         // byte for byte: skipping the pipeline loses nothing.
         for text in [
             "Be terse.\n",
             "You MUST: answer in English.\n\n```\nMUST: quoted\n<!-- x\n```\n",
             "Above.\n\n---\n\nBelow.\n",
+            "See [the intro](#intro) and [docs](#foo/bar).\n",
         ] {
             assert!(!needs_delivery(text));
             let delivered = extract_with_facts(text, &BTreeSet::new(), &BTreeMap::new())

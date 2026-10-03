@@ -1,4 +1,0 @@
-spec: "1"
-valid: true
-registers:
-  workflows: [renamed]

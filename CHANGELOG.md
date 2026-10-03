@@ -55,7 +55,14 @@ test that fails on the old code.
   trailing `---` block made end matter, the document's record rather than
   its text. Both are now refused as "introduced directive machinery", judged
   against the template's own delivered text, so a template that quotes a
-  `<!--` or ends in a `---` block of its own still spawns.
+  `<!--` or ends in a `---` block of its own still spawns. The machinery
+  check is judged the same way: it read the folded text a second time and
+  refused any spawn whose text did not parse again, but delivered text does
+  not always — a verbatim block quoting `MUST[y]` twice is a duplicate, and
+  an example quoting `[[must/x]]` dangles once delivery dropped the rule's
+  name — so such a template compiled at boot and could never spawn. A spawn
+  is now refused for machinery, or a refusal, the params added beyond the
+  template's own.
 - **A step's `servers:` is a cap.** With `security.policies` set, a tool a
   rule might touch was served through the supervisor's own connections and
   the step's plan still offered every server's tools, so a step held to
@@ -459,7 +466,10 @@ test that fails on the old code.
   it, so a document cannot choose what its own variants are decided by.
   `environment` and `locale` are not supplied. Subagent templates are now
   folded with the same facts, where they were folded with none, and so are
-  an OCI re-pull and a registry read.
+  an OCI re-pull and a registry read. A reload that changes only the model
+  reads a registry instruction again for the new facts; it kept the variants
+  chosen for the old model while turns went to the new one, and reported
+  the reload applied.
 - **Delivered text is never delivered twice.** Delivery is not idempotent: a
   second pass turns `plain` labels back into bold, a fence or keyword line
   quoted in an example into a live rule, and a quoted `<!--` into a note
@@ -473,21 +483,34 @@ test that fails on the old code.
     with no resolution, is delivered by agentd as before: the registry stamps
     `deliveredDigest` on every read, so the digest alone says nothing about
     who delivered. `instruction.loaded` for a resource read gains
-    `resolution`.
+    `resolution`. Under an `agent.instruction.trust` publisher pin a
+    resolved read verifies through its delivery attestation — its digest is
+    over the delivered bytes, and its manifest's authored digest is the one
+    the author signed — instead of comparing the author's digest with bytes
+    the author never wrote, which refused every pinned resolved read as a
+    digest mismatch. A pinned source with no `reader` cannot check a
+    delivery attestation, so a resolved read under it is refused by that
+    name: read it raw, or pin `reader`.
   - An instance-tier child's instruction is delivered once, by the parent.
     The parent writes the template's delivered prose, params folded in, into
     the child's config, and marks the child's environment with that prose's
     digest; the child uses its instruction as written only when it is an
     instance child and its instruction is exactly that text. The mark is
-    internal: no config path or `AGENTD_` alias reads it.
+    internal: no config path or `AGENTD_` alias reads it. The parent's own
+    check of the composed config before the spawn no longer delivers that
+    prose either; it refused templates the child would have used as
+    written. A child respawned after the parent's restart is told the same,
+    from the composed config it reads.
 - **A document with no fence is delivered when it has anything delivery
   touches, so it can now be refused where it used to load raw.** agentd ran
   delivery only on text with a block in it, so a fence-free document of
   keyword lines, author notes or end matter reached the model as written:
   `MUST[x] (if c):` and `BECAUSE:` unrendered, and the notes and the record
   that S9 and S27 say are never delivered, delivered. The gate is now
-  anything delivery renders or removes: a block, a keyword, alert or reason
-  line, a column-0 author note, front matter at line 1, or end matter. It
+  anything delivery renders, removes or refuses: a block (a leaf of a
+  registered kind included), a keyword, alert or reason line, an inline
+  `[[kind/name]]` or `[Label](#kind/name)` reference, a column-0 author
+  note, front matter at line 1, or end matter. It
   applies to the agent's instruction at load, an OCI re-pull and a registry
   read alike (a registry's resolved read and an instance child's
   parent-delivered instruction are still used as served). Plain prose with
@@ -498,14 +521,18 @@ test that fails on the old code.
 - **A `dir:` source drops each file's end matter, and `agent.prompt` drops
   end matter from every source.** End matter is a document's record, and
   only the last thing in a document is end matter, so in a combined folder
-  every file's record but the last sat mid-text as prose. Each file's is now
-  split off before the files are joined, without a warning; malformed end
-  matter refuses the source, naming the file (`… dir <dir>: <file>: end
-  matter is not valid YAML: …`). This covers the agent's instruction, a
-  subagent template's and `agent.prompt`'s `dir:`. A pinned folder's
-  per-file signatures are still checked over each file's full bytes. A
-  prompt from `file:`, `url:`, `oci:`, `text:` or a literal now loses its
-  end matter too (a `dir:` prompt lost it per file); malformed end matter
+  every file's record but the last sat mid-text as prose. Each file's but
+  the last is now split off before the files are joined, without a
+  warning; the last file's ends the combined document and is read there as
+  the same file's is read alone, so a `---` block that is body just before
+  it stays body. Malformed end matter in any file refuses the source,
+  naming the file (`… dir <dir>: <file>: end matter is not valid YAML:
+  …`). This covers the agent's instruction, a subagent template's and
+  `agent.prompt`'s `dir:`. A pinned folder's per-file signatures are still
+  checked over each file's full bytes. A prompt from any source, `text:`
+  and a literal included, now loses its end matter too, with a warning
+  naming `agent.prompt` and the lines dropped, since a task typed at a
+  terminal can end in a `---` block meant as text; malformed end matter
   refuses with `agent.prompt: end matter is not valid YAML: …`. Nothing else
   in a prompt is processed: it is the task, not an instruction document.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
@@ -572,9 +599,13 @@ unwrapped: a block the registry knows is never dropped from the delivered
 text while the load reports success.
 
 `doc::contains_blocks` is replaced by `doc::needs_delivery`, which is true
-for anything §3.5 delivery renders or removes — a block, a keyword, alert or
-reason line, a column-0 author note, front matter or end matter — and false
-for plain prose, which delivery would hand back unchanged.
+for anything §3.5 delivery renders, removes or refuses — a block (a leaf of a
+registered kind included), a keyword, alert or reason line, an inline
+reference, a column-0 author note, front matter or end matter — and false
+for plain prose, which delivery would hand back unchanged up to layout (a
+run of blank lines collapsed, leading and trailing ones dropped). The
+conformance runner checks that over every line and every document of the
+vendored corpus.
 
 Instruction refusals carry their Appendix B code; config.invalid text is
 unchanged. agentd-instruction's `Refusal` is now `{line, code, message}`

@@ -1,6 +1,0 @@
-# Reserved-bare guard (SPEC.md §3.2 rule 3): a bare kind shadowing a machinery
-# name fails CLOSED and names the sigiled spelling. Without it, a forgotten
-# sigil demotes configuration to prose one keystroke from correct.
-spec: "1"
-valid: false
-errors: ["shadows a machinery name", ":::!workflow"]

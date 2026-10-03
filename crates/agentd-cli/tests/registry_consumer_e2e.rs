@@ -330,12 +330,18 @@ fn an_unsigned_read_under_a_pinned_publisher_is_refused() {
 /// model received. A followed resource keeps the daemon from idling, so it is
 /// stopped once the run is done (or it exits on its own).
 fn run_echo(instruction: &str) -> String {
+    run_echo_as(instruction, "mock")
+}
+
+/// [`run_echo`] with the operator's `intelligence.model` — the model the
+/// instruction's variants are chosen for.
+fn run_echo_as(instruction: &str, model: &str) -> String {
     let mock = common::spawn_mock_mcp("mock://watched", false);
     let cfg = json!({
         "agent": {"name": "reg-resolved", "preflight": "never",
                   "instruction": {"mcp": instruction}},
         "mcp": {"servers": [{"name": "registry", "endpoint": format!("{}/mcp", mock.uri())}]},
-        "intelligence": {"endpoints": "mock:echo-system", "model": "mock"},
+        "intelligence": {"endpoints": "mock:echo-system", "model": model},
         "context": {"template": "{{instruction}}"},
         "store": {"kind": "memory"},
         "observability": {"log_level": "info", "log_content": true},
@@ -431,4 +437,74 @@ fn a_resolved_read_under_another_digest_is_refused() {
         "the refusal names the mismatch:\n{}",
         r.log
     );
+}
+
+/// A registry read is folded with the operator's facts where the read
+/// happens, at run time: the `agent` family of the model its turns use and
+/// `host=agentd`. So the claude variant is the one the model reads, the gpt
+/// one is not, and the variant for any host but agentd is dropped.
+#[test]
+fn a_registry_reads_variants_are_chosen_by_the_operators_model() {
+    let log = run_echo_as("instruction://ins_mock@variants", "claude-sonnet-4-5");
+    let done = event(&log, "run.done").unwrap_or_else(|| panic!("no run.done:\n{log}"));
+    let out = done["output"].as_str().unwrap_or_default();
+    assert!(out.contains("Answer as the claude variant."), "{log}");
+    assert!(!out.contains("gpt variant"), "{out}");
+    assert!(!out.contains("host other than agentd"), "{out}");
+}
+
+/// A resolved read is the registry's delivered text, which the author never
+/// signed: under a pinned publisher it verifies through the delivery
+/// attestation — its digest over these bytes, its manifest chained to the
+/// author's signature over the authored document — not by comparing the
+/// author's digest with bytes that were never authored.
+#[test]
+fn a_pinned_resolved_read_verifies_through_its_delivery_attestation() {
+    let key = publisher_key_file();
+    let r = boot(
+        "instruction://ins_mock@stable?resolved=1",
+        json!([{
+            "uri": "instruction://ins_mock@stable",
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+            "reader": "agent://mock-reader",
+            "max_capabilities": ["compute"],
+        }]),
+    );
+    let v = event(&r.log, "instruction.verified")
+        .unwrap_or_else(|| panic!("no verification:\n{}", r.log));
+    assert_eq!(v["delivery_checked"], true, "{v}");
+    let loaded = event(&r.log, "instruction.loaded")
+        .unwrap_or_else(|| panic!("no instruction.loaded:\n{}", r.log));
+    assert_eq!(loaded["resolution"], "resolved", "{loaded}");
+    assert!(
+        r.log.contains("proc.ready"),
+        "startup completed:\n{}",
+        r.log
+    );
+    let _ = std::fs::remove_file(&key);
+}
+
+/// …and without a `reader`, nothing binds the delivered bytes to what the
+/// author signed: the read is refused by that name, not as a digest
+/// mismatch it is not.
+#[test]
+fn a_pinned_resolved_read_without_a_reader_is_refused_by_name() {
+    let key = publisher_key_file();
+    let r = boot(
+        "instruction://ins_mock@stable?resolved=1",
+        json!([{
+            "uri": "instruction://ins_mock@stable",
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+        }]),
+    );
+    assert!(!r.log.contains("proc.ready"), "must not start:\n{}", r.log);
+    assert!(
+        r.log
+            .contains("a resolved read is the registry's delivered text"),
+        "the refusal names the resolved read:\n{}",
+        r.log
+    );
+    let _ = std::fs::remove_file(&key);
 }

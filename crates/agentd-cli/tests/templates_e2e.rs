@@ -248,6 +248,70 @@ fn an_instance_childs_instruction_is_delivered_once_by_the_parent() {
     );
 }
 
+/// Delivered text does not always read a second time: a verbatim block
+/// quoting `MUST[y]` twice is a duplicate to a second parse, and an example
+/// quoting `[[must/x]]` dangles once delivery dropped the rule's name. Such a
+/// template compiles at boot, so its spawns go through — the param guard and
+/// the parent's check of the composed config judge what the PARAMS added,
+/// and deliver nothing a second time. A `${HOME}` it quotes reaches the
+/// child's model as written: the child's loader substitutes every string,
+/// and an expanded copy would no longer be the text the parent delivered.
+#[cfg(feature = "a2a")]
+#[test]
+fn an_instance_template_whose_delivered_text_does_not_reread_spawns() {
+    let (code, log) = run_cfg(
+        "agent: { name: parent }\nstore: { kind: memory }\n\
+         intelligence: { endpoints: \"mock:echo-system\", model: mock }\n\
+         lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
+         observability: { log_level: info, log_content: true }\n\
+         subagents:\n\
+        \x20 templates:\n\
+        \x20   scribe:\n\
+        \x20     instruction: |\n\
+        \x20       MUST[x]: answer for {{params.id}} from $${HOME}.\n\
+        \n\
+        \x20       :::example\n\
+        \x20       See [[must/x]].\n\
+        \x20       :::\n\
+        \n\
+        \x20       :::verbatim\n\
+        \x20       MUST[y]: a\n\
+        \x20       MUST[y]: b\n\
+        \x20       :::\n\
+        \n\
+        \x20       :::!workflow{name=on-ask}\n\
+        \x20       steps:\n\
+        \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
+        \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
+        \x20         f:   { kind: finish, depends_on: [a], status: completed, output: \"{{steps.a.output}}\" }\n\
+        \x20       :::\n\
+        \x20     params: { id: { type: string, required: true } }\n\
+        \x20     ttl: 4s\n\
+         workflows:\n  - name: caller\n    steps:\n\
+        \x20     s:     { kind: once }\n\
+        \x20     spawn: { kind: subagent, template: scribe, params: { id: inc-7 }, depends_on: [s] }\n\
+        \x20     ask:   { kind: a2a.delegate, depends_on: [spawn], peer: \"{{steps.spawn.output.peer}}\", command: scribe.ask, args: {}, timeout: 30s, retry: { max: 6, backoff: 1s } }\n\
+        \x20     nap:   { kind: sleep, depends_on: [ask], duration: 5s }\n\
+        \x20     f:     { kind: finish, depends_on: [nap], status: completed, output: \"{{steps.ask.output}}\" }\n",
+    );
+    assert_eq!(code, Some(0), "{log}");
+    let done = events(&log, "run.done");
+    let caller: Vec<&Value> = done.iter().filter(|e| e["workflow"] == "caller").collect();
+    assert_eq!(caller.len(), 1, "{log}");
+    assert_eq!(caller[0]["status"], "completed", "{log}");
+    let prompt = caller[0]["output"].as_str().unwrap_or("");
+    for quoted in [
+        "**MUST:** answer for inc-7 from ${HOME}.\n",
+        "See [[must/x]].",
+        "MUST[y]: a\nMUST[y]: b",
+    ] {
+        assert!(
+            prompt.contains(quoted),
+            "{quoted:?} did not reach the child's model as delivered:\n{prompt}\n{log}"
+        );
+    }
+}
+
 #[cfg(feature = "a2a")]
 #[test]
 fn a_singleton_instance_refuses_a_second_live_spawn() {
@@ -367,5 +431,117 @@ fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
         code,
         Some(2),
         "a listener-defining template refuses BOOT:\n{log}"
+    );
+}
+
+/// A durable instance child outlives its parent's restart: the restored
+/// record respawns it on its composed config, and the respawned child is
+/// told, as the first one was, that the parent delivered its instruction —
+/// from that config, the one copy of the prose the child reads. Delivered
+/// a second time, the `plain` label below would turn bold.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_respawned_instance_child_is_delivered_once_too() {
+    use std::time::{Duration, Instant};
+    let dir = common::unique_path("tpl-respawn", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let template = "subagents:\n\
+        \x20 templates:\n\
+        \x20   scribe:\n\
+        \x20     instruction: |\n\
+        \x20       ---\n\
+        \x20       spec: \"1\"\n\
+        \x20       delivery: {labels: plain}\n\
+        \x20       ---\n\
+        \x20       MUST: answer for {{params.id}}.\n\
+        \n\
+        \x20       :::!workflow{name=on-ask}\n\
+        \x20       steps:\n\
+        \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
+        \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
+        \x20         f:   { kind: finish, depends_on: [a], status: completed, output: \"{{steps.a.output}}\" }\n\
+        \x20       :::\n\
+        \x20     params: { id: { type: string, required: true } }\n\
+        \x20     ttl: 12s\n";
+    let head = format!(
+        "agent: {{ name: parent }}\nstore: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+         intelligence: {{ endpoints: \"mock:echo-system\", model: mock }}\n\
+         observability: {{ log_level: info, log_content: true }}\n{template}"
+    );
+    // The first life spawns the child and is killed with it running.
+    let first = format!(
+        "{head}lifecycle: {{ run_until: drained }}\n\
+         workflows:\n  - name: caller\n    steps:\n\
+        \x20     s:     {{ kind: once }}\n\
+        \x20     spawn: {{ kind: subagent, template: scribe, params: {{ id: inc-7 }}, depends_on: [s] }}\n\
+        \x20     nap:   {{ kind: sleep, depends_on: [spawn], duration: 6s }}\n\
+        \x20     f:     {{ kind: finish, depends_on: [nap], status: completed }}\n"
+    );
+    std::fs::write(format!("{dir}/first.yaml"), first).unwrap();
+    let log1 = format!("{dir}/first.log");
+    let mut p1 = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &format!("{dir}/first.yaml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log1).unwrap())
+        .spawn()
+        .unwrap();
+    // Killed once the spawn step is done and its record persisted, with
+    // the run still napping.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let child_pid = loop {
+        let log = std::fs::read_to_string(&log1).unwrap_or_default();
+        let spawned = events(&log, "step.done")
+            .iter()
+            .any(|e| e["step"] == "spawn" && e["status"] == "done");
+        if let Some(pid) = events(&log, "instance.spawn")
+            .first()
+            .and_then(|e| e["pid"].as_i64())
+            .filter(|_| spawned)
+        {
+            break pid as i32;
+        }
+        assert!(Instant::now() < deadline, "no spawn:\n{log}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    unsafe { libc::kill(p1.id() as i32, libc::SIGKILL) };
+    let _ = p1.wait();
+    // PDEATHSIG takes the child down with its parent.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { libc::kill(child_pid, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the child outlived its parent");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The second life respawns it and asks it by its handle.
+    let second = format!(
+        "{head}lifecycle: {{ run_until: idle, idle_grace: 1500ms }}\n\
+         workflows:\n  - name: asker\n    steps:\n\
+        \x20     s:   {{ kind: once }}\n\
+        \x20     ask: {{ kind: a2a.delegate, depends_on: [s], peer: inst-1, command: scribe.ask, args: {{}}, timeout: 30s, retry: {{ max: 6, backoff: 1s }} }}\n\
+        \x20     f:   {{ kind: finish, depends_on: [ask], status: completed, output: \"{{{{steps.ask.output}}}}\" }}\n"
+    );
+    std::fs::write(format!("{dir}/second.yaml"), second).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &format!("{dir}/second.yaml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run");
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0), "{log}");
+    assert!(
+        !events(&log, "instance.respawn").is_empty(),
+        "the child was not respawned:\n{log}"
+    );
+    let done = events(&log, "run.done");
+    let asker: Vec<&Value> = done.iter().filter(|e| e["workflow"] == "asker").collect();
+    assert_eq!(asker.len(), 1, "{log}");
+    assert_eq!(asker[0]["status"], "completed", "{log}");
+    let prompt = asker[0]["output"].as_str().unwrap_or("");
+    assert!(
+        prompt.contains("MUST: answer for inc-7.\n") && !prompt.contains("**MUST:**"),
+        "the respawned child delivered its instruction a second time:\n{prompt}"
     );
 }

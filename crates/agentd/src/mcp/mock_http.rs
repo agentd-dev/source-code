@@ -806,6 +806,11 @@ const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---
 /// purpose, so only a consumer whose delivery gate sees front and end matter
 /// strips the record; one that reads it raw delivers a new text per read.
 const REGISTRY_DOC_PROSE: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, in prose.\n";
+/// The document `@variants` serves: one variant per model family (§5.2's
+/// `agent` key) and one for any host but agentd, so what a consumer delivers
+/// shows which facts it chose them by — its operator's model, read where the
+/// read happens, or none at all.
+pub const REGISTRY_DOC_VARIANTS: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\n:::when{agent=\"claude\"}\nAnswer as the claude variant.\n:::\n\n:::when{agent=\"gpt\"}\nAnswer as the gpt variant, at somewhat greater length.\n:::\n\n:::unless{host=\"agentd\"}\nAnswer as a host other than agentd.\n:::\n";
 /// How many times `@endmatter` has been read: the counter its end matter and
 /// versionId carry. Per mock process, which is per test.
 static END_MATTER_READS: AtomicU64 = AtomicU64::new(0);
@@ -866,7 +871,10 @@ fn registry_contents(uri: &str) -> serde_json::Value {
     let narrow = base.ends_with("@narrow");
     let end_matter = base.ends_with("@endmatter");
     let mut text = (if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC }).to_string();
-    let version_id = if end_matter {
+    let version_id = if base.ends_with("@variants") {
+        text = REGISTRY_DOC_VARIANTS.to_string();
+        "ver_mock_variants".to_string()
+    } else if end_matter {
         let n = END_MATTER_READS.fetch_add(1, Ordering::SeqCst) + 1;
         text = format!("{REGISTRY_DOC_PROSE}\n---\nreviewed: {n}\n---\n");
         format!("ver_mock_em_{n}")
@@ -910,8 +918,22 @@ fn registry_contents(uri: &str) -> serde_json::Value {
             instruction_core::digest(REGISTRY_RESOLVED_TEXT.as_bytes())
         };
         meta["md.instruction/deliveredDigest"] = json!(delivered);
-        // Unsigned: an author signature covers the AUTHORED text, and these
-        // bytes are not it.
+        // Signed as a registry signs a resolved read: the author signature
+        // covers the AUTHORED document, which these bytes are not, and the
+        // delivery attestation covers these bytes and chains to it through
+        // the authored document's manifest.
+        if let Some((author, delivery)) = mock_signatures_over(
+            text,
+            REGISTRY_RESOLVED_TEXT,
+            version_id,
+            MOCK_CAPABILITIES,
+            1,
+        ) {
+            meta["md.instruction/signature"] = json!(author);
+            meta["md.instruction/deliverySignature"] = json!(delivery);
+            meta["md.instruction/kid"] = json!(MOCK_PUBLISHER_KID);
+            meta["md.instruction/signatureKeyState"] = json!("active");
+        }
         return json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction",
             "text": REGISTRY_RESOLVED_TEXT, "_meta": meta}]});
     }
@@ -983,8 +1005,22 @@ fn mock_signatures(
     delivery_caps: &[&str],
     iat: u64,
 ) -> Option<(String, String)> {
+    mock_signatures_over(text, text, version_id, delivery_caps, iat)
+}
+
+/// [`mock_signatures`] for a read whose bytes are `delivered` — the
+/// registry's own delivery of the `authored` document, for a resolved read —
+/// rather than the authored text itself.
+#[cfg(feature = "sign")]
+fn mock_signatures_over(
+    text: &str,
+    delivered: &str,
+    version_id: &str,
+    delivery_caps: &[&str],
+    iat: u64,
+) -> Option<(String, String)> {
     use crate::config::attest::{Claims, sign_kid};
-    let digest = instruction_core::digest(text.as_bytes());
+    let digest = instruction_core::digest(delivered.as_bytes());
     let author = Claims {
         spec: crate::config::attest::SPEC_CLAIM.into(),
         typ: "author".into(),
@@ -1038,5 +1074,15 @@ fn mock_manifest(text: &str) -> Option<instruction_core::Manifest> {
 }
 #[cfg(not(feature = "sign"))]
 fn mock_signatures(_text: &str, _v: &str, _caps: &[&str], _iat: u64) -> Option<(String, String)> {
+    None
+}
+#[cfg(not(feature = "sign"))]
+fn mock_signatures_over(
+    _text: &str,
+    _delivered: &str,
+    _v: &str,
+    _caps: &[&str],
+    _iat: u64,
+) -> Option<(String, String)> {
     None
 }

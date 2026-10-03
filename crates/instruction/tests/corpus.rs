@@ -626,6 +626,81 @@ fn the_advisory_codes_are_appendix_c_when_present() {
     );
 }
 
+/// The delivery gate (`doc::needs_delivery`) against delivery itself, over
+/// every line of every vendored document and every whole document: what the
+/// gate lets through raw, delivery would have handed back unchanged — up to
+/// layout, which the gate's own contract leaves out — and never refused. A
+/// construct the gate cannot see is a construct that reaches a model raw, or
+/// a refusal that fails open; the corpus is where the spec's authors put
+/// every construct they define, so it finds one a hand-picked list misses.
+#[test]
+fn what_the_delivery_gate_passes_raw_delivery_leaves_alone() {
+    use instruction_core::doc::{all_families, extract_with_facts, needs_delivery};
+    // The §3.5 layout delivery applies to any text: runs of blank lines
+    // collapse to one, leading and trailing ones go, one final newline.
+    fn layout(text: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        for l in text.split('\n') {
+            if l.trim().is_empty() && out.last().is_none_or(|p| p.is_empty()) {
+                continue;
+            }
+            out.push(if l.trim().is_empty() { "" } else { l });
+        }
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+        if out.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", out.join("\n"))
+        }
+    }
+    let grants = all_families();
+    let mut texts: Vec<(String, String)> = Vec::new();
+    let mut ledger = Ledger::default();
+    for suite in SUITES {
+        for dir in cases(suite, &mut ledger) {
+            let Ok(doc) = std::fs::read_to_string(dir.join("doc.md")) else {
+                continue;
+            };
+            let at = format!("{suite}/{}", case_name(&dir));
+            for (i, line) in doc.lines().enumerate() {
+                texts.push((format!("{at}:{}", i + 1), format!("{line}\n")));
+            }
+            texts.push((at, doc));
+        }
+    }
+    let mut failures = Vec::new();
+    let mut raw = 0;
+    for (at, text) in &texts {
+        if needs_delivery(text) {
+            continue;
+        }
+        raw += 1;
+        match extract_with_facts(text, &grants, &BTreeMap::new()) {
+            Ok(ex) if ex.cleaned == layout(text) => {}
+            Ok(ex) => failures.push(format!(
+                "{at}: passed raw, but delivery changes {text:?} to {:?}",
+                ex.cleaned
+            )),
+            Err(errs) => failures.push(format!(
+                "{at}: passed raw, but delivery refuses {text:?}: {}",
+                refused(&errs)
+            )),
+        }
+    }
+    assert!(
+        raw > 0,
+        "no text passed the gate raw — the check checked nothing"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {raw} raw texts disagree with delivery:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 // ── The runner's own rules, judged on synthetic outcomes ────────────────────
 // The live fixtures exercise none of these conditions today (every artifact
 // passes, no stray file is vendored), so each rule is held here instead — a

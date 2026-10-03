@@ -207,3 +207,47 @@ fn malformed_end_matter_refuses_the_folder_naming_the_file() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A folder reads the way the same files read alone. A `---` block that is
+/// body in the last file — its real end matter follows it — stays body in
+/// the folder too: the combined document ends in that file's own end matter,
+/// so only that is dropped, where splitting it off first made the body block
+/// the folder's last and dropped it as end matter.
+#[test]
+fn a_body_block_before_the_last_files_end_matter_stays_text() {
+    const LAST: &str = "Second file, with a sample record:\n\n---\nkind: sample\n---\n\n---\nowner: team-two\n---\n";
+    let dir = common::unique_path("instr-folder-framed", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(format!("{dir}/10-a.md"), "First file.\n").unwrap();
+    std::fs::write(format!("{dir}/20-b.md"), LAST).unwrap();
+    let file = common::unique_path("instr-file-framed", "md");
+    std::fs::write(&file, LAST).unwrap();
+    let instruction_of = |source: &str| {
+        let (loaded, _) = agentd::config::settings::load(
+            &[
+                "--instruction".to_string(),
+                source.to_string(),
+                "--model".to_string(),
+                "mock".to_string(),
+            ],
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{source} did not load: {e:?}"));
+        loaded.settings.agent.instruction.expect("an instruction")
+    };
+    for (what, instruction) in [
+        ("folder", instruction_of(&dir)),
+        ("file", instruction_of(&file)),
+    ] {
+        assert!(
+            instruction.contains("---\nkind: sample\n---"),
+            "the {what} dropped the body block:\n{instruction}"
+        );
+        assert!(
+            !instruction.contains("team-two"),
+            "the {what} delivered its end matter:\n{instruction}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&file);
+}

@@ -16,8 +16,9 @@ run by `crates/instruction/tests/corpus.rs`.
 - `001`–`018` were copied from the specification repository's `core/`
   directory before upstream deleted it at `21fca67` (the corpus and its runner
   were removed there: they belong with an implementation, not with the text).
-  agentd owns them now. The `*.expected.yaml` beside them are the upstream
-  originals the JSON was derived from; the runner reads only the JSON.
+  agentd owns them now, as JSON expectations alone: the upstream YAML
+  originals they were derived from are gone, and so is the dialect key every
+  fixture carried, since nothing read either.
 - `019`–`022` are agentd-authored probes of the §4 forms against agentd's
   real config: a leaf-form `!mcp` (a document with no `:::` line at all, which
   the loader must still recognize), a table set, a section-form `!workflow`,

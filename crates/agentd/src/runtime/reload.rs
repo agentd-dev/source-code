@@ -557,6 +557,24 @@ impl Runtime {
                 Some(t) => StagedInstruction::Text(t),
                 None => StagedInstruction::Text(String::new()),
             })
+        } else if let Some(t) = new.agent.instruction.as_deref()
+            && self.instruction.source == "resource"
+            && cfg::looks_like_resource_uri(t)
+            && old.agent.instruction_facts != new.agent.instruction_facts
+        {
+            // The instruction is unchanged, but the facts its variants are
+            // chosen by are not: the model moved, and with it the `agent`
+            // family a `:::when{agent=…}` names. A static or `oci:` text is
+            // folded again by the new load; a resource one is read again
+            // here (with the new settings' facts: they are the running ones
+            // while a reload is staged), or the running text would keep the
+            // variants chosen for the old model while turns go to the new
+            // one, and the reload report the new model as applied.
+            let (server, res) = super::instruction_resource(t);
+            Some(StagedInstruction::Reread(
+                self.fetch_instruction_mcp(conns, server, res)
+                    .map_err(|e| vec![format!("agent.instruction {t}: {e}")])?,
+            ))
         } else if let Some(m) = mcp
             && let Some(t) = new.agent.instruction.as_deref()
             && self.instruction.source == "resource"

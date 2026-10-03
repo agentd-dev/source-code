@@ -587,28 +587,54 @@ pub fn fold_params_value(v: &mut Value, params: &Map<String, Value>) {
     }
 }
 
-/// The spawn guard that keeps params data: after folding, the prose must still
-/// contain no directives — the template's own were replaced by one-line notes
-/// at boot, so any fence found now can only have come from a param value.
-/// Returns `true` when the spawn must be refused.
+/// The spawn guard that keeps params data: after folding, the prose must
+/// carry no directive the template's own delivered text did not — the
+/// template's directives were replaced by one-line notes at boot, so one
+/// found now can only have come from a param value. Returns `true` when the
+/// spawn must be refused.
 ///
-/// Machinery is not the only thing a value can smuggle in. A column-0 `<!--`
-/// opens an author note, and an unclosed one runs to the end of the text and
-/// is never refused — every operator rule after the param would vanish from
-/// what the model reads. A trailing `---` block is end matter, the document's
-/// record rather than its text. Either is judged against `template_delivered`,
-/// the template's own delivered text: a template may quote both itself, and
-/// only one the params ADDED refuses the spawn.
+/// Everything is judged against `template_delivered`, the template's own
+/// delivered text, because delivery is not idempotent: read a second time,
+/// delivered text can carry machinery-shaped lines a verbatim block quoted,
+/// or refuse outright (a `MUST[y]` quoted twice is a duplicate; a quoted
+/// `[[must/x]]` dangles once delivery dropped the rule's name). Judging the
+/// folded text alone refused every spawn of such a template, plain params
+/// and none alike. So only what the params ADDED refuses: machinery beyond
+/// the template's, a refusal it did not have, a column-0 `<!--` (an author
+/// note — an unclosed one runs to the end of the text and is never refused,
+/// so every operator rule after the param would vanish from what the model
+/// reads), or end matter (the document's record rather than its text).
 pub fn params_introduced_machinery(template_delivered: &str, folded_prose: &str) -> bool {
-    let machinery = match idoc::extract(folded_prose, &idoc::all_families()) {
-        Ok(ex) => !ex.config.is_empty() || !ex.workflows.is_empty() || !ex.skills.is_empty(),
-        // Even a MALFORMED fence appearing post-fold is machinery-shaped input
-        // where only prose can be: refuse.
-        Err(_) => true,
-    };
-    machinery
+    machinery_added(template_delivered, folded_prose)
         || note_openers(folded_prose) > note_openers(template_delivered)
         || (has_end_matter(folded_prose) && !has_end_matter(template_delivered))
+}
+
+/// What a second extraction reads in `text`: its machinery counts (config
+/// keys, workflows, skills), or the codes of what it refuses.
+fn reread(text: &str) -> Result<[usize; 3], Vec<&'static str>> {
+    idoc::extract(text, &idoc::all_families())
+        .map(|ex| [ex.config.len(), ex.workflows.len(), ex.skills.len()])
+        .map_err(|errs| errs.iter().map(|r| r.code).collect())
+}
+
+/// Whether the folded text reads, a second time, as more than the template's
+/// own delivered text does: more machinery, a refusal where the template had
+/// none — even a MALFORMED fence appearing post-fold is machinery-shaped
+/// input where only prose can be — or a refusal the template's own did not
+/// include. A template whose delivered text refuses already is held to its
+/// codes: a value adding a well-formed fence to it adds no refusal, but
+/// nothing reads that text a second time — the flat tier hands it to the
+/// model and an instance child is told the parent delivered it.
+fn machinery_added(template_delivered: &str, folded_prose: &str) -> bool {
+    match (reread(template_delivered), reread(folded_prose)) {
+        (Ok(had), Ok(got)) => got.iter().zip(had).any(|(g, h)| *g > h),
+        (Err(_), Ok(got)) => got.iter().any(|g| *g > 0),
+        (Ok(_), Err(_)) => true,
+        (Err(had), Err(got)) => got.iter().any(|c| {
+            got.iter().filter(|g| *g == c).count() > had.iter().filter(|h| *h == c).count()
+        }),
+    }
 }
 
 /// The lines that open an author note: `<!--` at column 0 (§3.3 rule 11).
@@ -928,6 +954,45 @@ mod tests {
         ));
         let ends = "Body.\n\n---\nk: v\n---\n";
         assert!(!params_introduced_machinery(ends, ends));
+    }
+
+    /// Delivery is not idempotent, so a template's delivered text can refuse
+    /// when read a second time: a rule quoted twice in a verbatim block is a
+    /// duplicate, and a reference quoted in an example dangles once delivery
+    /// dropped the rule's name. Such a template compiles at boot and spawns
+    /// with plain params; only what a value ADDS refuses it.
+    #[test]
+    fn a_template_whose_delivered_text_does_not_reread_spawns_with_plain_params() {
+        let s = settings_with(concat!(
+            "    quoter:\n      instruction: \"MUST[x]: answer for {{params.who}}.\\n\\n",
+            ":::example\\nSee [[must/x]].\\n:::\\n\\n",
+            ":::verbatim\\nMUST[y]: a\\nMUST[y]: b\\n:::\\n\"\n",
+            "      params: { who: { type: string } }\n",
+        ));
+        let c = compile_templates(&s).unwrap();
+        let delivered = &c["quoter"].cleaned;
+        assert!(
+            idoc::extract(delivered, &idoc::all_families()).is_err(),
+            "the delivered text refuses a second read: {delivered}"
+        );
+        let with = |v: &str| {
+            let mut p = Map::new();
+            p.insert("who".into(), json!(v));
+            fold_params(delivered, &p)
+        };
+        assert!(!params_introduced_machinery(delivered, &with("ops")));
+        // A value that adds a refusal of its own is still refused: here a
+        // reference the template does not define…
+        assert!(params_introduced_machinery(
+            delivered,
+            &with("ops, per [[skill/nope]]")
+        ));
+        // …and, in a template that re-reads cleanly, one that adds a
+        // malformed fence.
+        let clean = "Investigate for {{params.who}}.\n";
+        let mut p = Map::new();
+        p.insert("who".into(), json!("ops\n:::!mcp{name=evil}\n"));
+        assert!(params_introduced_machinery(clean, &fold_params(clean, &p)));
     }
 
     /// A template is folded with the ROOT's facts — the operator's model and

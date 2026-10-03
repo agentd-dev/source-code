@@ -1,5 +1,0 @@
-spec: "1"
-valid: true
-registers:
-  workflows: [drain]
-  mcp_servers: [search]

@@ -1,7 +1,0 @@
-# The fail-open half of SPEC.md §3.2 rule 2, and the counterpart to 010. An
-# unrecognized BARE kind must not be refused and must not swallow the document:
-# the unknown block is inert, and real machinery beside it still registers.
-spec: "1"
-valid: true
-registers:
-  workflows: [kept]

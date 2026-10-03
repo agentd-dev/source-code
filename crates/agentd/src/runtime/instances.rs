@@ -179,7 +179,7 @@ impl Runtime {
         };
         // The composed document must be a bootable config NOW — a child that
         // exits 2 on its first breath is a refusal we can make synchronously.
-        if let Err(e) = validate_composed(&doc) {
+        if let Err(e) = validate_composed(&doc, &prose) {
             return err(format!(
                 "subagent.run: template '{tname}' composes an invalid config: {e}"
             ));
@@ -623,32 +623,29 @@ impl Runtime {
     /// the child's identity and its state is durable, so the respawned daemon
     /// picks up where the dead one stopped.
     pub(crate) fn respawn_restored_instances(&mut self) {
-        // The record keeps the prose the composed config was written with,
-        // so a respawned child is told it was delivered exactly as the first
-        // one was.
-        let candidates: Vec<(String, String, Option<Value>, String)> = self
+        let candidates: Vec<(String, String, Option<Value>)> = self
             .subagents
             .values()
             .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
-            .filter_map(|s| {
-                s.config_path
-                    .clone()
-                    .map(|c| (s.handle.clone(), c, None, s.instruction.clone()))
-            })
+            .filter_map(|s| s.config_path.clone().map(|c| (s.handle.clone(), c, None)))
             .collect();
-        for (handle, config, limits, delivered) in candidates {
+        for (handle, config, limits) in candidates {
             let path = PathBuf::from(&config);
             let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
                 continue;
             };
-            if !path.exists() {
+            // The respawned child is told it was delivered exactly as the
+            // first one was, from the composed config it is about to read —
+            // the one copy of that prose the child's digest check compares,
+            // so no other record of it can drift from what the child sees.
+            let Some(delivered) = delivered_prose_of(&path) else {
                 if let Some(s) = self.subagents.get_mut(&handle) {
                     s.status = "failed".into();
                     s.error = Some("config lost across restart".into());
                 }
                 self.persist_subagent(&handle);
                 continue;
-            }
+            };
             match self.spawn_instance_process(&path, &dir, &limits, &delivered) {
                 Ok(pid) => {
                     if let Some(s) = self.subagents.get_mut(&handle) {
@@ -1126,11 +1123,23 @@ fn instance_socket_path(dir: &std::path::Path, handle: &str) -> String {
     }
 }
 
+/// The delivered prose a composed config file carries, as the child's loader
+/// reads it — `agent.instruction` is the one string its `${VAR}`
+/// substitution leaves alone, so the file's text is the child's text; `None`
+/// when the file is gone or is not a composed config.
+fn delivered_prose_of(config: &std::path::Path) -> Option<String> {
+    let doc: Value = serde_json::from_slice(&std::fs::read(config).ok()?).ok()?;
+    Some(doc.get("agent")?.get("instruction")?.as_str()?.to_string())
+}
+
 /// Boot the composed document through the same typing + resolution +
-/// validation a config file gets. Errors are the aggregate report.
-fn validate_composed(doc: &Value) -> Result<(), String> {
-    let mut settings = crate::config::settings::Settings::from_document(doc.clone(), "template")
-        .map_err(|e| e.to_string())?;
+/// validation a config file gets. Errors are the aggregate report. `prose`
+/// is the instruction the composed document carries, delivered here: it is
+/// checked as the child will read it, not delivered a second time.
+fn validate_composed(doc: &Value, prose: &str) -> Result<(), String> {
+    let mut settings =
+        crate::config::settings::Settings::from_delivered_document(doc.clone(), "template", prose)
+            .map_err(|e| e.to_string())?;
     let res = crate::config::settings::resolve_services(&mut settings);
     let loaded = crate::config::settings::Loaded {
         settings,
@@ -1282,6 +1291,28 @@ fn inbox_report(ev: &crate::state::InboxEvent) -> Option<Result<(Admitted, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The composed config's prose reaches the child's loader byte for byte,
+    /// a `${VAR}` and a `$$` it quotes included — the digest the parent marks
+    /// the child with is of that prose, so an expanded copy would be
+    /// delivered a second time — and a respawn reads back the same prose.
+    #[test]
+    fn a_composed_instruction_survives_the_childs_env_substitution() {
+        let prose = "Quote `${HOME}` and `$${HOME}`, $$ and $5 as written.\n";
+        let doc = json!({"agent": {"name": "p/t", "instruction": prose},
+                         "store": {"kind": "memory"}});
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let (l, _) = crate::config::settings::load(
+            &["--config".to_string(), path.display().to_string()],
+            &[("HOME".into(), "/elsewhere".into())],
+        )
+        .unwrap();
+        assert_eq!(l.settings.agent.instruction.as_deref(), Some(prose));
+        assert_eq!(delivered_prose_of(&path).as_deref(), Some(prose));
+        assert_eq!(delivered_prose_of(&dir.path().join("gone.json")), None);
+    }
 
     /// Only the operator speaks for a child, from one pure rule that every
     /// consumer asks: `admit` refuses each report for an agent, a user and a

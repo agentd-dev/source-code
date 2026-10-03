@@ -1304,6 +1304,7 @@ pub fn combine_folder(
     }
     let mut warnings = Vec::new();
     let mut text = String::new();
+    let last = files.len() - 1;
     for (i, f) in files.iter().enumerate() {
         let body = std::fs::read_to_string(f).map_err(|e| format!("{at} dir {dir}: {f}: {e}"))?;
         // End matter is each file's record (S27), never delivered — and only
@@ -1314,10 +1315,19 @@ pub fn combine_folder(
         // that file and refuses the source, naming it. (A pinned folder's
         // per-file signatures are checked over the files' full bytes, not
         // this text.)
-        let body = crate::config::idoc::split_end_matter(&body)
-            .map_err(|e| format!("{at} dir {dir}: {f}: {}", e.message))?
-            .before
-            .to_string();
+        //
+        // The last file keeps its own: it ends the combined document, which
+        // reads it as end matter exactly where a single file's is read. Split
+        // off here, a `---` block that was body just before it would become
+        // the combined document's last block, and be dropped as end matter
+        // that the same file read alone keeps as text.
+        let split = crate::config::idoc::split_end_matter(&body)
+            .map_err(|e| format!("{at} dir {dir}: {f}: {}", e.message))?;
+        let body = if i == last {
+            body.clone()
+        } else {
+            split.before.to_string()
+        };
         // Front matter belongs to the document, and a combined instruction is
         // ONE document: the first file's is kept, a later file's is dropped
         // with a warning rather than left to read as prose mid-text.
@@ -1375,8 +1385,8 @@ pub fn strip_front_matter(text: &str) -> (String, bool) {
     (text.to_string(), false)
 }
 
-/// Whether `instruction` is the text an instance-tier parent already
-/// delivered for this process, which the §3.5 pipeline must not run on twice.
+/// The digest of the instruction an instance-tier parent already delivered
+/// for this process, which the §3.5 pipeline must not run on twice.
 ///
 /// The parent folds the template at boot, folds the params in at spawn and
 /// writes the DELIVERED prose as the child's `agent.instruction`. A second
@@ -1384,30 +1394,28 @@ pub fn strip_front_matter(text: &str) -> (String, bool) {
 /// keyword line quoted in an example into a live rule, and a quoted `<!--`
 /// into a note that deletes what follows. So the parent marks the child's
 /// environment with the digest of exactly that prose
-/// ([`crate::supervisor::reap::INSTANCE_DELIVERED_ENV`]), and the mark holds
-/// only for a process that is an instance child AND whose instruction is that
-/// text byte for byte: an edited or different instruction is delivered as
-/// any other. Skipping is fail-safe: delivered prose carries
-/// acknowledgements, not machinery, so nothing is activated by it.
-fn delivered_by_parent(instruction: &str) -> bool {
-    parent_delivered_digest_matches(
-        instruction,
+/// ([`crate::supervisor::reap::INSTANCE_DELIVERED_ENV`]), and the mark is read
+/// only in a process that is an instance child. It holds only for an
+/// instruction that is that text byte for byte ([`delivered_already`]): an
+/// edited or different instruction is delivered as any other. Skipping is
+/// fail-safe: delivered prose carries acknowledgements, not machinery, so
+/// nothing is activated by it.
+fn parent_delivered_digest() -> Option<String> {
+    parent_mark(
         std::env::var_os(crate::supervisor::reap::INSTANCE_CHILD_ENV).is_some(),
-        std::env::var(crate::supervisor::reap::INSTANCE_DELIVERED_ENV)
-            .ok()
-            .as_deref(),
+        std::env::var(crate::supervisor::reap::INSTANCE_DELIVERED_ENV).ok(),
     )
 }
 
-/// [`delivered_by_parent`] over its inputs, so the rule is testable without
-/// touching the process environment.
-fn parent_delivered_digest_matches(
-    instruction: &str,
-    instance_child: bool,
-    delivered: Option<&str>,
-) -> bool {
-    instance_child
-        && delivered.is_some_and(|d| d == instruction_core::digest(instruction.as_bytes()))
+/// [`parent_delivered_digest`] over its inputs, so the rule is testable
+/// without touching the process environment.
+fn parent_mark(instance_child: bool, delivered: Option<String>) -> Option<String> {
+    delivered.filter(|_| instance_child)
+}
+
+/// Whether `instruction` is exactly the text whose digest is `delivered`.
+fn delivered_already(instruction: &str, delivered: Option<&str>) -> bool {
+    delivered.is_some_and(|d| d == instruction_core::digest(instruction.as_bytes()))
 }
 
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
@@ -3869,7 +3877,36 @@ impl Settings {
     /// substituted at LOAD time instead (`load_workflows`), where the ones
     /// arriving from files, URLs and directories can be treated identically to
     /// inline ones.
-    pub fn from_document(mut doc: Value, source: &str) -> Result<Settings, String> {
+    pub fn from_document(doc: Value, source: &str) -> Result<Settings, String> {
+        Settings::type_document(doc, source, parent_delivered_digest())
+    }
+
+    /// [`Settings::from_document`] for a document whose `agent.instruction`
+    /// is `delivered`, prose this process already delivered: the §3.5
+    /// pipeline does not run on it a second time. An instance-tier parent
+    /// checks the child's composed config with this — the child is told the
+    /// same by its environment ([`parent_delivered_digest`]), and the check
+    /// that ran a delivery the child never runs refused templates the child
+    /// would have used as written.
+    pub fn from_delivered_document(
+        doc: Value,
+        source: &str,
+        delivered: &str,
+    ) -> Result<Settings, String> {
+        Settings::type_document(
+            doc,
+            source,
+            Some(instruction_core::digest(delivered.as_bytes())),
+        )
+    }
+
+    /// Type a settings document; `delivered` is the digest of an instruction
+    /// already delivered, if any.
+    fn type_document(
+        mut doc: Value,
+        source: &str,
+        delivered: Option<String>,
+    ) -> Result<Settings, String> {
         let vars: BTreeMap<String, Value> = doc
             .get("vars")
             .and_then(Value::as_object)
@@ -4243,7 +4280,7 @@ impl Settings {
             .map(str::to_string)
             && !looks_like_resource_uri(&instr)
             && crate::config::idoc::needs_delivery(&instr)
-            && !delivered_by_parent(&instr)
+            && !delivered_already(&instr, delivered.as_deref())
         {
             // The instruction is an Instruction Document — the single dialect,
             // and the ONLY surface extraction runs on (conversation text is
@@ -4370,8 +4407,8 @@ impl Settings {
         // only way to pass one was a shell `$(cat …)`. Same classification,
         // same sources, same code.
         if let Some(v) = doc.get("agent").and_then(|a| a.get("prompt")).cloned() {
-            let (text, from_dir) = match &v {
-                Value::String(sc) if instruction_key(sc) == "text" => (sc.clone(), false),
+            let text = match &v {
+                Value::String(sc) if instruction_key(sc) == "text" => sc.clone(),
                 _ => {
                     let (text, warns) = resolve_document_source(
                         &v,
@@ -4379,31 +4416,29 @@ impl Settings {
                         &egress_policy,
                     )?;
                     instruction_warnings.extend(warns);
-                    let from_dir = match &v {
-                        Value::String(sc) => instruction_key(sc) == "dir",
-                        _ => v.get("dir").is_some(),
-                    };
-                    (text, from_dir)
+                    text
                 }
             };
             // End matter is the document's record (S27), not the task: it
             // is dropped from EVERY source, the literal included, so where a
             // prompt lives never decides whether the model reads its record.
-            // A folder already dropped each file's (`combine_folder`); a
-            // second split of the joined text would take a block that was
-            // body in its own file. Nothing else is processed — the prompt
-            // is the task, not an instruction document: no delivery, no
-            // note stripping.
-            let text = if from_dir {
-                text
-            } else {
-                match crate::config::idoc::split_end_matter(&text) {
-                    Ok(split) if split.end_matter.is_some() => {
-                        format!("{}\n", split.before.trim_end())
-                    }
-                    Ok(_) => text,
-                    Err(e) => return Err(format!("{source}: agent.prompt: {}", e.message)),
+            // A folder's combined text ends in its last file's end matter
+            // (`combine_folder`), so it is split here like any other. Nothing
+            // else is processed — the prompt is the task, not an instruction
+            // document: no delivery, no note stripping. A task typed at a
+            // terminal can end in a `---` block meant as text, though, so
+            // the drop is said rather than done without a word.
+            let text = match crate::config::idoc::split_end_matter(&text) {
+                Ok(split) if split.end_matter.is_some() => {
+                    let dropped = text[split.before.len()..].trim().lines().count();
+                    instruction_warnings.push(format!(
+                        "agent.prompt: its closing `---` block ({dropped} lines) was read as \
+                         end matter, the document's record, and is not part of the task"
+                    ));
+                    format!("{}\n", split.before.trim_end())
                 }
+                Ok(_) => text,
+                Err(e) => return Err(format!("{source}: agent.prompt: {}", e.message)),
             };
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("prompt".into(), Value::String(text));
@@ -10745,6 +10780,22 @@ mod tests {
         );
         // A prompt with no end matter is the operator's text, byte for byte.
         assert_eq!(prompt(json!("Do it.\n\n\n")).unwrap(), "Do it.\n\n\n");
+        // A task typed at a terminal can end in a `---` block meant as text:
+        // the drop is said, naming the setting, and nothing is said when
+        // nothing was dropped.
+        let warnings = |p: Value| {
+            Settings::from_document(json!({"agent": {"name": "a", "prompt": p}}), "t")
+                .unwrap()
+                .agent
+                .instruction_warnings
+        };
+        let said = warnings(json!(TASK));
+        assert!(
+            said.iter()
+                .any(|w| w.starts_with("agent.prompt:") && w.contains("(3 lines)")),
+            "{said:?}"
+        );
+        assert!(warnings(json!("Do it.\n")).is_empty());
     }
 
     /// A folder of documents is ONE instruction, combined in `order`. The
@@ -11840,19 +11891,40 @@ mod tests {
     fn a_parent_delivered_instruction_is_bound_to_its_digest() {
         let text = "**MUST:** cite.\n";
         let digest = instruction_core::digest(text.as_bytes());
-        assert!(parent_delivered_digest_matches(text, true, Some(&digest)));
+        let mark = |child: bool, d: Option<&str>| parent_mark(child, d.map(str::to_string));
+        assert!(delivered_already(
+            text,
+            mark(true, Some(&digest)).as_deref()
+        ));
         assert!(
-            !parent_delivered_digest_matches(text, false, Some(&digest)),
+            !delivered_already(text, mark(false, Some(&digest)).as_deref()),
             "not an instance child"
         );
         assert!(
-            !parent_delivered_digest_matches(text, true, None),
+            !delivered_already(text, mark(true, None).as_deref()),
             "no mark"
         );
         assert!(
-            !parent_delivered_digest_matches("**MUST:** cite!\n", true, Some(&digest)),
+            !delivered_already("**MUST:** cite!\n", mark(true, Some(&digest)).as_deref()),
             "an edited instruction is delivered normally"
         );
+    }
+
+    /// The parent's check of a composed child config does not deliver the
+    /// prose it delivered itself: read a second time, a delivered text that
+    /// quotes `MUST[y]` twice in a verbatim block is a duplicate, and the
+    /// check refused a template the child would have used as written. Any
+    /// other text is delivered as before.
+    #[test]
+    fn a_delivered_document_is_typed_without_a_second_delivery() {
+        let delivered = "**MUST:** cite.\n\nMUST[y]: a\nMUST[y]: b\n";
+        let doc = json!({"agent": {"instruction": delivered}, "store": {"kind": "memory"}});
+        let e = Settings::from_document(doc.clone(), "template").unwrap_err();
+        assert!(e.contains("duplicate must/y"), "{e}");
+        let s = Settings::from_delivered_document(doc, "template", delivered).unwrap();
+        assert_eq!(s.agent.instruction.as_deref(), Some(delivered));
+        let other = json!({"agent": {"instruction": "MUST[y]: a\nMUST[y]: b\n"}});
+        assert!(Settings::from_delivered_document(other, "template", delivered).is_err());
     }
 
     /// The launcher's environment scrub reads the loader's own tables: every

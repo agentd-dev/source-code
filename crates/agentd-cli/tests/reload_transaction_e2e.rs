@@ -144,6 +144,10 @@ fn calls(mock: &common::MockMcp, tool: &str) -> usize {
 /// answering is this workflow's runs still completing.
 const TICK: &str = "  - name: tick\n    steps:\n      s: {kind: schedule, every: 300ms}\n      c: {kind: mcp.tool, depends_on: [s], server: a, tool: mock.ops}\n      f: {kind: finish, depends_on: [c], status: completed, output: tick}\n";
 
+/// A scheduled workflow that calls nothing: it keeps a daemon with no
+/// server to tick on alive.
+const QUIET_TICK: &str = "  - name: tick\n    steps:\n      s: {kind: schedule, every: 300ms}\n      f: {kind: finish, depends_on: [s], status: completed, output: tick}\n";
+
 /// A long-lived config: `servers` as (name, endpoint), each namespaced by its
 /// name; `workflows` as YAML list items; `extra` any further sections.
 fn config(instruction: &str, servers: &[(&str, &str)], workflows: &[&str], extra: &str) -> String {
@@ -1049,6 +1053,49 @@ fn the_instructions_server_cannot_be_removed_and_a_redial_resubscribes_it() {
         2,
         "the instruction was not subscribed on the new connection:\n{}",
         b.log()
+    );
+}
+
+/// A registry instruction's variants are chosen by the operator's model, and
+/// the model reloads. A reload that changes only the model reads the
+/// unchanged instruction again with the new facts: it used to keep the
+/// claude variant running while turns went to gpt, and report the new model
+/// as applied.
+#[test]
+fn a_model_change_rereads_a_registry_instruction_for_its_variants() {
+    let b = common::spawn_mock_mcp("mock://b", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let with_model = |model: &str| {
+        config(
+            "\"mcp://b/instruction://ins_mock@variants\"",
+            &[("b", &b.uri())],
+            &[QUIET_TICK],
+            &format!("intelligence:\n  endpoints: \"mock:final\"\n  model: {model}\n"),
+        )
+    };
+    std::fs::write(&cfg, with_model("claude-sonnet-4-5")).unwrap();
+    let d = Daemon::spawn(&cfg);
+    let log = d.wait_for(
+        |l| !events(l, "instruction.loaded").is_empty(),
+        "the instruction read",
+        15,
+    );
+    let first = events(&log, "instruction.loaded")[0]["bytes"].clone();
+
+    std::fs::write(&cfg, with_model("gpt-5")).unwrap();
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert!(
+        changed(outcome).iter().any(|c| c == "agent.instruction"),
+        "the gpt variant did not replace the claude one:\n{log}"
+    );
+    let loaded = events(&log, "instruction.loaded");
+    assert_ne!(
+        loaded.last().map(|l| l["bytes"].clone()),
+        Some(first),
+        "the running text is the claude variant still:\n{log}"
     );
 }
 

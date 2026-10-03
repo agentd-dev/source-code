@@ -1783,6 +1783,14 @@ impl Runtime {
     /// a downgrade. Returns the capability set the read admits for the §7.8
     /// wire-admission intersection, or `None` when no source demanded
     /// verification.
+    ///
+    /// A `resolved` read is the registry's DELIVERED text, which the author
+    /// never signed: the author signature covers the authored document, so
+    /// its digest is not compared with these bytes. What binds them to it is
+    /// the delivery attestation — its digest is over the delivered bytes,
+    /// and its manifest's authored digest is the one the author signed — so
+    /// a pinned resolved read verifies only for a source that names its
+    /// `reader`, and is refused by that name otherwise.
     #[allow(clippy::type_complexity)]
     fn verify_registry_read(
         &self,
@@ -1790,6 +1798,7 @@ impl Runtime {
         uri: &str,
         raw: &str,
         meta: &Option<Value>,
+        resolved: bool,
     ) -> Result<Option<Vec<String>>, instruction_core::Refusal> {
         use instruction_core::Refusal;
         let doc_id = uri.split('@').next().unwrap_or(uri);
@@ -1806,6 +1815,13 @@ impl Runtime {
         };
         // A §7 condition Appendix B has no row for, named for its document.
         let attestation = |message: String| Refusal::new("attestation", message);
+        if resolved && src.reader.is_none() {
+            return Err(attestation(format!(
+                "{doc_id}: a resolved read is the registry's delivered text, which the author \
+                 never signed — under a pinned publisher it verifies only through a delivery \
+                 attestation: pin `reader` for this source, or read it raw"
+            )));
+        }
         #[cfg(not(feature = "sign"))]
         {
             let _ = (client, raw, meta);
@@ -1867,8 +1883,10 @@ impl Runtime {
             // The author signs the §7.2 author digest — the front-matter
             // signature line excluded — so a registry document that carries
             // its own `signature:` line verifies here as it does from a file.
+            // A resolved read is not the authored text: its chain to this
+            // signature is the delivery's manifest, checked below.
             let want = instruction_core::author_digest(raw.as_bytes());
-            if claims.digest != want {
+            if !resolved && claims.digest != want {
                 return Err(Refusal::new(
                     "digest-mismatch",
                     format!(
@@ -2104,12 +2122,6 @@ impl Runtime {
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     };
-                    // §7.6 wire verification, BEFORE anything interprets the
-                    // bytes: a source that pins a publisher gets exactly what
-                    // that publisher signed, or nothing.
-                    let attested = self
-                        .verify_registry_read(&c, res, &raw, &meta)
-                        .map_err(|r| r.to_string())?;
                     // A RESOLVED read is text the registry already ran §3.5 on
                     // for this reader: delivering it again is not idempotent
                     // (labels re-bolded, a keyword line quoted in an example
@@ -2122,6 +2134,12 @@ impl Runtime {
                     // nothing folds from it.
                     let resolution = get_meta("resolution");
                     let resolved = resolution.as_deref() == Some("resolved");
+                    // §7.6 wire verification, BEFORE anything interprets the
+                    // bytes: a source that pins a publisher gets exactly what
+                    // that publisher signed, or nothing.
+                    let attested = self
+                        .verify_registry_read(&c, res, &raw, &meta, resolved)
+                        .map_err(|r| r.to_string())?;
                     if resolved
                         && get_meta("deliveredDigest")
                             .is_none_or(|d| d != instruction_core::digest(raw.as_bytes()))

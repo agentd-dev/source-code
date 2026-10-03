@@ -633,6 +633,56 @@ fn a_re_pulled_end_matter_edit_is_not_a_new_instruction() {
     );
 }
 
+/// A re-pull is folded with the operator's facts, as the load was: the
+/// document picks a variant by model family and drops one for any host but
+/// agentd, and the tag moves to an artifact that differs only in its end
+/// matter. Folded with the same facts, the re-pulled instruction is the same
+/// text; folded with none, it would swap the claude variant for the
+/// other-host one under a running agent.
+#[cfg(feature = "sign")]
+#[test]
+fn a_re_pulled_document_is_folded_with_the_operators_facts() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let doc = |n: u32| {
+        format!(
+            "---\nspec: \"1\"\nid: instruction://ins_facts\n---\n# Agent\n\n\
+             :::when{{agent=\"claude\"}}\nAnswer as the claude variant.\n:::\n\n\
+             :::unless{{host=\"agentd\"}}\nAnswer as a host other than agentd, at length.\n:::\n\n\
+             ---\nreviewed: {n}\n---\n"
+        )
+        .into_bytes()
+    };
+    let second = doc(2);
+    let second_digest = format!("sha256:{}", sha_hex(&second));
+    let swapped = Arc::new(AtomicBool::new(false));
+    let port = two_document_registry(doc(1), second, Arc::clone(&swapped));
+    let cfg = json!({
+        "agent": {"name": "oci-facts", "preflight": "never", "instruction": {
+            "oci": format!("127.0.0.1:{port}/acme/agent:v1"), "refresh": "1s"}},
+        "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "claude-sonnet-4-5"},
+        "store": {"kind": "memory"},
+    });
+    let log = run_until(cfg, &second_digest, Duration::from_secs(25), || {
+        swapped.store(true, Ordering::SeqCst);
+    });
+    let loaded: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["event"] == "instruction.loaded")
+        .collect();
+    let repulled = loaded
+        .iter()
+        .find(|v| v["layer_digest"] == second_digest.as_str())
+        .unwrap_or_else(|| panic!("the moved tag was never re-pulled:\n{log}"));
+    let first = &loaded[0];
+    assert_eq!(
+        (&repulled["bytes"], &repulled["version"]),
+        (&first["bytes"], &first["version"]),
+        "the re-pull chose other variants than the load:\n{log}"
+    );
+}
+
 /// A registry that serves one document, then another once `swapped` flips —
 /// a tag moving under a running agent, which is what §7.7 watches for.
 #[cfg(feature = "sign")]

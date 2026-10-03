@@ -534,7 +534,7 @@ shows one. `Block` gains `notes`; `Document` gains `end_matter`, and its
 `doc::split_end_matter` and `SplitEndMatter`, `doc::reserved_bare_names()`
 and `Registry::needs_attrs`. `tree_json` emits `endMatter` after the blocks
 when the document has end matter. Two choices differ from the TypeScript
-reference and are raised upstream: an empty `:::unless` refuses as
+reference and are to be raised upstream: an empty `:::unless` refuses as
 `missing-attribute`, the Appendix B condition, where the reference reports
 `schema`; and the corpus does not pin the line `end-matter-yaml` names,
 which here, as in the reference, is the first end-matter line.
@@ -550,7 +550,7 @@ source.
 and `unfound_overrides`, the document's override targets found nowhere.
 `CODES` gains `nested-machinery` and `nesting-depth`, this reader's own
 limits, which Appendix B has no row for; new `NON_CATALOGUE` lists them with
-`schema` (raised upstream). A container's child `Block` now carries its
+`schema` (to be raised upstream). A container's child `Block` now carries its
 `region` in the document body (it was `(0, 0)`), and `Block` carries the
 layout of a container's body for delivery, so it can no longer be built
 outside the crate.
@@ -565,7 +565,27 @@ a delivery attestation covers. Digests are in every build: `ring` is a
 normal dependency, `digest`, `author_digest`, `strip_front_matter_signature`
 and `front_matter_id` moved from `sign` to the crate root, and `sign` gates
 JWS/Ed25519 verification only. The `dump` example prints `canonical` too,
-and takes a corpus case directory, resolving includes as the runner does.
+and takes a corpus case directory, resolving includes as the runner does;
+its `tree` mode prints the fixture's tree with members in `serde_json`'s key
+order, not byte for byte.
+
+The manifest accounts for the delivered text and nothing else. A name the
+delivered document and an include both substitute is listed once per
+distinct source and value, sorted by name, then source, then digest, so
+every value in the text is accounted for. The reference de-duplicates by name
+per substitution pass and lists such a name twice, and the corpus pins
+neither; this is decided here and is to be raised upstream for S7. A key
+compared twice records its latest value, as in the reference. A `title` is
+substituted, and accounted for, only where its block delivers it, which is
+an example, an output or a context; a rule's, an admonition's and a
+glossary's title is not. An include that degrades to its note, because it
+does not parse, does not fold or nests past the delivery cap, leaves no
+entry, bytes or depth in the manifest and nothing its body accounted for.
+`limits.include_bytes` counts inlined text only, while the 1 MiB cap still
+counts every text read. `${name}` is scanned by `x-grammar.param`: a
+placeholder after a stray `${`, as in `${a ${b}`, is substituted and
+accounted for, as the reference's regex finds it, and a test holds the
+hand-written scan to the vendored grammar.
 
 agentd's §7 verification is the crate's: `config::attest` re-exports
 `Claims`, `SPEC_CLAIM`, `WIRE_FLOOR`, `Verified`, `verify`,
@@ -580,13 +600,32 @@ coded `signature-typ-mismatch`, `audience-mismatch`, `digest-mismatch`,
 `manifest-dropped-missing`, `unpinned-publisher`,
 `delivery-ceiling-exceeded`, `wire-floor` or `ungranted-family`, and
 `attestation` for the §7 conditions Appendix B has no row for (`CODES` and
-`NON_CATALOGUE` gain it; raised upstream). The text is what it was, with
-three exceptions: a delivery whose manifest has no `variants.dropped` is
+`NON_CATALOGUE` gain it; to be raised upstream). The text is what it was, with
+three exceptions. A delivery whose manifest has no `variants.dropped` is
 refused as `manifest: variants.dropped is required (§7.4 rule 5)` rather
-than as malformed claims; a JWS segment that is not base64url is refused as
-`attestation: bad signature base64` (or `bad header b64`, `bad claims b64`)
-rather than `invalid base64 character`; and whitespace inside a JWS, which
-agentd's copy skipped, is refused.
+than as malformed claims. A JWS segment that is not unpadded base64url is
+refused as `attestation: bad signature base64` (or `attestation: bad header
+base64`, `attestation: bad claims base64`) rather than `invalid base64
+character`; that covers the standard alphabet's `+` and `/`, a `=` and
+anything after it, and nonzero leftover bits, all of which the crate's
+decoder used to accept, so a signature segment could be re-spelled and
+still verify. A header that is not JSON is refused as `attestation:
+malformed header: …`. Whitespace inside a JWS, which agentd's copy skipped,
+is refused.
+
+The daemon's registry read verifies a delivery with the crate's
+`verify_document` when its trust pin sets `reader`. Before, it checked only
+the delivery's audience, expiry and digest itself, so it also skipped
+`doc` against the front-matter id, the manifest's chain to the author
+signature, and the delivery ceiling within the author's. The effective set
+is now `document_capabilities ∩ max_capabilities ∩ author ∩ delivery`, so a
+delivery that attests fewer families than its author narrows what the read
+admits, which it did not before. The delivery must embed the author
+signature the read carries. The author signature is compared with the §7.2
+author digest, which excludes the front-matter `signature:` line, rather
+than the plain digest, so a registry document that carries its own
+signature verifies. The read's refusals carry their Appendix B codes, or `attestation`, and
+`instruction.verified` gains `capabilities`, the set the read admits.
 
 ## v1.17.0 — A2A, and nothing beside it
 

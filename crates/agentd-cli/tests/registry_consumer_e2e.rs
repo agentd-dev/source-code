@@ -160,6 +160,8 @@ fn a_pinned_publisher_verifies_the_author_and_delivery_attestations() {
     assert_eq!(v["key_state"], "active");
     assert_eq!(v["publisher"], "https://instruction.md/pub/mock");
     assert_eq!(v["delivery_checked"], true, "the reader's aud was checked");
+    // grant (`compute`) ∩ max_capabilities ∩ author ∩ delivery.
+    assert_eq!(v["capabilities"], json!(["compute"]));
     // The delivery signature was verified with a DIFFERENT key from the
     // publisher's — discovered from the read's `deliveryKeys` pointer, which
     // is the shape a real registry serves (publisher keys attest authorship;
@@ -172,6 +174,85 @@ fn a_pinned_publisher_verifies_the_author_and_delivery_attestations() {
     assert!(
         r.log.contains("proc.ready"),
         "startup completed:\n{}",
+        r.log
+    );
+    let _ = std::fs::remove_file(&key);
+}
+
+/// A registry document may carry its own author JWS in its front matter.
+/// The author signs the §7.2 author digest, which excludes that line, so the
+/// read verifies against it — as the same bytes would from a file — and the
+/// delivery's manifest chains to it.
+#[test]
+fn a_document_carrying_its_own_signature_verifies_over_the_author_digest() {
+    let key = publisher_key_file();
+    let r = boot(
+        "instruction://ins_mock@selfsigned",
+        json!([{
+            "uri": "instruction://ins_mock@selfsigned",
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+            "delivery_keys": [],
+            "reader": "agent://mock-reader",
+        }]),
+    );
+    let v = event(&r.log, "instruction.verified")
+        .unwrap_or_else(|| panic!("no verification:\n{}", r.log));
+    assert_eq!(v["delivery_checked"], true);
+    assert!(
+        r.log.contains("proc.ready"),
+        "startup completed:\n{}",
+        r.log
+    );
+    let _ = std::fs::remove_file(&key);
+}
+
+/// A delivery attestation CAPS for its reader (§7.6 step 4: effective =
+/// grant ∩ max_capabilities ∩ author ∩ delivery). `@narrow` is signed by an
+/// author attesting `core` and `compute` and delivered attesting `core`
+/// alone, so the read admits nothing the grant (`compute`) names — the set
+/// the served document then folds under. A verifier that intersected only
+/// the author's set would admit `compute`.
+#[test]
+fn a_delivery_attestation_narrows_what_the_read_admits() {
+    let key = publisher_key_file();
+    let r = boot(
+        "instruction://ins_mock@narrow",
+        json!([{
+            "uri": "instruction://ins_mock@narrow",
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+            "delivery_keys": [],
+            "reader": "agent://mock-reader",
+        }]),
+    );
+    let v = event(&r.log, "instruction.verified")
+        .unwrap_or_else(|| panic!("no verification:\n{}", r.log));
+    assert_eq!(v["author_capabilities"], json!(["core", "compute"]));
+    assert_eq!(v["capabilities"], json!([]), "the delivery's cap applies");
+    let _ = std::fs::remove_file(&key);
+}
+
+/// The author signature a delivery chains to is the one the read carries,
+/// whose key state was checked: `@reauthored` serves a second valid author
+/// signature beside a delivery that embeds the first, and is refused.
+#[test]
+fn a_delivery_chained_to_another_author_signature_is_refused() {
+    let key = publisher_key_file();
+    let r = boot(
+        "instruction://ins_mock@reauthored",
+        json!([{
+            "uri": "instruction://ins_mock@reauthored",
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+            "delivery_keys": [],
+            "reader": "agent://mock-reader",
+        }]),
+    );
+    assert!(!r.log.contains("proc.ready"), "must not start:\n{}", r.log);
+    assert!(
+        r.log.contains("a different author signature"),
+        "the refusal names the chain:\n{}",
         r.log
     );
     let _ = std::fs::remove_file(&key);

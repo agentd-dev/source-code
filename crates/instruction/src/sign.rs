@@ -8,7 +8,7 @@
 //! refusal, never a downgrade. Signing (an author key held in memory) is a
 //! deployment concern and lives with the consumer; agentd's
 //! `config::attest` signs with its own key type and re-exports everything
-//! here, so the daemon verifies with this code and no copy of it.
+//! here, and its registry read verifies a delivery with [`verify_document`].
 //!
 //! Every refusal is a [`Refusal`] with no line, carrying the code Appendix B
 //! gives its condition (§1.4). The §7 conditions Appendix B has no row for —
@@ -85,13 +85,14 @@ pub fn verify(jws: &str, public_key: &[u8], want_typ: &str) -> Result<Claims, Re
         .map_err(|_| {
             attestation("attestation: signature does not verify against the pinned key")
         })?;
-    let header: Value =
-        serde_json::from_slice(&b64url_decode(h).ok_or_else(|| attestation("bad header b64"))?)
-            .map_err(|e| attestation(e.to_string()))?;
+    let header: Value = serde_json::from_slice(
+        &b64url_decode(h).ok_or_else(|| attestation("attestation: bad header base64"))?,
+    )
+    .map_err(|e| attestation(format!("attestation: malformed header: {e}")))?;
     if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
         return Err(attestation("attestation: alg must be EdDSA (§7.2)"));
     }
-    let payload = b64url_decode(p).ok_or_else(|| attestation("bad claims b64"))?;
+    let payload = b64url_decode(p).ok_or_else(|| attestation("attestation: bad claims base64"))?;
     let malformed =
         |e: serde_json::Error| attestation(format!("attestation: malformed claims: {e}"));
     // A manifest without `variants.dropped` is a condition of its own
@@ -313,7 +314,15 @@ pub fn admit_family(
     Ok(())
 }
 
+/// A JWS segment's bytes: base64url WITHOUT padding (RFC 7515 §2), and
+/// only that — no standard-alphabet `+` or `/`, no `=`, no length no
+/// encoding produces, no nonzero bits left over. Exactly one spelling per
+/// byte string, so a signature segment cannot be re-spelled (a `=` and
+/// anything after it, an alphabet swapped) and still verify.
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 4 == 1 {
+        return None;
+    }
     let mut bits: u32 = 0;
     let mut nbits = 0;
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
@@ -322,9 +331,8 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' => break,
+            b'-' => 62,
+            b'_' => 63,
             _ => return None,
         };
         bits = bits << 6 | v as u32;
@@ -334,7 +342,9 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
             out.push((bits >> nbits) as u8);
         }
     }
-    Some(out)
+    // The bits past the last whole byte are padding a canonical encoder
+    // writes as zero.
+    (bits & ((1 << nbits) - 1) == 0).then_some(out)
 }
 
 #[cfg(test)]
@@ -342,8 +352,9 @@ mod tests {
     use super::*;
     use crate::{Authored, author_digest};
 
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
     fn b64url_encode(b: &[u8]) -> String {
-        const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut out = String::new();
         for chunk in b.chunks(3) {
             let n = (chunk[0] as u32) << 16
@@ -637,6 +648,50 @@ mod tests {
             &late,
             "attestation",
             "attestation: the delivery signature has expired (§7.6 step 2)",
+        );
+    }
+
+    /// A JWS segment is unpadded base64url and nothing else: a signature
+    /// re-spelled — padded, `=` and anything after it, the standard
+    /// alphabet, nonzero leftover bits — decodes to the same bytes a lax
+    /// decoder would verify, so each is refused.
+    #[test]
+    fn a_jws_segment_is_unpadded_base64url_only() {
+        assert_eq!(b64url_decode("QQ"), Some(vec![0x41]));
+        assert_eq!(b64url_decode("-_8"), Some(vec![0xfb, 0xff]));
+        for bad in ["QR", "QQ==", "Q", "A", "QUJDA", "+/8", "Q Q"] {
+            assert_eq!(b64url_decode(bad), None, "{bad:?}");
+        }
+        let a_jws = sign_with(&AUTHOR, &author_claims(&["material"]));
+        verify_author(&a_jws, &pubkey(&AUTHOR)).unwrap();
+        let (input, sig) = a_jws.rsplit_once('.').unwrap();
+        // 64 bytes are 86 characters, the last carrying 4 bits of padding.
+        assert_eq!(sig.len(), 86);
+        let last = sig.as_bytes()[85];
+        let i = URL.iter().position(|c| *c == last).unwrap();
+        let flipped = format!("{}{}", &sig[..85], URL[i ^ 1] as char);
+        let swapped = sig.replacen('-', "+", 1).replacen('_', "/", 1);
+        assert_ne!(swapped, sig, "the fixture signature has a `-` or `_`");
+        for respelled in [
+            format!("{sig}="),
+            format!("{sig}=x"),
+            format!("{sig}=="),
+            swapped,
+            flipped,
+        ] {
+            assert_refusal(
+                &verify_author(&format!("{input}.{respelled}"), &pubkey(&AUTHOR)).unwrap_err(),
+                "attestation",
+                "attestation: bad signature base64",
+            );
+        }
+        let (h, rest) = a_jws.split_once('.').unwrap();
+        let (p, _) = rest.split_once('.').unwrap();
+        assert_eq!(
+            verify_author(&format!("{h}=.{p}.{sig}"), &pubkey(&AUTHOR))
+                .unwrap_err()
+                .code,
+            "attestation"
         );
     }
 }

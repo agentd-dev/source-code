@@ -119,14 +119,14 @@ pub const CODES: &[&str] = &[
     "override-guardrail",
     "override-stronger",
     // Not in Appendix B: refusals/non-integer-version pins it as its second
-    // entry (the TypeScript port's schema-validation path). Raised upstream.
+    // entry (the TypeScript port's schema-validation path). To be raised upstream.
     "schema",
     // Not in Appendix B: a §7 verification condition the table gives no row
     // (a JWS that does not parse or verify, an expired signature, a broken
-    // author→manifest chain). Rows raised upstream.
+    // author→manifest chain). Rows to be raised upstream.
     "attestation",
     // Not in Appendix B: this reader's own limits, refused where the
-    // reference delivers. Raised upstream.
+    // reference delivers. To be raised upstream.
     "nested-machinery",
     "nesting-depth",
 ];

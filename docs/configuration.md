@@ -903,7 +903,7 @@ agent:
         publisher: "https://instruction.md/pub/acme"
         author_keys: [/etc/keys/acme-author.pem]
         delivery_keys: [/etc/keys/delivery.pem]
-        reader: "agent://ops-1"     # enables the delivery `aud` check
+        reader: "agent://ops-1"     # enables the delivery check: aud, digest, manifest chain, ceiling
         max_capabilities: [material]
         freshness: 15m
 ```

@@ -137,24 +137,36 @@ pub(crate) const NESTING_CAP: usize = 2 * doc::NESTING_CAP;
 /// What a delivery's manifest accounts for beyond its variants (S7), as the
 /// walk delivers it. Only the delivered text is accounted for: a dropped
 /// variant is never walked, a `form` lists its inputs without substituting
-/// its body, and a skill's catalogue body is walked with the tally set aside
-/// ([`skill_body`]).
-#[derive(Default)]
-struct Tally {
+/// its body, a title is substituted only where its block delivers it, a
+/// skill's catalogue body is walked with the tally set aside
+/// ([`skill_body`]), and an include that degrades to its note hands back
+/// the tally as it found it ([`Walk::refused`]).
+#[derive(Default, Clone)]
+pub(crate) struct Tally {
     /// The facts a `when` or `unless` compared, kept or dropped, with the
     /// value compared — across nested variants and included documents. A key
     /// compared again records its latest value, as the reference's shared
-    /// map does.
+    /// map does: one key, one entry.
     facts: BTreeMap<String, String>,
-    /// Each parameter substituted, by name: its declared source and the
-    /// value used. The first use wins — one name, one entry.
-    parameters: BTreeMap<String, (String, String)>,
+    /// Each parameter substituted: its name, declared source and the value
+    /// used, once per distinct triple. Decided here, not inherited: the
+    /// reference de-duplicates by name per substitution pass — one pass per
+    /// include, one over the whole text — so a name an includer and an
+    /// include both substitute is listed twice, and keyed by name alone one
+    /// of the two values delivered would go unaccounted for. Every value in
+    /// the delivered text is listed; a name used twice alike, once. Raised
+    /// upstream as an open question for S7.
+    parameters: BTreeSet<(String, String, String)>,
     /// The placeholders a delivered line left as written.
     unresolved: BTreeSet<String>,
     /// Each transclusion, in pre-order as delivery met it.
     includes: Vec<Include>,
     /// The deepest include level reached; 0 when nothing was inlined.
     include_depth: usize,
+    /// The UTF-8 bytes of every text inlined (S7 `limits.include_bytes`).
+    /// Not [`Walk::include_bytes`], which caps the work and so also counts
+    /// a text read and then refused.
+    include_bytes: usize,
 }
 
 /// One `overrides` target a rule declares (S24), and where.
@@ -251,16 +263,34 @@ impl<'a> Walk<'a> {
         self.tally = sub.tally;
     }
 
+    /// Take back from an include's walk that degraded to its note — it
+    /// refused to fold, or went past the nesting cap after rendering — only
+    /// the bytes it read, which the cap counts. Its text was not inlined, so
+    /// the manifest names none of it (S7: `includes[]` is "the authored text
+    /// that was inlined"): the tally goes back to `before`, as it was before
+    /// [`Walk::inlined`], dropping the include's own entry and whatever its
+    /// body accounted for. Nor did it answer an override or silence a rule
+    /// in the delivered text. A refused include and an unresolvable one then
+    /// leave the same manifest, as they leave the same note.
+    pub(crate) fn refused(&mut self, sub: Walk, before: Tally) {
+        self.include_bytes = sub.include_bytes;
+        self.tally = before;
+    }
+
     /// Account for an include's text being inlined (S7): after the resolver
-    /// handed it over and the cycle, depth and byte caps let it through,
-    /// before it is delivered — its target as written, the digest of its
-    /// authored text, and the level it reaches.
-    pub(crate) fn inlined(&mut self, target: &str, text: &str) {
+    /// handed it over, the cycle, depth and byte caps let it through and it
+    /// parsed, before it is delivered — its target as written, the digest of
+    /// its authored text, its bytes and the level it reaches. Returns the
+    /// tally as it was, for [`Walk::refused`] should the include not fold.
+    pub(crate) fn inlined(&mut self, target: &str, text: &str) -> Tally {
+        let before = self.tally.clone();
         self.tally.includes.push(Include {
             target: target.to_string(),
             digest: crate::digest(text.as_bytes()),
         });
+        self.tally.include_bytes += text.len();
         self.tally.include_depth = self.tally.include_depth.max(self.depth + 1);
+        before
     }
 
     /// Account for a variant delivery met (S7): its per-kind counter in this
@@ -290,6 +320,7 @@ impl<'a> Walk<'a> {
             mut unresolved,
             includes,
             include_depth,
+            include_bytes,
         } = self.tally;
         // An override target found nowhere is unresolved too (S24).
         unresolved.extend(ex.unfound_overrides.iter().cloned());
@@ -301,14 +332,26 @@ impl<'a> Walk<'a> {
                 digest: crate::author_digest(doc.raw.as_bytes()),
                 version: None,
             },
-            parameters: parameters
-                .into_iter()
-                .map(|(name, (source, value))| ParameterUse {
-                    name,
-                    source,
-                    value_digest: crate::digest(value.as_bytes()),
-                })
-                .collect(),
+            parameters: {
+                // Sorted by name, then source, then digest: the order a
+                // reader recomputing it reaches without knowing the values.
+                let mut uses: Vec<ParameterUse> = parameters
+                    .into_iter()
+                    .map(|(name, source, value)| ParameterUse {
+                        name,
+                        source,
+                        value_digest: crate::digest(value.as_bytes()),
+                    })
+                    .collect();
+                uses.sort_by(|a, b| {
+                    (&a.name, &a.source, &a.value_digest).cmp(&(
+                        &b.name,
+                        &b.source,
+                        &b.value_digest,
+                    ))
+                });
+                uses
+            },
             facts: facts
                 .into_iter()
                 .map(|(key, value)| Fact {
@@ -320,7 +363,7 @@ impl<'a> Walk<'a> {
             includes,
             limits: Limits {
                 include_depth: include_depth as u64,
-                include_bytes: self.include_bytes as u64,
+                include_bytes: include_bytes as u64,
             },
             unresolved: unresolved.into_iter().collect(),
             overridden,
@@ -341,7 +384,9 @@ impl<'a> Walk<'a> {
     /// `${name}` substituted in one delivered line (§3.5 step 7): see
     /// [`doc::substitute_line`]. Each placeholder is accounted for as it is
     /// met (S7): a value substituted under its declared source, `static`
-    /// when undeclared; a placeholder left as written, unresolved.
+    /// when undeclared; a placeholder left as written, unresolved. Only
+    /// delivered text goes through here: what is never delivered is never
+    /// substituted, so never accounted for.
     fn sub(&mut self, line: &str) -> String {
         let Walk {
             params,
@@ -357,8 +402,7 @@ impl<'a> Walk<'a> {
                     .map_or("static", String::as_str);
                 tally
                     .parameters
-                    .entry(name.to_string())
-                    .or_insert_with(|| (source.to_string(), value.to_string()));
+                    .insert((name.to_string(), source.to_string(), value.to_string()));
             }
             None => {
                 tally.unresolved.insert(name.to_string());
@@ -978,13 +1022,17 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
         }
     };
     // An attribute the label shows is delivered text like any other, so its
-    // `${}` is substituted — before it is escaped into a tag.
-    let title = b.attrs.get("title").map(|t| w.sub(t));
-    let title = title.as_ref();
+    // `${}` is substituted — before it is escaped into a tag. Only where the
+    // label shows it: a rule's, an admonition's or a glossary's title is
+    // never delivered, so substituting it would account in the manifest
+    // (S7) for a value the delivered text does not hold.
+    let title = |w: &mut Walk| b.attrs.get("title").map(|t| w.sub(t));
     match b.kind.as_str() {
         // S16: quoted material — delivered as written, nothing in it
         // normalised, its author notes stripped.
         "example" => {
+            let title = title(w);
+            let title = title.as_ref();
             let avoid = flag(b, "avoid");
             let mut suffix = String::new();
             let mut attrs = String::new();
@@ -1014,6 +1062,8 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
         // S17: the body is prose (a rule in it is a rule); the schema is
         // the host's and never delivered.
         "output" => {
+            let title = title(w);
+            let title = title.as_ref();
             let mut suffix = String::new();
             let mut attrs = String::new();
             if let Some(f) = b.attrs.get("format").map(|f| w.sub(f)) {
@@ -1034,7 +1084,9 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
         }
         // context, form, tool and glossary deliver the same in every style.
         "context" => {
-            let t = title.map(|t| format!(" title=\"{t}\"")).unwrap_or_default();
+            let t = title(w)
+                .map(|t| format!(" title=\"{t}\""))
+                .unwrap_or_default();
             let mut out = vec![format!("<reference{t}>")];
             out.extend(inner(w));
             out.push("</reference>".into());
@@ -2636,7 +2688,10 @@ mod tests {
 
     /// Decided where the spec leaves it open (a): what an included document
     /// substitutes, and leaves unresolved, is the one delivery's — under its
-    /// own declarations, after the includer's first use of a name.
+    /// own declarations. A name the includer and an include both substitute
+    /// is listed once per value and source delivered, in either order: the
+    /// manifest accounts for every value in the text, which keyed by name
+    /// it would not.
     #[test]
     fn an_includes_parameters_are_the_deliverys() {
         let m = manifest_of(
@@ -2658,10 +2713,187 @@ mod tests {
             got,
             [
                 ("env", "static", crate::digest(b"prod")),
+                ("env", "workspace", crate::digest(b"staging")),
                 ("own", "prompt", crate::digest(b"x")),
             ]
         );
         assert_eq!(m.unresolved, strings(&["gone"]));
+        // The include first, and the same value twice from one source once.
+        let include = "::param{name=env default=staging source=workspace}\n\nInc ${env}.\n";
+        let m = manifest_of(
+            "::param{name=env default=prod}\n\n::include{id=\"i\"}\n\nIn ${env}, ${env}.\n\n\
+             ::include{id=\"i\"}\n",
+            &[],
+            &[],
+            &[("i", include)],
+        );
+        let got: Vec<(&str, &str, String)> = m
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.source.as_str(), p.value_digest.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("env", "static", crate::digest(b"prod")),
+                ("env", "workspace", crate::digest(b"staging")),
+            ]
+        );
+    }
+
+    /// A key an includer and an include both compare records the value
+    /// compared last, as the reference's one shared map does: one key, one
+    /// entry.
+    #[test]
+    fn a_fact_compared_again_records_its_latest_value() {
+        let m = manifest_of(
+            "::param{name=env default=prod}\n\n:::when{env=\"prod\"}\nP.\n:::\n\n::include{id=\"i\"}\n",
+            &[],
+            &[],
+            &[(
+                "i",
+                "::param{name=env default=staging}\n\n:::when{env=\"staging\"}\nS.\n:::\n",
+            )],
+        );
+        assert_eq!(m.facts.len(), 1, "{:?}", m.facts);
+        assert_eq!(m.facts[0].key, "env");
+        assert_eq!(m.facts[0].value_digest, crate::digest(b"staging"));
+    }
+
+    /// A title is accounted for only where its block delivers it: a rule's,
+    /// an admonition's and a glossary's never are, so a placeholder in one
+    /// is neither a parameter nor unresolved. An example's, an output's and
+    /// a context's are.
+    #[test]
+    fn a_title_never_delivered_is_not_accounted_for() {
+        let doc = ":::must{title=\"for ${p} ${q}\"}\nDo it.\n:::\n\n\
+                   :::note{title=\"N ${p} ${q}\"}\nNote body.\n:::\n\n\
+                   :::glossary{title=\"Terms ${p} ${q}\"}\nAPI\n: interface\n:::\n";
+        let m = manifest_of(doc, &[("p", "1")], &[], &[]);
+        assert!(m.parameters.is_empty(), "{:?}", m.parameters);
+        assert!(m.unresolved.is_empty(), "{:?}", m.unresolved);
+        for kind in ["example", "output", "context"] {
+            let m = manifest_of(
+                &format!(":::{kind}{{title=\"T ${{p}} ${{q}}\"}}\nBody.\n:::\n"),
+                &[("p", "1")],
+                &[],
+                &[],
+            );
+            let names: Vec<&str> = m.parameters.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["p"], "{kind}");
+            assert_eq!(m.unresolved, strings(&["q"]), "{kind}");
+        }
+    }
+
+    /// A placeholder after a stray `${` is substituted and accounted for,
+    /// as the grammar's regex meets it.
+    #[test]
+    fn a_placeholder_after_a_stray_opening_is_met() {
+        let ctx_params = [("b", "B"), ("c", "C")];
+        let text = "Use ${a ${b} and ${ ${c} now.\n";
+        let map: BTreeMap<String, String> = ctx_params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = crate::Context {
+            grants: all_families(),
+            params: map,
+            facts: BTreeMap::new(),
+            resolve_include: None,
+        };
+        let d = crate::deliver(&parse(text).unwrap(), &ctx).unwrap();
+        assert_eq!(d.text, "Use ${a B and ${ C now.\n");
+        let names: Vec<&str> = d
+            .manifest
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["b", "c"]);
+        assert!(
+            d.manifest.unresolved.is_empty(),
+            "{:?}",
+            d.manifest.unresolved
+        );
+    }
+
+    /// An include the byte cap refuses is not inlined, so not in the
+    /// manifest: neither its entry nor its bytes nor its depth. What fits
+    /// beside it still is.
+    #[test]
+    fn an_include_past_the_byte_cap_is_not_accounted_for() {
+        let big = "x".repeat(doc::INCLUDE_BYTES_CAP + 1);
+        let small = "Small.\n";
+        let m = manifest_of(
+            "::include{id=\"big\"}\n\n::include{id=\"small\"}\n",
+            &[],
+            &[],
+            &[("big", &big), ("small", small)],
+        );
+        let targets: Vec<&str> = m.includes.iter().map(|i| i.target.as_str()).collect();
+        assert_eq!(targets, ["small"]);
+        assert_eq!(
+            m.limits,
+            Limits {
+                include_depth: 1,
+                include_bytes: small.len() as u64,
+            }
+        );
+    }
+
+    /// An include that degrades to its note — it does not parse, it carries
+    /// machinery, or its bodies go past the nesting cap after it rendered —
+    /// was never inlined: the manifest names none of it, nor anything its
+    /// body accounted for, exactly as for a target nothing resolves.
+    #[test]
+    fn an_include_that_degrades_is_not_accounted_for() {
+        let deep = format!(
+            "Inc ${{p}} ${{q}}.\n\n:::when{{env=\"x\"}}\nW.\n:::\n\n::include{{id=\"inner\"}}\n\n{}x\n",
+            "MUST: ".repeat(NESTING_CAP + 1)
+        );
+        let cases = [
+            (
+                "unparseable",
+                ":::must{name=a}\nOne.\n:::\n\n:::must{name=a}\nTwo.\n:::\n".to_string(),
+            ),
+            (
+                "machinery",
+                "Inc ${p}.\n\n:::!config\nfoo: 1\n:::\n".to_string(),
+            ),
+            ("too deep", deep),
+        ];
+        let gone = manifest_of("Top.\n\n::include{id=\"gone\"}\n", &[], &[], &[]);
+        for (why, text) in cases {
+            let d = {
+                let includes: BTreeMap<String, String> = [
+                    ("i".to_string(), text.clone()),
+                    ("inner".to_string(), "Inner ${p}.\n".to_string()),
+                ]
+                .into();
+                let resolve = |id: &str| includes.get(id).cloned();
+                let ctx = crate::Context {
+                    grants: all_families(),
+                    params: BTreeMap::new(),
+                    facts: [("env".to_string(), "x".to_string())].into(),
+                    resolve_include: Some(&resolve),
+                };
+                crate::deliver(
+                    &parse("::param{name=p default=v}\n\nTop.\n\n::include{id=\"i\"}\n").unwrap(),
+                    &ctx,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                d.text, "Top.\n\n> _(included instruction not available)_\n",
+                "{why}"
+            );
+            let m = d.manifest;
+            assert!(m.includes.is_empty(), "{why}: {:?}", m.includes);
+            assert_eq!(m.limits, gone.limits, "{why}");
+            assert!(m.parameters.is_empty(), "{why}: {:?}", m.parameters);
+            assert!(m.facts.is_empty(), "{why}: {:?}", m.facts);
+            assert!(m.unresolved.is_empty(), "{why}: {:?}", m.unresolved);
+        }
     }
 
     /// Decided (b): a placeholder in fenced code is neither substituted nor

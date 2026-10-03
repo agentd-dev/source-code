@@ -3622,7 +3622,7 @@ const INCLUDE_DEPTH_CAP: usize = 8;
 /// (S7 `limits.include_bytes`), 1 MiB as the reference sets it. The depth cap
 /// bounds a chain, not its width: without this, a document of a thousand
 /// includes of a large document would inline all of them.
-const INCLUDE_BYTES_CAP: usize = 1 << 20;
+pub(crate) const INCLUDE_BYTES_CAP: usize = 1 << 20;
 
 /// Fold a parsed document into configuration + delivered prose, after checking
 /// grants. The whole document is refused if any block errors — no partial load.
@@ -3662,7 +3662,9 @@ pub fn fold_full(
 
 /// As [`fold_full`], with the §7.4 resolution manifest (S7) the same walk
 /// accounted for — what [`crate::deliver`] returns beside the text. The
-/// manifest's digests are computed only here, where it is asked for.
+/// parameter and fact digests are computed only here, where the manifest is
+/// asked for; an include's digest is taken as it is inlined, every walk,
+/// since its text is not kept.
 pub(crate) fn deliver_full(
     doc: &Document,
     granted: &BTreeSet<String>,
@@ -3847,25 +3849,29 @@ pub(crate) fn deliver_include(b: &Block, w: &mut Walk) -> Vec<String> {
         return unavailable();
     }
     w.include_bytes += text.len();
-    // The text is inlined from here on (S7): the manifest names it beside
-    // the bytes just counted, whether or not it then parses.
-    w.inlined(&id, &text);
     // End matter (S27) never arrives: the included document is parsed as a
     // document, which cuts it from the body it delivers.
     let Ok(d) = parse(&text) else {
         return unavailable();
     };
+    // Accounted for as inlined (S7) before it is delivered, so includes
+    // keep pre-order — and handed back unaccounted if it does not fold:
+    // text that degrades to the note was never inlined.
+    let before = w.inlined(&id, &text);
     let mut sub = w.include(&id, &d);
-    let inlined = fold_in(&d, &mut sub);
-    w.leave(sub);
-    match inlined {
-        Ok(ex) => ex
-            .cleaned
-            .trim_end_matches('\n')
-            .split('\n')
-            .map(str::to_string)
-            .collect(),
-        Err(_) => unavailable(),
+    match fold_in(&d, &mut sub) {
+        Ok(ex) => {
+            w.leave(sub);
+            ex.cleaned
+                .trim_end_matches('\n')
+                .split('\n')
+                .map(str::to_string)
+                .collect()
+        }
+        Err(_) => {
+            w.refused(sub, before);
+            unavailable()
+        }
     }
 }
 
@@ -4215,42 +4221,59 @@ pub(crate) fn substitute_line(
     while let Some(pos) = rest.find("${") {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + 2..];
-        if let Some(end) = after.find('}') {
-            let name = &after[..end];
-            match params.get(name) {
-                Some(val) => {
-                    let val = capped(val);
-                    met(name, Some(val));
-                    out.push_str(val);
-                }
-                None => {
-                    if is_placeholder_name(name) {
-                        met(name, None);
-                    }
-                    out.push_str("${");
-                    out.push_str(name);
-                    out.push('}');
-                }
-            }
-            rest = &after[end + 1..];
-        } else {
+        let len = placeholder_name_len(after);
+        // A placeholder is a name with its `}` right after it. Anything else
+        // — `${}`, `${a b}`, a `${` never closed — is text: the `${` is kept
+        // and the scan resumes just past it, so a placeholder inside it
+        // (`${a ${b}`) is still met, as the grammar's regex meets it.
+        if len == 0 || !after[len..].starts_with('}') {
             out.push_str("${");
             rest = after;
+            continue;
         }
+        let name = &after[..len];
+        match params.get(name) {
+            Some(val) => {
+                let val = capped(val);
+                met(name, Some(val));
+                out.push_str(val);
+            }
+            None => {
+                met(name, None);
+                out.push_str("${");
+                out.push_str(name);
+                out.push('}');
+            }
+        }
+        rest = &after[len + 1..];
     }
     out.push_str(rest);
     out
 }
 
-/// Whether `name` is a placeholder's, as the registry's
-/// `x-grammar.param` reads one: `[A-Za-z_][A-Za-z0-9_.-]*`.
-fn is_placeholder_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+/// The length of the placeholder name `s` opens with, 0 when it opens with
+/// none — the name `x-grammar.param` (`\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}`,
+/// `PARAM_GRAMMAR`) captures. All ASCII, so the length is a char boundary.
+fn placeholder_name_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    if !b
+        .first()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+    {
+        return 0;
+    }
+    1 + b[1..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+        .count()
 }
+
+/// The registry's `x-grammar.param`, which [`placeholder_name_len`] and
+/// [`substitute_line`] implement by hand (the crate has no regex engine); a
+/// test holds it to the vendored schema, so a re-vendor that changes the
+/// grammar fails there rather than silently changing signed manifests.
+#[cfg(test)]
+const PARAM_GRAMMAR: &str = r"\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}";
 
 /// The cap on one substituted value, in UTF-8 bytes (§3.5: a resolved value
 /// is "inserted as plain text, size-capped"), 2000 as the reference sets
@@ -7378,6 +7401,34 @@ steps:
                 .is_ok()
         );
         assert!(is_reference("@a-b/c.d_e") && !is_reference("@1a/b") && !is_reference("a/b"));
+    }
+
+    /// `x-grammar.param` is the grammar `placeholder_name_len` implements
+    /// by hand, and the scan meets what the regex meets: a placeholder
+    /// after a stray `${`, none in `${}`, `${a b}` or an unclosed `${x`.
+    #[test]
+    fn the_placeholder_scan_is_the_reference_grammar() {
+        let schema: Value = serde_json::from_str(schema_json()).unwrap();
+        assert_eq!(schema["x-grammar"]["param"].as_str(), Some(PARAM_GRAMMAR));
+        let params: BTreeMap<String, String> = [("b", "B"), ("c", "C"), ("a b", "no")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut met = Vec::new();
+        let out = substitute_line(
+            "Use ${a ${b} and ${ ${c} now, ${} ${a b} ${_x.y-z} ${9} ${x",
+            &params,
+            &mut |n, v| met.push((n.to_string(), v.map(str::to_string))),
+        );
+        assert_eq!(out, "Use ${a B and ${ C now, ${} ${a b} ${_x.y-z} ${9} ${x");
+        assert_eq!(
+            met,
+            [
+                ("b".to_string(), Some("B".to_string())),
+                ("c".to_string(), Some("C".to_string())),
+                ("_x.y-z".to_string(), None),
+            ]
+        );
     }
 
     /// Every pattern the registry carries is `x-grammar.attrRef`, which

@@ -839,13 +839,28 @@ fn registry_contents(uri: &str) -> serde_json::Value {
             "text": mock_jwks()}]});
     }
     let v2 = uri.ends_with("@next");
-    let text = if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC };
+    // `@narrow` serves version one with a delivery attestation that caps
+    // below the author's (`core` only): what a registry narrowing a
+    // document for one reader serves, and a verifier that intersects only
+    // the author's set would not see.
+    let narrow = uri.ends_with("@narrow");
     let version_id = if v2 { "ver_mock_2" } else { "ver_mock_1" };
+    let mut text = (if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC }).to_string();
+    // `@selfsigned` serves version one carrying its own author JWS in its
+    // front matter — the transport-independent form a file or OCI source
+    // carries. The author signs the §7.2 author digest, which excludes that
+    // line, so the JWS signed over the bare document is the one it carries.
+    if uri.ends_with("@selfsigned")
+        && let Some((author, _)) = mock_signatures(&text, version_id, MOCK_CAPABILITIES, 1)
+    {
+        text = text.replacen("---\n# ", &format!("signature: {author}\n---\n# "), 1);
+    }
+    let text = text.as_str();
     let mut meta = json!({
         "md.instruction/canonical": "instruction://ins_mock",
         "md.instruction/versionId": version_id,
         "md.instruction/revision": if v2 { 2 } else { 1 },
-        "md.instruction/ref": if v2 { "next" } else { "stable" },
+        "md.instruction/ref": uri.rsplit_once('@').map_or("stable", |(_, r)| r),
         "md.instruction/spec": "1",
         "md.instruction/publisher": MOCK_PUBLISHER,
         "md.instruction/resolution": "raw",
@@ -855,8 +870,17 @@ fn registry_contents(uri: &str) -> serde_json::Value {
     let digest = instruction_core::digest(text.as_bytes());
     meta["md.instruction/digest"] = json!(digest);
     meta["md.instruction/deliveredDigest"] = json!(digest);
-    if let Some((author, delivery)) = mock_signatures(text, version_id) {
+    let delivery_caps: &[&str] = if narrow { &["core"] } else { MOCK_CAPABILITIES };
+    if let Some((author, delivery)) = mock_signatures(text, version_id, delivery_caps, 1) {
         meta["md.instruction/signature"] = json!(author);
+        // `@reauthored` serves a second valid author signature over the same
+        // document (signed a moment later), not the one its delivery chains
+        // to.
+        if uri.ends_with("@reauthored")
+            && let Some((later, _)) = mock_signatures(text, version_id, delivery_caps, 2)
+        {
+            meta["md.instruction/signature"] = json!(later);
+        }
         meta["md.instruction/deliverySignature"] = json!(delivery);
         // The publisher kid describes the AUTHOR signature only; the delivery
         // JWS names its own key in its header.
@@ -902,9 +926,18 @@ fn mock_jwks() -> String {
     json!({"keys": []}).to_string()
 }
 
-/// `(author_jws, delivery_jws)` over this document, for the fixed test reader.
+/// What the mock's author attestation lets a document activate.
+const MOCK_CAPABILITIES: &[&str] = &["core", "compute"];
+
+/// `(author_jws, delivery_jws)` over this document, for the fixed test
+/// reader, the delivery capped at `delivery_caps`, both issued at `iat`.
 #[cfg(feature = "sign")]
-fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
+fn mock_signatures(
+    text: &str,
+    version_id: &str,
+    delivery_caps: &[&str],
+    iat: u64,
+) -> Option<(String, String)> {
     use crate::config::attest::{Claims, sign_kid};
     let digest = instruction_core::digest(text.as_bytes());
     let author = Claims {
@@ -913,9 +946,9 @@ fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
         doc: "instruction://ins_mock".into(),
         version: version_id.into(),
         digest: crate::config::attest::author_digest(text.as_bytes()),
-        capabilities: vec!["core".into(), "compute".into()],
+        capabilities: MOCK_CAPABILITIES.iter().map(|c| c.to_string()).collect(),
         publisher: MOCK_PUBLISHER.into(),
-        iat: 1,
+        iat,
         exp: u64::MAX / 2,
         aud: None,
         manifest: None,
@@ -926,6 +959,7 @@ fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
     let delivery = Claims {
         typ: "delivery".into(),
         digest,
+        capabilities: delivery_caps.iter().map(|c| c.to_string()).collect(),
         aud: Some("agent://mock-reader".into()),
         // The manifest the reference implementation accounts for this
         // delivery, in the signed form a registry embeds (S7) — not a
@@ -958,6 +992,6 @@ fn mock_manifest(text: &str) -> Option<instruction_core::Manifest> {
     )
 }
 #[cfg(not(feature = "sign"))]
-fn mock_signatures(_text: &str, _v: &str) -> Option<(String, String)> {
+fn mock_signatures(_text: &str, _v: &str, _caps: &[&str], _iat: u64) -> Option<(String, String)> {
     None
 }

@@ -654,9 +654,9 @@ impl RmcpClient {
     /// The revisions disagree: up to 2025-11-25 a client calls
     /// `resources/subscribe`, and from 2026-07-28 on `subscriptions/listen`
     /// replaces it (rmcp marks the former deprecated *for those versions
-    /// only*). Because this backend speaks whatever revision the SDK
-    /// negotiates, the choice must be read off the negotiated version rather
-    /// than hard-coded — calling the wrong one leaves the host with a
+    /// only*). Because the server's answer decides the revision a connection
+    /// speaks, the choice is read off the negotiated version rather than
+    /// hard-coded — calling the wrong one leaves the host with a
     /// subscription the server never honours.
     ///
     /// Either way the server must have advertised `resources.subscribe`: a
@@ -852,14 +852,14 @@ impl RmcpClient {
     }
 
     /// Does the negotiated revision define `subscriptions/listen`? Every
-    /// revision from 2026-07-28 on does — compared with `>=` exactly as rmcp's
-    /// own client decides the same question (`service/client.rs`), so a later
-    /// revision rmcp negotiates keeps the listen path rather than falling back
-    /// to a method that revision removed.
+    /// revision without an `initialize` does — rmcp's own predicate,
+    /// `has_initialize`, the one its client uses to choose the same lifecycle
+    /// (`service/client.rs`), so a later revision rmcp negotiates keeps the
+    /// listen path rather than falling back to a method that revision removed.
     fn listens(&self) -> bool {
         self.protocol_version
             .as_ref()
-            .is_some_and(|v| *v >= ProtocolVersion::V_2026_07_28)
+            .is_some_and(|v| !v.has_initialize())
     }
 
     /// What the listen pump reported since the last drain.
@@ -1000,8 +1000,9 @@ mod tests {
     fn the_handshake_offers_the_newest_revision_that_has_one() {
         // `initialize` offers 2025-11-25 because it is the newest revision
         // with an `initialize`, not because it is the SDK's default (that is
-        // 2026-07-28 now). The mock answers the revision agentd offers, so the
-        // two constants move together or this fails.
+        // 2026-07-28 now). agentd's mock answers `wire::PROTOCOL_VERSION`, so
+        // pinning it to the offer keeps the mock and the handshake on one
+        // revision.
         assert_eq!(INITIALIZE_OFFER, ProtocolVersion::LATEST_WITH_INITIALIZE);
         assert_eq!(INITIALIZE_OFFER, ProtocolVersion::V_2025_11_25);
         assert_eq!(crate::wire::PROTOCOL_VERSION, INITIALIZE_OFFER.as_str());

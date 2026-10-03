@@ -381,13 +381,13 @@ supplies — push callbacks, the `http` node, an AAuth person server.
 
 ### Which revision agentd speaks
 
-Whatever the SDK speaks. rmcp pins its `LATEST` at `2025-11-25` even though the
-newer constant exists — that is upstream saying what it is ready to speak, and
-overriding it would mean asking servers for a dialect the SDK may not fully
-implement. agentd gains the stateless revision on the release that promotes it,
-with no change here. The subscription mechanism follows the same rule:
-`resources/subscribe` at an older revision, `subscriptions/listen` at a stateless
-one, chosen from what was actually negotiated.
+agentd connects with `initialize` and offers `2025-11-25`: rmcp's
+`LATEST_WITH_INITIALIZE`, the newest revision that still has an `initialize`.
+It deliberately does not offer rmcp's `LATEST`, `2026-07-28`, because that
+revision has no `initialize` to offer it in. The server's answer decides the
+revision a connection speaks, and the subscription mechanism follows it:
+`resources/subscribe` at a revision with an `initialize`, `subscriptions/listen`
+at one without, chosen from what was actually negotiated.
 
 ### What agentd still owns
 

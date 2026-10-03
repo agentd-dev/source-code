@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The MCP client against a real server.
 //!
-//! Building on [`rmcp`] means inheriting spec-tracking from upstream, so these
-//! tests assert on the things that would silently break if the facade were
-//! wired wrong: that the revision on the wire is the one the SDK declares (not
-//! one we picked), that declared capabilities reach the handshake, and that
-//! tools and resources come back in agentd's own wire types.
+//! These tests assert on the things that would silently break if the facade
+//! were wired wrong: that the revision offered in `initialize` is the one agentd
+//! pins (rmcp's `LATEST_WITH_INITIALIZE`, 2025-11-25), not the SDK's default
+//! (its `LATEST`, 2026-07-28, which has no `initialize`), that declared
+//! capabilities reach the handshake, and that tools and resources come back in
+//! agentd's own wire types.
 //!
 //! It also pins the one SDK default agentd turns off: the SEP-2549 client
 //! response cache. A read here is a request to the server, every time, and a

@@ -191,10 +191,10 @@ fn spawn_mock() -> (String, Arc<Mutex<Seen>>) {
     (endpoint, seen)
 }
 
-// Scope: the handshake dialect belongs to the official SDK, which pins its
-// LATEST to the legacy revision — agentd speaks whatever revision the SDK
-// speaks, and gains the stateless (MODERN) one when the SDK does. Exercising a
-// dialect agentd does not implement would be testing the mocks, not agentd.
+// Scope: the handshake dialect belongs to the official SDK. agentd's
+// `initialize` offers 2025-11-25 (rmcp's LATEST_WITH_INITIALIZE), not the SDK's
+// LATEST (2026-07-28, which has no `initialize`); exercising a dialect agentd
+// does not connect with would be testing the mocks, not agentd.
 //
 // So what these cover is the part that is agentd's own: that a real server's
 // lifecycle works end to end over agentd's own credentialed transport, that

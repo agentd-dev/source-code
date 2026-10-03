@@ -248,7 +248,8 @@ and it is not yet published.
   URI it leaves out is refused rather than recorded as watched, and a
   re-listen that comes back narrower is said (`mcp.listen.narrowed`) and
   retried. This path serves MCP `2026-07-28` servers only, a revision agentd
-  does not negotiate yet (rmcp 3.1.2), so today only the tests reach it.
+  does not negotiate yet (its `initialize` still offers `2025-11-25`), so
+  today only the tests reach it.
 - **`resources/subscribe` needs the server's capability.** It was sent
   whether or not the server advertised `resources.subscribe`, though the docs
   said it never was, so a server that ignored it left a start or a wait

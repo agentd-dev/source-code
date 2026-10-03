@@ -13,12 +13,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The MCP revision agentd offers in `initialize`, and the one agentd's
-/// 2025-11-25 mock server answers. It is rmcp's
-/// `ProtocolVersion::LATEST_WITH_INITIALIZE` — the newest revision that still
-/// has an `initialize` — not rmcp's `LATEST`, which is 2026-07-28 and has none.
-/// The server's answer decides the revision a connection actually speaks; the
-/// pin to rmcp's constant is tested in `rmcp_client` and `tests/rmcp_backend.rs`.
+/// The MCP revision agentd's 2025-11-25 mock server answers to `initialize`.
+/// The handshake never reads it: what agentd offers is `INITIALIZE_OFFER` in
+/// `rmcp_client` (rmcp's `LATEST_WITH_INITIALIZE`). This copy exists as a
+/// `&str` because `ProtocolVersion::as_str` is not a `const fn`, so it cannot be
+/// derived from that constant; that the two are equal is tested in
+/// `rmcp_client::tests` and `tests/rmcp_backend.rs`.
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Method + notification names. Constants, so a typo is a compile error rather

@@ -1237,6 +1237,36 @@ id no pin covers. A folder is verified per file, before the documents combine.
 The attested capabilities CAP the grant: effective = grant ∩ ceiling ∩
 attested, so a signature can never widen what the operator gave.
 
+The author signature covers end matter. The author digest is the document's
+bytes with only the front-matter `signature:` line left out, so the closing
+`---` record (owners, approvals, review dates) is signed with the text, and
+editing it breaks the signature. An instruction's end matter and author
+notes never reach the model, from any source: a note is not parsed, end
+matter is the document's record, and delivery removes both.
+
+**Who DELIVERED it — a pinned `reader`.** A registry can resolve a document
+for one reader and sign that delivery. When a pin sets `reader`, agentd
+verifies the delivery attestation on every registry read, before anything
+interprets the bytes. It checks the audience, the expiry and the delivered
+digest. It checks the document id against the front-matter `id`. It checks
+the chain from the embedded resolution manifest's authored digest to the
+author signature the read carries, and the delivery ceiling within the
+author's. The effective set is then grant ∩ ceiling ∩ author ∩ delivery. The
+manifest a delivery embeds is the S7 signed form: the typed §7.4 manifest
+without `authored.version`, whose canonical bytes are RFC 8785 (JCS) JSON.
+The shape is strict. A delivery whose embedded manifest is not the S7
+shape, such as one missing `unresolved` or a `limits` count, is refused, and
+agentd reads no earlier shape. A registry that still embeds one fails
+verification wherever a pin sets `reader`.
+
+A §7 refusal carries its Appendix B code in `agentd-instruction`:
+`signature-typ-mismatch`, `audience-mismatch`, `digest-mismatch`,
+`manifest-dropped-missing`, `unpinned-publisher`,
+`delivery-ceiling-exceeded`, `wire-floor` or `ungranted-family`. A §7
+condition Appendix B has no row for, such as a JWS that does not parse or
+verify or an expired signature, carries `attestation`. The text agentd logs
+is the refusal's message, as before.
+
 **Who PUSHED it — `oci: {ref, cosign_key}`.** For an OCI artifact, the cosign
 signature beside it says which publisher pushed these bytes to this registry.
 agentd fetches it, verifies it against the configured public key, and checks

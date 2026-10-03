@@ -1,20 +1,50 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **instruction-core** — the reference implementation of the
 //! [Instruction Specification](https://github.com/instruction-md/specification)
-//! as a library.
+//! as a library: version 1, registry revision 1.1, with the S7 resolution
+//! manifest and S27 end matter.
 //!
-//! One Markdown file defines a whole agent. This crate turns such a document
-//! into a typed block tree ([`doc::parse`]) — author notes set aside unread,
-//! end matter split off as the document's record ([`doc::split_end_matter`])
-//! — validates it against the spec's own vendored JSON Schema registry
-//! (kinds, forms, grants, attribute values, the semantic rules, Appendix B
-//! refusal shapes), runs the §3.5 delivery pipeline
-//! byte-exactly ([`deliver`] — prose degraded, machinery acknowledged, `when`
-//! selected, includes transcluded, `${}` substituted last) with the §7.4
-//! resolution manifest accounting for it ([`Manifest`], S7), computes §7.2
-//! digests ([`digest()`]), reports the Appendix C advisories ([`advise()`]),
-//! and — behind the `sign` feature — verifies author/delivery JWS
-//! attestations ([`sign`]).
+//! One Markdown file defines a whole agent. This crate reads such a document
+//! against the spec's own vendored JSON Schema registry (kinds, forms,
+//! grants, keywords, labels, attribute values, the Appendix B refusals), so
+//! the parser cannot drift from the specification it implements.
+//!
+//! **The pipeline.** [`parse`] reads the block tree, and [`deliver`] turns it
+//! into the text one reader's model receives, byte-exactly (§3.5):
+//!
+//! - **Notes and end matter are removed.** An author note (`<!--` at column
+//!   0, S9) is never parsed and never delivered. End matter (a closing
+//!   `---` YAML block, S27) is the document's record: it is split off before
+//!   any block is read ([`doc::split_end_matter`]) and kept on
+//!   [`doc::Document::end_matter`].
+//! - **Variants are selected.** `when` keeps its body when its condition
+//!   matches the reader's facts and parameters, `unless` when it does not,
+//!   and `otherwise` when nothing in the run before it was kept (S10). A key
+//!   the reader was not given keeps the content.
+//! - **Overrides apply.** `overrides="kind/name"` keeps the named rule, and
+//!   its reason, out of the delivery (S24). A guardrail, or a rule stronger
+//!   than its overrider, is never overridden: refused in the same document,
+//!   kept in an included one.
+//! - **Every block is rendered once, from its block, in its document's label
+//!   style** (`bold`, `plain` or `tags`, S25). A rule delivers its label and
+//!   condition but never its name (S12, S15), a reason follows its rule
+//!   (S14), an example and an output stand their label on a line of their
+//!   own (S16, S17), machinery becomes its one acknowledgement line, and an
+//!   include is inlined in its own style.
+//! - **Typed parameters are substituted last.** `${name}` takes a value that
+//!   fits its declared type (S18), never inside fenced code, so a value is
+//!   never read again as Markdown.
+//!
+//! The same walk accounts for what it delivered in the §7.4 resolution
+//! manifest ([`Manifest`], S7): the authored digest, the parameters and
+//! facts used, the variants kept and dropped, the includes, the limits
+//! reached, and what was left unresolved or overridden.
+//! [`Manifest::signed_form`] is what a delivery attestation embeds, and
+//! [`Manifest::canonical`] its RFC 8785 bytes (S7 §3). The §7.2 digests
+//! ([`digest()`], [`author_digest`]) are in every build. [`advise()`]
+//! reports the Appendix C advisories, which never refuse a document and never
+//! change its delivery. Behind the `sign` feature, the `sign` module verifies
+//! author and delivery JWS attestations.
 //!
 //! agentd is the first consumer (its `config::idoc` module is a re-export of
 //! [`doc`], with the agentd-specific configuration folding layered on top);

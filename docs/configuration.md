@@ -757,6 +757,14 @@ sayable, which is why they are nested rather than validated.
 - Front matter belongs to a document, and the combination is **one** document:
   the first file's front matter is kept, and a later file's is dropped with a
   warning rather than left to read as prose in the middle of the text.
+- End matter (a closing `---` YAML block, the document's record) is each
+  file's own and is never delivered. Every file's but the last is split off
+  before the files are joined, without a warning; the last file's ends the
+  combined document and is read there exactly as that file's is read alone.
+  Malformed end matter in any file refuses the source, naming the file
+  (`… dir <dir>: <file>: end matter is not valid YAML: …`). A pinned
+  folder's per-file signatures are checked over each file's full bytes, end
+  matter included.
 - A folder that matches **nothing** is a refusal, not an empty instruction.
 
 This is the same folder source a [workflow entry](#61-where-definitions-come-from)
@@ -792,6 +800,13 @@ qualify, is an error at load. `mcp:` is
 instruction-only: an MCP resource is read *and subscribed* by the runtime's
 client, which does not exist yet at config load, so a child that needs one
 gets its own `agent.instruction`.
+
+`agent.prompt` drops its end matter from every source, `text:` and a literal
+included, with a warning naming `agent.prompt` and the lines dropped: a task
+typed at a terminal can end in a `---` block meant as text, so the drop is
+said. Malformed end matter refuses (`agent.prompt: end matter is not valid
+YAML: …`). Nothing else in a prompt is processed, since it is the task, not
+an instruction document.
 
 ### 5a.2 Refresh — `auto`, `off`, or a duration
 

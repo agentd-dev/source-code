@@ -2,7 +2,8 @@
 
 > **agentd is the reference implementation of the open
 > [Instruction Specification](https://github.com/instruction-md/specification)**
-> (owned by instruction.md, CC BY 4.0), version **1**. Machinery blocks carry a
+> (owned by instruction.md, CC BY 4.0), version **1**, registry revision
+> **1.1**, with the S7 resolution manifest and S27 end matter. Machinery blocks carry a
 > `!` sigil (`:::!workflow`, `:::!mcp`, …) so they can never be confused with
 > the prose blocks (`:::note`, `:::must`, …) that degrade into what the model
 > reads; a bare name that shadows a machinery kind is refused (`:::workflow`
@@ -16,8 +17,12 @@
 > `!policy` `!secret-ref`), compute (`!runtime` `!function` `!test` `!fixture`),
 > infra (`!git` `!volume` `!image`) and composition (`!agent`) — are each gated
 > behind an operator grant in `agent.document_capabilities` (the trust ladder;
-> fail-closed, restart-only). Any `:::`, `::`, or `## !kind` marker routes a
-> document to the parser; front matter may pin `spec: "1"` but need not. A
+> fail-closed, restart-only). A document goes through delivery when it holds
+> anything delivery renders, removes or refuses: a block, a keyword, alert or
+> `BECAUSE:` line, an inline reference (`[[kind/name]]`,
+> `[Label](#kind/name)`), a column-0 author note, front matter, or end matter.
+> Plain prose with none of these reaches the model byte for byte. Front matter
+> may pin `spec: "1"` but need not. A
 > document may be **signed** (§7) and pinned under `agent.instruction.trust` — see
 > [Signing and trust](#signing-and-trust) below. See the spec for the full
 > block reference and the delivery rules; the shapes here are the core kinds.
@@ -134,17 +139,23 @@ directive-carrying instruction: it declared its machinery explicitly — however
 the document was named, since the decision is made once the source has
 resolved.
 
-### `:::!skill{name, description, when}` — an inline skill
+### `:::!skill{name, description, trigger}` — an inline skill
 
 Skills are named instruction bundles, discovered from MCP servers and
 preloaded on `@skill:<name>` references. An inline skill needs no server at
 all — it is defined where it is used:
 
 ```text
-:::!skill{name=review description="how we review" when="reviewing PRs"}
+:::!skill{name=review description="how we review" trigger="reviewing PRs"}
 Check the tests before the diff. A missing test is a finding, not a nitpick.
 :::
 ```
+
+`trigger` says when the skill is for (S11): the model reads `[skill "review"
+is available — use it when reviewing PRs; reference it as @skill/review]`.
+`when` is its version-1 alias, and `trigger` wins when both are written. The
+catalogue holds the body as it would be delivered — rules labelled and never
+named, author notes stripped — not the raw text.
 
 It joins the catalogue like any discovered skill — progressive disclosure,
 hash-cached body, `@skill:review` from the instruction, a step, or a chat
@@ -153,10 +164,13 @@ operator wrote it closer to this agent than any server did.
 
 ### `:::context{title?}` and `:::example` — text with a stated role
 
-Model-facing, zero machinery: the fence is removed and the body kept, wrapped
-in `<reference>` / `<example>` tags — so the model sees an unambiguous
-boundary between *what to do*, *what is true*, and *what good output looks
-like*, instead of one undifferentiated wall of prose.
+Model-facing, zero machinery: the fence is removed and the body kept, under
+a boundary the model can see — a context is wrapped in `<reference>` tags,
+and an example is quoted under its own `**EXAMPLE:**` label (`**EXAMPLE
+(avoid):**` for one marked `avoid`), its body as written, with no keyword in
+it labelled and no reference degraded. So the model sees *what to do*, *what
+is true*, and *what good output looks like* apart, instead of one
+undifferentiated wall of prose.
 
 ## The whole agent from one document
 
@@ -226,8 +240,71 @@ naming the line.
 - **Nest by giving the outer fence more colons** — a `::::context` block can
   quote a literal `:::!workflow` without it being parsed.
 - Attributes: `key=value`, `key="quoted value with \" escapes"`, bare `flag`
-  (→ `"true"`).
+  (→ `"true"`). Keys are read in lower case (`{Name=x}` is `name`), and a
+  key written twice is refused.
 - The body is verbatim — its meaning belongs to the directive.
+
+## Revision 1.1 — what the prose can say
+
+agentd reads every construct registry revision 1.1 adds. The spec has the
+full rules; this is what each one does to the text the model reads, in the
+default bold label style.
+
+| Construct | Written | The model reads |
+|---|---|---|
+| author note (S9) | `<!--` at column 0, to the first line holding `-->` | nothing: a note is never parsed and never delivered, so a commented-out `:::!workflow` does not load |
+| named rule (S12) | `MUST[escalate]: page the on-call.` | `**MUST:** page the on-call.` The name is for `@must/escalate` and `[[must/escalate]]`, and is never delivered |
+| condition (S15) | `MUST (if the customer is on a paid plan): reply within an hour.` | `**MUST (if the customer is on a paid plan):** reply within an hour.` |
+| reason (S14) | a `BECAUSE:` paragraph after a rule, or `because=` on a container | `**BECAUSE:** …` on the line after the rule |
+| `SHOULD NOT` (S8) | `SHOULD NOT: …` or `:::should{not}` | `**SHOULD NOT:** …`, never `**SHOULD:**` |
+| `MAY`, `ALWAYS`, `AVOID` (S13) | as keywords | `**MAY:**`; `ALWAYS` and `AVOID` are aliases, delivered as `**MUST:**` and `**SHOULD NOT:**` |
+| `unless` / `otherwise` (S10) | `:::unless{model="x"}`, `:::otherwise` after a `when`/`unless` run | an `unless` body unless every key it names is known and matches; an `otherwise` body when nothing in the run before it was kept |
+| output (S17) | `:::output{format=json title="Reply"}` | `**OUTPUT (json) — Reply:**` on its own line, then the body; its `schema` is never delivered |
+| example to avoid (S16) | `:::example{avoid}` | `**EXAMPLE (avoid):**` on its own line, then the body as written |
+| typed parameter (S18) | `::param{name=limit type=number default=5}` | `${limit}` substituted only by a value that fits its type; one that does not leaves the placeholder |
+| override (S24) | `:::must{name=b overrides="must/a"}` | rule `b`; rule `a` and its reason are not delivered. A guardrail, or a rule stronger than its overrider, cannot be overridden |
+| label style (S25) | front matter `delivery: {labels: plain}` or `{labels: tags}` | `MUST: x`, or `<must>x</must>`; the default is bold |
+| end matter (S27) | a closing `---` YAML block after a blank line | nothing: it is the document's record (owners, approvals, changelog), and malformed end matter refuses the document |
+| `!eval` (S23) | `:::!eval{name=e target=@must/escalate}` with a YAML body | nothing: it is accepted and inert. It needs a name and a `target` that resolves, and it configures nothing. A bare `:::eval` is prose |
+
+A `${}` inside fenced code is not substituted. Machinery folds from the
+document's top level only: a `:::!tools` inside a `:::when` is refused, not
+ignored.
+
+### The facts a `when` or `unless` is decided by
+
+agentd answers three of the spec's context keys:
+
+- `host` is always `agentd`.
+- `model` is the model the agent's turns use by default, as the provider
+  receives it: `intelligence.default`, else `intelligence.model`, with a tier
+  resolved to its `model`.
+- `agent` is that model's family, when its id names one: `claude`, `gpt`
+  (`gpt-*` and `o1`/`o3`/`o4-…`), `gemini`, `llama` or `mistral`.
+
+`environment` and `locale` are not supplied, and neither is `agent` for a
+model id agentd does not recognise. A condition on a key that is not
+supplied keeps its content. The facts come from the operator's
+`intelligence` section, read before the document's `:::!config` merges under
+it, so a document cannot choose what its own variants are decided by. A
+subagent template, an OCI re-pull and a registry read are decided by the
+same facts as the agent's own instruction.
+
+### Delivered once
+
+Delivery is not idempotent: a second pass would read a fence or keyword line
+quoted in an example as a live rule, and a quoted `<!--` as a note. So
+agentd never delivers text that was already delivered.
+
+- **An instance child's instruction is delivered once, by the parent.** The
+  parent writes the template's delivered prose, with its params, into the
+  child's config, and the child uses that text as written.
+- **A registry's resolved read is used as delivered.** A read with
+  `md.instruction/resolution: resolved` is text the registry already
+  delivered for this reader: nothing is extracted from it, and nothing folds.
+  Its `md.instruction/deliveredDigest` must match the bytes served, or the
+  read is refused and the running instruction kept. A `raw` read, or one
+  with no resolution, is delivered by agentd.
 
 ## Reloading — edit the document, the agent follows
 
@@ -287,9 +364,9 @@ instruction as freely as you like; work in flight finishes as authored.
 
 - **Not a template language.** Directives declare; they do not compute.
   `{{config.*}}` folding and CEL live where they already live.
-- **Not full MyST.** No roles, no `:key:` option lines, no nested-directive
-  semantics — the container-fence subset is the whole grammar, parsed by a
-  couple of hundred lines of dependency-free code.
+- **Not full MyST.** No roles and no `:key:` option lines. The grammar is
+  the specification's (§3.2), read by `agentd-instruction` from the
+  vendored registry, with no Markdown or regex crate behind it.
 - **Not an escape from review.** A directive-carried workflow is config: it
   ships in the same file, diffs in the same review, and answers to the same
   immutability lock as everything else the operator deploys.

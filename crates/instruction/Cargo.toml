@@ -47,6 +47,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "Reference implementation of the Instruction Specification: parser, validator, delivery pipeline, and signature verification"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/agentd-dev/source-code"
 
 [lib]

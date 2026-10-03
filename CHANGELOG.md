@@ -18,6 +18,15 @@ a listen stream that ended, a subscribe that failed once and was never asked
 again. This is RFC 0045's P0. It adds no Events surface, and every fix has a
 test that fails on the old code.
 
+agentd also implements the Instruction Specification at revision 1.1, upstream
+345f275, with the S7 resolution manifest and S27 end matter. CI pins that
+revision, and both drift checks run against it. Documents gain author notes,
+end matter, named and conditional rules, reasons, `unless` and `otherwise`,
+typed parameters, overrides, label styles and `!eval`. Some delivered bytes of
+existing version-1 documents change too, and the entries below list each one.
+agentd-instruction 0.3.0 carries this work. Its API is breaking (see Crates),
+and it is not yet published.
+
 ### Security (breaking)
 
 - **A stream carries the taint of what feeds it, and a workflow that reads
@@ -303,9 +312,8 @@ test that fails on the old code.
   `---`, a YAML mapping and a closing `---` as its last lines. It is the
   document's record: a document with any block no longer delivers it, and
   end matter there that is not a YAML mapping refuses the document
-  (`end-matter-yaml`). A document with no block at all still reaches the
-  model as written, end matter included and unchecked, until the delivery
-  gate widens later in this release. A bare
+  (`end-matter-yaml`). A document with no block at all is held to the same
+  rule through the delivery gate below. A bare
   `:::eval` is prose, as is any machinery name registered after version 1
   (S23); `:::!eval` loads, needs a name and a `target=@kind/name` that
   resolves, and configures and delivers nothing. A value outside an
@@ -786,6 +794,10 @@ author digest, which excludes the front-matter `signature:` line, rather
 than the plain digest, so a registry document that carries its own
 signature verifies. The read's refusals carry their Appendix B codes, or `attestation`, and
 `instruction.verified` gains `capabilities`, the set the read admits.
+
+agentd-instruction 0.3.0 has a README: what the crate implements, the
+vendored revision and how to re-vendor it, the 0.3.0 API, its features, its
+refusal codes, and how to run conformance.
 
 ## v1.17.0 — A2A, and nothing beside it
 

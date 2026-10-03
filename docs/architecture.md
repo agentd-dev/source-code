@@ -96,7 +96,7 @@ them.
 |---|---|---|---|
 | `agentd-net` | `net` | 2,310 lines | HTTP/1.1 + SSE client, TLS, SSRF classifier, X.509 extraction |
 | `agentd-mcp` | `mcp` | 6,567 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
-| `agentd-instruction` | `instruction_core` | 6,691 lines | the Instruction Specification reference implementation: parser, validator, §3.5 delivery, §7 verification |
+| `agentd-instruction` | `instruction_core` | 15,252 lines | the Instruction Specification reference implementation (version 1, registry revision 1.1): parser, validator, §3.5 delivery, the §7.4 resolution manifest, Appendix C advisories, §7 verification |
 | `agentd-core` | `agentd` | ~89,000 lines | the engine: loop, supervisor, workflows, registry, config, state |
 | `agentd-cli` | bin `agentd` | 749 lines | argv dispatch and exit codes, nothing else |
 | `agentd-conformance` | — | — | black-box checks that drive the real binary |
@@ -124,7 +124,9 @@ external crates, every one optional and every one off by default: `ring` for
 `aauth`, `sign` and `oci`, `cel-interpreter` for `cel`, and the A2A stack behind
 `a2a` — `a2a-rs`, `buffa`, `buffa-types`, `tokio`, `axum`, `tokio-rustls`,
 `hyper`, `hyper-util`, `tower`, `async-trait`, `tokio-stream` and
-`futures-util`. `net`, `mcp` and `instruction` also contain **zero** `unsafe`;
+`futures-util`. `instruction` names `ring` unconditionally, for the §7.2
+digests its resolution manifest is made of, so `ring` is in every build of
+the engine. `net`, `mcp` and `instruction` also contain **zero** `unsafe`;
 in the engine every `unsafe` block outside `#[cfg(test)]` is libc FFI: thirty
 blocks across thirteen files, almost all of them signal handling, spawn, reaping,
 kill and cgroup work, plus the inotify watch and the termios juggling in

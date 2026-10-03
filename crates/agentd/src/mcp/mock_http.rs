@@ -852,7 +852,7 @@ fn registry_contents(uri: &str) -> serde_json::Value {
         "md.instruction/publisherKeys": "instruction://pub/mock/keys.json",
         "md.instruction/deliveryKeys": MOCK_DELIVERY_KEYS_URI,
     });
-    let digest = mock_digest(text.as_bytes());
+    let digest = instruction_core::digest(text.as_bytes());
     meta["md.instruction/digest"] = json!(digest);
     meta["md.instruction/deliveredDigest"] = json!(digest);
     if let Some((author, delivery)) = mock_signatures(text, version_id) {
@@ -865,15 +865,6 @@ fn registry_contents(uri: &str) -> serde_json::Value {
     }
     json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction",
         "text": text, "_meta": meta}]})
-}
-
-#[cfg(feature = "sign")]
-fn mock_digest(bytes: &[u8]) -> String {
-    crate::config::attest::digest(bytes)
-}
-#[cfg(not(feature = "sign"))]
-fn mock_digest(_bytes: &[u8]) -> String {
-    String::new()
 }
 
 #[cfg(feature = "sign")]
@@ -914,8 +905,8 @@ fn mock_jwks() -> String {
 /// `(author_jws, delivery_jws)` over this document, for the fixed test reader.
 #[cfg(feature = "sign")]
 fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
-    use crate::config::attest::{Authored, Claims, Manifest, Variants, sign_kid};
-    let digest = crate::config::attest::digest(text.as_bytes());
+    use crate::config::attest::{Claims, sign_kid};
+    let digest = instruction_core::digest(text.as_bytes());
     let author = Claims {
         spec: crate::config::attest::SPEC_CLAIM.into(),
         typ: "author".into(),
@@ -936,20 +927,11 @@ fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
         typ: "delivery".into(),
         digest,
         aud: Some("agent://mock-reader".into()),
-        manifest: Some(Manifest {
-            authored: Authored {
-                version: version_id.into(),
-                digest: crate::config::attest::author_digest(text.as_bytes()),
-            },
-            parameters: Vec::new(),
-            facts: Vec::new(),
-            variants: Variants {
-                kept: Vec::new(),
-                dropped: Vec::new(),
-            },
-            includes: Vec::new(),
-            limits: json!({}),
-        }),
+        // The manifest the reference implementation accounts for this
+        // delivery, in the signed form a registry embeds (S7) — not a
+        // hand-written one, which drifted from the shape a strict reader
+        // requires while every test against this mock passed.
+        manifest: Some(mock_manifest(text)?),
         author: Some(a_jws.clone()),
         ..author
     };
@@ -958,6 +940,22 @@ fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
         a_jws,
         sign_kid(&del_key, &delivery, Some(MOCK_DELIVERY_KID)).ok()?,
     ))
+}
+/// The §7.4 manifest of delivering `text` as the mock serves it — no
+/// parameters, no facts, nothing to include — in its signed form.
+#[cfg(feature = "sign")]
+fn mock_manifest(text: &str) -> Option<instruction_core::Manifest> {
+    let ctx = instruction_core::Context {
+        grants: instruction_core::doc::all_families(),
+        ..Default::default()
+    };
+    let doc = instruction_core::parse(text).ok()?;
+    Some(
+        instruction_core::deliver(&doc, &ctx)
+            .ok()?
+            .manifest
+            .signed_form(),
+    )
 }
 #[cfg(not(feature = "sign"))]
 fn mock_signatures(_text: &str, _v: &str) -> Option<(String, String)> {

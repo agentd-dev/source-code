@@ -114,9 +114,10 @@ aauth = ["tls", "dep:ring"]
 # Instruction attestation — §7 of the Instruction Specification: JWS compact
 # Ed25519 signatures over a document's authored/delivered digest, the
 # resolution manifest, and the trust-ladder ceiling. Reuses AAuth's Ed25519 +
-# base64url + SHA-256 — the SAME `ring` rustls already resolves, no new crate —
-# so it rides `aauth`. OFF by default; a binary that never verifies signed
-# documents carries none of it.
+# base64url — the SAME `ring` rustls already resolves, no new crate — so it
+# rides `aauth`. The digests and the manifest themselves are not behind it:
+# instruction-core computes them in every build. OFF by default; a binary
+# that never verifies signed documents carries no signature verification.
 sign = ["aauth", "instruction-core/sign"]
 # Instruction documents from an OCI artifact registry (RFC 0040): pull
 # `oci://registry/repo:tag[@sha256:…]` over the Distribution API v2 — token

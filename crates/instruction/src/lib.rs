@@ -10,9 +10,10 @@
 //! (kinds, forms, grants, attribute values, the semantic rules, Appendix B
 //! refusal shapes), runs the §3.5 delivery pipeline
 //! byte-exactly ([`deliver`] — prose degraded, machinery acknowledged, `when`
-//! selected, includes transcluded, `${}` substituted last), and — behind the
-//! `sign` feature — computes §7 digests and verifies author/delivery JWS
-//! attestations ([`sign`]).
+//! selected, includes transcluded, `${}` substituted last) with the §7.4
+//! resolution manifest accounting for it ([`Manifest`], S7), computes §7.2
+//! digests ([`digest()`]), and — behind the `sign` feature — verifies
+//! author/delivery JWS attestations ([`sign`]).
 //!
 //! agentd is the first consumer (its `config::idoc` module is a re-export of
 //! [`doc`], with the agentd-specific configuration folding layered on top);
@@ -36,6 +37,10 @@ pub use api::{Context, Delivery, deliver, parse, tree_json, validate};
 mod refusal;
 pub use refusal::{CODES, NON_CATALOGUE, Refusal, UNDETECTED};
 
-// The §7.4 manifest types are format, not crypto: always available, digest
-// STRINGS filled only when the `sign` feature computes them.
-pub use api::{Authored, Manifest, Variants};
+// The §7.4 manifest (S7) and the §7.2 digests it is made of are format, not
+// crypto: both in every build, so one delivery has one manifest whatever the
+// features. `sign` gates only JWS/Ed25519 verification.
+mod digest;
+mod manifest;
+pub use digest::{author_digest, digest, front_matter_id, strip_front_matter_signature};
+pub use manifest::{Authored, Fact, Include, Limits, Manifest, ParameterUse, Variants};

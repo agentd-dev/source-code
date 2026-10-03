@@ -35,8 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::doc::{
-    self, Block, BodyKind, Disposition, Document, Form, IncludeResolver, Node, Piece, registry,
+    self, Block, BodyKind, Disposition, Document, Extraction, Form, IncludeResolver, Node, Piece,
+    registry,
 };
+use crate::{Authored, Fact, Include, Limits, Manifest, ParameterUse, Variants};
 
 /// How labelled prose is delivered (S25), from the front matter's
 /// `delivery: {labels: bold|plain|tags}`. Each document chooses its own — an
@@ -71,9 +73,9 @@ impl Style {
 /// The state one delivery walk carries: what the reader is entitled to and
 /// the include recursion (shared down the include tree), what the document
 /// being walked declares (its own label style, parameters and facts), and
-/// what the whole delivery accounts for (the overrides and the bytes
-/// inlined). Private, so a later rule adds a field here instead of threading
-/// another argument through every renderer.
+/// what the whole delivery accounts for (the overrides, the bytes inlined,
+/// and the rest of its manifest). Private, so a later rule adds a field here
+/// instead of threading another argument through every renderer.
 pub(crate) struct Walk<'a> {
     pub(crate) granted: &'a BTreeSet<String>,
     /// The values `${name}` resolves to in this document (S18): each
@@ -107,6 +109,15 @@ pub(crate) struct Walk<'a> {
     pub(crate) overridden: Vec<String>,
     /// The bytes inlined from includes so far, over the whole delivery.
     pub(crate) include_bytes: usize,
+    /// What the whole delivery's manifest accounts for (S7), handed down to
+    /// each include's walk and back, so it is one account however deep the
+    /// includes go.
+    tally: Tally,
+    /// The variants this document kept and dropped, by their per-kind
+    /// counters (S7): an included document counts its own from 1 and
+    /// contributes none of them to the delivery's manifest.
+    variants: Variants,
+    counters: BTreeMap<String, u64>,
     /// How many bodies deep the renderer is in this document, and whether a
     /// body went past [`NESTING_CAP`]: the fold refuses the document then.
     nesting: usize,
@@ -122,6 +133,29 @@ pub(crate) struct Walk<'a> {
 /// refused rather than delivered in part. Counted per document: an include
 /// is its own.
 pub(crate) const NESTING_CAP: usize = 2 * doc::NESTING_CAP;
+
+/// What a delivery's manifest accounts for beyond its variants (S7), as the
+/// walk delivers it. Only the delivered text is accounted for: a dropped
+/// variant is never walked, a `form` lists its inputs without substituting
+/// its body, and a skill's catalogue body is walked with the tally set aside
+/// ([`skill_body`]).
+#[derive(Default)]
+struct Tally {
+    /// The facts a `when` or `unless` compared, kept or dropped, with the
+    /// value compared — across nested variants and included documents. A key
+    /// compared again records its latest value, as the reference's shared
+    /// map does.
+    facts: BTreeMap<String, String>,
+    /// Each parameter substituted, by name: its declared source and the
+    /// value used. The first use wins — one name, one entry.
+    parameters: BTreeMap<String, (String, String)>,
+    /// The placeholders a delivered line left as written.
+    unresolved: BTreeSet<String>,
+    /// Each transclusion, in pre-order as delivery met it.
+    includes: Vec<Include>,
+    /// The deepest include level reached; 0 when nothing was inlined.
+    include_depth: usize,
+}
 
 /// One `overrides` target a rule declares (S24), and where.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +196,9 @@ impl<'a> Walk<'a> {
             overrides: Vec::new(),
             overridden: Vec::new(),
             include_bytes: 0,
+            tally: Tally::default(),
+            variants: Variants::default(),
+            counters: BTreeMap::new(),
             nesting: 0,
             too_deep: false,
         };
@@ -175,8 +212,9 @@ impl<'a> Walk<'a> {
     /// its variants select on its own parameter values, never on the
     /// includer's, which were checked against no declaration of its. The
     /// overrides pending here go down with it; its own are added after them
-    /// and end with it. Hand it back with [`Walk::leave`].
-    pub(crate) fn include(&self, id: &str, doc: &Document) -> Walk<'a> {
+    /// and end with it. The delivery's tally goes down with it too, and its
+    /// variant counters start again. Hand it back with [`Walk::leave`].
+    pub(crate) fn include(&mut self, id: &str, doc: &Document) -> Walk<'a> {
         let mut seen = self.seen.clone();
         seen.insert(id.to_string());
         let mut w = Walk {
@@ -192,6 +230,9 @@ impl<'a> Walk<'a> {
             overrides: self.overrides.clone(),
             overridden: Vec::new(),
             include_bytes: self.include_bytes,
+            tally: std::mem::take(&mut self.tally),
+            variants: Variants::default(),
+            counters: BTreeMap::new(),
             nesting: 0,
             too_deep: false,
         };
@@ -201,12 +242,89 @@ impl<'a> Walk<'a> {
 
     /// Take back what an include's walk accounted for: which of the
     /// overrides pending here it found, the rules it overrode, the bytes it
-    /// inlined. Its own overrides end with it.
+    /// inlined, the tally. Its own overrides and variants end with it.
     pub(crate) fn leave(&mut self, sub: Walk) {
         let n = self.overrides.len();
         self.overrides = sub.overrides.into_iter().take(n).collect();
         self.overridden.extend(sub.overridden);
         self.include_bytes = sub.include_bytes;
+        self.tally = sub.tally;
+    }
+
+    /// Account for an include's text being inlined (S7): after the resolver
+    /// handed it over and the cycle, depth and byte caps let it through,
+    /// before it is delivered — its target as written, the digest of its
+    /// authored text, and the level it reaches.
+    pub(crate) fn inlined(&mut self, target: &str, text: &str) {
+        self.tally.includes.push(Include {
+            target: target.to_string(),
+            digest: crate::digest(text.as_bytes()),
+        });
+        self.tally.include_depth = self.tally.include_depth.max(self.depth + 1);
+    }
+
+    /// Account for a variant delivery met (S7): its per-kind counter in this
+    /// document, kept or dropped, and every fact its conditions compared.
+    fn variant(&mut self, b: &Block, kept: bool) {
+        let n = self.counters.entry(b.kind.clone()).or_default();
+        *n += 1;
+        let id = format!("{}#{n}", b.kind);
+        if kept {
+            self.variants.kept.push(id);
+        } else {
+            self.variants.dropped.push(id);
+        }
+        for (key, _) in doc::conditions(b) {
+            if let Some(value) = self.facts.get(key) {
+                self.tally.facts.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    /// The delivery's §7.4 manifest, once the walk of `doc` — the delivered
+    /// document — is done and folded into `ex`.
+    pub(crate) fn manifest(self, doc: &Document, ex: &Extraction) -> Manifest {
+        let Tally {
+            facts,
+            parameters,
+            mut unresolved,
+            includes,
+            include_depth,
+        } = self.tally;
+        // An override target found nowhere is unresolved too (S24).
+        unresolved.extend(ex.unfound_overrides.iter().cloned());
+        let mut overridden = ex.overridden.clone();
+        overridden.sort();
+        Manifest {
+            // A file reader knows no version; a registry sets it.
+            authored: Authored {
+                digest: crate::author_digest(doc.raw.as_bytes()),
+                version: None,
+            },
+            parameters: parameters
+                .into_iter()
+                .map(|(name, (source, value))| ParameterUse {
+                    name,
+                    source,
+                    value_digest: crate::digest(value.as_bytes()),
+                })
+                .collect(),
+            facts: facts
+                .into_iter()
+                .map(|(key, value)| Fact {
+                    key,
+                    value_digest: crate::digest(value.as_bytes()),
+                })
+                .collect(),
+            variants: self.variants,
+            includes,
+            limits: Limits {
+                include_depth: include_depth as u64,
+                include_bytes: self.include_bytes as u64,
+            },
+            unresolved: unresolved.into_iter().collect(),
+            overridden,
+        }
     }
 
     /// The overrides the document being walked declares that found their
@@ -221,9 +339,31 @@ impl<'a> Walk<'a> {
     }
 
     /// `${name}` substituted in one delivered line (§3.5 step 7): see
-    /// [`doc::substitute_line`].
-    fn sub(&self, line: &str) -> String {
-        doc::substitute_line(line, &self.params)
+    /// [`doc::substitute_line`]. Each placeholder is accounted for as it is
+    /// met (S7): a value substituted under its declared source, `static`
+    /// when undeclared; a placeholder left as written, unresolved.
+    fn sub(&mut self, line: &str) -> String {
+        let Walk {
+            params,
+            decls,
+            tally,
+            ..
+        } = self;
+        doc::substitute_line(line, params, &mut |name, value| match value {
+            Some(value) => {
+                let source = decls
+                    .get(name)
+                    .and_then(|d| d.get("source"))
+                    .map_or("static", String::as_str);
+                tally
+                    .parameters
+                    .entry(name.to_string())
+                    .or_insert_with(|| (source.to_string(), value.to_string()));
+            }
+            None => {
+                tally.unresolved.insert(name.to_string());
+            }
+        })
     }
 
     /// Take on what `doc` declares.
@@ -271,9 +411,14 @@ pub(crate) fn skill_body(b: &Block, lines: &[&str], w: &mut Walk) -> String {
     // overrides silence are not rules the delivered text left out. And a
     // catalogue body substitutes no parameter, as it never has: a skill's
     // text is the skill's, read when it is used.
+    // Nor is the catalogue the delivery's to account for in its manifest
+    // (S7): its variants, facts and includes are not the delivered text's.
     let overrides = std::mem::take(&mut w.overrides);
     let params = std::mem::take(&mut w.params);
     let (include_bytes, overridden) = (w.include_bytes, w.overridden.len());
+    let tally = std::mem::take(&mut w.tally);
+    let variants = std::mem::take(&mut w.variants);
+    let counters = std::mem::take(&mut w.counters);
     let body = if b.set_group.is_some() {
         // A set member's body is its entry's, which has no region of its own.
         let src: Vec<String> = b.body.split('\n').map(str::to_string).collect();
@@ -286,6 +431,9 @@ pub(crate) fn skill_body(b: &Block, lines: &[&str], w: &mut Walk) -> String {
     w.params = params;
     w.include_bytes = include_bytes;
     w.overridden.truncate(overridden);
+    w.tally = tally;
+    w.variants = variants;
+    w.counters = counters;
     body
 }
 
@@ -623,6 +771,14 @@ fn render(
             li += 1;
             continue;
         };
+        // A variant is accounted for where delivery meets it (S7), in
+        // pre-order: a kept one before the variants its body holds, and a
+        // dropped one's never, as its body is never walked.
+        if let Item::Block(b) = item
+            && matches!(b.kind.as_str(), "when" | "unless" | "otherwise")
+        {
+            w.variant(b, keep[si]);
+        }
         match item {
             Item::Note => {}
             Item::Inert => {
@@ -668,7 +824,7 @@ struct Prose {
 }
 
 impl Prose {
-    fn line(&mut self, l: &str, w: &Walk, degrade: bool) -> String {
+    fn line(&mut self, l: &str, w: &mut Walk, degrade: bool) -> String {
         match (self.in_code, doc::code_fence_len(l)) {
             (Some(open), Some(n)) if n == open => self.in_code = None,
             (None, Some(n)) => self.in_code = Some(n),
@@ -681,7 +837,7 @@ impl Prose {
 
     /// Quoted lines (an example, a `verbatim` body): no reference degraded,
     /// `${}` substituted outside their fenced code.
-    fn quoted(lines: Vec<String>, w: &Walk) -> Vec<String> {
+    fn quoted(lines: Vec<String>, w: &mut Walk) -> Vec<String> {
         let mut p = Prose::default();
         lines.iter().map(|l| p.line(l, w, false)).collect()
     }
@@ -2299,5 +2455,302 @@ mod tests {
         // A fragment link to a kind the registry does not know is a link.
         assert_eq!(degrade_inline("[x](#nope/y)"), "[x](#nope/y)");
         assert_eq!(degrade_inline("[[[must/a]]]"), "[a]");
+    }
+
+    // ── The S7 resolution manifest, accounted for by the delivery walk ──
+
+    /// A delivery's manifest with `params`, `facts` and `includes` (id →
+    /// text), every family granted.
+    fn manifest_of(
+        text: &str,
+        params: &[(&str, &str)],
+        facts: &[(&str, &str)],
+        includes: &[(&str, &str)],
+    ) -> Manifest {
+        let map = |kv: &[(&str, &str)]| -> BTreeMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let includes = map(includes);
+        let resolve = |id: &str| includes.get(id).cloned();
+        let ctx = crate::Context {
+            grants: all_families(),
+            params: map(params),
+            facts: map(facts),
+            resolve_include: Some(&resolve),
+        };
+        crate::deliver(&parse(text).unwrap(), &ctx)
+            .unwrap()
+            .manifest
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Variants are counted per kind in document order as delivery meets
+    /// them, kept and dropped each in encounter order: a kept variant before
+    /// those its body holds, a dropped one's never — nor the facts they
+    /// would have compared. An included document counts its own and adds
+    /// none, though the facts it compared are the delivery's.
+    #[test]
+    fn variants_are_counted_where_delivery_meets_them() {
+        let doc = "::::when{env=\"prod\"}\nProd.\n\n:::unless{tier=\"gold\"}\nNot gold.\n:::\n::::\n\n\
+                   ::::when{env=\"dev\"}\nDev.\n\n:::when{region=\"eu\"}\nNever met.\n:::\n::::\n\n\
+                   :::otherwise\nNeither.\n:::\n\n:::unless{tier=\"gold\" verbatim}\nAgain.\n:::\n\n\
+                   ::include{id=\"i\"}\n";
+        let m = manifest_of(
+            doc,
+            &[],
+            &[
+                ("env", "prod"),
+                ("tier", "gold"),
+                ("region", "eu"),
+                ("agent", "x"),
+                ("verbatim", "true"),
+            ],
+            &[("i", ":::when{agent=\"x\"}\nIncluded.\n:::\n")],
+        );
+        assert_eq!(m.variants.kept, strings(&["when#1"]));
+        assert_eq!(
+            m.variants.dropped,
+            strings(&["unless#1", "when#2", "otherwise#1", "unless#2"])
+        );
+        // `region` was compared only in a dropped subtree, `verbatim` is no
+        // condition; `agent` was compared by the include.
+        let keys: Vec<&str> = m.facts.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["agent", "env", "tier"]);
+        assert_eq!(m.facts[1].value_digest, crate::digest(b"prod"));
+    }
+
+    /// A fact is recorded only when the condition compared a known value: a
+    /// parameter whose value does not fit its type is no fact, and a key no
+    /// fact supplies was not compared.
+    #[test]
+    fn only_a_compared_value_is_a_recorded_fact() {
+        let m = manifest_of(
+            "::param{name=n type=number}\n\n:::when{n=\"1\"}\nA.\n:::\n\n:::when{unknown=\"x\"}\nB.\n:::\n",
+            &[("n", "lots")],
+            &[],
+            &[],
+        );
+        assert!(m.facts.is_empty(), "{:?}", m.facts);
+        assert_eq!(m.variants.kept, strings(&["when#1", "when#2"]));
+    }
+
+    /// Includes are recorded as they are inlined: pre-order, depth first, a
+    /// repeat twice, the target as written; bytes in UTF-8 over every
+    /// inlined text; the depth the deepest reached. A cycle, or a target
+    /// nothing resolves, inlines nothing and is not recorded.
+    #[test]
+    fn includes_are_accounted_as_they_are_inlined() {
+        let a = "A.\n\n::include{id=\"b\"}\n";
+        let b = "Café — ü.\n";
+        let c = "C.\n\n::include{id=\"c\"}\n";
+        let m = manifest_of(
+            "::include{id=\"a\"}\n\n::include{uri=\"instruction://ins_b\"}\n\n::include{id=\"a\"}\n\n\
+             ::include{id=\"c\"}\n\n::include{id=\"gone\"}\n",
+            &[],
+            &[],
+            &[("a", a), ("b", b), ("instruction://ins_b", b), ("c", c)],
+        );
+        let got: Vec<(&str, &str)> = m
+            .includes
+            .iter()
+            .map(|i| (i.target.as_str(), i.digest.as_str()))
+            .collect();
+        let (da, db, dc) = (
+            crate::digest(a.as_bytes()),
+            crate::digest(b.as_bytes()),
+            crate::digest(c.as_bytes()),
+        );
+        assert_eq!(
+            got,
+            [
+                ("a", da.as_str()),
+                ("b", db.as_str()),
+                ("instruction://ins_b", db.as_str()),
+                ("a", da.as_str()),
+                ("b", db.as_str()),
+                ("c", dc.as_str()),
+            ]
+        );
+        assert!(b.len() > b.chars().count(), "the sample is not ASCII");
+        assert_eq!(
+            m.limits,
+            Limits {
+                include_depth: 2,
+                include_bytes: (2 * a.len() + 3 * b.len() + c.len()) as u64,
+            }
+        );
+    }
+
+    /// Each parameter substituted in the delivered text is recorded once,
+    /// sorted, the first use winning, with its declared source — front
+    /// matter or `param` — or `static`, and the digest of the value used,
+    /// as capped. Text never delivered records nothing: a dropped variant, a
+    /// form's body, a skill's catalogue body.
+    #[test]
+    fn parameters_are_recorded_where_they_are_substituted() {
+        let long = "x".repeat(doc::PARAM_VALUE_BYTES_CAP + 10);
+        let doc = format!(
+            "---\nspec: \"1\"\nparameters:\n  - name: region\n    source: workspace\n    default: eu\n---\n\
+             ::param{{name=ticket source=prompt}}\n::param{{name=env default=prod}}\n::param{{name=big default=\"{long}\"}}\n\n\
+             Ship ${{env}} in ${{region}} for ${{ticket}}, ${{env}} again, ${{big}}.\n\n\
+             :::when{{env=\"dev\"}}\nOnly ${{secret}}.\n:::\n\n\
+             :::form{{title=\"Intake\"}}\nFill ${{hidden}}.\n:::\n\n\
+             :::!skill{{name=s}}\nUse ${{skillonly}} and ${{nothing}}.\n:::\n"
+        );
+        let m = manifest_of(
+            &doc,
+            &[
+                ("ticket", "T-1"),
+                ("secret", "s"),
+                ("hidden", "h"),
+                ("skillonly", "k"),
+            ],
+            &[],
+            &[],
+        );
+        let got: Vec<(&str, &str, String)> = m
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.source.as_str(), p.value_digest.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "big",
+                    "static",
+                    crate::digest(&long.as_bytes()[..doc::PARAM_VALUE_BYTES_CAP])
+                ),
+                ("env", "static", crate::digest(b"prod")),
+                ("region", "workspace", crate::digest(b"eu")),
+                ("ticket", "prompt", crate::digest(b"T-1")),
+            ]
+        );
+        assert!(m.unresolved.is_empty(), "{:?}", m.unresolved);
+    }
+
+    /// Decided where the spec leaves it open (a): what an included document
+    /// substitutes, and leaves unresolved, is the one delivery's — under its
+    /// own declarations, after the includer's first use of a name.
+    #[test]
+    fn an_includes_parameters_are_the_deliverys() {
+        let m = manifest_of(
+            "::param{name=env default=prod}\n\nIn ${env}.\n\n::include{id=\"i\"}\n",
+            &[],
+            &[],
+            &[(
+                "i",
+                "::param{name=env default=staging source=workspace}\n::param{name=own default=x source=prompt}\n\n\
+                 ${env}, ${own}, ${gone}.\n",
+            )],
+        );
+        let got: Vec<(&str, &str, String)> = m
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.source.as_str(), p.value_digest.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("env", "static", crate::digest(b"prod")),
+                ("own", "prompt", crate::digest(b"x")),
+            ]
+        );
+        assert_eq!(m.unresolved, strings(&["gone"]));
+    }
+
+    /// Decided (b): a placeholder in fenced code is neither substituted nor
+    /// recorded, resolvable or not.
+    #[test]
+    fn a_placeholder_in_fenced_code_is_not_accounted_for() {
+        let m = manifest_of(
+            "::param{name=env default=prod}\n\n```\n${env} ${nope}\n```\n",
+            &[],
+            &[],
+            &[],
+        );
+        assert!(m.parameters.is_empty(), "{:?}", m.parameters);
+        assert!(m.unresolved.is_empty(), "{:?}", m.unresolved);
+    }
+
+    /// Placeholders left as written are unresolved, sorted and once each; a
+    /// `${…}` the placeholder grammar does not admit is no placeholder.
+    #[test]
+    fn unresolved_placeholders_are_sorted_once_each() {
+        let m = manifest_of("Use ${b} ${a} ${b} ${} ${a b} ${_c.d-e}.\n", &[], &[], &[]);
+        assert_eq!(m.unresolved, strings(&["_c.d-e", "a", "b"]));
+    }
+
+    /// Decided (c): an `overrides` in a dropped variant adds nothing to
+    /// `overridden` or `unresolved`; delivered, it silences its target and
+    /// reports the one found nowhere.
+    #[test]
+    fn an_override_in_a_dropped_variant_is_not_accounted_for() {
+        let doc = "SHOULD[brevity]: be brief.\n\n::::when{env=\"dev\"}\n\
+                   :::must{name=m overrides=\"should/brevity, should/nowhere\"}\nM.\n:::\n::::\n";
+        let m = manifest_of(doc, &[], &[("env", "prod")], &[]);
+        assert!(m.overridden.is_empty(), "{:?}", m.overridden);
+        assert!(m.unresolved.is_empty(), "{:?}", m.unresolved);
+        let m = manifest_of(doc, &[], &[("env", "dev")], &[]);
+        assert_eq!(m.overridden, strings(&["should/brevity"]));
+        assert_eq!(m.unresolved, strings(&["should/nowhere"]));
+    }
+
+    /// `overridden` is sorted, and holds the rules silenced inside includes;
+    /// an unfound override target sorts among the unresolved placeholders.
+    #[test]
+    fn overridden_is_sorted_and_reaches_into_includes() {
+        let m = manifest_of(
+            "SHOULD[z]: z.\n\n::include{id=\"i\"}\n\n\
+             :::must{name=m overrides=\"should/z, should/a, should/gone\"}\nM ${p}.\n:::\n",
+            &[],
+            &[],
+            &[("i", "SHOULD[a]: a.\n")],
+        );
+        assert_eq!(m.overridden, strings(&["should/a", "should/z"]));
+        assert_eq!(m.unresolved, strings(&["p", "should/gone"]));
+    }
+
+    /// A skill's catalogue body is not the delivery: its variants, facts,
+    /// placeholders and includes are not in the manifest.
+    #[test]
+    fn a_skill_catalogue_body_is_not_accounted_for() {
+        let m = manifest_of(
+            "::::!skill{name=s}\nUse ${p} and ${q}.\n\n:::when{env=\"prod\"}\nP.\n:::\n\n\
+             ::include{id=\"one\"}\n::::\n",
+            &[("p", "1")],
+            &[("env", "prod")],
+            &[("one", "One.\n")],
+        );
+        assert_eq!(
+            m,
+            Manifest {
+                authored: m.authored.clone(),
+                ..Manifest::default()
+            }
+        );
+    }
+
+    /// The authored digest is the author digest of the raw document: its
+    /// front-matter signature line excluded, its end matter — never
+    /// delivered — included.
+    #[test]
+    fn the_authored_digest_covers_the_document_as_stored() {
+        let doc = "---\nspec: \"1\"\n---\nMUST: x.\n\n---\nowners: [ana]\n---\n";
+        let m = manifest_of(doc, &[], &[], &[]);
+        assert_eq!(m.authored.digest, crate::author_digest(doc.as_bytes()));
+        assert_eq!(m.authored.version, None);
+        let signed = doc.replacen("---\nMUST", "signature: a.b.c\n---\nMUST", 1);
+        assert_eq!(manifest_of(&signed, &[], &[], &[]).authored, m.authored);
+        let other_owner = doc.replace("ana", "bo");
+        assert_ne!(
+            manifest_of(&other_owner, &[], &[], &[]).authored,
+            m.authored
+        );
     }
 }

@@ -30,6 +30,11 @@ use std::path::{Path, PathBuf};
 
 use instruction_core::{Context, deliver, parse, tree_json};
 
+// The case reading the fixture dumper shares, so `dump` reproduces what this
+// runner compares.
+#[path = "support/corpus_case.rs"]
+mod corpus_case;
+
 /// The vendored fixtures — always present, so these tests always run.
 const CONFORMANCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformance");
 
@@ -73,61 +78,6 @@ fn inputs_of(suite: &str) -> &'static [&'static str] {
 /// closes them. Shrink-only: an entry that starts passing must be deleted
 /// here, and the test says so.
 const PENDING: &[&str] = &[
-    // The S7 resolution manifest — unit V7.
-    "corpus/author-notes/manifest.canonical.json",
-    "corpus/author-notes/manifest.json",
-    "corpus/coding-agent/manifest.canonical.json",
-    "corpus/coding-agent/manifest.json",
-    "corpus/conditions/manifest.canonical.json",
-    "corpus/conditions/manifest.json",
-    "corpus/deploy-runbook/manifest.canonical.json",
-    "corpus/deploy-runbook/manifest.json",
-    "corpus/end-matter/manifest.canonical.json",
-    "corpus/end-matter/manifest.json",
-    "corpus/eval/manifest.canonical.json",
-    "corpus/eval/manifest.json",
-    "corpus/examples-avoid/manifest.canonical.json",
-    "corpus/examples-avoid/manifest.json",
-    "corpus/house-style/manifest.canonical.json",
-    "corpus/house-style/manifest.json",
-    "corpus/labels-plain/manifest.canonical.json",
-    "corpus/labels-plain/manifest.json",
-    "corpus/labels-tags/manifest.canonical.json",
-    "corpus/labels-tags/manifest.json",
-    "corpus/named-rules/manifest.canonical.json",
-    "corpus/named-rules/manifest.json",
-    "corpus/nested-keyword/manifest.canonical.json",
-    "corpus/nested-keyword/manifest.json",
-    "corpus/orchestrator/manifest.canonical.json",
-    "corpus/orchestrator/manifest.json",
-    "corpus/output/manifest.canonical.json",
-    "corpus/output/manifest.json",
-    "corpus/overrides-house/manifest.canonical.json",
-    "corpus/overrides-house/manifest.json",
-    "corpus/overrides/manifest.canonical.json",
-    "corpus/overrides/manifest.json",
-    "corpus/param-flags/manifest.canonical.json",
-    "corpus/param-flags/manifest.json",
-    "corpus/parameter-types/manifest.canonical.json",
-    "corpus/parameter-types/manifest.json",
-    "corpus/permissions/manifest.canonical.json",
-    "corpus/permissions/manifest.json",
-    "corpus/reasons/manifest.canonical.json",
-    "corpus/reasons/manifest.json",
-    "corpus/research-agent/manifest.canonical.json",
-    "corpus/research-agent/manifest.json",
-    "corpus/should-not/manifest.canonical.json",
-    "corpus/should-not/manifest.json",
-    "corpus/skill-trigger/manifest.canonical.json",
-    "corpus/skill-trigger/manifest.json",
-    "corpus/spec-example/manifest.canonical.json",
-    "corpus/spec-example/manifest.json",
-    "corpus/support-agent/manifest.canonical.json",
-    "corpus/support-agent/manifest.json",
-    "corpus/variants/manifest.canonical.json",
-    "corpus/variants/manifest.json",
-    "corpus/verbatim/manifest.canonical.json",
-    "corpus/verbatim/manifest.json",
     // The S19 advisories — unit V9, which deletes this list.
     "advisories/empty-variant/advisories.json",
     "advisories/keyword-in-example/advisories.json",
@@ -322,27 +272,8 @@ fn the_shared_corpus_delivers_byte_exactly() {
     }
     let cases = cases("corpus", &mut ledger);
 
-    // Build the include resolver: front-matter `id` → document text, over the
-    // whole corpus.
-    let mut by_id: BTreeMap<String, String> = BTreeMap::new();
-    for dir in &cases {
-        let Ok(text) = std::fs::read_to_string(dir.join("doc.md")) else {
-            continue;
-        };
-        if let Ok(d) = parse(&text)
-            && let Some(id) = d.front.get("id").and_then(|v| v.as_str())
-        {
-            by_id.insert(id.to_string(), text.clone());
-            // Also index by the short id (`ins_x` and bare `x`).
-            if let Some(short) = id.rsplit('/').next() {
-                by_id.insert(short.to_string(), text.clone());
-                if let Some(bare) = short.strip_prefix("ins_") {
-                    by_id.insert(bare.to_string(), text);
-                }
-            }
-        }
-    }
-
+    // Includes resolve by front-matter `id` among the corpus documents.
+    let by_id = corpus_case::documents_by_id(&Path::new(CONFORMANCE).join("corpus"));
     let resolver = |id: &str| by_id.get(id).cloned();
     for dir in &cases {
         let name = case_name(dir);
@@ -350,24 +281,11 @@ fn the_shared_corpus_delivers_byte_exactly() {
         let Ok(text) = std::fs::read_to_string(dir.join("doc.md")) else {
             continue;
         };
-        let ctx_path = dir.join("context.json");
-        let ctx_v: serde_json::Value = if ctx_path.exists() {
-            serde_json::from_str(&std::fs::read_to_string(&ctx_path).unwrap()).unwrap()
-        } else {
-            serde_json::json!({})
-        };
-        let map_of = |key: &str| -> BTreeMap<String, String> {
-            ctx_v[key]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        };
+        let (params, facts) = corpus_case::context_of(&dir.join("context.json"));
         let ctx = Context {
             grants: instruction_core::doc::all_families(),
-            params: map_of("params"),
-            facts: map_of("facts"),
+            params,
+            facts,
             resolve_include: Some(&resolver),
         };
 
@@ -399,11 +317,12 @@ fn the_shared_corpus_delivers_byte_exactly() {
             },
         );
 
+        let delivery = deliver(&doc, &ctx);
         if dir.join("delivered.txt").exists() {
             let want = std::fs::read_to_string(dir.join("delivered.txt")).unwrap();
             ledger.record(
                 key("delivered.txt"),
-                match deliver(&doc, &ctx) {
+                match &delivery {
                     Ok(out) if out.text == want => Ok(()),
                     Ok(out) => Err(format!(
                         "delivered text differs (got {} bytes, want {})\n--- first diff ---\n{}",
@@ -411,7 +330,7 @@ fn the_shared_corpus_delivers_byte_exactly() {
                         want.len(),
                         first_diff(&want, &out.text)
                     )),
-                    Err(errs) => Err(format!("delivery refused: {}", refused(&errs))),
+                    Err(errs) => Err(format!("delivery refused: {}", refused(errs))),
                 },
             );
         }
@@ -428,17 +347,56 @@ fn the_shared_corpus_delivers_byte_exactly() {
                 },
             );
         }
-        // The §7 resolution manifest (S7) has no comparator in this crate yet;
-        // recording the artifact as failing keeps it on the PENDING ledger
-        // instead of out of sight.
-        for manifest in ["manifest.json", "manifest.canonical.json"] {
-            if dir.join(manifest).exists() {
-                ledger.record(key(manifest), Err("not compared yet — S7 (unit V7)".into()));
-            }
+        // The §7.4 resolution manifest (S7): `manifest.json` structure-exact,
+        // and byte-exact as the pretty form the fixtures are exported in;
+        // `manifest.canonical.json` byte-exact, the signed form.
+        if dir.join("manifest.json").exists() {
+            let want = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+            ledger.record(
+                key("manifest.json"),
+                match &delivery {
+                    Ok(out) => manifest_matches(&out.manifest, &want),
+                    Err(errs) => Err(format!("delivery refused: {}", refused(errs))),
+                },
+            );
+        }
+        if dir.join("manifest.canonical.json").exists() {
+            let want = std::fs::read(dir.join("manifest.canonical.json")).unwrap();
+            ledger.record(
+                key("manifest.canonical.json"),
+                match &delivery {
+                    Ok(out) if out.manifest.canonical().as_bytes() == want => Ok(()),
+                    Ok(out) => Err(format!(
+                        "canonical manifest differs\nwant: {}\n got: {}",
+                        String::from_utf8_lossy(&want),
+                        out.manifest.canonical()
+                    )),
+                    Err(errs) => Err(format!("delivery refused: {}", refused(errs))),
+                },
+            );
         }
     }
     eprintln!("shared corpus: {} cases", cases.len());
     ledger.finish("corpus");
+}
+
+/// A delivery's manifest against a `manifest.json`: the same structure, and
+/// — the fixtures being exported as pretty JSON with a closing newline —
+/// the same bytes.
+fn manifest_matches(got: &instruction_core::Manifest, want: &str) -> Result<(), String> {
+    let want_v: serde_json::Value = serde_json::from_str(want).unwrap();
+    let got_v = serde_json::to_value(got).unwrap();
+    if got_v != want_v {
+        return Err(format!("manifest differs\nwant: {want_v}\n got: {got_v}"));
+    }
+    let pretty = serde_json::to_string_pretty(got).unwrap() + "\n";
+    if pretty != want {
+        return Err(format!(
+            "manifest bytes differ\n--- first diff ---\n{}",
+            first_diff(want, &pretty)
+        ));
+    }
+    Ok(())
 }
 
 fn first_diff(want: &str, got: &str) -> String {

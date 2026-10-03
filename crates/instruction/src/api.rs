@@ -5,11 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::Refusal;
 use crate::doc::{self, Block, BodyKind, Disposition, Document, Form};
+use crate::{Manifest, Refusal};
 
 /// The delivery context: what this reader is entitled to and who it is.
 #[derive(Default)]
@@ -36,40 +35,6 @@ pub struct Delivery {
     pub manifest: Manifest,
 }
 
-/// The §7.4 resolution manifest. The digest STRINGS are filled only when the
-/// `sign` feature is built (they are empty otherwise, and a consumer that
-/// needs them enables the feature).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Manifest {
-    pub authored: Authored,
-    #[serde(default)]
-    pub parameters: Vec<Value>,
-    #[serde(default)]
-    pub facts: Vec<Value>,
-    pub variants: Variants,
-    #[serde(default)]
-    pub includes: Vec<Value>,
-    #[serde(default)]
-    pub limits: Value,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Authored {
-    pub version: String,
-    pub digest: String,
-}
-
-/// The `when` variants kept and dropped for this reader. `dropped` is REQUIRED
-/// on the wire (§7.4 rule 5): a reader must be able to tell content was
-/// withheld, or `when` is indistinguishable from censorship by a compromised
-/// resolver.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Variants {
-    #[serde(default)]
-    pub kept: Vec<String>,
-    pub dropped: Vec<String>,
-}
-
 /// Parse a document to its block tree, or return every problem found —
 /// fail-closed and specific, nothing half-parsed.
 pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
@@ -88,96 +53,20 @@ pub fn validate(document: &Document, ctx: &Context) -> Vec<Refusal> {
 }
 
 /// Run the §3.5 delivery pipeline: the byte-exact text one reader receives,
-/// plus the §7.4 manifest of every input that shaped it.
+/// plus the §7.4 manifest of every input that shaped it — both from the one
+/// walk, so the manifest accounts for exactly what the text delivered.
 pub fn deliver(document: &Document, ctx: &Context) -> Result<Delivery, Vec<Refusal>> {
     let resolve_none = |_: &str| -> Option<String> { None };
     let resolver: &dyn Fn(&str) -> Option<String> = match ctx.resolve_include {
         Some(r) => r,
         None => &resolve_none,
     };
-    let ex = doc::fold_full(document, &ctx.grants, &ctx.params, &ctx.facts, &resolver)?;
+    let (ex, manifest) =
+        doc::deliver_full(document, &ctx.grants, &ctx.params, &ctx.facts, &resolver)?;
     Ok(Delivery {
         text: ex.cleaned,
-        manifest: build_manifest(document, ctx, resolver),
+        manifest,
     })
-}
-
-/// The digest of some bytes, `sha256:<hex>` (§7.2). Empty without `sign`.
-pub fn digest(bytes: &[u8]) -> String {
-    #[cfg(feature = "sign")]
-    {
-        crate::sign::digest(bytes)
-    }
-    #[cfg(not(feature = "sign"))]
-    {
-        let _ = bytes;
-        String::new()
-    }
-}
-
-fn build_manifest(
-    document: &Document,
-    ctx: &Context,
-    resolver: &dyn Fn(&str) -> Option<String>,
-) -> Manifest {
-    let params_declared = doc::param_values(document, &ctx.params);
-    let mut when_facts = params_declared.clone();
-    for (k, v) in &ctx.facts {
-        when_facts.insert(k.clone(), v.clone());
-    }
-    let mut parameters = Vec::new();
-    // Every parameter that COULD have shaped the text: declared ones, plus
-    // explicit overrides. Values appear as digests, never as values (§7.4).
-    for (name, value) in &params_declared {
-        parameters.push(json!({"name": name, "value_digest": digest(value.as_bytes())}));
-    }
-    let mut kept = Vec::new();
-    let mut dropped = Vec::new();
-    let mut includes = Vec::new();
-    for b in document.blocks() {
-        match b.kind.as_str() {
-            "when" => {
-                let id = format!("when#{}", b.line);
-                if doc::variant_kept(b, &when_facts) {
-                    kept.push(id);
-                } else {
-                    dropped.push(id);
-                }
-            }
-            "include" => {
-                if let Some(id) = b.attrs.get("id").or_else(|| b.attrs.get("uri")) {
-                    let d = resolver(id)
-                        .map(|text| digest(text.as_bytes()))
-                        .unwrap_or_default();
-                    includes.push(json!({"uri": id, "digest": d}));
-                }
-            }
-            _ => {}
-        }
-    }
-    Manifest {
-        authored: Authored {
-            version: String::new(),
-            digest: authored_digest(document),
-        },
-        parameters,
-        facts: Vec::new(),
-        variants: Variants { kept, dropped },
-        includes,
-        limits: json!({"include_depth": 8}),
-    }
-}
-
-fn authored_digest(document: &Document) -> String {
-    #[cfg(feature = "sign")]
-    {
-        crate::sign::author_digest(document.raw.as_bytes())
-    }
-    #[cfg(not(feature = "sign"))]
-    {
-        let _ = document;
-        String::new()
-    }
 }
 
 /// The spec §9.1 block-tree dump — the shape the fixture corpus compares
@@ -363,10 +252,11 @@ mod tests {
         assert!(out.text.contains("Real work."), "{}", out.text);
         assert!(!out.text.contains("Rehearsal."), "staging variant dropped");
         assert!(out.text.contains("Use prod."), "param substituted last");
-        // The manifest accounts for the variants and the (unresolved) include.
-        assert_eq!(out.manifest.variants.kept, vec!["when#8".to_string()]);
-        assert_eq!(out.manifest.variants.dropped.len(), 1);
-        assert_eq!(out.manifest.includes[0]["uri"], "house");
+        // The manifest accounts for the variants by counter, and for no
+        // include: with no resolver nothing was inlined.
+        assert_eq!(out.manifest.variants.kept, ["when#1"]);
+        assert_eq!(out.manifest.variants.dropped, ["when#2"]);
+        assert!(out.manifest.includes.is_empty());
         // A refusal carries its line as data.
         let errs = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
         assert_eq!(errs[0].line, Some(1));

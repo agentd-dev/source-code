@@ -1848,7 +1848,7 @@ impl Runtime {
                 }
             }
             let claims = sign::verify_author(&jws, &key)?;
-            let want = sign::digest(raw.as_bytes());
+            let want = instruction_core::digest(raw.as_bytes());
             if claims.digest != want {
                 return Err(format!(
                     "{doc_id}: author signature covers {} but the delivered bytes hash to {want} — refuse",

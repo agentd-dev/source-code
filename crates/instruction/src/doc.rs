@@ -3660,6 +3660,22 @@ pub fn fold_full(
     fold_in(doc, &mut Walk::new(doc, granted, params, facts, resolve))
 }
 
+/// As [`fold_full`], with the §7.4 resolution manifest (S7) the same walk
+/// accounted for — what [`crate::deliver`] returns beside the text. The
+/// manifest's digests are computed only here, where it is asked for.
+pub(crate) fn deliver_full(
+    doc: &Document,
+    granted: &BTreeSet<String>,
+    params: &BTreeMap<String, String>,
+    facts: &BTreeMap<String, String>,
+    resolve: IncludeResolver,
+) -> Result<(Extraction, crate::Manifest), Vec<Refusal>> {
+    let mut w = Walk::new(doc, granted, params, facts, resolve);
+    let ex = fold_in(doc, &mut w)?;
+    let manifest = w.manifest(doc, &ex);
+    Ok((ex, manifest))
+}
+
 /// Fold one document of a delivery — the delivered one, or an include.
 fn fold_in(doc: &Document, w: &mut Walk) -> Result<Extraction, Vec<Refusal>> {
     let mut errs = Vec::new();
@@ -3831,6 +3847,9 @@ pub(crate) fn deliver_include(b: &Block, w: &mut Walk) -> Vec<String> {
         return unavailable();
     }
     w.include_bytes += text.len();
+    // The text is inlined from here on (S7): the manifest names it beside
+    // the bytes just counted, whether or not it then parses.
+    w.inlined(&id, &text);
     // End matter (S27) never arrives: the included document is parsed as a
     // document, which cuts it from the body it delivers.
     let Ok(d) = parse(&text) else {
@@ -3861,7 +3880,7 @@ pub(crate) fn deliver_include(b: &Block, w: &mut Walk) -> Vec<String> {
 pub(crate) fn variant_kept(b: &Block, facts: &BTreeMap<String, String>) -> bool {
     let mut all = true;
     let mut unknown = false;
-    for (k, allowed) in b.attrs.iter().filter(|(k, _)| *k != "verbatim") {
+    for (k, allowed) in conditions(b) {
         match facts.get(k) {
             None => unknown = true,
             Some(actual) => all &= allowed.split(',').any(|v| v.trim() == actual),
@@ -3872,6 +3891,13 @@ pub(crate) fn variant_kept(b: &Block, facts: &BTreeMap<String, String>) -> bool 
     } else {
         all
     }
+}
+
+/// A variant's conditions: its attributes, `key → admissible values`, less
+/// `verbatim`, which is how its body is delivered and compares nothing. One
+/// answer for selecting a variant and for the facts its manifest records.
+pub(crate) fn conditions(b: &Block) -> impl Iterator<Item = (&String, &String)> {
+    b.attrs.iter().filter(|(k, _)| *k != "verbatim")
 }
 
 /// A set of machinery delivers ONE line naming its members (§4.3 / Appendix A);
@@ -4174,7 +4200,16 @@ pub(crate) fn param_values(
 /// [`PARAM_VALUE_BYTES_CAP`]. An undeclared or unresolved `${x}` is left
 /// verbatim for the resolver to report. An inline code span is substituted:
 /// the corpus pins `` `${default_branch}` `` delivering `` `main` ``.
-pub(crate) fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> String {
+///
+/// `met` hears of each placeholder, for the manifest (S7): its name and the
+/// value inserted — capped, as delivered — or `None` for one left as
+/// written. A `${…}` whose name the placeholder grammar does not admit
+/// (`${}`, `${a b}`) is no placeholder, and is not heard of when left.
+pub(crate) fn substitute_line(
+    text: &str,
+    params: &BTreeMap<String, String>,
+    met: &mut dyn FnMut(&str, Option<&str>),
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
@@ -4183,8 +4218,15 @@ pub(crate) fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> 
         if let Some(end) = after.find('}') {
             let name = &after[..end];
             match params.get(name) {
-                Some(val) => out.push_str(capped(val)),
+                Some(val) => {
+                    let val = capped(val);
+                    met(name, Some(val));
+                    out.push_str(val);
+                }
                 None => {
+                    if is_placeholder_name(name) {
+                        met(name, None);
+                    }
                     out.push_str("${");
                     out.push_str(name);
                     out.push('}');
@@ -4198,6 +4240,16 @@ pub(crate) fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> 
     }
     out.push_str(rest);
     out
+}
+
+/// Whether `name` is a placeholder's, as the registry's
+/// `x-grammar.param` reads one: `[A-Za-z_][A-Za-z0-9_.-]*`.
+fn is_placeholder_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// The cap on one substituted value, in UTF-8 bytes (§3.5: a resolved value

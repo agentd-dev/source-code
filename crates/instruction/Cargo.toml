@@ -8,9 +8,10 @@
 # shim, with zero behaviour change) so the platform — publish-time
 # validation, resolved reads, a TypeScript twin sharing one fixture corpus —
 # consumes the same code agentd runs. Dependency posture matches agentd's
-# moat: serde + serde_json only; `ring` (already resolved by any TLS
-# consumer) appears only behind the `sign` feature for digests + Ed25519
-# verification.
+# moat: serde + serde_json, and `ring` (already resolved by any TLS consumer)
+# for the SHA-256 the §7.4 resolution manifest is made of — in every build,
+# so one delivery has one manifest whatever the features — and, behind the
+# `sign` feature, Ed25519 verification.
 #
 # Published to crates.io, because a published crate cannot depend on an
 # unpublished one: agentd-core embeds this parser, so agentd-core and
@@ -54,15 +55,15 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# §7 digests (sha256:<hex>) + JWS/Ed25519 signature verification, and the
-# digest fields of the resolution manifest. Off = the manifest carries empty
-# digest strings and verify is unavailable.
-sign = ["dep:ring"]
+# §7 JWS/Ed25519 signature verification (`sign::verify*`, `verify_document`,
+# `admit_family`, `Claims`). Digests and the resolution manifest are not
+# behind it: they are in every build.
+sign = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ring = { version = "0.17", optional = true }
+ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

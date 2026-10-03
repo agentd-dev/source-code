@@ -312,53 +312,12 @@ pub fn verify(jws: &str, public_key: &[u8], want_typ: &str) -> Result<Claims, St
     Ok(claims)
 }
 
-/// The resolution manifest (§7.4) — the attested account of how the delivered
-/// bytes were produced. Values appear as digests, not values.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Manifest {
-    pub authored: Authored,
-    #[serde(default)]
-    pub parameters: Vec<Value>,
-    #[serde(default)]
-    pub facts: Vec<Value>,
-    pub variants: Variants,
-    #[serde(default)]
-    pub includes: Vec<Value>,
-    #[serde(default)]
-    pub limits: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Authored {
-    pub version: String,
-    pub digest: String,
-}
-
-/// The `when` variants kept and dropped for this reader. `dropped` is REQUIRED
-/// (§7.4 rule 5): a reader must be able to tell that content was withheld, or
-/// `when` is indistinguishable from censorship by a compromised resolver — so
-/// there is deliberately no default, and a manifest that omits it is refused.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Variants {
-    #[serde(default)]
-    pub kept: Vec<String>,
-    pub dropped: Vec<String>,
-}
-
-/// Parse a resolution manifest from YAML, enforcing §7.4's shape (notably the
-/// required `variants.dropped`).
-pub fn parse_manifest(yaml: &str) -> Result<Manifest, String> {
-    let v = crate::config::yaml::parse(yaml).map_err(|e| format!("manifest: invalid YAML: {e}"))?;
-    serde_json::from_value(v).map_err(|e| {
-        if e.to_string().contains("dropped") {
-            "manifest: variants.dropped is REQUIRED (§7.4 rule 5) — a reader must be able to \
-             tell content was withheld"
-                .to_string()
-        } else {
-            format!("manifest: {e}")
-        }
-    })
-}
+/// The resolution manifest (§7.4, S7) — the attested account of how the
+/// delivered bytes were produced, values as digests. The reference
+/// implementation's types, so the shape a delivery embeds is the one the
+/// crate produces: strict, `variants.dropped` (§7.4 rule 5), `unresolved` and
+/// both `limits` counts required, and a manifest without one refused.
+pub use instruction_core::{Authored, Manifest, Variants};
 
 /// One pinned instruction source in operator configuration (§7.5) — the very
 /// type the config surface deserializes at `agent.instruction.trust`.
@@ -734,17 +693,10 @@ mod tests {
     fn manifest(dig: &str) -> Manifest {
         Manifest {
             authored: Authored {
-                version: "ver_01K003".into(),
                 digest: dig.into(),
+                version: Some("ver_01K003".into()),
             },
-            parameters: vec![],
-            facts: vec![],
-            variants: Variants {
-                kept: vec![],
-                dropped: vec![],
-            },
-            includes: vec![],
-            limits: Value::Null,
+            ..Manifest::default()
         }
     }
 
@@ -799,15 +751,24 @@ mod tests {
         assert!(e.contains("domain separation"), "{e}");
     }
 
+    /// The delivery manifest is the S7 shape: one that omits
+    /// `variants.dropped` (§7.4 rule 5) or `unresolved` is not a manifest,
+    /// so claims embedding it do not parse and the delivery is refused.
     #[test]
-    fn the_manifest_requires_variants_dropped() {
-        // dropped present → ok.
-        let ok = "authored: { version: v1, digest: \"sha256:aa\" }\nvariants: { kept: [], dropped: [when#1] }";
-        assert!(parse_manifest(ok).is_ok());
-        // dropped absent → refused, naming the rule.
-        let bad = "authored: { version: v1, digest: \"sha256:aa\" }\nvariants: { kept: [] }";
-        let e = parse_manifest(bad).unwrap_err();
-        assert!(e.contains("variants.dropped is REQUIRED"), "{e}");
+    fn the_manifest_requires_dropped_and_unresolved() {
+        let ok = serde_json::to_value(manifest("sha256:aa")).unwrap();
+        assert!(serde_json::from_value::<Manifest>(ok.clone()).is_ok());
+        let mut no_dropped = ok.clone();
+        no_dropped["variants"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dropped");
+        let mut no_unresolved = ok;
+        no_unresolved.as_object_mut().unwrap().remove("unresolved");
+        for bad in [no_dropped, no_unresolved] {
+            let e = serde_json::from_value::<Manifest>(bad).unwrap_err();
+            assert!(e.to_string().contains("missing field"), "{e}");
+        }
     }
 
     fn src() -> InstructionSource {

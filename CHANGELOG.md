@@ -439,6 +439,14 @@ test that fails on the old code.
   take a suspended run's callback. A `webhook` start `path` or a wait's
   `webhook.path` under `/hooks/_` is refused when the workflow is parsed,
   wherever it came from.
+- **The §7 delivery manifest is the S7 shape, and a delivery whose embedded
+  manifest is not is refused.** The manifest is typed: counter ids
+  (`when#1`, not a source line), each parameter's declared `source`, the
+  facts a variant compared, includes by `target`, `limits` with both
+  `include_depth` and `include_bytes` (UTF-8), and `unresolved`. Its signed
+  form is RFC 8785 JSON without `authored.version`. A registry that still
+  embeds the earlier shape (`limits: {}`, no `unresolved`) fails delivery
+  verification wherever a trust pin sets `reader`.
 
 ### Removed
 
@@ -546,6 +554,18 @@ limits, which Appendix B has no row for; new `NON_CATALOGUE` lists them with
 `region` in the document body (it was `(0, 0)`), and `Block` carries the
 layout of a container's body for delivery, so it can no longer be built
 outside the crate.
+
+agentd-instruction accounts for the §7.4 resolution manifest (S7) in the
+delivery walk, and the corpus's `manifest.json` and `manifest.canonical.json`
+are compared: the first by structure and as pretty bytes, the second byte for
+byte. `Manifest` is typed — new `ParameterUse`, `Fact`, `Include` and
+`Limits`; `Authored.version` is an `Option`, and every field §7.4 requires
+has no default — with `signed_form()` and `canonical()`, the RFC 8785 bytes
+a delivery attestation covers. Digests are in every build: `ring` is a
+normal dependency, `digest`, `author_digest`, `strip_front_matter_signature`
+and `front_matter_id` moved from `sign` to the crate root, and `sign` gates
+JWS/Ed25519 verification only. The `dump` example prints `canonical` too,
+and takes a corpus case directory, resolving includes as the runner does.
 
 ## v1.17.0 — A2A, and nothing beside it
 

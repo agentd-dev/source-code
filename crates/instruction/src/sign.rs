@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **§7 verification** — digests and JWS/Ed25519 attestation checks, feature
-//! `sign` (`ring`).
+//! **§7 verification** — JWS/Ed25519 attestation checks, feature `sign`.
 //!
 //! This is the VERIFY side the platform needs at publish and resolve time:
-//! `sha256:<hex>` digests (§7.2), the author digest that excludes a
-//! front-matter `signature:` line so a JWS can travel inside its own
-//! document, and author/delivery claim verification in the §7.6 order — a
+//! author/delivery claim verification in the §7.6 order, over the §7.2
+//! digests ([`crate::digest()`], [`crate::author_digest`]) every build has — a
 //! signature CAPS capability, never grants it, and every failure is a
 //! refusal, never a downgrade. Signing (an author key held in memory) is a
 //! deployment concern and lives with the consumer; agentd's
@@ -15,59 +13,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::Manifest;
+use crate::Manifest;
+use crate::digest::{digest, front_matter_id};
 
-/// The version claim every attestation carries (§7.2).
+/// The version claim every attestation carries (§7.2). It also versions the
+/// signed form of the manifest a delivery embeds (S7 §3): that form carries
+/// no discriminator of its own, so the revision the signer followed is the
+/// one this claim names, and a change to the shape or its canonical bytes
+/// must bring a discriminator inside the manifest.
 pub const SPEC_CLAIM: &str = "instruction/1";
 /// Families never admissible in a document that arrived over the wire (§7.8).
 pub const WIRE_FLOOR: &[&str] = &["compose", "identity"];
-
-/// `sha256:<hex>` of some bytes (§7.2).
-pub fn digest(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let d = ring::digest::digest(&ring::digest::SHA256, bytes);
-    let mut s = String::with_capacity(7 + 64);
-    s.push_str("sha256:");
-    for b in d.as_ref() {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// The author digest (§7.2): the stored bytes with the front-matter
-/// `signature:` line excluded, so the author JWS can ride in its own document.
-pub fn author_digest(doc: &[u8]) -> String {
-    digest(&strip_front_matter_signature(doc))
-}
-
-fn strip_front_matter_signature(doc: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(doc) else {
-        return doc.to_vec();
-    };
-    let Some(rest) = text.strip_prefix("---\n") else {
-        return doc.to_vec();
-    };
-    let Some(end) = rest.find("\n---") else {
-        return doc.to_vec();
-    };
-    let (front, body) = rest.split_at(end);
-    let kept: Vec<&str> = front
-        .split('\n')
-        .filter(|l| !l.starts_with("signature:"))
-        .collect();
-    format!("---\n{}{}", kept.join("\n"), body).into_bytes()
-}
-
-/// The front-matter `id`, which an attestation's `doc` claim must equal (§3.1).
-pub fn front_matter_id(doc: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(doc).ok()?;
-    let rest = text.strip_prefix("---\n")?;
-    let end = rest.find("\n---")?;
-    rest[..end].split('\n').find_map(|l| {
-        l.strip_prefix("id:")
-            .map(|v| v.trim().trim_matches('"').to_string())
-    })
-}
 
 /// An attestation's claims (§7.2). The three delivery-only fields (`aud`,
 /// `manifest`, `author`) are absent on an author attestation and REQUIRED on
@@ -291,7 +247,7 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Authored, Variants};
+    use crate::{Authored, author_digest};
 
     fn b64url_encode(b: &[u8]) -> String {
         const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -354,10 +310,9 @@ mod tests {
         let a_jws = sign_with(&[1; 32], &author_claims);
         let manifest = Manifest {
             authored: Authored {
-                version: "v1".into(),
                 digest: author_digest(doc),
+                version: Some("v1".into()),
             },
-            variants: Variants::default(),
             ..Manifest::default()
         };
         let delivery_claims = Claims {

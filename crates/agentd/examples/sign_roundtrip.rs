@@ -12,7 +12,7 @@
 #[cfg(feature = "sign")]
 fn main() {
     use agentd::aauth::AgentKey;
-    use agentd::config::attest::{self, Authored, Claims, Manifest, Variants};
+    use agentd::config::attest::{self, Claims};
     use serde_json::Value;
 
     let path = std::env::args()
@@ -52,20 +52,20 @@ fn main() {
     };
     let author_jws = attest::sign(&author, &author_claims).unwrap();
 
-    let manifest = Manifest {
-        authored: Authored {
-            version: version.into(),
-            digest: authored_digest.clone(),
-        },
-        parameters: vec![],
-        facts: vec![],
-        variants: Variants {
-            kept: vec![],
-            dropped: vec![],
-        },
-        includes: vec![],
-        limits: serde_json::json!({ "include_depth": 0, "include_bytes": bytes.len() }),
+    // The resolution manifest of this delivery, as the reference
+    // implementation accounts for it (§7.4, S7) — no parameters, no facts and
+    // no include resolver, so nothing is inlined — in the signed form a
+    // delivery attestation embeds.
+    let text = String::from_utf8(bytes.clone()).expect("the document is UTF-8");
+    let parsed = instruction_core::parse(&text).expect("the document parses");
+    let ctx = instruction_core::Context {
+        grants: instruction_core::doc::all_families(),
+        ..Default::default()
     };
+    let manifest = instruction_core::deliver(&parsed, &ctx)
+        .expect("the document delivers")
+        .manifest
+        .signed_form();
 
     let delivery_claims = Claims {
         spec: attest::SPEC_CLAIM.into(),

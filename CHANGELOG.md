@@ -593,13 +593,49 @@ code, severity, message}`, sorted by line and then code, for the fourteen
 Appendix C codes. New `Severity` (`warning`, `info`) and `ADVISORY_CODES`,
 the code and severity table, which a test holds to Appendix C. The message
 carries its `line N:` prefix, as `advisories.json` does. Advisories read
-the document and change neither its parse nor its delivery. They cover
-prose only, so nothing is reported inside front or end matter, fenced code,
-a machinery block or an author note. That includes a note in a block's body,
-which the reference implementation still scans (to be raised upstream).
-A section's child `Block`
-now carries its `region` in the document body, as a container's child
-does. The `dump` example prints `advisories`.
+the document and change neither its parse nor its delivery. The line scans
+(near-miss keywords, orphan reasons, keywords in examples, wiki-links,
+sigil schemes and undeclared parameters) read prose only, never front or
+end matter, fenced code, a machinery body or an author note. The block
+checks (variant keys and groups, a skill's `when`, overrides and parameter
+declarations) apply wherever the block is, inside a machinery body too.
+Three choices here depart from the reference implementation's `advise.ts`
+and are to be raised upstream. First, an author note in a block's or a
+set's body counts as a note: the line scans skip it, and between two
+variants it is transparent, as a top-level note is, so a `when`, a note and
+an `otherwise` inside a container are one group with no `orphan-otherwise`.
+`advise.ts` (and the Go and Python ports) scan such a note as prose and
+report the `otherwise` as an orphan, though their own delivery keeps the
+two as one group. Second, a `when` or `unless` with several unknown keys
+reports them in name order, as the Go port does, where `advise.ts` and the
+Python port use source order. Third, `skill-when-alias` also fires on a
+bare `when` flag, because a bare flag is read as `when=""`; the reference
+ports report only a string value. A section's child `Block` now carries its
+`region` in the document body, as a container's child does. The `dump`
+example prints `advisories`.
+
+Attribute keys are read in lower case, as §3.2 makes canonical (breaking).
+`{Name=x}` is `name` in the tree and the delivery, `{name=a Name=b}` is
+refused as `repeated-attribute`, and `:::when{HOST="x"}` selects on the
+`host` fact. A not-a-key message still quotes the token as it was typed.
+
+Nesting is fence-length containment (§3.3 rule 4; breaking). Inside a block
+opened with `:::`, an opener of three colons or more is a line of the body,
+not a nested block, and the first `:::` closes the outer block. Only a
+longer outer fence (`::::`) contains a `:::` block. Before, any opener
+nested, so tree, delivery and advisories differed from the reference on
+such documents. The tree and advisories now match it. Delivery still labels
+a rule lifted from such a body (`**MUST:** q`), as the tree says it is one.
+The reference delivers a kept variant by parsing its body again on its own,
+where the stray opener runs unclosed and the rule is left unlabelled. This
+is to be raised upstream with a conformance case. §3.1.1's scanner reads
+fences the same way.
+
+A front-matter parameter value that is a list is read as the reference's
+`String()` renders it, joined by a bare comma (`[1, 2]` is `1,2`). This
+applies to the default a `${x}` resolves to and to the `param-default-type`
+message. A form's `one of:` lists a parameter's values trimmed and joined by
+`, `, whether they were written as `values="a,b"` or as a YAML list.
 
 agentd's §7 verification is the crate's: `config::attest` re-exports
 `Claims`, `SPEC_CLAIM`, `WIRE_FLOOR`, `Verified`, `verify`,

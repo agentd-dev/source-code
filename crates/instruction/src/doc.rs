@@ -651,11 +651,13 @@ pub struct Block {
     /// `body`, which excludes lifted children; delivery reads the source.
     pub raw_body: Option<String>,
     /// The block's line region (0-based, inclusive) in the lines it was read
-    /// from: the document body for a top-level block or a container's child,
-    /// the body itself for a block delivery found reading one again. Delivery
-    /// replaces exactly this region with the block's delivered form, leaving
-    /// every other line untouched (§3.5 layout). A rule's region covers the
-    /// reason that follows it.
+    /// from: the document body for a top-level block, a container's child or
+    /// a section's child, the body itself for a block delivery found reading
+    /// one again. Delivery replaces exactly this region with the block's
+    /// delivered form, leaving every other line untouched (§3.5 layout) —
+    /// except a section's child's, which only [`crate::advise()`] reads to
+    /// place it: delivery reads a section's body again. A rule's region
+    /// covers the reason that follows it.
     pub region: (usize, usize),
     /// The lines of the rule's `BECAUSE:` paragraph (S14; 0-based body
     /// lines, inclusive), when one follows it. Its text is `attrs.because`.
@@ -1622,7 +1624,10 @@ fn collect_body(
         }
         // A nested container or set — recurse; an inert one's body is this
         // body's text, fences dropped, as the reference parser reads it.
-        if let Some(of) = open_fence(line) {
+        // Nesting is fence-length containment (§3.3 rule 4): only a SHORTER
+        // fence opens inside this one. An opener as long as ours is a line of
+        // this body, and the first close of that length is ours.
+        if let Some(of) = open_fence(line).filter(|of| of.len < open_len) {
             match parse_fenced(lines, i, of, line_base, lines.len(), depth + 1, errs) {
                 Fenced::Blocks {
                     blocks,
@@ -2465,14 +2470,19 @@ fn parse_attrs(src: &str, kind: &str, line_no: usize) -> (BTreeMap<String, Strin
             chars.next();
             continue;
         }
-        let mut key = String::new();
+        let mut typed = String::new();
         while let Some(&c) = chars.peek() {
             if c == '=' || c.is_whitespace() {
                 break;
             }
-            key.push(c);
+            typed.push(c);
             chars.next();
         }
+        // §3.2: keys are case-insensitive and lower-case is canonical, so
+        // `{Name=x}` IS `name`, and `{name=a Name=b}` repeats it. Everything
+        // downstream (the tree, `when` selection, the advisories) reads the
+        // canonical key; only the not-a-key message quotes what was typed.
+        let key = typed.to_lowercase();
         if key.is_empty() {
             errs.push(Refusal::at(
                 line_no,
@@ -2498,7 +2508,7 @@ fn parse_attrs(src: &str, kind: &str, line_no: usize) -> (BTreeMap<String, Strin
                     line_no,
                     "malformed-attributes",
                     format!(
-                        "attributes: expected key=value, found {key:?} — quote values with spaces"
+                        "attributes: expected key=value, found {typed:?} — quote values with spaces"
                     ),
                 ));
             }
@@ -2842,7 +2852,9 @@ fn scanner_reaches(lines: &[&str], from: usize, to: usize) -> bool {
             k += 1;
             continue;
         }
-        if let Some(of) = open_fence(l) {
+        // Fence-length containment (§3.3 rule 4), as the body walk reads it:
+        // an opener no shorter than the open container's is a body line.
+        if let Some(of) = open_fence(l).filter(|of| stack.last().is_none_or(|(n, _)| of.len < *n)) {
             if of.sigil && stack.is_empty() {
                 section = None;
             }
@@ -4046,8 +4058,20 @@ pub(crate) fn form_lines(
             if d.get("required").map(|v| v != "false").unwrap_or(false) {
                 segs.push("required".into());
             }
-            if let Some(values) = d.get("values").filter(|s| !s.is_empty()) {
-                segs.push(format!("one of: {values}"));
+            // The values as a list, whether written `values="a,b"` or as a
+            // YAML list: each trimmed, listed with ", ", as the reference
+            // lists `p.values`.
+            let values: Vec<&str> = d
+                .get("values")
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !values.is_empty() {
+                segs.push(format!("one of: {}", values.join(", ")));
             }
             if let Some(def) = d.get("default").filter(|s| !s.is_empty()) {
                 segs.push(format!("default: {def}"));
@@ -4156,10 +4180,13 @@ pub(crate) struct ParamDeclaration {
 /// twice, so a reader that keeps the last has [`param_decls`]' answer, and
 /// the advisories also know where each one is written.
 pub(crate) fn param_declarations(doc: &Document) -> Vec<ParamDeclaration> {
+    // A front-matter value as the reference's `String(v)` renders it: a list
+    // joins with a bare comma (`[1, 2]` is "1,2"), in the default a `${x}`
+    // resolves to and in the advisory that quotes it alike.
     fn text(v: &Value) -> String {
         match v {
             Value::String(s) => s.clone(),
-            Value::Array(items) => items.iter().map(text).collect::<Vec<_>>().join(", "),
+            Value::Array(items) => items.iter().map(text).collect::<Vec<_>>().join(","),
             other => other.to_string(),
         }
     }
@@ -6000,6 +6027,44 @@ steps:
     /// `unless` and `otherwise` select (S10): with the condition's fact
     /// matching, the `unless` is dropped and its `otherwise` kept; with it
     /// not matching, the reverse. Whichever is selected, the body arrives
+    /// A section's children carry their regions in the document body, as a
+    /// container's do: a fenced child from its opener to its close, a leaf
+    /// its own line. The advisories place a section's variants by them.
+    #[test]
+    fn a_sections_children_carry_their_body_regions() {
+        let b = only_block("## !skill tone\n\n::param{name=p}\n\n:::when{agent=\"a\"}\nC.\n:::\n");
+        assert_eq!(
+            b.children
+                .iter()
+                .map(|c| (c.kind.as_str(), c.region))
+                .collect::<Vec<_>>(),
+            [("param", (2, 2)), ("when", (4, 6))]
+        );
+    }
+
+    /// Attribute keys are case-insensitive and lower-case is canonical
+    /// (§3.2): `{Name=x}` is `name` in the tree, a key written twice in two
+    /// casings is repeated, and `when{HOST=…}` selects on the `host` fact.
+    #[test]
+    fn attribute_keys_are_read_in_lower_case() {
+        let b = only_block(":::note{Name=x}\nhi\n:::");
+        assert_eq!(b.attrs.keys().collect::<Vec<_>>(), ["name"]);
+        let e = parse(":::must{name=a Name=b}\nhi\n:::").unwrap_err();
+        assert_eq!(
+            (e[0].code, e[0].message.as_str()),
+            ("repeated-attribute", "attribute \"name\" is repeated")
+        );
+        // A bare key that is no flag is quoted as it was typed.
+        let e = parse(":::must{title=on Call}\nhi\n:::").unwrap_err();
+        assert!(e[0].message.contains("found \"Call\""), "{e:?}");
+        let doc = parse(":::when{HOST=\"other\"}\nW.\n:::\n:::otherwise\nO.\n:::\n").unwrap();
+        let facts: BTreeMap<String, String> = [("host".into(), "claude-code".into())].into();
+        let out = fold_full(&doc, &all_families(), &BTreeMap::new(), &facts, &|_| None)
+            .unwrap()
+            .cleaned;
+        assert_eq!(out, "O.\n");
+    }
+
     /// unwrapped and the parameter after them still resolves.
     #[test]
     fn unless_and_otherwise_select_their_body() {
@@ -6778,7 +6843,7 @@ steps:
             parse(":::when{agent=y}\nNEVER[cap]: exceed it.\n:::\n\nSee [[never/cap]].").is_ok()
         );
         assert!(
-            parse(":::when{agent=y}\n:::!workflow{name=w}\nsteps: {}\n:::\n:::\n\n:::!skill{name=s may=@workflow/w}\nx\n:::")
+            parse("::::when{agent=y}\n:::!workflow{name=w}\nsteps: {}\n:::\n::::\n\n:::!skill{name=s may=@workflow/w}\nx\n:::")
                 .is_ok()
         );
         // A sub-block's name is scoped to its parent: two tests may each
@@ -6919,16 +6984,20 @@ steps:
     }
 
     /// Blocks nest inside at most NESTING_CAP others; one deeper is refused
-    /// at its line, and nothing inside it is opened — fences of one length
-    /// nest, so ten thousand `:::when` lines once overflowed the stack.
+    /// at its line, and nothing inside it is opened — so however deep a
+    /// document nests (each level one colon shorter, §3.3 rule 4), the walk
+    /// recurses no deeper than the cap.
     #[test]
     fn blocks_nest_at_most_the_cap() {
+        // `n` blocks, the outermost fence longest and the innermost `:::`.
         let nest = |n: usize| {
-            format!(
-                "{}Deep.\n{}",
-                ":::when{a=\"1\"}\n".repeat(n),
-                ":::\n".repeat(n)
-            )
+            let fence = |k: usize| ":".repeat(3 + n - 1 - k);
+            let mut s: String = (0..n)
+                .map(|k| format!("{}when{{a=\"1\"}}\n", fence(k)))
+                .collect();
+            s.push_str("Deep.\n");
+            s.extend((0..n).rev().map(|k| format!("{}\n", fence(k))));
+            s
         };
         assert!(parse(&nest(NESTING_CAP + 1)).is_ok());
         let errs = parse(&nest(NESTING_CAP + 2)).unwrap_err();
@@ -6936,8 +7005,53 @@ steps:
             errs.iter().map(|r| (r.line, r.code)).collect::<Vec<_>>(),
             [(Some(NESTING_CAP as u32 + 2), "nesting-depth")]
         );
-        let errs = parse(&nest(10_000)).unwrap_err();
+        let errs = parse(&nest(2_000)).unwrap_err();
         assert!(errs.iter().all(|r| r.code == "nesting-depth"), "{errs:?}");
+    }
+
+    /// Nesting is fence-length containment (§3.3 rule 4): inside a `:::`
+    /// block an opener of three colons or more is a line of the body, and
+    /// the first `:::` closes the outer block — as the reference reads it,
+    /// tree and advisories alike. Only a longer outer fence contains it.
+    #[test]
+    fn a_fence_no_shorter_than_its_container_is_body_text() {
+        let d = parse(":::when{agent=\"a\"}\n:::example\nMUST: q\n:::\n:::\n").unwrap();
+        let b = d.blocks().next().unwrap();
+        assert_eq!((b.kind.as_str(), b.body.as_str()), ("when", ":::example"));
+        assert_eq!(
+            b.children
+                .iter()
+                .map(|c| c.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["must"]
+        );
+        // An outer fence no shorter than the inner one changes nothing: a
+        // `::::` opener inside `:::` is body text too.
+        let b = only_block(":::note\n::::when{agent=\"a\"}\nx\n::::\n");
+        assert_eq!(
+            (b.body.as_str(), b.children.len()),
+            ("::::when{agent=\"a\"}\nx", 0)
+        );
+        // A longer outer fence contains the shorter block.
+        let d = parse("::::when{agent=\"a\"}\n:::example\nMUST: q\n:::\n::::\n").unwrap();
+        let b = d.blocks().next().unwrap();
+        assert_eq!(
+            b.children
+                .iter()
+                .map(|c| c.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["example"]
+        );
+        // §3.1.1's scanner reads the same: `:::!config` inside the `:::note`
+        // is a line of its Markdown body, not a YAML block, so the `<!--`
+        // under it opens a note that never closes, and nothing after it is
+        // reached — as the body walk reads it, which finds the note never
+        // closed.
+        let text = ":::note\n:::!config\n<!-- x\n:::\n:::!config\nmodel: m\n:::\n";
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert!(!scanner_reaches(&lines, 0, 4));
+        let e = parse(text).unwrap_err();
+        assert_eq!((e[0].line, e[0].code), (Some(1), "unclosed-fence"), "{e:?}");
     }
 
     // ── author notes, end matter, inert blocks, attribute values and
@@ -7370,7 +7484,7 @@ steps:
         assert_eq!(d.blocks().next().unwrap().body, "::eval{name=y}");
         // An inert block in a body is that body's text, fences dropped, read
         // raw: a keyword inside it is not lifted.
-        let b = only_block(":::note\nA.\n:::aside\nMUST: raw\n:::\nB.\n:::\n");
+        let b = only_block("::::note\nA.\n:::aside\nMUST: raw\n:::\nB.\n::::\n");
         assert_eq!(
             (b.body.as_str(), b.children.len()),
             ("A.\nMUST: raw\nB.", 0)
@@ -7579,7 +7693,7 @@ steps:
             "the message speaks of conditions"
         );
         let d = parse(
-            ":::unless{env=\"prod\"}\nA.\n:::\n:::otherwise{ignored=\"yes\"}\nB.\n\n::::when{tier=\"x\"}\nMUST: c.\n::::\n:::\n",
+            ":::unless{env=\"prod\"}\nA.\n:::\n::::otherwise{ignored=\"yes\"}\nB.\n\n:::when{tier=\"x\"}\nMUST: c.\n:::\n::::\n",
         )
         .unwrap();
         let blocks: Vec<&Block> = d.blocks().collect();

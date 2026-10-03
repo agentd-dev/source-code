@@ -1639,6 +1639,12 @@ mod tests {
             with_params(doc, &[("d", "thorough")]),
             "**Inputs to collect**\n- **d** — one of: quick, thorough\n\nDepth thorough.\n"
         );
+        // A `param` attribute is listed the same way, however it is spaced.
+        let doc = "::param{name=d type=enum values=\"quick,thorough\"}\n\n:::form\n${d}\n:::\n";
+        assert_eq!(
+            with_params(doc, &[("d", "quick")]),
+            "**Inputs to collect**\n- **d** — one of: quick, thorough\n"
+        );
     }
 
     /// §3.4 rule 4: `${x}` in fenced code is the code's own syntax and is

@@ -178,11 +178,6 @@ pub const UNDETECTED: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
-    /// Appendix B codes a later unit of the 1.1 re-vendor constructs, with that
-    /// unit. Shrink-only: the unit that builds a code removes it here, and the
-    /// accounting test fails until it does.
-    const PENDING_CODES: &[(&str, &str)] = &[];
-
     /// Every `.rs` file under `dir`, at any depth, sorted. Recursive, so a
     /// module that moves into a directory of its own keeps its constructors
     /// in view of the accounting.
@@ -359,34 +354,23 @@ mod tests {
     }
 
     #[test]
-    fn every_code_is_built_undetected_or_pending() {
+    fn every_code_is_built_or_undetected() {
         let constructed = constructed_codes();
         let built = |code: &str| constructed.iter().any(|c| c == code);
         let undetected: Vec<&str> = UNDETECTED.iter().map(|(c, _)| *c).collect();
-        let pending: Vec<&str> = PENDING_CODES.iter().map(|(c, _)| *c).collect();
         let mut problems = Vec::new();
         for code in CODES {
-            match (
-                built(code),
-                undetected.contains(code),
-                pending.contains(code),
-            ) {
-                (true, false, false) | (false, true, false) | (false, false, true) => {}
-                (false, false, false) => problems.push(format!(
-                    "{code}: no site constructs it, and it is neither UNDETECTED nor pending"
+            match (built(code), undetected.contains(code)) {
+                (true, false) | (false, true) => {}
+                (false, false) => problems.push(format!(
+                    "{code}: no site constructs it, and it is not UNDETECTED"
                 )),
-                (true, _, true) => problems.push(format!(
-                    "{code}: now constructed — remove it from PENDING_CODES"
-                )),
-                (true, true, _) => {
+                (true, true) => {
                     problems.push(format!("{code}: constructed, yet listed as UNDETECTED"))
-                }
-                (false, true, true) => {
-                    problems.push(format!("{code}: both UNDETECTED and pending"))
                 }
             }
         }
-        for code in undetected.iter().chain(&pending) {
+        for code in &undetected {
             if !CODES.contains(code) {
                 problems.push(format!("{code}: listed, but not in CODES"));
             }

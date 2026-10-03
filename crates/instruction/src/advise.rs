@@ -7,10 +7,13 @@
 //!
 //! A port of the reference implementation's `advise.ts`, which the Go port
 //! mirrors and `conformance/advisories/` pins, line, code, severity and
-//! message. Advisories are reported for prose only (Appendix C): never inside
-//! an author note, fenced code, a machinery body, or front or end matter.
-//! The crate has no regex engine, so each pattern the reference writes as a
-//! regex is matched by hand here, and says which.
+//! message. The line scans (near misses, orphan reasons, keywords in
+//! examples, links, placeholders) read prose only (Appendix C): never an
+//! author note — one in a block's body included, where `advise.ts` still
+//! scans — fenced code, a machinery body, or front or end matter. The block
+//! checks (variants, a skill's `when`, overrides, parameters) apply wherever
+//! the block is. The crate has no regex engine, so each pattern the
+//! reference writes as a regex is matched by hand here, and says which.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,7 +76,8 @@ pub const ADVISORY_CODES: &[(&str, Severity)] = &[
 
 /// The Appendix C advisories for a parsed document, sorted by line and then
 /// code (a stable sort: two of one code on one line keep the order they were
-/// found in). Reading them changes neither the parse nor the delivery.
+/// found in, which for a variant's unknown keys is name order). Reading them
+/// changes neither the parse nor the delivery.
 pub fn advise(doc: &Document) -> Vec<Advisory> {
     let mut out: Vec<Advisory> = Vec::new();
     let mut add = |line: usize, code: &'static str, message: String| {
@@ -222,6 +226,8 @@ pub fn advise(doc: &Document) -> Vec<Advisory> {
         .collect();
     for b in &all {
         if b.kind == "when" || b.kind == "unless" {
+            // In name order, as the Go port reports them: `attrs` keeps no
+            // source order, which `advise.ts` and the Python port use.
             for k in b.attrs.keys().filter(|k| *k != "verbatim") {
                 used.insert(k.clone());
                 if !reg.context_keys().contains(k) && !decls.iter().any(|d| &d.name == k) {
@@ -237,6 +243,9 @@ pub fn advise(doc: &Document) -> Vec<Advisory> {
                 }
             }
         }
+        // A bare `when` flag is read as `when=""`, and the tree keeps no
+        // trace of which was written, so it is reported too; the reference
+        // ports report a string value only.
         if b.kind == "skill" && b.attrs.contains_key("when") {
             add(
                 b.line,
@@ -304,7 +313,10 @@ pub fn advise(doc: &Document) -> Vec<Advisory> {
         .collect();
     variants.sort_by_key(|&(_, start, _)| start);
     // Two variants are one group when only blank lines and notes lie
-    // between them.
+    // between them — a note in a container's or a set's body as well as a
+    // top-level one, as delivery groups them. `advise.ts` counts top-level
+    // notes only, and reports the `otherwise` after a nested note an orphan
+    // that its own delivery keeps in the group.
     let adjacent = |end: usize, start: usize| {
         (end + 1..start).all(|k| lines[k - 1].trim().is_empty() || notes.contains(&k))
     };
@@ -352,7 +364,8 @@ pub fn advise(doc: &Document) -> Vec<Advisory> {
 }
 
 /// The lines of every author note (S9), 1-based: those at the top level,
-/// those in a block's body, and those in a top-level set's body.
+/// those in a block's body, and those in a top-level set's body. The
+/// reference reads the top-level ones only; see the module docs.
 fn note_lines(doc: &Document, all: &[&Block]) -> BTreeSet<usize> {
     let at = |body_line: usize| doc.outline.base + body_line + 1;
     doc.nodes
@@ -898,6 +911,111 @@ mod tests {
     }
 
     #[test]
+    fn a_paragraph_starts_after_a_blank_a_heading_or_a_fence_or_at_a_list_item() {
+        assert_eq!(advised("# H\nMust: x\n"), [(2, "near-miss-keyword")]);
+        assert_eq!(
+            advised(":::note\nhi\n:::\nMust: x\n"),
+            [(4, "near-miss-keyword")]
+        );
+        assert_eq!(advised("Text\n- Must: x\n"), [(2, "near-miss-keyword")]);
+        // Inside a paragraph it is a word of the paragraph.
+        assert_eq!(advised("Text\nMust: x\n"), []);
+    }
+
+    #[test]
+    fn the_near_miss_message_names_a_reason_or_a_rule() {
+        let messages = |text: &str| {
+            let doc = doc::parse(text).unwrap();
+            advise(&doc)
+                .into_iter()
+                .map(|a| a.message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            messages("because: x\n"),
+            ["line 1: \"because:\" is prose — write \"BECAUSE:\" to make it a reason"]
+        );
+        assert_eq!(
+            messages("Must: x\n"),
+            ["line 1: \"Must:\" is prose — write \"MUST:\" to make it a rule"]
+        );
+    }
+
+    #[test]
+    fn only_a_reason_at_column_zero_is_an_orphan() {
+        assert_eq!(advised("Prose.\n\n  BECAUSE: x\n"), []);
+    }
+
+    #[test]
+    fn a_verbatim_flag_on_a_variant_is_no_context_key() {
+        assert_eq!(advised(":::when{agent=\"a\" verbatim}\nx\n:::\n"), []);
+    }
+
+    #[test]
+    fn an_otherwise_after_an_otherwise_is_an_orphan() {
+        let text = ":::when{agent=\"a\"}\nA\n:::\n:::otherwise\nB\n:::\n:::otherwise\nC\n:::\n";
+        assert_eq!(advised(text), [(7, "orphan-otherwise")]);
+    }
+
+    #[test]
+    fn a_variant_of_blank_lines_is_empty() {
+        assert_eq!(
+            advised(":::when{agent=\"a\"}\n  \n:::\n"),
+            [(1, "empty-variant")]
+        );
+    }
+
+    #[test]
+    fn a_note_in_a_container_still_joins_a_variant_group() {
+        // A deliberate departure from `advise.ts`, which reports the
+        // `otherwise` an orphan here (see the module docs): delivery keeps
+        // the two as one group, and so do the advisories.
+        let text =
+            "::::note\n:::when{agent=\"a\"}\nA\n:::\n<!-- n -->\n:::otherwise\nB\n:::\n::::\n";
+        assert_eq!(advised(text), []);
+    }
+
+    #[test]
+    fn a_redeclared_parameter_is_judged_by_its_last_declaration() {
+        let text = "---\nparameters:\n  - name: a\n---\n::param{name=a type=number default=x}\n";
+        assert_eq!(
+            advised(text),
+            [(5, "param-default-type"), (5, "unused-parameter")]
+        );
+    }
+
+    #[test]
+    fn a_list_default_is_quoted_as_the_reference_renders_it() {
+        let text = "---\nparameters: [{name: p, type: number, default: [1, 2]}]\n---\n${p}\n";
+        let doc = doc::parse(text).unwrap();
+        let messages: Vec<String> = advise(&doc).into_iter().map(|a| a.message).collect();
+        assert_eq!(messages, ["line 2: default \"1,2\" is not a number"]);
+    }
+
+    /// Every line an advisory names is the whole text's, front matter
+    /// included — the body's regions and reasons are placed past it.
+    #[test]
+    fn advisories_are_placed_past_the_front_matter() {
+        assert_eq!(
+            advised("---\nspec: 1\n---\n\nMust: x\n"),
+            [(5, "near-miss-keyword")]
+        );
+        assert_eq!(
+            advised("---\nspec: 1\n---\n[[oncall]]\n"),
+            [(4, "unqualified-wikilink")]
+        );
+        assert_eq!(
+            advised("---\nspec: 1\n---\n:::when{agent=\"a\"}\n:::\nprose\n:::otherwise\nO\n:::\n"),
+            [(4, "empty-variant"), (7, "orphan-otherwise")]
+        );
+        assert_eq!(
+            advised("---\nspec: 1\n---\n:::example\nMUST: q\n:::\n"),
+            [(5, "keyword-in-example")]
+        );
+        assert_eq!(advised("---\nspec: 1\n---\nMUST: x\n\nBECAUSE: y\n"), []);
+    }
+
+    #[test]
     fn code_spans_hide_links_and_placeholders() {
         assert_eq!(advised("Write `[[oncall]]` and `${x}`.\n"), []);
         assert_eq!(without_code_spans("a `b` c `d"), "a  c `d");
@@ -923,6 +1041,10 @@ mod tests {
         assert!(is_open_fence(":::when{agent=\"x\"}"));
         assert!(is_open_fence("::::!skill[]"));
         assert!(!is_open_fence(":::note hello"));
+        // `.` in the reference's `\{.*\}` matches no line terminator.
+        for t in ['\r', '\u{2028}', '\u{2029}'] {
+            assert!(!is_open_fence(&format!(":::note{{title=\"a{t}b\"}}")));
+        }
         assert!(is_close_fence(":::  "));
         assert!(!is_close_fence("  :::"));
     }

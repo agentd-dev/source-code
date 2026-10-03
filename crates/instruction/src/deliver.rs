@@ -18,16 +18,24 @@
 //! an included document in a label style of its own.
 //!
 //! Modelled on the reference implementation's `deliver.ts` (`renderLines`,
-//! `proseBlockLines`, `deliverFragment`). Parameter substitution stays the
-//! last step, over the whole text (`doc::fold_full`), so a value is never
-//! re-read as Markdown.
+//! `proseBlockLines`, `deliverFragment`), with one departure: `${}` is
+//! substituted where a source line becomes a delivered one, after its inline
+//! references are degraded, rather than over the whole text at the end. A
+//! value is still never re-read — nothing reads a delivered line again — and
+//! two things the whole-text pass got wrong come right. Whether a line is
+//! fenced code is read from the source, before a label is glued onto it
+//! (`**MUST:** ```sh` opens no fence the old pass could see). And an included
+//! document's lines arrive substituted with its own parameters, so the
+//! includer neither fills the placeholders the include left nor substitutes a
+//! value the include inserted a second time (§5.2 include rule 1; §3.5: a
+//! value is never re-parsed).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
 use crate::doc::{
-    self, Block, BodyKind, Disposition, Document, Form, IncludeResolver, Node, registry,
+    self, Block, BodyKind, Disposition, Document, Form, IncludeResolver, Node, Piece, registry,
 };
 
 /// How labelled prose is delivered (S25), from the front matter's
@@ -73,8 +81,16 @@ pub(crate) struct Walk<'a> {
     pub(crate) params: BTreeMap<String, String>,
     /// What `when` and `unless` match against: the parameters plus the
     /// runtime facts, the facts winning a collision (they are
-    /// runtime-authoritative).
+    /// runtime-authoritative). On a collision a variant selects on the fact
+    /// while `${key}` still substitutes the parameter; the reference lets the
+    /// parameter win both. An open question upstream, pinned by a test.
     pub(crate) facts: BTreeMap<String, String>,
+    /// The runtime facts the delivery was given, apart from any parameter:
+    /// all an included document receives from the delivery that includes it,
+    /// beside its own parameters. An includer's parameter values never reach
+    /// an include, as facts or as values (§5.2 include rule 1: "resolved with
+    /// its own parameters").
+    pub(crate) runtime: BTreeMap<String, String>,
     pub(crate) resolver: IncludeResolver<'a>,
     /// How many includes deep this document is (0 = the delivered document).
     pub(crate) depth: usize,
@@ -91,7 +107,21 @@ pub(crate) struct Walk<'a> {
     pub(crate) overridden: Vec<String>,
     /// The bytes inlined from includes so far, over the whole delivery.
     pub(crate) include_bytes: usize,
+    /// How many bodies deep the renderer is in this document, and whether a
+    /// body went past [`NESTING_CAP`]: the fold refuses the document then.
+    nesting: usize,
+    pub(crate) too_deep: bool,
 }
+
+/// How many bodies deep delivery renders, each inside the last: a rule in a
+/// `context` in a `when` is three. Twice what parse lets blocks nest
+/// ([`doc::NESTING_CAP`]), so no nesting of containers reaches it; what does
+/// is a chain of bodies read again — an alert quoted inside an alert, a
+/// keyword's text opening with a keyword — which parse never sees, and each
+/// of which re-reads everything inside it. Past the cap the document is
+/// refused rather than delivered in part. Counted per document: an include
+/// is its own.
+pub(crate) const NESTING_CAP: usize = 2 * doc::NESTING_CAP;
 
 /// One `overrides` target a rule declares (S24), and where.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +153,7 @@ impl<'a> Walk<'a> {
             granted,
             params: BTreeMap::new(),
             facts: BTreeMap::new(),
+            runtime: facts.clone(),
             resolver,
             depth: 0,
             seen: BTreeSet::new(),
@@ -131,6 +162,8 @@ impl<'a> Walk<'a> {
             overrides: Vec::new(),
             overridden: Vec::new(),
             include_bytes: 0,
+            nesting: 0,
+            too_deep: false,
         };
         w.enter(doc, params, facts);
         w
@@ -138,10 +171,11 @@ impl<'a> Walk<'a> {
 
     /// The walk of a document included as `id` from this one: one level
     /// deeper, `id` on the path, delivered with its OWN declarations and
-    /// style. It receives no caller parameters, and the includer's `when`
-    /// facts as its facts. The overrides pending here go down with it; its
-    /// own are added after them and end with it. Hand it back with
-    /// [`Walk::leave`].
+    /// style. It receives no caller parameters, and only the runtime facts:
+    /// its variants select on its own parameter values, never on the
+    /// includer's, which were checked against no declaration of its. The
+    /// overrides pending here go down with it; its own are added after them
+    /// and end with it. Hand it back with [`Walk::leave`].
     pub(crate) fn include(&self, id: &str, doc: &Document) -> Walk<'a> {
         let mut seen = self.seen.clone();
         seen.insert(id.to_string());
@@ -149,6 +183,7 @@ impl<'a> Walk<'a> {
             granted: self.granted,
             params: BTreeMap::new(),
             facts: BTreeMap::new(),
+            runtime: self.runtime.clone(),
             resolver: self.resolver,
             depth: self.depth + 1,
             seen,
@@ -157,8 +192,10 @@ impl<'a> Walk<'a> {
             overrides: self.overrides.clone(),
             overridden: Vec::new(),
             include_bytes: self.include_bytes,
+            nesting: 0,
+            too_deep: false,
         };
-        w.enter(doc, &BTreeMap::new(), &self.facts);
+        w.enter(doc, &BTreeMap::new(), &self.runtime);
         w
     }
 
@@ -181,6 +218,12 @@ impl<'a> Walk<'a> {
             .filter(|o| o.depth == self.depth && !o.found)
             .map(|o| o.target.clone())
             .collect()
+    }
+
+    /// `${name}` substituted in one delivered line (§3.5 step 7): see
+    /// [`doc::substitute_line`].
+    fn sub(&self, line: &str) -> String {
+        doc::substitute_line(line, &self.params)
     }
 
     /// Take on what `doc` declares.
@@ -210,7 +253,8 @@ impl<'a> Walk<'a> {
 /// delivered. `${}` is not yet substituted.
 pub(crate) fn document(doc: &Document, w: &mut Walk) -> Vec<String> {
     let lines: Vec<&str> = doc.source.split('\n').collect();
-    finalize(render(&lines, &doc.nodes, w, true))
+    let spans = node_spans(&doc.nodes);
+    finalize(render(&lines, (0, lines.len()), &spans, w, true))
 }
 
 /// A skill's catalogue body, rendered as its prose would be delivered — in
@@ -218,31 +262,85 @@ pub(crate) fn document(doc: &Document, w: &mut Walk) -> Vec<String> {
 /// the catalogue never shows a `MUST[name]:` the reader was never meant to
 /// see. `lines` is the document body the skill's region indexes.
 pub(crate) fn skill_body(b: &Block, lines: &[&str], w: &mut Walk) -> String {
-    let src = if b.set_group.is_some() {
-        // A set member's body is its entry's, which has no region of its own.
-        b.body.split('\n').map(str::to_string).collect()
-    } else {
-        body_source(b, lines)
-    };
-    // The catalogue is not the delivery: overrides (S24) are accounted for
-    // over the delivered text, as the reference delivers it, and a rule met
-    // here first would be marked found and leave its delivered twin — or a
-    // target found nowhere else — wrongly accounted.
+    // The catalogue is not the delivery, and accounts for nothing the
+    // delivery does. Overrides (S24) are accounted for over the delivered
+    // text, as the reference delivers it: a rule met here first would be
+    // marked found and leave its delivered twin — or a target found nowhere
+    // else — wrongly accounted. An include here is inlined, but its bytes
+    // are not the delivery's to cap (S7 `limits`), and the rules its own
+    // overrides silence are not rules the delivered text left out. And a
+    // catalogue body substitutes no parameter, as it never has: a skill's
+    // text is the skill's, read when it is used.
     let overrides = std::mem::take(&mut w.overrides);
-    let body = finalize(fragment(&src, w)).join("\n");
+    let params = std::mem::take(&mut w.params);
+    let (include_bytes, overridden) = (w.include_bytes, w.overridden.len());
+    let body = if b.set_group.is_some() {
+        // A set member's body is its entry's, which has no region of its own.
+        let src: Vec<String> = b.body.split('\n').map(str::to_string).collect();
+        nested(w, |w| reread(&src, w))
+    } else {
+        body(b, lines, w)
+    };
+    let body = finalize(body).join("\n");
     w.overrides = overrides;
+    w.params = params;
+    w.include_bytes = include_bytes;
+    w.overridden.truncate(overridden);
     body
 }
 
-/// A prose body delivered by the same rules, as lines. A body is not a
-/// document: it has no front or end matter, and it is not finalized — its
-/// blank lines are the enclosing document's to collapse.
-fn fragment(body: &[String], w: &mut Walk) -> Vec<String> {
+/// A block's prose body delivered by the same rules, as lines (TS
+/// `deliverFragment`). A body is not a document: it has no front or end
+/// matter, and it is not finalized — its blank lines are the enclosing
+/// document's to collapse.
+///
+/// A container's body is rendered from what parse read it as — its children
+/// at their regions in these same lines, its notes, its inert blocks — and
+/// is never read again: reading a body reads everything nested in it, so
+/// reading each again at every level made delivery cost the nesting depth
+/// times the size. Any other body has no lines of its own to index — a
+/// keyword's text starts after its label, an alert's lines are unquoted —
+/// so it is read again, as the reference reads every body.
+fn body(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
+    nested(w, |w| match container_body(b, lines) {
+        Some(range) => render(lines, range, &layout_spans(b), w, false),
+        None => reread(&body_source(b, lines), w),
+    })
+}
+
+/// A body read again on its own and rendered.
+fn reread(body: &[String], w: &mut Walk) -> Vec<String> {
     let lines: Vec<&str> = body.iter().map(String::as_str).collect();
-    // The document parsed whole before delivery began, so reading a piece
-    // of it again finds nothing to refuse that parse did not.
-    let (nodes, _) = doc::walk_nodes(&lines, 0, &mut Vec::new());
-    render(&lines, &nodes, w, false)
+    let nodes = read_again(&lines);
+    render(&lines, (0, lines.len()), &node_spans(&nodes), w, false)
+}
+
+/// The nodes of a body read again. The document parsed whole before delivery
+/// began, so reading a piece of it again finds nothing to refuse that parse
+/// did not.
+fn read_again(lines: &[&str]) -> Vec<Node> {
+    #[cfg(test)]
+    READS.with(|r| r.set(r.get() + 1));
+    doc::walk_nodes(lines, 0, &mut Vec::new()).0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many bodies delivery has read again, on this thread.
+    static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Render one more body deep, or note that the document nests past
+/// [`NESTING_CAP`] and render nothing — the fold refuses it.
+fn nested(w: &mut Walk, f: impl FnOnce(&mut Walk) -> Vec<String>) -> Vec<String> {
+    if w.nesting >= NESTING_CAP {
+        w.too_deep = true;
+        return Vec::new();
+    }
+    w.nesting += 1;
+    let out = f(w);
+    w.nesting -= 1;
+    out
 }
 
 /// What occupies a run of lines.
@@ -256,30 +354,54 @@ enum Item<'n> {
     Note,
 }
 
-/// The regions `nodes` occupy, in order: `(first line, last line, item)`.
-fn spans(nodes: &[Node]) -> Vec<(usize, usize, Item<'_>)> {
-    let mut spans = Vec::new();
-    let mut k = 0;
-    while k < nodes.len() {
-        match &nodes[k] {
-            Node::Text(_) => {}
-            Node::Note { start, end } => spans.push((*start, *end, Item::Note)),
-            Node::Inert { region, .. } => spans.push((region.0, region.1, Item::Inert)),
-            Node::Block(b) if b.set_group.is_some() => {
-                let mut members = vec![b];
-                while let Some(Node::Block(m)) = nodes.get(k + 1)
-                    && m.set_group == b.set_group
-                {
-                    members.push(m);
-                    k += 1;
+/// Where a block, a note or an inert block lies, from a document's nodes or
+/// a container's layout.
+enum At<'n> {
+    Block(&'n Block),
+    Note(usize, usize),
+    Inert(usize, usize),
+}
+
+/// What occupies each region delivery renders: `(first line, last line,
+/// item)`, in order.
+type Spans<'n> = Vec<(usize, usize, Item<'n>)>;
+
+/// The regions `at` occupy, in order, a set's members as one.
+fn spans<'n>(at: impl IntoIterator<Item = At<'n>>) -> Spans<'n> {
+    let mut spans: Spans<'n> = Vec::new();
+    for a in at {
+        match a {
+            At::Note(start, end) => spans.push((start, end, Item::Note)),
+            At::Inert(start, end) => spans.push((start, end, Item::Inert)),
+            At::Block(b) if b.set_group.is_some() => match spans.last_mut() {
+                Some((_, _, Item::Set(members))) if members[0].set_group == b.set_group => {
+                    members.push(b)
                 }
-                spans.push((b.region.0, b.region.1, Item::Set(members)));
-            }
-            Node::Block(b) => spans.push((b.region.0, b.region.1, Item::Block(b))),
+                _ => spans.push((b.region.0, b.region.1, Item::Set(vec![b]))),
+            },
+            At::Block(b) => spans.push((b.region.0, b.region.1, Item::Block(b))),
         }
-        k += 1;
     }
     spans
+}
+
+/// The regions a document's (or a body's, read again) nodes occupy.
+fn node_spans(nodes: &[Node]) -> Spans<'_> {
+    spans(nodes.iter().filter_map(|n| match n {
+        Node::Text(_) => None,
+        Node::Note { start, end } => Some(At::Note(*start, *end)),
+        Node::Inert { region, .. } => Some(At::Inert(region.0, region.1)),
+        Node::Block(b) => Some(At::Block(b)),
+    }))
+}
+
+/// The regions a container's body occupies, as parse laid it out.
+fn layout_spans(b: &Block) -> Spans<'_> {
+    spans(b.layout.iter().map(|p| match p {
+        Piece::Child(k) => At::Block(&b.children[*k]),
+        Piece::Note { start, end } => At::Note(*start, *end),
+        Piece::Inert { start, end } => At::Inert(*start, *end),
+    }))
 }
 
 /// Variant selection over one parent's spans (S10): whether each is
@@ -292,13 +414,14 @@ fn spans(nodes: &[Node]) -> Vec<(usize, usize, Item<'_>)> {
 /// its own nested variants, and only a kept one is walked (§5.2 rule 4).
 fn select(
     lines: &[&str],
+    from: usize,
     spans: &[(usize, usize, Item)],
     facts: &BTreeMap<String, String>,
 ) -> Vec<bool> {
     // Whether any member of the current run was kept; `None` when there is
     // no run for an `otherwise` to belong to.
     let mut group: Option<bool> = None;
-    let mut next = 0;
+    let mut next = from;
     let mut keep = Vec::with_capacity(spans.len());
     for (start, end, item) in spans {
         if lines
@@ -360,59 +483,73 @@ fn body_is_fragment(b: &Block) -> bool {
 /// rule inside a dropped variant declares nothing — §3.5 removes variants
 /// (step 3) before it applies overrides (step 4) — so the walk selects
 /// variants as delivery does and descends only into what delivery renders.
+/// The same order holds on the other side: a target is local only when the
+/// reader receives it here, so one this document has only inside a dropped
+/// variant is looked for in the documents it includes.
 fn declared_overrides(doc: &Document, w: &Walk) -> Vec<Override> {
     let reg = registry();
-    let top: Vec<&Block> = doc.blocks().collect();
-    let local: BTreeSet<String> = doc::every_block(&top)
-        .into_iter()
-        .filter_map(doc::identity_of)
-        .map(|(kind, name)| format!("{kind}/{name}"))
-        .collect();
-    let mut out = Vec::new();
+    let mut local = BTreeSet::new();
+    let mut declared = Vec::new();
     let mut visit = |b: &Block| {
-        let Some(strength) = reg.strength(&b.kind) else {
-            return;
-        };
-        let Some(list) = b.attrs.get("overrides") else {
+        if let Some((kind, name)) = doc::identity_of(b) {
+            local.insert(format!("{kind}/{name}"));
+        }
+        let (Some(strength), Some(list)) = (reg.strength(&b.kind), b.attrs.get("overrides")) else {
             return;
         };
         for target in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-            out.push(Override {
-                target: target.to_string(),
-                strength,
-                depth: w.depth,
-                local: local.contains(target),
-                found: false,
-            });
+            declared.push((target.to_string(), strength));
         }
     };
     let lines: Vec<&str> = doc.source.split('\n').collect();
-    received_blocks(&lines, &doc.nodes, &w.facts, &mut visit);
-    out
+    let spans = node_spans(&doc.nodes);
+    received_blocks(&lines, (0, lines.len()), &spans, &w.facts, 0, &mut visit);
+    declared
+        .into_iter()
+        .map(|(target, strength)| Override {
+            local: local.contains(&target),
+            target,
+            strength,
+            depth: w.depth,
+            found: false,
+        })
+        .collect()
 }
 
-/// Visit every block of `nodes` that delivery renders, in delivery order:
+/// Visit every block in `spans` that delivery renders, in delivery order:
 /// variants selected as [`select`] selects them, and a body descended into
-/// only where [`body_is_fragment`] says the renderer walks it.
+/// only where [`body_is_fragment`] says the renderer walks it, read as
+/// [`body`] reads it — and no deeper than it renders one (`nesting` bodies
+/// down already).
 fn received_blocks(
     lines: &[&str],
-    nodes: &[Node],
+    range: (usize, usize),
+    spans: &Spans,
     facts: &BTreeMap<String, String>,
+    nesting: usize,
     visit: &mut dyn FnMut(&Block),
 ) {
-    let spans = spans(nodes);
-    let keep = select(lines, &spans, facts);
+    let keep = select(lines, range.0, spans, facts);
     for ((_, _, item), kept) in spans.iter().zip(keep) {
         let Item::Block(b) = item else { continue };
         if !kept {
             continue;
         }
         visit(b);
-        if body_is_fragment(b) {
-            let body = body_source(b, lines);
-            let body: Vec<&str> = body.iter().map(String::as_str).collect();
-            let (nodes, _) = doc::walk_nodes(&body, 0, &mut Vec::new());
-            received_blocks(&body, &nodes, facts, visit);
+        if !body_is_fragment(b) || nesting >= NESTING_CAP {
+            continue;
+        }
+        match container_body(b, lines) {
+            Some(range) => {
+                received_blocks(lines, range, &layout_spans(b), facts, nesting + 1, visit)
+            }
+            None => {
+                let body = body_source(b, lines);
+                let body: Vec<&str> = body.iter().map(String::as_str).collect();
+                let nodes = read_again(&body);
+                let spans = node_spans(&nodes);
+                received_blocks(&body, (0, body.len()), &spans, facts, nesting + 1, visit);
+            }
         }
     }
 }
@@ -457,40 +594,32 @@ fn overridden(b: &Block, w: &mut Walk) -> bool {
     false
 }
 
-/// Render `lines`, which `nodes` were walked from. `top` is a document's
-/// own body, as opposed to a body inside one: only there is machinery
-/// folded, so only there is it acknowledged. A machinery block nested in a
-/// prose or variant body configures nothing — the fold reads the top level
-/// — and an acknowledgement would tell the model a workflow is loaded that
-/// is not; it delivers nothing, as it did before bodies were rendered.
-fn render(lines: &[&str], nodes: &[Node], w: &mut Walk, top: bool) -> Vec<String> {
-    let spans = spans(nodes);
-    let keep = select(lines, &spans, &w.facts);
+/// Render `lines[from..to]`, whose regions `spans` lists. `top` is a
+/// document's own body, as opposed to a body inside one. The fold refuses
+/// machinery anywhere but a document's top level, so a machinery block met
+/// in a body is one only a body read again found — in an alert's unquoted
+/// lines, which parse reads as text. It is delivered as the text parse says
+/// it is: acknowledging it would claim a configuration nothing folded, and
+/// dropping it would lose the author's words.
+fn render(
+    lines: &[&str],
+    (from, to): (usize, usize),
+    spans: &Spans,
+    w: &mut Walk,
+    top: bool,
+) -> Vec<String> {
+    let keep = select(lines, from, spans, &w.facts);
 
     let mut out = Vec::new();
-    let mut in_code = None::<usize>;
-    let mut prose = |l: &str, out: &mut Vec<String>| {
-        // Fenced code is delivered as written: nothing in it is a reference.
-        if let Some(tl) = in_code {
-            if doc::code_fence_len(l) == Some(tl) {
-                in_code = None;
-            }
-            out.push(l.to_string());
-        } else if let Some(tl) = doc::code_fence_len(l) {
-            in_code = Some(tl);
-            out.push(l.to_string());
-        } else {
-            out.push(degrade_inline(l));
-        }
-    };
-    let mut li = 0;
+    let mut prose = Prose::default();
+    let mut li = from;
     let mut si = 0;
-    while li < lines.len() {
+    while li < to {
         while spans.get(si).is_some_and(|s| s.0 < li) {
             si += 1;
         }
         let Some((start, end, item)) = spans.get(si).filter(|s| s.0 == li) else {
-            prose(lines[li], &mut out);
+            out.push(prose.line(lines[li], w, true));
             li += 1;
             continue;
         };
@@ -498,15 +627,23 @@ fn render(lines: &[&str], nodes: &[Node], w: &mut Walk, top: bool) -> Vec<String
             Item::Note => {}
             Item::Inert => {
                 // Its body, raw — nothing in it is lifted — with the fences
-                // removed.
-                for l in lines.get(start + 1..*end).unwrap_or_default() {
-                    prose(l, &mut out);
+                // removed, and its author notes, which are never delivered
+                // (S9), with them.
+                let body = lines.get(start + 1..*end).unwrap_or_default();
+                for l in without_notes(body) {
+                    out.push(prose.line(l, w, true));
                 }
             }
             // A dropped variant leaves nothing.
             Item::Block(_) if !keep[si] => {}
-            Item::Set(_) | Item::Block(_) if !top && machinery(item) => {}
-            Item::Set(members) => out.extend(doc::deliver_set_lines(members)),
+            Item::Set(_) | Item::Block(_) if !top && machinery(item) => {
+                for l in &lines[*start..=*end] {
+                    out.push(prose.line(l, w, true));
+                }
+            }
+            Item::Set(members) => {
+                out.extend(doc::deliver_set_lines(members).iter().map(|l| w.sub(l)))
+            }
             // An overridden rule is not delivered, nor its reason, which its
             // region covers.
             Item::Block(b) if b.disposition == Disposition::Prose && overridden(b, w) => {}
@@ -514,6 +651,62 @@ fn render(lines: &[&str], nodes: &[Node], w: &mut Walk, top: bool) -> Vec<String
         }
         li = end + 1;
         si += 1;
+    }
+    out
+}
+
+/// Source lines becoming delivered ones, in order. Fenced code is delivered
+/// as written: nothing in it is a reference or a placeholder (§3.4 rule 4),
+/// and a fence closes on a delimiter of its own length. Any other line has
+/// its inline references degraded (prose; quoted material keeps them) and
+/// then `${}` substituted, so a value is never read as a reference. Whether
+/// a line is code is decided here, from the source, before any label is
+/// glued onto it.
+#[derive(Default)]
+struct Prose {
+    in_code: Option<usize>,
+}
+
+impl Prose {
+    fn line(&mut self, l: &str, w: &Walk, degrade: bool) -> String {
+        match (self.in_code, doc::code_fence_len(l)) {
+            (Some(open), Some(n)) if n == open => self.in_code = None,
+            (None, Some(n)) => self.in_code = Some(n),
+            (None, None) if degrade => return w.sub(&degrade_inline(l)),
+            (None, None) => return w.sub(l),
+            _ => {}
+        }
+        l.to_string()
+    }
+
+    /// Quoted lines (an example, a `verbatim` body): no reference degraded,
+    /// `${}` substituted outside their fenced code.
+    fn quoted(lines: Vec<String>, w: &Walk) -> Vec<String> {
+        let mut p = Prose::default();
+        lines.iter().map(|l| p.line(l, w, false)).collect()
+    }
+}
+
+/// `lines` without their author notes (S9): a column-0 `<!--` outside fenced
+/// code through the first line holding `-->`, as parse reads one. For the
+/// bodies parse keeps no notes for — an inert block's, a glossary's.
+fn without_notes<'l>(lines: &[&'l str]) -> Vec<&'l str> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut in_code = None::<usize>;
+    let mut k = 0;
+    while k < lines.len() {
+        let l = lines[k];
+        match (in_code, doc::code_fence_len(l)) {
+            (Some(open), Some(n)) if n == open => in_code = None,
+            (None, Some(n)) => in_code = Some(n),
+            (None, None) if doc::note_opens(l) => {
+                k = doc::note_end(lines, k, lines.len()).unwrap_or(lines.len() - 1) + 1;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(l);
+        k += 1;
     }
     out
 }
@@ -530,12 +723,12 @@ fn machinery(item: &Item) -> bool {
 /// The lines one block delivers in place of its region.
 fn block_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
     match b.disposition {
-        Disposition::Machinery => doc::machinery_ack(b).into_iter().collect(),
+        Disposition::Machinery => doc::machinery_ack(b).iter().map(|l| w.sub(l)).collect(),
         Disposition::Structural if b.kind == "include" => doc::deliver_include(b, w),
         // A kept variant (dropped ones never get here) delivers its body
         // unwrapped, with no fence and no label; so does any other
         // structural kind with a body. A `param` delivers nothing.
-        Disposition::Structural if body_is_fragment(b) => fragment(&body_source(b, lines), w),
+        Disposition::Structural if body_is_fragment(b) => body(b, lines, w),
         Disposition::Structural => Vec::new(),
         Disposition::Prose => prose_lines(b, lines, w),
     }
@@ -546,20 +739,8 @@ fn block_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
 /// its heading, an alert's quoted lines unquoted, a keyword's text after its
 /// label and the lines of its paragraph. A leaf has none.
 fn body_source(b: &Block, lines: &[&str]) -> Vec<String> {
-    let (start, end) = b.region;
-    // The region covers the reason that follows a rule; only blank lines
-    // separate the two, so the block's own last line is the last non-blank
-    // one before the reason.
-    let own_end = match b.reason {
-        Some((reason, _)) => {
-            let mut j = reason;
-            while j > start + 1 && lines[j - 1].trim().is_empty() {
-                j -= 1;
-            }
-            j - 1
-        }
-        None => end,
-    };
+    let start = b.region.0;
+    let own_end = own_end(b, lines);
     let slice = |from: usize, to: usize| -> Vec<String> {
         lines
             .get(from..to)
@@ -591,6 +772,29 @@ fn body_source(b: &Block, lines: &[&str]) -> Vec<String> {
     }
 }
 
+/// The last line of a block's own region: the region covers the reason that
+/// follows a rule, and only blank lines separate the two, so it is the last
+/// non-blank line before the reason.
+fn own_end(b: &Block, lines: &[&str]) -> usize {
+    let (start, end) = b.region;
+    match b.reason {
+        Some((reason, _)) => {
+            let mut j = reason;
+            while j > start + 1 && lines[j - 1].trim().is_empty() {
+                j -= 1;
+            }
+            j - 1
+        }
+        None => end,
+    }
+}
+
+/// A container's body lines, `[from, to)`, between its fences — where parse
+/// laid out what is in it. `None` for any other form.
+fn container_body(b: &Block, lines: &[&str]) -> Option<(usize, usize)> {
+    (b.form == Form::Container).then(|| (b.region.0 + 1, own_end(b, lines)))
+}
+
 /// Whether an attribute is set as a flag (`{not}`, `{avoid}`).
 fn flag(b: &Block, attr: &str) -> bool {
     b.attrs
@@ -607,16 +811,20 @@ fn label_of(kind: &str) -> String {
 
 /// Prose degrades to its delivered form (Appendix A, S13-S17, S25).
 fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
-    let src = body_source(b, lines);
-    // A `verbatim` body is quoted whole; any other body is a fragment.
-    let body = |w: &mut Walk| {
+    // A `verbatim` body is quoted whole; any other body is a fragment. The
+    // source is copied only where it is delivered as written.
+    let src = || body_source(b, lines);
+    let inner = |w: &mut Walk| {
         if body_is_fragment(b) {
-            fragment(&src, w)
+            body(b, lines, w)
         } else {
-            src.clone()
+            Prose::quoted(src(), w)
         }
     };
-    let title = b.attrs.get("title");
+    // An attribute the label shows is delivered text like any other, so its
+    // `${}` is substituted — before it is escaped into a tag.
+    let title = b.attrs.get("title").map(|t| w.sub(t));
+    let title = title.as_ref();
     match b.kind.as_str() {
         // S16: quoted material — delivered as written, nothing in it
         // normalised, its author notes stripped.
@@ -639,16 +847,22 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
                 suffix,
                 attrs,
             };
-            wrap(w.style, &head, note_free(b, src), "", true)
+            wrap(
+                w.style,
+                &head,
+                Prose::quoted(note_free(b, src()), w),
+                "",
+                true,
+            )
         }
         // S17: the body is prose (a rule in it is a rule); the schema is
         // the host's and never delivered.
         "output" => {
             let mut suffix = String::new();
             let mut attrs = String::new();
-            if let Some(f) = b.attrs.get("format") {
+            if let Some(f) = b.attrs.get("format").map(|f| w.sub(f)) {
                 suffix.push_str(&format!(" ({f})"));
-                attrs.push_str(&format!(" format=\"{}\"", xml_attr(f)));
+                attrs.push_str(&format!(" format=\"{}\"", xml_attr(&f)));
             }
             if let Some(t) = title {
                 suffix.push_str(&format!(" — {t}"));
@@ -659,34 +873,42 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
                 suffix,
                 attrs,
             };
-            let body = body(w);
+            let body = inner(w);
             wrap(w.style, &head, body, "", true)
         }
         // context, form, tool and glossary deliver the same in every style.
         "context" => {
             let t = title.map(|t| format!(" title=\"{t}\"")).unwrap_or_default();
             let mut out = vec![format!("<reference{t}>")];
-            out.extend(body(w));
+            out.extend(inner(w));
             out.push("</reference>".into());
             out
         }
-        "form" => doc::form_lines(b, &w.decls),
+        "form" => doc::form_lines(b, &w.decls)
+            .iter()
+            .map(|l| w.sub(l))
+            .collect(),
         "tool" => {
-            let mut out = vec![doc::tool_head(b)];
-            out.extend(body(w));
+            let mut out = vec![w.sub(&doc::tool_head(b))];
+            out.extend(inner(w));
             out
         }
-        "glossary" => doc::deflist_entries(&b.body)
-            .into_iter()
-            .map(|(term, def)| format!("**{term}** — {}", degrade_inline(&def)))
-            .collect(),
+        // One line per term, from the parsed body less its author notes
+        // (S9), which the definition-list reader would take for a term.
+        "glossary" => {
+            let body: Vec<&str> = b.body.split('\n').collect();
+            doc::deflist_entries(&without_notes(&body).join("\n"))
+                .into_iter()
+                .map(|(term, def)| w.sub(&format!("**{term}** — {}", degrade_inline(&def))))
+                .collect()
+        }
         k if registry().label(k, false).is_some() => {
             // A rule, or an admonition: its label (the negated one for
             // `SHOULD NOT`, the canonical one for an alias — S8), its
             // condition (S15), never its name (S12).
             let label = registry().label(k, flag(b, "not")).unwrap_or(k).to_string();
-            let (suffix, attrs) = match b.attrs.get("if") {
-                Some(c) => (format!(" (if {c})"), format!(" if=\"{}\"", xml_attr(c))),
+            let (suffix, attrs) = match b.attrs.get("if").map(|c| w.sub(c)) {
+                Some(c) => (format!(" (if {c})"), format!(" if=\"{}\"", xml_attr(&c))),
                 None => (String::new(), String::new()),
             };
             // A keyword keeps the list marker it was written with.
@@ -700,7 +922,7 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
                 suffix,
                 attrs,
             };
-            let body = body(w);
+            let body = inner(w);
             let mut out = wrap(w.style, &head, body, lead, false);
             // S14: the reason, on its own line after the rule's text — the
             // blank lines that separated a `BECAUSE:` paragraph go. It keeps
@@ -713,7 +935,8 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
                     suffix: String::new(),
                     attrs: String::new(),
                 };
-                let text: Vec<String> = degrade_inline(because)
+                let text: Vec<String> = w
+                    .sub(&degrade_inline(because))
                     .split('\n')
                     .map(str::to_string)
                     .collect();
@@ -723,7 +946,7 @@ fn prose_lines(b: &Block, lines: &[&str], w: &mut Walk) -> Vec<String> {
         }
         // A prose kind the registry gives no delivery shape delivers its
         // body as written.
-        _ => src,
+        _ => Prose::quoted(src(), w),
     }
 }
 
@@ -1358,6 +1581,80 @@ mod tests {
         assert_eq!(ex.unfound_overrides, ["should/b"]);
     }
 
+    /// Nor does a catalogue body spend the delivery's include budget, or
+    /// record as overridden a rule an include in it silenced: an include in
+    /// a skill is inlined there, and accounted for nowhere.
+    #[test]
+    fn a_skill_body_accounts_for_nothing_it_includes() {
+        let sized = |n: usize| format!("{}\n", "x".repeat(n - 1));
+        let ex = fold_ctx(
+            ":::!skill{name=s}\n::include{id=\"big\"}\n:::\n\n::include{id=\"one\"}\n",
+            &[],
+            &[],
+            &[("big", &sized(1 << 20)), ("one", "MUST: one.\n")],
+        );
+        assert!(
+            ex.skills[0].body.starts_with("xxx"),
+            "inlined in the catalogue"
+        );
+        assert!(
+            ex.cleaned.ends_with("\n\n**MUST:** one.\n"),
+            "the delivery's include is not starved: {:?}",
+            &ex.cleaned[ex.cleaned.len().saturating_sub(80)..]
+        );
+        let ex = fold_ctx(
+            ":::!skill{name=s}\nA.\n\n::include{id=\"i\"}\n:::\n",
+            &[],
+            &[],
+            &[(
+                "i",
+                "SHOULD[b]: x.\n\n:::must{name=m overrides=\"should/b\"}\nM.\n:::\n",
+            )],
+        );
+        assert_eq!(ex.skills[0].body, "A.\n\n**MUST:** M.");
+        assert!(ex.overridden.is_empty(), "{:?}", ex.overridden);
+    }
+
+    /// §3.5 removes variants before overrides on both sides: a target this
+    /// document has only inside a dropped variant is not local, so the
+    /// override finds it in what the document includes.
+    #[test]
+    fn a_target_only_in_a_dropped_variant_is_looked_for_in_includes() {
+        let ex = fold_ctx(
+            ":::when{env=\"x\"}\nSHOULD[b]: x.\n:::\n\n::include{id=\"a\"}\n\n\
+             :::must{name=m overrides=\"should/b\"}\nM.\n:::\n",
+            &[],
+            &[("env", "y")],
+            &[("a", "SHOULD[b]: inc.\n")],
+        );
+        assert_eq!(ex.cleaned, "**MUST:** M.\n");
+        assert_eq!(ex.overridden, ["should/b"]);
+        assert!(
+            ex.unfound_overrides.is_empty(),
+            "{:?}",
+            ex.unfound_overrides
+        );
+    }
+
+    /// S24: a guardrail in an included document is found and kept, even by
+    /// an overrider as strong as it — a guardrail is never overridden.
+    #[test]
+    fn an_included_guardrail_is_kept_by_an_equal_overrider() {
+        let ex = fold_ctx(
+            "::include{id=\"h\"}\n\n:::guardrail{name=g overrides=\"guardrail/x\"}\nG.\n:::\n",
+            &[],
+            &[],
+            &[("h", "GUARDRAIL[x]: keep.\n")],
+        );
+        assert_eq!(ex.cleaned, "**GUARDRAIL:** keep.\n\n**GUARDRAIL:** G.\n");
+        assert!(ex.overridden.is_empty(), "{:?}", ex.overridden);
+        assert!(
+            ex.unfound_overrides.is_empty(),
+            "{:?}",
+            ex.unfound_overrides
+        );
+    }
+
     /// Includes are capped at 1 MiB inlined over the whole delivery: one
     /// include at the cap is inlined, the next is not, and neither is one
     /// over it on its own.
@@ -1549,6 +1846,20 @@ mod tests {
         );
     }
 
+    /// Notes (S9) are stripped from a glossary and from an inert body too,
+    /// though parse keeps none for either — but a `<!--` in fenced code is
+    /// code.
+    #[test]
+    fn notes_are_stripped_from_glossaries_and_inert_bodies() {
+        assert_eq!(
+            delivered(
+                ":::glossary\nTerm\n: Def one.\n<!-- secret glossary note -->\n\nOther\n: Def two.\n:::\n\n\
+                 :::aside\nA.\n<!-- secret inert note -->\n```html\n<!-- markup -->\n```\n:::\n"
+            ),
+            "**Term** — Def one.\n**Other** — Def two.\n\nA.\n```html\n<!-- markup -->\n```\n"
+        );
+    }
+
     /// Notes (S9) are stripped from prose and from every prose body; a
     /// `verbatim` body is quoted whole and keeps `<!--` as written.
     #[test]
@@ -1577,21 +1888,311 @@ mod tests {
         );
     }
 
-    /// Machinery nested in a body is not folded (the fold reads the top
-    /// level), so it is not acknowledged either: the model is never told a
-    /// workflow is loaded that is not. At the top level it is.
+    /// The refusals of a fold, as `(line, code)`.
+    fn refused(
+        text: &str,
+        facts: &[(&str, &str)],
+        includes: &[(&str, &str)],
+    ) -> Vec<(u32, String)> {
+        let map = |kv: &[(&str, &str)]| -> BTreeMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let includes = map(includes);
+        let resolve = |id: &str| includes.get(id).cloned();
+        fold_full(
+            &parse(text).unwrap(),
+            &all_families(),
+            &BTreeMap::new(),
+            &map(facts),
+            &resolve,
+        )
+        .unwrap_err()
+        .into_iter()
+        .map(|r| (r.line.unwrap_or(0), r.code.to_string()))
+        .collect()
+    }
+
+    /// Configuration folds from the top level only, so machinery anywhere
+    /// else is refused rather than loaded as nothing: in a kept `when` or a
+    /// dropped one, a `context`, a skill — a set once. At the top level it
+    /// folds and is acknowledged.
     #[test]
-    fn nested_machinery_claims_nothing() {
+    fn machinery_folds_from_the_top_level_only() {
         let wf = ":::!workflow{name=w}\nsteps: { s: { kind: manual } }\n:::";
-        let nested = format!("::::when{{env=\"prod\"}}\nKept.\n{wf}\n::::\n");
-        let ex = fold(&parse(&nested).unwrap(), &all_families()).unwrap();
-        assert!(ex.workflows.is_empty());
-        assert_eq!(ex.cleaned, "Kept.\n");
+        let in_when = format!("::::when{{env=\"prod\"}}\nKept.\n{wf}\n::::\n");
+        let nested = vec![(3, "nested-machinery".to_string())];
+        assert_eq!(refused(&in_when, &[("env", "prod")], &[]), nested);
+        assert_eq!(refused(&in_when, &[("env", "dev")], &[]), nested);
+        assert_eq!(
+            refused(
+                ":::context\nRead this.\n::!mcp{name=x url=\"https://x.test/mcp\"}\n:::\n",
+                &[],
+                &[]
+            ),
+            nested
+        );
+        assert_eq!(
+            refused(
+                ":::!skill{name=s}\nUse it.\n::!human{name=h}\n:::\n",
+                &[],
+                &[]
+            ),
+            nested
+        );
+        assert_eq!(
+            refused(
+                "::::when{env=\"prod\"}\nX.\n:::!human[]\n| name |\n|------|\n| a |\n| b |\n:::\n::::\n",
+                &[],
+                &[]
+            ),
+            vec![(3, "nested-machinery".to_string())],
+            "a set is one refusal"
+        );
         let ex = fold(&parse(wf).unwrap(), &all_families()).unwrap();
         assert_eq!(ex.workflows.len(), 1);
         assert_eq!(
             ex.cleaned,
             "[workflow \"w\" is loaded and runs autonomously]\n"
+        );
+    }
+
+    /// An included document folds no configuration, so one carrying
+    /// machinery is not available: the model is never told of a workflow
+    /// that was not loaded. Prose alone is inlined.
+    #[test]
+    fn an_included_document_with_machinery_is_not_available() {
+        let ex = fold_ctx(
+            "Top.\n\n::include{id=\"i\"}\n",
+            &[],
+            &[],
+            &[(
+                "i",
+                ":::!workflow{name=w}\nsteps: { s: { kind: manual } }\n:::\n",
+            )],
+        );
+        assert_eq!(
+            ex.cleaned,
+            "Top.\n\n> _(included instruction not available)_\n"
+        );
+        assert!(ex.workflows.is_empty() && ex.config.is_empty());
+        assert_eq!(
+            delivered_with("::include{id=\"i\"}\n", "i", "MUST: be kind.\n"),
+            "**MUST:** be kind.\n"
+        );
+    }
+
+    /// A machinery opener only delivery's second reading of a body finds —
+    /// in an alert's unquoted lines, which parse reads as text — is
+    /// delivered as the text it is: no acknowledgement of what never folded,
+    /// and none of the author's words lost.
+    #[test]
+    fn machinery_only_a_body_reading_finds_is_text() {
+        assert_eq!(
+            delivered("> [!NOTE]\n> Ask first.\n> ::!human{name=h}\n"),
+            "**NOTE:** Ask first.\n::!human{name=h}\n"
+        );
+    }
+
+    /// §5.2 include rule 1: an include is resolved with its OWN parameters.
+    /// The includer's value — a default it declares, or one it was given —
+    /// is no fact of the include's, so its variant and its `${}` agree.
+    #[test]
+    fn an_include_selects_and_substitutes_with_its_own_parameters() {
+        let inc = "::param{name=tier type=enum values=\"free, pro\" default=free}\n\n\
+                   :::when{tier=\"free\"}\nFree ${tier}.\n:::\n\n:::when{tier=\"pro\"}\nPro ${tier}.\n:::\n";
+        let declared = fold_ctx(
+            "::param{name=tier default=pro}\n\n::include{id=\"i\"}\n",
+            &[],
+            &[],
+            &[("i", inc)],
+        );
+        assert_eq!(declared.cleaned, "Free free.\n");
+        let given = fold_ctx(
+            "::include{id=\"i\"}\n",
+            &[("tier", "enterprise")],
+            &[],
+            &[("i", inc)],
+        );
+        assert_eq!(given.cleaned, "Free free.\n");
+        // Nor through an include in between, whatever either declares.
+        let nested = fold_ctx(
+            "::param{name=tier default=pro}\n\n::include{id=\"a\"}\n",
+            &[],
+            &[],
+            &[
+                (
+                    "a",
+                    "::param{name=tier default=pro}\n\n::include{id=\"i\"}\n",
+                ),
+                ("i", inc),
+            ],
+        );
+        assert_eq!(nested.cleaned, "Free free.\n");
+        // A runtime fact still reaches it.
+        let ex = fold_ctx(
+            "::include{id=\"i\"}\n",
+            &[],
+            &[("env", "prod")],
+            &[(
+                "i",
+                ":::when{env=\"prod\"}\nProd.\n:::\n:::otherwise\nElse.\n:::\n",
+            )],
+        );
+        assert_eq!(ex.cleaned, "Prod.\n");
+    }
+
+    /// An include's lines arrive substituted with its own parameters and
+    /// are touched by nothing of the includer's: a placeholder it left stays
+    /// (the caller's value never checked against its declaration), and a
+    /// value it inserted is not substituted again (§3.5: never re-parsed).
+    #[test]
+    fn the_includer_never_substitutes_an_includes_lines() {
+        let ex = fold_ctx(
+            "::include{id=\"i\"}\n",
+            &[("n", "lots")],
+            &[],
+            &[("i", "::param{name=n type=number}\n\nN=${n}\n")],
+        );
+        assert_eq!(ex.cleaned, "N=${n}\n");
+        let ex = fold_ctx(
+            "::param{name=b default=SECRET}\n\n::include{id=\"i\"}\n\nB=${b}\n",
+            &[],
+            &[],
+            &[("i", "::param{name=v default=\"${b}\"}\n\nV=${v} and ${b}\n")],
+        );
+        assert_eq!(ex.cleaned, "V=${b} and ${b}\n\nB=SECRET\n");
+    }
+
+    /// Whether a line is code is read from the source: a rule whose body
+    /// opens with a fence has its label glued onto that line, and the fence
+    /// is still a fence — its `${}` untouched, the prose after it
+    /// substituted. In every label style.
+    #[test]
+    fn a_label_glued_onto_a_fence_keeps_it_a_fence() {
+        let body =
+            "::param{name=x default=VAL}\n\n:::must\n```sh\necho ${x}\n```\n:::\n\nUse ${x}.\n";
+        assert_eq!(
+            delivered(body),
+            "**MUST:** ```sh\necho ${x}\n```\n\nUse VAL.\n"
+        );
+        assert_eq!(
+            delivered(&format!("---\ndelivery: {{labels: tags}}\n---\n{body}")),
+            "<must>```sh\necho ${x}\n```</must>\n\nUse VAL.\n"
+        );
+    }
+
+    /// §3.5: a substituted value is size-capped — 2000 bytes, cut on a
+    /// character boundary — however often its placeholder is written.
+    #[test]
+    fn a_substituted_value_is_capped() {
+        let long = "A".repeat(5000);
+        let out = with_params("${x}\n${x}\n", &[("x", &long)]);
+        let cap = "A".repeat(doc::PARAM_VALUE_BYTES_CAP);
+        assert_eq!(out, format!("{cap}\n{cap}\n"));
+        // Two-byte characters: the cut falls between them, not inside one.
+        let wide = "é".repeat(1001);
+        let out = with_params("${x}\n", &[("x", &wide)]);
+        assert_eq!(out, format!("{}\n", "é".repeat(1000)));
+    }
+
+    /// `n` `when`s, each inside the last, around one line.
+    fn whens(n: usize, inner: &str) -> String {
+        let mut doc = String::new();
+        for k in 0..n {
+            doc.push_str(&format!("{}when{{a=\"1\"}}\n", ":".repeat(n + 3 - k)));
+        }
+        doc.push_str(inner);
+        for k in (0..n).rev() {
+            doc.push_str(&format!("{}\n", ":".repeat(n + 3 - k)));
+        }
+        doc
+    }
+
+    /// A container's body is rendered from what parse read it as, never read
+    /// again: delivering containers nested as deep as parse admits reads no
+    /// body twice, so the work is the document's size, not its size times
+    /// its depth.
+    #[test]
+    fn a_container_body_is_never_read_again() {
+        let doc = parse(&whens(doc::NESTING_CAP + 1, "Deep.\n")).unwrap();
+        READS.with(|r| r.set(0));
+        let ex = fold(&doc, &all_families()).unwrap();
+        assert_eq!(ex.cleaned, "Deep.\n");
+        assert_eq!(READS.with(|r| r.get()), 0);
+        // A keyword's text starts after its label, so it has no lines of its
+        // own to index and is read again — once for the overrides it might
+        // declare, once for the delivery — however deep it sits.
+        let doc = parse(&whens(3, "MUST: deep.\n")).unwrap();
+        READS.with(|r| r.set(0));
+        assert_eq!(
+            fold(&doc, &all_families()).unwrap().cleaned,
+            "**MUST:** deep.\n"
+        );
+        assert_eq!(READS.with(|r| r.get()), 2);
+    }
+
+    /// Bodies render at most NESTING_CAP deep — twice what parse lets
+    /// containers nest, so only bodies read again reach it: a blockquote in a
+    /// blockquote, which parse never sees. Past it the document is refused,
+    /// never delivered in part.
+    #[test]
+    fn bodies_read_again_nest_at_most_the_cap() {
+        let alerts = |n: usize| {
+            (1..=n)
+                .map(|k| format!("{} [!NOTE]\n", ">".repeat(k).replace('>', "> ").trim_end()))
+                .collect::<String>()
+                + &format!("{} Deep.\n", "> ".repeat(n).trim_end())
+        };
+        assert!(delivered(&alerts(NESTING_CAP)).ends_with("Deep.\n"));
+        assert_eq!(
+            refused(&alerts(NESTING_CAP + 1), &[], &[]),
+            vec![(0, "nesting-depth".to_string())]
+        );
+        // So does a keyword whose text opens with a keyword, read again for
+        // every label.
+        let chain = |n: usize| format!("{}x\n", "MUST: ".repeat(n));
+        assert!(delivered(&chain(NESTING_CAP)).ends_with("x\n"));
+        assert_eq!(
+            refused(&chain(NESTING_CAP + 1), &[], &[]),
+            vec![(0, "nesting-depth".to_string())]
+        );
+    }
+
+    /// §5.2: a `param` declares wherever it is written — in a `when` body,
+    /// as a leaf or a table, as at the top level.
+    #[test]
+    fn a_param_in_a_body_declares() {
+        assert_eq!(
+            with_facts(
+                "::::when{a=\"1\"}\n:::param[]\n| name | default |\n|---|---|\n| p | v |\n:::\nUse ${p}.\n::::\n",
+                &[("a", "1")]
+            ),
+            "Use v.\n"
+        );
+        assert_eq!(
+            with_facts(
+                ":::when{agent=\"agentd\"}\n::param{name=y default=1}\n:::\n\nY=${y}\n",
+                &[("agent", "agentd")]
+            ),
+            "Y=1\n"
+        );
+    }
+
+    /// When a runtime fact and a parameter share a key, the variant selects
+    /// on the fact (runtime-authoritative) and `${key}` substitutes the
+    /// parameter. The reference lets the parameter win both; which is right
+    /// is open upstream, and this pins what the crate does until it is
+    /// settled.
+    #[test]
+    fn a_fact_selects_and_a_parameter_substitutes_on_a_shared_key() {
+        assert_eq!(
+            with_facts(
+                "::param{name=env default=dev}\n\n:::when{env=\"prod\"}\nProd ${env}.\n:::\n",
+                &[("env", "prod")]
+            ),
+            "Prod dev.\n"
         );
     }
 
@@ -1609,6 +2210,18 @@ mod tests {
              [skill \"b\" is available — use it when refunding; reference it as @skill/b]\n\n\
              [skill \"c\" is available — use it when first; reference it as @skill/c]\n\n\
              [skill \"d\" is available — reference it as @skill/d]\n"
+        );
+    }
+
+    /// Appendix A, `!human`: a role says what it may be asked for when
+    /// `may` is set.
+    #[test]
+    fn a_human_role_says_what_it_may_be_asked() {
+        assert_eq!(
+            delivered(
+                "::!human{name=ops channel=\"slack://x\" may=\"approve, deny\"}\n\n::!human{name=lead}\n"
+            ),
+            "[human role \"ops\" may be asked (may: approve, deny)]\n\n[human role \"lead\" may be asked]\n"
         );
     }
 

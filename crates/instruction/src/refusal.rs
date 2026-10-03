@@ -121,7 +121,16 @@ pub const CODES: &[&str] = &[
     // Not in Appendix B: refusals/non-integer-version pins it as its second
     // entry (the TypeScript port's schema-validation path). Raised upstream.
     "schema",
+    // Not in Appendix B: this reader's own limits, refused where the
+    // reference delivers. Raised upstream.
+    "nested-machinery",
+    "nesting-depth",
 ];
+
+/// The codes in [`CODES`] that Appendix B has no row for: one a fixture pins,
+/// and the refusals of this reader's own limits — machinery it would fold
+/// from nowhere but the top level, bodies nested past what it delivers.
+pub const NON_CATALOGUE: &[&str] = &["schema", "nested-machinery", "nesting-depth"];
 
 /// The Appendix B codes this crate never emits, each with the reason. Every
 /// other code in [`CODES`] has a site that constructs it; a unit test holds
@@ -403,6 +412,13 @@ mod tests {
                 CODES.contains(&code.as_str()),
                 "a constructor uses {code:?}, which is not in CODES"
             );
+        }
+    }
+
+    #[test]
+    fn the_non_catalogue_codes_are_codes() {
+        for code in NON_CATALOGUE {
+            assert!(CODES.contains(code), "{code} is not in CODES");
         }
     }
 

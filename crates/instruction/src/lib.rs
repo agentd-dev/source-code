@@ -34,7 +34,7 @@ pub use api::{Context, Delivery, deliver, parse, tree_json, validate};
 // Every refusal from `parse` to the API is one structured type carrying its
 // Appendix B code (S20); `CODES` and `UNDETECTED` account for the catalogue.
 mod refusal;
-pub use refusal::{CODES, Refusal, UNDETECTED};
+pub use refusal::{CODES, NON_CATALOGUE, Refusal, UNDETECTED};
 
 // The §7.4 manifest types are format, not crypto: always available, digest
 // STRINGS filled only when the `sign` feature computes them.

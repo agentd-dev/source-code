@@ -340,21 +340,24 @@ test that fails on the old code.
   - A keyword line in an unknown bare block's body, or a bare `:::eval`'s,
     is no longer bolded: the body is delivered raw, fences removed (S23).
   - A rule inside a body — an output, a context, a kept `when`, a tool — is
-    rendered as a rule; one inside a `:::context` was dropped. Machinery
-    nested in a body still delivers nothing: only top-level machinery is
-    folded, so an acknowledgement there would claim a block is loaded that
-    is not.
-  - Author notes are never delivered (S9), in prose or in any body, and
-    neither is end matter, an included document's included (S27). A
-    `verbatim` body keeps `<!--` as written.
+    rendered as a rule; one inside a `:::context` was dropped.
+  - Author notes are never delivered (S9), in prose or in any body — a
+    glossary's and an inert block's included — and neither is end matter,
+    an included document's included (S27). A `verbatim` body keeps `<!--`
+    as written, and so does fenced code.
+  - A `::!human` with `may` says what the role may be asked for: `[human
+    role "x" may be asked (may: approve, deny)]`.
   - A reference inside an inline code span is no longer degraded, and a
     line of only spaces or tabs is delivered empty.
   - A skill written with a trigger says when to use it (S11): `[skill "x" is
     available — use it when …; reference it as @skill/x]`, from `trigger` or
     a skill's `when`, `trigger` winning.
   - The skill catalogue's body is rendered as the skill's prose would be
-    delivered — rules labelled and never named, notes stripped — where it
-    carried `MUST[name]:` raw.
+    delivered — rules labelled and never named, notes stripped, variants
+    selected, includes inlined — where it carried `MUST[name]:` raw. It
+    still substitutes no parameter, and it accounts for nothing the
+    delivery does: an include in it spends none of the delivery's 1 MiB,
+    and an override is neither applied nor found in it.
   - `delivery: {labels: plain}` delivers `MUST: x`, and `delivery: {labels:
     tags}` delivers `<must>x</must>` (a multi-line body opens the tag on its
     first line and closes it on its last; an example and an output stand
@@ -378,15 +381,59 @@ test that fails on the old code.
     now used, where it was ignored, and a YAML list of `values` is listed
     by a form as `one of: a, b`.
   - `${x}` inside fenced code is no longer substituted (§3.4 rule 4); in an
-    inline code span it still is, as the corpus pins.
+    inline code span it still is, as the corpus pins. Whether a line is
+    code is read from the source, so a rule whose body opens with a fence
+    (`**MUST:** ```sh`) keeps it a fence.
+  - A substituted value is capped at 2000 bytes, cut on a character
+    boundary (§3.5 "size-capped"); a long default written many times
+    delivered a copy each time.
+  - A `param` declares wherever it is written, in a `when` or any other
+    body as at the top level (§5.2); one in a body was ignored and its
+    placeholder delivered raw.
+  - An included document is resolved with its own parameters only (§5.2
+    include rule 1). The includer's parameter values reached it as `when`
+    facts, so its variants selected on a value its `${}` did not
+    substitute, and the includer's substitution ran over its inlined lines,
+    filling placeholders it left with the includer's values and
+    substituting a value it had inserted again. Now an include sees the
+    runtime facts and its own parameters, and its lines arrive substituted
+    and are not touched again.
+  - Where a runtime fact and a parameter share a key, a variant selects on
+    the fact and `${key}` substitutes the parameter, as before; the
+    reference lets the parameter win both, and which is right is open
+    upstream.
   - `overrides="kind/name"` suppresses the rule it names, and its reason
     (S24). The target is looked up in the document, then in what it
     includes, in include order and depth first; a guardrail, or a rule
     stronger than its overrider, in an included document is kept. An
-    `overrides` declared inside a dropped variant does not apply. The skill
-    catalogue's bodies are rendered without overrides.
+    `overrides` declared inside a dropped variant does not apply, and a
+    target the document has only inside a dropped variant is looked for in
+    what it includes. The skill catalogue's bodies are rendered without
+    overrides.
   - The includes of one delivery are capped at 1 MiB inlined together; an
     include past the cap delivers the not-available note.
+- **Machinery folds from an instruction document's top level only, and
+  anywhere else is refused.** A `:::!tools`, `:::!workflow` or any other
+  machinery block nested in a body — a `when`'s, kept or dropped, a
+  `context`'s, a skill's — parsed, was never folded, and the document loaded
+  as if it were not there: `:::!tools deny: [exec]` inside a `:::when` denied
+  nothing. It is refused now (`nested-machinery`), naming the block and the
+  body it is in; a sub-block in its parent (`case` in a `test`) is its
+  parent's and is unaffected. An included document folds no configuration,
+  so one carrying machinery is not available and delivers the not-available
+  note, where its acknowledgement told the model of a workflow or a tool
+  policy nothing had loaded. A machinery opener that only delivery reads —
+  inside an alert's quoted lines, which parse reads as text — is delivered
+  as the text it is.
+- **An instruction document nests at most 32 blocks deep.** A block inside
+  more than 32 others is refused (`nesting-depth`) and not read: fences of
+  one length nest, so ten thousand `:::when` lines overflowed the reader's
+  stack and aborted the process. Delivery renders a container's body from
+  what parse read, where it read every body again at every level, so a
+  megabyte nested a thousand deep took seconds; it now costs what the same
+  text costs flat. A chain of bodies only delivery reads again — an alert
+  quoted in an alert, a keyword's text opening with a keyword — is refused
+  past 64.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -493,6 +540,12 @@ what a machinery block's recorded `content` reads; delivery reads the
 source.
 `Extraction` gains `overridden`, the rules an override kept from delivery,
 and `unfound_overrides`, the document's override targets found nowhere.
+`CODES` gains `nested-machinery` and `nesting-depth`, this reader's own
+limits, which Appendix B has no row for; new `NON_CATALOGUE` lists them with
+`schema` (raised upstream). A container's child `Block` now carries its
+`region` in the document body (it was `(0, 0)`), and `Block` carries the
+layout of a container's body for delivery, so it can no longer be built
+outside the crate.
 
 ## v1.17.0 — A2A, and nothing beside it
 

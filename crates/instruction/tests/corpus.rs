@@ -652,8 +652,8 @@ fn the_refusal_codes_are_appendix_b_when_present() {
         table.len()
     );
     let ours: BTreeSet<&str> = instruction_core::CODES.iter().copied().collect();
-    // Pinned by refusals/non-integer-version, with no row in Appendix B.
-    let non_catalogue: BTreeSet<&str> = ["schema"].into();
+    // The codes with no row in Appendix B, as the crate lists them.
+    let non_catalogue: BTreeSet<&str> = instruction_core::NON_CATALOGUE.iter().copied().collect();
     let missing: Vec<_> = table.difference(&ours).collect();
     let extra: Vec<_> = ours
         .difference(&table)

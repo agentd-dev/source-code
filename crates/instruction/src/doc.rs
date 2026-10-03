@@ -650,12 +650,12 @@ pub struct Block {
     /// lifted and `body` is the whole story. The tree (§9.1) always reads
     /// `body`, which excludes lifted children; delivery reads the source.
     pub raw_body: Option<String>,
-    /// The block's line region in the document body (0-based, inclusive), set
-    /// for TOP-LEVEL blocks by the walk. Delivery replaces exactly this region
-    /// with the block's delivered form, leaving every other line untouched
-    /// (§3.5 layout). `(0, 0)` on children in the tree: delivery walks a body
-    /// again on its own, which gives its blocks regions in that body. A
-    /// rule's region covers the reason that follows it.
+    /// The block's line region (0-based, inclusive) in the lines it was read
+    /// from: the document body for a top-level block or a container's child,
+    /// the body itself for a block delivery found reading one again. Delivery
+    /// replaces exactly this region with the block's delivered form, leaving
+    /// every other line untouched (§3.5 layout). A rule's region covers the
+    /// reason that follows it.
     pub region: (usize, usize),
     /// The lines of the rule's `BECAUSE:` paragraph (S14; 0-based body
     /// lines, inclusive), when one follows it. Its text is `attrs.because`.
@@ -664,6 +664,22 @@ pub struct Block {
     /// inclusive), not those of its children. Their lines stay in `body`, as
     /// the §9.1 tree keeps them, and are recorded for delivery to strip.
     pub notes: Vec<(usize, usize)>,
+    /// A container's body as the walk read it, in order: what delivery
+    /// renders the body from, so it never reads the body again. Empty for
+    /// any other form.
+    pub(crate) layout: Vec<Piece>,
+}
+
+/// One piece of a container's body, in the lines the container was read
+/// from (0-based, inclusive). Lines no piece covers are prose.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Piece {
+    /// `children[index]`, at its `region`.
+    Child(usize),
+    /// An author note (S9).
+    Note { start: usize, end: usize },
+    /// An inert block (S23), fences included.
+    Inert { start: usize, end: usize },
 }
 
 impl Block {
@@ -908,7 +924,7 @@ pub(crate) fn walk_nodes(
         }
         if let Some(of) = open_fence(lines[i]) {
             flush!();
-            match parse_fenced(lines, i, of, base, lines.len(), errs) {
+            match parse_fenced(lines, i, of, base, lines.len(), 0, errs) {
                 // A rule container's region covers the reason that follows it.
                 Fenced::Blocks {
                     blocks,
@@ -1005,17 +1021,48 @@ enum Fenced {
     },
 }
 
+/// How deep blocks nest: a block inside more than this many others is
+/// refused. Each level is a call deeper, and fences of one length nest, so a
+/// few hundred kilobytes of `:::when` lines once took the reader's stack
+/// down; no document needs a fraction of this.
+pub(crate) const NESTING_CAP: usize = 32;
+
 /// Classify the `:::` opener at `open_idx`, then parse it as a block or
-/// swallow it as an inert one. `bound` is where the enclosing body ends.
+/// swallow it as an inert one. `bound` is where the enclosing body ends, and
+/// `depth` how many blocks enclose this one.
 fn parse_fenced(
     lines: &[&str],
     open_idx: usize,
     of: OpenFence,
     line_base: usize,
     bound: usize,
+    depth: usize,
     errs: &mut Vec<Refusal>,
 ) -> Fenced {
     let line_no = line_base + open_idx + 1;
+    if depth > NESTING_CAP {
+        errs.push(Refusal::at(
+            line_no,
+            "nesting-depth",
+            format!(
+                ":::{} is nested inside more than {NESTING_CAP} blocks — this \
+                 reader reads at most {NESTING_CAP}; flatten the nesting",
+                of.kind
+            ),
+        ));
+        // Not read: the first close long enough ends it, as an inert
+        // block's does, so nothing deeper is ever opened. The document is
+        // refused, so where exactly it ended is no one's to rely on.
+        let next = (open_idx + 1..bound)
+            .find(|&j| fence_close_len(lines[j]).is_some_and(|n| n >= of.len))
+            .map_or(bound, |c| c + 1);
+        return Fenced::Blocks {
+            blocks: Vec::new(),
+            closed: next,
+            next,
+            notes: Vec::new(),
+        };
+    }
     let form = if of.is_set {
         Form::Set
     } else {
@@ -1051,8 +1098,15 @@ fn parse_fenced(
             };
         }
     };
-    let (blocks, closed, next, notes) =
-        parse_fence_and_reason(lines, open_idx, of, disposition, line_base, bound, errs);
+    let (mut blocks, closed, notes) =
+        parse_fence(lines, open_idx, of, disposition, line_base, depth, errs);
+    // A rule container's reason follows its close (S14).
+    let next = match blocks.as_mut_slice() {
+        [b] if b.form == Form::Container => {
+            attach_reason(b, lines, closed, bound, line_base, errs).unwrap_or(closed)
+        }
+        _ => closed,
+    };
     Fenced::Blocks {
         blocks,
         closed,
@@ -1071,6 +1125,7 @@ fn parse_fence(
     of: OpenFence,
     disposition: Option<Disposition>,
     line_base: usize,
+    depth: usize,
     errs: &mut Vec<Refusal>,
 ) -> (Vec<Block>, usize, Vec<(usize, usize)>) {
     let line_no = line_base + open_idx + 1;
@@ -1091,7 +1146,8 @@ fn parse_fence(
         set: of.is_set,
     };
 
-    let (c, close_idx, closed) = collect_body(lines, open_idx + 1, of.len, line_base, scan, errs);
+    let (c, close_idx, closed) =
+        collect_body(lines, open_idx + 1, of.len, line_base, scan, depth, errs);
     if !closed {
         errs.push(Refusal::at(
             line_no,
@@ -1139,6 +1195,7 @@ fn parse_fence(
                 region: (0, 0),
                 reason: None,
                 notes: c.notes,
+                layout: c.layout,
             }],
             close_idx + 1,
             Vec::new(),
@@ -1177,6 +1234,7 @@ fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<Refusal>) -> Leafed {
         region: (0, 0),
         reason: None,
         notes: Vec::new(),
+        layout: Vec::new(),
     }))
 }
 
@@ -1241,6 +1299,7 @@ fn parse_section(
                         region: (0, 0),
                         reason: None,
                         notes: Vec::new(),
+                        layout: Vec::new(),
                     }),
                     fc + 1,
                 )
@@ -1281,6 +1340,7 @@ fn parse_section(
                 region: (0, 0),
                 reason: None,
                 notes: c.notes,
+                layout: Vec::new(),
             }),
             end,
         )
@@ -1339,7 +1399,7 @@ fn section_extent(lines: &[&str], from: usize, level: usize, notes: bool) -> usi
             // it — an inert one raw to its first close, a note inside a
             // Markdown one hiding its fences — so the section ends where its
             // body does. Its refusals are the body walk's to report.
-            i = match parse_fenced(lines, i, of, 0, lines.len(), &mut Vec::new()) {
+            i = match parse_fenced(lines, i, of, 0, lines.len(), 1, &mut Vec::new()) {
                 Fenced::Blocks { next, .. } | Fenced::Inert { next, .. } => next,
             };
             continue;
@@ -1431,6 +1491,8 @@ struct Collected {
     /// inclusive). Their lines are in `body` and `raw`, as the tree keeps
     /// them.
     notes: Vec<(usize, usize)>,
+    /// The body's pieces, in order ([`Block::layout`]).
+    layout: Vec<Piece>,
 }
 
 impl Collected {
@@ -1438,6 +1500,13 @@ impl Collected {
     fn line(&mut self, l: &str) {
         self.body.push(l.to_string());
         self.raw.push(l.to_string());
+    }
+
+    /// A child block, at its region in the lines being read.
+    fn child(&mut self, mut b: Block, region: (usize, usize)) {
+        b.region = region;
+        self.layout.push(Piece::Child(self.children.len()));
+        self.children.push(b);
     }
 }
 
@@ -1451,6 +1520,7 @@ fn collect_body(
     open_len: usize,
     line_base: usize,
     scan: BodyScan,
+    depth: usize,
     errs: &mut Vec<Refusal>,
 ) -> (Collected, usize, bool) {
     let mut c = Collected::default();
@@ -1502,6 +1572,7 @@ fn collect_body(
                 }
             }
             c.notes.push((i, end));
+            c.layout.push(Piece::Note { start: i, end });
             i = end + 1;
             continue;
         }
@@ -1514,7 +1585,7 @@ fn collect_body(
         // A nested container or set — recurse; an inert one's body is this
         // body's text, fences dropped, as the reference parser reads it.
         if let Some(of) = open_fence(line) {
-            match parse_fenced(lines, i, of, line_base, lines.len(), errs) {
+            match parse_fenced(lines, i, of, line_base, lines.len(), depth + 1, errs) {
                 Fenced::Blocks {
                     blocks,
                     closed,
@@ -1526,7 +1597,9 @@ fn collect_body(
                     for l in lines.get(closed..next).unwrap_or_default() {
                         c.raw.push(l.to_string());
                     }
-                    c.children.extend(blocks);
+                    for b in blocks {
+                        c.child(b, (i, next.saturating_sub(1)));
+                    }
                     c.notes.extend(notes);
                     i = next;
                 }
@@ -1534,6 +1607,10 @@ fn collect_body(
                     for l in &body {
                         c.line(l);
                     }
+                    c.layout.push(Piece::Inert {
+                        start: i,
+                        end: next.saturating_sub(1),
+                    });
                     i = next;
                 }
             }
@@ -1542,7 +1619,7 @@ fn collect_body(
         // A nested leaf; an inert one is a line of the body.
         if let Some(lf) = leaf_open(line) {
             match parse_leaf(lf, line_base + i + 1, errs) {
-                Leafed::Block(b) => c.children.push(*b),
+                Leafed::Block(b) => c.child(*b, (i, i)),
                 Leafed::Refused => {}
                 Leafed::Inert => c.line(line),
             }
@@ -1560,7 +1637,8 @@ fn collect_body(
             for l in &lines[i..next.min(lines.len())] {
                 c.raw.push(l.to_string());
             }
-            c.children.push(b);
+            let region = b.region;
+            c.child(b, region);
             i = next;
             continue;
         }
@@ -1584,6 +1662,8 @@ fn collect_range(
     markdown: bool,
     errs: &mut Vec<Refusal>,
 ) -> Collected {
+    // A section is a top-level block, so its children are one deep.
+    let depth = 0;
     let mut c = Collected::default();
     let mut i = from;
     let mut in_code = None::<usize>;
@@ -1613,7 +1693,7 @@ fn collect_range(
             continue;
         }
         if let Some(of) = open_fence(line) {
-            match parse_fenced(lines, i, of, line_base, end, errs) {
+            match parse_fenced(lines, i, of, line_base, end, depth + 1, errs) {
                 Fenced::Blocks {
                     blocks,
                     closed,
@@ -1959,6 +2039,7 @@ fn parse_table_set(
             region: (0, 0),
             reason: None,
             notes: Vec::new(),
+            layout: Vec::new(),
         });
     }
     out
@@ -2036,6 +2117,7 @@ fn parse_deflist_set(
             region: (0, 0),
             reason: None,
             notes: Vec::new(),
+            layout: Vec::new(),
         });
     }
     out
@@ -2264,7 +2346,7 @@ pub(crate) fn code_fence_len(line: &str) -> Option<usize> {
 /// Whether `line` opens an author note (S9; §3.3 rule 11, `x-grammar.
 /// authorNoteOpen`): `<!--` at column 0. One that begins mid-line is inline
 /// HTML, and prose.
-fn note_opens(line: &str) -> bool {
+pub(crate) fn note_opens(line: &str) -> bool {
     line.starts_with("<!--")
 }
 
@@ -2272,7 +2354,7 @@ fn note_opens(line: &str) -> bool {
 /// first line holding `-->` (`authorNoteClose`), searched past the opener's
 /// own four characters, so `<!-->` does not close itself. `None` when no line
 /// before `bound` closes it.
-fn note_end(lines: &[&str], open: usize, bound: usize) -> Option<usize> {
+pub(crate) fn note_end(lines: &[&str], open: usize, bound: usize) -> Option<usize> {
     (open..bound).find(|&j| {
         let l = if j == open { &lines[j][4..] } else { lines[j] };
         l.contains("-->")
@@ -3565,7 +3647,9 @@ pub fn fold_with_params(
 /// delivered text runs the §3.5 pipeline: every block rendered once from
 /// itself (prose labelled, machinery replaced by its acknowledgement line — a
 /// set as one line — includes inlined), inline references degraded in prose,
-/// and `${}` substituted LAST so a value is never re-parsed as Markdown.
+/// and `${}` substituted after them so a value is never re-parsed as
+/// Markdown. Configuration folds from the document's top level only:
+/// machinery anywhere else, or in an included document, is refused.
 pub fn fold_full(
     doc: &Document,
     granted: &BTreeSet<String>,
@@ -3580,6 +3664,7 @@ pub fn fold_full(
 fn fold_in(doc: &Document, w: &mut Walk) -> Result<Extraction, Vec<Refusal>> {
     let mut errs = Vec::new();
     check_grants(doc, w.granted, &mut errs);
+    check_machinery_placement(doc, w.depth > 0, &mut errs);
     let mut out = Extraction {
         families: families_used(doc).into_iter().collect(),
         ..Extraction::default()
@@ -3624,12 +3709,22 @@ fn fold_in(doc: &Document, w: &mut Walk) -> Result<Extraction, Vec<Refusal>> {
         }
     }
 
-    // §3.5: the body rendered once, region by region; then `${}` is
-    // substituted LAST so a value is never re-parsed.
-    let text = deliver::document(doc, w).join("\n");
+    // §3.5: the body rendered once, region by region, `${}` substituted in
+    // each delivered line after its references are degraded.
+    let mut text = deliver::document(doc, w).join("\n");
+    if w.too_deep {
+        return Err(vec![Refusal::new(
+            "nesting-depth",
+            format!(
+                "blocks nest more than {} bodies deep — this reader delivers \
+                 at most {}; flatten the nesting",
+                deliver::NESTING_CAP,
+                deliver::NESTING_CAP
+            ),
+        )]);
+    }
     out.overridden = w.overridden.clone();
     out.unfound_overrides = w.unfound_overrides();
-    let mut text = substitute_params(&text, &w.params);
     // The delivered text ends with exactly one newline (§3.5) — part of the
     // bytes the delivery digest covers.
     if !text.is_empty() {
@@ -3637,6 +3732,67 @@ fn fold_in(doc: &Document, w: &mut Walk) -> Result<Extraction, Vec<Refusal>> {
     }
     out.cleaned = text;
     Ok(out)
+}
+
+/// Machinery folds into configuration from a document's top level, and from
+/// nowhere else: the fold reads it there, and so do the workflow and
+/// secret references it resolves and every consumer that reads the parsed
+/// document after it. A machinery block nested in a body — a `when`'s, a
+/// `context`'s, a skill's — would load as nothing while the document
+/// reported success, so it is refused, each block once; a sub-block in its
+/// parent (`case` in a `test`) is its parent's, and placed by parse. An
+/// included document folds no configuration at all — its delivered text is
+/// inlined, nothing more (§5.2 include rule 1), and its declarations were
+/// never the reader's to admit (§3.3 rule 10) — so one that carries
+/// machinery is refused, and the include degrades to the not-available note
+/// rather than tell the model of a workflow or a tool policy that is not
+/// there.
+fn check_machinery_placement(doc: &Document, included: bool, errs: &mut Vec<Refusal>) {
+    let mut seen = BTreeSet::new();
+    let mut refuse = |b: &Block, why: String, errs: &mut Vec<Refusal>| {
+        // A set's members share its line: one set, one refusal.
+        if seen.insert(b.line) {
+            errs.push(Refusal::at(b.line, "nested-machinery", why));
+        }
+    };
+    fn nested<'a>(b: &'a Block, out: &mut Vec<(&'a Block, &'a str)>) {
+        for c in &b.children {
+            if c.disposition == Disposition::Machinery
+                && lookup(&c.kind).is_some_and(|k| k.sub_of.is_none())
+            {
+                out.push((c, b.kind.as_str()));
+            }
+            nested(c, out);
+        }
+    }
+    for b in doc.blocks() {
+        if included && b.disposition == Disposition::Machinery {
+            refuse(
+                b,
+                format!(
+                    "an included document folds no configuration, so its `!{}` \
+                     would configure nothing — include prose, and declare \
+                     machinery in the including document",
+                    b.kind
+                ),
+                errs,
+            );
+        }
+        let mut inner = Vec::new();
+        nested(b, &mut inner);
+        for (c, parent) in inner {
+            refuse(
+                c,
+                format!(
+                    "`!{}` is inside a `{parent}` body — machinery folds into \
+                     configuration from the document's top level only; move it \
+                     out of the `{parent}`",
+                    c.kind
+                ),
+                errs,
+            );
+        }
+    }
 }
 
 /// Fold one block into CONFIGURATION only (delivery is separate). Prose and
@@ -3648,12 +3804,14 @@ fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
 }
 
 /// Transclude an `include` (§5.2): resolve the referenced document, deliver it
-/// with its OWN parameters and label style, and inline its lines. An
-/// unavailable document, a cycle, a too-deep include, one that would take the
-/// delivery past [`INCLUDE_BYTES_CAP`], or one that does not parse (its end
-/// matter included) degrades to a visible note rather than looping or
-/// revealing existence. The overrides still pending go down into it, and what
-/// it found and overrode comes back up (S24).
+/// with its OWN parameters and label style, and inline its lines — already
+/// substituted, and touched by nothing of the includer's. An unavailable
+/// document, a cycle, a too-deep include, one that would take the delivery
+/// past [`INCLUDE_BYTES_CAP`], or one that does not parse (its end matter
+/// included) or fold (a grant it lacks, machinery it carries) degrades to a
+/// visible note rather than looping or revealing existence. The overrides
+/// still pending go down into it, and what it found and overrode comes back
+/// up (S24).
 pub(crate) fn deliver_include(b: &Block, w: &mut Walk) -> Vec<String> {
     let unavailable = || vec!["> _(included instruction not available)_".to_string()];
     let Some(id) = b.attrs.get("id").or_else(|| b.attrs.get("uri")).cloned() else {
@@ -3665,8 +3823,10 @@ pub(crate) fn deliver_include(b: &Block, w: &mut Walk) -> Vec<String> {
     let Some(text) = (w.resolver)(&id) else {
         return unavailable();
     };
-    // Bytes as UTF-8 (S7), counted once the resolver has handed them over —
-    // what the cap protects is the delivery's size, whatever then parses.
+    // Bytes as UTF-8 (S7), counted once the resolver has handed them over,
+    // whatever then parses: what is capped is the text inlined. A value
+    // substituted in it can lengthen it, by at most PARAM_VALUE_BYTES_CAP a
+    // placeholder.
     if w.include_bytes + text.len() > INCLUDE_BYTES_CAP {
         return unavailable();
     }
@@ -3761,12 +3921,25 @@ pub(crate) fn machinery_ack(b: &Block) -> Option<String> {
         .unwrap_or_default();
     let path = b.attrs.get("path").cloned().unwrap_or_default();
     let target = b.attrs.get("target").cloned().unwrap_or_default();
-    Some(
-        tmpl.replace("{name}", &name)
-            .replace("{path}", &path)
-            .replace("{target}", &target)
-            .replace("{trigger}", trigger.map_or("", String::as_str)),
-    )
+    let line = tmpl
+        .replace("{name}", &name)
+        .replace("{path}", &path)
+        .replace("{target}", &target)
+        .replace("{trigger}", trigger.map_or("", String::as_str));
+    // A human role says what it may be asked for (Appendix A, the `!human`
+    // row): ` (may: …)` before the closing bracket, when `may` is set.
+    let may: Vec<&str> = match b.attrs.get("may") {
+        Some(m) if b.kind == "human" => m
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(match line.strip_suffix(']') {
+        Some(head) if !may.is_empty() => format!("{head} (may: {})]", may.join(", ")),
+        _ => line,
+    })
 }
 
 /// A `form` delivers its input list, not its body (§5.1): the body is a
@@ -3900,7 +4073,11 @@ pub(crate) fn param_decls(doc: &Document) -> BTreeMap<String, BTreeMap<String, S
             }
         }
     }
-    for b in doc.blocks() {
+    // A `param` anywhere declares (§5.2: "equivalent in every way" to a
+    // front-matter entry) — in a `when` body as at the top level, as the
+    // reference collects them.
+    let top: Vec<&Block> = doc.blocks().collect();
+    for b in every_block(&top) {
         if b.kind == "param"
             && let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned())
         {
@@ -3991,32 +4168,13 @@ pub(crate) fn param_values(
         .collect()
 }
 
-/// Substitute `${name}` with its value (§3.5 step 6) — inserted as plain text,
-/// never re-parsed. An undeclared or unresolved `${x}` is left verbatim for
-/// the resolver to report. Fenced code is not substituted (§3.4 rule 4): a
-/// `${x}` in a code sample is the sample's own syntax. An inline code span
-/// is: the corpus pins `` `${default_branch}` `` delivering `` `main` ``.
-fn substitute_params(text: &str, params: &BTreeMap<String, String>) -> String {
-    let mut in_code = None::<usize>;
-    let lines: Vec<String> = text
-        .split('\n')
-        .map(|l| {
-            // The fence rule prose delivery reads (deliver.rs): a fence
-            // closes on a delimiter of its own length.
-            match (in_code, code_fence_len(l)) {
-                (Some(open), Some(n)) if n == open => in_code = None,
-                (None, Some(n)) => in_code = Some(n),
-                (None, None) => return substitute_line(l, params),
-                _ => {}
-            }
-            l.to_string()
-        })
-        .collect();
-    lines.join("\n")
-}
-
-/// [`substitute_params`] on one line outside fenced code.
-fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> String {
+/// `${name}` substituted in one delivered line, outside fenced code (the
+/// renderer decides that from the source; §3.4 rule 4) — §3.5 step 7. A
+/// value is inserted as plain text, never re-parsed, and capped at
+/// [`PARAM_VALUE_BYTES_CAP`]. An undeclared or unresolved `${x}` is left
+/// verbatim for the resolver to report. An inline code span is substituted:
+/// the corpus pins `` `${default_branch}` `` delivering `` `main` ``.
+pub(crate) fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
@@ -4025,7 +4183,7 @@ fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> String {
         if let Some(end) = after.find('}') {
             let name = &after[..end];
             match params.get(name) {
-                Some(val) => out.push_str(val),
+                Some(val) => out.push_str(capped(val)),
                 None => {
                     out.push_str("${");
                     out.push_str(name);
@@ -4040,6 +4198,25 @@ fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The cap on one substituted value, in UTF-8 bytes (§3.5: a resolved value
+/// is "inserted as plain text, size-capped"), 2000 as the reference sets
+/// it. Without it, a document that declares one long default and writes its
+/// placeholder a thousand times delivers a thousand copies: a small
+/// document became a system prompt of any size.
+pub(crate) const PARAM_VALUE_BYTES_CAP: usize = 2000;
+
+/// A value cut to [`PARAM_VALUE_BYTES_CAP`], on a character boundary.
+fn capped(v: &str) -> &str {
+    if v.len() <= PARAM_VALUE_BYTES_CAP {
+        return v;
+    }
+    let mut end = PARAM_VALUE_BYTES_CAP;
+    while !v.is_char_boundary(end) {
+        end -= 1;
+    }
+    &v[..end]
 }
 
 /// A line that opens a keyword block (§4.5; S12, S15), as
@@ -4233,29 +4410,6 @@ fn attach_reason(
     Some(end)
 }
 
-/// Parse a `:::` block, then take the reason that follows a rule container.
-/// Returns the blocks, the index just past the closing fence, the index just
-/// past the reason (the same index when there is none), and a set body's
-/// author notes.
-fn parse_fence_and_reason(
-    lines: &[&str],
-    open_idx: usize,
-    of: OpenFence,
-    disposition: Option<Disposition>,
-    line_base: usize,
-    bound: usize,
-    errs: &mut Vec<Refusal>,
-) -> (Vec<Block>, usize, usize, Vec<(usize, usize)>) {
-    let (mut blocks, next, notes) = parse_fence(lines, open_idx, of, disposition, line_base, errs);
-    let end = match blocks.as_mut_slice() {
-        [b] if b.form == Form::Container => {
-            attach_reason(b, lines, next, bound, line_base, errs).unwrap_or(next)
-        }
-        _ => next,
-    };
-    (blocks, next, end, notes)
-}
-
 /// If `line` opens a blockquote alert (§4.6): the kind it maps to.
 pub(crate) fn alert_block_kind(line: &str) -> Option<String> {
     alert_keyword(line).and_then(|kw| registry().keyword_kind(&kw).map(str::to_string))
@@ -4302,6 +4456,7 @@ pub(crate) fn lift_keyword_or_alert(
         region: (0, 0), // set below, once the reason is known
         reason: None,
         notes: Vec::new(),
+        layout: Vec::new(),
     };
     // A keyword's flags (`SHOULD NOT` → `not`) are the only thing that keep
     // its polarity: it maps to the same kind as its positive form (S8).
@@ -6610,6 +6765,28 @@ steps:
     #[test]
     fn the_wire_floor_is_the_registrys() {
         assert_eq!(registry().wire_floor(), crate::sign::WIRE_FLOOR);
+    }
+
+    /// Blocks nest inside at most NESTING_CAP others; one deeper is refused
+    /// at its line, and nothing inside it is opened — fences of one length
+    /// nest, so ten thousand `:::when` lines once overflowed the stack.
+    #[test]
+    fn blocks_nest_at_most_the_cap() {
+        let nest = |n: usize| {
+            format!(
+                "{}Deep.\n{}",
+                ":::when{a=\"1\"}\n".repeat(n),
+                ":::\n".repeat(n)
+            )
+        };
+        assert!(parse(&nest(NESTING_CAP + 1)).is_ok());
+        let errs = parse(&nest(NESTING_CAP + 2)).unwrap_err();
+        assert_eq!(
+            errs.iter().map(|r| (r.line, r.code)).collect::<Vec<_>>(),
+            [(Some(NESTING_CAP as u32 + 2), "nesting-depth")]
+        );
+        let errs = parse(&nest(10_000)).unwrap_err();
+        assert!(errs.iter().all(|r| r.code == "nesting-depth"), "{errs:?}");
     }
 
     // ── author notes, end matter, inert blocks, attribute values and

@@ -12,8 +12,9 @@
 //! byte-exactly ([`deliver`] — prose degraded, machinery acknowledged, `when`
 //! selected, includes transcluded, `${}` substituted last) with the §7.4
 //! resolution manifest accounting for it ([`Manifest`], S7), computes §7.2
-//! digests ([`digest()`]), and — behind the `sign` feature — verifies
-//! author/delivery JWS attestations ([`sign`]).
+//! digests ([`digest()`]), reports the Appendix C advisories ([`advise()`]),
+//! and — behind the `sign` feature — verifies author/delivery JWS
+//! attestations ([`sign`]).
 //!
 //! agentd is the first consumer (its `config::idoc` module is a re-export of
 //! [`doc`], with the agentd-specific configuration folding layered on top);
@@ -36,6 +37,11 @@ pub use api::{Context, Delivery, deliver, parse, tree_json, validate};
 // Appendix B code (S20); `CODES` and `UNDETECTED` account for the catalogue.
 mod refusal;
 pub use refusal::{CODES, NON_CATALOGUE, Refusal, UNDETECTED};
+
+// The Appendix C advisories (S19): read from a parsed document, never a
+// refusal, and never a change to what it delivers.
+mod advise;
+pub use advise::{ADVISORY_CODES, Advisory, Severity, advise};
 
 // The §7.4 manifest (S7) and the §7.2 digests it is made of are format, not
 // crypto: both in every build, so one delivery has one manifest whatever the

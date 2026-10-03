@@ -746,6 +746,28 @@ pub struct Document {
     /// The original text verbatim (front and end matter included) — what an
     /// authored digest is computed over.
     pub raw: String,
+    /// Where the parts of `raw` lie that the tree does not keep a place for.
+    pub(crate) outline: Outline,
+}
+
+/// Where a document's parts lie in its source, beyond what the blocks carry:
+/// what the Appendix C advisories ([`crate::advise()`]) need to tell prose
+/// from front matter, end matter and author notes. Every block's region and
+/// reason index the body (`source`) and its line is the source's, so the
+/// body's offset is what places them in the whole text.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct Outline {
+    /// How many source lines precede the body: those of the front matter.
+    pub(crate) base: usize,
+    /// The front matter's lines, its `---` fences included (1-based,
+    /// inclusive).
+    pub(crate) front_matter: Option<(usize, usize)>,
+    /// The end matter's lines, its `---` fences included (1-based,
+    /// inclusive).
+    pub(crate) end_matter: Option<(usize, usize)>,
+    /// The author notes in a top-level set's body (0-based body lines,
+    /// inclusive): no block carries them, as no block's body holds them.
+    pub(crate) set_notes: Vec<(usize, usize)>,
 }
 
 impl Document {
@@ -766,12 +788,26 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
     let mut errs = Vec::new();
     let (front, body_start) = parse_front_matter(text, &mut errs);
     let base = body_start_line(text, body_start);
+    let mut outline = Outline {
+        base,
+        // The closing fence's line: `base`, or the one after it when the
+        // text ends on the fence with no newline to start a body.
+        front_matter: (body_start > 0).then(|| {
+            let fm = &text[..body_start];
+            (
+                1,
+                fm.strip_suffix('\n').unwrap_or(fm).matches('\n').count() + 1,
+            )
+        }),
+        ..Outline::default()
+    };
     // End matter (S27) is the document's record, not its text: it is cut from
     // what the block scanner reads, so nothing in it is a block, a keyword or
     // a reference. Malformed end matter is refused, and still ends the body
     // where it opens.
     let (body, end_matter) = match end_matter_span(text, base) {
         Some(span) => {
+            outline.end_matter = Some((span.opener_line, span.closer_line));
             let fields = match span.fields {
                 Ok(m) => Some(m),
                 Err(r) => {
@@ -785,6 +821,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
     };
     let lines: Vec<&str> = body.split('\n').collect();
     let (nodes, set_notes) = walk_nodes(&lines, base, &mut errs);
+    outline.set_notes.clone_from(&set_notes);
 
     let blocks: Vec<&Block> = nodes
         .iter()
@@ -823,6 +860,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
             end_matter,
             source: body.to_string(),
             raw: text.to_string(),
+            outline,
         })
     } else {
         Err(errs)
@@ -1703,7 +1741,12 @@ fn collect_range(
                     for l in lines.get(closed..next).unwrap_or_default() {
                         c.raw.push(l.to_string());
                     }
-                    c.children.extend(blocks);
+                    // A section's child carries its region in the body, as
+                    // a container's does: the advisories place it by that.
+                    for mut b in blocks {
+                        b.region = (i, next.min(end).saturating_sub(1));
+                        c.children.push(b);
+                    }
                     c.notes.extend(notes);
                     i = next.min(end);
                 }
@@ -1718,7 +1761,10 @@ fn collect_range(
         }
         if let Some(lf) = leaf_open(line) {
             match parse_leaf(lf, line_base + i + 1, errs) {
-                Leafed::Block(b) => c.children.push(*b),
+                Leafed::Block(mut b) => {
+                    b.region = (i, i);
+                    c.children.push(*b);
+                }
                 Leafed::Refused => {}
                 Leafed::Inert => c.line(line),
             }
@@ -2284,7 +2330,7 @@ fn section_open(line: &str) -> Option<SectionTok> {
 }
 
 /// An ATX heading's level (`#`-count), if the line is one at column 0.
-fn heading_level(line: &str) -> Option<usize> {
+pub(crate) fn heading_level(line: &str) -> Option<usize> {
     if !line.starts_with('#') {
         return None;
     }
@@ -2646,6 +2692,8 @@ pub fn split_end_matter(text: &str) -> Result<SplitEndMatter<'_>, Refusal> {
 struct EndMatterSpan<'a> {
     before: &'a str,
     opener_line: usize,
+    /// The 1-based line of its closing `---`.
+    closer_line: usize,
     fields: Result<BTreeMap<String, Value>, Refusal>,
 }
 
@@ -2658,6 +2706,7 @@ fn end_matter_span(text: &str, from: usize) -> Option<EndMatterSpan<'_>> {
     Some(EndMatterSpan {
         before: &text[..before],
         opener_line: open + 1,
+        closer_line: close + 1,
         // The first end-matter line: the opener's 1-based line plus one.
         fields: end_matter_fields(&lines[open + 1..close].join("\n"), open + 2),
     })
@@ -4087,6 +4136,26 @@ pub(crate) fn deflist_entries(body: &str) -> Vec<(String, String)> {
 /// YAML list of `values` is the comma-separated value a `param` attribute
 /// would carry, so both spellings check and render alike.
 pub(crate) fn param_decls(doc: &Document) -> BTreeMap<String, BTreeMap<String, String>> {
+    param_declarations(doc)
+        .into_iter()
+        .map(|d| (d.name, d.attrs))
+        .collect()
+}
+
+/// One declaration of a parameter, as [`param_declarations`] lists it.
+pub(crate) struct ParamDeclaration {
+    pub(crate) name: String,
+    /// Its attributes, every value as its text.
+    pub(crate) attrs: BTreeMap<String, String>,
+    /// The declaring block's line, or `None` for a front-matter entry.
+    pub(crate) line: Option<usize>,
+}
+
+/// Every declaration of a parameter, in order: the front-matter entries,
+/// then each `param` block in source order. A name declared twice is listed
+/// twice, so a reader that keeps the last has [`param_decls`]' answer, and
+/// the advisories also know where each one is written.
+pub(crate) fn param_declarations(doc: &Document) -> Vec<ParamDeclaration> {
     fn text(v: &Value) -> String {
         match v {
             Value::String(s) => s.clone(),
@@ -4094,14 +4163,17 @@ pub(crate) fn param_decls(doc: &Document) -> BTreeMap<String, BTreeMap<String, S
             other => other.to_string(),
         }
     }
-    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut out = Vec::new();
     if let Some(Value::Array(params)) = doc.front.get("parameters") {
         for p in params {
             if let Some(obj) = p.as_object()
                 && let Some(name) = obj.get("name").and_then(Value::as_str)
             {
-                let m = obj.iter().map(|(k, v)| (k.clone(), text(v))).collect();
-                out.insert(name.to_string(), m);
+                out.push(ParamDeclaration {
+                    name: name.to_string(),
+                    attrs: obj.iter().map(|(k, v)| (k.clone(), text(v))).collect(),
+                    line: None,
+                });
             }
         }
     }
@@ -4113,7 +4185,11 @@ pub(crate) fn param_decls(doc: &Document) -> BTreeMap<String, BTreeMap<String, S
         if b.kind == "param"
             && let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned())
         {
-            out.insert(name, b.attrs.clone());
+            out.push(ParamDeclaration {
+                name,
+                attrs: b.attrs.clone(),
+                line: Some(b.line),
+            });
         }
     }
     out
@@ -4254,7 +4330,7 @@ pub(crate) fn substitute_line(
 /// The length of the placeholder name `s` opens with, 0 when it opens with
 /// none — the name `x-grammar.param` (`\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}`,
 /// `PARAM_GRAMMAR`) captures. All ASCII, so the length is a char boundary.
-fn placeholder_name_len(s: &str) -> usize {
+pub(crate) fn placeholder_name_len(s: &str) -> usize {
     let b = s.as_bytes();
     if !b
         .first()
@@ -4384,7 +4460,7 @@ pub(crate) fn list_marker_len(line: &str) -> usize {
 /// optional indentation, an optional list marker, an optional `**`, the
 /// registry's reason keyword and `:`, an optional `**`, at least one blank.
 /// Returns the indentation's length and the length of the whole label.
-fn reason_line(line: &str) -> Option<(usize, usize)> {
+pub(crate) fn reason_line(line: &str) -> Option<(usize, usize)> {
     let t = line.trim_start_matches([' ', '\t']);
     let indent = line.len() - t.len();
     let r = &t[list_marker_len(t)..];

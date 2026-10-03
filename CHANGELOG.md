@@ -489,9 +489,9 @@ agentd-instruction 0.3.0 re-vendors Instruction Specification 345f275
 conformance directory (corpus, refusals, advisories, README, LICENSE) are
 upstream's bytes. A name is required where the schema's rules require one,
 not wherever a kind has identity: 1.1 gives every prose kind identity, and an
-anonymous `MUST:` stays valid. The conformance runner accounts for every
-vendored artifact; the ones this release does not meet yet are listed in the
-test as pending, and an artifact that starts passing must leave the list.
+anonymous `MUST:` stays valid. The conformance runner compares every
+vendored artifact, and each one passes; a file it does not know how to
+compare fails as an unknown artifact.
 Revision 1.1 registers `unless` and `otherwise` as structural kinds. A
 structural block with a body that is not a variant delivers that body
 unwrapped: a block the registry knows is never dropped from the delivered
@@ -586,6 +586,20 @@ counts every text read. `${name}` is scanned by `x-grammar.param`: a
 placeholder after a stray `${`, as in `${a ${b}`, is substituted and
 accounted for, as the reference's regex finds it, and a test holds the
 hand-written scan to the vendored grammar.
+
+agentd-instruction reports Appendix C advisories (`advise()`); agentd does
+not surface them yet. `advise(&Document)` returns every `Advisory {line,
+code, severity, message}`, sorted by line and then code, for the fourteen
+Appendix C codes. New `Severity` (`warning`, `info`) and `ADVISORY_CODES`,
+the code and severity table, which a test holds to Appendix C. The message
+carries its `line N:` prefix, as `advisories.json` does. Advisories read
+the document and change neither its parse nor its delivery. They cover
+prose only, so nothing is reported inside front or end matter, fenced code,
+a machinery block or an author note. That includes a note in a block's body,
+which the reference implementation still scans (to be raised upstream).
+A section's child `Block`
+now carries its `region` in the document body, as a container's child
+does. The `dump` example prints `advisories`.
 
 agentd's §7 verification is the crate's: `config::attest` re-exports
 `Claims`, `SPEC_CLAIM`, `WIRE_FLOOR`, `Verified`, `verify`,

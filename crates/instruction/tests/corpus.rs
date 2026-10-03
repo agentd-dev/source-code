@@ -18,17 +18,15 @@
 //! health it never performed. `the_vendored_corpus_matches_upstream_when_present`
 //! is the drift check, over the whole `conformance/` tree.
 //!
-//! **Every vendored artifact is accounted for.** An artifact either passes, or
-//! is named in [`PENDING`] — the one list of what this implementation does not
-//! meet yet. An unlisted failure fails; a listed entry that now passes fails
-//! until it is removed; a listed entry naming no artifact fails; and a file the
-//! runners do not know how to compare fails as an unknown artifact. So a
-//! re-vendor can add cases but never silently pass one this crate skips.
+//! **Every vendored artifact is compared, and must pass.** A file the runners
+//! do not know how to compare fails as an unknown artifact, and so does a
+//! case missing its `doc.md`. So a re-vendor can add cases but never
+//! silently pass one this crate skips.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use instruction_core::{Context, deliver, parse, tree_json};
+use instruction_core::{Context, advise, deliver, parse, tree_json};
 
 // The case reading the fixture dumper shares, so `dump` reproduces what this
 // runner compares.
@@ -73,33 +71,12 @@ fn inputs_of(suite: &str) -> &'static [&'static str] {
     }
 }
 
-/// The vendored artifacts this implementation does not meet yet, keyed
-/// `"<suite>/<case>/<file>"`, grouped by the unit of the 1.1 re-vendor that
-/// closes them. Shrink-only: an entry that starts passing must be deleted
-/// here, and the test says so.
-const PENDING: &[&str] = &[
-    // The S19 advisories — unit V9, which deletes this list.
-    "advisories/empty-variant/advisories.json",
-    "advisories/keyword-in-example/advisories.json",
-    "advisories/near-miss-keyword/advisories.json",
-    "advisories/nothing-inside-notes-or-code/advisories.json",
-    "advisories/orphan-because/advisories.json",
-    "advisories/otherwise-without-a-group/advisories.json",
-    "advisories/overrides-external/advisories.json",
-    "advisories/parameter-default-type/advisories.json",
-    "advisories/sigil-scheme-mismatch/advisories.json",
-    "advisories/skill-when-alias/advisories.json",
-    "advisories/undeclared-and-unused-parameters/advisories.json",
-    "advisories/unqualified-wikilink/advisories.json",
-    "advisories/when-unknown-key/advisories.json",
-];
-
-/// One suite run's outcome per artifact key, judged against [`PENDING`].
+/// One suite run's outcome per artifact key (`"<suite>/<case>/<file>"`).
 #[derive(Default)]
 struct Ledger {
     outcomes: BTreeMap<String, Result<(), String>>,
     /// Problems with the fixture tree itself (unknown files, a case with no
-    /// `doc.md`) — never pending-able.
+    /// `doc.md`).
     structural: Vec<String>,
 }
 
@@ -108,15 +85,14 @@ impl Ledger {
         self.outcomes.insert(key, outcome);
     }
 
-    /// Fail on every unlisted failure, every listed pass, and every listed
-    /// key of `suite` this run never recorded; print the counts.
+    /// Fail on every failing artifact and every structural problem; print
+    /// the counts.
     fn finish(self, suite: &str) {
         let total = self.outcomes.len();
-        let verdict = self.judge(suite, PENDING, Path::new(CONFORMANCE));
+        let verdict = self.judge();
         eprintln!(
-            "{suite}: {total} artifacts — {} pass, {} pending, {} failing",
+            "{suite}: {total} artifacts — {} pass, {} failing",
             verdict.passed,
-            verdict.pending_failed,
             verdict.failures.len()
         );
         assert!(
@@ -127,58 +103,25 @@ impl Ledger {
         );
     }
 
-    /// The judgment `finish` asserts on, against a given pending list and
-    /// fixture root — apart from the live run, so each of its rules has a
-    /// test of its own (see `the_ledger_*` below).
-    fn judge(self, suite: &str, pending_list: &[&str], root: &Path) -> Verdict {
-        let prefix = format!("{suite}/");
-        let pending: BTreeSet<&str> = pending_list
-            .iter()
-            .copied()
-            .filter(|k| k.starts_with(&prefix))
-            .collect();
+    /// The judgment `finish` asserts on, apart from the live run, so its
+    /// rule has a test of its own (`the_ledger_*` below).
+    fn judge(self) -> Verdict {
         let mut failures = self.structural;
-        // A PENDING key outside every suite is checked by every run, so a
-        // typo'd suite cannot hide in a list no runner reads.
-        for key in pending_list {
-            if !SUITES.iter().any(|s| key.starts_with(&format!("{s}/"))) {
-                failures.push(format!("PENDING {key:?} names no suite"));
-            }
-        }
-        let (mut passed, mut pending_failed) = (0, 0);
+        let mut passed = 0;
         for (key, outcome) in &self.outcomes {
-            match (outcome, pending.contains(key.as_str())) {
-                (Ok(()), false) => passed += 1,
-                (Err(_), true) => pending_failed += 1,
-                (Ok(()), true) => {
-                    failures.push(format!("{key}: now passes — remove it from PENDING"))
-                }
-                (Err(why), false) => failures.push(format!("{key}: {why}")),
+            match outcome {
+                Ok(()) => passed += 1,
+                Err(why) => failures.push(format!("{key}: {why}")),
             }
         }
-        for key in &pending {
-            if !self.outcomes.contains_key(*key) {
-                let exists = root.join(key).is_file();
-                failures.push(if exists {
-                    format!("PENDING {key:?} is not an artifact this runner compares")
-                } else {
-                    format!("PENDING {key:?} names a nonexistent file")
-                });
-            }
-        }
-        Verdict {
-            failures,
-            passed,
-            pending_failed,
-        }
+        Verdict { failures, passed }
     }
 }
 
-/// What [`Ledger::judge`] found: every failure, and the counts it printed.
+/// What [`Ledger::judge`] found: every failure, and the passes it counted.
 struct Verdict {
     failures: Vec<String>,
     passed: usize,
-    pending_failed: usize,
 }
 
 /// The suite's cases, in order, with every file in each case directory
@@ -446,9 +389,9 @@ fn the_shared_refusal_corpus_matches() {
             let wline = w["line"].as_u64();
             let wcode = w["code"].as_str().unwrap_or("");
             let wmsg = w["message"].as_str().unwrap_or("");
-            // A code no reader can produce is a fixture problem, not a
-            // pending one: a re-vendor that adds a condition must add its
-            // code to CODES first.
+            // A code no reader can produce is a fixture problem, named as
+            // one: a re-vendor that adds a condition must add its code to
+            // CODES first.
             if !instruction_core::CODES.contains(&wcode) {
                 ledger.structural.push(format!(
                     "refusals/{name}: pinned code {wcode:?} is not in CODES"
@@ -478,25 +421,41 @@ fn the_shared_refusal_corpus_matches() {
     ledger.finish("refusals");
 }
 
-/// The §19 advisories (S19): diagnostics that never block delivery. This
-/// crate emits none yet, so every case is recorded as not compared — on the
-/// PENDING ledger, where a re-vendor that adds one cannot pass unseen.
+/// The Appendix C advisories (S19): diagnostics that never block delivery.
+/// A case's whole advisory list is compared — every `{line, code, severity,
+/// message}`, in order — as the Go port's
+/// TestAdvisoryCasesYieldThePinnedAdvisories does: a reader that reports
+/// advisories reports these and no others.
 #[test]
 fn the_shared_advisory_corpus_matches() {
     let mut ledger = Ledger::default();
     let cases = cases("advisories", &mut ledger);
     for dir in &cases {
         let name = case_name(dir);
-        if dir.join("advisories.json").is_file() {
-            ledger.record(
-                format!("advisories/{name}/advisories.json"),
-                Err("not compared yet — S19 (unit V9)".into()),
-            );
-        } else {
+        let (Ok(text), Ok(want)) = (
+            std::fs::read_to_string(dir.join("doc.md")),
+            std::fs::read_to_string(dir.join("advisories.json")),
+        ) else {
             ledger.structural.push(format!(
-                "advisories/{name}: an advisory case needs advisories.json"
+                "advisories/{name}: an advisory case needs doc.md and advisories.json"
             ));
-        }
+            continue;
+        };
+        let want: serde_json::Value = serde_json::from_str(&want).unwrap();
+        ledger.record(
+            format!("advisories/{name}/advisories.json"),
+            match parse(&text) {
+                Err(errs) => Err(format!("refused: {}", refused(&errs))),
+                Ok(doc) => {
+                    let got = serde_json::to_value(advise(&doc)).unwrap();
+                    if got == want {
+                        Ok(())
+                    } else {
+                        Err(format!("advisories differ\nwant: {want}\n got: {got}"))
+                    }
+                }
+            },
+        );
     }
     eprintln!("advisory corpus: {} cases", cases.len());
     ledger.finish("advisories");
@@ -623,69 +582,72 @@ fn the_refusal_codes_are_appendix_b_when_present() {
     );
 }
 
+/// `ADVISORY_CODES` is the specification's Appendix C, when a checkout of it
+/// is at hand: the same codes, each with the table's severity. Like the
+/// Appendix B check it reads the README of the pinned checkout CI makes, and
+/// fails rather than skips when `INSTRUCTION_SPEC_REPO` names one without it.
+#[test]
+fn the_advisory_codes_are_appendix_c_when_present() {
+    let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
+    let upstream = explicit
+        .clone()
+        .unwrap_or_else(|_| "/root/instruction-md/specification".into());
+    let Ok(readme) = std::fs::read_to_string(Path::new(&upstream).join("README.md")) else {
+        assert!(
+            explicit.is_err(),
+            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no README.md — fail, not skip"
+        );
+        eprintln!("no upstream checkout; Appendix C check skipped");
+        return;
+    };
+    let start = readme
+        .find("\n## Appendix C")
+        .expect("the README has an Appendix C");
+    let end = readme[start + 1..]
+        .find("\n## ")
+        .map_or(readme.len(), |e| start + 1 + e);
+    // A row is `| `code` | severity | condition | message shape |`.
+    let table: BTreeSet<(&str, &str)> = readme[start..end]
+        .lines()
+        .filter_map(|row| {
+            let mut cells = row.strip_prefix('|')?.split('|').map(str::trim);
+            let code = cells.next()?.strip_prefix('`')?.strip_suffix('`')?;
+            Some((code, cells.next()?))
+        })
+        .collect();
+    let ours: BTreeSet<(&str, &str)> = instruction_core::ADVISORY_CODES
+        .iter()
+        .map(|(code, severity)| (*code, severity.as_str()))
+        .collect();
+    assert_eq!(table.len(), 14, "Appendix C rows read: {table:?}");
+    assert_eq!(
+        ours, table,
+        "ADVISORY_CODES differs from Appendix C in {upstream}"
+    );
+}
+
 // ── The runner's own rules, judged on synthetic outcomes ────────────────────
-// The live fixtures exercise none of these conditions today (no listed entry
-// passes, none is missing, no stray file is vendored), so each rule is held
-// here instead — a reverted rule fails its test, not just a future re-vendor.
+// The live fixtures exercise none of these conditions today (every artifact
+// passes, no stray file is vendored), so each rule is held here instead — a
+// reverted rule fails its test, not just a future re-vendor.
 
-/// A ledger with these outcomes, judged against `pending` over `root`.
-fn judged(outcomes: &[(&str, Result<(), String>)], pending: &[&str], root: &Path) -> Vec<String> {
+#[test]
+fn the_ledger_fails_a_failure_and_passes_a_pass() {
     let mut ledger = Ledger::default();
-    for (key, outcome) in outcomes {
-        ledger.record(key.to_string(), outcome.clone());
-    }
-    ledger.judge("corpus", pending, root).failures
-}
-
-#[test]
-fn the_ledger_fails_a_listed_entry_that_now_passes() {
-    let root = Path::new(CONFORMANCE);
-    let key = "corpus/coding-agent/tree.json";
-    let failures = judged(&[(key, Ok(()))], &[key], root);
+    ledger.record("corpus/a/tree.json".into(), Err("tree.json differs".into()));
+    ledger.record("corpus/b/tree.json".into(), Ok(()));
+    ledger
+        .structural
+        .push("corpus/c: case has no doc.md".into());
+    let verdict = ledger.judge();
     assert_eq!(
-        failures,
-        [format!("{key}: now passes — remove it from PENDING")]
-    );
-    // Still failing, it is pending and nothing else.
-    assert!(judged(&[(key, Err("x".into()))], &[key], root).is_empty());
-}
-
-#[test]
-fn the_ledger_fails_an_unlisted_failure_and_passes_an_unlisted_pass() {
-    let root = Path::new(CONFORMANCE);
-    let failures = judged(
-        &[
-            ("corpus/a/tree.json", Err("tree.json differs".into())),
-            ("corpus/b/tree.json", Ok(())),
-        ],
-        &[],
-        root,
-    );
-    assert_eq!(failures, ["corpus/a/tree.json: tree.json differs"]);
-}
-
-#[test]
-fn the_ledger_fails_a_listed_entry_no_run_recorded() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("corpus/a")).unwrap();
-    std::fs::write(dir.path().join("corpus/a/notes.txt"), "").unwrap();
-    let failures = judged(
-        &[],
-        &[
-            "corpus/a/notes.txt",
-            "corpus/gone/tree.json",
-            "corpsu/a/tree.json",
-        ],
-        dir.path(),
-    );
-    assert_eq!(
-        failures,
+        verdict.failures,
         [
-            "PENDING \"corpsu/a/tree.json\" names no suite",
-            "PENDING \"corpus/a/notes.txt\" is not an artifact this runner compares",
-            "PENDING \"corpus/gone/tree.json\" names a nonexistent file",
+            "corpus/c: case has no doc.md",
+            "corpus/a/tree.json: tree.json differs"
         ]
     );
+    assert_eq!(verdict.passed, 1);
 }
 
 #[test]

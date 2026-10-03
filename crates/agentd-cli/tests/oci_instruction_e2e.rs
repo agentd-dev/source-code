@@ -586,6 +586,53 @@ fn a_re_pulled_document_is_verified_against_the_same_pin() {
     );
 }
 
+/// A re-pull is delivered behind the same gate config load used. The
+/// document is fence-free — front matter, prose and end matter — and the tag
+/// moves to an artifact that differs only in its end matter (S27), the
+/// document's record: the re-pulled instruction is the same instruction, so
+/// its size and version stay put. A re-pull that read a fence-free document
+/// raw would adopt the record as a new instruction.
+#[cfg(feature = "sign")]
+#[test]
+fn a_re_pulled_end_matter_edit_is_not_a_new_instruction() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let doc = |n: u32| {
+        format!(
+            "---\nspec: \"1\"\nid: instruction://ins_em\n---\n# Agent\n\nServe pulls.\n\n---\nreviewed: {n}\n---\n"
+        )
+        .into_bytes()
+    };
+    let second = doc(2);
+    let second_digest = format!("sha256:{}", sha_hex(&second));
+    let swapped = Arc::new(AtomicBool::new(false));
+    let port = two_document_registry(doc(1), second, Arc::clone(&swapped));
+    let cfg = json!({
+        "agent": {"name": "oci-em", "preflight": "never", "instruction": {
+            "oci": format!("127.0.0.1:{port}/acme/agent:v1"), "refresh": "1s"}},
+        "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+        "store": {"kind": "memory"},
+    });
+    let log = run_until(cfg, &second_digest, Duration::from_secs(25), || {
+        swapped.store(true, Ordering::SeqCst);
+    });
+    let loaded: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["event"] == "instruction.loaded")
+        .collect();
+    let repulled = loaded
+        .iter()
+        .find(|v| v["layer_digest"] == second_digest.as_str())
+        .unwrap_or_else(|| panic!("the moved tag was never re-pulled:\n{log}"));
+    let first = &loaded[0];
+    assert_eq!(
+        (&repulled["bytes"], &repulled["version"]),
+        (&first["bytes"], &first["version"]),
+        "an end-matter edit was adopted as a new instruction:\n{log}"
+    );
+}
+
 /// A registry that serves one document, then another once `swapped` flips —
 /// a tag moving under a running agent, which is what §7.7 watches for.
 #[cfg(feature = "sign")]

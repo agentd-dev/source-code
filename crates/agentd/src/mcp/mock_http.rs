@@ -800,6 +800,15 @@ fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: Optio
 /// caller asks for `@next`, so a test can watch an apply boundary.
 const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
 const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+/// The document `@endmatter` serves: no fence at all — front matter and
+/// prose — followed by end matter that changes on every read, under a new
+/// versionId each time: a publisher editing only the record. Fence-free on
+/// purpose, so only a consumer whose delivery gate sees front and end matter
+/// strips the record; one that reads it raw delivers a new text per read.
+const REGISTRY_DOC_PROSE: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, in prose.\n";
+/// How many times `@endmatter` has been read: the counter its end matter and
+/// versionId carry. Per mock process, which is per test.
+static END_MATTER_READS: AtomicU64 = AtomicU64::new(0);
 /// The registry's RESOLVED read of the mock document (`…?resolved=1`): text
 /// §3.5 already ran on for this reader. It is delivered text a second
 /// delivery would change — bold labels, an example quoting a rule fence and
@@ -855,8 +864,18 @@ fn registry_contents(uri: &str) -> serde_json::Value {
     // document for one reader serves, and a verifier that intersects only
     // the author's set would not see.
     let narrow = base.ends_with("@narrow");
-    let version_id = if v2 { "ver_mock_2" } else { "ver_mock_1" };
+    let end_matter = base.ends_with("@endmatter");
     let mut text = (if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC }).to_string();
+    let version_id = if end_matter {
+        let n = END_MATTER_READS.fetch_add(1, Ordering::SeqCst) + 1;
+        text = format!("{REGISTRY_DOC_PROSE}\n---\nreviewed: {n}\n---\n");
+        format!("ver_mock_em_{n}")
+    } else if v2 {
+        "ver_mock_2".to_string()
+    } else {
+        "ver_mock_1".to_string()
+    };
+    let version_id = version_id.as_str();
     // `@selfsigned` serves version one carrying its own author JWS in its
     // front matter — the transport-independent form a file or OCI source
     // carries. The author signs the §7.2 author digest, which excludes that

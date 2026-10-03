@@ -563,3 +563,61 @@ fn variants_are_decided_by_host_and_the_model_family() {
     assert!(unknown.contains("AGENT-AGENTD"), "{unknown}");
     assert!(unknown.contains("AGENT-CLAUDE"), "{unknown}");
 }
+
+/// A document with no fence at all: a named, conditional keyword rule, a
+/// reason, an author note and end matter. Each is something delivery renders
+/// or removes, so the loader must deliver it — read raw, the model would see
+/// the note and the record S9 and S27 say it never sees, and labels the spec
+/// renders.
+const FENCE_FREE: &str = "# Support
+
+You answer tickets.
+
+MUST[cite] (if customer-facing): Cite the ticket number.
+BECAUSE: Customers quote it back to us.
+
+<!-- AUTHOR-NOTE: tighten this before launch -->
+SHOULD: Keep replies short.
+
+---
+owner: support-team
+reviewed: 2026-10-01
+---
+";
+
+#[test]
+fn a_fence_free_document_is_delivered_not_read_raw() {
+    let s = settings(FENCE_FREE, Value::Null);
+    let delivered = s.agent.instruction.expect("an instruction");
+    for rendered in [
+        "**MUST (if customer-facing):** Cite the ticket number.",
+        "**BECAUSE:** Customers quote it back to us.",
+        "**SHOULD:** Keep replies short.",
+    ] {
+        assert!(
+            delivered.contains(rendered),
+            "{rendered:?} in:\n{delivered}"
+        );
+    }
+    for gone in ["AUTHOR-NOTE", "<!--", "owner:", "support-team", "reviewed:"] {
+        assert!(
+            !delivered.contains(gone),
+            "{gone:?} delivered:\n{delivered}"
+        );
+    }
+    // Plain prose, with none of those constructs, is still the model's
+    // byte for byte.
+    let prose = "You answer tickets.\n\nBe brief. You MUST: stay polite.\n";
+    let s = settings(prose, Value::Null);
+    assert_eq!(s.agent.instruction.as_deref(), Some(prose));
+}
+
+/// Going through delivery is also going through its refusals: end matter
+/// that is not YAML refuses the document rather than reaching the model.
+#[test]
+fn malformed_end_matter_refuses_the_document() {
+    let (valid, err, _) = load("Be brief.\n\n---\nowner: [unclosed\n---\n", &[]);
+    assert!(!valid, "malformed end matter loaded");
+    assert!(err.contains("agent.instruction"), "{err}");
+    assert!(err.contains("end matter is not valid YAML"), "{err}");
+}

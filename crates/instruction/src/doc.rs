@@ -194,48 +194,43 @@ pub fn schema_json() -> &'static str {
     SCHEMA_JSON
 }
 
-/// Whether an instruction carries any Instruction Document block — a container
-/// or set fence, a section heading, or a sigiled/structural leaf. This is what
-/// the loader keys on to decide whether to run extraction: a document written
-/// entirely in leaf or section form (no `:::` line at all) must still be
-/// recognized, or its machinery is silently delivered as prose. A fence inside
-/// an author note is not a block (§3.3 rule 11): a commented-out `:::!workflow`
-/// is never parsed.
+/// Whether a text must go through §3.5 delivery before a model reads it:
+/// whether it carries anything delivery renders or removes. That is a block
+/// (a container or set fence, a section heading, a sigiled or structural
+/// leaf), a keyword, alert or reason line (S12-S15: `MUST[x] (if c):` and
+/// `BECAUSE:` are rendered, not read raw), a column-0 author note (S9: never
+/// delivered), front matter at line 1, or end matter (S27: never delivered;
+/// malformed end matter too, so that parse refuses it). A loader that
+/// delivers only when this is true hands plain prose — none of these —
+/// to the model byte for byte, and everything else through delivery.
 ///
-/// A note is skipped only where [`parse`]'s top-level walk reads one: past the
-/// front matter, and outside fenced code. A `<!--` in a code sample or a
-/// front-matter key is content there, and taking it for a note here would
-/// hide the blocks after it — the loader would skip extraction and deliver
-/// the document's machinery to the model as prose.
-pub fn contains_blocks(text: &str) -> bool {
-    let start = front_matter_bounds(text).map_or(0, |(_, body)| body);
-    let lines: Vec<&str> = text[start..].split('\n').collect();
-    let mut i = 0;
+/// The walk reads lines where [`parse`]'s top-level walk does: fenced code
+/// suspends all recognition, so a `MUST:` or a `<!--` in a code sample is
+/// content and no reason to deliver. Front matter and end matter are found
+/// as parse finds them, before the walk.
+pub fn needs_delivery(text: &str) -> bool {
+    if front_matter_bounds(text).is_some()
+        || !matches!(split_end_matter(text), Ok(s) if s.end_matter.is_none())
+    {
+        return true;
+    }
     let mut in_code = None::<usize>;
-    while i < lines.len() {
-        let line = lines[i];
+    for line in text.split('\n') {
         if let Some(tl) = in_code {
             if code_fence_len(line) == Some(tl) {
                 in_code = None;
             }
-            i += 1;
             continue;
         }
         if let Some(tl) = code_fence_len(line) {
             in_code = Some(tl);
-            i += 1;
             continue;
         }
-        // Outside code a note runs to its close, or to the end — where parse
-        // reads nothing more either.
-        if note_opens(line) {
-            match note_end(&lines, i, lines.len()) {
-                Some(end) => i = end + 1,
-                None => return false,
-            }
-            continue;
-        }
-        if open_fence(line).is_some()
+        if note_opens(line)
+            || keyword_line(line).is_some()
+            || reason_line(line).is_some()
+            || alert_block_kind(line).is_some()
+            || open_fence(line).is_some()
             || section_open(line).is_some()
             || leaf_open(line).is_some_and(|lf| {
                 lf.sigil || lookup(&lf.kind).is_some_and(|k| k.disposition != Disposition::Prose)
@@ -243,7 +238,6 @@ pub fn contains_blocks(text: &str) -> bool {
         {
             return true;
         }
-        i += 1;
     }
     false
 }
@@ -7281,20 +7275,88 @@ steps:
         assert_eq!(b.body, "steps: {}");
     }
 
+    /// Every 1.1 construct delivery renders or removes sends a text through
+    /// delivery, alone and fence-free; prose with none of them does not.
     #[test]
-    fn contains_blocks_ignores_a_fence_inside_a_note() {
-        assert!(!contains_blocks(
-            "<!--\n:::!workflow{name=w}\nsteps: {}\n:::\n-->\n"
-        ));
-        assert!(!contains_blocks("<!-- open\n::!human{name=a}\n"));
-        assert!(contains_blocks("<!-- x -->\n::!human{name=a}\n"));
+    fn needs_delivery_sees_every_construct_delivery_touches() {
+        for text in [
+            // Blocks: a container fence, a section, a sigiled leaf.
+            ":::must\nbe kind\n:::\n",
+            "## !workflow w\n```yaml\nsteps: {}\n```\n",
+            "::!human{name=a}\n",
+            // A keyword line, named and conditional, with or without bold.
+            "MUST[x] (if c): be kind\n",
+            "Intro.\n\n- **SHOULD:** be brief\n",
+            // An alert, and a reason line on its own.
+            "> [!WARNING]\n> mind the gap\n",
+            "BECAUSE: it matters\n",
+            // A column-0 author note, closed or not.
+            "Prose.\n<!-- the author's aside -->\n",
+            "Prose.\n<!-- never closed\n",
+            // Front matter at line 1.
+            "---\ntitle: t\n---\nPlain prose.\n",
+            // End matter, well-formed and malformed (parse refuses that one).
+            "Plain prose.\n\n---\nowner: me\n---\n",
+            "Plain prose.\n\n---\nowner: [\n---\n",
+        ] {
+            assert!(needs_delivery(text), "{text:?} needs delivery");
+        }
+        for text in [
+            "",
+            "Be terse.",
+            "Plain prose.\n\nA second paragraph, with *emphasis* and a [link](x).\n",
+            // Lookalikes that are not the construct: mid-line, indented, or
+            // a word that is no keyword.
+            "You MUST: answer in English.\n",
+            "  MUST: indented is a quote of one\n",
+            "Note: lower-case is prose.\n",
+            "Inline <!-- html --> is prose.\n",
+            // A thematic break that is not end matter.
+            "Above.\n\n---\n\nBelow.\n",
+            // Fenced code suspends recognition, notes and keywords included.
+            "Example:\n\n```html\n<!-- a template comment\nMUST: quoted\n```\n",
+        ] {
+            assert!(!needs_delivery(text), "{text:?} is plain prose");
+        }
+    }
+
+    /// What needs_delivery sends through delivery, delivery changes: the gate
+    /// never routes prose through a pipeline that then hands it back as-is,
+    /// and never lets a construct through raw. Proven against `deliver`
+    /// itself, so the predicate cannot drift from what the pipeline touches.
+    #[test]
+    fn needs_delivery_agrees_with_what_delivery_changes() {
+        for text in [
+            "MUST[x] (if c): be kind\nBECAUSE: it matters\n",
+            "Prose.\n<!-- the author's aside -->\nMore.\n",
+            "Plain prose.\n\n---\nowner: me\n---\n",
+        ] {
+            assert!(needs_delivery(text));
+            let delivered = extract_with_facts(text, &BTreeSet::new(), &BTreeMap::new())
+                .unwrap()
+                .cleaned;
+            assert_ne!(delivered, text, "delivery leaves {text:?} unchanged");
+        }
+        // …and what it lets through raw, delivery would have handed back
+        // byte for byte: skipping the pipeline loses nothing.
+        for text in [
+            "Be terse.\n",
+            "You MUST: answer in English.\n\n```\nMUST: quoted\n<!-- x\n```\n",
+            "Above.\n\n---\n\nBelow.\n",
+        ] {
+            assert!(!needs_delivery(text));
+            let delivered = extract_with_facts(text, &BTreeSet::new(), &BTreeMap::new())
+                .unwrap()
+                .cleaned;
+            assert_eq!(delivered, text, "delivery changes {text:?}");
+        }
     }
 
     /// A `<!--` that parse reads as content — in fenced code, or a front
     /// matter key — is no note to the gate either: the block after it is a
     /// block to both, or the loader would deliver it to the model as prose.
     #[test]
-    fn contains_blocks_reads_no_note_where_parse_reads_none() {
+    fn needs_delivery_reads_no_note_where_parse_reads_none() {
         for text in [
             // Unclosed in code: the gate must not stop at it.
             "Example:\n\n```html\n<!-- a template comment\n```\n\n:::!workflow{name=w}\nsteps: {}\n:::\n",
@@ -7310,7 +7372,7 @@ steps:
                 .count();
             assert_eq!(workflows, 1, "parse reads the workflow in {text:?}");
             assert!(
-                contains_blocks(text),
+                needs_delivery(text),
                 "the gate misses the workflow in {text:?}"
             );
         }

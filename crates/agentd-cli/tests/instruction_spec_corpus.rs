@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **Instruction Document Spec conformance corpus**, run against the real
-//! binary.
+//! agentd's **instruction-document probes**, run against the real binary.
 //!
 //! Each fixture in `tests/instruction-spec-corpus/` is a bare instruction
 //! document plus its expected OBSERVABLE outcome: does it validate, which error
-//! substrings appear, and what registers (`--capabilities`). The corpus is the
-//! spec's teeth — the spec is owned by instruction.md (CC-BY 4.0 text), and
-//! agentd conforms by running the corpus, not by claiming to. The registry the
-//! parser uses IS the vendored `instruction.schema.json`; behaviour
-//! pinned here is CONTRACT: a change that fails a fixture is a spec change, not
-//! a refactor.
+//! substrings appear, and what registers (`--capabilities`). They are
+//! agentd-owned black-box probes of the loader — the spec's own conformance
+//! corpus is the crate's (`crates/instruction/tests/conformance/`). The
+//! registry the parser uses IS the vendored `instruction.schema.json`, and
+//! this file also holds the checks that keep that vendor faithful.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -148,18 +146,6 @@ fn the_conformance_corpus_passes_against_this_binary() {
             );
             let exp: Value =
                 serde_json::from_str(&std::fs::read_to_string(&exp_path).unwrap()).unwrap();
-            // A fixture pins the spec dialect it is written against; one
-            // declaring a dialect this implementation does not speak is
-            // SKIPPED, not failed — dialect-2 fixtures may enter the shared
-            // corpus without failing dialect-1 runtimes (the runtime's own
-            // refusal of dialect-2 DOCUMENTS is separately pinned by the
-            // forward-compat guard's tests).
-            if let Some(spec) = exp["spec"].as_str()
-                && spec != "1"
-            {
-                eprintln!("  skip {name} (spec {spec}; this implementation speaks 1)");
-                continue;
-            }
             let grants: Vec<Value> = exp["grants"].as_array().cloned().unwrap_or_default();
             let (valid, errtext, caps) = run_case(&doc, &grants);
             // A valid document this build refuses ONLY because it uses an

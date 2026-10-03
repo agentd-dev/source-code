@@ -1638,12 +1638,13 @@ impl Runtime {
                 // caller surfaces the error and the running text stands.
                 let attested = self.verify_repulled_authorship(&raw)?;
                 // The DELIVERED text is the cleaned document (machinery folds
-                // to acknowledgement lines), matching what config load
-                // produced. A re-pulled document's machinery CHANGES apply on
+                // to acknowledgement lines, notes and end matter go), behind
+                // the same `needs_delivery` gate config load used. A
+                // re-pulled document's machinery CHANGES apply on
                 // reload/restart (the §5.5 quiesce doctrine); a document that
                 // no longer folds keeps the running text — refuse-and-keep,
                 // never a half-applied instruction.
-                let text = if crate::config::idoc::contains_blocks(&raw) {
+                let text = if crate::config::idoc::needs_delivery(&raw) {
                     // grant ∩ ceiling ∩ attested, exactly as §7.6 step 5 folds
                     // it at load: a re-pulled document that attests FEWER
                     // families gets fewer, never the set the old one carried.
@@ -2130,10 +2131,12 @@ impl Runtime {
                     }
                     // Otherwise (`raw`, the default, or no resolution at all)
                     // delivered text is the CLEANED document when it carries
-                    // machinery; the machinery itself applies on
+                    // anything delivery renders or removes — a block, a
+                    // keyword line, a note, front or end matter — gated
+                    // exactly as at load; the machinery itself applies on
                     // reload/restart. A document that no longer folds keeps
                     // the running text. (`sealed` was decrypted above.)
-                    let text = if !resolved && crate::config::idoc::contains_blocks(&raw) {
+                    let text = if !resolved && crate::config::idoc::needs_delivery(&raw) {
                         let mut granted: std::collections::BTreeSet<String> = self
                             .settings
                             .agent

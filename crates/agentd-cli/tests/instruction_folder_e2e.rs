@@ -134,3 +134,76 @@ fn a_later_documents_front_matter_is_dropped_out_loud() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A file's end matter (S27) is its record, never delivered — and in a
+/// folder, every file's but the last would otherwise sit mid-text where
+/// nothing reads it as end matter. Each file's is dropped, without a
+/// warning: dropping it is what delivery does anyway.
+#[test]
+fn every_files_end_matter_is_dropped_from_the_folder() {
+    let dir = common::unique_path("instr-folder-em", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        format!("{dir}/10-a.md"),
+        "First file.\n\n---\nowner: team-one\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{dir}/20-b.md"),
+        "Second file.\n\n---\nowner: team-two\n---\n",
+    )
+    .unwrap();
+    let (loaded, _) = agentd::config::settings::load(
+        &[
+            "--instruction".to_string(),
+            dir.clone(),
+            "--model".to_string(),
+            "mock".to_string(),
+        ],
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("the folder did not load: {e:?}"));
+    let instruction = loaded.settings.agent.instruction.expect("an instruction");
+    assert!(
+        instruction.contains("First file.") && instruction.contains("Second file."),
+        "{instruction}"
+    );
+    for gone in ["owner:", "team-one", "team-two"] {
+        assert!(
+            !instruction.contains(gone),
+            "{gone:?} delivered:\n{instruction}"
+        );
+    }
+    assert!(
+        !loaded.warnings.iter().any(|w| w.contains("end matter")),
+        "end matter is dropped without a word: {:?}",
+        loaded.warnings
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Malformed end matter is a defect in ONE file, and the refusal says which.
+#[test]
+fn malformed_end_matter_refuses_the_folder_naming_the_file() {
+    let dir = common::unique_path("instr-folder-em-bad", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(format!("{dir}/10-a.md"), "First file.\n").unwrap();
+    std::fs::write(
+        format!("{dir}/20-b.md"),
+        "Second file.\n\n---\nowner: [unclosed\n---\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--instruction", &dir, "--validate-config"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run");
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{log}");
+    assert!(
+        log.contains("20-b.md: end matter is not valid YAML"),
+        "the refusal names the file: {log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

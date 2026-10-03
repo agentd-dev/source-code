@@ -1306,6 +1306,18 @@ pub fn combine_folder(
     let mut text = String::new();
     for (i, f) in files.iter().enumerate() {
         let body = std::fs::read_to_string(f).map_err(|e| format!("{at} dir {dir}: {f}: {e}"))?;
+        // End matter is each file's record (S27), never delivered — and only
+        // the LAST thing in a document is end matter, so once files are
+        // joined every file's but the last would read as prose mid-text. It
+        // is split off here, per file, without a word: dropping it is what
+        // the spec says delivery does. Malformed end matter is a defect in
+        // that file and refuses the source, naming it. (A pinned folder's
+        // per-file signatures are checked over the files' full bytes, not
+        // this text.)
+        let body = crate::config::idoc::split_end_matter(&body)
+            .map_err(|e| format!("{at} dir {dir}: {f}: {}", e.message))?
+            .before
+            .to_string();
         // Front matter belongs to the document, and a combined instruction is
         // ONE document: the first file's is kept, a later file's is dropped
         // with a warning rather than left to read as prose mid-text.
@@ -4230,12 +4242,16 @@ impl Settings {
             .and_then(Value::as_str)
             .map(str::to_string)
             && !looks_like_resource_uri(&instr)
-            && crate::config::idoc::contains_blocks(&instr)
+            && crate::config::idoc::needs_delivery(&instr)
             && !delivered_by_parent(&instr)
         {
             // The instruction is an Instruction Document — the single dialect,
             // and the ONLY surface extraction runs on (conversation text is
-            // never parsed). Machinery blocks (`:::!workflow`, `:::!mcp`, …)
+            // never parsed). The gate is anything delivery touches, not just
+            // a fence: a fence-free document of keyword lines, notes or end
+            // matter read raw would hand the model what S9 and S27 say it
+            // never sees. Plain prose skips it and is delivered byte for
+            // byte. Machinery blocks (`:::!workflow`, `:::!mcp`, …)
             // fold into configuration; prose (`:::note`, `:::must`, …) degrades
             // into what the model reads; the extended families are gated by
             // `agent.document_capabilities`, read raw here before the document
@@ -4353,12 +4369,42 @@ impl Settings {
         // live in a file as to be typed at a terminal, and before this the
         // only way to pass one was a shell `$(cat …)`. Same classification,
         // same sources, same code.
-        if let Some(v) = doc.get("agent").and_then(|a| a.get("prompt"))
-            && !matches!(v, Value::String(sc) if instruction_key(sc) == "text")
-        {
-            let (text, warns) =
-                resolve_document_source(v, &format!("{source}: agent.prompt"), &egress_policy)?;
-            instruction_warnings.extend(warns);
+        if let Some(v) = doc.get("agent").and_then(|a| a.get("prompt")).cloned() {
+            let (text, from_dir) = match &v {
+                Value::String(sc) if instruction_key(sc) == "text" => (sc.clone(), false),
+                _ => {
+                    let (text, warns) = resolve_document_source(
+                        &v,
+                        &format!("{source}: agent.prompt"),
+                        &egress_policy,
+                    )?;
+                    instruction_warnings.extend(warns);
+                    let from_dir = match &v {
+                        Value::String(sc) => instruction_key(sc) == "dir",
+                        _ => v.get("dir").is_some(),
+                    };
+                    (text, from_dir)
+                }
+            };
+            // End matter is the document's record (S27), not the task: it
+            // is dropped from EVERY source, the literal included, so where a
+            // prompt lives never decides whether the model reads its record.
+            // A folder already dropped each file's (`combine_folder`); a
+            // second split of the joined text would take a block that was
+            // body in its own file. Nothing else is processed — the prompt
+            // is the task, not an instruction document: no delivery, no
+            // note stripping.
+            let text = if from_dir {
+                text
+            } else {
+                match crate::config::idoc::split_end_matter(&text) {
+                    Ok(split) if split.end_matter.is_some() => {
+                        format!("{}\n", split.before.trim_end())
+                    }
+                    Ok(_) => text,
+                    Err(e) => return Err(format!("{source}: agent.prompt: {}", e.message)),
+                }
+            };
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("prompt".into(), Value::String(text));
             }
@@ -10624,6 +10670,83 @@ mod tests {
         assert_eq!(s.agent.prompt.as_deref(), Some("./not-a-file.md"));
     }
 
+    /// `agent.prompt`'s end matter (S27) is the document's record, not the
+    /// task: it is dropped from EVERY source, so where a prompt lives never
+    /// decides whether the model reads it — and malformed end matter refuses,
+    /// naming the setting. Nothing else in a prompt is touched.
+    #[test]
+    fn a_prompts_end_matter_is_dropped_from_every_source() {
+        use std::io::{Read, Write};
+        const TASK: &str = "Summarize the inbox.\n<!-- kept: a prompt is not delivered -->\n\n---\nowner: ops\n---\n";
+        const WANT: &str = "Summarize the inbox.\n<!-- kept: a prompt is not delivered -->\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("task.md"), TASK).unwrap();
+        let folder = dir.path().join("tasks");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("10-a.md"), "First.\n\n---\nowner: a\n---\n").unwrap();
+        std::fs::write(folder.join("20-b.md"), TASK).unwrap();
+        // One loopback response, for the `url:` source.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/task.md", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.read(&mut [0u8; 2048]);
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{TASK}",
+                        TASK.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let prompt = |p: Value| {
+            Settings::from_document(
+                json!({"agent": {"name": "a", "instruction": "be terse", "prompt": p},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                "t",
+            )
+            .map(|s| s.agent.prompt.unwrap_or_default())
+        };
+        let file = dir.path().join("task.md").to_string_lossy().to_string();
+        for (source, p) in [
+            ("literal", json!(TASK)),
+            ("text:", json!({"text": TASK})),
+            ("file:", json!({"file": file})),
+            ("path", json!(file)),
+            ("url:", json!({"url": url})),
+        ] {
+            assert_eq!(prompt(p).unwrap(), WANT, "{source}");
+        }
+        assert_eq!(
+            prompt(json!({"dir": {"path": folder.to_string_lossy()}})).unwrap(),
+            format!("First.\n\n{WANT}"),
+            "each file of a folder"
+        );
+        // A folder's files are split once each, never the joined text again:
+        // a `---` block that is body in its own file stays body.
+        let framed = dir.path().join("framed");
+        std::fs::create_dir(&framed).unwrap();
+        std::fs::write(
+            framed.join("a.md"),
+            "x\n\n---\nk: body\n---\n\n---\nowner: a\n---\n",
+        )
+        .unwrap();
+        assert_eq!(
+            prompt(json!({"dir": {"path": framed.to_string_lossy()}})).unwrap(),
+            "x\n\n---\nk: body\n---\n"
+        );
+        // Malformed: refused, naming the setting — from a literal too.
+        let e = prompt(json!("Do it.\n\n---\nowner: [unclosed\n---\n")).unwrap_err();
+        assert!(
+            e.contains("agent.prompt: end matter is not valid YAML"),
+            "{e}"
+        );
+        // A prompt with no end matter is the operator's text, byte for byte.
+        assert_eq!(prompt(json!("Do it.\n\n\n")).unwrap(), "Do it.\n\n\n");
+    }
+
     /// A folder of documents is ONE instruction, combined in `order`. The
     /// test writes them out of alphabetical order on purpose: `name` order is
     /// a contract, not whatever `read_dir` happens to return.
@@ -10716,12 +10839,20 @@ mod tests {
     }
 
     /// A combined instruction is ONE document, so only the first file's front
-    /// matter applies — and dropping the rest is said out loud.
+    /// matter applies — and dropping the rest is said out loud. The combined
+    /// document then goes through delivery like any other, which reads its
+    /// front matter and does not hand it to the model.
     #[test]
     fn a_folder_keeps_only_the_first_documents_front_matter() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.md"), "---\nid: ins_1\n---\nfirst\n").unwrap();
         std::fs::write(dir.path().join("b.md"), "---\nid: ins_2\n---\nsecond\n").unwrap();
+        let combined = combine_folder(
+            &crate::config::fileset::Dir::Path(dir.path().to_string_lossy().to_string()),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(combined.text, "---\nid: ins_1\n---\nfirst\n\nsecond\n");
         let s = Settings::from_document(
             serde_json::json!({"agent": {"name": "a", "instruction": {"dir": dir.path().to_string_lossy()}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
@@ -10729,10 +10860,7 @@ mod tests {
             "t",
         )
         .expect("loads");
-        assert_eq!(
-            s.agent.instruction.as_deref(),
-            Some("---\nid: ins_1\n---\nfirst\n\nsecond\n")
-        );
+        assert_eq!(s.agent.instruction.as_deref(), Some("first\n\nsecond\n"));
         assert!(
             s.agent
                 .instruction_warnings

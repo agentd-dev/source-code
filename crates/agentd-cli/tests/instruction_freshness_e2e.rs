@@ -280,3 +280,104 @@ fn the_poll_rereads_only_the_server_that_served_the_instruction() {
         b.log()
     );
 }
+
+/// The publisher's key FILE (raw 32 public bytes) for the mock's fixed seed.
+#[cfg(feature = "sign")]
+fn publisher_key_file() -> String {
+    let key = agentd::aauth::AgentKey::from_seed(&agentd::mcp::mock_http::MOCK_SIGN_SEED)
+        .expect("test seed");
+    let path = common::unique_path("freshness-pub", "key");
+    std::fs::write(&path, key.public_bytes()).unwrap();
+    path
+}
+
+/// A publisher editing only a document's end matter (S27) publishes a new
+/// version of the RECORD, not of the instruction: the poll adopts the new
+/// versionId — logged at the apply boundary and reported in the binding —
+/// while the delivered text, and so the instruction's version, stay put. The
+/// document is fence-free, so this holds only because the delivery gate sees
+/// front and end matter: read raw, every poll would be a new instruction.
+/// Where the mock signs (`sign`), every read's author signature — which
+/// covers the end matter — is checked again.
+#[test]
+fn an_end_matter_only_edit_moves_the_version_id_not_the_instruction() {
+    const EM: &str = "instruction://ins_mock@endmatter";
+    let mock = common::spawn_mock_mcp("mock://watched", false);
+    let cfg = config(EM, "exit", json!([server("registry", &mock)]), "1h");
+    #[cfg(feature = "sign")]
+    let key = publisher_key_file();
+    #[cfg(feature = "sign")]
+    let cfg = {
+        let mut cfg = cfg;
+        cfg["agent"]["instruction"]["trust"] = json!([{
+            "uri": EM,
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+            "delivery_keys": [],
+            "reader": "agent://mock-reader",
+            "max_capabilities": ["compute"],
+        }]);
+        cfg
+    };
+    let mut d = boot(cfg);
+    let reads = |l: &str| -> Vec<Value> {
+        events(l, "instruction.loaded")
+            .into_iter()
+            .filter(|e| e["uri"] == EM)
+            .collect()
+    };
+    let log = d.wait_for("the startup read and two polls", |l| reads(l).len() >= 3);
+    let loaded = reads(&log);
+
+    // A new versionId on every read…
+    let ids: Vec<&str> = loaded
+        .iter()
+        .filter_map(|e| e["version_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        loaded.len(),
+        "every read has a versionId:\n{log}"
+    );
+    let distinct: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(distinct.len(), ids.len(), "the record moved:\n{log}");
+    // …and the same instruction every time.
+    for e in &loaded {
+        assert_eq!(
+            (&e["version"], &e["bytes"]),
+            (&loaded[0]["version"], &loaded[0]["bytes"]),
+            "an end-matter edit changed the delivered instruction:\n{log}"
+        );
+    }
+
+    // Each new versionId crossed the apply boundary and was reported.
+    let applied: Vec<Value> = events(&log, "instruction.applied")
+        .into_iter()
+        .filter(|e| e["uri"] == EM)
+        .collect();
+    let reported = events(&log, "instruction.binding.reported");
+    for id in &ids[1..] {
+        assert!(
+            applied.iter().any(|e| e["new_version_id"] == *id),
+            "{id} was not applied:\n{log}"
+        );
+        assert!(
+            reported.iter().any(|e| e["version_id"] == *id),
+            "{id} was not reported in the binding:\n{log}"
+        );
+    }
+
+    #[cfg(feature = "sign")]
+    {
+        let verified = events(&log, "instruction.verified")
+            .into_iter()
+            .filter(|e| e["uri"] == EM)
+            .count();
+        assert!(
+            verified >= loaded.len(),
+            "{verified} verifications for {} reads — a re-read's signature went unchecked:\n{log}",
+            loaded.len()
+        );
+        let _ = std::fs::remove_file(&key);
+    }
+}

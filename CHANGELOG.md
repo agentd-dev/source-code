@@ -480,6 +480,34 @@ test that fails on the old code.
     digest; the child uses its instruction as written only when it is an
     instance child and its instruction is exactly that text. The mark is
     internal: no config path or `AGENTD_` alias reads it.
+- **A document with no fence is delivered when it has anything delivery
+  touches, so it can now be refused where it used to load raw.** agentd ran
+  delivery only on text with a block in it, so a fence-free document of
+  keyword lines, author notes or end matter reached the model as written:
+  `MUST[x] (if c):` and `BECAUSE:` unrendered, and the notes and the record
+  that S9 and S27 say are never delivered, delivered. The gate is now
+  anything delivery renders or removes: a block, a keyword, alert or reason
+  line, a column-0 author note, front matter at line 1, or end matter. It
+  applies to the agent's instruction at load, an OCI re-pull and a registry
+  read alike (a registry's resolved read and an instance child's
+  parent-delivered instruction are still used as served). Plain prose with
+  none of these is still the model's byte for byte. Going through delivery
+  is going through its refusals: such a document is now refused for
+  `spec: "2"`, front matter that is not valid YAML, a dangling
+  `[[kind/name]]`, a duplicate `MUST[x]`, or malformed end matter.
+- **A `dir:` source drops each file's end matter, and `agent.prompt` drops
+  end matter from every source.** End matter is a document's record, and
+  only the last thing in a document is end matter, so in a combined folder
+  every file's record but the last sat mid-text as prose. Each file's is now
+  split off before the files are joined, without a warning; malformed end
+  matter refuses the source, naming the file (`… dir <dir>: <file>: end
+  matter is not valid YAML: …`). This covers the agent's instruction, a
+  subagent template's and `agent.prompt`'s `dir:`. A pinned folder's
+  per-file signatures are still checked over each file's full bytes. A
+  prompt from `file:`, `url:`, `oci:`, `text:` or a literal now loses its
+  end matter too (a `dir:` prompt lost it per file); malformed end matter
+  refuses with `agent.prompt: end matter is not valid YAML: …`. Nothing else
+  in a prompt is processed: it is the task, not an instruction document.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -542,6 +570,11 @@ Revision 1.1 registers `unless` and `otherwise` as structural kinds. A
 structural block with a body that is not a variant delivers that body
 unwrapped: a block the registry knows is never dropped from the delivered
 text while the load reports success.
+
+`doc::contains_blocks` is replaced by `doc::needs_delivery`, which is true
+for anything §3.5 delivery renders or removes — a block, a keyword, alert or
+reason line, a column-0 author note, front matter or end matter — and false
+for plain prose, which delivery would hand back unchanged.
 
 Instruction refusals carry their Appendix B code; config.invalid text is
 unchanged. agentd-instruction's `Refusal` is now `{line, code, message}`

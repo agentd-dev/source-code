@@ -99,7 +99,8 @@ fn main() {
         "principal://usr_7",
         now + 60,
         &["material".into()],
-        &src,
+        &src.publisher,
+        &src.max_capabilities,
         author.public_bytes(),
         delivery.public_bytes(),
     )

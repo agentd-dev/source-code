@@ -1720,7 +1720,10 @@ impl Runtime {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            match crate::config::attest::verify_authored(raw.as_bytes(), pins, now)? {
+            // A refusal joins the caller's error text over its Display.
+            match crate::config::attest::verify_authored(raw.as_bytes(), pins, now)
+                .map_err(|e| e.to_string())?
+            {
                 crate::config::attest::Authorship::Verified { capabilities, .. } => {
                     Ok(Some(capabilities))
                 }
@@ -1847,7 +1850,7 @@ impl Runtime {
                     ));
                 }
             }
-            let claims = sign::verify_author(&jws, &key)?;
+            let claims = sign::verify_author(&jws, &key).map_err(|e| e.to_string())?;
             let want = instruction_core::digest(raw.as_bytes());
             if claims.digest != want {
                 return Err(format!(
@@ -1878,7 +1881,7 @@ impl Runtime {
                 }
                 let (d_key, _) = resolve_verify_key(client, &d_uris, d_kid.as_deref())
                     .ok_or_else(|| format!("{doc_id}: no delivery key resolves (kid {d_kid:?})"))?;
-                let d = sign::verify_delivery(&d_jws, &d_key)?;
+                let d = sign::verify_delivery(&d_jws, &d_key).map_err(|e| e.to_string())?;
                 if d.aud.as_deref() != Some(reader.as_str()) {
                     return Err(format!(
                         "{doc_id}: delivery is for {:?}, not this reader {reader:?} (§7.6 step 2)",

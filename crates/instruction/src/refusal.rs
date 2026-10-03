@@ -121,6 +121,10 @@ pub const CODES: &[&str] = &[
     // Not in Appendix B: refusals/non-integer-version pins it as its second
     // entry (the TypeScript port's schema-validation path). Raised upstream.
     "schema",
+    // Not in Appendix B: a §7 verification condition the table gives no row
+    // (a JWS that does not parse or verify, an expired signature, a broken
+    // author→manifest chain). Rows raised upstream.
+    "attestation",
     // Not in Appendix B: this reader's own limits, refused where the
     // reference delivers. Raised upstream.
     "nested-machinery",
@@ -128,9 +132,10 @@ pub const CODES: &[&str] = &[
 ];
 
 /// The codes in [`CODES`] that Appendix B has no row for: one a fixture pins,
-/// and the refusals of this reader's own limits — machinery it would fold
-/// from nowhere but the top level, bodies nested past what it delivers.
-pub const NON_CATALOGUE: &[&str] = &["schema", "nested-machinery", "nesting-depth"];
+/// the §7 verification conditions without a row of their own, and the
+/// refusals of this reader's own limits — machinery it would fold from
+/// nowhere but the top level, bodies nested past what it delivers.
+pub const NON_CATALOGUE: &[&str] = &["schema", "attestation", "nested-machinery", "nesting-depth"];
 
 /// The Appendix B codes this crate never emits, each with the reason. Every
 /// other code in [`CODES`] has a site that constructs it; a unit test holds
@@ -176,15 +181,7 @@ mod tests {
     /// Appendix B codes a later unit of the 1.1 re-vendor constructs, with that
     /// unit. Shrink-only: the unit that builds a code removes it here, and the
     /// accounting test fails until it does.
-    const PENDING_CODES: &[(&str, &str)] = &[
-        ("signature-typ-mismatch", "V8"),
-        ("audience-mismatch", "V8"),
-        ("digest-mismatch", "V8"),
-        ("manifest-dropped-missing", "V8"),
-        ("unpinned-publisher", "V8"),
-        ("delivery-ceiling-exceeded", "V8"),
-        ("wire-floor", "V8"),
-    ];
+    const PENDING_CODES: &[(&str, &str)] = &[];
 
     /// Every `.rs` file under `dir`, at any depth, sorted. Recursive, so a
     /// module that moves into a directory of its own keeps its constructors

@@ -567,6 +567,27 @@ and `front_matter_id` moved from `sign` to the crate root, and `sign` gates
 JWS/Ed25519 verification only. The `dump` example prints `canonical` too,
 and takes a corpus case directory, resolving includes as the runner does.
 
+agentd's §7 verification is the crate's: `config::attest` re-exports
+`Claims`, `SPEC_CLAIM`, `WIRE_FLOOR`, `Verified`, `verify`,
+`verify_document`, `admit_family` and the digests from agentd-instruction
+instead of keeping a second copy, and keeps only signing, `verify_authored`,
+key files and the freshness helpers. `attest::verify_document` takes the
+pinned `publisher` and `max_capabilities` rather than an
+`InstructionSource`. §7 refusals carry Appendix B codes: `sign::verify`,
+`verify_author`, `verify_delivery`, `verify_document`, `admit_family` and
+`attest::verify_authored` return `Refusal` (no line) instead of `String`,
+coded `signature-typ-mismatch`, `audience-mismatch`, `digest-mismatch`,
+`manifest-dropped-missing`, `unpinned-publisher`,
+`delivery-ceiling-exceeded`, `wire-floor` or `ungranted-family`, and
+`attestation` for the §7 conditions Appendix B has no row for (`CODES` and
+`NON_CATALOGUE` gain it; raised upstream). The text is what it was, with
+three exceptions: a delivery whose manifest has no `variants.dropped` is
+refused as `manifest: variants.dropped is required (§7.4 rule 5)` rather
+than as malformed claims; a JWS segment that is not base64url is refused as
+`attestation: bad signature base64` (or `bad header b64`, `bad claims b64`)
+rather than `invalid base64 character`; and whitespace inside a JWS, which
+agentd's copy skipped, is refused.
+
 ## v1.17.0 — A2A, and nothing beside it
 
 The A2A listener spoke a private dialect beside the specification: an

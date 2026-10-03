@@ -4186,10 +4186,31 @@ impl Settings {
         #[cfg(feature = "sign")]
         let attested_capabilities: Option<Vec<String>> = {
             let mut attested: Option<Vec<String>> = None;
+            // Pins exist but name no key material this load can read — their
+            // `author_keys` are all registry JWKS URIs. The operator said what
+            // that means, and it means the same for a folder as for one
+            // document: the pins are the same whichever shape carried it.
+            let unenforceable = |warnings: &mut Vec<String>| -> Result<(), String> {
+                let why = "agent.instruction.trust pins a publisher, but its author_keys \
+                           are all instruction:// JWKS uris — resolving one needs the \
+                           registry client, which a file/dir/url/oci load does not have. \
+                           Point author_keys at a key FILE to verify this document";
+                match instruction_spec.unenforceable {
+                    InstructionUnenforceable::Ignore => Ok(()),
+                    InstructionUnenforceable::Warn => {
+                        warnings.push(why.to_string());
+                        Ok(())
+                    }
+                    InstructionUnenforceable::Refuse => Err(format!("{source}: {why}")),
+                }
+            };
             // A FOLDER is many documents, and the combination carries no single
             // signature — the second document's front matter (its `signature:`
             // included) is dropped when they join. So each file is verified on its
-            // own bytes, before they become one instruction.
+            // own bytes, before they become one instruction, and the folder is
+            // capped by the NARROWEST of its files: what they fold into is one
+            // instruction, and any file's machinery may land in it, so no file
+            // may lend the others a family its own author did not stand behind.
             if !instruction_dir_files.is_empty() && !instruction_spec.trust.is_empty() {
                 for f in &instruction_dir_files {
                     let bytes = std::fs::read(f).map_err(|e| format!("{source}: {f}: {e}"))?;
@@ -4198,12 +4219,29 @@ impl Settings {
                         &instruction_spec.trust,
                         now_secs(),
                     ) {
-                        Ok(crate::config::attest::Authorship::Verified { publisher, .. }) => {
+                        Ok(crate::config::attest::Authorship::Verified {
+                            publisher,
+                            capabilities,
+                            ..
+                        }) => {
                             instruction_warnings.push(format!(
                                 "agent.instruction: verified {f} against {publisher}"
                             ));
+                            attested = Some(match attested {
+                                None => capabilities,
+                                Some(mut narrowest) => {
+                                    narrowest.retain(|c| capabilities.contains(c));
+                                    narrowest
+                                }
+                            });
                         }
-                        Ok(_) => {}
+                        // The pins decide this, not the file, so every file
+                        // would say the same: decided once.
+                        Ok(crate::config::attest::Authorship::NoLocalKeys) => {
+                            unenforceable(&mut instruction_warnings)?;
+                            break;
+                        }
+                        Ok(crate::config::attest::Authorship::Unpinned) => {}
                         Err(e) => return Err(format!("{source}: agent.instruction {f}: {e}")),
                     }
                 }
@@ -4233,23 +4271,8 @@ impl Settings {
                         ));
                         attested = Some(capabilities);
                     }
-                    // Pins exist but name no key material this load can read —
-                    // their `author_keys` are all registry JWKS URIs. The operator
-                    // said what that means.
                     Ok(crate::config::attest::Authorship::NoLocalKeys) => {
-                        let why = "agent.instruction.trust pins a publisher, but its author_keys \
-                               are all instruction:// JWKS uris — resolving one needs the \
-                               registry client, which a file/dir/url/oci load does not have. \
-                               Point author_keys at a key FILE to verify this document";
-                        match instruction_spec.unenforceable {
-                            InstructionUnenforceable::Ignore => {}
-                            InstructionUnenforceable::Warn => {
-                                instruction_warnings.push(why.to_string())
-                            }
-                            InstructionUnenforceable::Refuse => {
-                                return Err(format!("{source}: {why}"));
-                            }
-                        }
+                        unenforceable(&mut instruction_warnings)?;
                     }
                     Ok(crate::config::attest::Authorship::Unpinned) => {}
                     Err(e) => return Err(format!("{source}: agent.instruction: {e}")),
@@ -10918,6 +10941,122 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("front matter") && w.contains("b.md")),
             "the dropped front matter is reported: {:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// `body` as a document signed by `key` for `instruction://ins_1`, its
+    /// author standing behind `caps` — the bytes `agentd sign` writes.
+    #[cfg(feature = "sign")]
+    fn signed_document(key: &crate::aauth::AgentKey, body: &str, caps: &[&str]) -> String {
+        use crate::config::attest::{Claims, SPEC_CLAIM, author_digest, sign};
+        let head = format!("---\nspec: \"1\"\nid: instruction://ins_1\n---\n{body}");
+        let claims = Claims {
+            spec: SPEC_CLAIM.into(),
+            typ: "author".into(),
+            doc: "instruction://ins_1".into(),
+            version: "1".into(),
+            digest: author_digest(head.as_bytes()),
+            capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
+            publisher: "https://pub.example".into(),
+            iat: 1,
+            exp: u64::MAX,
+            aud: None,
+            manifest: None,
+            author: None,
+        };
+        let jws = sign(key, &claims).unwrap();
+        head.replacen(
+            "id: instruction://ins_1\n",
+            &format!("id: instruction://ins_1\nsignature: {jws}\n"),
+            1,
+        )
+    }
+
+    /// A signed FOLDER is capped by its narrowest file. Its files fold into
+    /// one instruction, so the route `b.md` opens lands in the same document
+    /// as `a.md`, whose author did not stand behind `interface` — and the
+    /// operator's grant of it does not reach past what every author
+    /// attested. Each file verifying on its own bytes is not enough: what a
+    /// verified file attests has to cap the grant, as it does for one
+    /// document.
+    #[test]
+    #[cfg(feature = "sign")]
+    fn a_signed_folder_is_capped_by_its_narrowest_file() {
+        let key = crate::aauth::AgentKey::generate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("author.pub");
+        std::fs::write(&key_file, key.public_bytes()).unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let route = "Take the inbox.\n\n:::!endpoint{name=in path=/in}\ninto: {stream: inbox, subject: msg}\n:::\n";
+        let load = |a_caps: &[&str]| {
+            std::fs::write(
+                docs.join("a.md"),
+                signed_document(&key, "You are the desk.\n", a_caps),
+            )
+            .unwrap();
+            std::fs::write(
+                docs.join("b.md"),
+                signed_document(&key, route, &["interface"]),
+            )
+            .unwrap();
+            Settings::from_document(
+                json!({"agent": {"name": "a", "preflight": "never",
+                          "document_capabilities": ["interface"],
+                          "instruction": {"dir": docs.to_string_lossy(),
+                              "trust": [{"uri": "instruction://ins_1",
+                                         "publisher": "https://pub.example",
+                                         "author_keys": [key_file.to_string_lossy()]}]}},
+                    "streams": {"inbox": {}},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                MERGED_DOCUMENT,
+            )
+        };
+        // Every author stands behind `interface`: the route loads.
+        if let Err(e) = load(&["interface"]) {
+            panic!("every file attests the family, and still refused: {e}");
+        }
+        // One does not: the folder may not open it, though `b.md` alone could.
+        let e = load(&[]).expect_err("a file's attestation lent the folder a family");
+        assert!(e.contains("`interface` capability"), "{e}");
+    }
+
+    /// Pins whose keys are all registry JWKS uris cannot verify a folder any
+    /// more than one document, and the operator's `unenforceable` decides it
+    /// the same way: `refuse` refuses the folder rather than loading it
+    /// unverified.
+    #[test]
+    #[cfg(feature = "sign")]
+    fn a_folder_under_unenforceable_pins_follows_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "be terse\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "be kind\n").unwrap();
+        let load = |policy: &str| {
+            Settings::from_document(
+                json!({"agent": {"name": "a", "preflight": "never",
+                          "instruction": {"dir": dir.path().to_string_lossy(),
+                              "unenforceable": policy,
+                              "trust": [{"uri": "instruction://ins_42",
+                                         "publisher": "https://pub.example",
+                                         "author_keys": ["instruction://ins_42/keys.json"]}]}},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                MERGED_DOCUMENT,
+            )
+        };
+        let e = load("refuse").expect_err("an unverifiable folder loaded under `refuse`");
+        assert!(e.contains("key FILE"), "{e}");
+        let s = load("warn").expect("warn does not refuse");
+        assert_eq!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .filter(|w| w.contains("JWKS uris"))
+                .count(),
+            1,
+            "said once for the folder, not once per file: {:?}",
             s.agent.instruction_warnings
         );
     }

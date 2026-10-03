@@ -238,21 +238,52 @@ const DRIFT_TESTS: &[(&str, &str, &str)] = &[
 /// and moving the pin is now a change made with the re-vendor it describes.
 #[test]
 fn the_spec_checkout_is_pinned() {
+    let pin = spec_pin();
+    assert!(
+        pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the spec checkout must pin a full 40-hex commit sha, not {pin:?}"
+    );
+}
+
+/// The `ref:` of ci.yml's specification checkout: the one home of the pin.
+fn spec_pin() -> String {
     let ci = workflow("ci.yml");
     let step = ci
         .split("repository: instruction-md/specification")
         .nth(1)
         .expect("ci.yml checks out instruction-md/specification");
     let step = step.split("\n      - ").next().unwrap_or(step);
-    let pin = step
-        .lines()
+    step.lines()
         .find_map(|l| l.trim().strip_prefix("ref:"))
-        .map(str::trim)
-        .unwrap_or_else(|| panic!("the spec checkout carries no `ref:`:\n{step}"));
-    assert!(
-        pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
-        "the spec checkout must pin a full 40-hex commit sha, not {pin:?}"
-    );
+        .map(|p| p.trim().to_string())
+        .unwrap_or_else(|| panic!("the spec checkout carries no `ref:`:\n{step}"))
+}
+
+/// The documents that tell a reader which revision is vendored — the crate's
+/// README (its crates.io page, whose guide links point INTO that revision)
+/// and the corpus directory's UPSTREAM.md — name the pin, and no other
+/// revision. Their copies are what a re-vendor is told to update by hand, so
+/// one left behind would otherwise stay green while describing another tree.
+#[test]
+fn every_document_naming_the_vendored_revision_names_the_pin() {
+    let pin = spec_pin();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for doc in [
+        "crates/instruction/README.md",
+        "crates/agentd-cli/tests/instruction-spec-corpus/UPSTREAM.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        assert!(
+            text.contains(&pin),
+            "{doc} does not name the pinned revision {pin}"
+        );
+        for run in text
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .filter(|t| t.len() >= 40)
+        {
+            assert_eq!(run, pin, "{doc} names a revision that is not ci.yml's pin");
+        }
+    }
 }
 
 /// Both drift checks RUN, in CI and in the local gate, against the pinned
@@ -348,12 +379,34 @@ fn the_local_gate_lints_the_instruction_crate_without_sign() {
             && gate.contains("cargo clippy -p agentd-instruction --all-targets $F -- -D warnings"),
         "scripts/ci-gate.sh does not lint agentd-instruction over INSTRUCTION_ROWS"
     );
-    for row in rows {
+    for row in &rows {
         let line = if row.is_empty() {
             "run: cargo clippy -p agentd-instruction --all-targets -- -D warnings".to_string()
         } else {
             format!("run: cargo clippy -p agentd-instruction --all-targets {row} -- -D warnings")
         };
+        assert!(
+            job.lines()
+                .any(|l| l.trim().trim_start_matches("- ") == line),
+            "ci.yml's gate job lacks `{line}`"
+        );
+    }
+    // Its docs are its docs.rs page, built per row: rustdoc only WARNS on a
+    // broken intra-doc link — one to a feature-gated module, say — so each
+    // gate denies warnings rather than leave it to a dead link nobody sees.
+    assert!(
+        gate.contains("RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps -p agentd-instruction $F"),
+        "scripts/ci-gate.sh does not build agentd-instruction's docs over INSTRUCTION_ROWS"
+    );
+    for row in rows {
+        let line = format!(
+            "run: RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps -p agentd-instruction{}",
+            if row.is_empty() {
+                String::new()
+            } else {
+                format!(" {row}")
+            }
+        );
         assert!(
             job.lines()
                 .any(|l| l.trim().trim_start_matches("- ") == line),

@@ -1220,12 +1220,16 @@ exit `2`, naming the line and the kinds this reader knows — while an unknown
   `main` loop**: it declared its machinery explicitly. That holds however the
   document was named — inline, a file, a folder, an artifact — because the
   decision is made after the source resolves and its directives are extracted.
-- **`:::!skill{name, description, when}`** — an **inline skill**: the body
-  joins the skills catalogue with no MCP server involved, referenced as
+- **`:::!skill{name, description, trigger}`** (`when` is its alias) — an
+  **inline skill**: the body joins the skills catalogue with no MCP server
+  involved, referenced as
   `@skill:<name>` like any discovered skill. Inline wins a name collision —
   the operator wrote it closer to this agent than any server did.
 - **`:::context{title?}`** / **`:::example`** — model-facing: the fence goes,
-  the body stays, wrapped in `<reference>` / `<example>` tags.
+  the body stays. A context is wrapped in `<reference>` tags; an example is
+  quoted under its EXAMPLE label in the document's label style
+  (`**EXAMPLE:**` by default, `EXAMPLE:` in `plain`, `<example>` tags in
+  `tags`).
 
 Editing the instruction and reloading (SIGHUP / `watch_config`) re-extracts:
 an embedded workflow whose body changed is **replaced** (new runs on the new

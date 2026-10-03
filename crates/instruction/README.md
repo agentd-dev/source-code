@@ -51,9 +51,12 @@ Two drift tests compare them with a checkout of the specification:
 - `the_vendored_schema_matches_upstream_when_present` (agentd-cli's
   `tests/instruction_spec_corpus.rs`) compares the schema as parsed JSON.
 
-Each reads the checkout named by `INSTRUCTION_SPEC_REPO`, or a sibling clone
-at the default path. A test that finds neither prints `drift check skipped`
-and passes, so CI and `scripts/ci-gate.sh` do not leave it there. Their
+Each reads the checkout named by `INSTRUCTION_SPEC_REPO`; a path there that
+lacks the vendored files fails the test rather than skipping it. With the
+variable unset, each tries a maintainer's default path
+(`/root/instruction-md/specification`) and, finding nothing there, prints
+`drift check skipped` and passes — so outside that machine, set the
+variable. CI and `scripts/ci-gate.sh` do not leave it to a skip. Their
 `spec drift (pinned)` step checks out the revision `ci.yml` pins, runs both
 tests by name against it, and fails the run when either skipped or did not
 pass. `release_matrix.rs` holds both gates to that.
@@ -214,13 +217,10 @@ tree with its members in `serde_json`'s key order.
 
 ## Licence
 
-This crate's own source is licensed under either of
-
-- Apache License, Version 2.0 (`LICENSE-APACHE`), or
-- MIT license (`LICENSE-MIT`),
-
-at your option. 0.1.0 was published AGPL-3.0-only, and that version keeps
-that licence.
+The package's licence is the `license` field of its `Cargo.toml`, with the
+licence texts it ships (`LICENSE-APACHE`, `LICENSE-MIT`); each source file
+names its own in its SPDX header. 0.1.0 was published AGPL-3.0-only, and that
+version keeps that licence.
 
 The vendored material keeps its own terms. The schema is **CC BY 4.0** and
 the conformance fixtures are **Apache-2.0**, with upstream's `LICENSE` copied

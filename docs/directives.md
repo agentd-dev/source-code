@@ -166,11 +166,13 @@ operator wrote it closer to this agent than any server did.
 
 Model-facing, zero machinery: the fence is removed and the body kept, under
 a boundary the model can see — a context is wrapped in `<reference>` tags,
-and an example is quoted under its own `**EXAMPLE:**` label (`**EXAMPLE
-(avoid):**` for one marked `avoid`), its body as written, with no keyword in
-it labelled and no reference degraded. So the model sees *what to do*, *what
-is true*, and *what good output looks like* apart, instead of one
-undifferentiated wall of prose.
+and an example is quoted under its own label: `**EXAMPLE:**` in the default
+bold style (`**EXAMPLE (avoid):**` for one marked `avoid`), `EXAMPLE:` in
+`plain`, and `<example>` tags in `tags` (see the label-style row below). An
+example's keywords and references are left as written, with no keyword
+labelled and no reference degraded; its `${…}` parameters are substituted.
+So the model sees *what to do*, *what is true*, and *what good output looks
+like* apart, instead of one undifferentiated wall of prose.
 
 ## The whole agent from one document
 
@@ -237,8 +239,13 @@ naming the line.
   `{attributes}` — `:::!workflow`, `::::context{title="x"}`. A `:::`
   mid-sentence, or an indented fence, is prose.
 - It closes at a line of **at least as many** colons and nothing else.
-- **Nest by giving the outer fence more colons** — a `::::context` block can
-  quote a literal `:::!workflow` without it being parsed.
+- **A longer fence contains a shorter one** — a `:::must` inside a
+  `::::context` is parsed as a nested block. A fence of the SAME length is
+  not nesting: its opener is text in the outer body, and the first bare
+  closer ends the outer block. Nested machinery is refused
+  (`nested-machinery`). To quote fence syntax literally, mark the outer
+  block `verbatim` — `::::context{verbatim}` around a `:::!workflow`
+  delivers those lines unparsed, inside `<reference>`.
 - Attributes: `key=value`, `key="quoted value with \" escapes"`, bare `flag`
   (→ `"true"`). Keys are read in lower case (`{Name=x}` is `name`), and a
   key written twice is refused.
@@ -265,11 +272,12 @@ default bold label style.
 | override (S24) | `:::must{name=b overrides="must/a"}` | rule `b`; rule `a` and its reason are not delivered. A guardrail, or a rule stronger than its overrider, cannot be overridden |
 | label style (S25) | front matter `delivery: {labels: plain}` or `{labels: tags}` | `MUST: x`, or `<must>x</must>`; the default is bold |
 | end matter (S27) | a closing `---` YAML block after a blank line | nothing: it is the document's record (owners, approvals, changelog), and malformed end matter refuses the document |
-| `!eval` (S23) | `:::!eval{name=e target=@must/escalate}` with a YAML body | nothing: it is accepted and inert. It needs a name and a `target` that resolves, and it configures nothing. A bare `:::eval` is prose |
+| `!eval` (S23) | `:::!eval{name=e target=@must/escalate}` with a YAML body | nothing: it is accepted and inert. It needs a name; a `target`, when written, must resolve. It configures nothing. A bare `:::eval` is prose |
 
 A `${}` inside fenced code is not substituted. Machinery folds from the
-document's top level only: a `:::!tools` inside a `:::when` is refused, not
-ignored.
+document's top level only: a `:::!tools` inside a `::::when` is refused, not
+ignored. Written inside a `:::when` instead, the equal-length fence is not
+nesting, so its lines are the `when` body's text and are delivered as such.
 
 ### The facts a `when` or `unless` is decided by
 
@@ -300,8 +308,12 @@ agentd never delivers text that was already delivered.
   parent writes the template's delivered prose, with its params, into the
   child's config, and the child uses that text as written.
 - **A registry's resolved read is used as delivered.** A read with
-  `md.instruction/resolution: resolved` is text the registry already
-  delivered for this reader: nothing is extracted from it, and nothing folds.
+  `md.instruction/resolution: resolved` is text the registry says it already
+  delivered for this reader: nothing is extracted from it, nothing folds, and
+  its notes and end matter are the registry's to have removed. The
+  resolution is the serving server's own claim; it is verified only for a
+  source that pins `publisher` and `reader` (see
+  [security](security.md#where-the-instruction-came-from)).
   Its `md.instruction/deliveredDigest` must match the bytes served, or the
   read is refused and the running instruction kept. A `raw` read, or one
   with no resolution, is delivered by agentd.

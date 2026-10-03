@@ -70,6 +70,17 @@ for F in "${INSTRUCTION_ROWS[@]}"; do
 done
 [ $fail -eq 0 ] && echo "  all rows clean"
 
+# ci.yml's gate job: agentd-instruction's docs are its docs.rs page, and
+# rustdoc only warns on a broken intra-doc link — so deny warnings, per row.
+step "rustdoc (agentd-instruction, ${#INSTRUCTION_ROWS[@]} rows)"
+for F in "${INSTRUCTION_ROWS[@]}"; do
+  if ! RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agentd-instruction $F >/tmp/ci-gate.log 2>&1; then
+    echo "  FAIL  agentd-instruction docs  ${F:-<default>}"
+    grep -m3 -E '^(error|warning)' /tmp/ci-gate.log | sed 's/^/        /'
+    fail=1
+  fi
+done
+
 # ci.yml's `deny` job. It runs in quick mode too: it reads the lockfile and
 # builds nothing. The version is ci.yml's own pin, read rather than copied, so
 # a local run that judges with another cargo-deny says so. Without cargo-deny

@@ -161,6 +161,19 @@ and it is not yet published.
   A retired definition whose runs are still live counts until the last of
   them lands, so its runs' taint stays on the contracts that can still read
   their results back — across a restart too.
+- **A pinned registry read is bound to the pinned document.** The trust pin
+  is chosen by the URI's document id, but the signed `doc` claim was never
+  compared with it: under a URI pinned for one document, a registry could
+  serve another the same publisher signed, and it verified, with a `reader`
+  and without. A read whose signature names another `doc` is now refused
+  (`attestation`).
+- **A signed `dir:` folder is capped by what its authors attested.** Each
+  file was verified, but what it attested was then dropped, so the
+  operator's grant reached the folder whole. The folder is now capped by its
+  narrowest file. Pins whose keys are all registry JWKS uris were also
+  passed over silently for a folder; `agent.instruction.unenforceable`
+  now decides that case for a folder as it does for one document, so
+  `refuse` refuses it.
 
 ### Fixed
 
@@ -315,8 +328,8 @@ and it is not yet published.
   (`end-matter-yaml`). A document with no block at all is held to the same
   rule through the delivery gate below. A bare
   `:::eval` is prose, as is any machinery name registered after version 1
-  (S23); `:::!eval` loads, needs a name and a `target=@kind/name` that
-  resolves, and configures and delivers nothing. A value outside an
+  (S23); `:::!eval` loads and needs a name; a `target=@kind/name`, when
+  written, must resolve. It configures and delivers nothing. A value outside an
   attribute's schema `enum` or `pattern` (`::param{type=integer}`,
   `:::output{schema=reply}`) refuses (`attribute-value`), on a block, on
   each row of a set (at the set's line, where the reference reports it, and
@@ -584,7 +597,11 @@ and it is not yet published.
   skipped drift test still reports `ok`. The local gate reads the pin from
   `ci.yml` and fails when it cannot reach that revision.
 - agentd-instruction is linted with and without `sign`, and tested in its
-  default build, in CI and in `scripts/ci-gate.sh`.
+  default build, in CI and in `scripts/ci-gate.sh`. Its docs are built with
+  rustdoc warnings denied in both builds, so a broken intra-doc link fails
+  the gate instead of shipping to docs.rs.
+- `release_matrix.rs` holds the crate README and the corpus `UPSTREAM.md` to
+  `ci.yml`'s spec pin.
 
 ### Crates
 

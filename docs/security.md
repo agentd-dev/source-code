@@ -1224,8 +1224,9 @@ follow a registry's CDN (`oci.rs::get_blob`).
 ## Where the instruction came from
 
 The instruction is the agent's standing policy: whoever controls it controls
-what the agent will do. agentd can check two independent things about it, and
-they answer different questions.
+what the agent will do. agentd can check three independent things about it —
+who wrote it, who delivered it to this reader, and who pushed it — and they
+answer different questions.
 
 **Who WROTE it — `agent.instruction.trust`.** The Instruction Specification §7
 author signature travels inside the document, as a front-matter `signature:`
@@ -1233,22 +1234,37 @@ line. With a publisher pinned, agentd verifies that signature after decryption
 and before anything interprets the bytes — the one point a `file:`, `dir:`,
 `url:`, `oci:` and registry-served document all converge on. An unsigned
 document is refused, as is one signed by another publisher or naming a `doc`
-id no pin covers. A folder is verified per file, before the documents combine.
+id no pin covers. On a registry read the pin is chosen by the URI's document
+id, and the signature's `doc` claim must be that id: a document the same
+publisher signed for another id is refused when served under the pinned URI.
+A folder is verified per file, before the documents combine.
 The attested capabilities CAP the grant: effective = grant ∩ ceiling ∩
-attested, so a signature can never widen what the operator gave.
+attested, so a signature can never widen what the operator gave. A folder is
+capped by the narrowest of its files, since any file's machinery lands in the
+one instruction they combine into. Pins whose `author_keys` are all registry
+JWKS uris cannot verify a file, a folder, a `url:` or an `oci:` source, and
+`agent.instruction.unenforceable` decides what that means for each alike.
 
 The author signature covers end matter. The author digest is the document's
 bytes with only the front-matter `signature:` line left out, so the closing
 `---` record (owners, approvals, review dates) is signed with the text, and
-editing it breaks the signature. An instruction's end matter and author
-notes never reach the model, from any source: a note is not parsed, end
-matter is the document's record, and delivery removes both.
+editing it breaks the signature. agentd's delivery removes an instruction's
+end matter and author notes from every source it delivers: a note is not
+parsed, and end matter is the document's record. A registry read marked
+`md.instruction/resolution: resolved` is the exception, because it is the
+registry's delivery, not agentd's. agentd uses that text as served (see
+[directives](directives.md), *Delivered once*), so removing notes and end
+matter from it is the registry's job. Such a read is unverified unless its
+source pins `publisher` and `reader`; with both pinned, its delivery
+attestation is checked as described below.
 
 **Who DELIVERED it — a pinned `reader`.** A registry can resolve a document
 for one reader and sign that delivery. When a pin sets `reader`, agentd
 verifies the delivery attestation on every registry read, before anything
 interprets the bytes. It checks the audience, the expiry and the delivered
-digest. It checks the document id against the front-matter `id`. It checks
+digest. It checks the delivery's `doc` against the front-matter `id` when the
+delivered text still carries one (delivery strips front matter, so a resolved
+read binds its `doc` through the author check above instead). It checks
 the chain from the embedded resolution manifest's authored digest to the
 author signature the read carries, and the delivery ceiling within the
 author's. The effective set is then grant ∩ ceiling ∩ author ∩ delivery. The
@@ -1272,10 +1288,11 @@ signature beside it says which publisher pushed these bytes to this registry.
 agentd fetches it, verifies it against the configured public key, and checks
 that the signed payload names this manifest digest.
 
-Neither substitutes for the other. A registry compromise can serve a genuinely
+None substitutes for another. A registry compromise can serve a genuinely
 authored document from the wrong place; a stolen push credential can publish an
-artifact nobody authored. Pinning the reference by digest (`@sha256:…`) removes
-the mutable-tag question entirely and is the cheapest of the three.
+artifact nobody authored. For an OCI source, pinning the reference by digest
+(`@sha256:…`), which agentd compares with the manifest it fetches, removes the
+mutable-tag question entirely and costs less than any of the three checks.
 
 A build without `--features sign` cannot check an author signature at all, so a
 configured pin is a startup refusal there rather than a silent pass.

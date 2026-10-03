@@ -48,6 +48,13 @@ jobs:
         run: cargo clippy -p agentd-instruction --all-targets -- -D warnings
       - if: ${{ !cancelled() }}
         run: cargo clippy -p agentd-instruction --all-targets --features sign -- -D warnings
+      # Its docs are its docs.rs page. rustdoc only warns on a broken
+      # intra-doc link (one to a feature-gated module, say), so deny warnings
+      # in both builds rather than ship a dead link.
+      - if: ${{ !cancelled() }}
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agentd-instruction
+      - if: ${{ !cancelled() }}
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agentd-instruction --features sign
       - if: ${{ !cancelled() }}
         run: cargo test -p agentd-instruction --no-fail-fast
       # The two drift checks, by exact name, against the pinned checkout above.

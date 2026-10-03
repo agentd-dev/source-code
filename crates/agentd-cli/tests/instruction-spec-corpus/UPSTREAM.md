@@ -39,8 +39,9 @@ of the registry, and it is the normative one.
   (`crates/instruction/tests/corpus.rs`) does the same for the crate's
   vendored conformance tree.
 
-The two upstream checks run against `INSTRUCTION_SPEC_REPO`, else a sibling
-checkout at the default path, and skip only when neither exists. An EXPLICIT
+The two upstream checks run against `INSTRUCTION_SPEC_REPO`, else the
+maintainer default path `/root/instruction-md/specification`, and skip only
+when the variable is unset and nothing is at that path. An EXPLICIT
 `INSTRUCTION_SPEC_REPO` that has no schema fails rather than skips. CI sets it
 to the pinned checkout, and both CI's `spec drift (pinned)` step and
 `scripts/ci-gate.sh` run them by name and fail a run in which either skipped

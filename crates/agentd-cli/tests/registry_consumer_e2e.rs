@@ -258,6 +258,50 @@ fn a_delivery_chained_to_another_author_signature_is_refused() {
     let _ = std::fs::remove_file(&key);
 }
 
+/// A pin covers ONE document. `@foreign` serves, under the URI pinned for
+/// `ins_mock`, another document the same publisher signed for its own id —
+/// every signature valid, author and delivery, raw and resolved. Only the
+/// signed `doc` claim says it is not the pinned document, and the read is
+/// refused on it: with a `reader` and without, raw and resolved.
+#[test]
+fn a_document_signed_for_another_id_is_refused_under_the_pin() {
+    let key = publisher_key_file();
+    for (uri, reader) in [
+        ("instruction://ins_mock@foreign", None),
+        (
+            "instruction://ins_mock@foreign",
+            Some("agent://mock-reader"),
+        ),
+        (
+            "instruction://ins_mock@foreign?resolved=1",
+            Some("agent://mock-reader"),
+        ),
+    ] {
+        let mut pin = json!({
+            "uri": "instruction://ins_mock@foreign",
+            "publisher": "https://instruction.md/pub/mock",
+            "author_keys": [key.clone()],
+            "delivery_keys": [],
+        });
+        if let Some(r) = reader {
+            pin["reader"] = json!(r);
+        }
+        let r = boot(uri, json!([pin]));
+        assert!(
+            !r.log.contains("proc.ready"),
+            "{uri} (reader {reader:?}) must not start:\n{}",
+            r.log
+        );
+        assert!(
+            r.log
+                .contains("the signature is for \\\"instruction://ins_other\\\""),
+            "{uri} (reader {reader:?}): the refusal names the document signed:\n{}",
+            r.log
+        );
+    }
+    let _ = std::fs::remove_file(&key);
+}
+
 #[test]
 fn verification_fails_closed_on_a_wrong_key_and_a_wrong_reader() {
     // A key that did not sign this document: refuse, do not degrade.

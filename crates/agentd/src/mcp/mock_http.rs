@@ -871,6 +871,13 @@ fn registry_contents(uri: &str) -> serde_json::Value {
     let narrow = base.ends_with("@narrow");
     let end_matter = base.ends_with("@endmatter");
     let mut text = (if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC }).to_string();
+    // `@foreign` serves ANOTHER document under this URI — one the same
+    // publisher legitimately signed for its own id: what a registry swapping
+    // documents under a pinned URI serves. Every signature over it is valid;
+    // only its `doc` claim says it is not the document the pin names.
+    if base.ends_with("@foreign") {
+        text = text.replace("id: instruction://ins_mock", "id: instruction://ins_other");
+    }
     let version_id = if base.ends_with("@variants") {
         text = REGISTRY_DOC_VARIANTS.to_string();
         "ver_mock_variants".to_string()
@@ -1024,7 +1031,10 @@ fn mock_signatures_over(
     let author = Claims {
         spec: crate::config::attest::SPEC_CLAIM.into(),
         typ: "author".into(),
-        doc: "instruction://ins_mock".into(),
+        // The `doc` claim is the authored document's id (§7.3), as a
+        // publisher signs it — not the URI it happens to be served under.
+        doc: instruction_core::front_matter_id(text.as_bytes())
+            .unwrap_or_else(|| "instruction://ins_mock".into()),
         version: version_id.into(),
         digest: crate::config::attest::author_digest(text.as_bytes()),
         capabilities: MOCK_CAPABILITIES.iter().map(|c| c.to_string()).collect(),

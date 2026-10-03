@@ -1904,6 +1904,21 @@ impl Runtime {
                     ),
                 ));
             }
+            // The pin was chosen by the URI's document id, so the signature
+            // must be FOR that document. Nothing else binds them: the author
+            // digest is over whatever the registry served, and the crate's id
+            // check reads the front matter delivery strips. Without this, a
+            // registry could serve, under a URI pinned for one document,
+            // another the same publisher signed — and it would verify. The
+            // delivery attestation names the same `doc` (`verify_document`
+            // refuses a delivery whose `doc` is not its author's, and the
+            // author it chains to is this one), so this binds both.
+            if claims.doc != doc_id {
+                return Err(attestation(format!(
+                    "{doc_id}: the signature is for {:?}, not the pinned document — refuse",
+                    claims.doc
+                )));
+            }
             let now = crate::state::now_ms() / 1000;
             if claims.exp < now {
                 return Err(attestation(format!(

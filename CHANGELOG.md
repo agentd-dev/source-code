@@ -253,6 +253,19 @@ sent one at a time); agentd's answers to a server's requests are bounded at
 
 ### Fixed
 
+- **A resource subscription no owner wants any more is let go of.** The set
+  a connection held only grew: a wait that resolved or timed out, a run that
+  ended, an instruction that moved left its URI subscribed for the life of
+  the connection, and the server went on notifying for it. Every 5s the loop
+  unsubscribes what no armed `subscribe` start, suspended `wait on: resource`
+  or resource instruction wants (`mcp.unsubscribed`). A workflow a reload
+  retires keeps its start's URI subscribed when a wait or the instruction
+  still wants it — it used to look at other workflows' starts only. A fresh
+  wait's first subscribe is bounded by the management timeout, like every
+  other subscribe from the loop.
+- **A config the loader refuses on reload is said in its own words.**
+  `config.reload.invalid` printed a load failure debug-formatted
+  (`Usage("agentd: …")`, quotes escaped).
 - **`subagent.status` and `subagent.await` answer a child that finished
   without an error.** Their reply carried `error: null`, which their own
   contract types as a string, so a model asking about a child that had

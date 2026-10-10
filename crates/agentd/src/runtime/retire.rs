@@ -112,8 +112,9 @@ impl super::reactor::Runtime {
     /// on a config reload, `deleted` for `workflow.delete`.
     pub(crate) fn retire_workflow(&mut self, wf: &Workflow, reason: &str) {
         // 1. Unsubscribe the MCP resources this definition armed — unless
-        //    another still-armed workflow subscribes the same (server, uri),
-        //    in which case the subscription is theirs now.
+        //    another owner still wants the same (server, uri): a still-armed
+        //    workflow's start, a suspended wait, the instruction.
+        let wanted = self.wanted_resources(Some(&wf.name));
         for s in wf.start_steps() {
             if s.kind != "subscribe" {
                 continue;
@@ -121,18 +122,9 @@ impl super::reactor::Runtime {
             let (Some(server), Some(uri)) = (s.field_str("server"), s.field_str("uri")) else {
                 continue;
             };
-            let still_wanted = self
-                .workflows
-                .values()
-                .filter(|w| w.name != wf.name && w.armed)
-                .flat_map(|w| w.start_steps())
-                .any(|o| {
-                    o.kind == "subscribe"
-                        && o.field_str("server") == Some(server)
-                        && o.field_str("uri") == Some(uri)
-                });
+            let still_wanted = wanted.contains(&(server.to_string(), uri.to_string()));
             if !still_wanted && let Some(c) = self.mcp.get(server) {
-                match c.unsubscribe(uri) {
+                match c.unsubscribe_within(uri, crate::obs::health::management_timeout()) {
                     Ok(()) => self.log.info(
                         "workflow.unsubscribed",
                         json!({"workflow": wf.name, "server": server, "uri": uri}),

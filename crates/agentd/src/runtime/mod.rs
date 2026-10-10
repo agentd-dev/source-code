@@ -630,6 +630,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         mcp,
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),
+        release_due_ms: 0,
         registry,
         contexts: Contexts::new(model_window),
         memory: Memory::new(
@@ -2307,6 +2308,7 @@ impl Runtime {
     pub(crate) fn poll_mcp_notifications(&mut self) {
         self.redial_lost_sessions();
         self.retry_subscriptions();
+        self.release_unowned_subscriptions();
         let mut narrowed: Vec<(String, String)> = Vec::new();
         for (name, c) in &self.mcp {
             for e in c.drain_listen_events() {
@@ -2470,6 +2472,96 @@ impl Runtime {
         }
     }
 
+    /// The (server, uri) pairs an owner wants subscribed: the `subscribe`
+    /// starts of the armed workflows (all but `except`), the suspended
+    /// `wait {on: resource}` steps of the live runs, and the resource
+    /// instruction. What a re-dial restores, and nothing else is held.
+    pub(crate) fn wanted_resources(
+        &self,
+        except: Option<&str>,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let mut wanted = std::collections::BTreeSet::new();
+        for w in self
+            .workflows
+            .values()
+            .filter(|w| w.armed && Some(w.name.as_str()) != except)
+        {
+            for s in w.start_steps() {
+                if s.kind == "subscribe"
+                    && let (Some(server), Some(uri)) = (s.field_str("server"), s.field_str("uri"))
+                {
+                    wanted.insert((server.to_string(), uri.to_string()));
+                }
+            }
+        }
+        for run in self.runs.values().filter(|r| !r.status.is_terminal()) {
+            for st in run.steps.values() {
+                if st.status == StepStatus::Suspended
+                    && let Some(w) = &st.wait
+                    && w["kind"] == "resource"
+                    && let (Some(server), Some(uri)) = (w["server"].as_str(), w["uri"].as_str())
+                {
+                    wanted.insert((server.to_string(), uri.to_string()));
+                }
+            }
+        }
+        if self.instruction.source == "resource"
+            && let (Some(server), Some(uri)) = (&self.instruction.server, &self.instruction.uri)
+        {
+            wanted.insert((server.clone(), uri.clone()));
+        }
+        wanted
+    }
+
+    /// Let go of what a connection holds that no owner wants any more: the
+    /// URI of a wait that resolved, timed out or was cancelled, of a run that
+    /// ended, of an instruction that moved. Without it the set a connection
+    /// holds only grows over its life, and the server goes on notifying for
+    /// URIs nothing reads. Looked at every few seconds, from the loop.
+    fn release_unowned_subscriptions(&mut self) {
+        let now = now_ms();
+        if now < self.release_due_ms {
+            return;
+        }
+        self.release_due_ms = now + RELEASE_EVERY_MS;
+        let wanted = self.wanted_resources(None);
+        // A lost session is the re-dial's: it restores from the owners.
+        let held: Vec<(String, Arc<McpClient>)> = self
+            .mcp
+            .iter()
+            .filter(|(_, c)| !c.session_lost())
+            .map(|(n, c)| (n.clone(), Arc::clone(c)))
+            .collect();
+        let mut failed = false;
+        for (server, c) in held {
+            for uri in c.subscribed() {
+                if wanted.contains(&(server.clone(), uri.clone())) {
+                    continue;
+                }
+                let released = c.unsubscribe_within(&uri, crate::obs::health::management_timeout());
+                crate::obs::health::tick();
+                match released {
+                    Ok(()) => self.log.info(
+                        "mcp.unsubscribed",
+                        json!({"server": server, "uri": uri, "reason": "unowned"}),
+                    ),
+                    Err(e) => {
+                        failed = true;
+                        self.log.warn(
+                            "mcp.unsubscribe.fail",
+                            json!({"server": server, "uri": uri, "reason": "unowned", "err": e.to_string()}),
+                        );
+                    }
+                }
+            }
+        }
+        // Each attempt waits on the server from the loop: one that is not
+        // answering is not asked again every few seconds.
+        if failed {
+            self.release_due_ms = now_ms() + RELEASE_AFTER_FAILURE_MS;
+        }
+    }
+
     /// The spec a spawned child dials `name` with: the configured one, plus
     /// what reached the server on this process's live connection, so the
     /// child starts the same way.
@@ -2526,6 +2618,13 @@ impl Runtime {
         }
     }
 }
+
+/// How often the loop lets go of subscriptions no owner wants
+/// ([`Runtime::release_unowned_subscriptions`]).
+const RELEASE_EVERY_MS: u64 = 5_000;
+
+/// How long the loop waits after a pass that failed to let go of something.
+const RELEASE_AFTER_FAILURE_MS: u64 = 60_000;
 
 /// The subscriptions one server's owners want and its live connection does
 /// not hold, and when to ask for them again.

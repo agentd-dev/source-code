@@ -1112,8 +1112,19 @@ impl RmcpClient {
         Ok(())
     }
 
-    #[allow(deprecated)]
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
+        self.unsubscribe_bounded(uri, None)
+    }
+
+    /// [`Self::unsubscribe`], abandoned as a transport error after `bound`.
+    /// The URI is let go of on this side either way: nothing will read its
+    /// updates.
+    pub fn unsubscribe_within(&self, uri: &str, bound: Duration) -> Result<(), McpError> {
+        self.unsubscribe_bounded(uri, Some(bound))
+    }
+
+    #[allow(deprecated)]
+    fn unsubscribe_bounded(&self, uri: &str, bound: Option<Duration>) -> Result<(), McpError> {
         let _serial = self.subscribing.lock().unwrap_or_else(|e| e.into_inner());
         let mut narrowed = self.subscribed_set();
         if !narrowed.remove(uri) {
@@ -1128,15 +1139,17 @@ impl RmcpClient {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(uri);
+            let op = format!("resources/unsubscribe {uri}");
             return self
-                .rt
-                .block_on(
+                .bounded(
+                    bound,
+                    &op,
                     self.service
                         .unsubscribe(rmcp::model::UnsubscribeRequestParams::new(uri.to_string())),
-                )
-                .map_err(|e| self.fail(&format!("resources/unsubscribe {uri}"), e));
+                )?
+                .map_err(|e| self.fail(&op, e));
         }
-        self.listen_on(&narrowed, None, None).map(|_| ())
+        self.listen_on(&narrowed, bound, None).map(|_| ())
     }
 
     /// A copy of the accepted set, taken under its lock and released at once.

@@ -575,6 +575,16 @@ impl McpClient {
         self.sdk()?.unsubscribe(uri)
     }
 
+    /// [`Self::unsubscribe`], abandoned as a transport error after `bound`.
+    pub fn unsubscribe_within(&self, uri: &str, bound: Duration) -> Result<(), McpError> {
+        self.sdk()?.unsubscribe_within(uri, bound)
+    }
+
+    /// The URIs this connection holds a subscription for.
+    pub fn subscribed(&self) -> Vec<String> {
+        self.sdk().map(|c| c.subscribed()).unwrap_or_default()
+    }
+
     /// Drain any notifications queued since the last drain (e.g.
     /// `notifications/resources/updated`). The reactive router
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.

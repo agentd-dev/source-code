@@ -476,7 +476,10 @@ impl Runtime {
                 // Subscribe (notify-then-read on the loop's notification poll).
                 match self.mcp.get(&server).cloned() {
                     Some(c) => {
-                        if let Err(e) = c.subscribe(&uri) {
+                        let subscribed =
+                            c.subscribe_within(&uri, crate::obs::health::management_timeout());
+                        crate::obs::health::tick();
+                        if let Err(e) = subscribed {
                             self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait resource: subscribe {uri}: {e}")), 0);
                             return;
                         }

@@ -37,7 +37,7 @@
 //! record of the wire, which an e2e counts instead of trusting the client:
 //! `MOCK_DISCOVER <_meta>`, `MOCK_INITIALIZE <revision asked>`,
 //! `MOCK_REFUSED <code> <method> <reason>`, `MOCK_SESSION <id>`, `MOCK_GET`,
-//! `MOCK_SUBSCRIBE <uri>`, `MOCK_LISTEN <filter>`,
+//! `MOCK_SUBSCRIBE <uri>`, `MOCK_UNSUBSCRIBE <uri>`, `MOCK_LISTEN <filter>`,
 //! `MOCK_LISTEN_CLOSED <client|restart|done>`, `MOCK_CALL <params>`,
 //! `MOCK_READ <uri>`.
 //!
@@ -642,7 +642,16 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                 false,
             )
         }
-        "resources/unsubscribe" => (Response::ok(req.id, json!({})), false),
+        "resources/unsubscribe" => {
+            let uri = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            eprintln!("MOCK_UNSUBSCRIBE {uri}");
+            (Response::ok(req.id, json!({})), false)
+        }
         "resources/subscribe" => {
             // Every subscribe that REACHED the server, like `MOCK_READ`: the
             // server side's own count of what a client subscribed.

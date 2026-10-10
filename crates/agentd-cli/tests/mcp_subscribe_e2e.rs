@@ -243,6 +243,118 @@ fn a_subscribe_start_wakes_on_a_2026_07_28_server() {
     assert_stateless_wire(&mock);
 }
 
+/// A URI no owner wants any more is let go of, on the server too, while
+/// what a start still watches stays held: before, the set a connection held
+/// only grew, and the server went on notifying for URIs nothing read.
+#[test]
+fn a_uri_no_owner_wants_any_more_is_let_go_of() {
+    released("2025-11-25");
+}
+
+#[test]
+fn a_uri_no_owner_wants_any_more_is_let_go_of_at_2026_07_28() {
+    released("2026-07-28");
+}
+
+fn released(protocol_version: &str) {
+    let mock = common::spawn_mock_mcp_at(protocol_version, WATCHED, false);
+    let endpoint = mock.uri();
+    let daemon = Daemon::start(
+        "mcp-release",
+        &format!(
+            "agent:\n  name: release\n  instruction: mcp://mock/mock://instruction\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\nworkflows:\n  - name: watch\n    steps:\n      s: {{kind: subscribe, server: mock, uri: \"{WATCHED}\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n  - name: waits\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, on: resource, server: mock, uri: \"mock://waited\", depends_on: [s], timeout: 1s}}\n      f: {{kind: finish, depends_on: [w], status: completed}}\n  - name: parks\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, on: resource, server: mock, uri: \"mock://parked\", depends_on: [s], timeout: 120s}}\n      f: {{kind: finish, depends_on: [w], status: completed}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n"
+        ),
+    );
+    daemon.wait_for("the timed-out wait's URI to be let go of", |log| {
+        events(log, "mcp.unsubscribed")
+            .iter()
+            .any(|e| e["uri"] == "mock://waited" && e["reason"] == "unowned")
+    });
+    // Still wanted: the start's URI, the parked wait's, the instruction's.
+    let kept = [WATCHED, "mock://parked", "mock://instruction"];
+    let log = daemon.log();
+    assert!(
+        !events(&log, "mcp.unsubscribed")
+            .iter()
+            .any(|e| kept.iter().any(|k| e["uri"] == *k)),
+        "a URI an owner still wants was let go of:\n{log}"
+    );
+    let wire = mock.log();
+    if protocol_version == "2026-07-28" {
+        // The listen is opened again for what is still wanted, and only that.
+        let last = wire
+            .lines()
+            .filter_map(|l| l.strip_prefix("MOCK_LISTEN "))
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .next_back()
+            .expect("a listen");
+        let mut held: Vec<&str> = last["resourceSubscriptions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        held.sort_unstable();
+        let mut want = kept.to_vec();
+        want.sort_unstable();
+        assert_eq!(held, want, "{wire}");
+        assert_stateless_wire(&mock);
+    } else {
+        assert!(wire.contains("MOCK_UNSUBSCRIBE mock://waited"), "{wire}");
+        for k in kept {
+            assert!(!wire.contains(&format!("MOCK_UNSUBSCRIBE {k}")), "{wire}");
+        }
+    }
+}
+
+/// A workflow a reload retires lets go of its start's URI only when no other
+/// owner wants it: a wait still parked on the same URI keeps it held.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_retired_start_keeps_a_uri_a_parked_wait_still_wants() {
+    let mock = common::spawn_mock_mcp(WATCHED, false);
+    let endpoint = mock.uri();
+    let parks = format!(
+        "  - name: parks\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, on: resource, server: mock, uri: \"{WATCHED}\", depends_on: [s], timeout: 120s}}\n      f: {{kind: finish, depends_on: [w], status: completed}}\n"
+    );
+    let config = |watch: bool| {
+        format!(
+            "agent:\n  name: retire\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\nworkflows:\n{}{parks}lifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n",
+            if watch {
+                format!(
+                    "  - name: watch\n    steps:\n      s: {{kind: subscribe, server: mock, uri: \"{WATCHED}\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n"
+                )
+            } else {
+                String::new()
+            }
+        )
+    };
+    let daemon = Daemon::start("mcp-retire-keep", &config(true));
+    daemon.wait_for("the start armed and the wait parked", |log| {
+        !events(log, "start.subscribe.armed").is_empty()
+            && events(log, "step.start")
+                .iter()
+                .any(|e| e["kind"] == "wait" && e["step"] == "w")
+    });
+    std::fs::write(&daemon.cfg_path, config(false)).unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    daemon.wait_for("the start's workflow retired", |log| {
+        events(log, "workflow.unloaded")
+            .iter()
+            .any(|e| e["workflow"] == "watch")
+    });
+    // Past a sweep of what no owner wants.
+    std::thread::sleep(Duration::from_secs(6));
+    let log = daemon.log();
+    assert!(events(&log, "workflow.unsubscribed").is_empty(), "{log}");
+    assert!(events(&log, "mcp.unsubscribed").is_empty(), "{log}");
+    assert!(
+        !mock.log().contains(&format!("MOCK_UNSUBSCRIBE {WATCHED}")),
+        "{}",
+        mock.log()
+    );
+}
+
 /// The two workflows the restart tests watch with: a `subscribe` start on
 /// [`WATCHED`] and a `wait {on: resource}` on `mock://waited`, each counted
 /// apart at the server.

@@ -378,6 +378,8 @@ pub struct Runtime {
     /// ([`Runtime::retry_subscribe`]). In memory: a restart subscribes every
     /// owner again anyway.
     pub(crate) resubscribe_retry: BTreeMap<String, super::SubscribeRetry>,
+    /// When [`Runtime::release_unowned_subscriptions`] next looks.
+    pub(crate) release_due_ms: u64,
     pub(crate) registry: Registry,
     pub(crate) contexts: Contexts,
     pub(crate) memory: Memory,

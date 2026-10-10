@@ -373,16 +373,19 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         "agent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 2500ms }\n\
          observability: { log_level: info, log_content: true }\n\
+         intelligence: { model: claude-sonnet-5, default: fast, models: { fast: { model: claude-haiku-4-5 } } }\n\
          subagents:\n\
+        \x20 defaults: { model: gpt-5.1 }\n\
         \x20 templates:\n\
         \x20   approver:\n\
+        \x20     params: { team: { type: string } }\n\
         \x20     instruction: |\n\
         \x20       Approve deploys.\n\
         \x20       :::!channel{name=ops}\n\
         \x20       :::\n\
         \x20       :::!human{name=oncall channel=@channel/ops}\n\
         \x20       :::\n\
-        \x20       :::!workflow{name=approve}\n\
+        \x20       :::!workflow{name=\"approve_{{params.team}}\"}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: deploy.approve, roles: [agent, operator] }\n\
         \x20         ask: { kind: human, question: \"ship it?\", to: \"@human/oncall\", depends_on: [cmd] }\n\
@@ -391,7 +394,7 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         \x20     ttl: 2s\n\
          workflows:\n  - name: w\n    steps:\n\
         \x20     s:     { kind: once }\n\
-        \x20     spawn: { kind: subagent, template: approver, depends_on: [s], on_error: continue }\n\
+        \x20     spawn: { kind: subagent, template: approver, params: { team: blue }, depends_on: [s], on_error: continue }\n\
         \x20     f:     { kind: finish, depends_on: [spawn], status: completed, output: \"{{steps.spawn.error | ok}}\" }\n",
     );
     assert_eq!(code, Some(0), "{log}");
@@ -418,8 +421,21 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         .filter_map(|t| serde_json::from_str(&t).ok())
         .collect();
     assert_eq!(configs.len(), 1, "{log}");
+    // Keyed by the workflow's name as the child has it, its param folded.
     assert_eq!(
-        configs[0]["agent"]["gate_channels"]["approve"]["ask"], "@channel/ops",
+        configs[0]["agent"]["gate_channels"]["approve_blue"]["ask"], "@channel/ops",
+        "{}",
+        configs[0]
+    );
+    // The child runs the model its variants were folded for — the spawn
+    // default here — whatever the parent's `default` tier says.
+    assert_eq!(
+        configs[0]["intelligence"]["model"], "gpt-5.1",
+        "{}",
+        configs[0]
+    );
+    assert!(
+        configs[0]["intelligence"].get("default").is_none(),
         "{}",
         configs[0]
     );

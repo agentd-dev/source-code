@@ -13347,6 +13347,15 @@ mod tests {
             let e = load_doc(&doc("[a, {name: a}]")).unwrap_err().to_string();
             assert!(e.contains("events[a]: listed twice"), "{e}");
             assert!(load_doc(&doc("[{name: a, every: 1s}]")).is_err());
+            // One server's worth, like a server's own bindings.
+            let many = (0..65)
+                .map(|i| format!("e{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let e = load_doc(&doc(&format!("[{many}]")))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("65 event types, at most 64"), "{e}");
         }
     }
 

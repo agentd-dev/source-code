@@ -468,10 +468,28 @@ impl Runtime {
                     None => err(
                         "instruction.subscribe: the instruction is static text; give a uri".into(),
                     ),
-                    Some(u) => match self.subscribe_instruction(&u) {
-                        Ok(()) => ok(json!({"subscribed": true, "uri": u})),
-                        Err(e) => err(e),
-                    },
+                    Some(u) => {
+                        let was = (
+                            self.instruction.server.clone(),
+                            self.instruction.uri.clone(),
+                        );
+                        match self.subscribe_instruction(&u) {
+                            Ok(()) => {
+                                // Its MCP Events follow it to where it is now.
+                                #[cfg(feature = "mcp-events")]
+                                if was
+                                    != (
+                                        self.instruction.server.clone(),
+                                        self.instruction.uri.clone(),
+                                    )
+                                {
+                                    self.events_instruction_moved();
+                                }
+                                ok(json!({"subscribed": true, "uri": u}))
+                            }
+                            Err(e) => err(e),
+                        }
+                    }
                 }
             }
             // ---- memory ----

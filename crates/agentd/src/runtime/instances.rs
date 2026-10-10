@@ -292,8 +292,17 @@ impl Runtime {
         // The channels the template's `::!human`s put on its gates: the prose
         // the child reads no longer declares them, so they travel as the
         // operator's (`agent.gate_channels`), from the operator's template.
+        // A workflow's name, and a channel, may name a param: folded as the
+        // workflows are, so each still names its gate.
         if !t.gate_channels.is_empty() {
-            agent["gate_channels"] = json!(t.gate_channels);
+            let mut channels = json!(
+                t.gate_channels
+                    .iter()
+                    .map(|(wf, steps)| (fold_params(wf, params), steps))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            );
+            fold_params_value(&mut channels, params);
+            agent["gate_channels"] = channels;
         }
         // Machinery workflows join whatever a `:::!config` block declared.
         let mut wfs = t.workflows.clone();
@@ -433,8 +442,19 @@ impl Runtime {
                 o.remove("token");
             }
         }
-        if let Some(m) = &t.spec.model {
-            intel["model"] = json!(m);
+        // The model the template's variants were folded for
+        // (`templates::template_facts`): its own, else the spawn default.
+        // It is the child's model whatever the parent's `default` tier says.
+        if let Some(m) = t
+            .spec
+            .model
+            .as_deref()
+            .or(self.settings.subagents.defaults.model.as_deref())
+            .filter(|m| !m.trim().is_empty())
+            && let Some(o) = intel.as_object_mut()
+        {
+            o.insert("model".into(), json!(m));
+            o.remove("default");
         }
         if let Some(b) = &t.spec.budget {
             intel["budget"] = b.clone();

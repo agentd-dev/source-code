@@ -91,8 +91,11 @@ pub fn compile_templates(s: &Settings) -> Result<BTreeMap<String, CompiledTempla
 
 /// The facts a template's variants are judged by: those of the model its
 /// child runs — the template's `model:`, else `subagents.defaults.model`, else
-/// the root's — as the provider takes it (`Intelligence::wire_model`). A model
-/// a call site passes at spawn is not known here, and does not re-judge them.
+/// the root's — as the provider takes it (`Intelligence::wire_model`). Both
+/// tiers run that model: a flat spawn takes it as its `model`, and an
+/// instance child's composed `intelligence` names it over the parent's
+/// `default` (`runtime::instances`). A model a call site passes at spawn is
+/// not known here, and does not re-judge them.
 pub(crate) fn template_facts(s: &Settings, t: &SubagentTemplate) -> BTreeMap<String, String> {
     match t
         .model

@@ -172,6 +172,9 @@ impl<'de> Deserialize<'de> for InstructionEvent {
     }
 }
 
+/// Said at load wherever MCP Events is configured.
+const DRAFT_WARNING: &str = "MCP Events tracks SEP-3415, a draft: its methods, codes and capability may change between releases";
+
 /// Bindings one server may declare.
 pub const MAX_BINDINGS_PER_SERVER: usize = 64;
 /// Subscriptions one instance holds: static bindings and live runtime
@@ -421,7 +424,8 @@ pub(crate) fn subscribe_refusals(s: &Settings, w: &crate::engine::model::Workflo
 /// only — a webhook needs a credential and a route checked against a server,
 /// and an instruction that names none is served by whichever answers; one
 /// re-read a second is all an occurrence can bring sooner anyway.
-fn check_instruction(s: &Settings, d: &mut Diagnostics) {
+/// How many it holds, toward the instance's cap.
+fn check_instruction(s: &Settings, d: &mut Diagnostics) -> usize {
     let events = s
         .agent
         .instruction_spec
@@ -429,14 +433,20 @@ fn check_instruction(s: &Settings, d: &mut Diagnostics) {
         .as_ref()
         .map_or(&[][..], |m| m.events());
     if events.is_empty() {
-        return;
+        return 0;
     }
     if !cfg!(feature = "mcp-events") {
         d.errors.push(
             "agent.instruction.mcp.events: following the instruction by MCP Events requires building with --features mcp-events"
                 .into(),
         );
-        return;
+        return 0;
+    }
+    if events.len() > MAX_BINDINGS_PER_SERVER {
+        d.errors.push(format!(
+            "agent.instruction.mcp.events: {} event types, at most {MAX_BINDINGS_PER_SERVER}",
+            events.len()
+        ));
     }
     for (i, e) in events.iter().enumerate() {
         if e.name.trim().is_empty() {
@@ -450,11 +460,12 @@ fn check_instruction(s: &Settings, d: &mut Diagnostics) {
             ));
         }
     }
+    events.len()
 }
 
 /// Every MCP Events check, collected into `d` (RFC 0045 §5.2, §5.15).
 pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
-    check_instruction(s, d);
+    let followed = check_instruction(s, d);
     let declared: Vec<&super::McpServer> = s
         .mcp
         .servers
@@ -462,6 +473,9 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         .filter(|srv| !srv.events.is_empty() || !srv.event_grants.is_empty())
         .collect();
     if declared.is_empty() {
+        if followed > 0 {
+            d.warnings.push(DRAFT_WARNING.into());
+        }
         return;
     }
     if !cfg!(feature = "mcp-events") {
@@ -473,7 +487,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
         return;
     }
-    let mut total = 0usize;
+    let mut total = followed;
     let mut webhook_modes: Vec<(String, &super::McpServer)> = Vec::new();
     for srv in &declared {
         let untrusted = srv.tag_set().is_ok_and(|tags| {
@@ -557,13 +571,10 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     check_webhook(s, &webhook_modes, d);
     if total > MAX_SUBSCRIPTIONS {
         d.errors.push(format!(
-            "mcp.servers[].events: {total} bindings, at most {MAX_SUBSCRIPTIONS} per instance"
+            "mcp.servers[].events (with agent.instruction.mcp.events): {total} bindings, at most {MAX_SUBSCRIPTIONS} per instance"
         ));
     }
-    d.warnings.push(
-        "MCP Events tracks SEP-3415, a draft: its methods, codes and capability may change between releases"
-            .into(),
-    );
+    d.warnings.push(DRAFT_WARNING.into());
     let weak = match (&s.store.kind, &s.store.on_error) {
         (StoreKind::Memory, _) => {
             Some("the store is the memory store, so a binding's cursor does not survive a restart")

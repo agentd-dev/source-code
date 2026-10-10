@@ -340,8 +340,11 @@ impl Binding {
             self.state = State::Discovering;
         }
         self.into = shape.into;
-        if matches!(shape.replay, Replay::None) {
-            self.cursor = None; // from now, from the next arm or poll on
+        // Turned to `none`: from now, from the next arm or poll on. Already
+        // `none`, the cursor this life reached stands — a reload is not
+        // downtime.
+        if matches!(shape.replay, Replay::None) && !matches!(self.replay, Replay::None) {
+            self.cursor = None;
         }
         self.replay = shape.replay;
         self.ttl_ms = shape.ttl_ms;
@@ -686,9 +689,13 @@ impl Runtime {
                 });
         }
         self.events_sync_routes();
-        // A binding added (or whose modes changed) on a server already listed
-        // is held against that listing now, not at the next re-list — and one
-        // on a server already refused is refused with it, not left waiting.
+        self.events_hold_pending();
+    }
+
+    /// A binding added (or whose modes changed) on a server already listed
+    /// is held against that listing now, not at the next re-list — and one
+    /// on a server already refused is refused with it, not left waiting.
+    fn events_hold_pending(&mut self) {
         let pending: Vec<(String, Option<(&'static str, String)>)> = self
             .mcp_events
             .bindings
@@ -743,16 +750,59 @@ impl Runtime {
                     .insert(Owner::Instruction);
             }
         }
+        let mut keys = Vec::new();
         for b in self.mcp_events.bindings.values_mut() {
             if !wanted.contains(&b.key) {
                 b.owners.remove(&Owner::Instruction);
             }
-            // The config's and the grants' holds are gone: what is left
-            // lands nowhere.
-            if b.into.is_some() && b.owners.iter().all(|o| *o == Owner::Instruction) {
-                b.apply(Shape::of_instruction());
-            }
+            keys.push(b.key.clone());
         }
+        for key in keys {
+            self.events_fall_back_to_instruction(&key);
+        }
+    }
+
+    /// When only the instruction holds `key` — the config's binding and the
+    /// grants' holds gone — it takes the instruction's shape: polled, kept in
+    /// no stream. It keeps its cursor, so an edit since its last poll still
+    /// brings a read; a webhook subscription is let go when it is next held
+    /// against its listing (`events_evaluate`). Whether it changed.
+    fn events_fall_back_to_instruction(&mut self, key: &str) -> bool {
+        let Some(b) = self.mcp_events.bindings.get_mut(key) else {
+            return false;
+        };
+        if b.into.is_none()
+            || b.owners.is_empty()
+            || b.owners.iter().any(|o| *o != Owner::Instruction)
+        {
+            return false;
+        }
+        let cursor = b.cursor.clone();
+        b.apply(Shape::of_instruction());
+        b.cursor = cursor;
+        true
+    }
+
+    /// The running instruction moved (`instruction.subscribe` named another
+    /// source): its event types follow it — let go where it was, held where
+    /// it is — without the rest of a sync.
+    pub(crate) fn events_instruction_moved(&mut self) {
+        self.events_follow_instruction(now_ms());
+        let ownerless: Vec<String> = self
+            .mcp_events
+            .bindings
+            .values()
+            .filter(|b| b.owners.is_empty())
+            .map(|b| b.key.clone())
+            .collect();
+        for key in ownerless {
+            self.events_remove(&key, "instruction_moved");
+        }
+        if !self.events_servers().is_empty() && self.mcp_events.pool.is_none() {
+            self.mcp_events.pool = Some(Pool::start(self.events_tx.clone()));
+        }
+        self.events_sync_routes();
+        self.events_hold_pending();
     }
 
     /// Read the instruction again for the occurrences that came in, at most
@@ -1806,6 +1856,9 @@ impl Runtime {
             self.events_said("mcp.events.unsubscribed", key, owner, reason);
             if self.mcp_events.bindings[key].owners.is_empty() {
                 self.events_remove(key, reason);
+            } else if self.events_fall_back_to_instruction(key) {
+                self.events_sync_routes();
+                self.events_hold_pending();
             }
             self.events_save_runtime();
         }

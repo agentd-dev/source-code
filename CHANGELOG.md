@@ -381,7 +381,9 @@ sent one at a time); agentd's answers to a server's requests are bounded at
   `:::when{agent="gpt"}` blocks dropped and its `{agent="claude"}` ones kept:
   every template was folded with the agent's own model. Now its own `model:`
   decides (a tier is read as the provider's model), else
-  `subagents.defaults.model`, else the agent's.
+  `subagents.defaults.model`, else the agent's — and an instance-tier child
+  runs that model: it ignored `subagents.defaults.model`, and the parent's
+  `intelligence.default` tier overrode the template's own `model:`.
 - **The TUI and web UI keep saying a session expired.** When a session
   expired while a listing was still out (a slow agent, a slow runner), the
   listing's late answer set the connection back to `polling`, and the UI

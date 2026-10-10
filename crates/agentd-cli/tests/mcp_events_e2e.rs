@@ -787,9 +787,10 @@ fn a_wait_whose_subscription_is_refused_fails_instead_of_waiting() {
     );
 }
 
+#[cfg(feature = "hot-reload")]
 #[test]
-fn a_wait_the_grant_no_longer_allows_fails_on_reload_and_at_restart() {
-    // Reload: the grant now fixes an argument the subscription does not carry.
+fn a_wait_the_grant_no_longer_allows_fails_on_reload() {
+    // The grant now fixes an argument the subscription does not carry.
     let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
     let daemon = Daemon::start(
         "events-narrowed",
@@ -819,8 +820,11 @@ fn a_wait_the_grant_no_longer_allows_fails_on_reload_and_at_restart() {
             .any(|e| e["reason"] == "grant_narrowed"),
         "{log}"
     );
+}
 
-    // Restart: the same edit made while the daemon was down.
+#[test]
+fn a_wait_the_grant_no_longer_allows_fails_at_restart() {
+    // The same edit, made while the daemon was down.
     let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
     let dir = tempfile::tempdir().unwrap();
     let store = format!("  kind: file\n  file: {{path: {}}}\n", dir.path().display());

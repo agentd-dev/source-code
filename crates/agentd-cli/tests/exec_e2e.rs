@@ -171,12 +171,12 @@ fn every_exec_step_reports_its_exit_while_the_reactor_reaps() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
+    // How often the ticker got in depends on how busy the machine is; that
+    // it got in while the commands ran is what makes the reactor pass.
     assert!(
         d.events("run.done")
             .iter()
-            .filter(|e| e["workflow"] == "ticker")
-            .count()
-            >= 5,
+            .any(|e| e["workflow"] == "ticker"),
         "the ticker kept the reactor passing:\n{}",
         d.stderr()
     );

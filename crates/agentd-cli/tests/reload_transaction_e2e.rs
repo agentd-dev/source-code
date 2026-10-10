@@ -273,6 +273,29 @@ fn a_step_naming_a_tool_the_new_server_lacks_refuses_the_reload_and_nothing_appl
     assert_nothing_applied(&d, &a, &cfg, &original, 0, "b");
 }
 
+/// A config the loader itself refuses — it does not parse — is said in the
+/// loader's own words, as at startup, not as a debug-formatted value.
+#[test]
+fn a_config_that_does_not_parse_is_refused_in_the_loaders_words() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let original = config("Keep ticking.", &[("a", &a.uri())], &[TICK], "");
+    std::fs::write(&cfg, &original).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| done_with(l, "tick") >= 1, "a first tick", 15);
+
+    std::fs::write(&cfg, format!("{original}nope: 1\n")).unwrap();
+    let log = d.reload(0);
+    let refused = events(&log, "config.reload.invalid");
+    assert!(
+        refused.iter().any(|e| e["error"].as_str().is_some_and(|m| {
+            m.starts_with("agentd: config file") && m.contains("unknown field `nope`")
+        })),
+        "{refused:?}"
+    );
+}
+
 /// A reload that takes away a server a running workflow still calls is
 /// refused the same way — the workflows are checked against the servers the
 /// reload would run on even when the workflow entries did not change — and

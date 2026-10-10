@@ -110,7 +110,7 @@ impl Runtime {
 
     fn reload_inner(&mut self) -> Result<Vec<&'static str>, ReloadRefused> {
         let (loaded, _ask) = cfg::load(&self.args, &self.env)
-            .map_err(|e| ReloadRefused::Invalid(vec![format!("{e:?}")]))?;
+            .map_err(|e| ReloadRefused::Invalid(vec![e.to_string()]))?;
         let restart = cfg::restart_only_diff(&self.settings_doc, &loaded.doc);
         if !restart.is_empty() {
             return Err(ReloadRefused::RestartRequired(restart));

@@ -814,7 +814,9 @@ as the response. Its version is decided when it is published; nothing is
 published yet.
 
 agentd-instruction 0.3.0 re-vendors Instruction Specification 345f275
-(registry revision 1.1); CI pins that revision. The schema and the whole
+(registry revision 1.1); CI pins that revision. Every source file in it now
+carries the crate's own `MIT OR Apache-2.0` header; seven still said
+AGPL-3.0-only from before the 0.2.0 relicence. The schema and the whole
 conformance directory (corpus, refusals, advisories, README, LICENSE) are
 upstream's bytes. A name is required where the schema's rules require one,
 not wherever a kind has identity: 1.1 gives every prose kind identity, and an

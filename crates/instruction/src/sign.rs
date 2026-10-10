@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! **§7 verification** — JWS/Ed25519 attestation checks, feature `sign`.
 //!
 //! This is the VERIFY side the platform needs at publish and resolve time:

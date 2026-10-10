@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The crate's **stable public API** — the thin, typed surface the platform
 //! (publish-time validation, resolved reads, the TypeScript twin's shared
 //! fixtures) programs against, over the internals in [`crate::doc`].

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A hand-rolled **YAML subset** reader for config files → `serde_json::Value`.
 //!
 //! agentd's config file may be YAML (`--config agentd.yaml`) — but the

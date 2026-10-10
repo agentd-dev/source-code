@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The fixture dumper (E1-06): print one artifact of a document, as the
 //! shared conformance corpus pins it — the §9.1 block tree, the delivered
 //! text, the §7.4 resolution manifest (pretty, and in its signed canonical

@@ -217,10 +217,11 @@ tree with its members in `serde_json`'s key order.
 
 ## Licence
 
-The package's licence is the `license` field of its `Cargo.toml`, with the
-licence texts it ships (`LICENSE-APACHE`, `LICENSE-MIT`); each source file
-names its own in its SPDX header. 0.1.0 was published AGPL-3.0-only, and that
-version keeps that licence.
+The package is licensed under either of the Apache License, Version 2.0, or
+the MIT licence, at your option (`MIT OR Apache-2.0`, the `license` field of
+its `Cargo.toml`); both texts ship with it (`LICENSE-APACHE`, `LICENSE-MIT`),
+and every source file says so in its SPDX header. 0.1.0 was published
+AGPL-3.0-only, and that version keeps that licence.
 
 The vendored material keeps its own terms. The schema is **CC BY 4.0** and
 the conformance fixtures are **Apache-2.0**, with upstream's `LICENSE` copied

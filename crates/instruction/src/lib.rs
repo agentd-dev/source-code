@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! **instruction-core** — the reference implementation of the
 //! [Instruction Specification](https://github.com/instruction-md/specification)
 //! as a library: version 1, registry revision 1.1, with the S7 resolution

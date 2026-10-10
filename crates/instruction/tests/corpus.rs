@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! **The shared conformance fixtures** (E1-06): the same cases the TypeScript
 //! twin (`@instruction-md/spec`) and the Go port run, so the implementations
 //! cannot drift. Three suites, one directory per case:

@@ -41,6 +41,9 @@
 //! `MOCK_LISTEN_CLOSED <client|restart|done>`, `MOCK_CALL <params>`,
 //! `MOCK_READ <uri>`.
 //!
+//! `mock.publish` edits `mock://instruction` (`… Edition <n>.`) and pushes
+//! nothing, so a test decides how the consumer hears of it.
+//!
 //! It can also **restart** without exiting: `mock.restart` forgets every
 //! session it issued (a request still carrying one is answered `404`, as
 //! Streamable HTTP has a server say "no such session") and closes its open
@@ -154,6 +157,9 @@ struct State {
     /// `mock-<generation>`, so every earlier one is forgotten, and every
     /// stream opened before it is closed.
     generation: AtomicU64,
+    /// Bumped by `mock.publish`: the publisher's edit `mock://instruction`
+    /// reads with, made while the server stays up.
+    edition: AtomicU64,
     /// The server-to-client streams open now, which `mock.tools_changed`
     /// writes to.
     open: Mutex<Vec<Open>>,
@@ -248,6 +254,7 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         narrow: Mutex::new(Vec::new()),
         pending_emit: AtomicBool::new(false),
         generation: AtomicU64::new(0),
+        edition: AtomicU64::new(0),
         open: Mutex::new(Vec::new()),
         next_open: AtomicU64::new(0),
         store: Mutex::new(std::collections::BTreeMap::new()),
@@ -600,6 +607,7 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                         {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
                         {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
                         {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
+                        {"name": "mock.publish", "description": "edit mock://instruction, pushing nothing", "inputSchema": {"type": "object"}},
                         {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
                         {"name": "mock.refuse_subscribe", "description": "refuse the next `count` subscribes", "inputSchema": {"type": "object"}},
                         {"name": "mock.tools_changed", "description": "send notifications/tools/list_changed down every open stream that takes it", "inputSchema": {"type": "object"}},
@@ -650,9 +658,15 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                 "skill://incident-runbook" => ("text/x-skill+markdown", "# Incident runbook\n1. Acknowledge the alert. 2. Find the blast radius. 3. Mitigate first, root-cause later. 4. Write the timeline.".to_string()),
                 // A restart reads differently: the publisher's edit made
                 // while the server was down.
-                "mock://instruction" => ("text/plain", match state.generation.load(Ordering::SeqCst) {
-                    0 => "You are the mock-served agent. Follow the served instruction.".to_string(),
-                    g => format!("You are the mock-served agent, restarted {g} time(s). Follow the served instruction."),
+                "mock://instruction" => ("text/plain", {
+                    let text = match state.generation.load(Ordering::SeqCst) {
+                        0 => "You are the mock-served agent. Follow the served instruction.".to_string(),
+                        g => format!("You are the mock-served agent, restarted {g} time(s). Follow the served instruction."),
+                    };
+                    match state.edition.load(Ordering::SeqCst) {
+                        0 => text,
+                        e => format!("{text} Edition {e}."),
+                    }
                 }),
                 _ => ("text/plain", "the watched resource changed".to_string()),
             };
@@ -874,6 +888,13 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
         // A restart: every session issued so far is forgotten, and the
         // subscriptions with them — nothing is pushed until a client
         // subscribes again on a new session.
+        // The publisher edits the instruction; nothing is pushed — a test
+        // says how the consumer hears of it.
+        Some("mock.publish") => {
+            let edition = state.edition.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!("MOCK_PUBLISH {edition}");
+            tool_ok(req.id, json!({"ok": true, "edition": edition}))
+        }
         Some("mock.restart") => {
             state.pending_emit.store(false, Ordering::SeqCst);
             if let Some(sub) = args.get("subscribe").and_then(serde_json::Value::as_bool) {

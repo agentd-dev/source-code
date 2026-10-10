@@ -1005,6 +1005,15 @@ merged:
 
 **What stays out of v1.** A document or template declaring a grant (Q10 still open). Runtime subscriptions in subagent children. A runtime choice of mode, stream, rate or retention.
 
+### 5.16 The instruction follows its own updates (decided 2026-10-10, implemented)
+
+The user asked that a served instruction listen to MCP Events where its server supports them, and chose (over documents declaring bindings) **instruction updates by Events**: the instruction's own server says it changed, and agentd reads it again.
+
+- **Configuration.** `agent.instruction.mcp: {server, resource, events}`, operator-only like the rest of `agent.instruction`. Each entry is an event type as the server's `events/list` names it, or `{name, arguments}`. No registry type is assumed: the instruction.md registry has domain events (`instruction.ref.changed`, `instruction.version.revoked`) but serves no `events/*` yet, so the operator names what its registry offers.
+- **A third owner.** Each entry is a binding owned by `Owner::Instruction`, on the server that served the instruction while it is the running one (§5.15's ownership, beside `Config` and the runtime holds). Its shape is fixed: poll only (a webhook needs a credential and a route checked against a server, and `mcp: {resource}` without a server is answered by whichever serves it), `replay: none` (a start reads the instruction afresh, so nothing before it is worth catching up on), no `rate`, and no stream.
+- **The sink.** An occurrence is checked and deduplicated like any other, then sets the re-read; the loop reads the instruction again at most once a second (`instruction.event`), through the same path a `resources/updated` notification takes, so `instruction.updated` and `wake_on: [instruction_updated]` follow from it. A binding the config or a grant holds with the same identity is one subscription: its occurrences land in that stream as before, and the instruction is read again too. When the other holders go, the binding falls back to the instruction's shape at the next sync.
+- **Never instead of the other ways.** A server that does not list the type, or declares no Events, refuses the binding (§5.13) and the instruction is still followed by its resource subscription and its refresh timer. The §7.7 freshness deadline is unchanged.
+
 ### 5.14 Runtime flow
 
 ```mermaid

@@ -737,6 +737,21 @@ An edited `into` moves the waits on it to the new stream, from its head.
 Every runtime subscribe and unsubscribe is logged (`mcp.events.subscribed`
 / `.unsubscribed`, with its `owner`) and audited.
 
+**The instruction follows its own updates.** A served instruction
+(`agent.instruction.mcp: {server, resource, events}`) may name event types of
+the server that serves it whose occurrences mean it may have changed — a
+registry's `instruction.ref.changed`, say. Each is a poll binding on that
+server that lands in no stream: an occurrence reads the instruction again
+(`instruction.event`, then `instruction.loaded`, and `instruction.updated`
+when the text changed), a burst of them one read, at most one a second. It
+starts from "now" and keeps no cursor across a restart, since a start reads
+the instruction afresh. A binding the operator declared with the same type
+and arguments is the same subscription, both kept. It adds to the
+`resources/updated` subscription and the refresh timer and replaces neither:
+a server that does not list the type, or has no Events, refuses it as any
+binding is refused, and the instruction is followed the other ways
+([configuration §5a.1](configuration.md)).
+
 ## Who implements the protocol
 
 Outbound MCP is [`rmcp`](https://crates.io/crates/rmcp), the official Rust SDK

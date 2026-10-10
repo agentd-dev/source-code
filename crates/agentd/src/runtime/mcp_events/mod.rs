@@ -46,6 +46,9 @@ const BACKOFF_MAX_MS: u64 = 5 * 60 * 1000;
 const EXHAUSTED_MAX_MS: u64 = 15 * 60 * 1000;
 /// How long one `events/*` request may take.
 const REQUEST_BOUND: Duration = Duration::from_secs(30);
+/// The least time between two reads of the instruction its occurrences
+/// bring: a burst of them is one read.
+const REREAD_FLOOR_MS: u64 = 1_000;
 
 /// Where a binding is (§5.14).
 #[derive(Debug, Clone, PartialEq)]
@@ -88,9 +91,18 @@ pub(crate) enum Owner {
         run: Option<String>,
         expires_at: u64,
     },
+    /// The operator's `agent.instruction.mcp.events`: an occurrence re-reads
+    /// the instruction rather than landing in a stream.
+    Instruction,
 }
 
 impl Owner {
+    /// Held at runtime, inside a grant — a wait or a tool call — rather than
+    /// by what the settings declare.
+    fn is_runtime(&self) -> bool {
+        matches!(self, Owner::Wait { .. } | Owner::Tool { .. })
+    }
+
     /// The same holder: a tool caller's context holds a subscription once,
     /// however often it renews it; any other owner is itself.
     fn same_holder(&self, other: &Owner) -> bool {
@@ -108,6 +120,7 @@ impl Owner {
             Owner::Tool { context, run, .. } => {
                 json!({"kind": "tool", "context": context, "run": run})
             }
+            Owner::Instruction => json!({"kind": "instruction"}),
         }
     }
 }
@@ -156,7 +169,9 @@ pub(crate) struct Binding {
     pub(crate) name: String,
     pub(crate) arguments: Map<String, Value>,
     delivery: Vec<Delivery>,
-    into: EventInto,
+    /// The stream its occurrences land in; none when only the instruction
+    /// follows it.
+    into: Option<EventInto>,
     replay: Replay,
     /// The intake ceiling: `(burst, window seconds)`, and what is left of it.
     rate: Option<(u32, f64)>,
@@ -214,7 +229,7 @@ pub(crate) struct Binding {
 #[derive(Clone)]
 struct Shape {
     delivery: Vec<Delivery>,
-    into: EventInto,
+    into: Option<EventInto>,
     replay: Replay,
     rate: Option<(u32, f64)>,
     ttl_ms: u64,
@@ -224,7 +239,7 @@ impl Shape {
     fn of_binding(b: &crate::config::settings::events::EventBinding) -> Shape {
         Shape {
             delivery: b.delivery.clone(),
-            into: b.into.clone(),
+            into: Some(b.into.clone()),
             replay: b.replay,
             rate: b
                 .rate
@@ -240,7 +255,7 @@ impl Shape {
     fn of_grant(g: &crate::config::settings::events::EventGrant) -> Shape {
         Shape {
             delivery: g.delivery.clone(),
-            into: g.into.clone(),
+            into: Some(g.into.clone()),
             replay: g.replay,
             rate: g
                 .rate
@@ -250,6 +265,19 @@ impl Shape {
                 .ttl
                 .as_ref()
                 .map_or(hook::DEFAULT_TTL_MS, |d| d.0.as_millis() as u64),
+        }
+    }
+
+    /// What following the instruction asks: polled, kept nowhere, from
+    /// "now" — the instruction is read afresh at every start, so nothing
+    /// before it is worth catching up on.
+    fn of_instruction() -> Shape {
+        Shape {
+            delivery: vec![Delivery::Poll],
+            into: None,
+            replay: Replay::None,
+            rate: None,
+            ttl_ms: hook::DEFAULT_TTL_MS,
         }
     }
 }
@@ -377,6 +405,12 @@ pub(crate) struct Events {
     swept_at: u64,
     /// The webhook bindings' routes, shared with the webhook listener.
     pub(crate) hooks: hook::Routes,
+    /// An occurrence of an event type the instruction follows came in, and
+    /// the instruction is to be read again: `(server, event type)` of the
+    /// latest.
+    reread: Option<(String, String)>,
+    /// When the instruction was last read again for one.
+    reread_at: u64,
 }
 
 impl Events {
@@ -481,9 +515,9 @@ impl Runtime {
                 // The same subscription: what changed applies in place.
                 Some(live) => {
                     live.owners.insert(Owner::Config);
-                    let was = (live.into.stream.clone(), live.into.subject.clone());
+                    let was = live.into.clone();
                     live.apply(Shape::of_binding(&b));
-                    if was != (live.into.stream.clone(), live.into.subject.clone()) {
+                    if was.is_some() && was != live.into {
                         config_moved.push(key.clone());
                     }
                 }
@@ -518,7 +552,7 @@ impl Runtime {
             let runtime: Vec<Owner> = b
                 .owners
                 .iter()
-                .filter(|o| !matches!(o, Owner::Config))
+                .filter(|o| o.is_runtime())
                 .cloned()
                 .collect();
             if runtime.is_empty() {
@@ -564,9 +598,9 @@ impl Runtime {
                 }
             }
             if !b.owners.contains(&Owner::Config) {
-                let was = (b.into.stream.clone(), b.into.subject.clone());
+                let was = b.into.clone();
                 b.apply(Shape::of_grant(g));
-                if was != (b.into.stream.clone(), b.into.subject.clone()) {
+                if was.is_some() && was != b.into {
                     moved.push(b.key.clone());
                 }
             }
@@ -583,6 +617,7 @@ impl Runtime {
         for key in moved.into_iter().chain(config_moved) {
             self.events_follow_stream(&key);
         }
+        self.events_follow_instruction(now);
         self.events_enforce_caps();
         if reason == "boot" {
             self.events_reconcile_waits();
@@ -675,6 +710,73 @@ impl Runtime {
         }
     }
 
+    /// The instruction's own event types (`agent.instruction.mcp.events`),
+    /// held on the server that served it while it is the running
+    /// instruction. A binding the config or a grant holds already is
+    /// followed as it is; one only the instruction holds is polled and kept
+    /// in no stream.
+    fn events_follow_instruction(&mut self, now: u64) {
+        let mut wanted = std::collections::BTreeSet::new();
+        let source = self.settings.agent.instruction_spec.mcp.clone();
+        if let Some(m) = &source
+            && self.instruction.source == "resource"
+            && self.instruction.uri.as_deref() == Some(m.resource())
+            && let Some(server) = self.instruction.server.clone()
+        {
+            for e in m.events() {
+                let key = bridge::binding_hash(&server, &e.name, &e.arguments);
+                wanted.insert(key.clone());
+                self.mcp_events
+                    .bindings
+                    .entry(key.clone())
+                    .or_insert_with(|| {
+                        Binding::new(
+                            key,
+                            &server,
+                            &e.name,
+                            e.arguments.clone(),
+                            Shape::of_instruction(),
+                            now,
+                        )
+                    })
+                    .owners
+                    .insert(Owner::Instruction);
+            }
+        }
+        for b in self.mcp_events.bindings.values_mut() {
+            if !wanted.contains(&b.key) {
+                b.owners.remove(&Owner::Instruction);
+            }
+            // The config's and the grants' holds are gone: what is left
+            // lands nowhere.
+            if b.into.is_some() && b.owners.iter().all(|o| *o == Owner::Instruction) {
+                b.apply(Shape::of_instruction());
+            }
+        }
+    }
+
+    /// Read the instruction again for the occurrences that came in, at most
+    /// once per [`REREAD_FLOOR_MS`]; what is new is `instruction.updated`.
+    fn events_reread_instruction(&mut self, now: u64) {
+        if now < self.mcp_events.reread_at.saturating_add(REREAD_FLOOR_MS) {
+            return;
+        }
+        let Some((server, event)) = self.mcp_events.reread.take() else {
+            return;
+        };
+        self.mcp_events.reread_at = now;
+        self.log.info(
+            "instruction.event",
+            json!({"server": server, "event_type": event}),
+        );
+        if let Err(e) = self.reread_instruction() {
+            self.log.warn(
+                "instruction.reread.fail",
+                json!({"server": server, "uri": self.instruction.uri, "reason": "event", "err": e}),
+            );
+        }
+    }
+
     /// Every pass of the loop: list what needs listing, poll what is due.
     pub(crate) fn events_tick(&mut self) {
         if self.mcp_events.pool.is_none() {
@@ -685,6 +787,7 @@ impl Runtime {
         self.events_list_due(now);
         self.events_poll_due(now);
         self.events_hook_due(now);
+        self.events_reread_instruction(now);
         let mut active: BTreeMap<String, u64> = BTreeMap::new();
         for b in self.mcp_events.bindings.values() {
             if b.state == State::Active
@@ -1328,12 +1431,14 @@ impl Runtime {
         let Some(b) = self.mcp_events.bindings.get(key) else {
             return Taken::Rejected("malformed");
         };
-        let (server, name, stream, subject) = (
-            b.server.clone(),
-            b.name.clone(),
-            b.into.stream.clone(),
-            b.into.subject.clone(),
-        );
+        let (server, name) = (b.server.clone(), b.name.clone());
+        let follows = b.owners.contains(&Owner::Instruction);
+        // Where it lands: the stream of whatever else holds it — none when
+        // only the instruction does.
+        let into = b
+            .into
+            .clone()
+            .filter(|_| b.owners.iter().any(|o| *o != Owner::Instruction));
         let max_value_bytes = self.settings.store.max_value_bytes.map(|n| n as usize);
         let checked = bridge::check(
             &server,
@@ -1370,6 +1475,19 @@ impl Runtime {
             return Taken::Rate;
         }
         let occurred_at = data["occurred_at"].as_str().and_then(bridge::timestamp_ms);
+        if follows {
+            self.mcp_events.reread = Some((server.clone(), name.clone()));
+        }
+        let Some(EventInto { stream, subject }) = into else {
+            // Followed, kept nowhere: the instruction's read is what it
+            // brings.
+            crate::obs::metrics::record_mcp_event(&server, &name, mode, "followed");
+            if let Some(b) = self.mcp_events.bindings.get_mut(key) {
+                let evicted = b.seen.insert(seen_key, now);
+                crate::obs::metrics::record_mcp_events_dedup_evicted(&server, &name, evicted);
+            }
+            return Taken::Appended;
+        };
         match self.append(&stream, &subject, None, data, &id, &bridge::source(&server)) {
             Ok(_) => {
                 crate::obs::metrics::record_mcp_event(
@@ -1586,7 +1704,7 @@ impl Runtime {
         // expired tool hold kept is free for this one.
         self.mcp_events.swept_at = 0;
         self.events_sweep_owners(now_ms());
-        let held = |b: &Binding| b.owners.iter().any(|o| !matches!(o, Owner::Config));
+        let held = |b: &Binding| b.owners.iter().any(Owner::is_runtime);
         let existing = self.mcp_events.bindings.get(&key);
         if existing.is_none_or(|b| !held(b)) {
             let live = self
@@ -1631,10 +1749,16 @@ impl Runtime {
             b.owners.remove(p);
         }
         b.owners.insert(owner.clone());
+        // Joining one only the instruction follows: its occurrences land in
+        // the grant's stream from now on.
+        if b.into.is_none() {
+            b.apply(Shape::of_grant(&grant));
+        }
+        let into = b.into.clone().unwrap_or_else(|| grant.into.clone());
         let out = Subscribed {
             key: key.clone(),
-            stream: b.into.stream.clone(),
-            subject: b.into.subject.clone(),
+            stream: into.stream,
+            subject: into.subject,
         };
         if prior.is_none() {
             self.events_said("mcp.events.subscribed", &key, &owner, "subscribed");
@@ -1740,11 +1864,7 @@ impl Runtime {
             .bindings
             .values()
             .filter_map(|b| {
-                let owners: Vec<&Owner> = b
-                    .owners
-                    .iter()
-                    .filter(|o| !matches!(o, Owner::Config))
-                    .collect();
+                let owners: Vec<&Owner> = b.owners.iter().filter(|o| o.is_runtime()).collect();
                 (!owners.is_empty()).then(|| {
                     json!({"key": b.key, "server": b.server, "name": b.name,
                            "arguments": b.arguments, "owners": owners})
@@ -1846,7 +1966,7 @@ impl Runtime {
         for b in self.mcp_events.bindings.values() {
             for o in &b.owners {
                 let why = match o {
-                    Owner::Config => None,
+                    Owner::Config | Owner::Instruction => None,
                     Owner::Wait { run, step } => {
                         (!waiting.contains(&(run.clone(), step.clone(), b.key.clone())))
                             .then_some("wait_left")
@@ -1939,10 +2059,15 @@ impl Runtime {
     /// binding's `into` was edited): they wait on the new one, from its head
     /// now.
     fn events_follow_stream(&mut self, key: &str) {
-        let Some(b) = self.mcp_events.bindings.get(key) else {
+        let Some(EventInto { stream, subject }) = self
+            .mcp_events
+            .bindings
+            .get(key)
+            .and_then(|b| b.into.clone())
+        else {
             return;
         };
-        let (stream, subject) = (b.into.stream.clone(), b.into.subject.clone());
+        let b = &self.mcp_events.bindings[key];
         let waits: Vec<(String, String)> = b
             .owners
             .iter()
@@ -1991,13 +2116,13 @@ impl Runtime {
             .mcp_events
             .bindings
             .values()
-            .filter(|b| b.owners.iter().any(|o| !matches!(o, Owner::Config)))
+            .filter(|b| b.owners.iter().any(Owner::is_runtime))
             .map(|b| {
                 (
                     b.key.clone(),
                     b.server.clone(),
                     b.name.clone(),
-                    b.owners.contains(&Owner::Config),
+                    b.owners.iter().any(|o| !o.is_runtime()),
                 )
             })
             .collect();
@@ -2030,7 +2155,7 @@ impl Runtime {
                 .map(|b| {
                     b.owners
                         .iter()
-                        .filter(|o| !matches!(o, Owner::Config))
+                        .filter(|o| o.is_runtime())
                         .cloned()
                         .collect()
                 })
@@ -2231,8 +2356,10 @@ impl Runtime {
                                 ..
                             } if *c == context => Some(json!({
                                 "subscription": b.key, "server": b.server, "event": b.name,
-                                "arguments": b.arguments, "stream": b.into.stream,
-                                "subject": b.into.subject, "expires_at": expires_at,
+                                "arguments": b.arguments,
+                                "stream": b.into.as_ref().map(|i| &i.stream),
+                                "subject": b.into.as_ref().map(|i| &i.subject),
+                                "expires_at": expires_at,
                                 "state": b.state.name(),
                             })),
                             _ => None,

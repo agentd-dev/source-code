@@ -145,6 +145,16 @@ tracks a draft.
 - agentd-mcp: `RawHandler::body_limit` — a per-path body cap, answered `413`
   on the declared `Content-Length`, the body never buffered (an over-long
   body was dropped without an answer).
+- A served instruction follows its updates by MCP Events:
+  `agent.instruction.mcp: {server, resource, events: [...]}` names event
+  types of the instruction's server (`instruction.ref.changed`, or `{name,
+  arguments}`), each polled for on the server that served it, and an
+  occurrence reads the instruction again — a burst of them one read, at most
+  one a second (`instruction.event`). They land in no stream; a binding the
+  operator declared with the same type and arguments is shared, both kept.
+  Beside the `resources/updated` subscription and the refresh timer, never
+  instead of them: a server without the type or without Events refuses it
+  in `mcp.events.refused`, and the instruction is followed the other ways.
 
 ### MCP 2026-07-28 (RFC 0045 P1)
 

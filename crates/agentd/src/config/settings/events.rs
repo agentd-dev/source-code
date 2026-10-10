@@ -131,6 +131,47 @@ fn default_max() -> u32 {
     8
 }
 
+/// An event type the instruction's own server offers whose occurrences say
+/// the instruction may have changed (`agent.instruction.mcp.events`): each
+/// is polled for, and an occurrence re-reads the instruction — beside the
+/// resource subscription and the `refresh` timer, never instead of them.
+/// The type's name alone, or `{name, arguments}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstructionEvent {
+    /// The event type, exactly as the server's `events/list` names it.
+    pub name: String,
+    /// The subscription arguments: part of the binding's identity.
+    pub arguments: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for InstructionEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            name: String,
+            #[serde(default)]
+            arguments: Map<String, Value>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Full(Full),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Name(name) => InstructionEvent {
+                name,
+                arguments: Map::new(),
+            },
+            Raw::Full(f) => InstructionEvent {
+                name: f.name,
+                arguments: f.arguments,
+            },
+        })
+    }
+}
+
 /// Bindings one server may declare.
 pub const MAX_BINDINGS_PER_SERVER: usize = 64;
 /// Subscriptions one instance holds: static bindings and live runtime
@@ -376,8 +417,44 @@ pub(crate) fn subscribe_refusals(s: &Settings, w: &crate::engine::model::Workflo
     out
 }
 
+/// `agent.instruction.mcp.events`: each a named type, listed once. Polled
+/// only — a webhook needs a credential and a route checked against a server,
+/// and an instruction that names none is served by whichever answers; one
+/// re-read a second is all an occurrence can bring sooner anyway.
+fn check_instruction(s: &Settings, d: &mut Diagnostics) {
+    let events = s
+        .agent
+        .instruction_spec
+        .mcp
+        .as_ref()
+        .map_or(&[][..], |m| m.events());
+    if events.is_empty() {
+        return;
+    }
+    if !cfg!(feature = "mcp-events") {
+        d.errors.push(
+            "agent.instruction.mcp.events: following the instruction by MCP Events requires building with --features mcp-events"
+                .into(),
+        );
+        return;
+    }
+    for (i, e) in events.iter().enumerate() {
+        if e.name.trim().is_empty() {
+            d.errors.push(format!(
+                "agent.instruction.mcp.events[{i}]: an event type needs a name"
+            ));
+        } else if events[..i].contains(e) {
+            d.errors.push(format!(
+                "agent.instruction.mcp.events[{}]: listed twice with the same arguments",
+                e.name
+            ));
+        }
+    }
+}
+
 /// Every MCP Events check, collected into `d` (RFC 0045 §5.2, §5.15).
 pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
+    check_instruction(s, d);
     let declared: Vec<&super::McpServer> = s
         .mcp
         .servers

@@ -762,6 +762,31 @@ name a server nests one URI inside another:
     mcp: { server: gateway, resource: "instruction://ins_1@stable" }  # that server
 ```
 
+The pair also takes `events:` — the [MCP Events](mcp-events.md) types the
+instruction's server offers whose occurrences mean it may have changed. Each
+is polled for on the server that served the instruction, and an occurrence
+reads it again (a burst is one read, at most one a second); occurrences land
+in no stream. It is how a registry that speaks Events but holds no
+`resources/subscribe` stream open — a stateless deployment — tells agentd of
+an edit, sooner than the refresh timer would:
+
+```yaml
+    mcp:
+      server: registry
+      resource: "instruction://acme/support@stable"
+      events:
+        - instruction.ref.changed                                  # the type, as events/list names it
+        - { name: instruction.version.revoked, arguments: { ref: stable } }
+```
+
+They come beside the resource subscription and the refresh timer, never
+instead of them. A server that does not list a type, or offers no Events at
+all, refuses it once in `mcp.events.refused` with the reason, and the
+instruction is followed the other ways. A binding under `mcp.servers[].events`
+with the same type and arguments is one subscription: its occurrences land in
+its stream and the instruction is read again too. Requires the `mcp-events`
+feature.
+
 The two spellings compose on the command line — `--instruction ./agent.md
 --instruction.refresh 30s` keeps both, in either order.
 
@@ -864,7 +889,7 @@ is only ever right for one of them:
 | a **directory** | watches the folder *and* its documents, likewise — a new file appearing counts |
 | `oci://…@sha256:` | **nothing** — a digest pin is immutable, so re-reading can only return what it already returned |
 | `oci://…:tag` | polls every 5m — a mutable tag is the one case polling is for |
-| `mcp://`, `instruction://` | the server's `resources/updated` notification, polling every 5m as a fallback |
+| `mcp://`, `instruction://` | the server's `resources/updated` notification (and the `events:` it names, §5a.1), polling every 5m as a fallback |
 | **text** | nothing to re-read |
 
 A duration (`refresh: 30s`) overrides it; `off` disables re-reading entirely.

@@ -1037,3 +1037,135 @@ fn the_events_tools_exist_only_where_a_grant_offers_them() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&log);
 }
+
+/// A daemon whose instruction is `mock://instruction` on `mock`, following
+/// the event types in `events`, with no other way to hear of an edit: the
+/// mock pushes nothing (`--no-emit`) and `refresh` is off. `extra` goes under
+/// the server; a stream start keeps the daemon up.
+fn follows_config(endpoint: &str, events: &str, extra: &str) -> String {
+    format!(
+        "agent:\n  name: follows\n  instruction:\n    mcp:\n      server: mock\n      resource: \"mock://instruction\"\n      events: {events}\n    refresh: \"off\"\nstore:\n  kind: memory\nstreams:\n  ticks: {{}}\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\n      tags: {{\"*\": [sensitive]}}\n{extra}workflows:\n  - name: on_tick\n    steps:\n      s: {{kind: stream, stream: ticks, subject: tick, inputs: {{n: \"{{{{ payload.data.payload.n }}}}\"}}}}\n      f: {{kind: finish, depends_on: [s], status: completed, output: \"{{{{ inputs.n }}}}\"}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n  log_content: true\n"
+    )
+}
+
+/// The reads of `mock://instruction` that reached the mock.
+fn instruction_reads(mock: &common::MockMcp) -> usize {
+    mock.log()
+        .lines()
+        .filter(|l| *l == "MOCK_READ mock://instruction")
+        .count()
+}
+
+/// An edit nobody pushes is read when the instruction's server says, by an
+/// MCP Events occurrence, that it changed: a page of three is one read, the
+/// occurrences land in no stream, and the binding is on the server that
+/// served the instruction.
+#[test]
+fn the_instruction_is_read_again_when_its_server_says_it_changed() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-instruction",
+        &follows_config(
+            &mock.uri(),
+            "[{name: mock.tick, arguments: {topic: instruction}}]",
+            "",
+        ),
+    );
+    ready(&daemon, &mock, "mock.tick");
+    let first = events(&daemon.log(), "instruction.loaded")[0].clone();
+    assert_eq!(first["server"], "mock");
+    let before = instruction_reads(&mock);
+    mock.control("mock.publish", json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        instruction_reads(&mock),
+        before,
+        "an edit nobody announced is not read"
+    );
+    mock.control("mock.event", json!({"topic": "instruction", "count": 3}));
+    daemon.wait_for("the instruction read again", |l| {
+        !events(l, "instruction.updated").is_empty()
+    });
+    // Past the floor, so a second read would have shown.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let log = daemon.log();
+    let updated = events(&log, "instruction.updated");
+    assert_eq!(updated.len(), 1, "{log}");
+    assert_eq!(
+        updated[0]["version"],
+        first["version"].as_u64().unwrap() + 1
+    );
+    let said = events(&log, "instruction.event");
+    assert_eq!(said.len(), 1, "three occurrences, one read:\n{log}");
+    assert_eq!(said[0]["server"], "mock");
+    assert_eq!(said[0]["event_type"], "mock.tick");
+    assert_eq!(instruction_reads(&mock), before + 1, "{}", mock.log());
+    assert!(ticks(&log).is_empty(), "nothing lands in a stream:\n{log}");
+    let armed = events(&log, "mcp.events.armed");
+    assert!(armed.iter().all(|e| e["server"] == "mock"), "{log}");
+    let polled = polls(&mock);
+    assert!(
+        polled
+            .iter()
+            .all(|p| p["arguments"] == json!({"topic": "instruction"})),
+        "{polled:?}"
+    );
+}
+
+/// A binding the operator declared with the same identity is shared: each
+/// occurrence lands in its stream and starts its run, and the instruction is
+/// read again too.
+#[test]
+fn a_binding_the_operator_declared_is_shared_with_the_instruction() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-instruction-shared",
+        &follows_config(
+            &mock.uri(),
+            "[{name: mock.tick, arguments: {topic: t1}}]",
+            &format!("      events:\n{}", tick_binding("")),
+        ),
+    );
+    ready(&daemon, &mock, "mock.tick");
+    mock.control("mock.publish", json!({}));
+    mock.control("mock.event", json!({"topic": "t1", "count": 2}));
+    daemon.wait_for("both runs and the read", |l| {
+        ticks(l).len() == 2 && !events(l, "instruction.updated").is_empty()
+    });
+    let log = daemon.log();
+    let mut got: Vec<String> = ticks(&log).iter().map(|v| v.to_string()).collect();
+    got.sort();
+    assert_eq!(got, ["1", "2"], "{log}");
+    assert_eq!(events(&log, "instruction.updated").len(), 1, "{log}");
+    // One subscription, polled once per interval — not one per holder.
+    let armed = events(&log, "mcp.events.armed");
+    assert_eq!(armed.len(), 1, "{log}");
+}
+
+/// A type the instruction's server does not list, and a server without
+/// Events, are each refused with their reason — and the instruction is
+/// served and followed the other ways all the same.
+#[test]
+fn an_event_type_the_server_cannot_honour_is_refused_and_the_instruction_stays() {
+    for (extra, event, reason) in [
+        (&[][..], "mock.nope", "unknown_event"),
+        (&["--events", "none"][..], "mock.tick", "no_capability"),
+    ] {
+        let mock = common::spawn_mock_mcp_with(REVISION, "mock://res", false, extra);
+        let daemon = Daemon::start(
+            "events-instruction-refused",
+            &follows_config(&mock.uri(), &format!("[{event}]"), ""),
+        );
+        daemon.wait_for("the refusal", |l| {
+            events(l, "mcp.events.refused")
+                .iter()
+                .any(|e| e["event_type"] == event)
+        });
+        let log = daemon.log();
+        let refused = events(&log, "mcp.events.refused");
+        assert_eq!(refused[0]["reason"], reason, "{log}");
+        assert_eq!(refused[0]["server"], "mock", "{log}");
+        assert_eq!(events(&log, "instruction.loaded").len(), 1, "{log}");
+        assert!(polls(&mock).is_empty(), "{}", mock.log());
+    }
+}

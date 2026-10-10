@@ -676,15 +676,35 @@ impl<'de> Deserialize<'de> for OciSource {
 pub enum McpResource {
     /// `mcp: "instruction://…"` — any connected server that serves it.
     Uri(String),
-    /// `mcp: { server: …, resource: … }` — that server, that resource.
+    /// `mcp: { server: …, resource: … }` — that server, that resource; and
+    /// the MCP Events types whose occurrences re-read it, where that server
+    /// offers them.
     Named {
         #[serde(default)]
         server: Option<String>,
         resource: String,
+        #[serde(default)]
+        events: Vec<events::InstructionEvent>,
     },
 }
 
 impl McpResource {
+    /// The resource URI, without the server.
+    pub fn resource(&self) -> &str {
+        match self {
+            McpResource::Uri(u) => u,
+            McpResource::Named { resource, .. } => resource,
+        }
+    }
+
+    /// The event types whose occurrences re-read the instruction.
+    pub fn events(&self) -> &[events::InstructionEvent] {
+        match self {
+            McpResource::Uri(_) => &[],
+            McpResource::Named { events, .. } => events,
+        }
+    }
+
     /// The single `agent.instruction` scalar this resolves to. A named server
     /// becomes the `mcp://<server>/<resource>` form the runtime already
     /// routes on, so the config shape stays pleasant without the resolver
@@ -695,10 +715,12 @@ impl McpResource {
             McpResource::Named {
                 server: None,
                 resource,
+                ..
             } => resource.clone(),
             McpResource::Named {
                 server: Some(s),
                 resource,
+                ..
             } => format!("mcp://{s}/{resource}"),
         }
     }
@@ -9973,7 +9995,8 @@ mod tests {
         assert_eq!(
             spec(McpResource::Named {
                 server: None,
-                resource: "instruction://ins_1".into()
+                resource: "instruction://ins_1".into(),
+                events: vec![],
             })
             .source_value()
             .unwrap()
@@ -9987,6 +10010,7 @@ mod tests {
             spec(McpResource::Named {
                 server: Some("gateway".into()),
                 resource: "instruction://ins_1@stable".into(),
+                events: vec![],
             })
             .source_value()
             .unwrap()
@@ -13283,6 +13307,47 @@ mod tests {
             e.contains("require building with --features mcp-events"),
             "{e}"
         );
+    }
+
+    /// `agent.instruction.mcp.events`: each type by its name alone or with
+    /// its arguments; one listed twice is refused, and a build without the
+    /// feature refuses them all by name.
+    #[test]
+    fn the_instruction_follows_the_event_types_its_source_names() {
+        let doc = |events: &str| {
+            events_doc(&format!(
+                "agent:\n  instruction:\n    mcp:\n      server: pd\n      resource: \"instruction://ins_1@stable\"\n      events: {events}\n"
+            ))
+        };
+        let both = "[instruction.ref.changed, {name: instruction.version.revoked, arguments: {ref: stable}}]";
+        #[cfg(not(feature = "mcp-events"))]
+        {
+            let e = load_doc(&doc(both)).unwrap_err().to_string();
+            assert!(
+                e.contains("agent.instruction.mcp.events") && e.contains("--features mcp-events"),
+                "{e}"
+            );
+        }
+        #[cfg(feature = "mcp-events")]
+        {
+            let l = load_doc(&doc(both)).unwrap();
+            let events = l
+                .settings
+                .agent
+                .instruction_spec
+                .mcp
+                .as_ref()
+                .unwrap()
+                .events();
+            assert_eq!(events[0].name, "instruction.ref.changed");
+            assert!(events[0].arguments.is_empty());
+            assert_eq!(events[1].name, "instruction.version.revoked");
+            assert_eq!(events[1].arguments["ref"], "stable");
+            assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+            let e = load_doc(&doc("[a, {name: a}]")).unwrap_err().to_string();
+            assert!(e.contains("events[a]: listed twice"), "{e}");
+            assert!(load_doc(&doc("[{name: a, every: 1s}]")).is_err());
+        }
     }
 
     #[test]

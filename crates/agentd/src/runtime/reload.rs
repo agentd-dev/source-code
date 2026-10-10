@@ -848,11 +848,19 @@ impl Runtime {
         {
             self.events_sync("reload", &touched);
             let declared = |s: &cfg::Settings| {
-                s.mcp
+                let servers = s
+                    .mcp
                     .servers
                     .iter()
                     .map(|x| (x.name.clone(), x.events.clone(), x.event_grants.clone()))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let instruction = s
+                    .agent
+                    .instruction_spec
+                    .mcp
+                    .as_ref()
+                    .map(|m| m.events().to_vec());
+                (servers, instruction)
             };
             if declared(old) != declared(&new) {
                 changed.push("mcp.events");

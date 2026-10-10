@@ -113,6 +113,17 @@ pub fn authority_of(endpoint: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Is `v` a JSON-RPC 2.0 error response — the version tag, an integer code
+/// and a string message — rather than some other JSON error a gateway wrote?
+fn is_json_rpc_error(v: &Value) -> bool {
+    let error = v.get("error");
+    v.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && error.and_then(|e| e.get("code")).is_some_and(Value::is_i64)
+        && error
+            .and_then(|e| e.get("message"))
+            .is_some_and(Value::is_string)
+}
+
 /// A way to hang up one exchange from outside the thread that blocks on it.
 ///
 /// The send reads its answer on a blocking socket, and the only thing that
@@ -546,9 +557,15 @@ impl HttpTransport {
         )
         .map_err(HttpError::Http)?;
 
-        // Adopt a server-assigned session id — from the `initialize` answer
-        // only, see the struct doc.
-        if let (true, Some(sid)) = (opens_session, resp.header("mcp-session-id")) {
+        // Adopt a server-assigned session id — from an `initialize` answer
+        // that succeeded only, see the struct doc. A refused `initialize` (a
+        // version the server does not speak, an auth challenge) opened
+        // nothing, so its retry or fallback must not carry what it stamped.
+        if let (true, true, Some(sid)) = (
+            opens_session,
+            resp.is_success(),
+            resp.header("mcp-session-id"),
+        ) {
             *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
 
@@ -590,7 +607,10 @@ impl HttpTransport {
             // caller acts on, and the message is what an operator needs, where
             // the status alone says only "HTTP 400". An auth failure never is:
             // whatever its body says, `401`/`403` is the signal the credential
-            // machinery and the operator act on.
+            // machinery and the operator act on. Only a JSON-RPC error counts:
+            // a gateway's own JSON error (`{"error": {"code": 503, …}}`, with
+            // no `jsonrpc`) is not one, and its status is what the operator
+            // needs to see.
             let answerable = request_id.is_some()
                 && !matches!(status, 401 | 403)
                 && resp
@@ -599,9 +619,7 @@ impl HttpTransport {
             if answerable
                 && let Ok(bytes) = resp.into_body()
                 && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
-                && v.get("error")
-                    .and_then(|e| e.get("code"))
-                    .is_some_and(|c| c.is_i64())
+                && is_json_rpc_error(&v)
             {
                 return Ok(SendOutcome::Result(Some(v)));
             }

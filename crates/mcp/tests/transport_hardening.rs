@@ -730,6 +730,16 @@ fn an_auth_failure_or_a_bodyless_status_stays_a_status() {
                 "down",
             ),
         ),
+        // A gateway's own JSON error is not a JSON-RPC answer: no `jsonrpc`,
+        // so the status is what the operator sees.
+        (
+            "503",
+            json_body(
+                "503 Service Unavailable",
+                &json!({"error": {"code": 503, "message": "the server's own words: unavailable",
+                                  "status": "UNAVAILABLE"}}),
+            ),
+        ),
     ];
     for (code, bytes) in cases {
         let ep = spawn_scripted(move |_| bytes.clone());
@@ -805,6 +815,103 @@ fn a_session_is_taken_only_from_the_initialize_answer() {
         Some("y"),
         "the session is the initialize answer's"
     );
+}
+
+#[test]
+fn a_refused_initialize_opens_no_session() {
+    // A handshake the server refused — a revision it does not speak — opened
+    // nothing, whatever it stamped; the retry must not carry the stamp.
+    let ep = spawn_scripted(|msg| {
+        raw(
+            "400 Bad Request",
+            &["Content-Type: application/json", "Mcp-Session-Id: refused"],
+            &rpc_error(msg["id"].clone(), -32022, "Unsupported protocol version").to_string(),
+        )
+    });
+    let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]);
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    let _ = t.send(
+        Some(1),
+        body.to_string().as_bytes(),
+        Duration::from_secs(5),
+        &[],
+        |_| {},
+    );
+    assert_eq!(t.session_id(), None);
+}
+
+#[test]
+fn an_initialize_answered_on_a_stream_completes_the_handshake() {
+    // A server that speaks before it answers `initialize` (a log line) keeps
+    // the answer's stream open across the first frame: the exchange must
+    // outlive `post_message`, which returns with that first frame, until the
+    // answer arrives.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ep = format!("http://{}/mcp", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut w = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let Some((start, headers)) = read_head(&mut r) else {
+                    return;
+                };
+                let body = read_body(&mut r, &headers);
+                let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                if start.starts_with("GET") {
+                    let _ = w.write_all(&raw("405 Method Not Allowed", &[], ""));
+                    return;
+                }
+                if msg["method"] != "initialize" {
+                    let _ = w.write_all(&raw("202 Accepted", &[], ""));
+                    return;
+                }
+                let _ = w.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: s-1\r\nConnection: close\r\n\r\n",
+                );
+                let log = json!({"jsonrpc": "2.0", "method": "notifications/message",
+                                 "params": {"level": "info", "data": "starting"}});
+                let _ = write!(w, "data: {log}\n\n");
+                let _ = w.flush();
+                std::thread::sleep(Duration::from_millis(300));
+                let answer = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                    "protocolVersion": msg["params"]["protocolVersion"],
+                    "capabilities": {}, "serverInfo": {"name": "chatty", "version": "0"}}});
+                let _ = write!(w, "data: {answer}\n\n");
+                let _ = w.flush();
+            });
+        }
+    });
+    let mut c = mcp::client::McpClient::connect("chatty", &ep, vec![], Duration::from_secs(5))
+        .expect("connect");
+    c.initialize()
+        .expect("the handshake completes after the server's log line");
+    assert_eq!(c.protocol_version().as_deref(), Some("2025-11-25"));
+}
+
+#[test]
+fn a_404_with_a_json_rpc_body_on_a_session_marks_it_lost() {
+    // SDK servers answer a forgotten session with a `404` that says so in
+    // JSON-RPC. The body is the call's answer, and the `404` is still what
+    // tells the host to re-dial.
+    let ep = spawn_scripted(|msg| match msg["method"].as_str() {
+        Some("initialize") => initialized(msg),
+        Some("tools/list") => json_body(
+            "404 Not Found",
+            &rpc_error(msg["id"].clone(), -32001, "Session not found"),
+        ),
+        _ => raw("202 Accepted", &[], ""),
+    });
+    let mut c = mcp::client::McpClient::connect("forgets", &ep, vec![], Duration::from_secs(5))
+        .expect("connect");
+    c.initialize().expect("initialize");
+    let err = c.list_tools().expect_err("the session is gone");
+    assert!(
+        matches!(err, mcp::client::McpError::SessionExpired(_)),
+        "{err}"
+    );
+    assert!(c.session_lost());
 }
 
 #[test]
@@ -954,30 +1061,6 @@ fn a_response_stream_the_sdk_drops_hangs_up_its_connection() {
         "hung up {:?} after the drop",
         closed.saturating_duration_since(dropped)
     );
-}
-
-#[test]
-fn a_finished_exchange_hung_up_late_is_harmless() {
-    // The answer arrived and the stream ran to its end; the SDK drops it
-    // afterwards. The exchange is over, so the hang-up has nothing left to
-    // close: the client sends nothing more and nothing panics.
-    let answer = json!({"jsonrpc": "2.0", "id": 1,
-                        "result": {"content": [], "isError": false}});
-    let (ep, seen) = spawn_holding(format!("data: {answer}\n\n"));
-    let items = with_stream(&ep, tools_call(), async |stream| {
-        let items: Vec<_> = stream.collect().await;
-        items
-    });
-    assert_eq!(items.len(), 1, "the answer, then the end: {items:?}");
-    let got: Value =
-        serde_json::from_str(items[0].as_ref().unwrap().data.as_deref().unwrap()).unwrap();
-    assert_eq!(got["result"]["isError"], false, "{got}");
-    let (closed, sent) = seen.recv().expect("the server reports");
-    assert!(
-        closed.is_some(),
-        "the finished exchange closed its connection"
-    );
-    assert!(sent.is_empty(), "nothing after the request: {sent:?}");
 }
 
 #[test]

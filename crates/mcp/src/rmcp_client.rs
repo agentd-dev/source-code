@@ -543,9 +543,11 @@ impl RmcpClient {
     /// up.** Dropping the SDK's call future drops a request handle that does
     /// nothing when dropped — only a subscription cancels that way — so the
     /// request stays pending in the SDK's worker, which keeps its response
-    /// stream open. The exchange therefore runs on until the server answers
-    /// or the socket's idle bound (this connection's timeout) fires, without
-    /// holding up the calls behind it (see [`crate::rmcp_transport`]). The
+    /// stream open. The exchange therefore runs on until the server answers,
+    /// the socket's idle bound (this connection's timeout) fires, or the
+    /// client is closed (the SDK then aborts its streams, which hangs them
+    /// up), without holding up the calls behind it (see
+    /// [`crate::rmcp_transport`]). The
     /// server is told nothing meanwhile: no `notifications/cancelled` (the
     /// SDK's call helper, which drives the MRTR rounds, does not expose the
     /// request id), and at 2026-07-28 no closed stream either. Without a

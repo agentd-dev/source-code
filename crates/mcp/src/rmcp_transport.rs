@@ -44,7 +44,8 @@
 //! holding a connection and a subscription until the socket's timeout. At
 //! 2025-11-25 a closed stream cancels nothing, and the SDK still sends the
 //! notification. A call its caller merely abandons is NOT hung up: the SDK
-//! keeps that stream until it ends (see `RmcpClient::call_tool`).
+//! keeps that stream until it ends or the client closes (see
+//! `RmcpClient::call_tool`).
 
 use std::collections::HashMap;
 use std::sync::Arc;

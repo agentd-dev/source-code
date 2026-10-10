@@ -2883,6 +2883,17 @@
           },
           "type": "array"
         },
+        "gate_channels": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "description": "the channel a configured workflow's gate is announced on: workflow name → step path → channel. How a subagent template's ::!human channels reach its instance child; an instruction document's own ::!human declarations stand where both name a step. Operator-only.",
+          "type": "object"
+        },
         "instruction": {
           "oneOf": [
             {
@@ -2948,7 +2959,7 @@
                   "type": "string"
                 },
                 "mcp": {
-                  "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked",
+                  "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource, events} when it matters which server is asked or the instruction follows its updates by MCP Events",
                   "oneOf": [
                     {
                       "type": "string"
@@ -2956,6 +2967,36 @@
                     {
                       "additionalProperties": false,
                       "properties": {
+                        "events": {
+                          "description": "MCP Events types the instruction's server offers whose occurrences mean the instruction may have changed: each is polled for, and an occurrence re-reads the instruction (at most once a second), beside the resource subscription and the refresh timer. A server that does not offer one refuses it, said once in mcp.events.refused; the instruction is still followed the other ways. Requires the mcp-events feature.",
+                          "items": {
+                            "oneOf": [
+                              {
+                                "description": "the event type, as the server's events/list names it",
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "arguments": {
+                                    "description": "the subscription arguments, checked against the type's inputSchema",
+                                    "type": "object"
+                                  },
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            ]
+                          },
+                          "type": "array"
+                        },
                         "resource": {
                           "description": "the resource URI, e.g. instruction://ins_1@stable",
                           "type": "string"

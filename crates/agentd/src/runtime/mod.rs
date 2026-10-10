@@ -384,7 +384,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             }
         };
         let per_timeout = s.timeout.map(|d| d.0).unwrap_or(mcp_timeout);
-        match crate::mcp::from_spec(&spec, per_timeout).and_then(|mut c| c.initialize().map(|()| c))
+        match crate::mcp::from_spec(&spec, per_timeout)
+            .map(supervisor_client)
+            .and_then(|mut c| c.initialize().map(|()| c))
         {
             Ok(mut c) => {
                 c.set_tool_meta(crate::mcp::tool_meta(
@@ -2334,6 +2336,8 @@ impl Runtime {
         }
         let mut updated_instruction = false;
         let mut tools_changed = Vec::new();
+        #[cfg(feature = "mcp-events")]
+        let mut events_changed: Vec<String> = Vec::new();
         let mut resource_updates: Vec<(String, String)> = Vec::new();
         for (name, c) in &self.mcp {
             for n in c.drain_notifications() {
@@ -2355,6 +2359,8 @@ impl Runtime {
                     ::mcp::wire::method::NOTIFY_TOOLS_LIST_CHANGED => {
                         tools_changed.push(name.clone())
                     }
+                    #[cfg(feature = "mcp-events")]
+                    mcp_events::wire::method::LIST_CHANGED => events_changed.push(name.clone()),
                     _ => {}
                 }
             }
@@ -2368,6 +2374,10 @@ impl Runtime {
         }
         for s in tools_changed {
             self.log.info("mcp.tools_changed", json!({"server": s, "note": "recorded only; the tool catalogue is rebuilt at the next config reload"}));
+        }
+        #[cfg(feature = "mcp-events")]
+        for s in events_changed {
+            self.events_list_changed(&s);
         }
     }
 
@@ -2629,6 +2639,15 @@ impl Runtime {
                 now_ms() + ::mcp::client::redial_backoff(again.failures).as_millis() as u64;
         }
     }
+}
+
+/// A connection the supervisor holds, as opposed to a worker's: it listens
+/// for what the supervisor alone acts on — an MCP Events server's
+/// `events/list_changed` (RFC 0045 §2.15).
+pub(crate) fn supervisor_client(c: crate::mcp::client::McpClient) -> crate::mcp::client::McpClient {
+    #[cfg(feature = "mcp-events")]
+    let c = c.with_listen_extension(mcp_events::listen_extension());
+    c
 }
 
 /// How often the loop lets go of subscriptions no owner wants

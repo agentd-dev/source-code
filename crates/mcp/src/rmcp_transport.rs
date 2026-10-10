@@ -62,6 +62,19 @@ use sse_stream::{Error as SseError, Sse};
 
 use crate::http::{Hangup, HttpError, HttpTransport};
 
+/// What an extension adds to a connection's `subscriptions/listen`: members
+/// of its filter, and the notifications it delivers on that stream, which go
+/// to the host's notification queue rather than to the SDK. rmcp's filter is
+/// a closed struct, and its subscription ends a listen on any notification
+/// outside it — which would end the listen that carries everything else.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListenExtension {
+    /// Members added to `params.notifications` of every listen.
+    pub members: serde_json::Map<String, Value>,
+    /// Notification methods taken off the listen stream for the host.
+    pub methods: Vec<String>,
+}
+
 /// The SDK's transport, backed by agentd's authenticated HTTP.
 #[derive(Clone)]
 pub struct AgentdHttp {
@@ -93,6 +106,9 @@ pub struct AgentdHttp {
     /// `tools/list` answer goes there directly, so the answer can still come
     /// back whole.
     notifications: Option<Arc<Mutex<Vec<crate::rpc::Notification>>>>,
+    /// An extension's part of every listen (see [`ListenExtension`]), set
+    /// once the server's capabilities are known.
+    listen_extension: Arc<Mutex<Option<ListenExtension>>>,
 }
 
 impl AgentdHttp {
@@ -106,7 +122,20 @@ impl AgentdHttp {
             idle_cuts: Arc::default(),
             tools_seen: Arc::default(),
             notifications: None,
+            listen_extension: Arc::default(),
         }
+    }
+
+    /// Add `extension`'s members to every listen on this connection, and take
+    /// its notifications off the listen stream for the host's queue (which
+    /// [`Self::with_notifications`] names). Read per listen, so it can be set
+    /// once the server's capabilities are known.
+    pub fn with_listen_extension(
+        mut self,
+        extension: Arc<Mutex<Option<ListenExtension>>>,
+    ) -> AgentdHttp {
+        self.listen_extension = extension;
+        self
     }
 
     /// Queue what a server streams ahead of a `tools/list` answer onto
@@ -328,7 +357,7 @@ impl StreamableHttpClient for AgentdHttp {
         auth_header: Option<String>,
         custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let body = serde_json::to_vec(&message)
+        let mut body = serde_json::to_vec(&message)
             .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
         let request_id = request_id_of(&message);
         let (bootstrap, discovers) = match &message {
@@ -351,6 +380,32 @@ impl StreamableHttpClient for AgentdHttp {
             },
             _ => None,
         };
+        // An extension's part of a listen: its filter members in the body, and
+        // its notifications diverted to the host as they arrive.
+        let mut divert: Vec<String> = Vec::new();
+        if listen_idle.is_some()
+            && let Some(ext) = self
+                .listen_extension
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            && self.notifications.is_some()
+        {
+            let mut v: Value = serde_json::from_slice(&body)
+                .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
+            if let Some(filter) = v
+                .pointer_mut("/params/notifications")
+                .and_then(Value::as_object_mut)
+            {
+                filter.extend(ext.members);
+                body = serde_json::to_vec(&v)
+                    .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
+                divert = ext.methods;
+            }
+        }
+        let diverted = (!divert.is_empty())
+            .then(|| self.notifications.clone())
+            .flatten();
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
@@ -394,6 +449,15 @@ impl StreamableHttpClient for AgentdHttp {
                 timeout,
                 &refs,
                 |n| {
+                    if let Some(queue) = &diverted
+                        && let Some(method) = n.get("method").and_then(Value::as_str)
+                        && divert.iter().any(|m| m == method)
+                    {
+                        queue.lock().unwrap_or_else(|e| e.into_inner()).push(
+                            crate::rpc::Notification::new(method, n.get("params").cloned()),
+                        );
+                        return;
+                    }
                     let _ = notes_tx.send(Pumped::Message(n));
                 },
                 &hangup,

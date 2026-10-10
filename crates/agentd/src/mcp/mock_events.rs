@@ -9,7 +9,8 @@
 //!
 //! Control tools (`tools/call`, unlisted): `mock.event {topic, count, id?,
 //! bad_schema?, oversize?, malformed?}` appends occurrences;
-//! `mock.event_trim {topic}` drops everything appended so far and one more
+//! `mock.events_changed {}` lists a third type, `mock.later`, and tells every
+//! listen that asked for `eventsListChanged`; `mock.event_trim {topic}` drops everything appended so far and one more
 //! occurrence the client never read, so its next poll is answered `truncated`; `mock.events_fail {code, data?,
 //! times?}` answers the next polls with that error; `mock.events_flags
 //! {always_more?, repeat?, ignore_max?}` makes every answer say `hasMore`, the
@@ -44,6 +45,8 @@ struct Inner {
     ignore_max: bool,
     /// The last page answered, for `repeat`.
     last: Option<Value>,
+    /// `mock.later` is listed (`mock.events_changed`).
+    later: bool,
 }
 
 /// The mock's Events state, shared by every connection.
@@ -68,8 +71,8 @@ pub fn declare(caps: &mut Value, spelling: Spelling) {
     }
 }
 
-fn descriptors() -> Vec<Value> {
-    vec![
+fn descriptors(later: bool) -> Vec<Value> {
+    let mut all = vec![
         json!({
             "name": "mock.tick",
             "description": "an occurrence the mock.event control tool appends",
@@ -86,7 +89,17 @@ fn descriptors() -> Vec<Value> {
             "inputSchema": {"type": "object"},
             "payloadSchema": {"type": "object"}
         }),
-    ]
+    ];
+    if later {
+        all.push(json!({
+            "name": "mock.later",
+            "description": "a type listed once mock.events_changed is called",
+            "delivery": ["poll"],
+            "inputSchema": {"type": "object"},
+            "payloadSchema": {"type": "object"}
+        }));
+    }
+    all
 }
 
 /// The error object of a refusal.
@@ -105,7 +118,8 @@ pub fn handle(events: &Events, method: &str, params: &Value) -> Result<Value, Va
             let cursor = params.get("cursor").and_then(Value::as_str);
             eprintln!("MOCK_EVENTS_LIST {}", cursor.unwrap_or("-"));
             // One type per page: the client must follow `nextCursor`.
-            let all = descriptors();
+            let later = events.inner.lock().unwrap_or_else(|e| e.into_inner()).later;
+            let all = descriptors(later);
             let at: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
             let mut page = json!({"resultType": "complete", "events": all.get(at).into_iter().collect::<Vec<_>>()});
             if at + 1 < all.len() {
@@ -128,7 +142,7 @@ fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
     }
     let name = params["name"].as_str().unwrap_or_default();
     match name {
-        "mock.tick" => {}
+        "mock.tick" | "mock.later" => {}
         "mock.webhook_only" => {
             return Err(refusal(
                 UNSUPPORTED,
@@ -264,6 +278,10 @@ pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
                 ));
             }
             Some(json!({"armed": times}))
+        }
+        "mock.events_changed" => {
+            g.later = true;
+            Some(json!({"later": true}))
         }
         "mock.events_flags" => {
             if let Some(b) = args["always_more"].as_bool() {

@@ -183,6 +183,24 @@ impl Events {
     }
 }
 
+/// What a supervisor connection adds to its listen for MCP Events: when the
+/// server declares the extension with `listChanged: true` (either spelling,
+/// Q2), `eventsListChanged` in the filter, and `notifications/events/
+/// list_changed` taken off the stream for the loop [SEP L192-208].
+pub(crate) fn listen_extension() -> ::mcp::rmcp_client::ListenExtensionFn {
+    std::sync::Arc::new(|caps: &Value| {
+        let declared = wire::declared(caps)?;
+        (declared.get("listChanged") == Some(&Value::Bool(true))).then(|| {
+            let mut members = Map::new();
+            members.insert(wire::LIST_CHANGED_FILTER.into(), Value::Bool(true));
+            ::mcp::rmcp_transport::ListenExtension {
+                members,
+                methods: vec![wire::method::LIST_CHANGED.to_string()],
+            }
+        })
+    })
+}
+
 /// `base` with up to ±10% jitter: polling clients MUST jitter (2026-07-28
 /// caching), so many bindings on one server do not poll in step.
 fn jitter(base: u64) -> u64 {
@@ -600,6 +618,18 @@ impl Runtime {
                 params,
                 bound: REQUEST_BOUND,
             });
+        }
+    }
+
+    /// The server said its event types changed: list them again now, rather
+    /// than at the next 15-minute re-list.
+    pub(crate) fn events_list_changed(&mut self, server: &str) {
+        if let Some(l) = self.mcp_events.listings.get_mut(server)
+            && l.refused.is_none()
+        {
+            l.due_at = 0;
+            self.log
+                .info("mcp.events.list_changed", json!({"server": server}));
         }
     }
 

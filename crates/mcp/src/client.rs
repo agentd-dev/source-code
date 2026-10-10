@@ -113,6 +113,9 @@ pub struct McpClient {
     /// iff the `elicitation` client capability is declared, so a server only
     /// asks what the host can actually deliver to a human.
     elicitation: Option<Arc<dyn inbound::Handler>>,
+    /// What an extension adds to the connection's listen; see
+    /// [`Self::with_listen_extension`]. Kept, so a re-dial adds it too.
+    listen_extension: Option<crate::rmcp_client::ListenExtensionFn>,
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
     /// `{"agent/run_id": …}`) so a backing service can recognize a retried call
     /// as the same logical operation and dedupe it rather than repeating a side
@@ -166,6 +169,7 @@ impl McpClient {
             redial: Mutex::default(),
             endpoint: endpoint.to_string(),
             elicitation: None,
+            listen_extension: None,
             tool_meta: None,
             client_info: Implementation {
                 name: "agentd".into(),
@@ -205,6 +209,13 @@ impl McpClient {
     /// we can actually deliver the question to a human.
     pub fn with_elicitation(mut self, handler: Arc<dyn inbound::Handler>) -> Self {
         self.elicitation = Some(handler);
+        self
+    }
+
+    /// Let an extension add to the connection's `subscriptions/listen`; see
+    /// [`crate::rmcp_client::RmcpBuilder::with_listen_extension`].
+    pub fn with_listen_extension(mut self, decide: crate::rmcp_client::ListenExtensionFn) -> Self {
+        self.listen_extension = Some(decide);
         self
     }
 
@@ -309,6 +320,9 @@ impl McpClient {
                 .with_listen_idle(self.listen_idle);
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
+        }
+        if let Some(decide) = &self.listen_extension {
+            b = b.with_listen_extension(Arc::clone(decide));
         }
         if let Some(bound) = handshake_bound {
             b = b.with_handshake_bound(bound);

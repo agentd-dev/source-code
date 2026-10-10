@@ -45,6 +45,10 @@ pub fn declared(capabilities: &Value) -> Option<&Value> {
         .filter(|v| v.is_object())
 }
 
+/// The `subscriptions/listen` filter field that asks for
+/// `notifications/events/list_changed` [SEP L196-208].
+pub const LIST_CHANGED_FILTER: &str = "eventsListChanged";
+
 /// What the client declares in its per-request capabilities [SEP L77-92].
 pub fn client_extensions() -> Value {
     json!({ EXTENSION: {} })

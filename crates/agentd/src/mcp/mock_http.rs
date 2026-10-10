@@ -205,6 +205,9 @@ struct Open {
     /// Takes `notifications/tools/list_changed`: a `GET` stream always, a
     /// listen when its acknowledgment holds `toolsListChanged`.
     tools: bool,
+    /// Takes `notifications/events/list_changed`: a listen whose
+    /// acknowledgment holds `eventsListChanged`.
+    events: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -774,6 +777,23 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
     // The registry's consumer-alignment tools (RFC-0028 §3.3). The call is
     // echoed on stderr so an e2e can assert WHAT the consumer reported
     // without needing a live registry.
+    // The listing changed: tell every listen that asked.
+    if name == Some("mock.events_changed") {
+        let _ = super::mock_events::control(&state.events, "mock.events_changed", &args);
+        let mut told = 0;
+        for o in lock(&state.open).iter_mut().filter(|o| o.events) {
+            let params = o
+                .subscription
+                .as_ref()
+                .map(|id| json!({"_meta": {SUBSCRIPTION_ID: id}}));
+            let note = json::Notification::new("notifications/events/list_changed", params);
+            if send_frame(&mut o.socket, &note) {
+                told += 1;
+            }
+        }
+        eprintln!("MOCK_EVENTS_CHANGED {told}");
+        return tool_ok(req.id, json!({"told": told}));
+    }
     if let Some(n) = name
         && let Some(out) = super::mock_events::control(&state.events, n, &args)
     {
@@ -1207,7 +1227,16 @@ fn serve_listen(stream: &mut TcpStream, id: &Value, body: &Value, state: &State)
     if let Some(uris) = filter["resourceSubscriptions"].as_array_mut() {
         uris.retain(|u| subscribe && !narrow.iter().any(|n| u == n));
     }
+    // Events' list changes are honoured only where Events is declared: a
+    // server that did not declare `listChanged` leaves the field out of its
+    // acknowledgment [SEP L208].
+    if state.events_spelling == super::mock_events::Spelling::None
+        && let Some(f) = filter.as_object_mut()
+    {
+        f.remove("eventsListChanged");
+    }
     let tools = filter["toolsListChanged"] == true;
+    let events = filter["eventsListChanged"] == true;
     let meta = json!({SUBSCRIPTION_ID: id});
     let mut frames = vec![json!({
         "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
@@ -1252,6 +1281,7 @@ fn serve_listen(stream: &mut TcpStream, id: &Value, body: &Value, state: &State)
                 socket,
                 subscription: Some(id.clone()),
                 tools,
+                events,
             });
         }
     }
@@ -1284,6 +1314,7 @@ fn serve_notifications(stream: &mut TcpStream, state: &State) {
                 socket,
                 subscription: None,
                 tools: true,
+                events: false,
             });
         }
     }

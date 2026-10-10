@@ -365,6 +365,7 @@ impl Runtime {
                 continue;
             }
             match crate::mcp::from_spec(spec, server_timeout(new, s))
+                .map(super::supervisor_client)
                 .and_then(|mut c| c.initialize().map(|()| c))
             {
                 Ok(mut c) => {

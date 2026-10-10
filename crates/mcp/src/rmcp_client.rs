@@ -350,6 +350,9 @@ pub struct RmcpClient {
     /// The next id [`Self::call_raw`] uses: a range the SDK's own counter,
     /// which starts at 0, never reaches.
     raw_ids: std::sync::atomic::AtomicI64,
+    /// An extension's part of every listen on this connection, as decided
+    /// from the server's capabilities (see [`RmcpBuilder::with_listen_extension`]).
+    listen_extension: Arc<Mutex<Option<crate::rmcp_transport::ListenExtension>>>,
 }
 
 /// Where [`RmcpClient::call_raw`]'s request ids start.
@@ -379,7 +382,16 @@ pub struct RmcpBuilder {
     first: FirstRequest,
     /// How long a listen stream may stay silent; see [`LISTEN_IDLE`].
     listen_idle: Duration,
+    /// What an extension adds to this connection's listen, given the server's
+    /// capabilities as it sent them; see [`Self::with_listen_extension`].
+    listen_extension: Option<ListenExtensionFn>,
 }
+
+/// Decides, from the server's `capabilities` as it sent them, what an
+/// extension adds to the connection's `subscriptions/listen` — `None` when
+/// the server offers it nothing.
+pub type ListenExtensionFn =
+    Arc<dyn Fn(&Value) -> Option<crate::rmcp_transport::ListenExtension> + Send + Sync>;
 
 impl RmcpBuilder {
     pub fn new(
@@ -403,7 +415,20 @@ impl RmcpBuilder {
             handshake_bound: None,
             first: FirstRequest::Discover,
             listen_idle: LISTEN_IDLE,
+            listen_extension: None,
         }
+    }
+
+    /// Let an extension add to the connection's listen: once the server's
+    /// capabilities are known, `decide` names the filter members and the
+    /// notifications the extension needs (`notifications/events/list_changed`
+    /// behind `eventsListChanged`, say). The connection then holds a listen
+    /// for them even when nothing else would, and takes those notifications
+    /// off the stream for the host's queue — rmcp's own listen would end on
+    /// a notification outside its four-field filter.
+    pub fn with_listen_extension(mut self, decide: ListenExtensionFn) -> Self {
+        self.listen_extension = Some(decide);
+        self
     }
 
     /// Let a listen stream stay silent for `idle` (never less than the
@@ -492,11 +517,14 @@ impl RmcpBuilder {
                 self.headers.clone(),
             )),
         };
+        let listen_extension: Arc<Mutex<Option<crate::rmcp_transport::ListenExtension>>> =
+            Arc::default();
         let start = Start {
             endpoint: self.endpoint.clone(),
             socket: Arc::clone(&socket),
             timeout: self.timeout,
             listen_idle: self.listen_idle,
+            listen_extension: Arc::clone(&listen_extension),
             handler: Handler {
                 queue: Arc::clone(&notifications),
                 // Replaced per attempt: `initialize` carries the revision it
@@ -566,6 +594,7 @@ impl RmcpBuilder {
             tools_dropped: Mutex::default(),
             own_meta,
             raw_ids: std::sync::atomic::AtomicI64::new(RAW_ID_BASE),
+            listen_extension: Arc::clone(&listen_extension),
         };
         // rmcp sends a tool's `Mcp-Param-*` headers only for tools whose
         // schema it has cached on this connection from a `tools/list` — and a
@@ -578,6 +607,9 @@ impl RmcpBuilder {
         if client.listens() && client.caps.tools.is_some() {
             // Inside the handshake bound: what is left of it, not a new one.
             client.prime(bound.map(|b| b.saturating_sub(started.elapsed())))?;
+        }
+        if let (Some(decide), Some(caps)) = (&self.listen_extension, &client.raw_caps) {
+            *listen_extension.lock().unwrap_or_else(|e| e.into_inner()) = decide(caps);
         }
         client.stand();
         Ok(client)
@@ -690,6 +722,9 @@ struct Start {
     timeout: Duration,
     listen_idle: Duration,
     handler: Handler,
+    /// The extension's part of every listen, filled once the capabilities
+    /// are known.
+    listen_extension: Arc<Mutex<Option<crate::rmcp_transport::ListenExtension>>>,
 }
 
 /// A started connection: the service, the server's capabilities as sent, the
@@ -719,7 +754,8 @@ impl Start {
     ) -> Result<Started, Failed> {
         let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&self.socket), self.timeout)
             .with_listen_idle(self.listen_idle)
-            .with_notifications(Arc::clone(&self.handler.queue));
+            .with_notifications(Arc::clone(&self.handler.queue))
+            .with_listen_extension(Arc::clone(&self.listen_extension));
         // The caller's headers are the socket's, never the SDK's too: the SDK
         // hands its custom headers to the socket on every request, so a copy
         // here put each one — `Authorization` included — on the wire twice.
@@ -1377,7 +1413,13 @@ impl RmcpClient {
     /// way a `list_changed` arrives.
     fn wants_list_changed(&self) -> bool {
         let (t, p, r) = self.list_flags();
-        t || p || r
+        t || p
+            || r
+            || self
+                .listen_extension
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
     }
 
     /// The filter of a listen on `uris`, with the `list_changed` flags when
@@ -1467,7 +1509,22 @@ impl RmcpClient {
                 // `list_changed` notifications for good.
                 Err(e) if listen_refused(&e) && !uris.is_empty() && self.wants_list_changed() => {
                     let plain = self.filter_for(uris, false);
-                    match self.bounded(bound, "subscriptions/listen", peer.listen(plain))? {
+                    // An extension's members are flags too: the plain listen
+                    // goes without them, and stays without them if it is the
+                    // one the server takes.
+                    let extension = self
+                        .listen_extension
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    let retried = self.bounded(bound, "subscriptions/listen", peer.listen(plain));
+                    if !matches!(retried, Ok(Ok(_))) {
+                        *self
+                            .listen_extension
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = extension;
+                    }
+                    match retried? {
                         Ok(s) => {
                             self.flags_refused
                                 .store(true, std::sync::atomic::Ordering::SeqCst);

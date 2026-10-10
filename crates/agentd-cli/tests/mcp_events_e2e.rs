@@ -597,3 +597,56 @@ fn a_binding_added_on_a_refused_server_is_refused_at_once() {
     });
     assert!(!bare.log().contains("MOCK_EVENTS_"), "{}", bare.log());
 }
+
+#[test]
+fn a_type_listed_later_is_armed_when_the_server_says_its_list_changed() {
+    // The standing listen asks for `eventsListChanged`; the notification it
+    // brings is taken off the stream for the loop — rmcp's own listen would
+    // have ended on it — and the server is listed again at once, not at the
+    // next 15-minute re-list.
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let later = "        - name: mock.later\n          delivery: [poll]\n          into: {stream: ticks, subject: tick}\n";
+    let daemon = Daemon::start("events-list-changed", &config(&mock.uri(), MEMORY, later));
+    daemon.wait_for("the type refused as unknown", |l| {
+        events(l, "mcp.events.refused")
+            .iter()
+            .any(|e| e["reason"] == "unknown_event")
+    });
+    let asked = |m: &common::MockMcp| {
+        m.log()
+            .lines()
+            .filter_map(|l| l.strip_prefix("MOCK_LISTEN "))
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .any(|f| f["eventsListChanged"] == true)
+    };
+    daemon.wait_for("a listen that asks for eventsListChanged", |_| asked(&mock));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let told = mock.control("mock.events_changed", json!({}))["told"]
+            .as_u64()
+            .unwrap_or(0);
+        if told > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no listen took the notification:\n{}",
+            mock.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon.wait_for("the type armed", |l| armed(l, "mock.later"));
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.events.list_changed")
+            .iter()
+            .any(|e| e["server"] == "mock"),
+        "{log}"
+    );
+    assert!(
+        !events(&log, "mcp.listen.ended")
+            .iter()
+            .any(|e| e["level"] == "warn"),
+        "the standing listen outlived the notification:\n{log}"
+    );
+}

@@ -10,6 +10,7 @@
 //! backs off with jitter and keeps its cursor (§5.13).
 
 pub mod bridge;
+pub mod hook;
 pub mod pool;
 pub mod wire;
 
@@ -134,6 +135,20 @@ enum Stop {
     Refused(String),
 }
 
+/// What became of one occurrence offered to a binding (`events_take`).
+enum Taken {
+    Appended,
+    /// Already in the dedup set.
+    Duplicate,
+    /// Never appendable — replay would bring the same bytes: `oversize` or
+    /// `malformed`.
+    Rejected(&'static str),
+    /// The binding's `rate` is dry.
+    Rate,
+    /// The stream refused it (pressure).
+    Refused(String),
+}
+
 /// One binding, live.
 pub(crate) struct Binding {
     pub(crate) key: String,
@@ -169,6 +184,30 @@ pub(crate) struct Binding {
     generation: u64,
     /// Who holds it: the config, waits, tool calls.
     pub(crate) owners: std::collections::BTreeSet<Owner>,
+    /// Webhook: the lease to suggest (`ttl`).
+    ttl_ms: u64,
+    /// Webhook: the live subscription's secret, in memory only.
+    secret: Option<String>,
+    /// Webhook: subscribed, and deliveries are taken.
+    armed: bool,
+    /// Webhook: a subscription may exist on the server — an arm was sent,
+    /// and no unsubscribe since.
+    subscribed: bool,
+    /// Webhook: when the lease is refreshed.
+    refresh_at: u64,
+    /// Webhook: deliveries refused (`429`/`503`) and not yet taken, by
+    /// hashed `webhook-id`, with when each was first refused.
+    refused: BTreeMap<String, u64>,
+    /// Webhook: consecutive `CallbackEndpointError`s.
+    hook_failures: u32,
+    /// Webhook: the connection a reload replaced, unsubscribed on at the
+    /// next arm.
+    prior: Option<std::sync::Arc<crate::mcp::client::McpClient>>,
+    /// Modes the server would not deliver in, passed over until a reload or
+    /// a re-dial decides afresh.
+    demoted: Vec<Delivery>,
+    /// Its record is in the store.
+    recorded: bool,
 }
 
 /// What a binding's config or its grant decides of it.
@@ -178,6 +217,7 @@ struct Shape {
     into: EventInto,
     replay: Replay,
     rate: Option<(u32, f64)>,
+    ttl_ms: u64,
 }
 
 impl Shape {
@@ -190,6 +230,10 @@ impl Shape {
                 .rate
                 .as_deref()
                 .and_then(|r| crate::supervisor::tree::parse_rate(r).ok()),
+            ttl_ms: b
+                .ttl
+                .as_ref()
+                .map_or(hook::DEFAULT_TTL_MS, |d| d.0.as_millis() as u64),
         }
     }
 
@@ -202,6 +246,10 @@ impl Shape {
                 .rate
                 .as_deref()
                 .and_then(|r| crate::supervisor::tree::parse_rate(r).ok()),
+            ttl_ms: g
+                .ttl
+                .as_ref()
+                .map_or(hook::DEFAULT_TTL_MS, |d| d.0.as_millis() as u64),
         }
     }
 }
@@ -240,6 +288,16 @@ impl Binding {
             schema_relisted: false,
             generation: 0,
             owners: Default::default(),
+            ttl_ms: shape.ttl_ms,
+            secret: None,
+            armed: false,
+            subscribed: false,
+            refresh_at: 0,
+            refused: BTreeMap::new(),
+            hook_failures: 0,
+            prior: None,
+            demoted: Vec::new(),
+            recorded: false,
         }
     }
 
@@ -250,10 +308,15 @@ impl Binding {
         if self.delivery != shape.delivery {
             self.delivery = shape.delivery;
             self.mode = None;
+            self.demoted.clear();
             self.state = State::Discovering;
         }
         self.into = shape.into;
+        if matches!(shape.replay, Replay::None) {
+            self.cursor = None; // from now, from the next arm or poll on
+        }
         self.replay = shape.replay;
+        self.ttl_ms = shape.ttl_ms;
         if self.rate != shape.rate {
             self.rate = shape.rate;
             self.tokens = shape.rate.map_or(0.0, |(burst, _)| f64::from(burst));
@@ -312,6 +375,8 @@ pub(crate) struct Events {
     next_generation: u64,
     /// When the owners were last looked over.
     swept_at: u64,
+    /// The webhook bindings' routes, shared with the webhook listener.
+    pub(crate) hooks: hook::Routes,
 }
 
 impl Events {
@@ -548,6 +613,7 @@ impl Runtime {
             {
                 b.state = State::Discovering;
                 b.mode = None;
+                b.demoted.clear();
             }
         }
         if self.mcp_events.bindings.is_empty() {
@@ -556,6 +622,35 @@ impl Runtime {
         if !servers.is_empty() && self.mcp_events.pool.is_none() {
             self.mcp_events.pool = Some(Pool::start(self.events_tx.clone()));
         }
+        // A webhook binding being decided again (its modes changed, a refusal
+        // looked at again, a re-dial) takes no deliveries until it is armed
+        // afresh — an arm always unsubscribes first — or, deciding on another
+        // mode, lets its subscription go (`events_evaluate`). Then every
+        // binding that may deliver by webhook has its route.
+        let reset: Vec<String> = self
+            .mcp_events
+            .bindings
+            .values_mut()
+            .filter(|b| b.mode.is_none() && (b.armed || b.secret.is_some()))
+            .map(|b| {
+                b.armed = false;
+                b.secret = None;
+                b.key.clone()
+            })
+            .collect();
+        for key in reset {
+            self.mcp_events
+                .hooks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .and_modify(|r| {
+                    r.armed = false;
+                    r.secret = None;
+                    r.pending = None;
+                });
+        }
+        self.events_sync_routes();
         // A binding added (or whose modes changed) on a server already listed
         // is held against that listing now, not at the next re-list — and one
         // on a server already refused is refused with it, not left waiting.
@@ -589,13 +684,16 @@ impl Runtime {
         self.events_sweep_owners(now);
         self.events_list_due(now);
         self.events_poll_due(now);
-        let active = self
-            .mcp_events
-            .bindings
-            .values()
-            .filter(|b| b.state == State::Active)
-            .count() as u64;
-        crate::obs::metrics::set_event_subscriptions(vec![("poll".to_string(), active)]);
+        self.events_hook_due(now);
+        let mut active: BTreeMap<String, u64> = BTreeMap::new();
+        for b in self.mcp_events.bindings.values() {
+            if b.state == State::Active
+                && let Some(m) = b.mode
+            {
+                *active.entry(m.as_str().to_string()).or_default() += 1;
+            }
+        }
+        crate::obs::metrics::set_event_subscriptions(active.into_iter().collect());
     }
 
     /// Ask each server with a binding or a grant for its event types, when
@@ -681,6 +779,10 @@ impl Runtime {
         if b.state == State::Refused(reason) {
             return;
         }
+        self.events_hook_stop(key, false);
+        let Some(b) = self.mcp_events.bindings.get_mut(key) else {
+            return;
+        };
         b.state = State::Refused(reason);
         b.mode = None;
         self.log.error(
@@ -711,7 +813,10 @@ impl Runtime {
                 let Some(b) = self.mcp_events.bindings.get_mut(&key) else {
                     continue;
                 };
-                if !matches!(b.state, State::Active | State::Paused(_)) || b.in_flight {
+                if !matches!(b.state, State::Active | State::Paused(_))
+                    || b.in_flight
+                    || b.mode != Some(Delivery::Poll)
+                {
                     continue;
                 }
                 if now < b.due_at {
@@ -880,6 +985,7 @@ impl Runtime {
                 }
                 self.events_polled(&key, result)
             }
+            other => self.events_hook_done(other),
         }
     }
 
@@ -968,13 +1074,14 @@ impl Runtime {
                 "the server's events/list does not name this event type",
             );
         };
-        // The first mode the operator listed that the server offers and this
-        // build delivers. Webhook arrives with P3, push with P4.
+        // The first mode the operator listed that the server offers (push
+        // waits on the SEP, P4).
         let mode = b
             .delivery
             .iter()
             .copied()
-            .find(|m| *m == Delivery::Poll && d.delivery.iter().any(|x| x == m.as_str()));
+            .filter(|m| !b.demoted.contains(m))
+            .find(|m| d.delivery.iter().any(|x| x == m.as_str()));
         let Some(mode) = mode else {
             let detail = format!(
                 "the operator lists {:?}, the server offers {:?}",
@@ -1002,7 +1109,14 @@ impl Runtime {
             b.schema_relisted = false;
         }
         b.payload_schema = d.payload_schema.clone();
+        let left_webhook = mode != Delivery::Webhook && (b.subscribed || b.prior.is_some());
         b.mode = Some(mode);
+        if left_webhook {
+            self.events_hook_stop(key, false);
+        }
+        let Some(b) = self.mcp_events.bindings.get_mut(key) else {
+            return;
+        };
         if matches!(was, State::Discovering | State::Refused(_)) {
             b.state = State::Active;
             // Re-armed after a failure (a type the server said it lost, a
@@ -1012,11 +1126,16 @@ impl Runtime {
             } else {
                 now
             };
-            self.log.info(
-                "mcp.events.armed",
-                json!({"server": b.server, "event_type": b.name, "mode": mode.as_str(),
-                       "cursor_present": b.cursor.is_some()}),
-            );
+            // A webhook binding is armed when its subscribe answers
+            // (`hook::events_armed`).
+            b.armed = false;
+            if mode == Delivery::Poll {
+                self.log.info(
+                    "mcp.events.armed",
+                    json!({"server": b.server, "event_type": b.name, "mode": mode.as_str(),
+                           "cursor_present": b.cursor.is_some()}),
+                );
+            }
         }
     }
 
@@ -1034,6 +1153,7 @@ impl Runtime {
             return Err(());
         };
         b.loaded = true;
+        b.recorded = record.is_some();
         if let Some(seen) = seen {
             b.seen = Seen::from_json(&seen.state["entries"]);
         }
@@ -1083,15 +1203,6 @@ impl Runtime {
                 )),
             );
         }
-        let (server, name, stream, subject, schema) = (
-            b.server.clone(),
-            b.name.clone(),
-            b.into.stream.clone(),
-            b.into.subject.clone(),
-            b.payload_schema.clone(),
-        );
-        let max_value_bytes = self.settings.store.max_value_bytes.map(|n| n as usize);
-        let source = bridge::source(&server);
         let mut appended = 0u64;
         let mut fresh = 0u64;
         // Why the page stopped short, if it did: the cursor then holds, and
@@ -1099,96 +1210,20 @@ impl Runtime {
         // appends the rest and nothing twice.
         let mut stopped: Option<Stop> = None;
         for raw in &page.events {
-            match bridge::check(&server, &name, key, raw, schema.as_ref(), max_value_bytes) {
-                Checked::Rejected { cause, event_id } => {
-                    crate::obs::metrics::record_mcp_event(&server, &name, "poll", "rejected");
-                    self.log.warn(
-                        "mcp.events.rejected",
-                        json!({"server": server, "event_type": name, "event_id": event_id.as_deref().map(tame), "cause": cause}),
-                    );
-                }
-                Checked::Append {
-                    id,
-                    event_id,
-                    data,
-                    schema_ok,
-                } => {
-                    let seen_key = bridge::seen_key(&event_id);
-                    let b = &self.mcp_events.bindings[key];
-                    if b.seen.contains(&seen_key) {
-                        crate::obs::metrics::record_mcp_event(&server, &name, "poll", "duplicate");
-                        continue;
-                    }
-                    // The intake ceiling holds whatever the server sends: one
-                    // that ignored `maxEvents` is stopped here, not trusted.
-                    if b.rate.is_some() && b.tokens < 1.0 {
-                        stopped = Some(Stop::Rate);
-                        break;
-                    }
+            match self.events_take(key, raw, "poll", now) {
+                Taken::Appended => {
+                    appended += 1;
                     fresh += 1;
-                    let occurred_at = data["occurred_at"].as_str().and_then(bridge::timestamp_ms);
-                    match self.append(&stream, &subject, None, data, &id, &source) {
-                        Ok(_) => {
-                            appended += 1;
-                            crate::obs::metrics::record_mcp_event(
-                                &server,
-                                &name,
-                                "poll",
-                                if schema_ok {
-                                    "appended"
-                                } else {
-                                    "schema_mismatch"
-                                },
-                            );
-                            if let Some(at) = occurred_at {
-                                crate::obs::metrics::set_mcp_event_lag(
-                                    &server,
-                                    &name,
-                                    now.saturating_sub(at),
-                                );
-                            }
-                            if let Some(b) = self.mcp_events.bindings.get_mut(key) {
-                                let evicted = b.seen.insert(seen_key, now);
-                                crate::obs::metrics::record_mcp_events_dedup_evicted(
-                                    &server, &name, evicted,
-                                );
-                                if b.rate.is_some() {
-                                    b.tokens = (b.tokens - 1.0).max(0.0);
-                                }
-                                if !schema_ok && !b.schema_relisted {
-                                    b.schema_relist = true;
-                                    b.schema_relisted = true;
-                                }
-                            }
-                            if !schema_ok {
-                                self.log.warn(
-                                    "mcp.events.schema_mismatch",
-                                    json!({"server": server, "event_type": name, "event_id": tame(&event_id)}),
-                                );
-                            }
-                        }
-                        // Over the store's limit: no retry of it fits, so the
-                        // cursor moves past it, said like an oversize one.
-                        Err(crate::runtime::streams::AppendError::TooLarge(_)) => {
-                            crate::obs::metrics::record_mcp_event(
-                                &server, &name, "poll", "rejected",
-                            );
-                            self.log.warn(
-                                "mcp.events.rejected",
-                                json!({"server": server, "event_type": name, "event_id": tame(&event_id), "cause": "oversize"}),
-                            );
-                        }
-                        Err(crate::runtime::streams::AppendError::Refused(e)) => {
-                            crate::obs::metrics::record_mcp_event(
-                                &server,
-                                &name,
-                                "poll",
-                                "refused_pressure",
-                            );
-                            stopped = Some(Stop::Refused(e));
-                            break;
-                        }
-                    }
+                }
+                Taken::Duplicate | Taken::Rejected(_) => {}
+                Taken::Rate => {
+                    stopped = Some(Stop::Rate);
+                    break;
+                }
+                Taken::Refused(e) => {
+                    fresh += 1;
+                    stopped = Some(Stop::Refused(e));
+                    break;
                 }
             }
         }
@@ -1245,14 +1280,11 @@ impl Runtime {
                 json!({"server": b.server, "event_type": b.name, "cause": "truncated"}),
             );
         }
-        if page.cursor != b.cursor {
-            b.cursor = page.cursor.clone();
-            let record = json!({"mode": b.mode.map(Delivery::as_str), "cursor": b.cursor,
-                                "state": b.state.name(), "since": now});
-            let _ = self
-                .durable
-                .put(Kind::Memory, &b.cursor_key(), record, None);
-        }
+        // The record is written when the cursor moves, and once at first —
+        // so a type without replay, whose cursor never moves, still has one,
+        // and a re-arm after downtime says what it could not recover.
+        let write = page.cursor != b.cursor || !b.recorded;
+        b.cursor = page.cursor.clone();
         // Drain a backlog at once while each page holds something new — but
         // a bounded number of times: a server that always says `hasMore` is
         // not a reason to poll in a loop (§5.6.1).
@@ -1267,6 +1299,126 @@ impl Runtime {
                     .clamp(POLL_FLOOR_MS, POLL_CEILING_MS),
             )
         };
+        if write {
+            self.events_record(key);
+        }
+    }
+
+    /// Write a binding's record: its mode, its cursor, its state.
+    fn events_record(&mut self, key: &str) {
+        let Some(b) = self.mcp_events.bindings.get_mut(key) else {
+            return;
+        };
+        let record = json!({"mode": b.mode.map(Delivery::as_str), "cursor": b.cursor,
+                            "state": b.state.name(), "since": now_ms()});
+        if self
+            .durable
+            .put(Kind::Memory, &b.cursor_key(), record, None)
+            .is_ok()
+        {
+            b.recorded = true;
+        }
+    }
+
+    /// Offer one occurrence to a binding, whichever mode delivered it: checked
+    /// (§5.4), deduplicated, held to the binding's `rate`, appended. What was
+    /// appended is in the dedup set and has spent a token; the caller flushes
+    /// the stream before anything says it is kept.
+    fn events_take(&mut self, key: &str, raw: &Value, mode: &'static str, now: u64) -> Taken {
+        let Some(b) = self.mcp_events.bindings.get(key) else {
+            return Taken::Rejected("malformed");
+        };
+        let (server, name, stream, subject) = (
+            b.server.clone(),
+            b.name.clone(),
+            b.into.stream.clone(),
+            b.into.subject.clone(),
+        );
+        let max_value_bytes = self.settings.store.max_value_bytes.map(|n| n as usize);
+        let checked = bridge::check(
+            &server,
+            &name,
+            key,
+            raw,
+            b.payload_schema.as_ref(),
+            max_value_bytes,
+        );
+        let (id, event_id, data, schema_ok) = match checked {
+            Checked::Rejected { cause, event_id } => {
+                crate::obs::metrics::record_mcp_event(&server, &name, mode, "rejected");
+                self.log.warn(
+                    "mcp.events.rejected",
+                    json!({"server": server, "event_type": name, "event_id": event_id.as_deref().map(tame), "cause": cause}),
+                );
+                return Taken::Rejected(cause);
+            }
+            Checked::Append {
+                id,
+                event_id,
+                data,
+                schema_ok,
+            } => (id, event_id, data, schema_ok),
+        };
+        let seen_key = bridge::seen_key(&event_id);
+        if b.seen.contains(&seen_key) {
+            crate::obs::metrics::record_mcp_event(&server, &name, mode, "duplicate");
+            return Taken::Duplicate;
+        }
+        // The intake ceiling holds whatever the server sends: one that ignored
+        // `maxEvents`, or delivers faster than the ceiling, is stopped here.
+        if b.rate.is_some() && b.tokens < 1.0 {
+            return Taken::Rate;
+        }
+        let occurred_at = data["occurred_at"].as_str().and_then(bridge::timestamp_ms);
+        match self.append(&stream, &subject, None, data, &id, &bridge::source(&server)) {
+            Ok(_) => {
+                crate::obs::metrics::record_mcp_event(
+                    &server,
+                    &name,
+                    mode,
+                    if schema_ok {
+                        "appended"
+                    } else {
+                        "schema_mismatch"
+                    },
+                );
+                if let Some(at) = occurred_at {
+                    crate::obs::metrics::set_mcp_event_lag(&server, &name, now.saturating_sub(at));
+                }
+                if let Some(b) = self.mcp_events.bindings.get_mut(key) {
+                    let evicted = b.seen.insert(seen_key, now);
+                    crate::obs::metrics::record_mcp_events_dedup_evicted(&server, &name, evicted);
+                    if b.rate.is_some() {
+                        b.tokens = (b.tokens - 1.0).max(0.0);
+                    }
+                    if !schema_ok && !b.schema_relisted {
+                        b.schema_relist = true;
+                        b.schema_relisted = true;
+                    }
+                }
+                if !schema_ok {
+                    self.log.warn(
+                        "mcp.events.schema_mismatch",
+                        json!({"server": server, "event_type": name, "event_id": tame(&event_id)}),
+                    );
+                }
+                Taken::Appended
+            }
+            // Over the store's limit: no retry of it fits, so it is passed
+            // over, said like an oversize one.
+            Err(crate::runtime::streams::AppendError::TooLarge(_)) => {
+                crate::obs::metrics::record_mcp_event(&server, &name, mode, "rejected");
+                self.log.warn(
+                    "mcp.events.rejected",
+                    json!({"server": server, "event_type": name, "event_id": tame(&event_id), "cause": "oversize"}),
+                );
+                Taken::Rejected("oversize")
+            }
+            Err(crate::runtime::streams::AppendError::Refused(e)) => {
+                crate::obs::metrics::record_mcp_event(&server, &name, mode, "refused_pressure");
+                Taken::Refused(e)
+            }
+        }
     }
 
     /// A poll that failed: what the code says follows (§5.13).
@@ -1543,6 +1695,14 @@ impl Runtime {
 
     /// Stop a binding no owner holds: its records go.
     fn events_remove(&mut self, key: &str, reason: &str) {
+        // A webhook subscription is let go eagerly; later deliveries to its
+        // route are answered `410`.
+        self.events_hook_stop(key, true);
+        self.mcp_events
+            .hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
         if let Some(b) = self.mcp_events.bindings.remove(key) {
             let _ = self.durable.delete(Kind::Memory, &b.cursor_key());
             let _ = self.durable.delete(Kind::Memory, &b.seen_key());

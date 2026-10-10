@@ -353,6 +353,71 @@ fn a_webhook_await_pauses_a_workflow_until_the_callback_arrives() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// A `wait {on: webhook}` on a file store, its callback authenticated by a
+/// header whose value is a secret reference.
+fn durable_await_config(llm: &str, port: u16, store: &str) -> String {
+    format!(
+        "\
+         agent:\n  name: hookdurable\n  instruction: You process callbacks.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: file\n  file: {{path: {store}}}\n\
+         webhooks:\n  listen: http://127.0.0.1:{port}\n\
+         workflows:\n  - name: await-cb\n    steps:\n\
+         \x20     s:    {{kind: once}}\n\
+         \x20     w:    {{kind: wait, on: webhook, webhook: {{path: /hooks/cb/durable, auth: {{header: {{name: X-Token, equals: \"{{{{secret:CB_TOKEN}}}}\"}}}}}}, depends_on: [s], timeout: 5m}}\n\
+         \x20     done: {{kind: finish, depends_on: [w], status: completed}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n"
+    )
+}
+
+#[test]
+fn a_webhook_await_is_served_again_after_a_restart() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().display().to_string();
+    let env = [("CB_TOKEN", "t0ken")];
+    let (first, _, cfg) = spawn_bound(|port| durable_await_config(&llm.uri, port, &store), &env);
+    assert!(
+        wait_for(|| !first.events("webhook.await.armed").is_empty(), 10),
+        "{}",
+        first.stderr()
+    );
+    drop(first);
+    std::fs::remove_file(&cfg).ok();
+    // The next life serves the same route, with the same auth, rebuilt from
+    // the wait's durable record.
+    let (second, addr, cfg) =
+        spawn_bound(|port| durable_await_config(&llm.uri, port, &store), &env);
+    assert!(
+        wait_for(
+            || second
+                .events("webhook.await.restored")
+                .iter()
+                .any(|e| e["path"] == "/hooks/cb/durable"),
+            10
+        ),
+        "{}",
+        second.stderr()
+    );
+    let (code, _) = post(&addr, "/hooks/cb/durable", &[("X-Token", "wrong")], "{}");
+    assert_eq!(code, 401, "the restored route keeps its auth");
+    let (code, body) = post(&addr, "/hooks/cb/durable", &[("X-Token", "t0ken")], "{}");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        wait_for(
+            || second
+                .events("run.done")
+                .iter()
+                .any(|e| e["status"] == "completed"),
+            10
+        ),
+        "{}",
+        second.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
 #[test]
 fn a_respond_sync_webhook_returns_the_run_result_inline() {
     let secret = "s3cr3t";

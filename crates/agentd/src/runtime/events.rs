@@ -68,6 +68,9 @@ pub enum Event {
     /// An MCP Events request finished on the events worker pool.
     #[cfg(feature = "mcp-events")]
     McpEvents(Box<super::mcp_events::pool::Done>),
+    /// A verified MCP Events webhook delivery, for the loop to keep.
+    #[cfg(feature = "mcp-events")]
+    McpEventHook(Box<super::mcp_events::hook::Arrival>),
     /// The 200 ms tick.
     Tick,
 }

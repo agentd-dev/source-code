@@ -540,14 +540,15 @@ reload that edits them dials nothing.
 |---|---|---|
 | `name` | required | The event type, as the server's `events/list` names it |
 | `arguments` | `{}` | Subscription arguments, checked against the type's `inputSchema`; part of the binding's identity |
-| `delivery` | required | The acceptable modes in preference order: `poll` (`webhook` is refused until it is built) |
+| `delivery` | required | The acceptable modes in preference order: `poll`, `webhook`; the first the server offers for the type is used |
 | `into` | required | `{stream, subject}`: a stream declared under `streams:` |
 | `replay` | `1h` | How far back to catch up after downtime (`maxAgeMs`), ≥ 1 s, or `none` to always start from now |
 | `rate` | — | Intake ceiling `<burst>/<per>`; **required** on an untagged or `untrusted_input` server |
+| `ttl` | `1h` | Webhook only: the lease agentd asks for (`ttlMs`); it refreshes at 80% of what the server grants |
 
 `event_grants[]` — an event type runtime subscriptions may be made for: a
 `wait {on: event, subscribe:}` or, with `tools: true`, the `events.*` tools.
-`name`, `delivery`, `into`, `replay` and `rate` as above, plus `fixed`
+`name`, `delivery`, `into`, `replay`, `rate` and `ttl` as above, plus `fixed`
 (arguments no runtime subscription may set), `max` (live runtime
 subscriptions, 1–64, default 8), `lifetime` (how long a tool-made
 subscription lives, ≤ 30d, default 1d) and `tools` (default `false`).
@@ -555,7 +556,11 @@ subscription lives, ≤ 30d, default 1d) and `tools` (default `false`).
 Refused at load: an undeclared stream, an empty subject, an empty or repeated
 mode, two bindings of one type with the same arguments, two grants for one
 type, more than 64 bindings on a server or 256 in all, a missing `rate` where
-it is required, a `ttl` on a binding without `webhook`. A config that declares
+it is required, a `ttl` on a binding without `webhook`. A binding or grant
+listing `webhook` also needs the webhook listener (`webhooks.listen`, the
+`a2a` feature, no `webhooks.tls.client_ca`), an `https://` `webhooks.url`
+(warned about when it is not a globally routable address) and a credential on
+its server. A config that declares
 any binding or grant says at load that it tracks a draft (SEP-3415), and warns
 when the store would not keep a cursor (the memory store, or
 `store.on_error: degrade`). Built without `mcp-events`, both are refused by

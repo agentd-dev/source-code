@@ -99,6 +99,8 @@ pub struct Options {
     pub hold_listen: bool,
     /// How the 2026-07-28 edge declares MCP Events (`mock_events`).
     pub events: super::mock_events::Spelling,
+    /// The CA its webhook deliveries trust (a PEM file).
+    pub hook_ca: Option<String>,
 }
 
 impl Options {
@@ -111,6 +113,7 @@ impl Options {
             lifecycle: Lifecycle::Initialize,
             hold_listen: true,
             events: super::mock_events::Spelling::Extension,
+            hook_ca: None,
         }
     }
 }
@@ -164,8 +167,11 @@ struct State {
     /// wait for.
     called: Mutex<std::collections::BTreeSet<String>>,
     /// The MCP Events surface (2026-07-28 edge), and how it is declared.
-    events: super::mock_events::Events,
+    events: Arc<super::mock_events::Events>,
     events_spelling: super::mock_events::Spelling,
+    /// Its webhook delivery.
+    #[cfg(all(feature = "mcp-events", feature = "tls"))]
+    hooks: Arc<super::mock_hooks::Hooks>,
 }
 
 impl State {
@@ -245,7 +251,15 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         fail_next: AtomicU64::new(0),
         ops: Mutex::new(Vec::new()),
         called: Mutex::new(std::collections::BTreeSet::new()),
-        events: super::mock_events::Events::default(),
+        events: Arc::new(super::mock_events::Events::default()),
+        #[cfg(all(feature = "mcp-events", feature = "tls"))]
+        hooks: {
+            let hooks = Arc::new(super::mock_hooks::Hooks::default());
+            if let Some(pem) = opts.hook_ca.as_deref().and_then(|p| std::fs::read(p).ok()) {
+                hooks.set_ca(pem);
+            }
+            hooks
+        },
         events_spelling: opts.events,
     });
     for conn in listener.incoming() {
@@ -355,7 +369,22 @@ fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
         m if m.starts_with("events/")
             && state.events_spelling != super::mock_events::Spelling::None =>
         {
-            match super::mock_events::handle(&state.events, m, &body["params"]) {
+            let principal = http.header("authorization");
+            let answered = match m {
+                #[cfg(all(feature = "mcp-events", feature = "tls"))]
+                "events/subscribe" => {
+                    state
+                        .hooks
+                        .subscribe(&state.events, principal, &body["params"])
+                }
+                #[cfg(all(feature = "mcp-events", feature = "tls"))]
+                "events/unsubscribe" => state.hooks.unsubscribe(principal, &body["params"]),
+                _ => {
+                    let _ = principal;
+                    super::mock_events::handle(&state.events, m, &body["params"])
+                }
+            };
+            match answered {
                 Ok(result) => write_json(
                     stream,
                     200,
@@ -796,6 +825,12 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
     }
     if let Some(n) = name
         && let Some(out) = super::mock_events::control(&state.events, n, &args)
+    {
+        return tool_ok(req.id, out);
+    }
+    #[cfg(all(feature = "mcp-events", feature = "tls"))]
+    if let Some(n) = name
+        && let Some(out) = state.hooks.control(&state.events, n, &args)
     {
         return tool_ok(req.id, out);
     }

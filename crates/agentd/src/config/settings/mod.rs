@@ -13073,7 +13073,7 @@ mod tests {
                 binding(&format!(
                     "          delivery: [webhook]\n{into}          rate: 1/1s\n"
                 )),
-                "`webhook` is not built yet",
+                "`webhook` needs the webhook listener",
             ),
             (
                 binding(&format!("          delivery: [poll]\n{into}")),
@@ -13140,6 +13140,68 @@ mod tests {
                 .map(|e| e.to_string())
                 .unwrap_or_default();
             assert!(e.contains(says), "want {says:?}:\n{e}\n---\n{doc}");
+        }
+    }
+
+    #[cfg(all(feature = "mcp-events", feature = "a2a"))]
+    #[test]
+    fn a_webhook_binding_needs_its_listener_an_https_url_and_a_credential() {
+        let doc = |server: &str, webhooks: &str| {
+            format!(
+                "{}{webhooks}",
+                events_doc(&format!(
+                    "{server}      tags: {{\"*\": [sensitive]}}\n      events:\n        - name: incident.created\n          delivery: [webhook, poll]\n          into: {{stream: incidents, subject: s}}\n          ttl: 30m\n"
+                ))
+            )
+        };
+        let cred = "      headers: {Authorization: \"{{secret:PD_AUTH}}\"}\n";
+        // The credential resolves, as in a deployment (see `base_env`).
+        crate::sec::secret::set_prompted("PD_AUTH", "Bearer t".into());
+        let listener = |url: &str, extra: &str| {
+            format!(
+                "webhooks:\n  listen: https://127.0.0.1:8443\n  url: {url}\n  tls: {{cert: /c.pem, key: /k.pem{extra}}}\n"
+            )
+        };
+        // Everything it needs: it loads, saying a loopback URL may be refused.
+        let ok = load_doc(&doc(cred, &listener("https://127.0.0.1:8443", ""))).unwrap();
+        let d = validate(&ok);
+        assert!(d.errors.is_empty(), "{:?}", d.errors);
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("not a globally routable address")),
+            "{:?}",
+            d.warnings
+        );
+        let public = load_doc(&doc(cred, &listener("https://hooks.example.com", ""))).unwrap();
+        assert!(
+            !validate(&public)
+                .warnings
+                .iter()
+                .any(|w| w.contains("globally routable")),
+            "a public name is not warned about"
+        );
+        for (body, says) in [
+            (doc(cred, ""), "set webhooks.listen"),
+            (doc(cred, ""), "needs webhooks.url"),
+            (
+                doc(cred, &listener("http://127.0.0.1:8443", "")),
+                "needs an https:// webhooks.url",
+            ),
+            (
+                doc(
+                    cred,
+                    &listener("https://hooks.example.com", ", client_ca: /ca.pem"),
+                ),
+                "asks for a client certificate",
+            ),
+            (
+                doc("", &listener("https://hooks.example.com", "")),
+                "needs a credential on mcp server \"pd\"",
+            ),
+        ] {
+            let e = load_doc(&body).unwrap_err().to_string();
+            assert!(e.contains(says), "want {says:?}:\n{e}\n---\n{body}");
         }
     }
 

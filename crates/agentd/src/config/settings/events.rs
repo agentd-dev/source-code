@@ -178,7 +178,7 @@ fn check_common(
 ) {
     if delivery.is_empty() {
         d.errors.push(format!(
-            "{at}.delivery: list the acceptable modes, in preference order (poll)"
+            "{at}.delivery: list the acceptable modes, in preference order (poll, webhook)"
         ));
     }
     for (i, m) in delivery.iter().enumerate() {
@@ -186,11 +186,6 @@ fn check_common(
             d.errors
                 .push(format!("{at}.delivery: `{}` is listed twice", m.as_str()));
         }
-    }
-    if delivery.contains(&Delivery::Webhook) {
-        d.errors.push(format!(
-            "{at}.delivery: `webhook` is not built yet (RFC 0045 P3); list `poll`"
-        ));
     }
     if into.stream.trim().is_empty() || !s.streams.contains_key(&into.stream) {
         d.errors.push(format!(
@@ -213,6 +208,94 @@ fn check_common(
             "{at}.rate: required on an untagged or `untrusted_input` server — whoever can write into the watched upstream otherwise decides how often runs start"
         )),
         None => {}
+    }
+}
+
+/// What `webhook` delivery needs (RFC 0045 §5.2), for each binding or grant
+/// that lists it: the listener it is delivered to (the `a2a` feature,
+/// `webhooks.listen`, no client certificate asked — no server presents one),
+/// a `webhooks.url` the server can deliver to (`https://` [SEP "TLS
+/// requirement"]), and a credential on the server, because a webhook
+/// subscription is keyed by an authenticated principal [SEP "Subscription
+/// identity"].
+fn check_webhook(s: &Settings, modes: &[(String, &super::McpServer)], d: &mut Diagnostics) {
+    if modes.is_empty() {
+        return;
+    }
+    let first = &modes[0].0;
+    if !cfg!(feature = "a2a") {
+        d.errors.push(format!(
+            "{first}.delivery: `webhook` needs the webhook listener, which requires building with --features a2a"
+        ));
+    }
+    if s.webhooks.listen.is_none() {
+        d.errors.push(format!(
+            "{first}.delivery: `webhook` needs the webhook listener — set webhooks.listen"
+        ));
+    }
+    if s.webhooks.tls.client_ca.is_some() {
+        d.errors.push(format!(
+            "{first}.delivery: `webhook` cannot be delivered to a listener that asks for a client certificate (webhooks.tls.client_ca): no MCP server presents one"
+        ));
+    }
+    match s.webhooks.url.as_deref() {
+        None => d.errors.push(format!(
+            "{first}.delivery: `webhook` needs webhooks.url — the https:// URL the server delivers to"
+        )),
+        Some(u) => match super::validate_webhooks_url(u) {
+            Ok(o) if o.scheme != "https" => d.errors.push(format!(
+                "{first}.delivery: `webhook` needs an https:// webhooks.url — callback URLs must use https [SEP-3415]"
+            )),
+            Ok(o) if !globally_routable(&o.host) => d.warnings.push(format!(
+                "webhooks.url {u:?} is not a globally routable address: a server delivering webhooks may refuse it unless it is configured to allow it"
+            )),
+            _ => {} // a bad URL is reported with webhooks.url itself
+        },
+    }
+    for (at, srv) in modes {
+        let has = |auth: bool, headers: &std::collections::BTreeMap<String, String>| {
+            auth || headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("authorization"))
+        };
+        let own = has(
+            srv.auth.is_some() || srv.oauth.is_some() || srv.aauth == Some(true),
+            &srv.headers,
+        );
+        let catalogued = srv
+            .service
+            .as_ref()
+            .and_then(|n| s.services.get(n))
+            .is_some_and(|svc| has(svc.auth.is_some(), &svc.headers));
+        if !own && !catalogued {
+            d.errors.push(format!(
+                "{at}.delivery: `webhook` needs a credential on mcp server {:?} (auth, oauth, aauth, an Authorization header, or a catalogued service with one) — a webhook subscription is keyed by the authenticated principal",
+                srv.name
+            ));
+        }
+    }
+}
+
+/// Whether `host` may be a globally routable address: a name (DNS decides),
+/// or a literal outside loopback, private, link-local and the unspecified
+/// ranges.
+fn globally_routable(host: &str) -> bool {
+    use std::net::IpAddr;
+    if crate::net::http::is_loopback_host(host) {
+        return false;
+    }
+    match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            !(v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_loopback())
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let seg = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg & 0xfe00) == 0xfc00
+                || (seg & 0xffc0) == 0xfe80)
+        }
+        Err(_) => true,
     }
 }
 
@@ -314,6 +397,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         return;
     }
     let mut total = 0usize;
+    let mut webhook_modes: Vec<(String, &super::McpServer)> = Vec::new();
     for srv in &declared {
         let untrusted = srv.tag_set().is_ok_and(|tags| {
             tags.is_empty() || tags.contains(&crate::sec::scope::TrifectaTag::UntrustedInput)
@@ -353,6 +437,9 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 d,
             );
             check_leases(&at, &b.delivery, b.replay, b.ttl.as_ref(), d);
+            if b.delivery.contains(&Delivery::Webhook) {
+                webhook_modes.push((at.clone(), srv));
+            }
         }
         let mut granted = std::collections::BTreeSet::new();
         for g in &srv.event_grants {
@@ -385,8 +472,12 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 d,
             );
             check_leases(&at, &g.delivery, g.replay, g.ttl.as_ref(), d);
+            if g.delivery.contains(&Delivery::Webhook) {
+                webhook_modes.push((at.clone(), srv));
+            }
         }
     }
+    check_webhook(s, &webhook_modes, d);
     if total > MAX_SUBSCRIPTIONS {
         d.errors.push(format!(
             "mcp.servers[].events: {total} bindings, at most {MAX_SUBSCRIPTIONS} per instance"

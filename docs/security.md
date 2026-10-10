@@ -1136,12 +1136,29 @@ request is in:
   wakes a waiter once. Under `store.on_error: degrade` a failed write is reported as made,
   and "kept" is only as true as the store. A marker answers replays for seven days, and a
   sweep removes it after that (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`).
+- **A webhook wait outlives a restart without its secret at rest.** Its durable wait record
+  keeps the route's path and its `auth` as written — `{{secret:…}}` references, never a
+  resolved value — and boot serves the callback again, resolving them then
+  (`runtime/webhooks.rs::restore_webhook_callbacks`); one that no longer resolves fails its
+  step.
 - **`/hooks/_` is reserved.** A `wait {on: webhook}` without a fixed path is armed at
   `/hooks/_cb/<token>`, and configured routes are matched before those callbacks. A route
   under the prefix could therefore take a suspended run's callback, so a `webhook` start
   `path` or a `wait` `webhook.path` under `/hooks/_` is refused when the workflow is parsed —
   at load for a configured workflow, and when an agent-stored one is registered
   (`engine/model.rs::RESERVED_HOOK_PREFIX`).
+- **MCP Events webhook routes verify the server, and nothing else does.** A webhook
+  binding's deliveries arrive at `/hooks/_mcp/<binding>` under the reserved prefix
+  (`runtime/mcp_events/hook.rs`). Each request is checked against the Standard Webhooks
+  signature before its body is parsed — all four headers, a timestamp within 5 minutes,
+  HMAC-SHA256 over the raw body under the secret minted for that subscription (32 bytes from
+  the kernel CSPRNG, held in memory only, never in the store), compared in constant time, and
+  the subscription id once it is known — and answered `401` otherwise
+  (`sec/stdwebhooks.rs`). `webhooks.default_auth` does not apply there: a server cannot send
+  a bearer. The server's verification challenge is echoed only under a signature that
+  verifies, so the listener is no oracle for a third party subscribing someone else's URL. A
+  body over 256 KiB is answered `413` on its declared length and never buffered. A listener
+  that asks for a client certificate cannot take these deliveries and is refused at load.
 - **A served document opens a route only under the `interface` grant.** `workflows` is a
   document's to write, but a `webhook` start or a `wait {on: webhook}` in one opens a route on
   the operator's listener, answering whoever reaches it with the auth the route itself names.

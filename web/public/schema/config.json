@@ -4390,6 +4390,10 @@
             }
           },
           "type": "object"
+        },
+        "url": {
+          "description": "the URL the listener is reached at from outside (https://host[:port][/prefix]); callback URLs are built on it",
+          "type": "string"
         }
       },
       "type": "object"

@@ -23,6 +23,10 @@ pub const MAX_BODY: usize = 8 * 1024 * 1024;
 /// can do that BEFORE authenticating (the head is read to find the credential).
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 
+/// The most of a refused body read and dropped after a `413`, so the peer
+/// sees the answer (a lingering close).
+const LINGER_BYTES: u64 = 1024 * 1024;
+
 /// Cap on the number of header lines kept. The byte cap already bounds the
 /// total, but 64 KiB of four-byte headers is still ~13k `Vec` entries and every
 /// `RawRequest::header` lookup is a linear scan over them — so bound the count
@@ -164,7 +168,8 @@ pub trait RawHandler: Send + Sync + 'static {
 
     /// The largest body a request to `path` may carry: a declared
     /// `Content-Length` over it is answered `413` once the head is read,
-    /// before the body is. At most [`MAX_BODY`].
+    /// and the body is never buffered (what follows is dropped, up to a
+    /// bound, so the peer reads the answer). At most [`MAX_BODY`].
     fn body_limit(&self, _method: &str, _path: &str) -> usize {
         MAX_BODY
     }
@@ -220,14 +225,18 @@ fn serve_conn_raw<S: Read + Write + Send + 'static>(
     let req = match read_request(&mut reader, &limit) {
         Ok(req) => req,
         Err(ReadError::BodyTooLarge) => {
-            // Refused on the declared length: the body is never read, so a
-            // peer cannot make the listener buffer what it will not keep.
+            // Refused on the declared length: the body is never buffered, so
+            // a peer cannot make the listener hold what it will not keep.
             let _ = write_simple(
                 reader.get_mut(),
                 413,
                 "Payload Too Large",
                 b"request body exceeds this path's size limit",
             );
+            // A lingering close: what the peer is still sending is read and
+            // dropped (up to a bound, under the read timeout), so its write
+            // completes and it reads the answer instead of a reset.
+            let _ = io::copy(&mut Read::take(&mut reader, LINGER_BYTES), &mut io::sink());
             return;
         }
         Err(ReadError::HeadTooLarge) => {

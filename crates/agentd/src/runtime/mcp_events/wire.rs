@@ -17,6 +17,8 @@ pub const REVISION: &str = "2026-07-28";
 pub mod method {
     pub const LIST: &str = "events/list";
     pub const POLL: &str = "events/poll";
+    pub const SUBSCRIBE: &str = "events/subscribe";
+    pub const UNSUBSCRIBE: &str = "events/unsubscribe";
     pub const LIST_CHANGED: &str = "notifications/events/list_changed";
 }
 
@@ -27,6 +29,7 @@ pub mod code {
     pub const FORBIDDEN: i64 = -32024;
     pub const RESOURCE_EXHAUSTED: i64 = -32025;
     pub const UNSUPPORTED: i64 = -32026;
+    pub const CALLBACK_ENDPOINT_ERROR: i64 = -32027;
     pub const INVALID_PARAMS: i64 = -32602;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const HEADER_MISMATCH: i64 = -32020;
@@ -129,6 +132,85 @@ pub fn poll_params(
     p
 }
 
+/// The params of one webhook `events/subscribe` — a first subscribe or a
+/// refresh, the same call [SEP "Subscribing"]. `cursor` is the last one
+/// persisted, `null` for "from now"; `maxAgeMs` goes with a cursor only.
+pub fn subscribe_params(
+    name: &str,
+    arguments: &Map<String, Value>,
+    url: &str,
+    secret: &str,
+    cursor: Option<&str>,
+    max_age_ms: Option<u64>,
+    ttl_ms: u64,
+) -> Map<String, Value> {
+    let mut p = Map::new();
+    p.insert("name".into(), json!(name));
+    p.insert("arguments".into(), Value::Object(arguments.clone()));
+    p.insert(
+        "delivery".into(),
+        json!({"mode": "webhook", "url": url, "secret": secret}),
+    );
+    p.insert("cursor".into(), cursor.map_or(Value::Null, |c| json!(c)));
+    if let (Some(ms), Some(_)) = (max_age_ms, cursor) {
+        p.insert("maxAgeMs".into(), json!(ms));
+    }
+    p.insert("ttlMs".into(), json!(ttl_ms));
+    p
+}
+
+/// The params of one `events/unsubscribe`: the subscription key's parts the
+/// client supplies [SEP "Unsubscribing"].
+pub fn unsubscribe_params(
+    name: &str,
+    arguments: &Map<String, Value>,
+    url: &str,
+) -> Map<String, Value> {
+    let mut p = Map::new();
+    p.insert("name".into(), json!(name));
+    p.insert("arguments".into(), Value::Object(arguments.clone()));
+    p.insert("delivery".into(), json!({"url": url}));
+    p
+}
+
+/// An `events/subscribe` answer [SEP "Subscribing", "Webhook delivery
+/// status"]. `refreshBefore: null` is no expiry, which agentd never asks for.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subscribed {
+    pub id: String,
+    #[serde(default)]
+    pub refresh_before: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub delivery_status: Option<DeliveryStatus>,
+}
+
+/// How the server's deliveries to the callback are going. Optional, and
+/// `lastError` is one of a closed set of categories, never endpoint output.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryStatus {
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub throttled: Option<bool>,
+    #[serde(default)]
+    pub retry_after_ms: Option<u64>,
+}
+
+impl DeliveryStatus {
+    /// Some deliveries failed: suspended, or a last error reported.
+    pub fn failing(&self) -> bool {
+        self.active == Some(false) || self.last_error.is_some()
+    }
+}
+
 /// The params of one `events/list` page.
 pub fn list_params(cursor: Option<&str>) -> Map<String, Value> {
     let mut p = Map::new();
@@ -226,6 +308,56 @@ mod tests {
         assert!(declared(&json!({"extensions": {"io.example/x": {}}})).is_none());
         // A declaration that is not an object is not one.
         assert!(declared(&json!({"events": true})).is_none());
+    }
+
+    #[test]
+    fn the_seps_webhook_examples_read_through_the_wire_types() {
+        // [SEP "Subscribing"]
+        let ok: Subscribed = serde_json::from_value(json!({
+          "resultType": "complete",
+          "id": "sub_a3f1c8e2b0d49f7e",
+          "refreshBefore": "2026-02-19T16:30:00Z",
+          "cursor": "cursor_start_001",
+          "truncated": false
+        }))
+        .unwrap();
+        assert_eq!(ok.id, "sub_a3f1c8e2b0d49f7e");
+        assert!(ok.delivery_status.is_none());
+        // [SEP "Webhook delivery status"]
+        let failing: Subscribed = serde_json::from_value(json!({
+          "resultType": "complete", "id": "sub_a", "refreshBefore": "2026-02-19T17:00:00Z",
+          "cursor": "cursor_xyz", "truncated": false,
+          "deliveryStatus": {"active": false, "lastDeliveryAt": "2026-02-19T15:45:00Z",
+                             "lastError": "http_4xx", "failedSince": "2026-02-19T15:50:00Z"}
+        }))
+        .unwrap();
+        assert!(failing.delivery_status.unwrap().failing());
+        let throttled: DeliveryStatus = serde_json::from_value(json!({
+          "active": true, "lastDeliveryAt": "2026-02-19T16:28:00Z", "lastError": null,
+          "throttled": true, "retryAfterMs": 60000
+        }))
+        .unwrap();
+        assert!(!throttled.failing());
+        assert_eq!(throttled.retry_after_ms, Some(60000));
+        let args = json!({"severity": "P1"}).as_object().unwrap().clone();
+        let p = subscribe_params(
+            "incident.created",
+            &args,
+            "https://h/x",
+            "whsec_k",
+            None,
+            Some(1),
+            3_600_000,
+        );
+        assert_eq!(
+            p["delivery"],
+            json!({"mode": "webhook", "url": "https://h/x", "secret": "whsec_k"})
+        );
+        assert_eq!(p["cursor"], Value::Null);
+        assert!(!p.contains_key("maxAgeMs"));
+        assert_eq!(p["ttlMs"], 3_600_000);
+        let u = unsubscribe_params("incident.created", &args, "https://h/x");
+        assert_eq!(u["delivery"], json!({"url": "https://h/x"}));
     }
 
     #[test]

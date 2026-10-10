@@ -87,11 +87,12 @@ fn dispatch() -> i32 {
 }
 
 /// `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]
-/// [--protocol-version <v>] [--events <extension|top-level|none>]`: the mock
+/// [--protocol-version <v>] [--events <extension|top-level|none>]
+/// [--hook-ca <pem>]`: the mock
 /// at 2025-11-25 (the `initialize` handshake; the default) or 2026-07-28
 /// (`server/discover`), its MCP Events declared in SEP-3415's spelling (the
-/// default), the design sketch's, or not at all. Anything else is a usage
-/// error.
+/// default), the design sketch's, or not at all; its webhook deliveries
+/// trust the CA in `--hook-ca`. Anything else is a usage error.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 fn mock_mcp_http(args: &[String]) -> i32 {
     use agentd::mcp::mock_http::{Lifecycle, Options, run_with};
@@ -125,6 +126,7 @@ fn mock_mcp_http(args: &[String]) -> i32 {
                     }
                 };
             }
+            "--hook-ca" => opts.hook_ca = it.next().cloned(),
             _ => positional.push(arg.as_str()),
         }
     }

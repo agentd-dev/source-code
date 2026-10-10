@@ -220,6 +220,12 @@ pub mod oauth;
 // scaffolding.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_events;
+#[cfg(all(
+    any(feature = "internal-mocks", debug_assertions),
+    feature = "mcp-events",
+    feature = "tls"
+))]
+pub mod mock_hooks;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
 

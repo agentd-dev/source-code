@@ -60,6 +60,31 @@ const FORBIDDEN: i64 = -32024;
 const UNSUPPORTED: i64 = -32026;
 const INVALID_PARAMS: i64 = -32602;
 
+impl Events {
+    /// `(head, floor)` of `topic`: its newest sequence, and the position
+    /// below which retention trimmed.
+    pub fn position(&self, topic: &str) -> (u64, u64) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let head = g.head.get(topic).copied().unwrap_or(0);
+        let floor = g
+            .log
+            .get(topic)
+            .and_then(|l| l.first())
+            .map_or(head, |(s, _, _)| s - 1);
+        (head, floor)
+    }
+
+    /// The occurrence at `seq` of `topic`, if it is kept.
+    pub fn occurrence(&self, topic: &str, seq: u64) -> Option<Value> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.log
+            .get(topic)?
+            .iter()
+            .find(|(s, _, _)| *s == seq)
+            .map(|(_, _, o)| o.clone())
+    }
+}
+
 /// The capabilities member that declares Events, in `spelling`.
 pub fn declare(caps: &mut Value, spelling: Spelling) {
     match spelling {
@@ -76,7 +101,7 @@ fn descriptors(later: bool) -> Vec<Value> {
         json!({
             "name": "mock.tick",
             "description": "an occurrence the mock.event control tool appends",
-            "delivery": ["poll"],
+            "delivery": ["poll", "webhook"],
             "inputSchema": {"type": "object", "additionalProperties": false,
                             "properties": {"topic": {"type": "string"}}},
             "payloadSchema": {"type": "object", "required": ["n"],

@@ -688,6 +688,14 @@ impl Runtime {
             }
             let previous = std::mem::replace(&mut self.mcp, set);
             self.mcp_specs = specs;
+            // A replaced or dropped connection's webhook subscriptions are
+            // let go on that connection (RFC 0045 §5.6.3).
+            #[cfg(feature = "mcp-events")]
+            for name in &touched {
+                if let Some(old) = previous.get(name) {
+                    self.events_connection_replaced(name, std::sync::Arc::clone(old));
+                }
+            }
             for r in &dropped {
                 if skills.is_none() {
                     self.skills.forget_server(r);

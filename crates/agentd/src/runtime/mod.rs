@@ -1155,6 +1155,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // a wait that can never be woken fails its step, and failing a step
     // resolves it against the definition its run started with.
     rt.resubscribe_waits(&|_, _| true, "boot");
+    // A restored `wait on: webhook` is served its callback again.
+    #[cfg(feature = "a2a")]
+    rt.restore_webhook_callbacks();
     // MCP Events bindings: listed and polled from the loop, from the cursors
     // the store kept.
     #[cfg(feature = "mcp-events")]
@@ -1226,6 +1229,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             &rt.settings.webhooks,
             nodes,
             rt.webhook_callbacks.clone(),
+            #[cfg(feature = "mcp-events")]
+            rt.events_hook_routes(),
             rt.events_tx.clone(),
             &envmap,
             write_timeout,

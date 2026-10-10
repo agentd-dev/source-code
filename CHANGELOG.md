@@ -48,7 +48,7 @@ grant, a workflow's `wait` and the model (the `events.*` tools) subscribe at
 runtime. The feature ships in the release binaries and says at load that it
 tracks a draft.
 
-### MCP Events (RFC 0045 P2)
+### MCP Events (RFC 0045 P2, P3)
 
 **Added.**
 
@@ -101,14 +101,33 @@ tracks a draft.
   / `rmcp_transport::ListenExtension` (filter members and notifications an
   extension adds to a connection's listen).
 - The built-in mock serves Events on its 2026-07-28 edge (`--events
-  extension|top-level|none`).
+  extension|top-level|none`), webhook delivery included (`--hook-ca`).
+- Webhook delivery (P3): `delivery: [webhook, …]`, the server POSTing each
+  occurrence to the webhook listener at `<webhooks.url>/hooks/_mcp/<binding>`.
+  Every arm is a fresh subscription (unsubscribe, then subscribe from the
+  stored cursor) under a secret minted for it and held in memory only, so
+  what the server abandoned while agentd was away is replayed; the lease is
+  refreshed at 80%. The listener checks the Standard Webhooks signature
+  before anything else and answers the verification challenge only under it;
+  an occurrence is answered `200` once durably appended, `429`/`503` when it
+  cannot be kept yet — and while such a refusal is outstanding no cursor is
+  persisted, so the server's watermark cannot carry it past an occurrence it
+  gave up; a refusal outstanding for 5 minutes pauses the binding until it
+  can re-arm. A refresh reporting failed deliveries re-arms from the cursor;
+  `gap` and `terminated` envelopes are taken; removal and a credential
+  change unsubscribe on the connection the subscription was made on. Load
+  checks: the listener, an `https://` `webhooks.url`, no client-certificate
+  listener, a credential on the server.
+- A `wait {on: webhook}` survives a restart: its record keeps the callback
+  route and its auth references (never a resolved secret), and boot serves
+  the route again. It could only time out after one before.
 - `webhooks.url` (restart-only): the URL the webhook listener is reached at
   from outside, behind a proxy — `https://` (loopback `http://` aside), never
   a wildcard host, with an optional path prefix. A `wait {on: webhook}`'s
   callback URL is built on it, where it was built on the bound `listen`.
 - agentd-mcp: `RawHandler::body_limit` — a per-path body cap, answered `413`
-  on the declared `Content-Length` before the body is read (an over-long body
-  was dropped without an answer).
+  on the declared `Content-Length`, the body never buffered (an over-long
+  body was dropped without an answer).
 
 ### MCP 2026-07-28 (RFC 0045 P1)
 

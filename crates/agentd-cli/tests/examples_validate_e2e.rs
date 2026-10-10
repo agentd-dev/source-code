@@ -15,7 +15,8 @@
     feature = "cel",
     feature = "sign",
     feature = "cron",
-    feature = "mcp-events"
+    feature = "mcp-events",
+    feature = "a2a"
 ))]
 mod common;
 
@@ -24,7 +25,8 @@ use std::path::{Path, PathBuf};
     feature = "cel",
     feature = "sign",
     feature = "cron",
-    feature = "mcp-events"
+    feature = "mcp-events",
+    feature = "a2a"
 ))]
 use std::process::Command;
 
@@ -37,7 +39,8 @@ fn examples_root() -> PathBuf {
     feature = "cel",
     feature = "sign",
     feature = "cron",
-    feature = "mcp-events"
+    feature = "mcp-events",
+    feature = "a2a"
 ))]
 fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -59,7 +62,8 @@ fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
     feature = "cel",
     feature = "sign",
     feature = "cron",
-    feature = "mcp-events"
+    feature = "mcp-events",
+    feature = "a2a"
 ))]
 fn secret_names(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -75,8 +79,9 @@ fn secret_names(text: &str) -> Vec<String> {
 }
 
 /// The examples are written against the RELEASE build. Two use a CEL `when:`,
-/// one binds MCP Events, one carries a `trust` pin and several schedule on a
-/// `cron`, so a build without `cel`, `mcp-events`, `sign` or `cron` refuses
+/// two bind MCP Events (one delivered by webhook, which rides the `a2a`
+/// listener), one carries a `trust` pin and several schedule on a `cron`, so a
+/// build without `cel`, `mcp-events`, `a2a`, `sign` or `cron` refuses
 /// them for a reason that has nothing
 /// to do with whether the example is current. This asks its question only on a build that can answer it — if a
 /// future example needs another feature, it says so by failing here.
@@ -85,7 +90,8 @@ fn secret_names(text: &str) -> Vec<String> {
     feature = "cel",
     feature = "sign",
     feature = "cron",
-    feature = "mcp-events"
+    feature = "mcp-events",
+    feature = "a2a"
 ))]
 fn every_shipped_example_config_validates() {
     let mut files = Vec::new();
@@ -247,7 +253,8 @@ fn the_roots_beside_a_tainted_route_keep_their_read_backs() {
     feature = "cel",
     feature = "sign",
     feature = "cron",
-    feature = "mcp-events"
+    feature = "mcp-events",
+    feature = "a2a"
 ))]
 #[test]
 fn the_server_fragment_layers_under_a_config_and_its_trifecta_is_refused() {

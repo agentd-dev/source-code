@@ -493,13 +493,80 @@ that could would choose an upstream subscription and decide how often runs
 start. Editing a binding never re-dials its server; a reload applies an
 edited one in place, stops a removed one, and arms an added one.
 
-**Delivery.** This build delivers by **poll**: agentd asks
-`events/poll` from its stored cursor, at the interval the server names
-(`nextPollMs`, never under 1 s, jittered), at once again while the server says
-`hasMore` and the page held something new (ten times in a row at most).
-Webhook delivery comes next (RFC 0045 P3); a binding listing `webhook` is
-refused at load until then. Polls run on four threads of their own, so a slow
+**Delivery.** `delivery` lists the modes the operator accepts, in
+preference order; agentd uses the first the server offers for the type (push
+waits on the SEP). Requests run on four threads of their own, so a slow
 server never holds the loop.
+
+- **Poll.** agentd asks `events/poll` from its stored cursor, at the interval
+  the server names (`nextPollMs`, never under 1 s, jittered), at once again
+  while the server says `hasMore` and the page held something new (ten times
+  in a row at most).
+- **Webhook.** The server POSTs each occurrence to agentd's webhook listener.
+  It needs the listener (`webhooks.listen`, the `a2a` feature, no
+  `webhooks.tls.client_ca` — no server presents a client certificate), a
+  `webhooks.url` the server can reach (`https://`; one that is not a
+  globally routable address is warned about, since a server may refuse it),
+  and a credential on the server (`auth`, `oauth`, `aauth`, an
+  `Authorization` header, or a catalogued service with one), because the
+  server keys the subscription by the authenticated principal. All of it is
+  checked at load.
+
+  ```yaml
+  webhooks:
+    listen: https://0.0.0.0:8443
+    url: https://agent.example.com:8443     # where the server delivers
+    tls: {cert: /etc/agentd/tls.crt, key: /etc/agentd/tls.key}
+  mcp:
+    servers:
+      - name: pagerduty
+        service: pagerduty
+        events:
+          - name: incident.created
+            delivery: [webhook, poll]       # webhook where offered, else poll
+            into: {stream: incidents, subject: incident.created}
+            ttl: 1h                         # the lease agentd asks for (default 1h)
+  ```
+
+  Each binding has its own route, `<webhooks.url>/hooks/_mcp/<binding>`, the
+  same across restarts. Every arm — boot, a re-dial, a resume — is a **fresh
+  subscription**: `events/unsubscribe`, then `events/subscribe` from the
+  stored cursor, under a secret minted for it from the kernel CSPRNG and held
+  in memory only. A fresh subscription is how what the server gave up on
+  while agentd was away comes back: the server replays from the cursor. The
+  lease is refreshed at 80% of what the server grants.
+
+  The listener checks every request's Standard Webhooks signature first —
+  all four headers, the timestamp within 5 minutes, the HMAC over the raw
+  body, the subscription id once known — and nothing else on these routes
+  authenticates (`webhooks.default_auth` does not apply; a server cannot send
+  a bearer). It answers the server's verification challenge itself, and only
+  under a signature that verifies. An occurrence is answered `200` once it is
+  durably appended (`duplicate` when the dedup set has it); `413` over 256 KiB,
+  before the body is read; `410` when it is malformed, or the route has no
+  binding; `429` or `503` when it cannot be kept yet (pressure, the binding's
+  `rate`, a degraded store), which the server retries. While such a refusal
+  is outstanding agentd persists no cursor — the server's watermark would
+  move past the refused occurrence if it gave it up — and a refusal still
+  outstanding after 5 minutes pauses the binding: it unsubscribes, keeps its
+  cursor, and re-arms from it once the cause clears. A refresh reporting
+  failed deliveries (`deliveryStatus`) re-arms from the stored cursor too. A
+  `gap` envelope is `mcp.events.gap`; `terminated` with `Forbidden` refuses
+  the binding, with `NotFound` or `Unsupported` lists the server again, with
+  anything else re-arms after a backoff. A mode the server would not deliver
+  in (`Unsupported`, or five failed endpoint verifications in a row) is passed
+  over for the operator's next one until a reload or a re-dial decides
+  afresh. A re-arm that cannot first let go of the old subscription fails and
+  is retried — a subscribe that found it still live would be a refresh, and
+  replay nothing. Removing a binding, or a reload that changes its
+  server's credential, unsubscribes it on the connection it was made on.
+  agentd does not unsubscribe at shutdown: the next boot re-arms.
+
+  Each instance holds its own subscriptions, so replicas need distinct
+  `webhooks.url`s. Two losses stay invisible on the wire: a server that
+  omits `deliveryStatus` and gives up deliveries that never reached agentd,
+  and anything missed on a type without replay (`cursor: null`, said as
+  `mcp.events.gap` with cause `no_replay`).
 
 **What lands on the stream.** One stream event per occurrence:
 

@@ -4,7 +4,7 @@
 //! goes back to the loop as an event; the loop is the single writer of
 //! streams and records.
 
-use super::wire::{self, Descriptor, PollPage};
+use super::wire::{self, Descriptor, PollPage, Subscribed};
 use crate::mcp::client::McpClient;
 use crate::runtime::events::Event;
 use serde_json::{Map, Value};
@@ -31,6 +31,34 @@ pub enum Job {
         /// Which poll of the binding this is (see `Binding::generation`).
         generation: u64,
         client: Arc<McpClient>,
+        params: Map<String, Value>,
+        bound: Duration,
+    },
+    /// A webhook arm or refresh: `events/subscribe`. An arm is a fresh
+    /// subscription — `unsubscribe` first (whatever it answers), on the
+    /// connection a credential change replaced (`prior`) and on this one —
+    /// so the server replays from the cursor (§5.6.3).
+    Arm {
+        key: String,
+        generation: u64,
+        server: String,
+        client: Arc<McpClient>,
+        prior: Option<Arc<McpClient>>,
+        /// Fresh: unsubscribe first. The subscription's key either way, for
+        /// letting go of what this arm made if its binding is gone by then.
+        fresh: bool,
+        unsubscribe: Map<String, Value>,
+        subscribe: Map<String, Value>,
+        bound: Duration,
+    },
+    /// An eager `events/unsubscribe`: a webhook binding stopped — on the
+    /// connection a reload replaced (`prior`), then on `client`.
+    Unsubscribe {
+        key: String,
+        generation: u64,
+        server: String,
+        client: Option<Arc<McpClient>>,
+        prior: Option<Arc<McpClient>>,
         params: Map<String, Value>,
         bound: Duration,
     },
@@ -61,7 +89,6 @@ impl std::fmt::Display for Failure {
 }
 
 /// One answer, back to the loop.
-#[derive(Debug)]
 pub enum Done {
     List {
         server: String,
@@ -72,6 +99,72 @@ pub enum Done {
         generation: u64,
         result: Result<PollPage, Failure>,
     },
+    Arm {
+        key: String,
+        generation: u64,
+        /// A fresh subscription, not a refresh.
+        fresh: bool,
+        result: Result<Subscribed, Failure>,
+        /// What made it, to let it go again if its binding is gone.
+        server: String,
+        client: Arc<McpClient>,
+        unsubscribe: Map<String, Value>,
+    },
+    Unsubscribe {
+        key: String,
+        generation: u64,
+        server: String,
+        result: Result<(), Failure>,
+    },
+}
+
+impl std::fmt::Debug for Done {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Done::List { server, result } => f
+                .debug_struct("List")
+                .field("server", server)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Done::Poll {
+                key,
+                generation,
+                result,
+            } => f
+                .debug_struct("Poll")
+                .field("key", key)
+                .field("generation", generation)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Done::Arm {
+                key,
+                generation,
+                fresh,
+                result,
+                server,
+                ..
+            } => f
+                .debug_struct("Arm")
+                .field("key", key)
+                .field("generation", generation)
+                .field("fresh", fresh)
+                .field("server", server)
+                .field("ok", &result.is_ok())
+                .finish_non_exhaustive(),
+            Done::Unsubscribe {
+                key,
+                generation,
+                server,
+                result,
+            } => f
+                .debug_struct("Unsubscribe")
+                .field("key", key)
+                .field("generation", generation)
+                .field("server", server)
+                .field("ok", &result.is_ok())
+                .finish(),
+        }
+    }
 }
 
 pub struct Pool {
@@ -130,6 +223,54 @@ fn work(rx: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
                 }),
                 key,
             },
+            Job::Arm {
+                key,
+                generation,
+                server,
+                client,
+                prior,
+                fresh,
+                unsubscribe,
+                subscribe,
+                bound,
+            } => Done::Arm {
+                result: arm(
+                    &client,
+                    prior.as_deref(),
+                    fresh,
+                    &unsubscribe,
+                    subscribe,
+                    bound,
+                ),
+                key,
+                generation,
+                fresh,
+                server,
+                client,
+                unsubscribe,
+            },
+            Job::Unsubscribe {
+                key,
+                generation,
+                server,
+                client,
+                prior,
+                params,
+                bound,
+            } => {
+                if let Some(prior) = &prior {
+                    let _ = call(prior, wire::method::UNSUBSCRIBE, params.clone(), bound);
+                }
+                Done::Unsubscribe {
+                    result: match &client {
+                        Some(c) => call(c, wire::method::UNSUBSCRIBE, params, bound).map(|_| ()),
+                        None => Ok(()),
+                    },
+                    key,
+                    generation,
+                    server,
+                }
+            }
         };
         if events.send(Event::McpEvents(Box::new(done))).is_err() {
             return;
@@ -148,6 +289,39 @@ fn call(
         Ok(Err(e)) => Err(Failure::Rpc(e)),
         Err(e) => Err(Failure::Transport(e.to_string())),
     }
+}
+
+/// A webhook arm or refresh. A fresh one first lets go of the old
+/// subscription — on the replaced connection, whatever it answers, then on
+/// this one, which must answer that it did (or that there was none): a
+/// subscribe that found the old one still live would be a refresh, whose
+/// cursor is a no-op, and nothing abandoned would be replayed.
+fn arm(
+    client: &McpClient,
+    prior: Option<&McpClient>,
+    fresh: bool,
+    unsubscribe: &Map<String, Value>,
+    subscribe: Map<String, Value>,
+    bound: Duration,
+) -> Result<Subscribed, Failure> {
+    if fresh {
+        if let Some(prior) = prior {
+            let _ = call(prior, wire::method::UNSUBSCRIBE, unsubscribe.clone(), bound);
+        }
+        match call(
+            client,
+            wire::method::UNSUBSCRIBE,
+            unsubscribe.clone(),
+            bound,
+        ) {
+            Ok(_) => {}
+            Err(Failure::Rpc(r)) if r.code == wire::code::NOT_FOUND => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let v = call(client, wire::method::SUBSCRIBE, subscribe, bound)?;
+    serde_json::from_value::<Subscribed>(v)
+        .map_err(|e| Failure::Transport(format!("events/subscribe: {e}")))
 }
 
 /// Every page of `events/list`, within the caps.

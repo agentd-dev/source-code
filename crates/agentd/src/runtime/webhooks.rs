@@ -439,6 +439,9 @@ pub struct WebhookHandler {
     pressure: std::sync::Arc<super::pressure::Pressure>,
     /// The dynamic `wait: {on: webhook}` await callbacks (shared with the loop).
     callbacks: SharedCallbacks,
+    /// The MCP Events webhook bindings' routes (shared with the loop).
+    #[cfg(feature = "mcp-events")]
+    mcp_hooks: crate::runtime::mcp_events::hook::Routes,
     events_tx: Sender<Event>,
     timeout: Duration,
     log: Logger,
@@ -448,6 +451,18 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
     fn handle(&self, req: &::mcp::http_server::RawRequest) -> ::mcp::http_server::RawResponse {
         use ::mcp::http_server::RawResponse as R;
         let path = req.path().to_string();
+        // An MCP Events webhook binding's route: its own verification, no
+        // listener default auth — a server cannot send a bearer [SEP].
+        #[cfg(feature = "mcp-events")]
+        if path.starts_with(crate::runtime::mcp_events::hook::PATH_PREFIX) {
+            return crate::runtime::mcp_events::hook::serve(
+                &self.mcp_hooks,
+                req,
+                &self.events_tx,
+                self.timeout,
+                &self.log,
+            );
+        }
         // A static `webhook` start-node route. The table is cloned out of the
         // lock so a concurrent reload never blocks (or is blocked by) a
         // request in flight.
@@ -490,6 +505,17 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
             });
         }
         R::text(404, "Not Found", b"no webhook at this path".to_vec())
+    }
+
+    /// An MCP Events delivery is at most 256 KiB [SEP "Delivery profile"],
+    /// refused `413` before it is read.
+    fn body_limit(&self, _method: &str, path: &str) -> usize {
+        #[cfg(feature = "mcp-events")]
+        if path.starts_with(crate::runtime::mcp_events::hook::PATH_PREFIX) {
+            return crate::runtime::mcp_events::hook::MAX_BODY;
+        }
+        let _ = path;
+        ::mcp::http_server::MAX_BODY
     }
 }
 
@@ -926,6 +952,7 @@ pub(crate) fn spawn_webhook_listener(
     webhooks: &Webhooks,
     nodes: Vec<WebhookNode>,
     callbacks: SharedCallbacks,
+    #[cfg(feature = "mcp-events")] mcp_hooks: crate::runtime::mcp_events::hook::Routes,
     events_tx: Sender<Event>,
     env: &dyn Fn(&str) -> Option<String>,
     write_timeout: Duration,
@@ -980,6 +1007,8 @@ pub(crate) fn spawn_webhook_listener(
         routes: std::sync::RwLock::new(Arc::new(routes)),
         pressure,
         callbacks,
+        #[cfg(feature = "mcp-events")]
+        mcp_hooks,
         events_tx,
         timeout: write_timeout,
         log: log.clone(),
@@ -1480,11 +1509,90 @@ impl crate::runtime::reactor::Runtime {
             "webhook.await.armed",
             json!({"run": run_id, "step": step_id, "path": path, "url": url}),
         );
+        // The route and its auth — as written, references and all, never a
+        // resolved secret — go in the durable wait record, so a restart can
+        // serve the callback again (`restore_webhook_callbacks`).
+        let route = json!({"path": path, "auth": wcfg.and_then(|w| w.get("auth")).cloned()});
         self.suspend_wait(
             run_id,
             step_id,
-            super::waits::wait_record("signal", json!({"signal": token}), timeout_ms),
+            super::waits::wait_record(
+                "signal",
+                json!({"signal": token, "webhook": route}),
+                timeout_ms,
+            ),
         );
+    }
+
+    /// At boot: serve again the callback of every `wait {on: webhook}` still
+    /// suspended, from its durable record — the callback map lives in memory,
+    /// and without this a restarted wait could only time out. A route whose
+    /// auth no longer resolves fails its step, saying why.
+    pub(crate) fn restore_webhook_callbacks(&mut self) {
+        use crate::engine::run::StepStatus;
+        let mut routes: Vec<(String, String, String, String, Option<Value>, u64)> = Vec::new();
+        for (rid, run) in &self.runs {
+            if run.status.is_terminal() {
+                continue;
+            }
+            for (sid, st) in &run.steps {
+                let Some(w) = st
+                    .wait
+                    .as_ref()
+                    .filter(|_| st.status == StepStatus::Suspended)
+                else {
+                    continue;
+                };
+                let (Some(signal), Some(path)) =
+                    (w["signal"].as_str(), w["webhook"]["path"].as_str())
+                else {
+                    continue;
+                };
+                let expires = w["deadline_ms"]
+                    .as_u64()
+                    .unwrap_or_else(|| w["since_ms"].as_u64().unwrap_or_else(now_ms) + 3_600_000);
+                let auth = w["webhook"].get("auth").filter(|a| !a.is_null()).cloned();
+                routes.push((
+                    rid.clone(),
+                    sid.clone(),
+                    signal.to_string(),
+                    path.to_string(),
+                    auth,
+                    expires,
+                ));
+            }
+        }
+        let env = |k: &str| std::env::var(k).ok();
+        for (run, step, signal, path, auth, expires_ms) in routes {
+            match build_verify(
+                auth.as_ref(),
+                self.settings.webhooks.default_auth.as_ref(),
+                &env,
+            ) {
+                Ok(verify) => {
+                    self.webhook_callbacks.lock().unwrap().insert(
+                        path.clone(),
+                        Callback {
+                            signal,
+                            verify,
+                            expires_ms,
+                        },
+                    );
+                    self.log.info(
+                        "webhook.await.restored",
+                        json!({"run": run, "step": step, "path": path}),
+                    );
+                }
+                Err(e) => self.finish_step_pub(
+                    &run,
+                    &step,
+                    StepStatus::Failed,
+                    None,
+                    Some(format!("wait webhook: {e}")),
+                    0,
+                ),
+            }
+        }
     }
 }
 

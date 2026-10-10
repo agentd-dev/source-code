@@ -781,6 +781,8 @@ impl Runtime {
             } => self.on_subscribe_read(&server, &uri, content),
             #[cfg(feature = "mcp-events")]
             Event::McpEvents(done) => self.on_events_done(*done),
+            #[cfg(feature = "mcp-events")]
+            Event::McpEventHook(d) => self.events_hook_delivery(*d),
             Event::Background { .. } | Event::Tick => {}
         }
     }

@@ -370,6 +370,7 @@ impl StreamableHttpClient for AgentdHttp {
                 &hangup,
             );
             if let (Some(n), Err(HttpError::Http(io))) = (&idle_cuts, &resp)
+                && hangup.streamed()
                 && matches!(
                     io.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut

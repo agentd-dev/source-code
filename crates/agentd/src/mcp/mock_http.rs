@@ -189,7 +189,10 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 req.id,
                 json!({
                     "protocolVersion": if state.listen { "2026-07-28" } else { PROTOCOL_VERSION },
-                    "capabilities": {"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
+                    // At the stateless revision a `listChanged` would open a
+                    // standing listen beside the URI listen the tests watch;
+                    // this mock offers none there.
+                    "capabilities": {"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": !state.listen}, "tools": {}, "prompts": {"listChanged": !state.listen}},
                     "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
                 }),
             ),

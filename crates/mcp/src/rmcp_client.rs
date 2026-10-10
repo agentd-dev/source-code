@@ -299,12 +299,14 @@ pub struct RmcpClient {
     /// Set once the server refused a listen that asked for its
     /// `list_changed` notifications ([`ListenEvent::FlagsRefused`]).
     flags_refused: std::sync::atomic::AtomicBool,
-    /// Every tool name the server's `tools/list` answers named.
+    /// The tool names the server's `tools/list` answers named during the
+    /// current list (recorded by the transport, taken by the list).
     tools_seen: ToolNames,
-    /// The names rmcp handed back from those lists: the tools it kept.
-    tools_kept: Mutex<std::collections::BTreeSet<String>>,
-    /// Dropped tools already reported ([`Self::drain_dropped_tools`]).
+    /// Tools dropped by the last list and already named, so each is named
+    /// once while it stays dropped.
     tools_reported: Mutex<std::collections::BTreeSet<String>>,
+    /// Dropped tools not yet drained by the host.
+    tools_dropped: Mutex<Vec<String>>,
 }
 
 /// Builder state, so the host can declare capabilities before connecting (the
@@ -455,6 +457,7 @@ impl RmcpBuilder {
         };
         let first = self.first;
         let bound = self.handshake_bound;
+        let started = std::time::Instant::now();
         let (service, raw_caps, idle_cuts, tools_seen) = rt
             .block_on(async move {
                 match bound {
@@ -509,8 +512,8 @@ impl RmcpBuilder {
             idle_cuts,
             flags_refused: std::sync::atomic::AtomicBool::new(false),
             tools_seen,
-            tools_kept: Mutex::default(),
             tools_reported: Mutex::default(),
+            tools_dropped: Mutex::default(),
         };
         // rmcp sends a tool's `Mcp-Param-*` headers only for tools whose
         // schema it has cached on this connection from a `tools/list` — and a
@@ -521,7 +524,8 @@ impl RmcpBuilder {
         // and a connection that cannot list cannot send those headers, and
         // fails. One POST per dial, as the probe is for an older server.
         if client.listens() && client.caps.tools.is_some() {
-            client.prime(bound)?;
+            // Inside the handshake bound: what is left of it, not a new one.
+            client.prime(bound.map(|b| b.saturating_sub(started.elapsed())))?;
         }
         client.stand();
         Ok(client)
@@ -812,28 +816,61 @@ impl RmcpClient {
     }
 
     pub fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
+        self.forget_seen();
         let res = self
             .rt
             .block_on(self.service.list_all_tools())
-            .map_err(|e| self.fail("tools/list", e))?;
-        self.kept(&res);
+            .map_err(|e| self.fail("tools/list", e));
+        let res = self.listed(res)?;
         self.convert(&res, "tools/list")
     }
 
     /// The priming list (see `connect`), bounded like the startup.
     fn prime(&self, bound: Option<Duration>) -> Result<(), McpError> {
+        self.forget_seen();
         let res = self
-            .bounded(bound, "tools/list", self.service.list_all_tools())?
-            .map_err(|e| self.fail("tools/list", e))?;
-        self.kept(&res);
-        Ok(())
+            .bounded(bound, "tools/list", self.service.list_all_tools())
+            .and_then(|r| r.map_err(|e| self.fail("tools/list", e)));
+        self.listed(res).map(|_| ())
     }
 
-    fn kept(&self, tools: &[rmcp::model::Tool]) {
-        self.tools_kept
+    fn forget_seen(&self) {
+        self.tools_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .extend(tools.iter().map(|t| t.name.to_string()));
+            .clear();
+    }
+
+    /// Compare what this list's answers named with what rmcp kept, and queue
+    /// each newly dropped tool once. A failed list compares nothing; a tool
+    /// kept again can be named again if it is dropped later.
+    fn listed(
+        &self,
+        res: Result<Vec<rmcp::model::Tool>, McpError>,
+    ) -> Result<Vec<rmcp::model::Tool>, McpError> {
+        let seen = std::mem::take(&mut *self.tools_seen.lock().unwrap_or_else(|e| e.into_inner()));
+        let tools = res?;
+        let kept: std::collections::BTreeSet<&str> =
+            tools.iter().map(|t| t.name.as_ref()).collect();
+        let dropped: std::collections::BTreeSet<String> = seen
+            .into_iter()
+            .filter(|t| !kept.contains(t.as_str()))
+            .collect();
+        let mut reported = self
+            .tools_reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reported.retain(|t| dropped.contains(t));
+        let fresh: Vec<String> = dropped
+            .into_iter()
+            .filter(|t| !reported.contains(t))
+            .collect();
+        reported.extend(fresh.iter().cloned());
+        self.tools_dropped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(fresh);
+        Ok(tools)
     }
 
     /// Tools the server listed that rmcp dropped, each named once per
@@ -842,22 +879,7 @@ impl RmcpClient {
     /// so only to its own tracing — so the agent would lose a tool with
     /// nothing in any log. This crate has no logger; the host says it.
     pub fn drain_dropped_tools(&self) -> Vec<String> {
-        let seen = self
-            .tools_seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let kept = self.tools_kept.lock().unwrap_or_else(|e| e.into_inner());
-        let mut reported = self
-            .tools_reported
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dropped: Vec<String> = seen
-            .into_iter()
-            .filter(|t| !kept.contains(t) && !reported.contains(t))
-            .collect();
-        reported.extend(dropped.iter().cloned());
-        dropped
+        std::mem::take(&mut *self.tools_dropped.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// `tools/call`, bounded as a whole by `bound` when there is one. `meta`
@@ -1250,7 +1272,10 @@ impl RmcpClient {
         let subscription =
             match self.bounded(bound, "subscriptions/listen", peer.listen(flagged.clone()))? {
                 Ok(s) => s,
-                Err(e) if !uris.is_empty() && self.wants_list_changed() => {
+                // Only a refusal: a transport failure says nothing about the flags,
+                // and turning them off for it would cost the connection its
+                // `list_changed` notifications for good.
+                Err(e) if listen_refused(&e) && !uris.is_empty() && self.wants_list_changed() => {
                     let plain = self.filter_for(uris, false);
                     match self.bounded(bound, "subscriptions/listen", peer.listen(plain))? {
                         Ok(s) => {
@@ -1348,6 +1373,11 @@ fn acknowledged(filter: &SubscriptionFilter) -> std::collections::BTreeSet<Strin
         .collect()
 }
 
+/// The most listen events a connection keeps until its host drains them. A
+/// connection nothing drains (a turn worker's) keeps only the latest, so a
+/// server that stays down does not grow its queue without end.
+const LISTEN_EVENTS_KEPT: usize = 256;
+
 /// What a listen pump shares with its connection.
 #[derive(Clone)]
 struct PumpCtx {
@@ -1361,10 +1391,11 @@ struct PumpCtx {
 
 impl PumpCtx {
     fn report(&self, e: ListenEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(e);
+        let mut q = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        if q.len() >= LISTEN_EVENTS_KEPT {
+            q.remove(0);
+        }
+        q.push(e);
     }
 
     fn queue_update(&self, uri: &str) {
@@ -1392,60 +1423,109 @@ impl PumpCtx {
     }
 }
 
-/// What the pump last saw of each URI it holds, while a listen was live.
+/// Did the server refuse a listen in JSON-RPC as one it will not take — a
+/// method it does not have, a filter it does not accept? Asking again gets the
+/// same answer. A transport failure is not that: agentd's socket answers one
+/// as an internal error.
+fn listen_refused(e: &rmcp::ServiceError) -> bool {
+    matches!(
+        e,
+        rmcp::ServiceError::McpError(d)
+            if d.code == ErrorCode::INVALID_PARAMS || d.code == ErrorCode::METHOD_NOT_FOUND
+    )
+}
+
+/// Work for the [`resync`] reader.
+enum Job {
+    /// A listen was acknowledged: take what these URIs hold now.
+    Baseline(Vec<String>),
+    /// A live update arrived for this URI: read it again.
+    Reread(String),
+    /// The stream was seen to end at this instant.
+    Ended(std::time::Instant),
+    /// A re-listen was acknowledged: wake each of these URIs that changed.
+    Resync(Vec<String>),
+}
+
+/// The pump's reads, on a task of their own so the pump drains its stream at
+/// memory speed: rmcp ends a subscription whose 64-slot buffer fills, and a
+/// pump that read after every update would fill it in any burst.
 ///
 /// Listens cannot be resumed — a re-opened one starts from now — so an update
 /// sent while one was being re-opened is gone. What agentd guarantees instead
-/// is that state converges: after every re-listen, a held URI whose content
-/// differs from what was last seen while a listen was live gets ONE wake
-/// (`resources/updated`), and the waits, starts and instruction it reaches
-/// read it as they would any update. Changes inside one gap are coalesced; a
-/// change reverted inside the gap is not delivered. A URI with no such
-/// baseline (`None`: never read while live, or a read that failed) is woken.
-#[derive(Default)]
-struct Baseline {
-    seen: std::collections::BTreeMap<String, Option<String>>,
-    /// URIs re-read after a live update, and when, since the stream last
-    /// proved alive with a frame: a read that finished just before the stream
-    /// was seen to end may have run in the gap.
-    unproven: std::collections::BTreeMap<String, std::time::Instant>,
-}
-
-/// How soon before a stream is seen to end a read must have finished to be
-/// doubted. A stream's end reaches the pump within milliseconds of the
-/// connection closing; a read that finished well before it saw a live stream.
-const UNPROVEN: Duration = Duration::from_secs(1);
-
-impl Baseline {
-    /// Record what every acknowledged URI holds now, while the listen is live.
-    async fn take(&mut self, ctx: &PumpCtx, filter: &SubscriptionFilter) {
-        for uri in acknowledged(filter) {
-            let now = ctx.read(&uri).await;
-            self.seen.insert(uri, now);
+/// is that state converges: what each held URI holds is read when a listen is
+/// acknowledged and after each live update; after every re-listen it is read
+/// again, and a URI whose content differs, or cannot be compared, gets ONE
+/// wake (`resources/updated`), which the waits, starts and instruction on it
+/// read as they would any update. Changes inside one gap are coalesced; a
+/// change reverted inside the gap is not delivered. A read that finished after
+/// the stream was seen to end may have run in the gap, so it is doubted, and
+/// its URI woken. Only that one: a wake is not free — a one-shot `wait` it
+/// reaches resolves — so a URI is never woken on suspicion alone. `pending`
+/// coalesces re-reads: a burst of updates for one URI costs one read.
+async fn resync(
+    ctx: PumpCtx,
+    mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
+    pending: Arc<Mutex<std::collections::BTreeSet<String>>>,
+) {
+    // What each URI held, and when that read finished.
+    let mut seen: std::collections::BTreeMap<String, (Option<String>, std::time::Instant)> =
+        Default::default();
+    while let Some(job) = jobs.recv().await {
+        match job {
+            Job::Baseline(uris) => {
+                for uri in uris {
+                    let now = ctx.read(&uri).await;
+                    seen.insert(uri, (now, std::time::Instant::now()));
+                }
+            }
+            Job::Reread(uri) => {
+                pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&uri);
+                let now = ctx.read(&uri).await;
+                seen.insert(uri, (now, std::time::Instant::now()));
+            }
+            Job::Ended(at) => {
+                for (content, read_at) in seen.values_mut() {
+                    if *read_at > at {
+                        *content = None;
+                    }
+                }
+            }
+            Job::Resync(uris) => {
+                for uri in uris {
+                    let now = ctx.read(&uri).await;
+                    let before = seen.get(&uri).and_then(|(c, _)| c.clone());
+                    if now.is_none() || before.is_none() || before != now {
+                        ctx.queue_update(&uri);
+                    }
+                    seen.insert(uri, (now, std::time::Instant::now()));
+                }
+            }
         }
     }
+}
 
-    /// After a re-listen: wake each acknowledged URI that changed in the gap
-    /// (or cannot be compared), and take the new baseline.
-    async fn resync(&mut self, ctx: &PumpCtx, filter: &SubscriptionFilter) {
-        for uri in acknowledged(filter) {
-            let now = ctx.read(&uri).await;
-            let before = self.seen.get(&uri).cloned().flatten();
-            if now.is_none() || before.is_none() || before != now {
-                ctx.queue_update(&uri);
-            }
-            self.seen.insert(uri, now);
-        }
+/// Aborts a task when dropped: the pump's reader lives exactly as long as the
+/// pump, which is aborted whenever its listen is replaced.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
 /// Open a listen on `filter`, retrying until the server takes it. Used for a
 /// listen nobody is waiting on — the standing one that carries `list_changed`,
 /// opened in the background at connect — so it must never fail anything: a
-/// refusal is said ONCE ([`ListenEvent::Unavailable`]), the listen is asked for
+/// failure is said ONCE ([`ListenEvent::Unavailable`]), the listen is asked for
 /// again on the usual backoff without a word, and its acknowledgment is said
-/// as [`ListenEvent::Resumed`].
-async fn establish(ctx: &PumpCtx, filter: &SubscriptionFilter) -> Subscription {
+/// as [`ListenEvent::Resumed`]. A server that refuses it in JSON-RPC will
+/// refuse it again: said, and not asked for again (`None`).
+async fn establish(ctx: &PumpCtx, filter: &SubscriptionFilter) -> Option<Subscription> {
     let mut wait = RELISTEN_MIN;
     let mut said = false;
     loop {
@@ -1454,15 +1534,19 @@ async fn establish(ctx: &PumpCtx, filter: &SubscriptionFilter) -> Subscription {
                 if said {
                     ctx.report(ListenEvent::Resumed);
                 }
-                return s;
+                return Some(s);
             }
             Err(e) => {
+                let refused = listen_refused(&e);
                 if !said {
                     ctx.report(ListenEvent::Unavailable {
                         reason: format!("subscriptions/listen: {e}"),
-                        retry_ms: wait.as_millis() as u64,
+                        retry_ms: if refused { 0 } else { wait.as_millis() as u64 },
                     });
                     said = true;
+                }
+                if refused {
+                    return None;
                 }
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(RELISTEN_MAX);
@@ -1486,14 +1570,20 @@ async fn establish(ctx: &PumpCtx, filter: &SubscriptionFilter) -> Subscription {
 /// those out of `held` and says so ([`ListenEvent::Narrowed`]), and the pump
 /// listens on with what was acknowledged: rmcp drops every update outside the
 /// acknowledgment, so a URI kept in `held` would read as watched and never
-/// wake. Every re-listen is followed by a resync ([`Baseline`]).
+/// wake. Every re-listen is followed by a resync ([`resync`]).
 async fn pump(first: Option<Subscription>, ctx: PumpCtx, mut filter: SubscriptionFilter) {
     let mut subscription = match first {
         Some(s) => s,
-        None => establish(&ctx, &filter).await,
+        None => match establish(&ctx, &filter).await {
+            Some(s) => s,
+            None => return,
+        },
     };
-    let mut baseline = Baseline::default();
-    baseline.take(&ctx, subscription.acknowledged()).await;
+    let (jobs, rx) = tokio::sync::mpsc::unbounded_channel();
+    let pending: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let _reader = AbortOnDrop(tokio::spawn(resync(ctx.clone(), rx, Arc::clone(&pending))));
+    let mut acked = acknowledged(subscription.acknowledged());
+    let _ = jobs.send(Job::Baseline(acked.iter().cloned().collect()));
     let mut wait = RELISTEN_MIN;
     loop {
         let opened = tokio::time::Instant::now();
@@ -1505,46 +1595,37 @@ async fn pump(first: Option<Subscription>, ctx: PumpCtx, mut filter: Subscriptio
                 // than parsed as a whole frame — which failed on every one of
                 // them and dropped each wake without a word.
                 Ok(Some(note)) => {
-                    // The stream is alive: reads since the last frame did not
-                    // run in a gap.
-                    baseline.unproven.clear();
                     if let Ok(v) = serde_json::to_value(&note)
                         && let Some(method) = v.get("method").and_then(Value::as_str)
                     {
                         let params = v.get("params").cloned();
-                        let updated = (method == crate::wire::method::NOTIFY_RESOURCES_UPDATED)
-                            .then(|| {
-                                params
-                                    .as_ref()
-                                    .and_then(|p| p.get("uri"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .flatten();
+                        if method == crate::wire::method::NOTIFY_RESOURCES_UPDATED
+                            && let Some(uri) = params
+                                .as_ref()
+                                .and_then(|p| p.get("uri"))
+                                .and_then(Value::as_str)
+                            && acked.contains(uri)
+                            && pending
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(uri.to_string())
+                        {
+                            // The read that moves the baseline, so the next
+                            // resync compares against what the host was just
+                            // woken for.
+                            let _ = jobs.send(Job::Reread(uri.to_string()));
+                        }
                         ctx.queue
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .push(rpc::Notification::new(method, params));
-                        // A live update moves the baseline, so the next resync
-                        // compares against what the host was just woken for.
-                        if let Some(uri) = updated
-                            && baseline.seen.contains_key(&uri)
-                        {
-                            let now = ctx.read(&uri).await;
-                            baseline.seen.insert(uri.clone(), now);
-                            baseline.unproven.insert(uri, std::time::Instant::now());
-                        }
                     }
                 }
                 Ok(None) => break ended(subscription.end()),
                 Err(e) => break format!("subscriptions/listen: {e}"),
             }
         };
-        for (uri, read_at) in std::mem::take(&mut baseline.unproven) {
-            if read_at.elapsed() < UNPROVEN {
-                baseline.seen.insert(uri, None);
-            }
-        }
+        let _ = jobs.send(Job::Ended(std::time::Instant::now()));
         let idle = ctx.idle_cuts.load(std::sync::atomic::Ordering::SeqCst) > cuts;
         // A stream that stayed open a good while ended for a reason of its
         // own, and starts the backoff over; one that ended at once did not.
@@ -1562,12 +1643,14 @@ async fn pump(first: Option<Subscription>, ctx: PumpCtx, mut filter: Subscriptio
             wait = (wait * 2).min(RELISTEN_MAX);
             match ctx.peer.listen(filter.clone()).await {
                 Ok(s) => {
-                    let acked = acknowledged(s.acknowledged());
-                    let dropped: Vec<String> = acknowledged(&filter)
-                        .into_iter()
-                        .filter(|u| !acked.contains(u))
+                    let now = acknowledged(s.acknowledged());
+                    let dropped: Vec<String> = acked
+                        .iter()
+                        .filter(|u| !now.contains(*u))
+                        .cloned()
                         .collect();
                     subscription = s;
+                    acked = now;
                     ctx.report(ListenEvent::Resumed);
                     if !dropped.is_empty() {
                         ctx.held
@@ -1577,7 +1660,7 @@ async fn pump(first: Option<Subscription>, ctx: PumpCtx, mut filter: Subscriptio
                         filter = subscription.acknowledged().clone();
                         ctx.report(ListenEvent::Narrowed { dropped });
                     }
-                    baseline.resync(&ctx, subscription.acknowledged()).await;
+                    let _ = jobs.send(Job::Resync(acked.iter().cloned().collect()));
                     break;
                 }
                 Err(e) => reason = format!("subscriptions/listen: {e}"),

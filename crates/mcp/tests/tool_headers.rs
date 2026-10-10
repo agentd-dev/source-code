@@ -155,6 +155,8 @@ fn a_failed_priming_list_fails_the_connect() {
             Some((status, body)),
         );
         let err = connect(&ep, FirstRequest::Discover).err().expect("refused");
+        // Long enough for a listen opened in the background to have arrived.
+        std::thread::sleep(Duration::from_millis(500));
         assert!(err.contains("tools/list:"), "{err}");
         assert!(err.contains(says), "{err}");
         assert_eq!(count(&seen, "subscriptions/listen"), 0, "{err}");

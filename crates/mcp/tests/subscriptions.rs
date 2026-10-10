@@ -135,6 +135,11 @@ struct Server {
     refuse_flagged: AtomicBool,
     /// Hold a flags-only listen's response head this long.
     slow_flags_head_ms: AtomicU64,
+    /// Answer each `resources/read` after this long.
+    slow_reads_ms: AtomicU64,
+    /// Answer the next listen with a plain `500`: a server having a bad
+    /// moment, not one refusing the filter.
+    fail_listen_once: AtomicBool,
 }
 
 impl Server {
@@ -395,6 +400,9 @@ fn stateless(req: &Req, w: &mut TcpStream, server: &Server) {
         }
         "tools/list" => respond(w, 200, &[], &tools(&id)),
         "resources/read" => {
+            std::thread::sleep(Duration::from_millis(
+                server.slow_reads_ms.load(Ordering::SeqCst),
+            ));
             if server.fail_reads.load(Ordering::SeqCst) {
                 return respond(w, 200, &[], &error(&id, -32603, "read failed"));
             }
@@ -430,6 +438,9 @@ fn listen(req: &Req, w: &mut TcpStream, server: &Server) {
     ));
     if server.refuse_listen_once.swap(false, Ordering::SeqCst) {
         return respond(w, 200, &[], &error(&id, -32603, "listen refused"));
+    }
+    if server.fail_listen_once.swap(false, Ordering::SeqCst) {
+        return respond_raw(w, 500, &[], "boom");
     }
     let asked = &req.body["params"]["notifications"];
     if server.refuse_flagged.load(Ordering::SeqCst) && asked["toolsListChanged"] == true {
@@ -1307,11 +1318,17 @@ fn settled(server: &Arc<Server>, uris: &[&str]) -> RmcpClient {
     for u in uris {
         c.subscribe(u).expect("subscribe");
     }
-    // A baseline read and a re-read per URI on the last listen.
-    wait_until("the pump's reads", || {
-        server.count("resources/read") >= 2 * uris.len()
+    // The baseline reads and the re-reads after the updates each listen opens
+    // with: wait until they stop.
+    let mut last = usize::MAX;
+    wait_until("the pump's reads to settle", || {
+        let now = server.count("resources/read");
+        let settled = now == last && now >= uris.len();
+        last = now;
+        std::thread::sleep(Duration::from_millis(300));
+        settled
     });
-    std::thread::sleep(Duration::from_millis(1300));
+    std::thread::sleep(Duration::from_millis(300));
     let _ = c.drain_notifications();
     let _ = c.drain_listen_events();
     c
@@ -1365,7 +1382,7 @@ fn a_live_update_moves_the_baseline() {
     wait_until("the live update's re-read", || {
         server.count("resources/read") > reads
     });
-    std::thread::sleep(Duration::from_millis(1300));
+    std::thread::sleep(Duration::from_millis(300));
     let _ = c.drain_notifications();
     re_listen(&server, &c, || {});
     assert!(synthetic(&c.drain_notifications()).is_empty());
@@ -1458,7 +1475,9 @@ fn a_handshake_connection_opens_no_listen() {
 
 #[test]
 fn a_refused_standing_listen_does_not_fail_the_connect_and_is_said_once() {
-    for how in 0..3 {
+    // A server having a bad moment (a 500, a stream dropped before its
+    // acknowledgment): said once, asked for again until it holds.
+    for how in [1, 2] {
         let server = Arc::new(Server::default());
         server.refuse_flags_only.store(3, Ordering::SeqCst);
         server.refuse_flags_how.store(how, Ordering::SeqCst);
@@ -1475,7 +1494,7 @@ fn a_refused_standing_listen_does_not_fail_the_connect_and_is_said_once() {
             .count();
         assert_eq!(
             unavailable, 1,
-            "said once, refused three times ({how}): {events:?}"
+            "said once, failed three times ({how}): {events:?}"
         );
         assert_eq!(server.flags_only_listens().len(), 4, "({how})");
         wait_until("the accepted listen open", || server.open_listens() == 1);
@@ -1484,6 +1503,23 @@ fn a_refused_standing_listen_does_not_fail_the_connect_and_is_said_once() {
             drained(&c, "notifications/tools/list_changed")
         });
     }
+    // A server that refuses the filter in JSON-RPC will refuse it again: said
+    // once, and not asked for again; the connection works without it.
+    let server = Arc::new(Server::default());
+    server.refuse_flags_only.store(u64::MAX, Ordering::SeqCst);
+    let c = standing(&server, &["tools"]);
+    c.list_tools().expect("the connection works without it");
+    let mut events = Vec::new();
+    wait_until("the refusal said", || {
+        events.extend(c.drain_listen_events());
+        events
+            .iter()
+            .any(|e| matches!(e, ListenEvent::Unavailable { .. }))
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    events.extend(c.drain_listen_events());
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(server.flags_only_listens().len(), 1, "not asked for again");
 }
 
 #[test]
@@ -1495,8 +1531,9 @@ fn a_slow_standing_listen_does_not_delay_the_connect() {
     let ep = spawn(Arc::clone(&server), Lifecycle::Stateless);
     let started = Instant::now();
     let c = connect(&ep, Lifecycle::Stateless);
+    // The server holds the listen 3 s: the connect does not wait for it.
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(2),
         "{:?}",
         started.elapsed()
     );
@@ -1533,4 +1570,80 @@ fn a_server_refusing_the_list_changed_flag_keeps_its_uri_subscriptions() {
             .iter()
             .any(|n| n.method == "notifications/resources/updated")
     });
+}
+
+#[test]
+fn a_burst_of_updates_does_not_outrun_the_pump() {
+    // rmcp gives a listen a 64-message buffer and ends the subscription when
+    // it fills. The pump's reads must not hold up its draining: with every
+    // read slow, a burst of 200 updates is drained whole, and the listen
+    // does not end.
+    let server = Arc::new(Server::default());
+    let c = settled(&server, &["demo://a"]);
+    server.slow_reads_ms.store(50, Ordering::SeqCst);
+    for _ in 0..200 {
+        server.push("demo://a");
+    }
+    // Drained at memory speed: a pump that read after each update would take
+    // 200 × 50 ms.
+    let started = Instant::now();
+    let mut pushed = 0;
+    wait_until("every update drained", || {
+        pushed += c
+            .drain_notifications()
+            .iter()
+            .filter(|n| {
+                n.params
+                    .as_ref()
+                    .is_some_and(|p| p["_meta"][PUSHED] == true)
+            })
+            .count();
+        pushed == 200
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    let events = c.drain_listen_events();
+    assert!(events.is_empty(), "the listen ended: {events:?}");
+    // A burst for one URI costs a handful of reads, not one per update:
+    // counted once the reads have stopped.
+    let mut last = usize::MAX;
+    wait_until("the re-reads to stop", || {
+        let now = server.count("resources/read");
+        let stopped = now == last;
+        last = now;
+        std::thread::sleep(Duration::from_millis(300));
+        stopped
+    });
+    assert!(
+        server.count("resources/read") < 20,
+        "{}",
+        server.count("resources/read")
+    );
+}
+
+#[test]
+fn a_transient_listen_failure_does_not_turn_off_list_changed() {
+    let server = Arc::new(Server::default());
+    let c = standing(&server, &["tools"]);
+    wait_until("the standing listen", || server.open_listens() == 1);
+    server.fail_listen_once.store(true, Ordering::SeqCst);
+    assert!(
+        c.subscribe("demo://a").is_err(),
+        "a 500 is the call's error"
+    );
+    c.subscribe("demo://a").expect("asked again, taken");
+    let last = server.requests("subscriptions/listen").pop().unwrap();
+    assert_eq!(
+        last.body["params"]["notifications"]["toolsListChanged"],
+        true
+    );
+    assert!(
+        !c.drain_listen_events()
+            .iter()
+            .any(|e| matches!(e, ListenEvent::FlagsRefused { .. })),
+        "a server error is no refusal of the flags"
+    );
 }

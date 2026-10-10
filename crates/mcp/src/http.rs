@@ -138,8 +138,11 @@ pub(crate) struct Hangup {
     socket: Mutex<Option<TcpStream>>,
     /// How long the exchange's event stream may stay silent once its head
     /// has arrived, when that differs from the connection's timeout (which
-    /// still bounds the dial, the request and the head).
+    /// still bounds the dial, the request, the head and the first event).
     stream_idle: Option<std::time::Duration>,
+    /// Set once the stream's idle bound applies: a read timeout from then on
+    /// is the stream going quiet, not a server that never answered.
+    streaming: AtomicBool,
 }
 
 impl Hangup {
@@ -153,11 +156,19 @@ impl Hangup {
         }
     }
 
-    /// Give the armed connection the stream's own idle bound, now that the
-    /// head has arrived. The socket is shared with whatever wraps it (TLS
-    /// included), so its read timeout bounds every read the stream makes.
+    /// Did the stream's idle bound apply (see `streaming`)?
+    pub(crate) fn streamed(&self) -> bool {
+        self.streaming.load(Ordering::SeqCst)
+    }
+
+    /// Give the armed connection the stream's own idle bound, now that its
+    /// first event (a listen's acknowledgment) has arrived: until then the
+    /// connection's timeout bounds a server that holds the answer back. The
+    /// socket is shared with whatever wraps it (TLS included), so its read
+    /// timeout bounds every read the stream makes.
     fn open_stream(&self) {
         let Some(idle) = self.stream_idle else { return };
+        self.streaming.store(true, Ordering::SeqCst);
         if let Some(s) = self
             .socket
             .lock()
@@ -670,9 +681,12 @@ impl HttpTransport {
         }
 
         if resp.is_event_stream() {
-            hangup.open_stream();
             let mut sse = resp.sse();
+            let mut first = true;
             while let Some(ev) = sse.next_event().map_err(HttpError::Http)? {
+                if std::mem::take(&mut first) {
+                    hangup.open_stream();
+                }
                 if let Some(msg) = route_message(&ev, request_id, on_notification) {
                     return Ok(SendOutcome::Result(Some(msg)));
                 }

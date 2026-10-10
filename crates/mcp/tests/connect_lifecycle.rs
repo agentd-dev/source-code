@@ -115,16 +115,40 @@ fn a_server_without_server_discover_is_reached_through_the_2025_11_25_handshake(
 
 #[test]
 fn a_2026_07_28_server_is_reached_through_server_discover_alone() {
-    let (ep, seen) = stateless_server(StatelessOpts::default());
+    // It offers `tools/list_changed`, so the connection also opens its
+    // standing listen — after its priming list — which this server refuses
+    // as a method it does not have: asked once, not again.
+    let (ep, seen) = stateless_server(StatelessOpts {
+        caps: json!({"tools": {"listChanged": true}, "resources": {}}),
+        ..StatelessOpts::default()
+    });
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     c.list_tools().unwrap();
     c.call_tool("echo", Some(json!({}))).unwrap();
     c.read_resource("demo://x").unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
 
+    let all = methods(&seen);
+    let listen = all
+        .iter()
+        .position(|m| m == "subscriptions/listen")
+        .expect("the standing listen");
+    assert_eq!(all[..2], ["server/discover", "tools/list"], "{all:?}");
+    assert!(listen >= 2, "primed before it listens: {all:?}");
+    assert_eq!(count(&seen, "subscriptions/listen"), 1, "{all:?}");
+    let listened = &requests(&seen, "subscriptions/listen")[0];
+    assert_eq!(
+        listened.body["params"]["notifications"]["toolsListChanged"],
+        true
+    );
     // The first `tools/list` is the connection's priming list: rmcp sends a
     // tool's headers only from a schema it listed on this connection.
+    let without_listen: Vec<&String> = all
+        .iter()
+        .filter(|m| *m != "subscriptions/listen")
+        .collect();
     assert_eq!(
-        methods(&seen),
+        without_listen,
         [
             "server/discover",
             "tools/list",

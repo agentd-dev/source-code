@@ -94,6 +94,7 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
         let _ = std::fs::remove_file(&self.err_path);
+        let _ = std::fs::remove_file(&self.cfg_path);
     }
 }
 
@@ -196,9 +197,8 @@ fn a_restart_catches_up_from_the_stored_cursor_and_fires_nothing_twice() {
     let mut first = Daemon::start_at("events-restart-1", &cfg_path);
     first.wait_for("the binding armed", |l| armed(l, "mock.tick"));
     mock.control("mock.event", json!({"topic": "t1", "count": 1}));
+    // The cursor is written in the pass that appended, before the run fires.
     first.wait_for("the first run", |l| ticks(l).len() == 1);
-    // The cursor is written once the poll after the append is answered.
-    std::thread::sleep(Duration::from_millis(1500));
     first.stop();
 
     // While it was down.
@@ -407,7 +407,7 @@ fn a_binding_rate_paces_intake_and_each_poll_asks_for_what_it_may_take() {
         &config(
             &mock.uri(),
             MEMORY,
-            &tick_binding("          rate: 2/10s\n"),
+            &tick_binding("          rate: 2/60s\n"),
         ),
     );
     daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
@@ -496,4 +496,104 @@ fn editing_a_binding_or_adding_one_dials_nothing() {
     // The first binding kept its subscription and goes on.
     mock.control("mock.event", json!({"topic": "t1"}));
     daemon.wait_for("a run on the edited binding", |l| !ticks(l).is_empty());
+}
+
+#[test]
+fn a_server_that_ignores_max_events_is_still_held_to_the_rate() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control("mock.events_flags", json!({"ignore_max": true}));
+    let daemon = Daemon::start(
+        "events-ignore-max",
+        &config(
+            &mock.uri(),
+            MEMORY,
+            &tick_binding("          rate: 2/60s\n"),
+        ),
+    );
+    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    mock.control("mock.event", json!({"topic": "t1", "count": 10}));
+    daemon.wait_for("the paced pause", |l| {
+        events(l, "mcp.events.paused")
+            .iter()
+            .any(|e| e["cause"] == "rate")
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let log = daemon.log();
+    assert_eq!(
+        ticks(&log).len(),
+        2,
+        "two of the ten the page carried:\n{log}"
+    );
+}
+
+#[test]
+fn a_schema_changed_in_place_lets_the_cursor_go_and_says_the_gap() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-schema-changed",
+        &config(&mock.uri(), MEMORY, &tick_binding("")),
+    );
+    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the first run", |l| ticks(l).len() == 1);
+    // Answered so three times: each is a gap and a listing, and the polls
+    // between them wait the backoff the failures earn (1 s, then 2 s).
+    mock.control(
+        "mock.events_fail",
+        json!({"code": -32026, "times": 3,
+        "data": {"feature": "payloadSchema", "reason": "schema_changed"}}),
+    );
+    let gaps = |l: &str| {
+        events(l, "mcp.events.gap")
+            .iter()
+            .filter(|e| e["cause"] == "schema_changed")
+            .count()
+    };
+    daemon.wait_for("the first gap", |l| gaps(l) >= 1);
+    let first = Instant::now();
+    daemon.wait_for("the third gap", |l| gaps(l) >= 3);
+    assert!(
+        first.elapsed() >= Duration::from_millis(2500),
+        "backed off, not looped: {:?}",
+        first.elapsed()
+    );
+    // Re-armed from now each time: the first poll asked from now, so did
+    // each after a change, and the last of them was answered — after which
+    // the binding polls from the fresh cursor, and what comes next arrives.
+    daemon.wait_for("polling from the fresh cursor", |_| {
+        let sent = polls(&mock);
+        sent.iter().filter(|p| p["cursor"].is_null()).count() >= 4
+            && sent.last().is_some_and(|p| !p["cursor"].is_null())
+    });
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the run after the change", |l| ticks(l).len() == 2);
+}
+
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_binding_added_on_a_refused_server_is_refused_at_once() {
+    let bare = common::spawn_mock_mcp_with(REVISION, "mock://res", false, &["--events", "none"]);
+    let daemon = Daemon::start(
+        "events-refused-add",
+        &config(&bare.uri(), MEMORY, &tick_binding("")),
+    );
+    daemon.wait_for("the server refused", |l| {
+        events(l, "mcp.events.refused")
+            .iter()
+            .any(|e| e["reason"] == "no_capability")
+    });
+    let two = format!(
+        "{}        - name: mock.tick\n          arguments: {{topic: t2}}\n          delivery: [poll]\n          into: {{stream: ticks, subject: tick}}\n",
+        tick_binding("")
+    );
+    std::fs::write(&daemon.cfg_path, config(&bare.uri(), MEMORY, &two)).unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    daemon.wait_for("the added binding refused", |l| {
+        events(l, "mcp.events.refused")
+            .iter()
+            .filter(|e| e["reason"] == "no_capability")
+            .count()
+            >= 2
+    });
+    assert!(!bare.log().contains("MOCK_EVENTS_"), "{}", bare.log());
 }

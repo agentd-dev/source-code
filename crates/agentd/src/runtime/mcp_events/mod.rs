@@ -32,6 +32,9 @@ const MAX_DRAIN: u32 = 10;
 const POLL_FLOOR_MS: u64 = 1_000;
 /// The interval when a server names none.
 const POLL_DEFAULT_MS: u64 = 30_000;
+/// The longest a server's `nextPollMs` may hold a binding off: past it, a
+/// server could park a binding for good.
+const POLL_CEILING_MS: u64 = 15 * 60 * 1000;
 /// How often a server's event types are listed again; the only way, beside
 /// `list_changed`, a changed descriptor is seen (§5.3).
 const RELIST_MS: u64 = 15 * 60 * 1000;
@@ -68,6 +71,14 @@ impl State {
     }
 }
 
+/// Why a page stopped before its last occurrence.
+enum Stop {
+    /// The binding's `rate` ran dry.
+    Rate,
+    /// An append the stream refused (pressure), or a flush that failed.
+    Refused(String),
+}
+
 /// One binding, live.
 pub(crate) struct Binding {
     pub(crate) key: String,
@@ -92,8 +103,15 @@ pub(crate) struct Binding {
     drain: u32,
     failures: u32,
     payload_schema: Option<Value>,
-    /// A payload failed its schema since the last listing: list again, once.
+    /// A payload failed its schema: list the server again.
     schema_relist: bool,
+    /// That re-list was asked for already; it is asked for once per
+    /// payload schema, not on every page that fails it.
+    schema_relisted: bool,
+    /// Bumped at every poll dispatched: an answer for an older one — a
+    /// binding removed and declared again while its poll was out — is not
+    /// this binding's.
+    generation: u64,
 }
 
 impl Binding {
@@ -134,8 +152,9 @@ struct Listing {
     in_flight: bool,
     due_at: u64,
     failures: u32,
-    /// Why the server cannot be used for Events at all, while it holds.
-    refused: Option<&'static str>,
+    /// Why the server cannot be used for Events at all, while it holds: the
+    /// reason, and what to say.
+    refused: Option<(&'static str, String)>,
 }
 
 /// The loop's MCP Events state.
@@ -144,6 +163,8 @@ pub(crate) struct Events {
     pub(crate) bindings: BTreeMap<String, Binding>,
     listings: BTreeMap<String, Listing>,
     pool: Option<Pool>,
+    /// The next poll generation; never reused within a life.
+    next_generation: u64,
 }
 
 impl Events {
@@ -173,7 +194,8 @@ fn jitter(base: u64) -> u64 {
     if spread == 0 {
         return base;
     }
-    base - spread + u64::from_le_bytes(b) % (2 * spread + 1)
+    let offset = u64::from_le_bytes(b) % spread.saturating_mul(2).saturating_add(1);
+    (base - spread).saturating_add(offset)
 }
 
 /// The backoff after `failures` failures in a row, capped at `max`.
@@ -263,6 +285,8 @@ impl Runtime {
                             failures: 0,
                             payload_schema: None,
                             schema_relist: false,
+                            schema_relisted: false,
+                            generation: 0,
                         },
                     );
                 }
@@ -295,33 +319,44 @@ impl Runtime {
         self.mcp_events
             .listings
             .retain(|s, _| servers.contains(s) && !redialed.contains(s));
+        // A reload or a re-dial is when a refusal is looked at again (a new
+        // credential, a server changed); a listing alone clears only what it
+        // decided (`events_evaluate`).
         for b in self.mcp_events.bindings.values_mut() {
-            if redialed.contains(&b.server) && !b.in_flight {
+            if (redialed.contains(&b.server) || matches!(b.state, State::Refused(_)))
+                && !b.in_flight
+            {
                 b.state = State::Discovering;
                 b.mode = None;
             }
+        }
+        if self.mcp_events.bindings.is_empty() {
+            crate::obs::metrics::set_event_subscriptions(Vec::new());
         }
         if !self.mcp_events.bindings.is_empty() && self.mcp_events.pool.is_none() {
             self.mcp_events.pool = Some(Pool::start(self.events_tx.clone()));
         }
         // A binding added (or whose modes changed) on a server already listed
-        // is held against that listing now, not at the next re-list.
-        let pending: Vec<String> = self
+        // is held against that listing now, not at the next re-list — and one
+        // on a server already refused is refused with it, not left waiting.
+        let pending: Vec<(String, Option<(&'static str, String)>)> = self
             .mcp_events
             .bindings
             .values()
-            .filter(|b| {
-                b.state == State::Discovering
-                    && self
-                        .mcp_events
-                        .listings
-                        .get(&b.server)
-                        .is_some_and(|l| l.descriptors.is_some())
+            .filter(|b| b.state == State::Discovering)
+            .filter_map(|b| {
+                let l = self.mcp_events.listings.get(&b.server)?;
+                match &l.refused {
+                    Some(r) => Some((b.key.clone(), Some(r.clone()))),
+                    None => l.descriptors.is_some().then(|| (b.key.clone(), None)),
+                }
             })
-            .map(|b| b.key.clone())
             .collect();
-        for key in pending {
-            self.events_evaluate(&key);
+        for (key, refused) in pending {
+            match refused {
+                Some((reason, detail)) => self.events_refuse(&key, reason, &detail),
+                None => self.events_evaluate(&key),
+            }
         }
     }
 
@@ -375,10 +410,7 @@ impl Runtime {
                 });
                 wire::declared(&caps).is_none().then_some("no_capability")
             };
-            let listing = self.mcp_events.listings.entry(server.clone()).or_default();
             if let Some(reason) = refusal {
-                listing.refused = Some(reason);
-                listing.due_at = u64::MAX;
                 let detail = match reason {
                     "revision" => format!(
                         "the connection reached {}; MCP Events is defined only from {} — no events/* request is sent",
@@ -387,9 +419,13 @@ impl Runtime {
                     ),
                     _ => "the server does not declare the io.modelcontextprotocol/events extension — no events/* request is sent".to_string(),
                 };
+                let listing = self.mcp_events.listings.entry(server.clone()).or_default();
+                listing.refused = Some((reason, detail.clone()));
+                listing.due_at = u64::MAX;
                 self.events_refuse_server(&server, reason, &detail);
                 continue;
             }
+            let listing = self.mcp_events.listings.entry(server.clone()).or_default();
             listing.refused = None;
             listing.in_flight = true;
             for b in self.mcp_events.bindings.values_mut() {
@@ -465,6 +501,18 @@ impl Runtime {
                     None
                 }
             };
+            // The records are read before the first poll: a poll from a
+            // cursor the store could not give back would move past whatever
+            // it held, with nothing said (§5.1 rule 2).
+            let unread = self
+                .mcp_events
+                .bindings
+                .get(&key)
+                .is_some_and(|b| !b.loaded);
+            if held.is_none() && unread && self.events_load_records(&key).is_err() {
+                self.events_pause(&key, "store_degraded");
+                continue;
+            }
             match held {
                 Some(cause) => self.events_pause(&key, cause),
                 None => self.events_dispatch_poll(&key, now),
@@ -473,18 +521,25 @@ impl Runtime {
     }
 
     fn events_pause(&mut self, key: &str, cause: &'static str) {
+        self.events_pause_for(key, cause, None);
+    }
+
+    /// Pause a binding for `cause`, said once per pause; held at its cursor.
+    fn events_pause_for(&mut self, key: &str, cause: &'static str, detail: Option<&str>) {
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return;
         };
         if b.state != State::Paused(cause) {
             b.state = State::Paused(cause);
-            self.log.warn(
-                "mcp.events.paused",
-                json!({"server": b.server, "event_type": b.name, "cause": cause}),
-            );
+            let mut line = json!({"server": b.server, "event_type": b.name, "cause": cause});
+            if let Some(d) = detail {
+                line["detail"] = json!(tame(d));
+            }
+            self.log.warn("mcp.events.paused", line);
         }
         if cause != "rate" {
-            b.due_at = now_ms() + 1_000;
+            b.failures += 1;
+            b.due_at = now_ms() + backoff(b.failures, BACKOFF_MAX_MS).min(30_000);
         }
     }
 
@@ -532,9 +587,15 @@ impl Runtime {
             max_events,
         );
         b.in_flight = true;
+        self.mcp_events.next_generation += 1;
+        let generation = self.mcp_events.next_generation;
+        if let Some(b) = self.mcp_events.bindings.get_mut(key) {
+            b.generation = generation;
+        }
         if let Some(pool) = &self.mcp_events.pool {
             pool.submit(Job::Poll {
                 key: key.to_string(),
+                generation,
                 client,
                 params,
                 bound: REQUEST_BOUND,
@@ -558,13 +619,24 @@ impl Runtime {
                 );
                 self.events_listed(&server, result)
             }
-            Done::Poll { key, result } => {
-                if let Some(b) = self.mcp_events.bindings.get(&key) {
-                    crate::obs::metrics::record_mcp_events_request(
-                        &b.server,
-                        wire::method::POLL,
-                        outcome(result.as_ref().err()),
-                    );
+            Done::Poll {
+                key,
+                generation,
+                result,
+            } => {
+                let Some(b) = self.mcp_events.bindings.get(&key) else {
+                    return; // removed while its poll was out
+                };
+                crate::obs::metrics::record_mcp_events_request(
+                    &b.server,
+                    wire::method::POLL,
+                    outcome(result.as_ref().err()),
+                );
+                // An answer for a poll this binding did not send — it was
+                // removed and declared again meanwhile — is dropped: applied,
+                // it could move the cursor past what was never appended.
+                if b.generation != generation {
+                    return;
                 }
                 self.events_polled(&key, result)
             }
@@ -617,11 +689,15 @@ impl Runtime {
             "mcp.events.listed",
             json!({"server": server, "types": types}),
         );
+        // A listing clears what a listing decides; what the server said to a
+        // poll — not this credential, not this mode — waits for a reload or a
+        // re-dial.
         let keys: Vec<String> = self
             .mcp_events
             .bindings
             .values()
             .filter(|b| b.server == server)
+            .filter(|b| !matches!(b.state, State::Refused("forbidden" | "not_supported")))
             .map(|b| b.key.clone())
             .collect();
         for key in keys {
@@ -675,19 +751,27 @@ impl Runtime {
             return self.events_refuse(key, "invalid_arguments", &detail);
         }
         let was = b.state.clone();
-        let loaded = b.loaded;
-        if !loaded {
-            self.events_load_records(key);
+        if !b.loaded {
+            // A read that fails is retried before the first poll.
+            let _ = self.events_load_records(key);
         }
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return;
         };
+        if b.payload_schema != d.payload_schema {
+            b.schema_relisted = false;
+        }
         b.payload_schema = d.payload_schema.clone();
         b.mode = Some(mode);
         if matches!(was, State::Discovering | State::Refused(_)) {
             b.state = State::Active;
-            b.due_at = now;
-            b.failures = 0;
+            // Re-armed after a failure (a type the server said it lost, a
+            // schema it changed): the backoff the failure earned still holds.
+            b.due_at = if b.failures > 0 {
+                now + backoff(b.failures, BACKOFF_MAX_MS)
+            } else {
+                now
+            };
             self.log.info(
                 "mcp.events.armed",
                 json!({"server": b.server, "event_type": b.name, "mode": mode.as_str(),
@@ -697,28 +781,24 @@ impl Runtime {
     }
 
     /// Read a binding's records, once per life: its cursor and its dedup set.
-    fn events_load_records(&mut self, key: &str) {
+    /// Only a record that is not there starts the binding from "now" [SEP
+    /// L690]; a read that failed is an error, and the binding is not polled
+    /// until a read succeeds.
+    fn events_load_records(&mut self, key: &str) -> Result<(), ()> {
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
-            return;
+            return Ok(());
+        };
+        let record = self.durable.get(Kind::Memory, &b.cursor_key());
+        let seen = self.durable.get(Kind::Memory, &b.seen_key());
+        let (Ok(record), Ok(seen)) = (record, seen) else {
+            return Err(());
         };
         b.loaded = true;
-        let record = self
-            .durable
-            .get(Kind::Memory, &b.cursor_key())
-            .ok()
-            .flatten()
-            .map(|e| e.state);
-        let seen = self
-            .durable
-            .get(Kind::Memory, &b.seen_key())
-            .ok()
-            .flatten()
-            .map(|e| Seen::from_json(&e.state["entries"]));
         if let Some(seen) = seen {
-            b.seen = seen;
+            b.seen = Seen::from_json(&seen.state["entries"]);
         }
-        let Some(record) = record else {
-            return; // a new binding starts from "now" [SEP L690]
+        let Some(record) = record.map(|e| e.state) else {
+            return Ok(()); // a new binding starts from "now"
         };
         b.cursor = match b.replay {
             // `replay: none` always re-arms from now.
@@ -734,6 +814,7 @@ impl Runtime {
             );
             crate::obs::metrics::record_mcp_event_gap(&b.server, &b.name, "no_replay");
         }
+        Ok(())
     }
 
     fn events_polled(&mut self, key: &str, result: Result<wire::PollPage, Failure>) {
@@ -773,7 +854,10 @@ impl Runtime {
         let source = bridge::source(&server);
         let mut appended = 0u64;
         let mut fresh = 0u64;
-        let mut stopped: Option<String> = None;
+        // Why the page stopped short, if it did: the cursor then holds, and
+        // what was appended is in the dedup set, so the poll that resumes
+        // appends the rest and nothing twice.
+        let mut stopped: Option<Stop> = None;
         for raw in &page.events {
             match bridge::check(&server, &name, raw, schema.as_ref(), max_value_bytes) {
                 Checked::Rejected { cause, event_id } => {
@@ -790,9 +874,16 @@ impl Runtime {
                     schema_ok,
                 } => {
                     let seen_key = bridge::seen_key(&event_id);
-                    if self.mcp_events.bindings[key].seen.contains(&seen_key) {
+                    let b = &self.mcp_events.bindings[key];
+                    if b.seen.contains(&seen_key) {
                         crate::obs::metrics::record_mcp_event(&server, &name, "poll", "duplicate");
                         continue;
+                    }
+                    // The intake ceiling holds whatever the server sends: one
+                    // that ignored `maxEvents` is stopped here, not trusted.
+                    if b.rate.is_some() && b.tokens < 1.0 {
+                        stopped = Some(Stop::Rate);
+                        break;
                     }
                     fresh += 1;
                     let occurred_at = data["occurred_at"].as_str().and_then(bridge::timestamp_ms);
@@ -824,8 +915,9 @@ impl Runtime {
                                 if b.rate.is_some() {
                                     b.tokens = (b.tokens - 1.0).max(0.0);
                                 }
-                                if !schema_ok {
+                                if !schema_ok && !b.schema_relisted {
                                     b.schema_relist = true;
+                                    b.schema_relisted = true;
                                 }
                             }
                             if !schema_ok {
@@ -853,25 +945,36 @@ impl Runtime {
                                 "poll",
                                 "refused_pressure",
                             );
-                            stopped = Some(e);
+                            stopped = Some(Stop::Refused(e));
                             break;
                         }
                     }
                 }
             }
         }
-        // Nothing moves past an occurrence that is not durably kept: the
-        // appends are flushed before the cursor is written (§5.1 rule 2).
-        if appended > 0
-            && let Err(e) = self.durable.flush(true)
-        {
-            stopped = Some(format!("the stream head was not saved: {e}"));
+        // Nothing moves past an occurrence that is not durably kept: whenever
+        // this pass appended or is about to move the cursor, the stream is
+        // flushed first (§5.1 rule 2) — a page of duplicates after a flush
+        // that failed included.
+        let moving = stopped.is_none()
+            && self
+                .mcp_events
+                .bindings
+                .get(key)
+                .is_some_and(|b| b.cursor != page.cursor);
+        let flushed = if appended > 0 || moving {
+            self.durable.flush(true).map(|_| ())
+        } else {
+            Ok(())
+        };
+        if let Err(e) = &flushed {
+            stopped = Some(Stop::Refused(format!("the stream head was not saved: {e}")));
         }
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return;
         };
         b.seen.expire(now);
-        if appended > 0 {
+        if appended > 0 && flushed.is_ok() {
             let _ = self.durable.put(
                 Kind::Memory,
                 &b.seen_key(),
@@ -879,21 +982,20 @@ impl Runtime {
                 None,
             );
         }
-        if let Some(why) = stopped {
-            // Held at the old cursor; what was appended is in the dedup set,
-            // so the poll that resumes appends the rest and nothing twice.
-            let cause = if self.pressure.refusal(false).is_some() {
-                "pressure"
-            } else {
-                "store_degraded"
-            };
-            self.log.warn(
-                "mcp.events.paused",
-                json!({"server": b.server, "event_type": b.name, "cause": cause, "detail": tame(&why)}),
-            );
-            b.state = State::Paused(cause);
-            b.due_at = now + 1_000;
-            return;
+        match stopped {
+            Some(Stop::Rate) => {
+                b.due_at = b.refill_at(now);
+                return self.events_pause_for(key, "rate", None);
+            }
+            Some(Stop::Refused(why)) => {
+                let cause = if self.pressure.refusal(false).is_some() {
+                    "pressure"
+                } else {
+                    "store_degraded"
+                };
+                return self.events_pause_for(key, cause, Some(&why));
+            }
+            None => {}
         }
         b.failures = 0;
         if page.truncated {
@@ -922,7 +1024,7 @@ impl Runtime {
             now + jitter(
                 page.next_poll_ms
                     .unwrap_or(POLL_DEFAULT_MS)
-                    .max(POLL_FLOOR_MS),
+                    .clamp(POLL_FLOOR_MS, POLL_CEILING_MS),
             )
         };
     }
@@ -934,6 +1036,9 @@ impl Runtime {
             return;
         };
         let (server, name) = (b.server.clone(), b.name.clone());
+        // List the server again; the binding is armed against what it then
+        // lists, after the backoff this failure earns — a server that keeps
+        // answering the same way is not asked in a loop.
         let rediscover = |rt: &mut Runtime| {
             if let Some(l) = rt.mcp_events.listings.get_mut(&server) {
                 l.due_at = 0;
@@ -941,6 +1046,7 @@ impl Runtime {
             }
             if let Some(b) = rt.mcp_events.bindings.get_mut(key) {
                 b.state = State::Discovering;
+                b.failures += 1;
             }
         };
         match &e {
@@ -956,6 +1062,9 @@ impl Runtime {
                 wire::code::METHOD_NOT_FOUND => {
                     self.events_refuse(key, "method_not_found", &r.message);
                 }
+                // The type changed in place: a cursor minted under the old
+                // schema is answered so again, so it is let go — what happened
+                // in between is lost, and said so [SEP L221].
                 wire::code::UNSUPPORTED
                     if r.data
                         .as_ref()
@@ -963,6 +1072,15 @@ impl Runtime {
                         .and_then(Value::as_str)
                         == Some("schema_changed") =>
                 {
+                    if let Some(b) = self.mcp_events.bindings.get_mut(key) {
+                        b.cursor = None;
+                        let _ = self.durable.delete(Kind::Memory, &b.cursor_key());
+                    }
+                    self.log.warn(
+                        "mcp.events.gap",
+                        json!({"server": server, "event_type": name, "cause": "schema_changed"}),
+                    );
+                    crate::obs::metrics::record_mcp_event_gap(&server, &name, "schema_changed");
                     rediscover(self);
                 }
                 wire::code::UNSUPPORTED => {

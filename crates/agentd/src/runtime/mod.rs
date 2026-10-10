@@ -2450,6 +2450,10 @@ impl Runtime {
         // Everything is asked for below, a pending retry's URIs included.
         self.resubscribe_retry.remove(&name);
         self.restore_subscriptions(&name, None, "session_lost");
+        // Its MCP Events bindings are held against the new connection: a
+        // re-dial is when a refusal is looked at again (§5.7).
+        #[cfg(feature = "mcp-events")]
+        self.events_sync("session_lost", std::slice::from_ref(&name));
     }
 
     /// Subscribe again, on `server`'s live connection, what an owner wants

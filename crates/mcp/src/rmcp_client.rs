@@ -838,11 +838,15 @@ impl RmcpClient {
     /// on the answer's stream reaches the host's queue as the handler would
     /// queue it.
     ///
+    /// `bound` is the whole exchange's: an answer still streaming at it —
+    /// keepalives, notifications — is hung up on, so no server holds the
+    /// caller past it.
+    ///
     /// The outer error is the connection's (a transport failure, a lost
-    /// session); the inner one is the server's JSON-RPC refusal, with its
-    /// `code` and `data`, for the caller to branch on. A result whose
-    /// `resultType` is anything but `"complete"` is a protocol error: this
-    /// call has no way to follow an interim result.
+    /// session, the bound); the inner one is the server's JSON-RPC refusal,
+    /// with its `code` and `data`, for the caller to branch on. A result
+    /// whose `resultType` is anything but `"complete"` is a protocol error:
+    /// this call has no way to follow an interim result.
     pub fn call_raw(
         &self,
         method: &str,
@@ -857,12 +861,17 @@ impl RmcpClient {
         let mut headers: Vec<(&str, &str)> = vec![("MCP-Protocol-Version", &version)];
         if self.listens() {
             let mut caps = self.own_meta["clientCapabilities"].clone();
-            if extensions.as_object().is_some_and(|e| !e.is_empty()) {
-                caps["extensions"] = extensions;
+            if let Some(ext) = extensions.as_object().filter(|e| !e.is_empty())
+                && let Some(c) = caps.as_object_mut()
+                && let Value::Object(have) = c.entry("extensions").or_insert_with(|| json!({}))
+            {
+                have.extend(ext.clone());
             }
             let meta = params.entry("_meta").or_insert_with(|| json!({}));
             if !meta.is_object() {
-                *meta = json!({});
+                // The revision's keys need an object; what the caller put
+                // there is kept beside them rather than dropped.
+                *meta = json!({"value": meta.take()});
             }
             meta["io.modelcontextprotocol/protocolVersion"] = json!(version);
             meta["io.modelcontextprotocol/clientInfo"] = self.own_meta["clientInfo"].clone();
@@ -874,9 +883,32 @@ impl RmcpClient {
             McpError::Transport(format!("mcp server '{}': {method}: {e}", self.name))
         })?;
         let queue = Arc::clone(&self.notifications);
-        let answered = self.http.send(Some(id), &bytes, bound, &headers, |n| {
-            queue_as_handler(&queue, &n);
-        });
+        // The socket's timeout bounds each read; the exchange as a whole is
+        // bounded here, by hanging it up.
+        let hangup = Arc::new(crate::http::Hangup::default());
+        let (finished, deadline) = std::sync::mpsc::channel::<()>();
+        let timer = {
+            let hangup = Arc::clone(&hangup);
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    deadline.recv_timeout(bound)
+                {
+                    hangup.hang_up();
+                }
+            })
+        };
+        let answered = self.http.send_until_hangup(
+            Some(id),
+            &bytes,
+            bound,
+            &headers,
+            |n| {
+                queue_as_handler(&queue, &n);
+            },
+            &hangup,
+        );
+        drop(finished);
+        let _ = timer.join();
         let answer = match answered {
             Ok(Some(v)) => v,
             Ok(None) => {

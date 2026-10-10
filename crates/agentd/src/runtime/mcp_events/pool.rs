@@ -28,6 +28,8 @@ pub enum Job {
     },
     Poll {
         key: String,
+        /// Which poll of the binding this is (see `Binding::generation`).
+        generation: u64,
         client: Arc<McpClient>,
         params: Map<String, Value>,
         bound: Duration,
@@ -67,6 +69,7 @@ pub enum Done {
     },
     Poll {
         key: String,
+        generation: u64,
         result: Result<PollPage, Failure>,
     },
 }
@@ -115,10 +118,12 @@ fn work(rx: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
             },
             Job::Poll {
                 key,
+                generation,
                 client,
                 params,
                 bound,
             } => Done::Poll {
+                generation,
                 result: call(&client, wire::method::POLL, params, bound).and_then(|v| {
                     serde_json::from_value::<PollPage>(v)
                         .map_err(|e| Failure::Transport(format!("events/poll: {e}")))

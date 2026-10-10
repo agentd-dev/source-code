@@ -216,6 +216,30 @@ fn check_common(
     }
 }
 
+/// `replay` and `ttl`: a catch-up bound under a second asks the server for
+/// nothing between polls — `none` says that plainly — and `ttl` is the
+/// webhook lease, which a binding without `webhook` has none of.
+fn check_leases(
+    at: &str,
+    delivery: &[Delivery],
+    replay: Replay,
+    ttl: Option<&Dur>,
+    d: &mut Diagnostics,
+) {
+    if let Replay::Within(w) = replay
+        && w < Duration::from_secs(1)
+    {
+        d.errors.push(format!(
+            "{at}.replay: under a second replays nothing — write `none` to always start from now"
+        ));
+    }
+    if ttl.is_some() && !delivery.contains(&Delivery::Webhook) {
+        d.errors.push(format!(
+            "{at}.ttl: the webhook lease, and this binding lists no `webhook` delivery"
+        ));
+    }
+}
+
 /// Every MCP Events check, collected into `d` (RFC 0045 §5.2, §5.15).
 pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     let declared: Vec<&super::McpServer> = s
@@ -275,6 +299,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 untrusted,
                 d,
             );
+            check_leases(&at, &b.delivery, b.replay, b.ttl.as_ref(), d);
         }
         let mut granted = std::collections::BTreeSet::new();
         for g in &srv.event_grants {
@@ -306,6 +331,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 untrusted,
                 d,
             );
+            check_leases(&at, &g.delivery, g.replay, g.ttl.as_ref(), d);
         }
     }
     if total > MAX_SUBSCRIPTIONS {

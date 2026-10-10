@@ -395,6 +395,22 @@ impl Runtime {
         if security.as_object().is_some_and(|o| !o.is_empty()) {
             doc["security"] = security;
         }
+        // MCP Events bindings and grants are the parent operator's alone
+        // (RFC 0045 §5.11.6): a child subscribing would make subscriptions
+        // the model's to create by spawning children, and a mirror would
+        // start one run per child for each occurrence. The template is
+        // refused one at compile; whatever composed the servers, the child
+        // gets none.
+        if let Some(servers) = doc
+            .get_mut("mcp")
+            .and_then(|m| m.get_mut("servers"))
+            .and_then(Value::as_array_mut)
+        {
+            for srv in servers.iter_mut().filter_map(Value::as_object_mut) {
+                srv.remove("events");
+                srv.remove("event_grants");
+            }
+        }
         // Intelligence: the parent's section, minus its budget (the child's
         // budget is the template's grant) and minus any INLINE token (the env
         // passthrough carries it; a secret REFERENCE rides along fine).

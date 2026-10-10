@@ -14,7 +14,8 @@ mod common;
 use common::*;
 use mcp::client::{FirstRequest, McpClient};
 use serde_json::{Map, Value, json};
-use std::time::Duration;
+use std::io::Write;
+use std::time::{Duration, Instant};
 
 const METHOD: &str = "x/echo";
 
@@ -189,4 +190,62 @@ fn at_2025_11_25_it_rides_the_session_and_adds_no_meta() {
     assert_eq!(req.header("mcp-session-id"), Some("s-1"));
     assert_eq!(req.header("mcp-protocol-version"), Some("2025-11-25"));
     assert_eq!(req.count("mcp-method"), 0);
+}
+
+#[test]
+fn an_answer_that_keeps_streaming_is_hung_up_at_the_bound() {
+    // Keepalives reset a per-read timeout for ever; the bound is the whole
+    // exchange's. What the server said meanwhile reaches the host's queue.
+    let (ep, _) = spawn(|req, w| {
+        let id = req.id();
+        let supported = [MODERN.to_string()];
+        if let Some((status, body)) = stateless_refusal(req, &supported) {
+            return respond(w, status, &[], &body);
+        }
+        match req.method() {
+            "server/discover" => respond(
+                w,
+                200,
+                &[],
+                &discover_answer(
+                    &id,
+                    &StatelessOpts {
+                        caps: json!({}),
+                        ..StatelessOpts::default()
+                    },
+                ),
+            ),
+            METHOD => {
+                let _ = w.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                );
+                for _ in 0..100 {
+                    let note = json!({"jsonrpc": "2.0", "method": "notifications/message",
+                                      "params": {"level": "info", "data": "still here"}});
+                    if w.write_all(format!("data: {note}\n\n").as_bytes()).is_err() {
+                        return;
+                    }
+                    let _ = w.flush();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            _ => respond(w, 404, &[], &error(&id, -32601, "Method not found")),
+        }
+    });
+    let c = connect(&ep, FirstRequest::Discover);
+    let started = Instant::now();
+    let e = c
+        .call_raw(METHOD, Map::new(), Value::Null, Duration::from_secs(1))
+        .expect_err("hung up at the bound");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "took {:?}: {e}",
+        started.elapsed()
+    );
+    assert!(
+        c.drain_notifications()
+            .iter()
+            .any(|n| n.method == "notifications/message"),
+        "the stream's notifications reach the host"
+    );
 }

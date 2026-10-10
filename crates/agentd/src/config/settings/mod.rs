@@ -13034,6 +13034,18 @@ mod tests {
                 )),
                 "unknown variant `push`",
             ),
+            (
+                binding(&format!(
+                    "          delivery: [poll]\n{into}          rate: 1/1s\n          replay: 0\n"
+                )),
+                "replay: under a second",
+            ),
+            (
+                binding(&format!(
+                    "          delivery: [poll]\n{into}          rate: 1/1s\n          ttl: 1h\n"
+                )),
+                "ttl: the webhook lease",
+            ),
         ];
         for (doc, says) in cases {
             let e = load_doc(&doc)

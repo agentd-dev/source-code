@@ -12,8 +12,9 @@
 //! `mock.event_trim {topic}` drops everything appended so far and one more
 //! occurrence the client never read, so its next poll is answered `truncated`; `mock.events_fail {code, data?,
 //! times?}` answers the next polls with that error; `mock.events_flags
-//! {always_more?, repeat?}` makes every answer say `hasMore`, or the next
-//! answer repeat the last page that held occurrences.
+//! {always_more?, repeat?, ignore_max?}` makes every answer say `hasMore`, the
+//! next answer repeat the last page that held occurrences, or every answer
+//! carry all that is pending whatever `maxEvents` asks.
 
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -39,6 +40,8 @@ struct Inner {
     fail: VecDeque<Value>,
     always_more: bool,
     repeat: bool,
+    /// Answer every occurrence after the cursor, whatever `maxEvents` asks.
+    ignore_max: bool,
     /// The last page answered, for `repeat`.
     last: Option<Value>,
 }
@@ -184,7 +187,11 @@ fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
     } else {
         (from, false)
     };
-    let max = params["maxEvents"].as_u64().unwrap_or(50) as usize;
+    let max = if g.ignore_max {
+        usize::MAX
+    } else {
+        params["maxEvents"].as_u64().unwrap_or(50) as usize
+    };
     let after: Vec<&(u64, String, Value)> = log.iter().filter(|(s, _, _)| *s > start).collect();
     let page: Vec<&(u64, String, Value)> = after.iter().take(max).copied().collect();
     let next = page.last().map_or(start, |(s, _, _)| *s);
@@ -264,6 +271,9 @@ pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
             }
             if let Some(b) = args["repeat"].as_bool() {
                 g.repeat = b;
+            }
+            if let Some(b) = args["ignore_max"].as_bool() {
+                g.ignore_max = b;
             }
             Some(json!({"ok": true}))
         }

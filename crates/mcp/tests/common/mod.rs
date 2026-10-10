@@ -578,7 +578,8 @@ pub fn stateless_server(opts: StatelessOpts) -> (String, Seen) {
                 "contents": [{"uri": req.body["params"]["uri"], "text": "x"}]}),
                 ),
             ),
-            _ => respond(w, 200, &stamp, &error(&id, -32601, "Method not found")),
+            // rmcp's server answers a method it does not know `404`.
+            _ => respond(w, 404, &stamp, &error(&id, -32601, "Method not found")),
         }
     })
 }

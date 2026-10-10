@@ -530,6 +530,11 @@ fn classify(e: &ClientInitializeError, failure: Option<BootstrapFailure>) -> Nex
         // The server listed what it speaks and 2026-07-28 is not there (a
         // `-32022`, or a DiscoverResult): reach it at the newest
         // `initialize`-era revision it lists that rmcp knows, else nothing.
+        // A version refusal that lists nothing proves nothing about the
+        // server: reach it as any other refusal.
+        E::NoCompatibleProtocolVersion {
+            server_supported, ..
+        } if server_supported.is_empty() => Next::Initialize(INITIALIZE_OFFER),
         E::NoCompatibleProtocolVersion {
             server_supported, ..
         } => server_supported
@@ -552,7 +557,10 @@ fn classify(e: &ClientInitializeError, failure: Option<BootstrapFailure>) -> Nex
 
 /// Should a refused `initialize` be followed by `server/discover`? Only when
 /// the server answered — a JSON-RPC refusal, or a 4xx other than 401 — which
-/// is how a 2026-07-28-only server refuses a handshake it does not have.
+/// is how a 2026-07-28-only server refuses a handshake it does not have. A 403
+/// re-probes too, for the reason a 403 to `server/discover` falls back: a
+/// proxy that allow-lists methods refuses the one it does not know. A 5xx,
+/// silence or a server never reached says nothing about the era.
 fn re_probes(e: &ClientInitializeError, failure: Option<BootstrapFailure>) -> bool {
     matches!(e, ClientInitializeError::JsonRpcError(_))
         || matches!(failure, Some(BootstrapFailure::Status(s)) if (400..500).contains(&s) && s != 401)
@@ -633,6 +641,7 @@ impl Start {
                 if !re_probes(&f, failure) {
                     return Err(format!("initialize: {}", said(&f)));
                 }
+                self.socket.forget_session();
                 // The re-probe never leads back to a second `initialize`.
                 self.attempt(discover_lifecycle(), INITIALIZE_OFFER)
                     .await
@@ -1266,6 +1275,14 @@ mod tests {
                 .collect(),
         };
         let closed = || E::ConnectionClosed("gone".into());
+        // How a socket failure reaches the classifier: rmcp's transport
+        // error, carrying no text of ours.
+        let transport = || {
+            E::transport::<StreamableHttpClientTransport<crate::rmcp_transport::AgentdHttp>>(
+                rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedEndOfStream,
+                "send discover request",
+            )
+        };
         let at = |v: ProtocolVersion| Next::Initialize(v);
         let rows: Vec<(E, Option<BootstrapFailure>, Next)> = vec![
             (rpc(-32020), None, Next::Refuse),
@@ -1298,10 +1315,49 @@ mod tests {
                 at(INITIALIZE_OFFER),
             ),
             (closed(), None, at(INITIALIZE_OFFER)),
+            (listed(&[]), None, at(INITIALIZE_OFFER)),
+            (
+                E::UncorrelatedErrorResponse {
+                    expected: rmcp::model::NumberOrString::Number(0),
+                    received: rmcp::model::NumberOrString::String("server-error".into()),
+                },
+                None,
+                at(INITIALIZE_OFFER),
+            ),
+            (transport(), None, at(INITIALIZE_OFFER)),
+            (transport(), Some(NoAnswer), at(INITIALIZE_OFFER)),
+            (transport(), Some(Status(401)), Next::Refuse),
+            (transport(), Some(Unreached), Next::Refuse),
         ];
         for (e, failure, want) in rows {
             assert_eq!(classify(&e, failure), want, "{e} / {failure:?}");
         }
+    }
+
+    #[test]
+    fn a_refused_handshake_re_probes_only_when_the_server_answered() {
+        use BootstrapFailure::*;
+        let rpc = ClientInitializeError::JsonRpcError(rmcp::ErrorData::new(
+            ErrorCode(-32022),
+            "Unsupported protocol version",
+            None,
+        ));
+        let closed = || ClientInitializeError::ConnectionClosed("gone".into());
+        assert!(re_probes(&rpc, None), "a JSON-RPC refusal");
+        assert!(
+            re_probes(&closed(), Some(Status(400))),
+            "a 4xx without a body"
+        );
+        assert!(re_probes(&closed(), Some(Status(404))));
+        assert!(
+            re_probes(&closed(), Some(Status(403))),
+            "an allow-listing proxy"
+        );
+        assert!(!re_probes(&closed(), Some(Status(401))), "the challenge");
+        assert!(!re_probes(&closed(), Some(Status(500))), "a server error");
+        assert!(!re_probes(&closed(), Some(NoAnswer)), "silence");
+        assert!(!re_probes(&closed(), Some(Unreached)), "never reached");
+        assert!(!re_probes(&closed(), None));
     }
 
     /// The SDK's own messages — a notification it sends, the answer to a

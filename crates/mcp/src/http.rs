@@ -305,6 +305,15 @@ impl HttpTransport {
     /// status Streamable HTTP gives a session the server no longer holds. A
     /// `404` to a request with no session (the `initialize` itself, a server
     /// that never issued one) says nothing about a session.
+    /// Drop the session a refused handshake left behind, before another
+    /// startup on this socket: a server can stamp a session on an
+    /// `initialize` it refused with a 200, and the next request — a
+    /// `server/discover` re-probe — must not carry it.
+    pub(crate) fn forget_session(&self) {
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.session_lost.store(false, Ordering::SeqCst);
+    }
+
     fn note_status(&self, status: u16, carried_session: bool) {
         if status == 404 && carried_session {
             self.session_lost.store(true, Ordering::SeqCst);

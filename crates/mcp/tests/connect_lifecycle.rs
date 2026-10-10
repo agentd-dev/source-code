@@ -377,10 +377,66 @@ fn a_session_stamped_by_a_2026_07_28_server_is_never_echoed() {
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     c.list_tools().unwrap();
     c.call_tool("echo", Some(json!({}))).unwrap();
+    // rmcp's server answers an unknown method `404` + -32601: on a request
+    // that carried no session, that is not a lost session.
+    assert!(c.list_resource_templates().is_err());
     for r in seen.lock().unwrap().iter() {
         assert_eq!(r.header("mcp-session-id"), None, "{}", r.method());
     }
     assert!(!c.session_lost());
+}
+
+#[test]
+fn a_session_stamped_on_a_refused_handshake_does_not_ride_the_re_probe() {
+    // A 2026-07-28 server that refuses `initialize` with a 200 and stamps a
+    // session on it: the re-probe and everything after it carry no session.
+    let (ep, seen) = spawn(|req, w| {
+        let id = req.id();
+        match req.method() {
+            "initialize" => respond(
+                w,
+                200,
+                &[("Mcp-Session-Id", "stale")],
+                &initialize_refusal(&id, "2025-11-25", &[MODERN.to_string()]),
+            ),
+            "server/discover" => respond(
+                w,
+                200,
+                &[],
+                &discover_answer(&id, &StatelessOpts::default()),
+            ),
+            "tools/list" => respond(w, 200, &[], &result(&id, json!({"tools": []}))),
+            _ => respond(w, 404, &[], &error(&id, -32601, "Method not found")),
+        }
+    });
+    let c = connect(&ep, FirstRequest::Initialize).unwrap();
+    c.list_tools().unwrap();
+    assert!(c.list_resource_templates().is_err());
+    let reqs = seen.lock().unwrap().clone();
+    for r in reqs.iter().filter(|r| r.method() != "initialize") {
+        assert_eq!(r.header("mcp-session-id"), None, "{}", r.method());
+    }
+    assert!(!c.session_lost(), "a 404 on a sessionless request");
+}
+
+#[test]
+fn an_initialize_first_connection_re_probes_past_a_forbidden_handshake() {
+    let (ep, seen) = spawn(|req, w| {
+        let id = req.id();
+        match req.method() {
+            "initialize" => respond_raw(w, 403, &[], ""),
+            "server/discover" => respond(
+                w,
+                200,
+                &[],
+                &discover_answer(&id, &StatelessOpts::default()),
+            ),
+            _ => respond(w, 200, &[], &result(&id, json!({"tools": []}))),
+        }
+    });
+    let c = connect(&ep, FirstRequest::Initialize).unwrap();
+    assert_eq!(methods(&seen)[..2], ["initialize", "server/discover"]);
+    assert_eq!(c.protocol_version().as_deref(), Some("2026-07-28"));
 }
 
 #[test]

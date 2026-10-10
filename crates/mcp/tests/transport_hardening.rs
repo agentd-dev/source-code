@@ -877,7 +877,8 @@ fn an_initialize_answered_on_a_stream_completes_the_handshake() {
                 std::thread::sleep(Duration::from_millis(300));
                 let answer = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {
                     "protocolVersion": msg["params"]["protocolVersion"],
-                    "capabilities": {}, "serverInfo": {"name": "chatty", "version": "0"}}});
+                    "capabilities": {"events": {"x": 1}},
+                    "serverInfo": {"name": "chatty", "version": "0"}}});
                 let _ = write!(w, "data: {answer}\n\n");
                 let _ = w.flush();
             });
@@ -888,6 +889,9 @@ fn an_initialize_answered_on_a_stream_completes_the_handshake() {
     c.initialize()
         .expect("the handshake completes after the server's log line");
     assert_eq!(c.protocol_version().as_deref(), Some("2025-11-25"));
+    // The answer's capabilities are kept as sent though it came at the end
+    // of a stream: members rmcp does not model are not lost.
+    assert_eq!(c.capability("events"), Some(json!({"x": 1})));
 }
 
 #[test]

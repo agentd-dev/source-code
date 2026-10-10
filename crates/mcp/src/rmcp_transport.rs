@@ -116,8 +116,11 @@ impl AgentdHttp {
 pub(crate) enum BootstrapFailure {
     /// The server answered with this status and no JSON-RPC body.
     Status(u16),
-    /// The request never reached a server: the dial (TCP, DNS, TLS) failed,
-    /// or this build cannot speak the endpoint's scheme.
+    /// The request never reached a server: the TCP dial (or the name lookup)
+    /// failed, or this build cannot speak the endpoint's scheme. A TLS
+    /// failure is not this: the handshake runs on the first read, so it
+    /// surfaces as `NoAnswer`, the fallback meets the same failure, and the
+    /// error names both.
     Unreached,
     /// The server took the request and gave no answer: it went silent past
     /// the timeout, reset the connection, or answered with no body.

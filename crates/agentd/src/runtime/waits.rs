@@ -791,6 +791,11 @@ impl Runtime {
                 json!({"run": rid, "step": sid, "kind": "event",
                        "stream": event.get("stream"), "subject": event.get("subject")}),
             );
+            // What the event carried, the run it wakes carries.
+            let carries = super::starts::event_carries(&event);
+            if !carries.is_empty() {
+                self.hand_run(&rid, &carries);
+            }
             self.finish_step_pub(&rid, &sid, StepStatus::Done, Some(event), None, 0);
         }
     }

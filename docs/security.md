@@ -290,6 +290,9 @@ the subagent record's `carries`) as text reaches it, and only ever added to:
 - a run, when a signal or an A2A message reaches it: what the sender carried — a
   `workflow.signal` step or tool, a peer's own `workflow.signal`, a peer's message to a
   `wait {on: message}` — and a `signal` start records the same on the run it starts;
+- a stream event, when a run `emit`s it: what that run carries, on the event's record — and
+  so a run a `stream`, `batch` or `correlate` start fires on it, and a run a
+  `wait {on: event}` resumes on it, carries it too;
 - a run, when it ends: what its definition can be handed by then, before the definition
   can be released;
 - a child, when it is spawned: what its spawner carried; and when `subagent.send` steers
@@ -313,10 +316,10 @@ A context that holds a leg less is handed the text whole, as before — and then
 its own result is withheld in turn from a reader holding both, and what it starts or feeds
 is judged as a run that read a tainted stream would be. So a read-back is never refused at
 load: a reader holding both legs is withheld from, and one holding a leg less can hand the
-text only to what its own reach covers. One gap: what a run that only the runtime knows to
-carry outside input — one an A2A peer's request started — puts on a stream with `emit` is
-not carried to the stream's consumers; the static check follows a run's `emit` only for
-the taint it can see in the definitions. An operator reading a run over A2A — the
+text only to what its own reach covers. What a run that only the runtime knows to carry
+outside input — one an A2A peer's request started — puts on a stream with `emit` reaches
+the stream's consumers on the event's record, beyond the taint the static check can see in
+the definitions. An operator reading a run over A2A — the
 `workflow.status` op, the run's task — is no model's context, and reads it whole.
 `security.allow_trifecta` lifts the withholding with every other trifecta gate.
 

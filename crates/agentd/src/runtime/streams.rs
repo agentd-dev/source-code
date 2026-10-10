@@ -93,6 +93,24 @@ impl super::reactor::Runtime {
         id: &str,
         source: &str,
     ) -> Result<u64, AppendError> {
+        self.append_carrying(stream, subject, correlation, data, id, source, None)
+    }
+
+    /// [`Runtime::append`], recording on the event what the run that emits
+    /// it carries (`withhold`): its consumers take it on — the runs a
+    /// `stream`, `batch` or `correlate` start fires, the run a `wait {on:
+    /// event}` resumes — as a signal's receiver takes on its sender's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_carrying(
+        &mut self,
+        stream: &str,
+        subject: &str,
+        correlation: Option<&str>,
+        data: Value,
+        id: &str,
+        source: &str,
+        carries: Option<&super::withhold::Carries>,
+    ) -> Result<u64, AppendError> {
         let Some(cfg) = self.settings.streams.get(stream).cloned() else {
             return Err(AppendError::Refused(format!(
                 "stream {stream:?} is not declared (add it under `streams:`)"
@@ -122,11 +140,14 @@ impl super::reactor::Runtime {
         let mut seq = head + 1;
         let mut probes = 0usize;
         loop {
-            let event = json!({
+            let mut event = json!({
                 "id": id, "stream": stream, "subject": subject, "seq": seq,
                 "ts": now_ms(), "source": source,
                 "correlation": correlation, "data": &data,
             });
+            if let Some(c) = carries.filter(|c| !c.is_empty()) {
+                event["carries"] = serde_json::to_value(c).unwrap_or(Value::Null);
+            }
             let created = self
                 .durable
                 .create(Kind::Event, &key(stream, seq), event)

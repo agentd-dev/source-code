@@ -1702,14 +1702,21 @@ impl Runtime {
                         .get(run_id)
                         .map(|r| r.workflow.clone())
                         .unwrap_or_default();
-                    match self.append_event(
-                        &stream,
-                        &subject,
-                        correlation.as_deref(),
-                        data,
-                        &id,
-                        &source,
-                    ) {
+                    // What this run carries goes on the event, for whatever
+                    // consumes it.
+                    let carries = self.run_carries(run_id);
+                    match self
+                        .append_carrying(
+                            &stream,
+                            &subject,
+                            correlation.as_deref(),
+                            data,
+                            &id,
+                            &source,
+                            Some(&carries),
+                        )
+                        .map_err(|e| e.to_string())
+                    {
                         Ok(seq) => {
                             self.log.info(
                                 "stream.emit",

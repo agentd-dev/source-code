@@ -511,6 +511,8 @@ impl Runtime {
         kind: &str,
         origin: Value,
     ) -> Admission {
+        // What the events carried, the run carries.
+        let carries = event_carries(&payload);
         self.admit_start(
             workflow,
             node,
@@ -519,7 +521,7 @@ impl Runtime {
             kind,
             None,
             Some(origin),
-            None,
+            (!carries.is_empty()).then_some(&carries),
         )
     }
 
@@ -1075,4 +1077,28 @@ pub fn run_event(status: RunStatus) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// What the stream events a consumer offers carry (`withhold`): a single
+/// event's, or every one of a batch's or a correlation's.
+pub(crate) fn event_carries(payload: &Value) -> super::withhold::Carries {
+    let mut c = super::withhold::Carries::default();
+    let mut take = |e: &Value| {
+        if let Some(x) = e
+            .get("carries")
+            .and_then(|v| serde_json::from_value::<super::withhold::Carries>(v.clone()).ok())
+        {
+            c.union(&x);
+        }
+    };
+    take(payload);
+    for e in payload
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        take(e);
+    }
+    c
 }

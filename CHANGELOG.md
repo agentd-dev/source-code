@@ -121,6 +121,11 @@ tracks a draft.
 - A `wait {on: webhook}` survives a restart: its record keeps the callback
   route and its auth references (never a resolved secret), and boot serves
   the route again. It could only time out after one before.
+- What a run carries is recorded on the stream events it `emit`s, and the
+  runs that consume them carry it: a `stream`, `batch` or `correlate` start's
+  run, and a `wait {on: event}`'s. A run only the runtime knows to carry
+  outside input (an A2A peer's request started it) no longer launders it
+  through a stream.
 - Webhook idempotency markers are swept on a store without `list` too (an
   MCP or HTTP store that offers none): each period's markers are recorded in
   a small paged index, written before the marker, and the sweep deletes

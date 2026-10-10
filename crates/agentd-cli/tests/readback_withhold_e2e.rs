@@ -1231,6 +1231,84 @@ fn a_run_a_peer_started_run_starts_carries_its_text() {
     }
 }
 
+/// What a peer-started run puts on a stream, the stream's consumers carry:
+/// the run a `stream` start fires on its event, and the run a `wait {on:
+/// event}` resumes on it. Nothing in the definitions opens a route, so the
+/// static check sees no taint; the event's record does. The same emit from
+/// a run the operator started carries nothing.
+#[cfg(feature = "a2a")]
+#[test]
+fn what_a_peer_started_run_emits_its_consumers_carry() {
+    let t = tempfile::tempdir().unwrap();
+    let workflows = format!(
+        "  - name: job\n    steps:\n      m: {{kind: manual}}\n      \
+         e: {{kind: emit, depends_on: [m], stream: inbox, subject: s, data: {{x: 1}}}}\n      \
+         f: {{kind: finish, depends_on: [e], status: completed}}\n  \
+         - name: consumer\n    steps:\n      \
+         st: {{kind: stream, stream: inbox}}\n      \
+         f: {{kind: finish, depends_on: [st], status: completed, output: \"{RUN_SECRET}\"}}\n"
+    );
+    for (bearer, withheld) in [(PEER, true), (OPERATOR, false)] {
+        let turns = json!([call("workflow.status", json!({"name": "consumer"})), echo()]);
+        let d = Peered::start(
+            t.path(),
+            "streams:\n  inbox: {}\n",
+            &workflows,
+            turns,
+            false,
+        );
+        d.command(bearer, "workflow.run", json!({"workflow": "job"}));
+        d.wait("run.done", 2);
+        let ran = d.ask();
+        let answer = ran.answer();
+        assert_eq!(
+            peer_marker(&answer),
+            withheld,
+            "{bearer}: {answer}\n{}",
+            ran.log
+        );
+        assert_eq!(answer.contains(RUN_SECRET), !withheld, "{bearer}: {answer}");
+    }
+}
+
+/// The run a `wait {on: event}` resumes on such an event carries it too,
+/// though the operator started it.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_wait_woken_by_what_a_peer_started_run_emits_carries_it() {
+    let t = tempfile::tempdir().unwrap();
+    let workflows = format!(
+        "  - name: job\n    steps:\n      m: {{kind: manual}}\n      \
+         e: {{kind: emit, depends_on: [m], stream: inbox, subject: s, data: {{x: 1}}}}\n      \
+         f: {{kind: finish, depends_on: [e], status: completed}}\n  \
+         - name: waiter\n    steps:\n      \
+         m: {{kind: manual}}\n      \
+         w: {{kind: wait, depends_on: [m], on: event, stream: inbox, timeout: 60s}}\n      \
+         f: {{kind: finish, depends_on: [w], status: completed, output: \"{RUN_SECRET}\"}}\n"
+    );
+    let turns = json!([call("workflow.status", json!({"name": "waiter"})), echo()]);
+    let d = Peered::start(
+        t.path(),
+        "streams:\n  inbox: {}\n",
+        &workflows,
+        turns,
+        false,
+    );
+    d.command(OPERATOR, "workflow.run", json!({"workflow": "waiter"}));
+    // The wait anchors at the stream's head when it suspends: it is
+    // suspended before anything is emitted.
+    d.wait_until(|log| {
+        log.lines()
+            .any(|l| l.contains("\"event\":\"step.start\"") && l.contains("\"step\":\"w\""))
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    d.command(PEER, "workflow.run", json!({"workflow": "job"}));
+    d.wait("run.done", 2);
+    let ran = d.ask();
+    let answer = ran.answer();
+    assert!(peer_marker(&answer), "{answer}\n{}", ran.log);
+}
+
 /// A reader holding a leg less is handed a peer-started run whole — and
 /// carries it on: the root, holding both, reads that reader's result
 /// withheld. The static check cannot see this (nothing in the definitions

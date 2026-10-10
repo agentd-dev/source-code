@@ -390,10 +390,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                     &instance,
                     Some(&trace.trace_id),
                 ));
-                // Said after the connect (its priming list) and after the
-                // catalogue's own list.
-                report_dropped_tools(&log, &s.name, &c);
                 let tools = c.list_tools().unwrap_or_default();
+                // What the connect's priming list and this one dropped.
                 report_dropped_tools(&log, &s.name, &c);
                 log.info(
                     "mcp.connect",

@@ -58,13 +58,16 @@ pub fn discover_issuer(resource: &str, timeout: Duration) -> Option<String> {
 /// that validates those before auth answers with its 401 instead of a -32020.
 fn challenge_metadata_url(resource: &str, timeout: Duration) -> Option<String> {
     let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-    if let Some(url) = probe(
+    match probe(
         resource,
         timeout,
         &[("Accept", "application/json")],
         initialize,
     ) {
-        return Some(url);
+        Answer::Challenge(url) => return Some(url),
+        // Nothing answered: a second probe would only wait as long again.
+        Answer::Unreached => return None,
+        Answer::NoChallenge => {}
     }
     let version = ::mcp::wire::DISCOVER_PROTOCOL_VERSION;
     let discover = serde_json::json!({
@@ -76,7 +79,7 @@ fn challenge_metadata_url(resource: &str, timeout: Duration) -> Option<String> {
         }}
     })
     .to_string();
-    probe(
+    match probe(
         resource,
         timeout,
         &[
@@ -85,31 +88,49 @@ fn challenge_metadata_url(resource: &str, timeout: Duration) -> Option<String> {
             ("Mcp-Method", "server/discover"),
         ],
         discover.as_bytes(),
-    )
+    ) {
+        Answer::Challenge(url) => Some(url),
+        Answer::Unreached | Answer::NoChallenge => None,
+    }
 }
 
-/// One unauthenticated POST of `body` with `headers`; the challenge's
-/// `resource_metadata` URL if the answer carries a challenge that names one.
-fn probe(
-    resource: &str,
-    timeout: Duration,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> Option<String> {
-    let url = Url::parse(resource).ok()?;
-    let mut stream = oauth2::connect(&url, timeout).ok()?;
+/// What one probe drew.
+enum Answer {
+    /// A challenge naming its `resource_metadata` URL.
+    Challenge(String),
+    /// An HTTP answer without one.
+    NoChallenge,
+    /// No HTTP answer at all.
+    Unreached,
+}
+
+/// One unauthenticated POST of `body` with `headers`.
+fn probe(resource: &str, timeout: Duration, headers: &[(&str, &str)], body: &[u8]) -> Answer {
+    let Ok(url) = Url::parse(resource) else {
+        return Answer::Unreached;
+    };
+    let Ok(mut stream) = oauth2::connect(&url, timeout) else {
+        return Answer::Unreached;
+    };
     let mut all: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
     all.extend_from_slice(headers);
-    let resp = http::send(
+    let Ok(resp) = http::send(
         stream.as_mut(),
         &url.host_header(),
         "POST",
         &url.path,
         &all,
         body,
-    )
-    .ok()?;
-    parse_resource_metadata(resp.header("www-authenticate")?)
+    ) else {
+        return Answer::Unreached;
+    };
+    match resp
+        .header("www-authenticate")
+        .and_then(parse_resource_metadata)
+    {
+        Some(url) => Answer::Challenge(url),
+        None => Answer::NoChallenge,
+    }
 }
 
 /// Extract the `resource_metadata` URL from a `WWW-Authenticate` header value

@@ -267,7 +267,11 @@ pub fn run() -> i32 {
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
             Ok(mut c) => {
-                crate::runtime::report_dropped_tools(&log, &spec.name, &c);
+                // A turn worker dials every server for every turn; the
+                // supervisor has already said what its tools lack.
+                if payload.role != crate::subagent::protocol::Role::Turn {
+                    crate::runtime::report_dropped_tools(&log, &spec.name, &c);
+                }
                 log.info(
                     "mcp.connect",
                     serde_json::json!({"server": spec.name, "protocol": c.protocol_version()}),

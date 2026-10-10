@@ -201,6 +201,12 @@ fn every_header_rmcp_adds_is_one_agentd_refuses() {
     ] {
         assert!(methods.contains(&m), "{m} was not sent: {methods:?}");
     }
+    // And at 2025-11-25, where the transport adds the session it echoes.
+    let (legacy, legacy_seen) = legacy_server(LegacyOpts::default());
+    let c = connect(&legacy, FirstRequest::Initialize).unwrap();
+    c.call_tool("echo", Some(json!({}))).unwrap();
+    let mut reqs = reqs;
+    reqs.extend(legacy_seen.lock().unwrap().iter().cloned());
     for r in &reqs {
         for (name, _) in &r.headers {
             assert!(
@@ -210,9 +216,10 @@ fn every_header_rmcp_adds_is_one_agentd_refuses() {
             );
         }
         assert!(
-            r.headers
-                .iter()
-                .any(|(n, _)| mcp::wire::is_protocol_header(n)),
+            r.method() == "initialize"
+                || r.headers
+                    .iter()
+                    .any(|(n, _)| mcp::wire::is_protocol_header(n)),
             "{}: no protocol header at all",
             r.method()
         );

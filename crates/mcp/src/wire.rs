@@ -25,10 +25,17 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// `initialize`, reached with that request alone.
 pub const DISCOVER_PROTOCOL_VERSION: &str = "2026-07-28";
 
-/// The request headers the MCP client sets itself, at MCP 2026-07-28: the
-/// revision, the method and the name it routes on. An operator's copy would
-/// go out beside the client's, and a server refuses the duplicate (-32020).
-pub const PROTOCOL_HEADERS: &[&str] = &["mcp-protocol-version", "mcp-method", "mcp-name"];
+/// The request headers the MCP client sets itself: the revision, the method
+/// and the name it routes on (MCP 2026-07-28), and the session and the
+/// stream-resumption point (2025-11-25). An operator's copy would go out
+/// beside the client's, and a server refuses the duplicate (-32020).
+pub const PROTOCOL_HEADERS: &[&str] = &[
+    "mcp-protocol-version",
+    "mcp-method",
+    "mcp-name",
+    "mcp-session-id",
+    "last-event-id",
+];
 
 /// Prefixes of the request headers the client sets itself: a tool argument
 /// annotated with `x-mcp-header` travels as `Mcp-Param-<name>`.

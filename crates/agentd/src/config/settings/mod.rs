@@ -6910,7 +6910,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
         for (h, v) in &svc.headers {
-            if ::mcp::wire::is_protocol_header(h) {
+            // Only an MCP service's headers reach the MCP client; a peer's or
+            // an intelligence endpoint's are theirs to set.
+            if svc.kind == ServiceKind::Mcp && ::mcp::wire::is_protocol_header(h) {
                 err(
                     &mut d,
                     format!(
@@ -12479,6 +12481,16 @@ mod tests {
         }
         let errs = errors(
             "mcp:\n  servers:\n    - {name: m, endpoint: https://m/mcp, headers: {X-Env: prod}}\n",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("set by the MCP client itself")),
+            "{errs:?}"
+        );
+        // A peer's headers are not the MCP client's.
+        let errs = errors(
+            "services:\n  p:\n    kind: peer\n    endpoint: https://p/a2a\n    headers: {\"Mcp-Method\": x}\n",
         );
         assert!(
             !errs

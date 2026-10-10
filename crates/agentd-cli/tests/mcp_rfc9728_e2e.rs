@@ -199,8 +199,12 @@ fn a_server_that_checks_the_standard_headers_before_auth_still_gives_its_challen
     // A 2026-07-28 server: a request without the standard headers, or whose
     // `Mcp-Method` is not its method, is refused before authentication.
     let ep = spawn_strict("https://as.example", |headers, msg| {
+        let meta = &msg["params"]["_meta"];
         header(headers, "mcp-protocol-version").is_none()
             || header(headers, "mcp-method") != msg["method"].as_str()
+            || meta["io.modelcontextprotocol/protocolVersion"].as_str()
+                != header(headers, "mcp-protocol-version")
+            || meta["io.modelcontextprotocol/clientCapabilities"].is_null()
     });
     assert_eq!(
         discover_issuer(&ep, Duration::from_secs(5)).as_deref(),

@@ -24,8 +24,10 @@
 //!
 //! Keeping the channel out of the definition is what keeps a `to:` written
 //! anywhere else — config YAML, `workflow.create`, a model's `ask_human` —
-//! principal syntax only: nothing but a document's own declaration can put a
-//! channel on a gate, because only there is the channel's meaning declared.
+//! principal syntax only: a channel reaches a gate from a document's own
+//! declaration, or from the operator's `agent.gate_channels` (how a
+//! subagent template's declarations reach its child, which the parent
+//! composes), and never from a definition.
 
 use std::collections::BTreeMap;
 

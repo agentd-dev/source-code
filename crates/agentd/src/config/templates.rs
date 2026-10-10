@@ -89,6 +89,22 @@ pub fn compile_templates(s: &Settings) -> Result<BTreeMap<String, CompiledTempla
     if errs.is_empty() { Ok(out) } else { Err(errs) }
 }
 
+/// The facts a template's variants are judged by: those of the model its
+/// child runs — the template's `model:`, else `subagents.defaults.model`, else
+/// the root's — as the provider takes it (`Intelligence::wire_model`). A model
+/// a call site passes at spawn is not known here, and does not re-judge them.
+pub(crate) fn template_facts(s: &Settings, t: &SubagentTemplate) -> BTreeMap<String, String> {
+    match t
+        .model
+        .as_deref()
+        .or(s.subagents.defaults.model.as_deref())
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(reference) => idoc::instruction_facts(Some(&s.intelligence.wire_model(reference))),
+        None => s.agent.instruction_facts.clone(),
+    }
+}
+
 fn compile_one(
     name: &str,
     t: &SubagentTemplate,
@@ -105,20 +121,21 @@ fn compile_one(
     // instruction document too, and its `human` steps addressed to its own
     // `::!human`s would otherwise reach the child as the folded channel —
     // accepted here, refused by the child at every spawn. The channels are
-    // kept: the child's configuration has no way to carry them (only the
-    // agent's own document can put a channel on a gate), so the parent's
-    // validation says they are not announced rather than dropping them
-    // without a word.
+    // kept, and composed into the child's `agent.gate_channels`: the prose
+    // the child reads no longer declares the `::!human`s.
     //
-    // Folded with the root's facts, so a template's `:::unless{host="agentd"}`
-    // is decided exactly as the same block in the agent's own instruction —
-    // the operator's answers, which the root's document could not choose.
+    // Folded with the facts of the model the child runs (`template_facts`):
+    // a `:::when{agent="gpt"}` variant is meant for the model that will read
+    // it. `host` is agentd's either way, so a template's
+    // `:::unless{host="agentd"}` is decided as the same block in the agent's
+    // own instruction — the operator's answers, which no document chooses.
+    let facts = template_facts(s, t);
     let (ex, gate_channels) = match idoc::parse(&t.instruction).and_then(|doc| {
         let mut ex = idoc::fold_full(
             &doc,
             &idoc::all_families(),
             &BTreeMap::new(),
-            &s.agent.instruction_facts,
+            &facts,
             &|_| None,
         )?;
         let channels = crate::config::humans::address_document_gates(&doc, &mut ex.workflows);
@@ -1019,9 +1036,48 @@ mod tests {
         assert!(params_introduced_machinery(clean, &fold_params(clean, &p)));
     }
 
-    /// A template is folded with the ROOT's facts — the operator's model and
-    /// `host=agentd` — so its variants are decided as the same blocks in the
-    /// agent's own instruction are.
+    /// A template's variants are decided by the model its child runs: its
+    /// own `model:` (a literal or a tier, read as the provider takes it), else
+    /// `subagents.defaults.model`, else the root's. `host` is agentd's
+    /// throughout.
+    #[test]
+    fn a_template_is_folded_with_its_childs_model() {
+        let variants = "\x20       :::when{agent=\"claude\"}\n\
+             \x20       FOR-CLAUDE\n\
+             \x20       :::\n\
+             \x20       :::when{agent=\"gpt\"}\n\
+             \x20       FOR-GPT\n\
+             \x20       :::\n";
+        let fold = |extra: &str, template_model: &str| {
+            let doc: Value = crate::config::yaml::parse(&format!(
+                "intelligence:\n  endpoints: \"https://llm.example/v1\"\n  model: claude-sonnet-4-5\n  models:\n    fast: {{model: gpt-5.1-mini}}\n\
+                 subagents:\n{extra}  templates:\n    t:\n{template_model}      instruction: |\n\
+                 \x20       Base.\n{variants}"
+            ))
+            .unwrap();
+            let s = Settings::from_document(doc, "t").unwrap();
+            compile_templates(&s).unwrap()["t"].cleaned.clone()
+        };
+        for (extra, model, want, not) in [
+            ("", "      model: gpt-5.1\n", "FOR-GPT", "FOR-CLAUDE"),
+            ("", "      model: fast\n", "FOR-GPT", "FOR-CLAUDE"),
+            (
+                "  defaults: {model: gpt-5.1}\n",
+                "",
+                "FOR-GPT",
+                "FOR-CLAUDE",
+            ),
+            ("", "", "FOR-CLAUDE", "FOR-GPT"),
+        ] {
+            let cleaned = fold(extra, model);
+            assert!(cleaned.contains(want), "{model:?} {extra:?}: {cleaned}");
+            assert!(!cleaned.contains(not), "{model:?} {extra:?}: {cleaned}");
+        }
+    }
+
+    /// With no model of its own, a template is folded with the ROOT's facts —
+    /// the operator's model and `host=agentd` — so its variants are decided as
+    /// the same blocks in the agent's own instruction are.
     #[test]
     fn a_template_is_folded_with_the_roots_facts() {
         let doc: Value = crate::config::yaml::parse(

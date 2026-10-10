@@ -359,6 +359,19 @@ sent one at a time); agentd's answers to a server's requests are bounded at
 
 ### Fixed
 
+- **A subagent template's gate channels are announced in its child.** A
+  template whose `human` steps were addressed to a `::!human` with a channel
+  loaded, but its child announced nothing, since the prose the child reads no
+  longer declares the `::!human`s (the parent's boot warned). The parent now
+  composes them into the child's new `agent.gate_channels` — operator-only,
+  reloadable; an operator may write it for any configured workflow, and a
+  document's own declaration stands where both name a step.
+- **A subagent template's variants are judged by the model its child runs.**
+  A template with `model: gpt-5.1` under a Claude agent had its
+  `:::when{agent="gpt"}` blocks dropped and its `{agent="claude"}` ones kept:
+  every template was folded with the agent's own model. Now its own `model:`
+  decides (a tier is read as the provider's model), else
+  `subagents.defaults.model`, else the agent's.
 - **The TUI and web UI keep saying a session expired.** When a session
   expired while a listing was still out (a slow agent, a slow runner), the
   listing's late answer set the connection back to `polling`, and the UI

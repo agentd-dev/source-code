@@ -295,6 +295,16 @@ pub struct Agent {
     /// by the document.
     #[serde(default)]
     pub document_capabilities: Vec<String>,
+    /// The channel a gate is announced on, for a configured workflow whose
+    /// `human` steps no instruction document addressed: workflow name → step
+    /// path (`config::humans::GateChannels`) → channel. It is how a subagent
+    /// template's `::!human` channels reach its instance child — the parent
+    /// composes it — and an operator may write it for any configured
+    /// workflow. Operator-only: a served document puts a channel on its own
+    /// gates by declaring the `::!human`, and where both name a step the
+    /// document's declaration stands.
+    #[serde(default)]
+    pub gate_channels: crate::config::humans::GateChannels,
     /// Declarations lifted from extended-family instruction blocks (`!file`,
     /// `!function`, `!runtime`, …), keyed by kind — DERIVED, never a config key.
     /// Recorded so `--capabilities` can report what a document reached for; the
@@ -1049,6 +1059,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // The grant set that decides which machinery families this very document
     // may activate — the ladder it is standing on.
     "agent.document_capabilities",
+    // Where a gate is announced: a document announces its own by declaring
+    // the `::!human`; a channel on a gate it did not declare is the
+    // operator's (or, in a template's child, the composing parent's) to give.
+    "agent.gate_channels",
     // Where the instruction comes from, who may sign it, and which key opens
     // it: a document that can rewrite this can point the next read at itself.
     "agent.instruction",
@@ -4529,6 +4543,22 @@ impl Settings {
             settings.agent.document_declarations = ex.declarations;
             settings.agent.document_config = ex.config;
         }
+        // The operator's channels (a template's child: what its parent
+        // composed) beside the document's, which stand where both name a step.
+        for (wf, steps) in &settings.agent.gate_channels {
+            for (step, ch) in steps {
+                let have = gate_channels.entry(wf.clone()).or_default();
+                match have.get(step) {
+                    Some(doc) if doc != ch => instruction_warnings.push(format!(
+                        "agent.gate_channels.{wf}.{step}: the instruction document announces this gate on {doc:?}; {ch:?} is not used"
+                    )),
+                    Some(_) => {}
+                    None => {
+                        have.insert(step.clone(), ch.clone());
+                    }
+                }
+            }
+        }
         settings.agent.document_gate_channels = gate_channels;
         settings.agent.document_workflows = document_workflows;
         settings.agent.document_grants = document_grants;
@@ -7182,37 +7212,33 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // instance-machinery checks all run here, so a bad template refuses the
     // PARENT's startup — naming the template — instead of failing at the first
     // spawn, long after the deploy.
-    match crate::config::templates::compile_templates(s) {
-        Err(errs) => {
-            for e in errs {
-                err(&mut d, e);
+    // A template's gates addressed to a `::!human` with a channel are
+    // announced on it in the child: the parent composes the channels into
+    // the child's `agent.gate_channels` (`runtime::instances`).
+    if let Err(errs) = crate::config::templates::compile_templates(s) {
+        for e in errs {
+            err(&mut d, e);
+        }
+    }
+    for (wf, steps) in &s.agent.gate_channels {
+        for (step, ch) in steps {
+            if ch.trim().is_empty() || step.trim().is_empty() {
+                err(
+                    &mut d,
+                    format!(
+                        "agent.gate_channels.{wf}: a step path and a channel are both required"
+                    ),
+                );
             }
         }
-        // A template's gate addressed to a `::!human` that declares a channel
-        // loads — answered by the operators, as in the agent's own document —
-        // but the child's configuration cannot carry the channel, so it is
-        // announced nowhere. Said here, where the author can still choose.
-        Ok(compiled) => {
-            for (name, c) in &compiled {
-                let at: Vec<String> = c
-                    .gate_channels
-                    .iter()
-                    .flat_map(|(wf, steps)| {
-                        steps
-                            .iter()
-                            .map(move |(st, ch)| format!("{wf}.{st} → {ch}"))
-                    })
-                    .collect();
-                if !at.is_empty() {
-                    d.warnings.push(format!(
-                        "subagents.templates.{name}: its gates addressed to a `::!human` with a \
-                         channel ({}) are answered by the operators, but a template's child does \
-                         not announce the channel — only the agent's own instruction document \
-                         carries a channel onto its gates",
-                        at.join(", ")
-                    ));
-                }
-            }
+        let inline = s
+            .workflows
+            .iter()
+            .any(|w| w.get("name").and_then(Value::as_str) == Some(wf.as_str()));
+        if !inline {
+            d.warnings.push(format!(
+                "agent.gate_channels.{wf}: no inline workflow has this name — the channels apply only if a configured definition of that name loads"
+            ));
         }
     }
     if !s.subagents.templates.is_empty() && s.a2a.listen.is_none() {
@@ -8415,6 +8441,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "agent.ask_human_unowned",
     "agent.conversation_budget",
     "agent.description",
+    // Merged into the document's gate channels, whose change a reload sees
+    // and answers by reloading the definitions (`stage_reload`).
+    "agent.gate_channels",
     "agent.instruction",
     "agent.max_parallel_turns",
     "agent.on_workflow_finished",
@@ -8915,6 +8944,7 @@ mod tests {
                     "store.http" => json!({"base_url": "https://s"}),
                     "security.aauth" => json!({"provider": "https://apd"}),
                     "lifecycle.exit_code_map" => json!({"3": 0}),
+                    "agent.gate_channels" => json!({"w": {"approve": "@channel/ops"}}),
                     _ => json!({"k": "v"}),
                 },
                 paths::Kind::Any => match b.path.as_str() {
@@ -13203,6 +13233,28 @@ mod tests {
             let e = load_doc(&body).unwrap_err().to_string();
             assert!(e.contains(says), "want {says:?}:\n{e}\n---\n{body}");
         }
+    }
+
+    /// `agent.gate_channels` puts a channel on a configured workflow's gate —
+    /// what a template's child is composed with — and an empty one is
+    /// refused.
+    #[test]
+    fn gate_channels_reach_the_gates_of_configured_workflows() {
+        let wf = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      h: {kind: human, depends_on: [s], to: operator, question: ok?}\n      f: {kind: finish, depends_on: [h], status: completed}\n";
+        let l = load_doc(&format!(
+            "store: {{kind: memory}}\nagent:\n  gate_channels: {{approve: {{h: \"@channel/ops\"}}}}\n{wf}"
+        ))
+        .unwrap();
+        assert_eq!(
+            l.settings.agent.document_gate_channels["approve"]["h"],
+            "@channel/ops"
+        );
+        let e = load_doc(&format!(
+            "store: {{kind: memory}}\nagent:\n  gate_channels: {{approve: {{h: \"\"}}}}\n{wf}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("agent.gate_channels.approve"), "{e}");
     }
 
     #[cfg(feature = "mcp-events")]

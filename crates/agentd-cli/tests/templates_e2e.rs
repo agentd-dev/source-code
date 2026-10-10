@@ -23,6 +23,15 @@ fn events(stderr: &str, name: &str) -> Vec<Value> {
 
 fn run_cfg(cfg_text: &str) -> (Option<i32>, String) {
     let dir = common::unique_path("tpl", "d");
+    let out = run_cfg_in(&format!("{dir}/state"), cfg_text);
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// [`run_cfg`] with its state under `state`, which is left for the caller to
+/// read (the children's composed configurations are there).
+fn run_cfg_in(state: &str, cfg_text: &str) -> (Option<i32>, String) {
+    let dir = common::unique_path("tpl", "d");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = format!("{dir}/c.yaml");
     std::fs::write(&cfg, cfg_text).unwrap();
@@ -30,7 +39,7 @@ fn run_cfg(cfg_text: &str) -> (Option<i32>, String) {
         .args(["--config", &cfg])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .env("AGENTD_STATE_DIR", format!("{dir}/state"))
+        .env("AGENTD_STATE_DIR", state)
         .output()
         .expect("run");
     let log = String::from_utf8_lossy(&out.stderr).to_string();
@@ -353,12 +362,14 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
 /// addressed to its own `::!human` loads as the agent's own document's does:
 /// answered by the operators. Before, the parent accepted the template and
 /// every spawn failed — the child was handed the folded channel as its `to`
-/// and refused it. The child's configuration cannot carry the channel, and
-/// the parent's boot says so instead of dropping it without a word.
+/// and refused it. The channel travels to the child in its composed
+/// `agent.gate_channels`, so the child announces it.
 #[cfg(feature = "a2a")]
 #[test]
-fn a_templates_document_gate_spawns_and_its_unannounced_channel_is_said() {
-    let (code, log) = run_cfg(
+fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
+    let state = common::unique_path("tpl-gate", "state");
+    let (code, log) = run_cfg_in(
+        &state,
         "agent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 2500ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -399,15 +410,24 @@ fn a_templates_document_gate_spawns_and_its_unannounced_channel_is_said() {
         !events(&log, "instance.spawn").is_empty(),
         "the instance child spawned:\n{log}"
     );
-    assert!(
-        events(&log, "config.warning").iter().any(|w| {
-            let w = w["warning"].as_str().or(w["msg"].as_str()).unwrap_or("");
-            w.contains("subagents.templates.approver")
-                && w.contains("approve.ask → @channel/ops")
-                && w.contains("does not announce the channel")
-        }),
-        "the parent says the template's channel is announced nowhere:\n{log}"
+    // The child's composed configuration carries the channel its parent
+    // read off the template's `::!human`.
+    let children = std::fs::read_dir(format!("{state}/subagents")).unwrap();
+    let configs: Vec<Value> = children
+        .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("config.json")).ok())
+        .filter_map(|t| serde_json::from_str(&t).ok())
+        .collect();
+    assert_eq!(configs.len(), 1, "{log}");
+    assert_eq!(
+        configs[0]["agent"]["gate_channels"]["approve"]["ask"], "@channel/ops",
+        "{}",
+        configs[0]
     );
+    assert!(
+        !log.contains("does not announce the channel"),
+        "the parent no longer warns:\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 #[test]

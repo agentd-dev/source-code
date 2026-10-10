@@ -289,6 +289,12 @@ impl Runtime {
             .or_insert_with(|| json!({}));
         agent["name"] = json!(format!("{}/{}", self.instance, t.name));
         agent["instruction"] = json!(prose);
+        // The channels the template's `::!human`s put on its gates: the prose
+        // the child reads no longer declares them, so they travel as the
+        // operator's (`agent.gate_channels`), from the operator's template.
+        if !t.gate_channels.is_empty() {
+            agent["gate_channels"] = json!(t.gate_channels);
+        }
         // Machinery workflows join whatever a `:::!config` block declared.
         let mut wfs = t.workflows.clone();
         for w in &mut wfs {

@@ -126,8 +126,12 @@ the declaration itself instead: the gate goes to the human's
 names none, and the human's `channel` is announced on `human.asked` and the
 task's `askChannel` annotation without deciding who answers. A reference to a
 human the document does not declare is refused at load. A subagent
-template's document addresses its gates the same way, but its channels are
-not announced (the parent's boot warns). See
+template's document addresses its gates the same way, and its channels are
+announced in its child: the parent composes them into the child's
+`agent.gate_channels`, since the prose the child reads no longer declares the
+`::!human`s. An operator may write `agent.gate_channels` for any configured
+workflow too (workflow → step path → channel); where a document declares the
+same step's channel, the document's stands. See
 [Addressed gates](node-registry.md#addressed-gates).
 
 Two things happen to the *text*. The model reads the **cleaned** instruction,
@@ -294,9 +298,13 @@ agentd answers three of the spec's context keys:
 model id agentd does not recognise. A condition on a key that is not
 supplied keeps its content. The facts come from the operator's
 `intelligence` section, read before the document's `:::!config` merges under
-it, so a document cannot choose what its own variants are decided by. A
-subagent template, an OCI re-pull and a registry read are decided by the
-same facts as the agent's own instruction.
+it, so a document cannot choose what its own variants are decided by. An
+OCI re-pull and a registry read are decided by the same facts as the agent's
+own instruction. A subagent template is decided by the model its child runs:
+the template's own `model:` (a literal, or a tier resolved to its `model`),
+else `subagents.defaults.model`, else the agent's; a model a call site passes
+when it spawns the template does not decide them again, and `host` is
+`agentd` throughout.
 
 ### Delivered once
 

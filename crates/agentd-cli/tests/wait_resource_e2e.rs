@@ -17,6 +17,7 @@
 
 mod common;
 
+use agentd::mcp::mock_http::Options;
 use serde_json::Value;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -146,10 +147,15 @@ fn life(cfg: &str) -> (ExitStatus, String) {
 /// The first life parks on a server that never pushes, so the wait is still
 /// suspended when the process dies.
 fn first_life(tag: &str) -> (String, String) {
+    first_life_at(tag, "2025-11-25")
+}
+
+/// [`first_life`] on a server speaking `protocol_version`.
+fn first_life_at(tag: &str, protocol_version: &str) -> (String, String) {
     let dir = common::unique_path(tag, "d");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = format!("{dir}/c.yaml");
-    let quiet = common::spawn_mock_mcp(WAITED, false);
+    let quiet = common::spawn_mock_mcp_at(protocol_version, WAITED, false);
     std::fs::write(&cfg, config(&dir, Some(&format!("{}/mcp", quiet.uri())))).unwrap();
     let l1 = park_and_kill(&cfg, &dir);
     assert_eq!(quiet.subscribes(WAITED), 1, "{}", quiet.log());
@@ -159,12 +165,23 @@ fn first_life(tag: &str) -> (String, String) {
 
 #[test]
 fn a_resource_wait_survives_a_restart_and_resolves_on_the_next_update() {
-    let (dir, cfg) = first_life("wait-resource-boot");
+    survives_a_restart("2025-11-25");
+}
+
+#[test]
+fn a_resource_wait_survives_a_restart_and_resolves_on_the_next_update_at_2026_07_28() {
+    // The subscription boot makes for the restored wait is a listen: the
+    // server's update arrives on it, and the run finishes.
+    survives_a_restart("2026-07-28");
+}
+
+fn survives_a_restart(protocol_version: &str) {
+    let (dir, cfg) = first_life_at("wait-resource-boot", protocol_version);
 
     // The next life, on a server that pushes an update once subscribed: the
     // only subscription that can reach it is the one boot makes for the
     // restored wait (the `once` start does not fire again beside a live run).
-    let pushing = common::spawn_mock_mcp(WAITED, true);
+    let pushing = common::spawn_mock_mcp_at(protocol_version, WAITED, true);
     std::fs::write(&cfg, config(&dir, Some(&format!("{}/mcp", pushing.uri())))).unwrap();
     let (status, l2) = life(&cfg);
     assert_eq!(status.code(), Some(0), "{l2}");
@@ -176,6 +193,10 @@ fn a_resource_wait_survives_a_restart_and_resolves_on_the_next_update() {
     );
     // Counted where it lands: the new server saw the subscription.
     assert_eq!(pushing.subscribes(WAITED), 1, "{}", pushing.log());
+    if protocol_version == "2026-07-28" {
+        assert_eq!(pushing.initializes(), 0, "{}", pushing.log());
+        assert_eq!(pushing.refused(), 0, "{}", pushing.log());
+    }
     let done = events(&l2, "run.done");
     assert!(
         done.iter().any(|e| e["workflow"] == "waits"
@@ -223,13 +244,13 @@ fn a_restored_wait_on_a_server_without_subscriptions_fails_at_boot() {
     let (dir, cfg) = first_life("wait-resource-nosub");
 
     // The server came back without `resources.subscribe`.
-    let addr_file = common::unique_path("mock-nosub", "addr");
-    let _ = std::fs::remove_file(&addr_file);
-    let thread_file = addr_file.clone();
-    std::thread::spawn(move || {
-        agentd::mcp::mock_http::run_offering(&thread_file, WAITED, true, false);
-    });
-    let endpoint = format!("http://{}/mcp", common::read_addr_file(&addr_file));
+    let endpoint = format!(
+        "{}/mcp",
+        common::mock_in_thread(Options {
+            subscribe: false,
+            ..Options::new(WAITED)
+        })
+    );
     std::fs::write(&cfg, config(&dir, Some(&endpoint))).unwrap();
     let (_, l2) = life(&cfg);
     assert!(
@@ -250,7 +271,6 @@ fn a_restored_wait_on_a_server_without_subscriptions_fails_at_boot() {
         "the restored run failed instead of parking:\n{l2}"
     );
     assert!(events(&l2, "wait.resubscribed").is_empty(), "{l2}");
-    let _ = std::fs::remove_file(&addr_file);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1,45 +1,124 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A minimal built-in **Streamable HTTP** MCP server, for tests and for operators
 //! kicking the tyres on reactive setups. Hidden mode:
-//! `agentd --internal-mock-mcp-http <addr-file> <uri> [--no-emit]`.
+//! `agentd --internal-mock-mcp-http <addr-file> <uri> [--no-emit] [--protocol-version <v>]`.
 //!
 //! Binds a **loopback TCP** listener on `127.0.0.1:0` and writes the bound
 //! `host:port` into `<addr-file>` (atomically: tmp + rename;
 //! [`crate::announce_addr`]) so the launching harness discovers the endpoint by
 //! waiting for the file, then hands agentd `--mcp name=http://<addr>`.
 //!
-//! It serves one resource at `<uri>` — `initialize` (advertising
-//! `resources.subscribe`), `resources/list`, `resources/read`,
-//! `resources/subscribe` — over the Streamable HTTP transport
-//! (thread-per-connection, blocking, no dep). After a subscribe it pushes one
-//! `notifications/resources/updated` on the long-lived `GET` SSE stream (unless
-//! `emit` is off), so a reactive agent reached over HTTP has something to react
-//! to.
+//! It serves one resource at `<uri>`, a checkpointer tool profile, canned
+//! knowledge and search tools, a registry-shaped instruction, and the `mock.*`
+//! tools a test steers it with — thread-per-connection, blocking, no dep. It
+//! speaks one of the two lifecycles an MCP client reaches a server through
+//! ([`Lifecycle`]; `--protocol-version` picks it):
 //!
-//! It can also **restart** without exiting: the `mock.restart` tool forgets
-//! every session it issued (a request still carrying one is answered `404`,
-//! as Streamable HTTP has a server say "no such session") and closes its open
-//! notification streams, the way a process that exits drops its sockets. That
-//! is how an e2e watches agentd notice a lost session and re-subscribe. Called
-//! with `{"subscribe": false}` it comes back without `resources.subscribe`;
-//! after a restart `mock://instruction` reads differently, as a publisher's
-//! edit made while the server was down would. `mock.refuse_subscribe` refuses
-//! the next `count` subscribes, as a server still warming up does.
+//! - **`Initialize`** (2025-11-25, the default). The `initialize` handshake
+//!   issues a session; a subscription is `resources/subscribe`, after which one
+//!   `notifications/resources/updated` goes down the long-lived `GET` stream
+//!   (unless `emit` is off). `server/discover` is answered `-32601`, the way a
+//!   server that predates it answers.
+//! - **`Discover`** (2026-07-28). `server/discover` and no handshake, no
+//!   session, no `GET`. Every request is held to the revision's rules — the
+//!   `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers, the `_meta`
+//!   every request carries, and the `Mcp-Param-Region` header the annotated
+//!   `mock.regional` tool declares — and one that breaks a rule is refused
+//!   `400` with the JSON-RPC error the revision names. `initialize` is refused
+//!   as a revision it does not speak (`-32022`), `resources/subscribe` as a
+//!   method the revision removed. A subscription is a `subscriptions/listen`
+//!   stream: acknowledged (less what `mock.narrow` left out, and less every URI
+//!   while subscriptions are off), sent one update for `<uri>` when the
+//!   acknowledgment holds it and `emit` is on, then held until the client
+//!   hangs up or the server restarts — or closed at once, without
+//!   [`Options::hold_listen`].
 //!
-//! [`run_listening`] speaks the stateless revision instead: a subscription is
-//! a `subscriptions/listen` stream, which the mock acknowledges, sends one
-//! update down (for `<uri>`, when it is in the filter) and then closes, as a
-//! server that drops it does. `mock.narrow` makes every later acknowledgment
-//! leave a URI out.
+//! Each request that reaches it leaves a line on stderr, the server side's own
+//! record of the wire, which an e2e counts instead of trusting the client:
+//! `MOCK_DISCOVER <_meta>`, `MOCK_INITIALIZE <revision asked>`,
+//! `MOCK_REFUSED <code> <method> <reason>`, `MOCK_SESSION <id>`, `MOCK_GET`,
+//! `MOCK_SUBSCRIBE <uri>`, `MOCK_LISTEN <filter>`,
+//! `MOCK_LISTEN_CLOSED <client|restart|done>`, `MOCK_CALL <params>`,
+//! `MOCK_READ <uri>`.
+//!
+//! It can also **restart** without exiting: `mock.restart` forgets every
+//! session it issued (a request still carrying one is answered `404`, as
+//! Streamable HTTP has a server say "no such session") and closes its open
+//! notification streams and held listens, the way a process that exits drops
+//! its sockets. That is how an e2e watches agentd notice a lost session and
+//! subscribe again. Called with `{"subscribe": false}` it comes back without
+//! `resources.subscribe`; after a restart `mock://instruction` reads
+//! differently, as a publisher's edit made while the server was down would.
+//! `mock.refuse_subscribe` refuses the next `count` subscribes — a
+//! `resources/subscribe`, or a listen that names a URI — as a server still
+//! warming up does. `mock.tools_changed` sends
+//! `notifications/tools/list_changed` down every open stream that takes it.
 
 use ::mcp::rpc::{self as json, Incoming, Request, Response};
-use ::mcp::wire::{PROTOCOL_VERSION, method};
-use serde_json::json;
+use ::mcp::wire::{DISCOVER_PROTOCOL_VERSION, PROTOCOL_VERSION, method};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// How a client reaches the mock, named by mechanism rather than by revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// The `initialize` handshake and its session (MCP 2025-11-25).
+    Initialize,
+    /// `server/discover`, then every request on its own (MCP 2026-07-28).
+    Discover,
+}
+
+impl Lifecycle {
+    /// The lifecycle of an MCP revision the mock speaks; `None` for any other.
+    pub fn of_revision(revision: &str) -> Option<Lifecycle> {
+        match revision {
+            DISCOVER_PROTOCOL_VERSION => Some(Lifecycle::Discover),
+            PROTOCOL_VERSION => Some(Lifecycle::Initialize),
+            _ => None,
+        }
+    }
+}
+
+/// What the mock serves and how ([`run_with`]).
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// The one resource it serves and notifies for.
+    pub uri: String,
+    /// Send one `resources/updated` for `uri` after each subscription.
+    pub emit: bool,
+    /// Offer subscriptions (`resources.subscribe`). Off, it is a server that
+    /// serves resources but never notifies; a restart may turn it off.
+    pub subscribe: bool,
+    pub lifecycle: Lifecycle,
+    /// Hold a `subscriptions/listen` stream open until the client hangs up or
+    /// the server restarts; off, close each one 50 ms after its frames.
+    pub hold_listen: bool,
+}
+
+impl Options {
+    /// `uri` at 2025-11-25, emitting, offering subscriptions, holding listens.
+    pub fn new(uri: impl Into<String>) -> Options {
+        Options {
+            uri: uri.into(),
+            emit: true,
+            subscribe: true,
+            lifecycle: Lifecycle::Initialize,
+            hold_listen: true,
+        }
+    }
+}
+
+/// The `_meta` keys of the 2026-07-28 revision.
+const META_PREFIX: &str = "io.modelcontextprotocol/";
+const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+/// A header that does not match the request (2026-07-28).
+const HEADER_MISMATCH: i64 = -32020;
+/// A revision the server does not speak (2026-07-28).
+const UNSUPPORTED_VERSION: i64 = -32022;
 
 /// Cross-connection server state: a subscribe (on a POST) arms a one-shot push
 /// that the open `GET` SSE stream delivers. The mock also implements the
@@ -52,29 +131,35 @@ use std::time::Duration;
 struct State {
     uri: String,
     emit: bool,
+    lifecycle: Lifecycle,
+    hold_listen: bool,
     /// Advertise `resources.subscribe`. Off, the mock is a server that offers
     /// resources but no subscriptions. A restart may turn it off.
     subscribe: AtomicBool,
-    /// `resources/subscribe` calls still to refuse (`mock.refuse_subscribe`).
+    /// Subscribes still to refuse (`mock.refuse_subscribe`).
     refuse_subscribes: AtomicU64,
-    /// Speak the stateless revision: subscriptions are `subscriptions/listen`.
-    listen: bool,
     /// URIs every listen acknowledgment leaves out (`mock.narrow`).
-    narrow: std::sync::Mutex<Vec<String>>,
+    narrow: Mutex<Vec<String>>,
     pending_emit: AtomicBool,
     /// Bumped by `mock.restart`; the session the mock issues is
-    /// `mock-<generation>`, so every earlier one is forgotten.
+    /// `mock-<generation>`, so every earlier one is forgotten, and every
+    /// stream opened before it is closed.
     generation: AtomicU64,
+    /// The server-to-client streams open now, which `mock.tools_changed`
+    /// writes to.
+    open: Mutex<Vec<Open>>,
+    next_open: AtomicU64,
     /// The checkpointer store: key → (seq → envelope). Monotonic per key.
-    store: std::sync::Mutex<
-        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, serde_json::Value>>,
-    >,
+    store: Mutex<std::collections::BTreeMap<String, std::collections::BTreeMap<u64, Value>>>,
     /// `flaky` call counter (first call errors, later ones succeed).
-    flaky_calls: std::sync::atomic::AtomicU64,
+    flaky_calls: AtomicU64,
     /// Fault injection: remaining `state.*` calls to fail with a tool error.
-    fail_next: std::sync::atomic::AtomicU64,
+    fail_next: AtomicU64,
     /// Every `state.*` call performed (tool name) — `mock.ops` reports it.
-    ops: std::sync::Mutex<Vec<String>>,
+    ops: Mutex<Vec<String>>,
+    /// The name of every tool called so far, which `mock.tools_changed` can
+    /// wait for.
+    called: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl State {
@@ -82,27 +167,47 @@ impl State {
     fn session(&self) -> String {
         format!("mock-{}", self.generation.load(Ordering::SeqCst))
     }
+
+    /// Take one of the refusals `mock.refuse_subscribe` asked for, if any are
+    /// left. A compare-exchange loop, not `fetch_update`: newer toolchains
+    /// deprecate that name for `try_update`, which the MSRV does not have.
+    fn take_refusal(&self) -> bool {
+        let left = &self.refuse_subscribes;
+        let mut n = left.load(Ordering::SeqCst);
+        loop {
+            if n == 0 {
+                return false;
+            }
+            match left.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+/// A server-to-client stream the mock holds open: the `GET` notification
+/// stream (2025-11-25) or a held `subscriptions/listen` (2026-07-28).
+struct Open {
+    id: u64,
+    /// A clone of the stream's socket. Written only under the registry's lock,
+    /// so two writers never interleave their frames.
+    socket: TcpStream,
+    /// The listen's request id, which every notification on it carries as its
+    /// `subscriptionId`; `None` for a `GET` stream.
+    subscription: Option<Value>,
+    /// Takes `notifications/tools/list_changed`: a `GET` stream always, a
+    /// listen when its acknowledgment holds `toolsListChanged`.
+    tools: bool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Serve the mock on loopback TCP until the process is killed, announcing the
 /// bound address through `addr_file`. Returns the process exit code.
-pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
-    run_offering(addr_file, uri, emit, true)
-}
-
-/// [`run`], advertising `resources.subscribe` only when `subscribe` is set —
-/// a server that serves resources but offers no subscriptions.
-pub fn run_offering(addr_file: &str, uri: &str, emit: bool, subscribe: bool) -> i32 {
-    serve(addr_file, uri, emit, subscribe, false)
-}
-
-/// [`run`] at the stateless revision, where a subscription is a
-/// `subscriptions/listen` stream (see the module docs).
-pub fn run_listening(addr_file: &str, uri: &str) -> i32 {
-    serve(addr_file, uri, true, true, true)
-}
-
-fn serve(addr_file: &str, uri: &str, emit: bool, subscribe: bool, listen: bool) -> i32 {
+pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
@@ -115,18 +220,22 @@ fn serve(addr_file: &str, uri: &str, emit: bool, subscribe: bool, listen: bool) 
         return 1;
     }
     let state = Arc::new(State {
-        uri: uri.to_string(),
-        emit,
-        subscribe: AtomicBool::new(subscribe),
+        uri: opts.uri.clone(),
+        emit: opts.emit,
+        lifecycle: opts.lifecycle,
+        hold_listen: opts.hold_listen,
+        subscribe: AtomicBool::new(opts.subscribe),
         refuse_subscribes: AtomicU64::new(0),
-        listen,
-        narrow: std::sync::Mutex::new(Vec::new()),
+        narrow: Mutex::new(Vec::new()),
         pending_emit: AtomicBool::new(false),
         generation: AtomicU64::new(0),
-        store: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-        flaky_calls: std::sync::atomic::AtomicU64::new(0),
-        fail_next: std::sync::atomic::AtomicU64::new(0),
-        ops: std::sync::Mutex::new(Vec::new()),
+        open: Mutex::new(Vec::new()),
+        next_open: AtomicU64::new(0),
+        store: Mutex::new(std::collections::BTreeMap::new()),
+        flaky_calls: AtomicU64::new(0),
+        fail_next: AtomicU64::new(0),
+        ops: Mutex::new(Vec::new()),
+        called: Mutex::new(std::collections::BTreeSet::new()),
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -136,73 +245,271 @@ fn serve(addr_file: &str, uri: &str, emit: bool, subscribe: bool, listen: bool) 
     0
 }
 
-/// One HTTP request per connection (the client sends `Connection: close`). A
-/// `GET` is the notification SSE stream; a `POST` is one JSON-RPC frame.
+/// One HTTP request per connection (the client sends `Connection: close`).
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
-    let Some((method_line, session, body)) = read_http(&stream) else {
+    let Some(http) = read_http(&stream) else {
         return;
     };
+    match state.lifecycle {
+        Lifecycle::Initialize => serve_initialize(&mut stream, &http, &state),
+        Lifecycle::Discover => serve_discover(&mut stream, &http, &state),
+    }
+}
+
+/// The 2025-11-25 edge. A `GET` is the notification SSE stream; a `POST` is
+/// one JSON-RPC frame.
+fn serve_initialize(stream: &mut TcpStream, http: &Http, state: &State) {
     // A session from before the last `mock.restart`: this server no longer
     // knows it. A request with no session at all (the handshake, a test's own
     // control call) is served.
-    let frame = serde_json::from_slice::<Incoming>(&body);
-    let handshake = matches!(&frame, Ok(Incoming::Request(r)) if r.method == "initialize");
-    if !handshake && session.is_some_and(|s| s != state.session()) {
+    let frame = serde_json::from_slice::<Incoming>(&http.body);
+    let handshake = matches!(&frame, Ok(Incoming::Request(r)) if r.method == method::INITIALIZE);
+    if !handshake
+        && http
+            .header("mcp-session-id")
+            .is_some_and(|s| s != state.session())
+    {
         let _ = stream
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
-    let is_get = method_line.starts_with("GET ");
-    if is_get {
-        serve_notifications(&mut stream, &state);
-        return;
-    }
-    // POST: the JSON-RPC frame. A listen answers with a stream of its own.
-    if let Ok(Incoming::Request(req)) = &frame
-        && req.method == "subscriptions/listen"
-    {
-        serve_listen(&mut stream, req, &state);
+    if http.is_get() {
+        serve_notifications(stream, state);
         return;
     }
     match frame {
         Ok(Incoming::Request(req)) => {
-            let (resp, session) = handle_request(req, &state);
-            let payload = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
-            write_json(&mut stream, payload, session.then(|| state.session()));
+            if req.method == "server/discover" {
+                // A server that predates `server/discover`: the method is one
+                // it does not have.
+                eprintln!("MOCK_DISCOVER {}", meta_of(req.params.as_ref()));
+            }
+            let (resp, session) = handle_request(req, http, state);
+            let payload = serde_json::to_value(resp).unwrap_or(Value::Null);
+            write_json(stream, 200, &payload, session.then(|| state.session()));
         }
         // A notification POST (e.g. notifications/initialized) → 202, no body.
-        Ok(Incoming::Notification(_)) | Ok(Incoming::Response(_)) | Err(_) => {
-            let _ = stream.write_all(
-                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-        }
+        Ok(Incoming::Notification(_)) | Ok(Incoming::Response(_)) | Err(_) => accepted(stream),
     }
 }
 
+/// The 2026-07-28 edge: no session and no `GET`, every request held to the
+/// revision's rules before it is answered.
+fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
+    if http.is_get() {
+        eprintln!("MOCK_GET");
+        let _ = stream.write_all(
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        return;
+    }
+    // The revision has no sessions; a client that sends one is said, and
+    // served all the same — what it must not do is depend on one.
+    if let Some(session) = http.header("mcp-session-id") {
+        eprintln!("MOCK_SESSION {session}");
+    }
+    let body: Value = serde_json::from_slice(&http.body).unwrap_or(Value::Null);
+    let called = body["method"].as_str().unwrap_or_default().to_string();
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    if called == method::INITIALIZE {
+        // The revision asked for is not one this server speaks.
+        let asked = body["params"]["protocolVersion"]
+            .as_str()
+            .unwrap_or_default();
+        eprintln!("MOCK_INITIALIZE {asked}");
+        let data = json!({"supported": [DISCOVER_PROTOCOL_VERSION], "requested": asked});
+        return refuse(
+            stream,
+            400,
+            &id,
+            &called,
+            UNSUPPORTED_VERSION,
+            "Unsupported protocol version",
+            Some(data),
+        );
+    }
+    if called == "server/discover" {
+        eprintln!("MOCK_DISCOVER {}", meta_of(body.get("params")));
+    }
+    if let Some((code, reason, data)) = stateless_refusal(http, &body) {
+        return refuse(stream, 400, &id, &called, code, &reason, data);
+    }
+    match called.as_str() {
+        "server/discover" => {
+            let payload = json!({"jsonrpc": "2.0", "id": id, "result": discover_result(state)});
+            write_json(stream, 200, &payload, None);
+        }
+        "subscriptions/listen" => serve_listen(stream, &id, &body, state),
+        // The revision removed them: a subscription is a listen.
+        method::RESOURCES_SUBSCRIBE | method::RESOURCES_UNSUBSCRIBE => refuse(
+            stream,
+            404,
+            &id,
+            &called,
+            json::METHOD_NOT_FOUND,
+            "Method not found",
+            None,
+        ),
+        m if m.starts_with("notifications/") => accepted(stream),
+        _ => match serde_json::from_value::<Request>(body) {
+            Ok(req) => {
+                let (resp, _) = handle_request(req, http, state);
+                let mut payload = serde_json::to_value(resp).unwrap_or(Value::Null);
+                // Every result at this revision says how to read it.
+                if let Some(result) = payload.get_mut("result").and_then(Value::as_object_mut) {
+                    result
+                        .entry("resultType")
+                        .or_insert_with(|| json!("complete"));
+                }
+                write_json(stream, 200, &payload, None);
+            }
+            Err(_) => accepted(stream),
+        },
+    }
+}
+
+/// Why a 2026-07-28 server refuses this request, checked in the order rmcp's
+/// own server checks: the revision header, the revision itself, `_meta`, then
+/// the routing headers — and, for `mock.regional`, the `Mcp-Param-Region`
+/// header its `x-mcp-header` annotation declares. `None` when it is
+/// acceptable.
+fn stateless_refusal(http: &Http, body: &Value) -> Option<(i64, String, Option<Value>)> {
+    let mismatch = |why: &str| Some((HEADER_MISMATCH, why.to_string(), None));
+    if http.count("mcp-protocol-version") != 1 {
+        return mismatch("MCP-Protocol-Version must be sent once");
+    }
+    let asked = http.header("mcp-protocol-version").unwrap_or_default();
+    if asked != DISCOVER_PROTOCOL_VERSION {
+        let data = json!({"supported": [DISCOVER_PROTOCOL_VERSION], "requested": asked});
+        return Some((
+            UNSUPPORTED_VERSION,
+            "Unsupported protocol version".into(),
+            Some(data),
+        ));
+    }
+    let params = &body["params"];
+    let meta = &params["_meta"];
+    if meta[format!("{META_PREFIX}protocolVersion")].as_str() != Some(asked) {
+        return mismatch("_meta protocolVersion does not match the header");
+    }
+    if meta
+        .get(format!("{META_PREFIX}clientCapabilities"))
+        .is_none()
+        || meta.get(format!("{META_PREFIX}clientInfo")).is_none()
+    {
+        return Some((
+            json::INVALID_PARAMS,
+            "_meta lacks clientInfo or clientCapabilities".into(),
+            None,
+        ));
+    }
+    let called = body["method"].as_str().unwrap_or_default();
+    if http.count("mcp-method") != 1 || http.header("mcp-method") != Some(called) {
+        return mismatch("Mcp-Method does not match the body");
+    }
+    let name = match called {
+        method::TOOLS_CALL | method::PROMPTS_GET => params["name"].as_str(),
+        method::RESOURCES_READ => params["uri"].as_str(),
+        _ => None,
+    };
+    if let Some(name) = name
+        && (http.count("mcp-name") != 1 || http.header("mcp-name") != Some(name))
+    {
+        return mismatch("Mcp-Name does not match the body");
+    }
+    if called == method::TOOLS_CALL
+        && params["name"] == "mock.regional"
+        && (http.count("mcp-param-region") != 1
+            || http.header("mcp-param-region") != params["arguments"]["region"].as_str())
+    {
+        return mismatch("Mcp-Param-Region does not match the argument");
+    }
+    None
+}
+
+/// Refuse a request with `status` and the JSON-RPC error `code`, and say so.
+fn refuse(
+    stream: &mut TcpStream,
+    status: u16,
+    id: &Value,
+    method: &str,
+    code: i64,
+    reason: &str,
+    data: Option<Value>,
+) {
+    eprintln!("MOCK_REFUSED {code} {method} {reason}");
+    let mut error = json!({"code": code, "message": reason});
+    if let Some(data) = data {
+        error["data"] = data;
+    }
+    write_json(
+        stream,
+        status,
+        &json!({"jsonrpc": "2.0", "id": id, "error": error}),
+        None,
+    );
+}
+
+/// The answer to `server/discover`: every field the revision requires.
+fn discover_result(state: &State) -> Value {
+    json!({
+        "resultType": "complete",
+        "supportedVersions": [DISCOVER_PROTOCOL_VERSION],
+        "capabilities": {
+            "resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true},
+            "tools": {"listChanged": true},
+            "prompts": {"listChanged": true}
+        },
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}}
+    })
+}
+
+/// A request's `params._meta`, for a log line (`null` when it has none).
+fn meta_of(params: Option<&Value>) -> Value {
+    params
+        .and_then(|p| p.get("_meta"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn accepted(stream: &mut TcpStream) {
+    let _ = stream
+        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
 /// Build the JSON-RPC response for one request. Returns the response and whether
-/// to stamp the `Mcp-Session-Id` header (on `initialize`).
-fn handle_request(req: Request, state: &State) -> (Response, bool) {
+/// to stamp the `Mcp-Session-Id` header (on `initialize`, which only the
+/// 2025-11-25 edge passes on).
+fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) {
     let uri = &state.uri;
     match req.method.as_str() {
-        "initialize" => (
-            Response::ok(
-                req.id,
-                json!({
-                    "protocolVersion": if state.listen { "2026-07-28" } else { PROTOCOL_VERSION },
-                    // At the stateless revision a `listChanged` would open a
-                    // standing listen beside the URI listen the tests watch;
-                    // this mock offers none there.
-                    "capabilities": {"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": !state.listen}, "tools": {}, "prompts": {"listChanged": !state.listen}},
-                    "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
-                }),
-            ),
-            true,
-        ),
+        "initialize" => {
+            let asked = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            eprintln!("MOCK_INITIALIZE {asked}");
+            (
+                Response::ok(
+                    req.id,
+                    json!({
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
+                        "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
+                    }),
+                ),
+                true,
+            )
+        }
         "ping" => (Response::ok(req.id, json!({})), false),
         "tools/list" => (
             Response::ok(
                 req.id,
-                with_listen_tools(
+                with_revision_tools(
                     state,
                     json!({"tools": [
                         {"name": "state.put", "description": "checkpointer put", "inputSchema": {"type": "object"}},
@@ -215,7 +522,8 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                         {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
                         {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
                         {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
-                        {"name": "mock.refuse_subscribe", "description": "refuse the next `count` resources/subscribe calls", "inputSchema": {"type": "object"}},
+                        {"name": "mock.refuse_subscribe", "description": "refuse the next `count` subscribes", "inputSchema": {"type": "object"}},
+                        {"name": "mock.tools_changed", "description": "send notifications/tools/list_changed down every open stream that takes it", "inputSchema": {"type": "object"}},
                         {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
                         {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
                         {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
@@ -226,7 +534,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
             ),
             false,
         ),
-        "tools/call" => (handle_tool_call(req, state), false),
+        "tools/call" => (handle_tool_call(req, http, state), false),
         "resources/list" => (
             Response::ok(
                 req.id,
@@ -337,23 +645,9 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 .and_then(|p| p.get("uri"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            // Decided before the line is written, as for a listen.
+            let refused = state.take_refusal();
             eprintln!("MOCK_SUBSCRIBE {asked}");
-            // Take one refusal if any are left. A compare-exchange loop, not
-            // `fetch_update`: newer toolchains deprecate that name for
-            // `try_update`, which the MSRV does not have.
-            let refused = {
-                let left = &state.refuse_subscribes;
-                let mut n = left.load(Ordering::SeqCst);
-                loop {
-                    if n == 0 {
-                        break false;
-                    }
-                    match left.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => break true,
-                        Err(now) => n = now,
-                    }
-                }
-            };
             if refused {
                 return (
                     Response::err(req.id, json::INTERNAL_ERROR, "subscribe refused"),
@@ -382,7 +676,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
 /// JSON **and** the same JSON as `structuredContent`. Both are emitted because
 /// the store adapter's default mapping reads `result.structuredContent.*` and
 /// falls back to the text part, so serving both exercises either path.
-fn handle_tool_call(req: Request, state: &State) -> Response {
+fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
     fn tool_ok(id: json::Id, v: serde_json::Value) -> Response {
         Response::ok(
             id,
@@ -399,9 +693,22 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
     let name = params.get("name").and_then(serde_json::Value::as_str);
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     // Every call's params as they reached the server — `_meta` and arguments
-    // both — so an e2e can assert what the wire carried, not what the client
-    // meant to send.
-    eprintln!("MOCK_CALL {params}");
+    // both, and under `headers` the `Mcp-Param-*` headers it came with — so an
+    // e2e can assert what the wire carried, not what the client meant to send.
+    let mut logged = params.clone();
+    let param_headers: serde_json::Map<String, Value> = http
+        .headers
+        .iter()
+        .filter(|(k, _)| k.starts_with("mcp-param-"))
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
+    if !param_headers.is_empty() {
+        logged["headers"] = Value::Object(param_headers);
+    }
+    eprintln!("MOCK_CALL {logged}");
+    if let Some(n) = name {
+        lock(&state.called).insert(n.to_string());
+    }
     // A strict server: `_meta` belongs in `params._meta` (MCP reserves it
     // there), and no tool here declares an argument by that name, so one
     // arriving inside `arguments` is refused the way `additionalProperties:
@@ -460,6 +767,42 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
             eprintln!("MOCK_RESTART {generation}");
             tool_ok(req.id, json!({"ok": true, "generation": generation}))
         }
+        // Every client that holds a stream open for it is told the tool list
+        // changed — once `receivers` such streams are open and a call of the
+        // tool `after` has reached the mock (bounded), so a caller can wait
+        // for the clients it means to tell, and for one of them to be past a
+        // point of its own. Answers with its arguments and how many were told.
+        Some("mock.tools_changed") => {
+            let want = args
+                .get("receivers")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let after = args.get("after").and_then(serde_json::Value::as_str);
+            match tools_changed(state, want, after) {
+                Ok(told) => {
+                    let mut out = if args.is_object() {
+                        args.clone()
+                    } else {
+                        json!({})
+                    };
+                    out["notified"] = json!(told);
+                    tool_ok(req.id, out)
+                }
+                Err(open) => tool_err(
+                    req.id,
+                    &format!(
+                        "mock.tools_changed: {open} of {want} receivers open, {after:?} called: {}",
+                        after.is_none_or(|t| lock(&state.called).contains(t))
+                    ),
+                ),
+            }
+        }
+        // The annotated tool: its `region` travels as `Mcp-Param-Region` at
+        // 2026-07-28, which the edge refuses the call without.
+        Some("mock.regional") => tool_ok(
+            req.id,
+            json!({"region": args.get("region").cloned().unwrap_or(Value::Null)}),
+        ),
         Some("mock.narrow") => {
             let uri = args
                 .get("uri")
@@ -668,14 +1011,21 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
     ]
 }
 
-/// The tool list, plus — at the stateless revision, where the client checks
-/// `x-mcp-header` annotations — `mock.nested`, whose annotation sits on a
-/// nested property, which the client rejects and drops: the tool a host must
+/// The tool list, plus — at 2026-07-28, where a tool's `x-mcp-header`
+/// annotation names a header its argument travels in — `mock.regional`, whose
+/// `region` is `Mcp-Param-Region`, and `mock.nested`, whose annotation sits on
+/// a nested property, which the client rejects and drops: the tool a host must
 /// say it lost.
-fn with_listen_tools(state: &State, mut list: serde_json::Value) -> serde_json::Value {
-    if state.listen
+fn with_revision_tools(state: &State, mut list: Value) -> Value {
+    if state.lifecycle == Lifecycle::Discover
         && let Some(tools) = list["tools"].as_array_mut()
     {
+        tools.push(json!({
+            "name": "mock.regional",
+            "description": "answers with the region it was called for",
+            "inputSchema": {"type": "object", "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"}}}
+        }));
         tools.push(json!({
             "name": "mock.nested",
             "description": "a nested x-mcp-header annotation the client drops",
@@ -686,133 +1036,294 @@ fn with_listen_tools(state: &State, mut list: serde_json::Value) -> serde_json::
     list
 }
 
-/// One `subscriptions/listen`: acknowledge the filter (less what `mock.narrow`
-/// left out), send one `resources/updated` for the mock's resource when the
-/// acknowledgment holds it, and close the stream without a final result — a
-/// server that dropped it. Every listen that reached the mock is logged
-/// `MOCK_LISTEN <uris>`.
-fn serve_listen(stream: &mut TcpStream, req: &Request, state: &State) {
-    let mut filter = req
-        .params
-        .as_ref()
-        .and_then(|p| p.get("notifications"))
-        .cloned()
-        .unwrap_or(json!({}));
-    let narrow = state
-        .narrow
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some(uris) = filter["resourceSubscriptions"].as_array_mut() {
-        uris.retain(|u| !narrow.iter().any(|n| u == n));
+/// Send `notifications/tools/list_changed` down every open stream that takes
+/// it, once `receivers` of them are open and the tool `after` has been called.
+/// Returns how many were told, or the open count when that never held within
+/// 30 s (nothing is sent then). The frames are written before this returns,
+/// so a caller that sees the answer knows each client has them on its socket.
+fn tools_changed(state: &State, receivers: usize, after: Option<&str>) -> Result<usize, usize> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let called = after.is_none_or(|t| lock(&state.called).contains(t));
+        {
+            let mut open = lock(&state.open);
+            let ready = open.iter().filter(|o| o.tools).count();
+            if called && ready >= receivers {
+                let mut told = 0;
+                for o in open.iter_mut().filter(|o| o.tools) {
+                    let params = o
+                        .subscription
+                        .as_ref()
+                        .map(|id| json!({"_meta": {SUBSCRIPTION_ID: id}}));
+                    let note = json::Notification::new(method::NOTIFY_TOOLS_LIST_CHANGED, params);
+                    if send_frame(&mut o.socket, &note) {
+                        told += 1;
+                    }
+                }
+                eprintln!("MOCK_TOOLS_CHANGED {told}");
+                return Ok(told);
+            }
+            if Instant::now() >= deadline {
+                return Err(ready);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    let uris: Vec<&str> = filter["resourceSubscriptions"]
+}
+
+/// Write one SSE `data:` frame; `false` when the client is gone.
+fn send_frame(socket: &mut TcpStream, frame: &impl serde::Serialize) -> bool {
+    let data = serde_json::to_string(frame).unwrap_or_default();
+    socket
+        .write_all(format!("data: {data}\n\n").as_bytes())
+        .and_then(|()| socket.flush())
+        .is_ok()
+}
+
+/// Wait on an open stream until the client hangs up (`"client"`) or the server
+/// restarts (`"restart"`). The client sends nothing more on it, so a read
+/// returns only at its end; it times out every 25 ms to look at the
+/// generation, and, when `tick` is given, to run it — `false` from `tick` ends
+/// the wait as the client being gone.
+fn hold(
+    stream: &mut TcpStream,
+    state: &State,
+    generation: u64,
+    mut tick: impl FnMut(&mut TcpStream) -> bool,
+) -> &'static str {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+    let mut byte = [0u8; 1];
+    loop {
+        if state.generation.load(Ordering::SeqCst) != generation {
+            return "restart";
+        }
+        if !tick(stream) {
+            return "client";
+        }
+        match stream.read(&mut byte) {
+            Ok(0) => return "client",
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return "client",
+        }
+    }
+}
+
+/// One `subscriptions/listen` (2026-07-28). Every URI in the filter is logged
+/// `MOCK_SUBSCRIBE <uri>`, and the filter `MOCK_LISTEN <filter>`. A refusal
+/// `mock.refuse_subscribe` armed answers a listen that names a URI with a
+/// JSON-RPC `-32603`. Otherwise the filter is acknowledged — less what
+/// `mock.narrow` left out, and less every URI while subscriptions are off —
+/// one `resources/updated` for the mock's resource follows when `emit` is on
+/// and the acknowledgment holds it, and the stream is held until the client
+/// hangs up or the server restarts (or, without `hold_listen`, closed 50 ms
+/// later without a final result: a server that dropped it). How it ended is
+/// logged `MOCK_LISTEN_CLOSED <client|restart|done>`.
+fn serve_listen(stream: &mut TcpStream, id: &Value, body: &Value, state: &State) {
+    let asked = match &body["params"]["notifications"] {
+        f @ Value::Object(_) => f.clone(),
+        _ => json!({}),
+    };
+    let wanted: Vec<&str> = asked["resourceSubscriptions"]
         .as_array()
-        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    eprintln!("MOCK_LISTEN {}", uris.join(","));
-    let meta = json!({"io.modelcontextprotocol/subscriptionId": serde_json::to_value(&req.id).unwrap_or_default()});
+    // Decided before the lines are written, so a test that sees them and then
+    // arms a refusal never has it taken by the listen it saw.
+    let refused = !wanted.is_empty() && state.take_refusal();
+    for uri in &wanted {
+        eprintln!("MOCK_SUBSCRIBE {uri}");
+    }
+    eprintln!("MOCK_LISTEN {asked}");
+    if refused {
+        let refused = json!({"jsonrpc": "2.0", "id": id,
+            "error": {"code": json::INTERNAL_ERROR, "message": "subscribe refused"}});
+        return write_json(stream, 200, &refused, None);
+    }
+    let narrow = lock(&state.narrow).clone();
+    let subscribe = state.subscribe.load(Ordering::SeqCst);
+    let mut filter = asked.clone();
+    if let Some(uris) = filter["resourceSubscriptions"].as_array_mut() {
+        uris.retain(|u| subscribe && !narrow.iter().any(|n| u == n));
+    }
+    let tools = filter["toolsListChanged"] == true;
+    let meta = json!({SUBSCRIPTION_ID: id});
     let mut frames = vec![json!({
         "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
         "params": {"_meta": meta, "notifications": filter}
     })];
-    if uris.contains(&state.uri.as_str()) {
+    let acked = filter["resourceSubscriptions"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|u| *u == state.uri));
+    if state.emit && acked {
         frames.push(json!({
             "jsonrpc": "2.0", "method": method::NOTIFY_RESOURCES_UPDATED,
             "params": {"_meta": meta, "uri": state.uri}
         }));
     }
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
-    if stream.write_all(head.as_bytes()).is_err() {
-        return;
+    let mut out = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+    );
+    for f in &frames {
+        out.push_str(&format!("data: {f}\n\n"));
     }
-    for f in frames {
-        let _ = stream.write_all(format!("data: {f}\n\n").as_bytes());
+    if !state.hold_listen {
+        let _ = stream.write_all(out.as_bytes());
         let _ = stream.flush();
-    }
-    std::thread::sleep(Duration::from_millis(50));
-}
-
-/// The long-lived `GET` SSE stream: hold it open and deliver the one-shot
-/// `resources/updated` armed by a subscribe. Deliberately sends NO keep-alive
-/// comments — the client polls its stop flag via a read timeout between events,
-/// and a stream of comments would keep its SSE reader busy and defeat that. The
-/// thread loops until the process exits (a test mock; the harness reaps it).
-fn serve_notifications(stream: &mut TcpStream, state: &State) {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
-    if stream.write_all(head.as_bytes()).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+        eprintln!("MOCK_LISTEN_CLOSED done");
         return;
     }
-    let _ = stream.flush();
+    // Held: registered before the acknowledgment leaves, and written under the
+    // registry's lock, so a client that has the acknowledgment can count on
+    // `mock.tools_changed` reaching it, and its frames never interleave.
     let generation = state.generation.load(Ordering::SeqCst);
-    loop {
-        // A restart drops the stream, as an exiting process drops its sockets.
-        if state.generation.load(Ordering::SeqCst) != generation {
+    let open_id = state.next_open.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut open = lock(&state.open);
+        if stream.write_all(out.as_bytes()).is_err() || stream.flush().is_err() {
+            eprintln!("MOCK_LISTEN_CLOSED client");
             return;
         }
-        if state.pending_emit.swap(false, Ordering::SeqCst) {
-            let note = json::Notification::new(
-                method::NOTIFY_RESOURCES_UPDATED,
-                Some(json!({"uri": state.uri})),
-            );
-            let data = serde_json::to_string(&note).unwrap_or_default();
-            if stream
-                .write_all(format!("data: {data}\n\n").as_bytes())
-                .is_err()
-            {
-                return;
-            }
-            let _ = stream.flush();
+        if let Ok(socket) = stream.try_clone() {
+            open.push(Open {
+                id: open_id,
+                socket,
+                subscription: Some(id.clone()),
+                tools,
+            });
         }
-        std::thread::sleep(Duration::from_millis(25));
+    }
+    let how = hold(stream, state, generation, |_| true);
+    lock(&state.open).retain(|o| o.id != open_id);
+    let _ = stream.shutdown(Shutdown::Both);
+    eprintln!("MOCK_LISTEN_CLOSED {how}");
+}
+
+/// The long-lived `GET` SSE stream (2025-11-25): hold it open and deliver the
+/// one-shot `resources/updated` armed by a subscribe, and whatever
+/// `mock.tools_changed` sends. Deliberately sends NO keep-alive comments — the
+/// client polls its stop flag via a read timeout between events, and a stream
+/// of comments would keep its SSE reader busy and defeat that. It ends when
+/// the client hangs up or the server restarts, as an exiting process drops
+/// its sockets.
+fn serve_notifications(stream: &mut TcpStream, state: &State) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    let generation = state.generation.load(Ordering::SeqCst);
+    let open_id = state.next_open.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut open = lock(&state.open);
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let _ = stream.flush();
+        if let Ok(socket) = stream.try_clone() {
+            open.push(Open {
+                id: open_id,
+                socket,
+                subscription: None,
+                tools: true,
+            });
+        }
+    }
+    hold(stream, state, generation, |stream| {
+        if !state.pending_emit.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        let note = json::Notification::new(
+            method::NOTIFY_RESOURCES_UPDATED,
+            Some(json!({"uri": state.uri})),
+        );
+        let _open = lock(&state.open);
+        send_frame(stream, &note)
+    });
+    lock(&state.open).retain(|o| o.id != open_id);
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// One HTTP request as the mock read it.
+struct Http {
+    /// The request line, e.g. `POST /mcp HTTP/1.1`.
+    line: String,
+    /// Every header, its name lower-cased, duplicates kept in arrival order.
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Http {
+    fn is_get(&self) -> bool {
+        self.line.starts_with("GET ")
+    }
+
+    /// The first value of header `name` (lower-case).
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// How many times header `name` (lower-case) was sent.
+    fn count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(k, _)| k == name).count()
     }
 }
 
 /// Read one HTTP request (request line, headers, Content-Length body) off a
-/// clone of `stream`. Returns `(request_line, mcp_session_id, body)` — the
-/// other headers are unused by the mock.
-fn read_http(stream: &TcpStream) -> Option<(String, Option<String>, Vec<u8>)> {
+/// clone of `stream`.
+fn read_http(stream: &TcpStream) -> Option<Http> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).ok()? == 0 {
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
         return None;
     }
-    let mut content_length = 0usize;
-    let mut session = None;
+    let mut headers = Vec::new();
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
+        let mut h = String::new();
+        if reader.read_line(&mut h).ok()? == 0 {
             break;
         }
-        let line = line.trim_end();
-        if line.is_empty() {
+        let h = h.trim_end();
+        if h.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = v.trim().parse().unwrap_or(0);
-        }
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("mcp-session-id")
-        {
-            session = Some(v.trim().to_string());
+        if let Some((k, v)) = h.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
         }
     }
+    let content_length = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0usize);
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).ok()?;
-    Some((request_line, session, body))
+    Some(Http {
+        line: line.trim_end().to_string(),
+        headers,
+        body,
+    })
 }
 
 /// Write an `application/json` HTTP response carrying `payload`, optionally
 /// stamping the `Mcp-Session-Id` header.
-fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: Option<String>) {
-    let body = serde_json::to_vec(&payload).unwrap_or_default();
+fn write_json(stream: &mut TcpStream, status: u16, payload: &Value, session: Option<String>) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Status",
+    };
+    let body = serde_json::to_vec(payload).unwrap_or_default();
     let session_hdr = session
         .map(|s| format!("Mcp-Session-Id: {s}\r\n"))
         .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{session_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());

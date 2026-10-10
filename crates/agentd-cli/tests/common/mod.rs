@@ -26,6 +26,9 @@ pub struct MockMcp {
     /// The mock's stderr: its `MOCK_*` lines are the server side's own record
     /// of what reached it.
     log_path: String,
+    /// The MCP revision it speaks: "2025-11-25" (the `initialize` handshake)
+    /// or "2026-07-28" (`server/discover`).
+    protocol_version: String,
 }
 
 impl MockMcp {
@@ -33,9 +36,51 @@ impl MockMcp {
     pub fn uri(&self) -> String {
         format!("http://{}", self.addr)
     }
+    /// The MCP revision the mock speaks.
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
     /// Everything the mock wrote to stderr so far.
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+    /// How many `marker` lines the mock wrote (`MOCK_GET`, or `MOCK_LISTEN …`
+    /// but not `MOCK_LISTEN_CLOSED …`).
+    fn marked(&self, marker: &str) -> usize {
+        let with_rest = format!("{marker} ");
+        self.log()
+            .lines()
+            .filter(|l| *l == marker || l.starts_with(&with_rest))
+            .count()
+    }
+    /// `server/discover` requests that reached the mock, at either revision.
+    pub fn discovers(&self) -> usize {
+        self.marked("MOCK_DISCOVER")
+    }
+    /// `initialize` requests that reached the mock, at either revision.
+    pub fn initializes(&self) -> usize {
+        self.marked("MOCK_INITIALIZE")
+    }
+    /// Requests the 2026-07-28 mock refused for breaking the revision's rules.
+    pub fn refused(&self) -> usize {
+        self.marked("MOCK_REFUSED")
+    }
+    /// Requests that carried a session to the 2026-07-28 mock, which has none.
+    pub fn sessions(&self) -> usize {
+        self.marked("MOCK_SESSION")
+    }
+    /// `GET` requests to the 2026-07-28 mock, which has no `GET` stream.
+    pub fn gets(&self) -> usize {
+        self.marked("MOCK_GET")
+    }
+    /// `subscriptions/listen` requests that reached the 2026-07-28 mock.
+    pub fn listens(&self) -> usize {
+        self.marked("MOCK_LISTEN")
+    }
+    /// Call one of the mock's own `mock.*` tools, as an operator's script
+    /// would ([`mock_control`]); returns its structured result.
+    pub fn control(&self, tool: &str, args: Value) -> Value {
+        mock_control(&self.uri(), &self.protocol_version, tool, args)
     }
     /// How many `resources/read` calls for exactly `uri` reached the mock —
     /// counted by the server, so a read the client answered from anywhere else
@@ -67,11 +112,19 @@ impl Drop for MockMcp {
     }
 }
 
-/// Launch the mock HTTP MCP server serving one resource at `uri`. `emit` controls
-/// the post-subscribe `resources/updated` push on the GET SSE stream. Blocks
-/// until the mock has bound and announced its address (so agentd can connect
-/// immediately).
+/// Launch the mock HTTP MCP server serving one resource at `uri`, at
+/// 2025-11-25. `emit` controls the post-subscribe `resources/updated` push on
+/// the GET SSE stream. Blocks until the mock has bound and announced its
+/// address (so agentd can connect immediately).
 pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
+    spawn_mock_mcp_at("2025-11-25", uri, emit)
+}
+
+/// [`spawn_mock_mcp`] speaking `protocol_version`: "2025-11-25" (the
+/// `initialize` handshake and a session) or "2026-07-28" (`server/discover`,
+/// every request held to the revision's rules, subscriptions as
+/// `subscriptions/listen` streams).
+pub fn spawn_mock_mcp_at(protocol_version: &str, uri: &str, emit: bool) -> MockMcp {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let addr_file = unique_path("mock-mcp", "addr");
     let _ = std::fs::remove_file(&addr_file);
@@ -79,6 +132,8 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
         "--internal-mock-mcp-http".to_string(),
         addr_file.clone(),
         uri.to_string(),
+        "--protocol-version".to_string(),
+        protocol_version.to_string(),
     ];
     if !emit {
         args.push("--no-emit".to_string());
@@ -97,7 +152,72 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
         addr_file,
         addr,
         log_path,
+        protocol_version: protocol_version.to_string(),
     }
+}
+
+/// Serve the mock with `opts` on a thread of this test process, for a variant
+/// no command-line flag reaches (subscriptions off, listens closed at once).
+/// Returns its bare `http://<addr>` endpoint once it is bound. Its `MOCK_*`
+/// lines go to this process's stderr.
+pub fn mock_in_thread(opts: agentd::mcp::mock_http::Options) -> String {
+    let addr_file = unique_path("mock-thread", "addr");
+    let _ = std::fs::remove_file(&addr_file);
+    let thread_file = addr_file.clone();
+    std::thread::spawn(move || agentd::mcp::mock_http::run_with(&thread_file, &opts));
+    let addr = read_addr_file(&addr_file);
+    let _ = std::fs::remove_file(&addr_file);
+    format!("http://{addr}")
+}
+
+/// Call the mock's own tool `tool` with `args` at `endpoint`, as an operator's
+/// script would, and return its structured result. At 2026-07-28 the request
+/// carries what the revision requires of every request — the
+/// `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers and the `_meta`
+/// beside them — so a control call is never what the mock refuses; at
+/// 2025-11-25 it carries no session, which the mock serves. Asserts the mock
+/// answered 200.
+pub fn mock_control(endpoint: &str, protocol_version: &str, tool: &str, args: Value) -> Value {
+    let addr = endpoint
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let mut params = json!({"name": tool, "arguments": args});
+    let mut head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n"
+    );
+    if protocol_version == "2026-07-28" {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": protocol_version,
+            "io.modelcontextprotocol/clientInfo": {"name": "agentd-e2e", "version": "0"},
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        head.push_str(&format!(
+            "MCP-Protocol-Version: {protocol_version}\r\nMcp-Method: tools/call\r\nMcp-Name: {tool}\r\n"
+        ));
+    }
+    let body =
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}).to_string();
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
+    let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("dial mock {addr}: {e}"));
+    s.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    s.write_all(head.as_bytes())
+        .and_then(|()| s.write_all(body.as_bytes()))
+        .expect("send to mock");
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    let reply = parse_reply(&raw);
+    assert_eq!(reply.status, 200, "mock tool {tool}: {reply:?}");
+    let v = reply.json();
+    assert!(
+        v["result"]["isError"] != true,
+        "mock tool {tool} failed: {v}"
+    );
+    v["result"]["structuredContent"].clone()
 }
 
 /// A loopback TCP port nothing holds, for something the test then tells to

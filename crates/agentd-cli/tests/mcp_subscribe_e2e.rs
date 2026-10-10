@@ -16,13 +16,18 @@
 //! What a re-dial restores is read off the owners — the starts, the waits, the
 //! instruction — through the code a reload's re-dial takes, and a subscribe it
 //! makes that fails in a way that may pass is asked again.
+//!
+//! At 2026-07-28 there is no session to lose: a subscription is a
+//! `subscriptions/listen` stream, and a restart closes it. The mock speaks
+//! that revision for real — sessionless, every request held to the
+//! revision's headers and `_meta` — and the tests that run against it say
+//! what reached it: no `initialize`, nothing refused, no session, no `GET`.
 #![cfg(unix)]
 
 mod common;
 
-use serde_json::Value;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use agentd::mcp::mock_http::{Lifecycle, Options};
+use serde_json::{Value, json};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -93,28 +98,29 @@ impl Drop for Daemon {
     }
 }
 
-/// Call one of the mock's own tools with no session, as an operator's script
-/// would — the mock serves a request that carries none.
-fn mock_tool(endpoint: &str, tool: &str) {
-    mock_tool_with(endpoint, tool, "{}");
+/// Whether one `subscriptions/listen` that reached the mock asked for every
+/// URI in `uris` — logged once the mock has decided whether to refuse it.
+fn listened_for(mock: &common::MockMcp, uris: &[&str]) -> bool {
+    mock.log()
+        .lines()
+        .filter_map(|l| l.strip_prefix("MOCK_LISTEN "))
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .any(|f| {
+            uris.iter().all(|u| {
+                f["resourceSubscriptions"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == u))
+            })
+        })
 }
 
-/// [`mock_tool`] with `arguments` (a JSON object).
-fn mock_tool_with(endpoint: &str, tool: &str, arguments: &str) {
-    let addr = endpoint.trim_start_matches("http://");
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
-    );
-    let mut s = TcpStream::connect(addr).expect("dial mock");
-    write!(
-        s,
-        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .expect("send");
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    assert!(out.starts_with("HTTP/1.1 200"), "mock tool {tool}: {out}");
+/// What a 2026-07-28 connection never sends the mock: an `initialize`, a
+/// request the revision's rules refuse, a session, a `GET`.
+fn assert_stateless_wire(mock: &common::MockMcp) {
+    assert_eq!(mock.initializes(), 0, "{}", mock.log());
+    assert_eq!(mock.refused(), 0, "{}", mock.log());
+    assert_eq!(mock.sessions(), 0, "{}", mock.log());
+    assert_eq!(mock.gets(), 0, "{}", mock.log());
 }
 
 #[test]
@@ -135,7 +141,7 @@ fn a_server_that_forgets_the_session_is_re_dialed_and_the_subscription_restored(
     assert_eq!(mock.subscribes(WATCHED), 1);
 
     // The server restarts: its session, and the subscription with it, gone.
-    mock_tool(&endpoint, "mock.restart");
+    mock.control("mock.restart", json!({}));
 
     daemon.wait_for("a run fired by a wake on the new session", |log| {
         events(log, "run.done").len() >= 2
@@ -171,37 +177,70 @@ fn a_server_that_forgets_the_session_is_re_dialed_and_the_subscription_restored(
 
 #[test]
 fn a_server_without_subscriptions_is_a_loud_failure_not_a_silent_park() {
-    let addr_file = common::unique_path("mock-nosub", "addr");
-    let _ = std::fs::remove_file(&addr_file);
-    let thread_file = addr_file.clone();
-    std::thread::spawn(move || {
-        agentd::mcp::mock_http::run_offering(&thread_file, WATCHED, true, false);
-    });
-    let endpoint = format!("http://{}/mcp", common::read_addr_file(&addr_file));
+    // At either revision: no `resources.subscribe` in the answer to the
+    // handshake or to `server/discover`.
+    for lifecycle in [Lifecycle::Initialize, Lifecycle::Discover] {
+        let endpoint = common::mock_in_thread(Options {
+            subscribe: false,
+            lifecycle,
+            ..Options::new(WATCHED)
+        });
+        let daemon = Daemon::start(
+            "mcp-nosub",
+            &format!(
+                "agent:\n  name: nosub\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\nworkflows:\n  - name: watch\n    steps:\n      s: {{kind: subscribe, server: mock, uri: \"{WATCHED}\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n  - name: waits\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, on: resource, server: mock, uri: \"{WATCHED}\", depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w], status: completed}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n"
+            ),
+        );
+
+        daemon.wait_for("the start to be refused and the wait to fail", |log| {
+            !events(log, "start.subscribe.unsupported").is_empty()
+                && log.contains("wait resource: subscribe")
+        });
+        let log = daemon.log();
+        let refused = &events(&log, "start.subscribe.unsupported")[0];
+        assert_eq!(refused["level"], "error", "{lifecycle:?}: {log}");
+        assert_eq!(refused["uri"], WATCHED, "{lifecycle:?}: {log}");
+        assert!(
+            events(&log, "start.subscribe.armed").is_empty(),
+            "{lifecycle:?}: nothing was armed:\n{log}"
+        );
+        assert!(
+            log.contains("resources.subscribe"),
+            "{lifecycle:?}: the wait's failure names the missing capability:\n{log}"
+        );
+    }
+}
+
+#[test]
+fn a_subscribe_start_wakes_on_a_2026_07_28_server() {
+    let mock = common::spawn_mock_mcp_at("2026-07-28", WATCHED, true);
+    let endpoint = mock.uri();
     let daemon = Daemon::start(
-        "mcp-nosub",
+        "mcp-listen-wake",
         &format!(
-            "agent:\n  name: nosub\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}\nworkflows:\n  - name: watch\n    steps:\n      s: {{kind: subscribe, server: mock, uri: \"{WATCHED}\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n  - name: waits\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, on: resource, server: mock, uri: \"{WATCHED}\", depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w], status: completed}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n"
+            "agent:\n  name: listen-wake\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\nworkflows:\n  - name: watch\n    steps:\n      s: {{kind: subscribe, server: mock, uri: \"{WATCHED}\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n"
         ),
     );
-
-    daemon.wait_for("the start to be refused and the wait to fail", |log| {
-        !events(log, "start.subscribe.unsupported").is_empty()
-            && log.contains("wait resource: subscribe")
+    daemon.wait_for("the listen's update to fire a run", |log| {
+        !events(log, "run.done").is_empty()
     });
     let log = daemon.log();
-    let refused = &events(&log, "start.subscribe.unsupported")[0];
-    assert_eq!(refused["level"], "error", "{log}");
-    assert_eq!(refused["uri"], WATCHED, "{log}");
     assert!(
-        events(&log, "start.subscribe.armed").is_empty(),
-        "nothing was armed:\n{log}"
+        events(&log, "mcp.connect")
+            .iter()
+            .any(|e| e["server"] == "mock" && e["protocol"] == "2026-07-28"),
+        "the connection says the revision it reached:\n{log}"
     );
     assert!(
-        log.contains("resources.subscribe"),
-        "the wait's failure names the missing capability:\n{log}"
+        events(&log, "start.subscribe.armed")
+            .iter()
+            .any(|e| e["uri"] == WATCHED),
+        "{log}"
     );
-    let _ = std::fs::remove_file(&addr_file);
+    // Reached through `server/discover`, subscribed through a listen.
+    assert!(mock.discovers() >= 1, "{}", mock.log());
+    assert!(listened_for(&mock, &[WATCHED]), "{}", mock.log());
+    assert_stateless_wire(&mock);
 }
 
 /// The two workflows the restart tests watch with: a `subscribe` start on
@@ -219,13 +258,12 @@ fn a_server_back_from_a_restart_without_subscriptions_fails_the_waits_and_says_t
     // server that came back without `resources.subscribe` gets the answer
     // it gets there — not a warning and a wait parked for ever.
     let mock = common::spawn_mock_mcp(WATCHED, false);
-    let endpoint = mock.uri();
-    let daemon = Daemon::start("mcp-lost-cap", &watch_and_wait(&endpoint, "lostcap"));
+    let daemon = Daemon::start("mcp-lost-cap", &watch_and_wait(&mock.uri(), "lostcap"));
     daemon.wait_for("the start and the wait to subscribe", |_| {
         mock.subscribes(WATCHED) >= 1 && mock.subscribes("mock://waited") >= 1
     });
 
-    mock_tool_with(&endpoint, "mock.restart", r#"{"subscribe": false}"#);
+    mock.control("mock.restart", json!({"subscribe": false}));
 
     daemon.wait_for("the wait to fail and the start to be refused", |log| {
         !events(log, "start.subscribe.unsupported").is_empty()
@@ -255,16 +293,15 @@ fn a_re_subscribe_the_restarted_server_refuses_is_asked_again() {
     // A server still warming up refuses the first subscribe on the new
     // session. Said once and left, the start never fired again.
     let mock = common::spawn_mock_mcp(WATCHED, true);
-    let endpoint = mock.uri();
-    let daemon = Daemon::start("mcp-resub-retry", &watch_and_wait(&endpoint, "retry"));
+    let daemon = Daemon::start("mcp-resub-retry", &watch_and_wait(&mock.uri(), "retry"));
     daemon.wait_for(
         "the first wake to fire a run, and the wait to subscribe",
         |log| !events(log, "run.done").is_empty() && mock.subscribes("mock://waited") >= 1,
     );
 
     // The start's re-subscribe and the wait's are both refused.
-    mock_tool_with(&endpoint, "mock.refuse_subscribe", r#"{"count": 2}"#);
-    mock_tool(&endpoint, "mock.restart");
+    mock.control("mock.refuse_subscribe", json!({"count": 2}));
+    mock.control("mock.restart", json!({}));
 
     daemon.wait_for("a run fired by a wake on the retried subscription", |log| {
         events(log, "run.done").len() >= 2
@@ -296,6 +333,61 @@ fn a_re_subscribe_the_restarted_server_refuses_is_asked_again() {
     assert_eq!(mock.subscribes(WATCHED), 3, "{}", mock.log());
 }
 
+/// Whether a run of `workflow` started after the last `mcp.listen.resumed`
+/// line: a wake the re-opened listen delivered.
+fn started_after_the_resume(log: &str, workflow: &str) -> bool {
+    let lines: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let Some(resumed) = lines
+        .iter()
+        .rposition(|e| e["event"] == "mcp.listen.resumed")
+    else {
+        return false;
+    };
+    lines[resumed..]
+        .iter()
+        .any(|e| e["event"] == "run.start" && e["workflow"] == workflow)
+}
+
+#[test]
+fn a_re_subscribe_the_restarted_server_refuses_is_asked_again_at_2026_07_28() {
+    // At 2026-07-28 a restart has no session to lose: it closes the listen
+    // that carries every subscription, and the connection listens again. A
+    // server still warming up refuses the first re-listens; they are asked
+    // again until one is acknowledged, and the start fires on it.
+    let mock = common::spawn_mock_mcp_at("2026-07-28", WATCHED, true);
+    let daemon = Daemon::start(
+        "mcp-relisten-retry",
+        &watch_and_wait(&mock.uri(), "relisten"),
+    );
+    daemon.wait_for(
+        "the first wake to fire a run, and the wait to be in the listen",
+        |log| {
+            !events(log, "run.done").is_empty() && listened_for(&mock, &[WATCHED, "mock://waited"])
+        },
+    );
+
+    mock.control("mock.refuse_subscribe", json!({"count": 2}));
+    mock.control("mock.restart", json!({}));
+
+    daemon.wait_for("a run fired by a wake on the listen opened again", |log| {
+        started_after_the_resume(log, "watch")
+    });
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.listen.ended")
+            .iter()
+            .any(|e| e["level"] == "warn"
+                && e["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("subscribe refused"))),
+        "a refused re-listen is said, and asked again:\n{log}"
+    );
+    assert_stateless_wire(&mock);
+}
+
 #[test]
 fn a_resource_instruction_is_read_again_after_its_server_restarts() {
     // The publisher may have changed the instruction while the server was
@@ -314,7 +406,7 @@ fn a_resource_instruction_is_read_again_after_its_server_restarts() {
     });
     assert_eq!(mock.reads("mock://instruction"), 1, "{}", mock.log());
 
-    mock_tool(&endpoint, "mock.restart");
+    mock.control("mock.restart", json!({}));
 
     daemon.wait_for("the instruction read again, changed", |log| {
         !events(log, "instruction.updated").is_empty()
@@ -325,29 +417,41 @@ fn a_resource_instruction_is_read_again_after_its_server_restarts() {
 
 #[test]
 fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_dropped() {
-    // The stateless revision: one `subscriptions/listen` stream carries every
-    // subscription. The mock closes each one after its update, so the daemon
-    // says the end and listens again; then it starts acknowledging without
-    // the waited URI. rmcp drops every update outside an acknowledgment, so
-    // the URI is said dropped, asked for again, and — the server still
-    // leaving it out — the wait on it fails rather than parking for ever.
-    let addr_file = common::unique_path("mock-listen", "addr");
-    let _ = std::fs::remove_file(&addr_file);
-    let thread_file = addr_file.clone();
-    std::thread::spawn(move || {
-        agentd::mcp::mock_http::run_listening(&thread_file, WATCHED);
-    });
-    let endpoint = format!("http://{}", common::read_addr_file(&addr_file));
-    let daemon = Daemon::start("mcp-listen", &watch_and_wait(&endpoint, "listener"));
+    // At 2026-07-28 one `subscriptions/listen` stream carries every
+    // subscription. A restart closes it: the daemon says the end and listens
+    // again. Then the server acknowledges without the waited URI. rmcp drops
+    // every update outside an acknowledgment, so the URI is said dropped,
+    // asked for again, and — the server still leaving it out — the wait on it
+    // fails rather than parking for ever.
+    let mock = common::spawn_mock_mcp_at("2026-07-28", WATCHED, true);
+    let daemon = Daemon::start("mcp-listen", &watch_and_wait(&mock.uri(), "listener"));
+    daemon.wait_for(
+        "the start to fire and the wait to be in the listen",
+        |log| {
+            !events(log, "run.done").is_empty() && listened_for(&mock, &[WATCHED, "mock://waited"])
+        },
+    );
+
+    mock.control("mock.restart", json!({}));
+
     daemon.wait_for("the listen to end and be opened again", |log| {
         !events(log, "mcp.listen.resumed").is_empty()
     });
     let log = daemon.log();
     let ended = &events(&log, "mcp.listen.ended")[0];
     assert_eq!(ended["server"], "mock", "{log}");
+    assert_eq!(ended["level"], "warn", "a restart is no idle cut:\n{log}");
     assert!(ended["retry_ms"].as_u64().is_some(), "{log}");
+    assert!(
+        mock.log()
+            .lines()
+            .any(|l| l == "MOCK_LISTEN_CLOSED restart"),
+        "{}",
+        mock.log()
+    );
 
-    mock_tool_with(&endpoint, "mock.narrow", r#"{"uri": "mock://waited"}"#);
+    mock.control("mock.narrow", json!({"uri": "mock://waited"}));
+    mock.control("mock.restart", json!({}));
 
     daemon.wait_for("the wait on the dropped URI to fail", |log| {
         events(log, "run.done")
@@ -358,7 +462,7 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
     assert!(
         events(&log, "mcp.listen.narrowed")
             .iter()
-            .any(|e| e["dropped"] == serde_json::json!(["mock://waited"])),
+            .any(|e| e["dropped"] == json!(["mock://waited"])),
         "the narrowing is said:\n{log}"
     );
     assert!(
@@ -371,20 +475,21 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
                     .is_some_and(|m| m.contains("acknowledged the listen without"))),
         "the retry met the refusal, and the wait was told:\n{log}"
     );
-    let _ = std::fs::remove_file(&addr_file);
+    assert_stateless_wire(&mock);
 }
 
 #[test]
 fn an_instruction_on_a_server_without_subscriptions_is_said_once_not_on_every_refresh() {
     // Such a server is followed by the refresh re-read alone. Said when the
     // instruction is first read from it — not as a warning on every re-read.
-    let addr_file = common::unique_path("mock-nosub-ins", "addr");
-    let _ = std::fs::remove_file(&addr_file);
-    let thread_file = addr_file.clone();
-    std::thread::spawn(move || {
-        agentd::mcp::mock_http::run_offering(&thread_file, WATCHED, false, false);
-    });
-    let endpoint = format!("http://{}/mcp", common::read_addr_file(&addr_file));
+    let endpoint = format!(
+        "{}/mcp",
+        common::mock_in_thread(Options {
+            emit: false,
+            subscribe: false,
+            ..Options::new(WATCHED)
+        })
+    );
     let daemon = Daemon::start(
         "mcp-nosub-instruction",
         &format!(
@@ -404,22 +509,16 @@ fn an_instruction_on_a_server_without_subscriptions_is_said_once_not_on_every_re
         1,
         "said once:\n{log}"
     );
-    let _ = std::fs::remove_file(&addr_file);
 }
 
 #[test]
 fn a_tool_rmcp_drops_is_logged_once_by_the_daemon() {
-    // At the stateless revision the MCP client drops, without a word, a tool
-    // whose `x-mcp-header` annotation it rejects. The daemon says it — once,
-    // though boot drains twice (after the connect's priming list and after
-    // the catalogue's own list).
-    let addr_file = common::unique_path("mock-dropped", "addr");
-    let _ = std::fs::remove_file(&addr_file);
-    let thread_file = addr_file.clone();
-    std::thread::spawn(move || {
-        agentd::mcp::mock_http::run_listening(&thread_file, WATCHED);
-    });
-    let endpoint = format!("http://{}", common::read_addr_file(&addr_file));
+    // At 2026-07-28 the MCP client drops, without a word, a tool whose
+    // `x-mcp-header` annotation it rejects. The daemon says it — once, though
+    // boot drains twice (after the connect's priming list and after the
+    // catalogue's own list).
+    let mock = common::spawn_mock_mcp_at("2026-07-28", WATCHED, true);
+    let endpoint = mock.uri();
     let daemon = Daemon::start(
         "mcp-dropped",
         &format!(
@@ -439,5 +538,5 @@ fn a_tool_rmcp_drops_is_logged_once_by_the_daemon() {
         dropped[0]["reason"], "invalid x-mcp-header annotation",
         "{log}"
     );
-    let _ = std::fs::remove_file(&addr_file);
+    assert_stateless_wire(&mock);
 }

@@ -265,6 +265,7 @@ const MAIN_FLAGS: &[&str] = &[
     "--internal-mock-mcp-http",
     "--internal-mock-llm",
     "--no-emit",
+    "--protocol-version",
 ];
 
 /// Every flag an agentd invocation in `text` passes, with the line it starts

@@ -48,18 +48,12 @@ fn dispatch() -> i32 {
         }
     }
 
-    // Hidden built-in Streamable HTTP mock MCP server (tests/dev):
-    // `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]`. Binds loopback
-    // TCP (127.0.0.1:0) and announces the bound address through <addr-file>.
+    // Hidden built-in Streamable HTTP mock MCP server (tests/dev). Binds
+    // loopback TCP (127.0.0.1:0) and announces the bound address through
+    // <addr-file>.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if argv.get(1).map(String::as_str) == Some("--internal-mock-mcp-http") {
-        let addr_file = argv
-            .get(2)
-            .map(String::as_str)
-            .unwrap_or("/tmp/agentd-mock-mcp.addr");
-        let uri = argv.get(3).map(String::as_str).unwrap_or("mock://resource");
-        let emit = !argv.iter().any(|a| a == "--no-emit");
-        return agentd::mcp::mock_http::run(addr_file, uri, emit);
+        return mock_mcp_http(&argv[2..]);
     }
 
     // Hidden built-in mock LLM (tests):
@@ -90,6 +84,42 @@ fn dispatch() -> i32 {
 
     let env: Vec<(String, String)> = std::env::vars().collect();
     run(&argv[1..], &env)
+}
+
+/// `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]
+/// [--protocol-version <v>]`: the mock at 2025-11-25 (the `initialize`
+/// handshake; the default) or 2026-07-28 (`server/discover`). Any other
+/// revision is a usage error.
+#[cfg(any(feature = "internal-mocks", debug_assertions))]
+fn mock_mcp_http(args: &[String]) -> i32 {
+    use agentd::mcp::mock_http::{Lifecycle, Options, run_with};
+    let mut positional = Vec::new();
+    let mut opts = Options::new("mock://resource");
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--no-emit" => opts.emit = false,
+            "--protocol-version" => {
+                let asked = it.next().map(String::as_str).unwrap_or_default();
+                let Some(lifecycle) = Lifecycle::of_revision(asked) else {
+                    eprintln!(
+                        "--internal-mock-mcp-http: --protocol-version {asked:?}: the mock speaks 2026-07-28 and 2025-11-25"
+                    );
+                    return exit::USAGE;
+                };
+                opts.lifecycle = lifecycle;
+            }
+            _ => positional.push(arg.as_str()),
+        }
+    }
+    let addr_file = positional
+        .first()
+        .copied()
+        .unwrap_or("/tmp/agentd-mock-mcp.addr");
+    if let Some(uri) = positional.get(1) {
+        opts.uri = (*uri).to_string();
+    }
+    run_with(addr_file, &opts)
 }
 
 /// A loaded daemon invocation: the configuration, what was asked of it, and

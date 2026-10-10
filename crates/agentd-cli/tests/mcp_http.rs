@@ -9,6 +9,8 @@
 //! at a mock server on a real port, and assert from the *server's* side, which
 //! is the only side that can tell whether the wire is right.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -16,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use agentd::mcp::client::McpClient;
+use agentd::mcp::mock_http::{Lifecycle, Options};
 use serde_json::{Value, json};
 
 /// What the mock observed, so the test can assert protocol-level behaviour
@@ -297,33 +300,9 @@ fn notification_get_stream_delivers_server_pushes() {
     // pushes a resources/updated on the GET SSE stream after a subscribe. Prove
     // agentd's notification thread receives it (the reactive-over-HTTP push
     // channel).
-    let addr_file = format!(
-        "/tmp/agentd-mcp-notify-{}-{}.addr",
-        std::process::id(),
-        line!()
-    );
-    let addr_file_thread = addr_file.clone();
-    std::thread::spawn(move || {
-        agentd::mcp::mock_http::run(&addr_file_thread, "mock://res", true);
-    });
-    // Wait for the address announcement.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !std::path::Path::new(&addr_file).exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mock never announced its address"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let addr = std::fs::read_to_string(&addr_file).expect("read mock addr-file");
-
-    let mut client = McpClient::connect(
-        "mock",
-        &format!("http://{}", addr.trim()),
-        Vec::new(),
-        Duration::from_secs(5),
-    )
-    .expect("connect");
+    let endpoint = common::mock_in_thread(Options::new("mock://res"));
+    let mut client =
+        McpClient::connect("mock", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
     client.initialize().expect("initialize");
     assert!(client.capabilities().supports_subscribe());
     client.subscribe("mock://res").expect("subscribe");
@@ -346,7 +325,225 @@ fn notification_get_stream_delivers_server_pushes() {
 
     // Dropping the client stops the notification thread cleanly.
     drop(client);
-    let _ = std::fs::remove_file(&addr_file);
+}
+
+#[test]
+fn a_2026_07_28_and_a_2025_11_25_server_both_connect_list_tools_and_serve_a_subscription() {
+    // The built-in mock at each revision, reached the way agentd reaches any
+    // server: `server/discover` first, `initialize` for a server that
+    // predates it. At either one the client settles on the revision the server
+    // speaks, lists its tools, and a subscription — a `subscriptions/listen`
+    // stream, or `resources/subscribe` and the GET stream — delivers the
+    // server's update.
+    for (lifecycle, revision) in [
+        (Lifecycle::Discover, "2026-07-28"),
+        (Lifecycle::Initialize, "2025-11-25"),
+    ] {
+        let endpoint = common::mock_in_thread(Options {
+            lifecycle,
+            ..Options::new("mock://res")
+        });
+        let mut client = McpClient::connect("mock", &endpoint, Vec::new(), Duration::from_secs(5))
+            .expect("connect");
+        client.initialize().expect("reach the server");
+        assert_eq!(client.protocol_version().as_deref(), Some(revision));
+        let tools = client.list_tools().expect("tools/list");
+        assert!(
+            tools.iter().any(|t| t.name == "state.put"),
+            "{revision}: {:?}",
+            tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        client.subscribe("mock://res").expect("subscribe");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        loop {
+            got.extend(client.drain_notifications());
+            if got.iter().any(|n| {
+                n.method == "notifications/resources/updated"
+                    && n.params.as_ref().is_some_and(|p| p["uri"] == "mock://res")
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{revision}: no update within 5 s: {got:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// One raw request to the mock at `addr`: `headers` as given, `body` as the
+/// payload. Returns the status and the JSON body (`Null` when there is none).
+fn raw(addr: &str, line: &str, headers: &[(&str, &str)], body: &Value) -> (u16, Value) {
+    let payload = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
+    let mut req = format!("{line}\r\nHost: {addr}\r\nContent-Type: application/json\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    ));
+    let mut s = TcpStream::connect(addr).expect("dial mock");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.write_all(req.as_bytes()).expect("send");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    let status = out
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = out
+        .split_once("\r\n\r\n")
+        .and_then(|(_, b)| serde_json::from_str(b).ok())
+        .unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// A request body at 2026-07-28 for `method` with `params`, its `_meta`
+/// carrying `meta` (merged over a complete one).
+fn body(method: &str, mut params: Value, meta: Value) -> Value {
+    let mut full = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "e2e", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    for (k, v) in meta.as_object().cloned().unwrap_or_default() {
+        if v.is_null() {
+            full.as_object_mut().unwrap().remove(&k);
+        } else {
+            full[k] = v;
+        }
+    }
+    params["_meta"] = full;
+    json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
+}
+
+#[test]
+fn the_2026_07_28_mock_enforces_what_the_revision_requires() {
+    // The mock is the arbiter the daemon's 2026-07-28 tests trust, so it must
+    // refuse what a real server of that revision refuses — or a client that
+    // left a header out would pass every one of them.
+    let endpoint = common::mock_in_thread(Options {
+        lifecycle: Lifecycle::Discover,
+        ..Options::new("mock://res")
+    });
+    let addr = endpoint.trim_start_matches("http://");
+    let post = "POST /mcp HTTP/1.1";
+    let v = ("MCP-Protocol-Version", "2026-07-28");
+    let code = |b: &Value| b["error"]["code"].as_i64();
+    let regional = || {
+        body(
+            "tools/call",
+            json!({"name": "mock.regional", "arguments": {"region": "eu"}}),
+            json!({}),
+        )
+    };
+    let call_headers = [
+        v,
+        ("Mcp-Method", "tools/call"),
+        ("Mcp-Name", "mock.regional"),
+    ];
+
+    // What a 2026-07-28 client sends is served — the refusals below are the
+    // rules, not a server that refuses everything.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[
+            v,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "mock.regional"),
+            ("Mcp-Param-Region", "eu"),
+        ],
+        &regional(),
+    );
+    assert_eq!(status, 200, "{b}");
+    assert_eq!(b["result"]["structuredContent"]["region"], "eu", "{b}");
+    assert_eq!(b["result"]["resultType"], "complete", "{b}");
+
+    // No Mcp-Method.
+    let (status, b) = raw(addr, post, &[v], &body("tools/list", json!({}), json!({})));
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    // The header and `_meta` name different revisions.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[v, ("Mcp-Method", "tools/list")],
+        &body(
+            "tools/list",
+            json!({}),
+            json!({"io.modelcontextprotocol/protocolVersion": "2025-11-25"}),
+        ),
+    );
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    // No clientCapabilities.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[v, ("Mcp-Method", "tools/list")],
+        &body(
+            "tools/list",
+            json!({}),
+            json!({"io.modelcontextprotocol/clientCapabilities": null}),
+        ),
+    );
+    assert_eq!((status, code(&b)), (400, Some(-32602)), "{b}");
+    // The annotated tool without the header its argument travels in.
+    let (status, b) = raw(addr, post, &call_headers, &regional());
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    // The handshake the revision does not have.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[],
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                           "clientInfo": {"name": "e2e", "version": "0"}}}),
+    );
+    assert_eq!((status, code(&b)), (400, Some(-32022)), "{b}");
+    assert_eq!(
+        b["error"]["data"]["supported"],
+        json!(["2026-07-28"]),
+        "{b}"
+    );
+    assert_eq!(b["error"]["data"]["requested"], "2025-11-25", "{b}");
+    // No GET stream.
+    let (status, _) = raw(addr, "GET /mcp HTTP/1.1", &[v], &Value::Null);
+    assert_eq!(status, 405);
+    // A method the revision removed.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[v, ("Mcp-Method", "resources/subscribe")],
+        &body(
+            "resources/subscribe",
+            json!({"uri": "mock://res"}),
+            json!({}),
+        ),
+    );
+    assert_eq!((status, code(&b)), (404, Some(-32601)), "{b}");
+    // `server/discover`, with every field the revision requires.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[v, ("Mcp-Method", "server/discover")],
+        &body("server/discover", json!({}), json!({})),
+    );
+    assert_eq!(status, 200, "{b}");
+    let r = &b["result"];
+    assert_eq!(r["resultType"], "complete", "{b}");
+    assert_eq!(r["supportedVersions"], json!(["2026-07-28"]), "{b}");
+    assert_eq!(r["capabilities"]["tools"]["listChanged"], true, "{b}");
+    assert_eq!(r["capabilities"]["resources"]["subscribe"], true, "{b}");
+    assert!(r["ttlMs"].is_u64(), "{b}");
+    assert!(r["cacheScope"].is_string(), "{b}");
 }
 
 #[test]

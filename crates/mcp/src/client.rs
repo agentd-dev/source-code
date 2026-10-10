@@ -580,6 +580,18 @@ impl McpClient {
         self.sdk()?.unsubscribe_within(uri, bound)
     }
 
+    /// One JSON-RPC request the SDK does not model, on this connection; see
+    /// [`crate::rmcp_client::RmcpClient::call_raw`].
+    pub fn call_raw(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        bound: Duration,
+    ) -> Result<Result<Value, rpc::RpcError>, McpError> {
+        self.sdk()?.call_raw(method, params, extensions, bound)
+    }
+
     /// The URIs this connection holds a subscription for.
     pub fn subscribed(&self) -> Vec<String> {
         self.sdk().map(|c| c.subscribed()).unwrap_or_default()

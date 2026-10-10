@@ -126,26 +126,10 @@ impl AgentdHttp {
     /// `false` — not taken — for a request, which only the handler can
     /// answer, and on a connection with no queue.
     fn queue_ahead(&self, v: &Value) -> bool {
-        let Some(queue) = &self.notifications else {
-            return false;
-        };
-        let Some(method) = v.get("method").and_then(Value::as_str) else {
-            return false;
-        };
-        if v.get("id").is_some() {
-            return false;
+        match &self.notifications {
+            Some(queue) => crate::rmcp_client::queue_as_handler(queue, v),
+            None => false,
         }
-        if crate::rmcp_client::QUEUED_NOTIFICATIONS.contains(&method) {
-            let params = v
-                .get("params")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default()));
-            queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(crate::rpc::Notification::new(method, Some(params)));
-        }
-        true
     }
 
     /// Let a listen stream stay silent for `idle` — never less than the

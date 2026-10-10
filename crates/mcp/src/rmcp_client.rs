@@ -106,6 +106,28 @@ pub(crate) const QUEUED_NOTIFICATIONS: [&str; 6] = [
     method::NOTIFY_PROGRESS,
 ];
 
+/// Queue `v` — a message taken off a stream outside the SDK — for the host,
+/// as [`Handler`] would have: a notification of a kind it queues goes onto
+/// `queue`, any other notification is passed over as the handler would pass
+/// it over. `false`, and nothing queued, for a message that is not a
+/// notification (a request needs the handler to answer it).
+pub(crate) fn queue_as_handler(queue: &Mutex<Vec<rpc::Notification>>, v: &Value) -> bool {
+    let Some(method) = v.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    if v.get("id").is_some() {
+        return false;
+    }
+    if QUEUED_NOTIFICATIONS.contains(&method) {
+        let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
+        queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(rpc::Notification::new(method, Some(params)));
+    }
+    true
+}
+
 impl Handler {
     fn queue(&self, method: &str, params: Value) {
         self.queue
@@ -321,7 +343,17 @@ pub struct RmcpClient {
     tools_reported: Mutex<std::collections::BTreeSet<String>>,
     /// Dropped tools not yet drained by the host.
     tools_dropped: Mutex<Vec<String>>,
+    /// What the SDK says about this client on every 2026-07-28 request —
+    /// `clientInfo` and `clientCapabilities` — for [`Self::call_raw`], which
+    /// says the same.
+    own_meta: Value,
+    /// The next id [`Self::call_raw`] uses: a range the SDK's own counter,
+    /// which starts at 0, never reaches.
+    raw_ids: std::sync::atomic::AtomicI64,
 }
+
+/// Where [`RmcpClient::call_raw`]'s request ids start.
+const RAW_ID_BASE: i64 = 1 << 40;
 
 /// Builder state, so the host can declare capabilities before connecting (the
 /// handshake carries them, so they cannot be added afterwards).
@@ -445,6 +477,10 @@ impl RmcpBuilder {
         );
         implementation.title = self.client_info.title.clone();
 
+        let own_meta = json!({
+            "clientInfo": serde_json::to_value(&implementation).unwrap_or_else(|_| json!({})),
+            "clientCapabilities": serde_json::to_value(&caps).unwrap_or_else(|_| json!({})),
+        });
         let name = self.name.clone();
         // The SDK speaks the protocol; agentd supplies the socket, so a
         // connection keeps its signer and its mTLS identity.
@@ -528,6 +564,8 @@ impl RmcpBuilder {
             tools_seen,
             tools_reported: Mutex::default(),
             tools_dropped: Mutex::default(),
+            own_meta,
+            raw_ids: std::sync::atomic::AtomicI64::new(RAW_ID_BASE),
         };
         // rmcp sends a tool's `Mcp-Param-*` headers only for tools whose
         // schema it has cached on this connection from a `tools/list` — and a
@@ -785,6 +823,98 @@ impl RmcpClient {
 
     pub fn protocol_version(&self) -> Option<&str> {
         self.protocol_version.as_ref().map(ProtocolVersion::as_str)
+    }
+
+    /// One JSON-RPC request the SDK does not model — an extension's method —
+    /// on this connection's own socket, signed like every other request.
+    ///
+    /// It carries what the SDK puts on each request it sends: the negotiated
+    /// `MCP-Protocol-Version`, and at a revision without `initialize`
+    /// `Mcp-Method` and the per-request `_meta` — the revision, the client's
+    /// info, and its capabilities with `extensions` declared in them (a
+    /// method's own `_meta` keys are kept). `Mcp-Name` is not set: the
+    /// revision defines it for tools, resources and prompts only. The id comes
+    /// from a range the SDK's counter never reaches, and a notification sent
+    /// on the answer's stream reaches the host's queue as the handler would
+    /// queue it.
+    ///
+    /// The outer error is the connection's (a transport failure, a lost
+    /// session); the inner one is the server's JSON-RPC refusal, with its
+    /// `code` and `data`, for the caller to branch on. A result whose
+    /// `resultType` is anything but `"complete"` is a protocol error: this
+    /// call has no way to follow an interim result.
+    pub fn call_raw(
+        &self,
+        method: &str,
+        mut params: serde_json::Map<String, Value>,
+        extensions: Value,
+        bound: Duration,
+    ) -> Result<Result<Value, rpc::RpcError>, McpError> {
+        let id = self
+            .raw_ids
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let version = self.protocol_version().unwrap_or_default().to_string();
+        let mut headers: Vec<(&str, &str)> = vec![("MCP-Protocol-Version", &version)];
+        if self.listens() {
+            let mut caps = self.own_meta["clientCapabilities"].clone();
+            if extensions.as_object().is_some_and(|e| !e.is_empty()) {
+                caps["extensions"] = extensions;
+            }
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if !meta.is_object() {
+                *meta = json!({});
+            }
+            meta["io.modelcontextprotocol/protocolVersion"] = json!(version);
+            meta["io.modelcontextprotocol/clientInfo"] = self.own_meta["clientInfo"].clone();
+            meta["io.modelcontextprotocol/clientCapabilities"] = caps;
+            headers.push(("Mcp-Method", method));
+        }
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let bytes = serde_json::to_vec(&body).map_err(|e| {
+            McpError::Transport(format!("mcp server '{}': {method}: {e}", self.name))
+        })?;
+        let queue = Arc::clone(&self.notifications);
+        let answered = self.http.send(Some(id), &bytes, bound, &headers, |n| {
+            queue_as_handler(&queue, &n);
+        });
+        let answer = match answered {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Err(McpError::Transport(format!(
+                    "mcp server '{}': {method}: no answer",
+                    self.name
+                )));
+            }
+            Err(e) if self.http.session_lost() => {
+                return Err(McpError::SessionExpired(format!(
+                    "mcp server '{}': {method}: {e}",
+                    self.name
+                )));
+            }
+            Err(e) => {
+                return Err(McpError::Transport(format!(
+                    "mcp server '{}': {method}: {e}",
+                    self.name
+                )));
+            }
+        };
+        if let Some(error) = answer.get("error") {
+            return match serde_json::from_value::<rpc::RpcError>(error.clone()) {
+                Ok(e) => Ok(Err(e)),
+                Err(e) => Err(McpError::Transport(format!(
+                    "mcp server '{}': {method}: an error answer that is not JSON-RPC's: {e}",
+                    self.name
+                ))),
+            };
+        }
+        let result = answer.get("result").cloned().unwrap_or(Value::Null);
+        match result.get("resultType").and_then(Value::as_str) {
+            None | Some("complete") => Ok(Ok(result)),
+            Some(other) => Err(McpError::Transport(format!(
+                "mcp server '{}': {method}: resultType {other:?} is not one this request can follow",
+                self.name
+            ))),
+        }
     }
 
     /// Has the server forgotten this connection's session? Once it has, every

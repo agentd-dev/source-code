@@ -514,9 +514,10 @@ Per-server auth/framing headers (e.g. `Authorization: Bearer {{secret:…}}`) ar
 declared secret-free in the config file's `mcp.servers[].headers` and resolved at
 connect time (§12), never inlined in the spec or logged. Richer per-server
 options — `auth`, `oauth`, `aauth`, `ns`, `timeout`, `tags` — are file/path only. The headers the MCP client sets itself — `MCP-Protocol-Version`,
-`Mcp-Method`, `Mcp-Name` and every `Mcp-Param-*` — are refused at load, on
-`mcp.servers[].headers` and `services.<name>.headers` alike: a copy would go
-out beside the client's own, and a 2026-07-28 server refuses the duplicate.
+`Mcp-Method`, `Mcp-Name`, every `Mcp-Param-*`, `Mcp-Session-Id` and
+`Last-Event-ID` — are refused at load, on `mcp.servers[].headers` and an MCP
+service's `services.<name>.headers` alike: a copy would go out beside the
+client's own, and a server refuses the duplicate.
 
 A spec without `=` fails with `--mcp: want name=endpoint (got: …)`; an empty name
 is `mcp.servers[]: a server has an empty name`; a repeated name is

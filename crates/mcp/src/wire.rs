@@ -52,6 +52,12 @@ pub fn is_protocol_header(name: &str) -> bool {
 /// Method + notification names. Constants, so a typo is a compile error rather
 /// than a `-32601` at runtime.
 pub mod method {
+    /// The first request of MCP 2026-07-28, in place of `initialize`.
+    pub const SERVER_DISCOVER: &str = "server/discover";
+    /// MCP 2026-07-28's one stream of server notifications per connection.
+    pub const SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
+    /// A listen's acknowledgment: the filter the server took.
+    pub const NOTIFY_SUBSCRIPTIONS_ACKNOWLEDGED: &str = "notifications/subscriptions/acknowledged";
     pub const INITIALIZE: &str = "initialize";
     pub const INITIALIZED: &str = "notifications/initialized";
     pub const PING: &str = "ping";

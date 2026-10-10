@@ -45,7 +45,10 @@ agent:
         # publisher's key set, revoked keys and revoked versions refuse, and the
         # fold runs under grant ∩ ceiling ∩ author-attested capabilities. An
         # unsigned read then refuses at startup — fail closed, never a downgrade.
-        publisher: "https://instruction.md/pub/agentd-dev"
+        # The dev registry signs agentd-dev's documents as its personal
+        # organisation, `u-62ccd39904`; a pin on any other publisher refuses
+        # every read (exit 6, "author claims publisher …").
+        publisher: "https://instruction.md/pub/u-62ccd39904"
         # Author keys: file paths (raw/hex/base64url Ed25519), or JWKS uris like
         # "instruction://pub/<owner>/keys.json" read from the serving registry;
         # EMPTY = discover from the read's own publisherKeys pointer.

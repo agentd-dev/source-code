@@ -3,10 +3,11 @@
 //!
 //! A blocking facade over the official `rmcp` SDK ([`client`], [`rmcp_client`]),
 //! run over agentd's own credentialed Streamable-HTTP socket ([`http`],
-//! [`rmcp_transport`]): the SDK owns the protocol — the handshake, the version
-//! negotiation, the typed requests and notifications — and agentd keeps the
-//! connection, so a request signer and an mTLS client identity apply to every
-//! dial. [`wire`] holds agentd's own view of the message types,
+//! [`rmcp_transport`]): the SDK owns the protocol — both lifecycles (MCP
+//! 2026-07-28's `server/discover` and 2025-11-25's `initialize`), the typed
+//! requests and notifications — while agentd chooses which lifecycle a
+//! connection starts with and when to fall back, and keeps the connection, so
+//! a request signer and an mTLS client identity apply to every dial. [`wire`] holds agentd's own view of the message types,
 //! [`inbound`] the host seam for server→client elicitation, and [`rpc`] the
 //! JSON-RPC codec agentd's other channels share.
 //!

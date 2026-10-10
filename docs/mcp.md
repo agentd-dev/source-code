@@ -75,70 +75,118 @@ mcp:
     - { name: http, endpoint: https://mcp-http.internal/mcp, ns: web, timeout: 30s }
 ```
 
-### 1.3 The handshake and capability negotiation
+### 1.3 Connecting: discover, or the handshake
 
-On connect, before anything else, agentd runs the MCP lifecycle. It pins
-`protocolVersion: "2025-11-25"` and declares client capabilities sparingly. The
-handshake below is a **supervisor** boot connection — the one the process dials
-while assembling the tool catalogue at startup and again on reload — and it
-declares none at all:
+A connection starts with `server/discover`, the first request of MCP
+**2026-07-28** — a revision with no handshake and no session, where every
+request carries what the handshake used to agree once. The probe below is a
+**supervisor** boot connection (the one the process dials while assembling the
+tool catalogue at startup and again on reload), which declares no client
+capability:
 
 ```jsonc
-// agentd → server
-{ "jsonrpc":"2.0","id":1,"method":"initialize","params":{
-    "protocolVersion":"2025-11-25",
-    "capabilities":{},                                    // a boot connection declares none
-    "clientInfo":{"name":"agentd","version":"1.17.0",
-                  "title":"<instance>"}                   // build version; title = the instance name
-}}
+// agentd → server   (headers: MCP-Protocol-Version: 2026-07-28,
+//                    Mcp-Method: server/discover, no Mcp-Session-Id)
+{ "jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":{
+    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+    "io.modelcontextprotocol/clientInfo":{"name":"agentd","version":"1.17.0",
+                                          "title":"<instance>"},  // title = the instance name
+    "io.modelcontextprotocol/clientCapabilities":{}              // a boot connection declares none
+}}}
 // server → agentd
-{ "jsonrpc":"2.0","id":1,"result":{
-    "protocolVersion":"2025-11-25",
+{ "jsonrpc":"2.0","id":0,"result":{
+    "resultType":"complete",
+    "supportedVersions":["2026-07-28"],
     "capabilities":{
       "resources":{"subscribe":true,"listChanged":true},
       "tools":{"listChanged":true}
     },
-    "serverInfo":{"name":"mcp-server-fs","version":"…"},
-    "instructions":"…"                                   // optional; folded into the prompt
+    "ttlMs":0, "cacheScope":"private",
+    "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"mcp-server-fs","version":"…"}}
+}}
+```
+
+rmcp requires `resultType`, `ttlMs` and `cacheScope`; a server that leaves them
+out is not refused for it — agentd reads an absent `ttlMs` as `0`, as the
+caching rules say, an absent `cacheScope` as `private` and an absent
+`resultType` as `complete`. An `instructions` member is not read. From here on
+every request carries the same three `_meta` keys and the standard headers
+(`MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` on a call, a read or a
+prompt), and none carries a session.
+
+**A server that predates discover** is reached through the `initialize`
+handshake of **2025-11-25**, which is what every older server answers:
+
+```jsonc
+// agentd → server   (no MCP-Protocol-Version on this one request)
+{ "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+    "protocolVersion":"2025-11-25",
+    "capabilities":{},
+    "clientInfo":{"name":"agentd","version":"1.17.0","title":"<instance>"}
+}}
+// server → agentd   (header: Mcp-Session-Id: <session>)
+{ "jsonrpc":"2.0","id":1,"result":{
+    "protocolVersion":"2025-11-25",
+    "capabilities":{"resources":{"subscribe":true,"listChanged":true},"tools":{"listChanged":true}},
+    "serverInfo":{"name":"mcp-server-fs","version":"…"}
 }}
 // agentd → server
 { "jsonrpc":"2.0","method":"notifications/initialized" }
 ```
 
-A connection the **agent loop** holds — a turn worker's or a subagent's — sends
-`"capabilities":{"elicitation":{}}` instead, and no `title`: the workload label
-is stamped once, in the supervisor process, and the spawn payload that re-execs
-a child carries no instance name, so a child's `clientInfo.title` is absent.
+What a refused probe means is decided by the refusal, and the rule is broad on
+purpose — every server that answers `initialize` today must keep being reached:
+
+| The probe got | agentd |
+|---|---|
+| a `-32022` whose `data.supported` names `2026-07-28` | asks again at that revision (rmcp) |
+| a `-32022`, or a DiscoverResult, listing only older revisions | sends `initialize` offering the newest of them it knows |
+| a `-32020` or `-32021` (a modern server refusing agentd's own request), a `401` (its challenge is what `agentd login` follows), a server never reached, or a list with nothing agentd can offer | fails the connect, naming the refusal |
+| anything else — a `-32601` in any frame or status, a `403` (a proxy that allow-lists methods), a `4xx` or `5xx` with or without a JSON-RPC body, `{}`, a `202`, silence until the connection's timeout | sends `initialize` offering `2025-11-25` |
+
+The probe is bounded like every request, by the connection's timeout — not by
+rmcp's own fixed 10s, which would cut off a slow server that `initialize`
+reaches. A fallback that is refused too names both refusals; no request goes
+out twice. A re-dial, and a turn worker's or subagent's dial, start the way the
+connection they follow reached the server — a server reached through the
+handshake costs them no probe — and a server that has since dropped
+`initialize` is re-probed when it refuses it.
+
+A connection the **agent loop** holds — a turn worker's or a subagent's —
+declares `"elicitation":{}` instead (in `clientCapabilities` on 2026-07-28, in
+`capabilities` on the handshake), and no `title`: the workload label is stamped
+once, in the supervisor process, and the spawn payload that re-execs a child
+carries no instance name.
 
 Why so nearly empty? You only declare a *client* capability when you intend to
 *service* it, and agentd services one: `elicitation`. A server's
 `elicitation/create` becomes an `ask_human` gate — the question is rendered in
 every attached display client, the answer is shaped against the server's
 `requestedSchema`, and an answer that cannot be made to conform, or that nobody
-gives within 300s, comes back to the server as `cancel`. It offers no `roots`,
-`sampling` or `tasks`. That is the minimal interop posture and the smallest
-injection surface, and it is self-enforcing on the wire: apart from
-elicitation, agentd reads **notifications** off the server→client stream and
-nothing else. Any other server→client *request* has no declared capability
-behind it, so it is dropped rather than answered — there is no `roots/list` to
-leak a filesystem scope and no `sampling/createMessage` to turn the agent's
-model into someone else's.
+gives within 300s, comes back to the server as `cancel`. At 2026-07-28 the
+question arrives inside the tool call (`input_required`), and the call is made
+again with the answer. agentd offers no `roots`, `sampling` or `tasks`. That is
+the minimal interop posture and the smallest injection surface, and it is
+self-enforcing on the wire: apart from elicitation, agentd reads
+**notifications** off the server and nothing else. Any other server→client
+*request* has no declared capability behind it, so it is dropped rather than
+answered — there is no `roots/list` to leak a filesystem scope and no
+`sampling/createMessage` to turn the agent's model into someone else's.
 
-**Version negotiation.** agentd offers `2025-11-25` and accepts a downgrade to
-`2025-06-18`, `2025-03-26`, or `2024-11-05` where the feature use overlaps
-(e.g. structured tool output requires ≥ `2025-06-18`). A version it cannot speak,
-or a handshake that doesn't finish inside that server's request timeout
-(`mcp.servers[].timeout`, else `mcp.default_timeout`, default **60s**), is a
-connect failure. The negotiated capability set then belongs to that connection
-(a re-dial after a lost session, below, negotiates afresh) and gates the calls
-whose silence would pass for success: agentd never subscribes — neither
-`resources/subscribe` nor a URI in a `subscriptions/listen` filter — on a server
-that didn't advertise `resources.subscribe`. That is a loud failure, never a
-watch that silently never fires: a `subscribe` start logs
-`start.subscribe.unsupported` at error level, a `wait {on: resource}` step fails
-with the missing capability named, and a resource instruction logs
-`instruction.subscribe.unsupported` once, when it is first read from that
-server, and is followed by its `refresh` re-read alone.
+**Capabilities.** Whichever answer reached the server — the DiscoverResult or
+the `initialize` result — its capabilities belong to that connection (a re-dial
+after a lost session negotiates afresh), kept exactly as the server sent them
+(`McpClient::capability(name)` returns any member, extensions included). They
+gate the calls whose silence would pass for success: agentd never subscribes —
+neither `resources/subscribe` nor a URI in a `subscriptions/listen` filter — on
+a server that didn't advertise `resources.subscribe`, and it does not ask for
+prompts or completions a server did not offer. A missing subscribe capability
+is a loud failure, never a watch that silently never fires: a `subscribe`
+start logs `start.subscribe.unsupported` at error level, a
+`wait {on: resource}` step fails with the missing capability named, and a
+resource instruction logs `instruction.subscribe.unsupported` once, when it is
+first read from that server, and is followed by its `refresh` re-read alone.
+`mcp.connect` logs the revision the connection negotiated as `protocol`.
 
 A server that fails its handshake is logged (`mcp.connect.fail`) and simply
 omitted from the catalogue — its tools are unavailable, the rest of the run goes
@@ -245,10 +293,11 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
 2. Subscriptions are (re-)armed whenever the workflow that owns them is armed —
    at startup, and again after a config reload — so a restart restores every
    watched URI — the starts', the suspended `wait {on: resource}` steps' and
-   the resource instruction's. Underneath, the notification stream reconnects
-   on its own after a transient drop; a server with no push channel at all
-   leaves the client pull-only rather than failing. A URI counts as subscribed
-   only once the server accepted it — at a stateless revision, only once the
+   the resource instruction's. Underneath, a handshake connection's
+   notification stream (its `GET`) reconnects on its own after a transient
+   drop; a server with no push channel at all leaves the client pull-only
+   rather than failing. A URI counts as subscribed only once the server
+   accepted it — on a 2026-07-28 connection, only once the
    listen's acknowledgment names it, since a server may take a narrower filter
    than it was asked for — so a subscribe that failed is sent again on the next
    try, and adding a URI sends that URI alone. A subscribe agentd makes from
@@ -276,9 +325,11 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
    that loses each new session right after the handshake (one that answers the
    notification stream's `GET` with `404`, where the spec says `405`) is
    re-dialed on the same growing wait, settling to once every 30s. Calls made
-   on the lost session in the meantime fail as `session expired`. Sessions
-   exist up to `2025-11-25`; the stateless revisions have none.
-4. **At a stateless revision** the subscriptions ride one
+   on the lost session in the meantime fail as `session expired`. Sessions,
+   and this re-dial, belong to connections reached through `initialize`; a
+   2026-07-28 connection has none, and its server's restart shows as
+   `mcp.listen.ended` then `mcp.listen.resumed`, never `session_lost`.
+4. **On a 2026-07-28 connection** the subscriptions ride one
    `subscriptions/listen` stream per connection. When it ends — the server
    closed or completed it, or the client fell behind — agentd logs
    `mcp.listen.ended` (with the reason and the wait) and listens again with the
@@ -309,9 +360,11 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
    `resources` `listChanged` holds a listen for them from the moment it
    connects, even with no URI subscribed. It is opened in the background:
    a server that refuses it, fails it or is slow to answer never fails or
-   delays the connection. A refusal is logged once, `mcp.listen.unavailable`,
-   and the listen is asked for again on the same backoff until it is held
-   (`mcp.listen.resumed`). A server that advertises a `listChanged` but
+   delays the connection. A failure (a `5xx`, a dropped stream, no answer) is
+   logged once, `mcp.listen.unavailable`, and the listen is asked for again on
+   the same backoff until it is held (`mcp.listen.resumed`); a JSON-RPC refusal
+   of the filter is logged once and not asked for again, and the connection
+   works without its `list_changed`. A server that advertises a `listChanged` but
    refuses that flag in a filter keeps its URI subscriptions: the listen is
    asked for once more without the flags, and the connection stops asking
    for them (`mcp.listen.flags_refused`).
@@ -320,9 +373,10 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
 
 | Trigger | Capability needed | Subscribe call | Notification | Payload |
 |---|---|---|---|---|
-| a specific item changed | `resources.subscribe` | `resources/subscribe{uri}` per URI | `notifications/resources/updated` | `{uri}` (+ optional `title`) |
-| the *set* of resources changed | `resources.listChanged` | none (capability-implied) | `notifications/resources/list_changed` | none |
-| the *set* of tools changed | `tools.listChanged` | none | `notifications/tools/list_changed` | none |
+| a specific item changed (2025-11-25) | `resources.subscribe` | `resources/subscribe{uri}` per URI | `notifications/resources/updated` | `{uri}` (+ optional `title`) |
+| a specific item changed (2026-07-28) | `resources.subscribe` | the URI in the connection's one `subscriptions/listen` filter | `notifications/resources/updated` | `{uri}` |
+| the *set* of resources changed | `resources.listChanged` | none at 2025-11-25; the `resourcesListChanged` flag in the listen at 2026-07-28 | `notifications/resources/list_changed` | none |
+| the *set* of tools changed | `tools.listChanged` | none at 2025-11-25; the `toolsListChanged` flag in the listen at 2026-07-28 | `notifications/tools/list_changed` | none |
 
 You wire a subscription to a run with a **`subscribe` start node** in a workflow:
 
@@ -343,9 +397,10 @@ The runtime issues `resources/subscribe` for the URI, then idles and fires a run
 on each update (notify-then-read).
 
 > **Reactivity rides Streamable HTTP.** Subscriptions are `resources/subscribe`
-> against the owning MCP server (a `subscriptions/listen` filter at a stateless
-> revision); the client holds the SSE stream open and processes pushed
-> `notifications/resources/updated` (notify-then-read).
+> against the owning MCP server on a handshake connection, and a
+> `subscriptions/listen` filter on a 2026-07-28 one; the client holds the SSE
+> stream open and processes pushed `notifications/resources/updated`
+> (notify-then-read).
 
 ### 1.7 Liveness and lifecycle
 
@@ -367,8 +422,8 @@ worker or a subagent dials take a fixed **60s**: the spawn payload carries no
 per-server timeout, so neither reaches the child. Either way a wedged server
 cannot hang the loop: the call fails, the failure becomes an observation, and
 the run carries on. A call abandoned at its bound holds up no other call on
-the same connection. Its `ping` method is available as an explicit liveness
-round-trip.
+the same connection; it is not hung up either, and runs on until the server
+answers, its socket's timeout fires, or the client closes.
 
 Because agentd spawns no process for an MCP server, there is no child to signal
 or reap — closing the HTTP connection *is* the shutdown. The notification thread
@@ -407,20 +462,50 @@ and every server keeps its credentials. An MCP endpoint is operator-configured,
 so it is dialled directly; the SSRF guard is for addresses a peer or the model
 supplies — push callbacks, the `http` node, an AAuth person server.
 
-### Which revision agentd speaks
+### Revisions
 
-A connection starts with `server/discover`, offering `2026-07-28`, the
-revision without a handshake or a session. A server that predates it refuses
-the probe — in whichever shape (a `-32601`, a `4xx` or `5xx`, `{}`, a `202`,
-silence) — and is reached through the `initialize` handshake offering
-`2025-11-25`, or the newest older revision it lists. What cannot be helped by
-a handshake is said instead of retried: a `401` (its challenge is what
-`agentd login` follows), a modern server refusing agentd's own request
-(`-32020`/`-32021`), a server that was never reached. A re-dial, and a turn
-worker's dial, start the way the connection they follow was reached. The
-subscription mechanism follows the revision negotiated: `resources/subscribe`
-up to `2025-11-25`, `subscriptions/listen` from `2026-07-28` on. `mcp.connect`
-logs the revision as `protocol`.
+agentd speaks two MCP revisions and picks per server: it probes with
+`server/discover` (2026-07-28) and falls back to the `initialize` handshake
+(2025-11-25, or the newest older revision a server lists), as §1.3 sets out.
+The fallback is agentd's own, not rmcp's `ClientLifecycleMode::Auto`: Auto
+gives the probe a fixed 10s — over agentd's socket a later answer then fails
+the connect instead of falling back — and it gives up on a server that lists
+only older revisions.
+
+| | 2026-07-28 (`server/discover`) | 2025-11-25 (`initialize`) |
+|---|---|---|
+| first request | `server/discover` | `initialize`, then `notifications/initialized` |
+| session | none | `Mcp-Session-Id` from the `initialize` answer, echoed on every request; a lost one is re-dialed |
+| server push | the `subscriptions/listen` stream only | a `GET` event stream |
+| per-request `_meta` | `protocolVersion`, `clientInfo`, `clientCapabilities` on every request | none (agreed once in the handshake) |
+| headers | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` on a call/read/prompt, `Mcp-Param-*` for annotated tool arguments | `MCP-Protocol-Version` |
+| tool headers | the connection lists its tools once when it connects, so every call — a turn worker's too — carries its `Mcp-Param-*` headers | — |
+| resource subscriptions | one listen, its filter widened and narrowed | `resources/subscribe` / `resources/unsubscribe` per URI |
+| `list_changed` | a listen that asks for it, held from connect | on the `GET` stream |
+| cancellation | closing the request's stream (a replaced listen is hung up); a call abandoned at its bound is not, and runs until the server answers or the socket's timeout | `notifications/cancelled` |
+| server→client requests | inside the call (`input_required`), answered and called again | requests on the stream, answered |
+| response cache | off | off |
+
+The headers the client sets itself — `MCP-Protocol-Version`, `Mcp-Method`,
+`Mcp-Name`, every `Mcp-Param-*`, `Mcp-Session-Id` and `Last-Event-ID` — are
+refused in `mcp.servers[].headers` and an MCP service's `headers` at load: a
+copy would go out beside the client's own.
+
+**Known limits.**
+
+- A dial that probes a server that predates discover costs one extra POST. A
+  re-dial and a worker's dial start the way the server was reached, and do
+  not.
+- agentd's answers to a server's requests (an elicitation) are bounded at 5s
+  by rmcp.
+- A `resources/read` that answers `input_required` fails.
+- At 2026-07-28 rmcp drops, without a word, a tool whose `x-mcp-header`
+  annotation it rejects (a nested one, for instance); agentd logs each as
+  `mcp.tool.dropped`.
+- A server that changes revision is re-probed only when it refuses
+  `initialize`, or when a reload dials it afresh.
+- A server that answers the probe only after the connection's timeout is
+  reached through `initialize` after that wait.
 
 ### What agentd still owns
 

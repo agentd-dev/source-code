@@ -27,6 +27,78 @@ existing version-1 documents change too, and the entries below list each one.
 agentd-instruction 0.3.0 carries this work. Its API is breaking (see Crates),
 and it is not yet published.
 
+And agentd speaks MCP 2026-07-28 (RFC 0045's P1): every connection starts
+with `server/discover`, the revision with no handshake and no session, and a
+server that predates it is reached through the 2025-11-25 `initialize`
+handshake as before. Moving there took more than a dependency bump: rmcp
+3.5.0, agentd's own fallback (rmcp's would have cut off slow servers and
+servers pinned to an older revision), and a 2026-07-28 connection that keeps
+working the way a handshake connection did — its listens are not cut when
+quiet, an update lost while one re-opened is recovered by a re-read, tool
+changes still arrive, and every tool call, a turn worker's included, carries
+the headers its tool requires. It was checked live against the official
+TypeScript and Python SDK servers and the instruction.md dev gateway before
+the switch landed.
+
+### MCP 2026-07-28 (RFC 0045 P1)
+
+**Changed (breaking).**
+
+- **Every MCP connection starts with `server/discover`.** A 2026-07-28
+  server is reached with it alone; an older one refuses it and is reached
+  through `initialize` offering 2025-11-25 (or the newest older revision it
+  lists). The refusal decides: a `-32020`/`-32021`, a `401`, an unreachable
+  server or nothing in common fail the connect; anything else — a `-32601`
+  in any frame or status, a `403`, a `4xx`/`5xx`, `{}`, a `202`, silence
+  until the connection's timeout — falls back. A fallback refused too names
+  both refusals. A re-dial, and a turn worker's or subagent's dial, start
+  the way the server was reached.
+- **Headers the MCP client sets itself are refused at load**
+  (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`,
+  `Mcp-Session-Id`, `Last-Event-ID`) on `mcp.servers[].headers` and an MCP
+  service's headers: a copy went out beside the client's own.
+- **agentd-mcp's socket hands back the server's answer:** a JSON-RPC 2.0
+  error in a non-2xx body (`401`/`403` excepted) or in an event-stream frame
+  with no usable id is the request's answer; a session is adopted only from an
+  `initialize` that succeeded. `ListenEvent::Ended` carries `idle`, and
+  `ListenEvent` gains `Unavailable` and `FlagsRefused`.
+
+**Added.**
+
+- 2026-07-28-only servers are reachable, and `mcp.connect` says which
+  revision a connection negotiated (`protocol`).
+- On a 2026-07-28 connection: a listen stream has its own idle bound (10
+  minutes, never below the timeout) and an idle cut is said at info; after
+  every re-listen the URIs it holds are read again and a changed one is woken
+  once (state converges; a URI is never woken on suspicion); a listen for the
+  server's advertised `list_changed` notifications is held from connect, so
+  `mcp.tools_changed` and a warm subagent's tool refresh keep working
+  (`mcp.listen.unavailable` once when the server will not hold it); the
+  connection lists its tools once at connect, so every call carries its
+  `Mcp-Param-*` headers.
+- `mcp.tool.dropped`: a tool rmcp drops for an `x-mcp-header` annotation it
+  rejects is logged, once per tool per connection.
+- agentd-mcp: `FirstRequest` and `start_with`, `first_request()`,
+  `capability(name)` (any capability member as the server sent it),
+  `drain_dropped_tools()`, `with_listen_idle`, `wire::DISCOVER_PROTOCOL_VERSION`,
+  `wire::PROTOCOL_HEADERS`/`is_protocol_header`, and the
+  `server/discover`/`subscriptions/listen` method names.
+
+**Fixed.**
+
+- A server's own refusal reaches the operator — "Unsupported protocol
+  version (-32022)", not "HTTP 400" — and a refused `initialize` names it.
+- A response stream the SDK drops hangs up its HTTP connection, which at
+  2026-07-28 is the request's cancellation; a replaced listen no longer holds
+  its connection and the server's subscription until the socket times out.
+- `agentd login`'s RFC 9728 probe finds the challenge whichever check a server
+  makes first: a bare `initialize`, then, only after an answer without a
+  challenge, a `server/discover` with the standard headers.
+
+**Changed with rmcp 3.5.** Up to 16 POSTs in flight per connection (3.1
+sent one at a time); agentd's answers to a server's requests are bounded at
+5s; an elicitation's `$schema` and property order are kept.
+
 ### Security (breaking)
 
 - **A stream carries the taint of what feeds it, and a workflow that reads
@@ -247,9 +319,8 @@ and it is not yet published.
   which the pump dropped, wake it. A listen's acknowledgment is checked: a
   URI it leaves out is refused rather than recorded as watched, and a
   re-listen that comes back narrower is said (`mcp.listen.narrowed`) and
-  retried. This path serves MCP `2026-07-28` servers only, a revision agentd
-  does not negotiate yet (its `initialize` still offers `2025-11-25`), so
-  today only the tests reach it.
+  retried. This path serves MCP `2026-07-28` connections (see the P1
+  section above).
 - **`resources/subscribe` needs the server's capability.** It was sent
   whether or not the server advertised `resources.subscribe`, though the docs
   said it never was, so a server that ignored it left a start or a wait
@@ -609,7 +680,10 @@ and it is not yet published.
 agentd-mcp has breaking API changes: `McpError::SessionExpired` is a new
 variant, and `capabilities()` and `protocol_version()` return owned values,
 because the negotiated state now belongs to the live connection, which a
-re-dial replaces.
+re-dial replaces. It now needs rmcp ^3.5, connects discover-first (see the
+P1 section), and `HttpTransport::send` returns a non-2xx JSON-RPC error body
+as the response. Its version is decided when it is published; nothing is
+published yet.
 
 agentd-instruction 0.3.0 re-vendors Instruction Specification 345f275
 (registry revision 1.1); CI pins that revision. The schema and the whole

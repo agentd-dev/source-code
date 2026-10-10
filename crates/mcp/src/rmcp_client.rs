@@ -19,7 +19,7 @@
 //! (`discover_lifecycle`); an older one with the `initialize` handshake, which
 //! offers `INITIALIZE_OFFER` — rmcp's `LATEST_WITH_INITIALIZE`, the newest
 //! revision that still has an `initialize` — or the newest older one a server
-//! lists. [`FirstRequest`] says which goes first, and [`classify`] decides
+//! lists. [`FirstRequest`] says which goes first, and `classify` decides
 //! when a refusal means the other era. Both pins are named in exactly one
 //! place each, and a test holds them to rmcp's constants. Everything
 //! version-dependent here (notably [`RmcpClient::subscribe`]) branches on the

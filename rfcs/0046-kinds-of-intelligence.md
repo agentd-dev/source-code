@@ -327,10 +327,12 @@ Two loop-level uses of a decision model are left for after measurement (§11 Q3)
 
 ## 11. Phases and open questions
 
-**P1 — providers, kinds, roles.** Config, resolution, per-provider clients, roles wired into every call site, the three replaced keys removed, kind checks. Only `chat` behaviour; nothing changes for an unchanged config.
-**P2 — decide.** The contract, `dialect: decisions`, emulation, `classify`/`route`/`judge` native, the `decide` node and tool, `confidence`/`on_unsure`/`escalate`, the decision mock.
-**P3 — decisions in the loop.** The preflight, goal and approve roles on decision models; §8's untrusted-input rule for every approver.
-**P4 — reasoning.** `effort`, the per-dialect mapping, reasoning parts across tool rounds, `think` on `roles.think`.
+Each phase brings a field together with what it does — no key is accepted before it has an effect.
+
+**P1 — providers and roles.** `intelligence.providers`, `provider` on models, `intelligence.roles` (model names), resolution, per-provider clients, every call site through its role (including the goal check and the ask judge, which had none), the three replaced keys removed, the document check. Chat models only; nothing changes for an unchanged config.
+**P2 — decide.** `kind` (`chat`, `decision`), `escalate`, the contract, `dialect: decisions`, emulation, `classify`/`route`/`judge` native, the `decide` node and tool, `confidence`/`on_unsure`, kind checks per role and node, the decision mock.
+**P3 — decisions in the loop.** Role bindings with `confidence`; the preflight, goal and approve roles on decision models; §8's untrusted-input rule for every approver.
+**P4 — reasoning.** `kind: reasoning`, `reasoning: {effort, budget}`, `effort` on nodes and `think`, the per-dialect mapping, reasoning parts across tool rounds.
 
 Decided by the user, 2026-10-10:
 

@@ -1,0 +1,66 @@
+name: publish-crate
+
+# Publish one library crate to crates.io by hand, on its own schedule — for a
+# crate other projects consume between agentd releases (agentd-instruction,
+# which the instruction.md platform builds on), without cutting an agentd tag.
+#
+#   gh workflow run publish-crate.yml -f crate=agentd-instruction
+#
+# The release workflow still publishes every crate a tag moves; agentd-core and
+# agentd-cli are not offered here, because their version IS the tag's. A
+# version already on the index is left alone, so running this twice is safe.
+# The crate is tested as it will be built before the one irreversible step.
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "The crate to publish"
+        required: true
+        type: choice
+        options: [agentd-instruction, agentd-net, agentd-mcp]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CRATE: ${{ inputs.crate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test it, every feature on
+        run: cargo test -p "$CRATE" --all-features --locked --no-fail-fast
+
+      - name: publish unless that version is already on crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          v=$(cargo metadata --no-deps --format-version 1 \
+                | jq -r ".packages[] | select(.name==\"$CRATE\") | .version")
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                   -H 'user-agent: agentd-release (agent@agentd.dev)' \
+                   "https://crates.io/api/v1/crates/$CRATE/$v")
+          if [ "$code" = "200" ]; then
+            echo "$CRATE $v is already on crates.io — nothing to publish"
+            exit 0
+          fi
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set"
+            exit 1
+          fi
+          echo "publishing $CRATE $v"
+          cargo publish -p "$CRATE" --locked
+          for _ in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                     -H 'user-agent: agentd-release (agent@agentd.dev)' \
+                     "https://crates.io/api/v1/crates/$CRATE/$v")
+            if [ "$code" = "200" ]; then echo "$CRATE $v is on crates.io"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::$CRATE $v never appeared on the index"
+          exit 1

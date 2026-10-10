@@ -798,6 +798,11 @@ impl Runtime {
             | "workflow.pause" | "workflow.resume" | "workflow.signal" => {
                 self.workflow_tool(caller, name, args)
             }
+            // ---- MCP Events (RFC 0045 §5.15) ----
+            #[cfg(feature = "mcp-events")]
+            "events.list" | "events.subscribe" | "events.unsubscribe" | "events.subscriptions" => {
+                self.events_tool(caller, name, args)
+            }
             // ---- guarded local command runner (default-OFF) ----
             #[cfg(feature = "exec")]
             "exec" => self.exec_tool(caller, args),

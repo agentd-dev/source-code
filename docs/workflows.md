@@ -614,6 +614,32 @@ event that predates the run would let the step succeed on work nobody had asked
 for, under an idempotency key covering a different world. Durable offsets
 belong to consumers.
 
+**A wait that subscribes** (MCP Events, [`mcp.md`](mcp.md) §1.8) makes its own
+subscription to an upstream event type, inside an operator's `event_grants`
+entry, and waits on it alone:
+
+```yaml
+      merged:
+        kind: wait
+        on: event
+        subscribe:
+          server: github
+          event: pull_request.closed
+          arguments: {number: "{{ inputs.pr }}"}   # rendered at dispatch
+        match: "event.data.payload.merged == true"
+        timeout: 2d
+```
+
+`stream` and `subject` come from the grant. The subscription starts from now
+when the wait suspends, the wait wakes only on that subscription's occurrences
+(`event.data.subscription`), and it is let go when the step leaves the wait. A
+`subscribe` naming a server and event type no grant covers is refused at load,
+on reload and for a stored definition. An occurrence reaches the stream up to a
+poll interval after it happened — so **check, then wait**: read the current
+state with a tool first (has the pull request merged already?), and wait only
+for what comes after. A join that must never miss belongs to a `stream` start
+or `correlate`, which keep durable offsets.
+
 ```yaml
       approve:
         kind: human

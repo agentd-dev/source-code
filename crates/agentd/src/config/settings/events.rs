@@ -240,6 +240,59 @@ fn check_leases(
     }
 }
 
+/// The waits of `w` that subscribe under no grant: each names a server and an
+/// event type with no `event_grants` entry. Checked wherever a definition is
+/// — load, reload, a stored one, `workflow.create`/`update` — so a document
+/// or the agent can use only what the operator granted (RFC 0045 §5.15).
+pub(crate) fn subscribe_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Vec<String> {
+    use crate::engine::model::Step;
+    // Every step, nested bodies included: a wait inside a loop or a branch
+    // subscribes like one at the top.
+    fn walk<'a>(steps: impl Iterator<Item = &'a Step>, out: &mut Vec<&'a Step>) {
+        for st in steps {
+            out.push(st);
+            for body in st.body.iter().chain(st.branches.values()) {
+                walk(body.steps.values(), out);
+            }
+        }
+    }
+    let mut steps = Vec::new();
+    walk(w.steps.values(), &mut steps);
+    let mut out = Vec::new();
+    for st in steps {
+        if st.kind != "wait" {
+            continue;
+        }
+        let Some(sub) = st.spec.get("subscribe") else {
+            continue;
+        };
+        let (Some(server), Some(event)) = (
+            sub.get("server").and_then(Value::as_str),
+            sub.get("event").and_then(Value::as_str),
+        ) else {
+            continue; // the model check names a missing one
+        };
+        let granted = s
+            .mcp
+            .servers
+            .iter()
+            .find(|x| x.name == server)
+            .is_some_and(|x| x.event_grants.iter().any(|g| g.name == event));
+        if !granted {
+            out.push(format!(
+                "workflow {:?} step {:?}: subscribes to {event:?} on mcp server {server:?}, which no `event_grants` entry grants — runtime subscriptions are made only inside an operator grant",
+                w.name, st.id
+            ));
+        } else if !cfg!(feature = "mcp-events") {
+            out.push(format!(
+                "workflow {:?} step {:?}: a wait that subscribes requires building with --features mcp-events",
+                w.name, st.id
+            ));
+        }
+    }
+    out
+}
+
 /// Every MCP Events check, collected into `d` (RFC 0045 §5.2, §5.15).
 pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     let declared: Vec<&super::McpServer> = s

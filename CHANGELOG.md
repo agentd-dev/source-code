@@ -40,6 +40,69 @@ the headers its tool requires. It was checked live against the official
 TypeScript and Python SDK servers and the instruction.md dev gateway before
 the switch landed.
 
+Then MCP Events itself (RFC 0045's P2, against SEP-3415 — a draft
+extension, defined for 2026-07-28 only): a server's event occurrences reach
+declared streams, polled, and everything downstream is what streams already
+do. Operators bind event types with fixed arguments; inside an operator's
+grant, a workflow's `wait` and the model (the `events.*` tools) subscribe at
+runtime. The feature ships in the release binaries and says at load that it
+tracks a draft.
+
+### MCP Events (RFC 0045 P2)
+
+**Added.**
+
+- `mcp.servers[].events` — a binding: one event type, fixed `arguments`,
+  `delivery` (the acceptable modes in preference order; `poll` in this
+  release), `into` (a declared stream and subject), `replay`, `rate`.
+  Polled on four threads of their own; each occurrence becomes one stream
+  event under a deterministic id, `mcp/<server>/<type>/<eventId>`, the
+  server's data under `data.payload`. The cursor never moves past an
+  occurrence that is not durably appended; a 35-minute dedup set and the id
+  make re-delivery harmless; `rate` holds whatever the server sends; a
+  `truncated` answer, a re-arm without replay and a schema changed in place
+  are `mcp.events.gap`.
+- `mcp.servers[].event_grants` — an event type runtime subscriptions may be
+  made for, with `fixed` arguments, `max` live subscriptions, a `lifetime`
+  and `tools`. A `wait {on: event, subscribe: {server, event, arguments}}`
+  subscribes from now, wakes only on its own subscription's occurrences and
+  lets go when it leaves the wait; with `tools: true`, the root and workflow
+  steps get `events.list`, `events.subscribe`, `events.unsubscribe` and
+  `events.subscriptions`. Runtime subscriptions survive a restart; every
+  subscribe and unsubscribe is logged and audited. A wait whose subscription
+  is refused, taken by a grant change or not kept across a restart fails,
+  saying why, instead of waiting for nothing; a reload or restart applies a
+  narrowed grant (`fixed`, `tools`, `lifetime`, `max`) to what is already
+  live; and the trifecta check reads a subscribing wait's grant stream.
+- Discovery at connect, in either capability spelling (SEP-3415's extension
+  key, or the sketch's top-level `events` some servers still send), only on
+  2026-07-28 connections; `events/list` paged and listed again every
+  15 minutes, or at once when the server says its list changed — asked for
+  on the standing listen with `eventsListChanged`, and taken off that stream
+  before rmcp, whose listen would end on it.
+- Every refusal is said once at error level with its reason
+  (`mcp.events.refused`: `revision`, `no_capability`, `method_not_found`,
+  `unknown_event`, `no_common_mode`, `invalid_arguments`, `forbidden`,
+  `not_supported`, `list_too_large`), and nothing is sent where nothing may
+  be. Anything that may pass backs off with jitter and keeps its cursor.
+- Metrics: `agent_mcp_events_total`, `agent_mcp_events_requests_total`,
+  `agent_mcp_event_gaps_total`, `agent_mcp_events_dedup_evicted_total`,
+  `agent_mcp_event_lag_ms`, and the `kind="event"` series of
+  `agent_subscriptions_active`; the bindings' counts in the status
+  `counters`.
+- A binding's or grant's stream carries its server's tags (untrusted when
+  untagged) into the load-time trifecta check. Bindings and grants are
+  operator-only: a served document or a subagent template declaring either
+  is refused.
+- The `mcp-events` feature, in the release set (and the image, `deny.toml`'s
+  graph and the CI matrix).
+- agentd-mcp: `McpClient::call_raw` (a request the SDK does not model, with
+  what the revision requires, bounded as a whole) and `with_listen_extension`
+  / `rmcp_transport::ListenExtension` (filter members and notifications an
+  extension adds to a connection's listen).
+- The built-in mock serves Events on its 2026-07-28 edge (`--events
+  extension|top-level|none`).
+
 ### MCP 2026-07-28 (RFC 0045 P1)
 
 **Changed (breaking).**

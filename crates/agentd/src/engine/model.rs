@@ -294,6 +294,7 @@ pub const KINDS: &[KindInfo] = &[
             "webhook",
             "stream",
             "subject",
+            "subscribe",
             "match",
             "timeout",
             "on_timeout",
@@ -2086,6 +2087,34 @@ fn parse_step(
                     "{at}: `on` is fixed by the definition — it decides what the wait opens \
                      or reads, which is checked at load — so it cannot be templated"
                 ));
+            }
+            // A wait that subscribes (RFC 0045 §5.15): the server and the
+            // event type are the definition's, since they decide which
+            // operator grant the subscription is made under — only the
+            // arguments render at dispatch — and the grant names the stream.
+            if kind == "wait"
+                && let Some(sub) = spec.get("subscribe")
+            {
+                if spec.get("on").and_then(Value::as_str) != Some("event") {
+                    errs.push(format!("{at}: `subscribe` belongs to `wait {{on: event}}`"));
+                }
+                if spec.get("stream").is_some() || spec.get("subject").is_some() {
+                    errs.push(format!(
+                        "{at}: a wait that subscribes reads the stream its grant names — drop `stream` and `subject`"
+                    ));
+                }
+                for field in ["server", "event"] {
+                    match sub.get(field).and_then(Value::as_str) {
+                        Some(v) if v.contains("{{") => errs.push(format!(
+                            "{at}: subscribe.{field} is fixed by the definition — it decides the operator grant, checked at load — so it cannot be templated"
+                        )),
+                        Some(v) if !v.trim().is_empty() => {}
+                        _ => errs.push(format!("{at}: subscribe.{field} is required")),
+                    }
+                }
+                if sub.get("arguments").is_some_and(|a| !a.is_object()) {
+                    errs.push(format!("{at}: subscribe.arguments must be an object"));
+                }
             }
             if spec.get("on").and_then(Value::as_str) == Some("webhook") {
                 check_hook_path(

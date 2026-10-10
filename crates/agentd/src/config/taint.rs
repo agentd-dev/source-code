@@ -449,19 +449,33 @@ fn templated(name: &str) -> bool {
 }
 
 /// The stream a step reads events from, as written: a `stream` or
-/// `correlate` start, or a `wait {on: event}`.
-fn read_stream(st: &Step) -> Option<&str> {
+/// `correlate` start, or a `wait {on: event}` — on the stream it names, or,
+/// when it subscribes (RFC 0045 §5.15), on the one its grant feeds.
+fn read_stream<'a>(st: &'a Step, s: &'a Settings) -> Option<&'a str> {
     match st.kind.as_str() {
         "stream" | "correlate" => st.field_str("stream"),
-        "wait" if st.field_str("on") == Some("event") => st.field_str("stream"),
+        "wait" if st.field_str("on") == Some("event") => match st.field("subscribe") {
+            Some(sub) => {
+                let server = sub.get("server").and_then(Value::as_str)?;
+                let event = sub.get("event").and_then(Value::as_str)?;
+                s.mcp
+                    .servers
+                    .iter()
+                    .filter(|srv| srv.name == server)
+                    .flat_map(|srv| &srv.event_grants)
+                    .find(|g| g.name == event)
+                    .map(|g| g.into.stream.as_str())
+            }
+            None => st.field_str("stream"),
+        },
         _ => None,
     }
 }
 
-/// The tainted streams a step reads events from. A templated name is any of
-/// them.
-fn consumes<'t>(st: &Step, streams: &'t BTreeMap<String, StreamTaint>) -> Vec<&'t str> {
-    let Some(name) = read_stream(st) else {
+/// The tainted streams a step reads events from ([`Edges::reads`]). A
+/// templated name is any of them.
+fn consumes<'t>(reads: Option<&str>, streams: &'t BTreeMap<String, StreamTaint>) -> Vec<&'t str> {
+    let Some(name) = reads else {
         return Vec::new();
     };
     streams
@@ -557,8 +571,8 @@ impl Propagation<'_> {
         self.edges
             .iter()
             .filter(|(_, steps)| {
-                steps.iter().any(|(st, _, _)| {
-                    read_stream(st).is_some_and(|n| {
+                steps.iter().any(|(_, _, e)| {
+                    e.reads.as_deref().is_some_and(|n| {
                         templated(n) || streams.iter().any(|s| s == n || templated(s))
                     })
                 })
@@ -740,8 +754,8 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
             }
         }
         for (w, steps) in edges.iter() {
-            for (st, _, e) in steps {
-                for name in consumes(st, streams) {
+            for (_, _, e) in steps {
+                for name in consumes(e.reads.as_deref(), streams) {
                     let (tags, origins) = (streams[name].tags.clone(), &streams[name].origins);
                     let run = runs.entry(w.name.clone()).or_default();
                     grew |= union(&mut run.tags, &tags);
@@ -885,6 +899,8 @@ type StepEdges<'w> = (&'w Step, String, Edges);
 /// to a child.
 #[derive(Debug, Default)]
 struct Edges {
+    /// The stream it reads events from ([`read_stream`]).
+    reads: Option<String>,
     held: Vec<Held>,
     started: Started,
     emits: BTreeSet<String>,
@@ -1451,6 +1467,7 @@ impl<'a> Reach<'a> {
     /// hold no tools; a deterministic `mcp.tool` or `http` step is not
     /// steered by the text it carries.
     fn step(&self, st: &Step, at: &str, e: &mut Edges) {
+        e.reads = read_stream(st, self.s).map(str::to_string);
         match st.kind.as_str() {
             "agent" => {
                 e.held.extend(self.listed_or_all(&st.spec));
@@ -1777,6 +1794,36 @@ mod tests {
         .unwrap();
         s.mcp.servers.push(feed);
         assert!(check(&s, &[consumer("inbox", &["mail"])]).is_empty());
+    }
+
+    #[test]
+    fn a_wait_that_subscribes_reads_its_grants_stream() {
+        // The wait names no stream: it reads the one its grant feeds, and a
+        // run that waits that way and then hands an agent a sensitive +
+        // egress server is refused like any other reader.
+        let mut s = servers(json!({}));
+        let feed: crate::config::settings::McpServer = serde_json::from_value(json!({
+            "name": "feed", "endpoint": "https://feed.invalid/mcp",
+            "event_grants": [{"name": "item.created", "delivery": ["poll"],
+                              "into": {"stream": "inbox", "subject": "item"}, "rate": "1/1s"}]
+        }))
+        .unwrap();
+        s.mcp.servers.push(feed);
+        let waiter = wf(json!({"name": "triage", "steps": {
+            "s": {"kind": "manual"},
+            "w": {"kind": "wait", "depends_on": ["s"], "on": "event",
+                  "subscribe": {"server": "feed", "event": "item.created"}},
+            "a": {"kind": "agent", "depends_on": ["w"], "instruction": "x",
+                  "servers": ["mail"], "tools": ["mail.*", "notes.*"]},
+            "f": {"kind": "finish", "depends_on": ["a"], "status": "completed"}
+        }}));
+        let errs = check(&s, &[waiter]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("MCP Events grant \"item.created\" on mcp server \"feed\""),
+            "{}",
+            errs[0]
+        );
     }
 
     #[test]

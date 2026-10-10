@@ -428,6 +428,54 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
 
+    // ---- MCP Events (RFC 0045 §5.15): offered only where an operator grant
+    // says `tools: true` (`registry::build`) ----
+    c(
+        "events.list",
+        "events",
+        "The MCP event types you may subscribe to: each one's server, description, arguments (inputSchema), payload, and the stream its occurrences land in.",
+        obj(json!({"server": s("Only this MCP server's types")}), &[]),
+        open_obj(json!({"types": arr(any())}), &["types"]),
+        true,
+        ROOT_WF,
+    );
+    c(
+        "events.subscribe",
+        "events",
+        "Subscribe to an MCP event type an operator grant offers, with arguments. Its occurrences are appended to the grant's stream (named in the answer), for the workflows that read it; the subscription lasts until you unsubscribe, the grant's lifetime passes, or your run ends.",
+        obj(
+            json!({"server": s("The MCP server"), "event": s("The event type, as events.list names it"), "arguments": {"type": "object", "description": "Subscription arguments, per the type's inputSchema"}}),
+            &["server", "event"],
+        ),
+        open_obj(
+            json!({"subscription": {"type": "string"}, "stream": {"type": "string"}, "subject": {"type": "string"}, "expires_at": {"type": "integer"}}),
+            &["subscription", "stream", "subject"],
+        ),
+        true,
+        ROOT_WF,
+    );
+    c(
+        "events.unsubscribe",
+        "events",
+        "Stop a subscription you made with events.subscribe.",
+        obj(
+            json!({"subscription": s("The subscription events.subscribe returned")}),
+            &["subscription"],
+        ),
+        open_obj(json!({"stopped": {"type": "boolean"}}), &["stopped"]),
+        true,
+        ROOT_WF,
+    );
+    c(
+        "events.subscriptions",
+        "events",
+        "The subscriptions you hold: each one's server, event type, arguments, stream and expiry.",
+        obj(json!({}), &[]),
+        open_obj(json!({"subscriptions": arr(any())}), &["subscriptions"]),
+        true,
+        ROOT_WF,
+    );
+
     // ---- workflows ----
     c(
         "workflow.run",

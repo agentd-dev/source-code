@@ -1,6 +1,6 @@
 # RFC 0045: MCP Events
 
-**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8), with the two follow-ups decided 2026-10-01 (a stored definition needs the `interface` grant to open a route; a tainted run's read-back result taints its caller) built after it, and the second replaced on 2026-10-02 by withholding: a tainted result read back by a context holding `sensitive` and `egress` is answered with its text withheld, and implicit notes are opt-in (§8 item 13, §5.11.3, §11). P1 (rmcp 3.5.0 and MCP `2026-07-28`) is implemented (§8). The Events surface itself (P2 onwards) is not built. It tracks an external **draft**: SEP-3415, "Events Extension" (Draft, Extensions Track, opened 2026-10-05), which is the design sketch written in SEP format and is not yet part of the MCP specification (§2.1, §2.15). Anything marked **[draft may change]** follows text that is still open upstream.
+**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8), with the two follow-ups decided 2026-10-01 (a stored definition needs the `interface` grant to open a route; a tainted run's read-back result taints its caller) built after it, and the second replaced on 2026-10-02 by withholding: a tainted result read back by a context holding `sensitive` and `egress` is answered with its text withheld, and implicit notes are opt-in (§8 item 13, §5.11.3, §11). P1 (rmcp 3.5.0 and MCP `2026-07-28`) and P2 (bindings, poll mode, and the runtime subscriptions of §5.15) are implemented (§8); webhook (P3) is next. It tracks an external **draft**: SEP-3415, "Events Extension" (Draft, Extensions Track, opened 2026-10-05), which is the design sketch written in SEP format and is not yet part of the MCP specification (§2.1, §2.15). Anything marked **[draft may change]** follows text that is still open upstream.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-29. Revised 2026-09-30 after three adversarial reviews (spec fidelity, codebase fidelity, design completeness). Decisions Q1, Q3 and Q8, the order of work, and the two item-13 follow-ups recorded 2026-10-01; the read-back one revised 2026-10-02 (§11). P0 implemented 2026-10-01/02, and §8 P0 corrected to what it proved. P1 implemented 2026-10-03/10. Revised 2026-10-10 for SEP-3415 (§2.15), with the decisions Q2, Q4, Q6 and Q9 recorded and Q6's dynamic subscriptions designed (§5.15, §11).
 **Extends:** RFC 0035 (event streams). MCP events land in declared streams and are consumed by the existing `stream` and `correlate` starts and by `wait {on: event}`. **Supersedes only the consumption half of RFC 0035 Phase D** ("the MCP broker profile"). Phase D was never built. Its publish half, a broker exposed as an MCP server with `publish` tools (`rfcs/0035-event-streams.md:175-179`), needs no profile, and MCP Events has no publish operation. RFC 0035 is annotated with a pointer, not rewritten (§4, row 1).
@@ -563,7 +563,7 @@ Every re-list also re-evaluates refused bindings (`unknown_event`, `no_common_mo
 | `stream` / `subject` | `into.stream` / `into.subject` |
 | `source` | `mcp:<server>`. Workflow names must match `[a-zA-Z_][a-zA-Z0-9_-]{0,63}` (`engine/model.rs:1355`), so this can never equal a workflow name and trip the feedback rule (`runtime/streams.rs:304`). |
 | `correlation` | `null`. `correlate` keys events by `by`, a dot-path that defaults to the envelope's `correlation` (`runtime/streams.rs:611-614`), not by CEL. With `correlation: null`, every MCP event logs `correlate.unkeyed` and is skipped (`:714-724`), unless `by` names a payload field, for example `by: data.payload.incidentId`. A key taken from an untrusted payload lets whoever writes into the upstream complete another entity's join, so such joins should be bounded with `correlate`'s `window`. `wait {on: event}` matches with CEL over `event` and the run's inputs. |
-| `data` | `{server, event, event_id, occurred_at, schema_ok, payload}`. `payload` is the occurrence's `data`, verbatim. `occurred_at` is the server's `timestamp`. |
+| `data` | `{server, event, event_id, occurred_at, schema_ok, subscription, payload}`. `payload` is the occurrence's `data`, verbatim. `occurred_at` is the server's `timestamp`. `subscription` is the binding's key, which a subscribing wait filters on (§5.15). |
 
 Before appending, each occurrence goes through these checks:
 
@@ -949,11 +949,11 @@ mcp:
           into: {stream: github, subject: pr.closed}
           rate: 60/1m                         # per subscription; required on an untrusted server
           max: 32                             # live runtime subscriptions under this grant
-          ttl: 7d                             # the longest a tool-made subscription lives
+          lifetime: 7d                        # the longest a tool-made subscription lives
           tools: true                         # offer the events.* tools for it (default false)
 ```
 
-- **Validation at load** is a binding's (§5.2): `into.stream` declared, `delivery` from the closed set, `rate` on an untagged or `untrusted_input` server, the webhook requirements. Also `1 ≤ max ≤ 64`, `ttl ≤ 30d`, at most one grant per `(server, name)`, and the instance cap counts static bindings and live runtime subscriptions together (256).
+- **Validation at load** is a binding's (§5.2): `into.stream` declared, `delivery` from the closed set, `rate` on an untagged or `untrusted_input` server, the webhook requirements. Also `1 ≤ max ≤ 64`, `lifetime ≤ 30d`, at most one grant per `(server, name)`, and the instance cap counts static bindings and live runtime subscriptions together (256).
 - **Classification.** `event_grants` is operator-only and refused at both document fold sites, as `events` is (§5.2, §5.11.6). A served document, a template or a stored definition can use a grant; it cannot make one.
 - **Taint** is static, because the grant fixes the stream: `into.stream` gets the server's tags, plus `untrusted_input` when the server is untagged, exactly as a binding's stream does (§5.11.3).
 
@@ -987,10 +987,21 @@ merged:
 | `events.unsubscribe` | `subscription` | `{stopped}` |
 | `events.subscriptions` | — | The caller's live subscriptions |
 
-- **Owner.** A tool-made subscription is owned by the calling context: the root conversation, or a workflow run's `agent` step. It lives until that owner unsubscribes it, until the grant's `ttl`, or until a reload removes the grant or the server. It survives a restart. A run's subscriptions are released when the run ends. Subagent children run out of process and are not offered the tools in v1; a child asking for one gets the registry's usual "not offered" refusal.
+- **Owner.** A tool-made subscription is owned by the calling context: the root conversation, or a workflow run's `agent` step. It lives until that owner unsubscribes it, until the grant's `lifetime`, or until a reload removes the grant or the server. It survives a restart. A run's subscriptions are released when the run ends. Subagent children run out of process and are not offered the tools in v1; a child asking for one gets the registry's usual "not offered" refusal.
 - **Reach and tags.** Subscribing sends arguments to the server, so the tools count as reaching it: they are offered only to a context whose reach includes the server, and they carry the server's tags in the trifecta check.
 - **What reaches the model** is decided as for a binding (§5.10): the operator wires consumers to the grant's stream — a `stream` start whose workflow hands the event to an `agent` step, or `message`s the root. The tool's answer names the stream and subject, so the model can be told where its events land. `events.subscribe` never wakes anyone by itself.
 - **Bounds and audit.** `max` per grant and the instance cap bound what a model can create; a subscribe beyond them is refused naming the cap. Every subscribe and unsubscribe, by a wait or a tool, logs `mcp.events.subscribed` / `.unsubscribed` with `owner` and writes an audit entry, as a binding's does.
+
+**As built, after review (2026-10-10).**
+
+- **Release is immediate.** A wait lets go of its subscription when the step leaves the wait (`finish_step`), and a subscribe sweeps owners that are gone before it checks `max`, so a sequence of waits under `max: 1` works. A run that ends or is cancelled is still noticed by the 5 s sweep.
+- **A wait never waits for nothing.** When the subscription is refused (the listing, the server's answer, `inputSchema`), taken by a grant change, or not kept across a restart (boot reconciles every suspended subscribing wait against the restored bindings), the wait fails, saying why. A tool's hold on a refused subscription stays, visible as `state: refused`, and a refusal at subscribe time is an error to the caller.
+- **The grant reaches what is live.** On reload and at boot: a subscription whose arguments no longer carry the grant's `fixed` values, or a tool hold under `tools: false`, is let go (`grant_narrowed`); a tool hold is shortened to a lowered `lifetime`; holds past a lowered `max`, or past the instance cap once static bindings are counted first, go (`grant_max`, `instance_cap`). An edited `into` moves the waits on it to the new stream, anchored at its head.
+- **One hold per holder.** A tool caller subscribing again renews its hold rather than stacking a second one.
+- **Bounds.** Runtime arguments are at most 4 KiB serialized. A failed save of the runtime index is logged (`mcp.events.index.failed`), not swallowed. A restored entry whose grant is gone has its records deleted.
+- **Listing.** A server with a grant is listed at boot, not at its first runtime subscription, so `events.list` has types to offer and `inputSchema` applies at subscribe time.
+- **Checks reach nested steps.** The load-time grant check walks loop, branch and subgraph bodies, and the trifecta check reads a subscribing wait's grant stream (§5.11.3).
+- **One occurrence, two subscriptions.** The stream event id is `mcp/<server>/<type>/<eventId>`, without the subscription: an occurrence two subscriptions on one grant both receive is appended twice, each wait sees its own copy, and a `stream` start fires one run for it.
 
 **What stays out of v1.** A document or template declaring a grant (Q10 still open). Runtime subscriptions in subagent children. A runtime choice of mode, stream, rate or retention.
 
@@ -1289,7 +1300,7 @@ All of these exist: `crates/agentd-cli/tests/store_kill_e2e.rs`, `streams_e2e.rs
 - The hybrid "`initialize` answered with 2026-07-28" mocks are deleted; the tripwire test is replaced by `the_revisions_agentd_offers_are_pinned`.
 - **For P2.** The 2026-07-28 caching page says a client that polls MUST apply jitter and backoff, which touches the §7.7 freshness poll and P2's 15-minute re-list. The Events draft's codes `-32011`..`-32015` fall in `-32000`..`-32019`, which 2026-07-28 reserves (MUST NOT allocate), so they will be renumbered, not merely may be.
 
-### P2 — The bridge and poll mode (`mcp-events` feature)
+### P2 — The bridge and poll mode (`mcp-events` feature) — implemented
 
 **Scope:**
 
@@ -1327,6 +1338,18 @@ All of these exist: `crates/agentd-cli/tests/store_kill_e2e.rs`, `streams_e2e.rs
 **Since SEP-3415 and the 2026-10-10 decisions:** P2 is built against [SEP], for `2026-07-28` connections only (a `2025-11-25` connection's bindings are refused `revision`); the mock's Events surface is on its 2026-07-28 edge; the codes are `-32023`..`-32027`; `list_changed` is tested through the standing listen's `eventsListChanged`; it also builds the grants, the `wait` that subscribes and the `events.*` tools (§5.15); and `mcp-events` joins the release feature set (Q4), with the one-line draft warning at load.
 
 **Depends on:** P0 items 1, 2, 4, 6, 10 and 11, and P1 (both are on `main`).
+
+**Implemented** on `main`, unreleased: `dae37d5f` (`call_raw`), `b12a6903` (configuration, the feature in the release set), `2b905661` (the runtime, the mock surface, the e2e), `36dc5945` (the wave's review), `172377be` (`list_changed` through the standing listen), `f4899a67`, and the runtime subscriptions of §5.15 with this documentation.
+
+*As built:*
+
+- **Log fields.** A binding's event type is `event_type` in every log line: the logger keys the line's own name `event`, which §5.12's table would have overwritten. New lines beside §5.12's: `mcp.events.poll.fail` and `mcp.events.list.fail` (a failure that may pass, with `retry_ms`), `mcp.events.removed`, `mcp.events.list_changed`, and `mcp.events.subscribed` / `.unsubscribed` carrying `owner` (`config`, `wait`, `tool`) and a `reason` for letting go (`wait_left`, `expired`, `run_ended`, `unsubscribed`, `grant_removed`). `mcp.events.gap` gains the cause `schema_changed`.
+- **The cursor (§5.1 rule 2) under failure.** A record read that fails pauses the binding (`store_degraded`) rather than starting it from now; the stream is flushed before every cursor write, and the dedup set is written only after a flush that held; an answer for a poll the binding did not send (removed and declared again meanwhile) is dropped by a generation tag; `rate` holds whatever a page carries, stopping it with the cursor held where a server ignores `maxEvents`.
+- **No loops.** `NotFound` and `schema_changed` re-arm only after the backoff the failure earned, and `schema_changed` lets the stale cursor go (a schema-epoch cursor is answered so again) and says the gap. `nextPollMs` is capped at 15 minutes; `call_raw`'s bound is the whole exchange's (a timer hangs up an answer that keeps streaming keepalives), so no server holds the pool.
+- **Refusals.** A listing re-evaluates only what a listing decides; `forbidden` and `not_supported` wait for a reload or a re-dial (a re-dial after a lost session included). A binding added on a server already refused `revision` or `no_capability` is refused at once.
+- **Runtime subscriptions.** A binding has owners (`config`, a suspended wait, a tool call); equal identities share one subscription and one record; with the last owner it stops and its records go. Runtime-owned bindings are kept in one record, `_mcpev/runtime`, and restored at boot for every grant that still allows them. A tool-made subscription is owned by the calling run (any of its steps may stop it) or the root conversation. Every stream event carries `data.subscription`, its binding's identity. A `subscribe` naming no grant is refused by the checks every definition passes (load, reload, a stored one).
+- **The client never offers what it was not asked for.** Only the supervisor's connections ask for `eventsListChanged`, and a child's composed configuration carries no binding or grant.
+- **Tests:** `crates/agentd-cli/tests/mcp_events_e2e.rs` (twenty scenarios through the mock's Events surface), `crates/mcp/tests/raw_requests.rs`, and unit tests in `runtime/mcp_events/{wire,bridge}.rs`, `config/settings` and `config/taint.rs`. Interop with `mcp.d` and conformance PR #521 is still to do.
 
 ### P3 — Webhook mode (the ChatGPT-deployed subset)
 

@@ -525,6 +525,41 @@ is `mcp.servers[]: a server has an empty name`; a repeated name is
 code-registered tools; and a non-`https`/non-loopback-`http` endpoint is rejected
 at startup. All exit `2`.
 
+### MCP Events — `mcp.servers[].events` and `event_grants`
+
+With the `mcp-events` feature (in the release set), a server's event types
+reach declared streams ([`mcp.md`](mcp.md) §1.8). Both keys are file-only and
+operator-only — a served document or a subagent template that declares
+either is refused — and neither is part of how the server is dialed, so a
+reload that edits them dials nothing.
+
+`events[]` — a **binding**: one event type, subscribed with fixed arguments.
+
+| Key | Default | |
+|---|---|---|
+| `name` | required | The event type, as the server's `events/list` names it |
+| `arguments` | `{}` | Subscription arguments, checked against the type's `inputSchema`; part of the binding's identity |
+| `delivery` | required | The acceptable modes in preference order: `poll` (`webhook` is refused until it is built) |
+| `into` | required | `{stream, subject}`: a stream declared under `streams:` |
+| `replay` | `1h` | How far back to catch up after downtime (`maxAgeMs`), ≥ 1 s, or `none` to always start from now |
+| `rate` | — | Intake ceiling `<burst>/<per>`; **required** on an untagged or `untrusted_input` server |
+
+`event_grants[]` — an event type runtime subscriptions may be made for: a
+`wait {on: event, subscribe:}` or, with `tools: true`, the `events.*` tools.
+`name`, `delivery`, `into`, `replay` and `rate` as above, plus `fixed`
+(arguments no runtime subscription may set), `max` (live runtime
+subscriptions, 1–64, default 8), `lifetime` (how long a tool-made
+subscription lives, ≤ 30d, default 1d) and `tools` (default `false`).
+
+Refused at load: an undeclared stream, an empty subject, an empty or repeated
+mode, two bindings of one type with the same arguments, two grants for one
+type, more than 64 bindings on a server or 256 in all, a missing `rate` where
+it is required, a `ttl` on a binding without `webhook`. A config that declares
+any binding or grant says at load that it tracks a draft (SEP-3415), and warns
+when the store would not keep a cursor (the memory store, or
+`store.on_error: degrade`). Built without `mcp-events`, both are refused by
+name.
+
 ### The system prompt — `context.template:`
 
 The system prompt is **data plus a template**. The runtime exposes what it

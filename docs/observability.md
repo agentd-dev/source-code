@@ -114,6 +114,18 @@ exhaustive.
 | `wait.resubscribed` / `wait.resubscribe.fail` | `server`, `uri`, `reason` (+ `err`) — a suspended `wait on: resource` was subscribed again: `reason: boot` for every wait restored from the store, `reload` on a server a reload dialed or dropped, `session_lost` after a re-dial, `retry` when a failed one is asked again. A wait that can never be woken — its server is gone from the config, or does not advertise `resources.subscribe` (or left the URI out of a listen acknowledgment) — is `wait.resubscribe.fail` at error level, with `failed` (how many steps), and those steps fail. A server that is configured but not connected (down at boot, or its reload re-dial failed) is at error level with `parked` (how many steps): the waits stay parked under their timeouts until a reload connects it. Any other failure is at warn level, and is asked again on a 1s→30s backoff |
 | `mcp.unsubscribed` / `mcp.unsubscribe.fail` | `server`, `uri`, `reason: unowned` (+ `err`) — a URI the connection held that no owner wants any more (no armed `subscribe` start, no suspended `wait on: resource`, not the resource instruction: a wait resolved, timed out or was cancelled, its run ended, the instruction moved) was let go of, on the server too; looked at every 5s. A failure is at warn level and is looked at again a minute later; a connection whose session is lost is left to its re-dial |
 | `workflow.unsubscribed` / `workflow.unsubscribe_fail` | `workflow`, `server`, `uri` (+ `err`) — a workflow a reload or `workflow.delete` retired let go of its `subscribe` start's URI, which no other owner wants |
+| `mcp.events.listed` | `server`, `types` — a server's MCP Events listing was read (at a binding's first need, every 15 min, after a reload that dialed the server, and when the server says its list changed) |
+| `mcp.events.armed` | `server`, `event_type`, `mode`, `cursor_present` — a binding is polling; `cursor_present: false` starts it from now |
+| `mcp.events.refused` | `server`, `event_type`, `reason`, `detail` — at error level, once per refusal: the binding is not polled until a reload, a re-dial or a later listing allows it. `reason` ∈ `revision`, `no_capability`, `method_not_found`, `unknown_event`, `no_common_mode`, `invalid_arguments`, `forbidden`, `not_supported`, `list_too_large` (docs/mcp.md §1.8) |
+| `mcp.events.paused` / `mcp.events.resumed` | `server`, `event_type`, `cause` (`pressure`, `store_degraded`, `rate`) — at warn / info: the binding holds its cursor and is not polled while the cause lasts |
+| `mcp.events.poll.fail` | `server`, `event_type`, `err`, `code` (when the server answered one), `retry_ms` — a poll that may pass on a retry; the binding backs off with jitter and keeps its cursor. At error level for `-32020` (a header the server refused: a defect in agentd's request) |
+| `mcp.events.list.fail` | `server`, `err`, `retry_ms` — a listing that may pass on a retry |
+| `mcp.events.rejected` | `server`, `event_type`, `event_id`, `cause` (`oversize`, `malformed`) — at warn level: an occurrence not appended; the cursor moves past it |
+| `mcp.events.schema_mismatch` | `server`, `event_type`, `event_id` — at warn level: appended with `schema_ok: false`; the type is listed again |
+| `mcp.events.gap` | `server`, `event_type`, `cause` (`truncated`: the server skipped from the cursor; `no_replay`: a type without replay re-armed after downtime; `schema_changed`: the type changed in place, and the cursor minted under the old schema was let go) — at warn level |
+| `mcp.events.list_changed` | `server` — the server said its event types changed (on the standing listen, which asks for `eventsListChanged`); they are listed again now |
+| `mcp.events.subscribed` / `mcp.events.unsubscribed` | `server`, `event_type`, `owner` (`{kind: config\|wait\|tool, …}`), `reason`, `subscription` — a runtime subscription made or let go (a wait that subscribed, an `events.*` call; `reason` on letting go: `wait_left`, `expired`, `run_ended`, `unsubscribed`, `grant_removed`). Each is also an audit entry |
+| `mcp.events.removed` | `server`, `event_type`, `reason` — a reload removed a binding; its records went with it |
 | `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
 | `start.shed` / `start.frozen` / `start.inbox.failed` | `workflow`, `node`, `kind`, plus `cause` (`err` for the inbox) — a firing was refused: resource pressure, a §7.7 freshness freeze, or a failed write of the durable inbox. A `stream` or `correlate` consumer's line also names what it holds — `stream` with `seq` and `event_id` (one event), `from`, `to`, `events`, `seqs` and `event_ids` (a batch) or `correlation`, `events`, `seqs` and `event_ids` (a join) — and that stays unconsumed and is offered again on later passes; a held consumer reads no further until it is admitted. The line is written once when the consumer starts being held, not on every pass |
 | `start.inputs.invalid` | `workflow`, `node`, `kind`, `err`, plus the same stream fields — the start's `inputs` mapping did not render and the firing is cancelled. The same event would fail the same way every time, so a stream consumer moves past it, and this line is its record |
@@ -590,9 +602,11 @@ The metrics that matter (derivable from logs by default; emitted directly under
 the features below):
 
 - **Gauges:** `agent_ready` (0/1) and `agent_up` — plus `agent_active_subagents`,
-  `agent_tree_depth`, `agent_tree_breadth` and `agent_subscriptions_active`, which
-  are **reserved**: rendered, never written in this build, so they sit flat at `0`
-  (see [Reactive-backlog gauges (reserved)](#reactive-backlog-gauges-reserved)).
+  `agent_tree_depth`, `agent_tree_breadth` and the unlabelled
+  `agent_subscriptions_active`, which are **reserved**: rendered, never written in
+  this build, so they sit flat at `0` (see
+  [Reactive-backlog gauges (reserved)](#reactive-backlog-gauges-reserved)). The
+  `kind="event"` series of `agent_subscriptions_active` is written (MCP Events).
 - **Counters:** `agent_loop_steps_total`, `agent_intel_calls_total`,
   `agent_tokens_total{type=in|out}`, `agent_reactions_total`,
   `agent_subagents_spawned_total`, `agent_subagents_exited_total{status}`,
@@ -708,7 +722,9 @@ the gauges that do move. The same reservation covers `agent_active_subagents`,
 
 - **`agent_pending_events`** — reactive events received but not yet routed.
 - **`agent_inflight_reactions`** — reactions currently executing.
-- **`agent_subscriptions_active`** — reconciled declared subscriptions.
+- **`agent_subscriptions_active`** — reconciled declared subscriptions. Only
+  the unlabelled series is reserved: `agent_subscriptions_active{kind="event",mode}`
+  is written (see [MCP Events metrics](#mcp-events-metrics)).
 - **`agent_reaction_lag_ms`** — age of the oldest un-routed pending event.
 
 #### Resource-pressure gauges
@@ -739,6 +755,30 @@ the gauges that do move. The same reservation covers `agent_active_subagents`,
   `{stream="other",consumer="other"}` series carrying the largest of their
   lags. With no consumers the family renders its `# HELP` / `# TYPE` lines and
   no sample.
+
+#### MCP Events metrics
+
+Labelled by binding: `server` and `event` (the event type) come from the
+operator's `mcp.servers[].events` — at most 256 bindings — and the other
+labels from closed domains. A family past 512 series folds the rest into one
+whose labels all read `other`.
+
+- **`agent_mcp_events_total{server,event,mode,outcome}`** — occurrences, by
+  what became of them: `appended`, `schema_mismatch` (appended, flagged),
+  `duplicate` (dropped by the dedup set), `rejected` (oversize or malformed),
+  `refused_pressure` (held at the cursor).
+- **`agent_mcp_events_requests_total{server,method,outcome}`** — `events/list`
+  and `events/poll` requests: `ok`, `refused` (a JSON-RPC error answer),
+  `failed` (no usable answer).
+- **`agent_mcp_event_gaps_total{server,event,cause}`** — `truncated`,
+  `no_replay`, `schema_changed`.
+- **`agent_mcp_events_dedup_evicted_total{server,event}`** — dedup entries
+  dropped to stay under the 4096 cap; a duplicate older than what the set
+  keeps is appended again (with the same stream-event id).
+- **`agent_mcp_event_lag_ms{server,event}`** — the append time minus the
+  occurrence's `timestamp`, clamped at 0. **Server-reported**: as true as the
+  server's clock.
+- **`agent_subscriptions_active{kind="event",mode}`** — bindings polling now.
 
 (The unlabelled bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
 `agent_reactions_total`, etc. — are emitted alongside the frozen set, so a scrape

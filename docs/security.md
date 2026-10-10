@@ -188,7 +188,14 @@ So every declared stream gets a tag set from every producer the configuration de
   not mirror is refused (`instance.mirror.fail`);
 - an `emit` from a run that carries taint puts it on its target. Every `emit` target is
   static — a templated one is taken to be every declared stream — so this is a fixed point
-  over the workflow graph.
+  over the workflow graph;
+- an MCP Events binding or grant (`mcp.servers[].events`, `event_grants`) adds its server's
+  tags, and `untrusted_input` when the server is untagged: whoever can write into the
+  watched upstream (an email to a monitored inbox, a message in a watched channel) writes
+  into the stream. Bindings and grants are operator-only — a served document or a subagent
+  template declaring either is refused, and a child's composed config carries neither —
+  and the `events.*` tools carry the tags of every server a grant offers them on, since
+  subscribing sends model-chosen arguments to that server.
 
 A run started from a tainted stream (`stream` or `correlate` start) or waiting on one
 (`wait {on: event}`; a templated stream name is any tainted stream) carries its tags, and

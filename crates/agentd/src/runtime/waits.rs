@@ -519,6 +519,44 @@ impl Runtime {
             // bookkeeping. The reason is narrow and specific: a `stream` start's
             // filter sees only `{event}`, and there was nowhere to match an
             // event against THIS run's inputs. `match` closes that.
+            // A wait that subscribes: the subscription is made under the
+            // operator's grant, owned by this step, and the wait reads the
+            // stream the grant names — only its own subscription's events.
+            "event" if spec.get("subscribe").is_some() => {
+                #[cfg(feature = "mcp-events")]
+                {
+                    let sub = &spec["subscribe"];
+                    let server = sub["server"].as_str().unwrap_or_default().to_string();
+                    let event = sub["event"].as_str().unwrap_or_default().to_string();
+                    let arguments = sub["arguments"].as_object().cloned().unwrap_or_default();
+                    let owner = super::mcp_events::Owner::Wait {
+                        run: run_id.to_string(),
+                        step: step_id.to_string(),
+                    };
+                    match self.events_subscribe_runtime(&server, &event, arguments, owner) {
+                        Ok(s) => {
+                            let anchor = self
+                                .durable
+                                .manifest()
+                                .streams
+                                .get(&s.stream)
+                                .map(|m| m.seq)
+                                .unwrap_or(0);
+                            let rec = json!({
+                                "stream": s.stream,
+                                "subject": s.subject,
+                                "match": spec.get("match").and_then(Value::as_str),
+                                "anchor": anchor,
+                                "subscription": s.key,
+                            });
+                            self.suspend_wait(run_id, step_id, wait_record("event", rec, timeout));
+                        }
+                        Err(e) => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait subscribe: {e}")), 0),
+                    }
+                }
+                #[cfg(not(feature = "mcp-events"))]
+                self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some("wait subscribe: MCP Events requires building with --features mcp-events".into()), 0);
+            }
             "event" => {
                 let Some(stream) = spec.get("stream").and_then(Value::as_str) else {
                     self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some("wait on: event requires `stream`".into()), 0);
@@ -617,6 +655,9 @@ impl Runtime {
             expr: Option<String>,
             inputs: Value,
             vars: Value,
+            /// A wait that subscribed reads only its own subscription's
+            /// events (`data.subscription`).
+            subscription: Option<String>,
         }
         let mut by_stream: std::collections::BTreeMap<String, Vec<Waiter>> =
             std::collections::BTreeMap::new();
@@ -646,6 +687,7 @@ impl Runtime {
                         expr: w["match"].as_str().map(str::to_string),
                         inputs: run.inputs.clone(),
                         vars: Value::Object(run.vars.clone()),
+                        subscription: w["subscription"].as_str().map(str::to_string),
                     });
             }
         }
@@ -700,6 +742,11 @@ impl Runtime {
                     }
                     if let Some(pat) = &w.subject
                         && !super::streams::subject_matches(pat, subject)
+                    {
+                        return true;
+                    }
+                    if let Some(sub) = &w.subscription
+                        && event["data"]["subscription"].as_str() != Some(sub.as_str())
                     {
                         return true;
                     }

@@ -8092,6 +8092,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     for e in crate::config::taint::refusals(s, &parsed.iter().collect::<Vec<_>>()) {
         err(&mut d, e);
     }
+    for w in &parsed {
+        for e in events::subscribe_refusals(s, w) {
+            err(&mut d, e);
+        }
+    }
     d
 }
 
@@ -13054,6 +13059,20 @@ mod tests {
                 .unwrap_or_default();
             assert!(e.contains(says), "want {says:?}:\n{e}\n---\n{doc}");
         }
+    }
+
+    #[cfg(feature = "mcp-events")]
+    #[test]
+    fn a_nested_wait_that_subscribes_under_no_grant_is_refused_at_load() {
+        let doc = format!(
+            "{}workflows:\n  - name: w\n    steps:\n      s: {{kind: once}}\n      each:\n        kind: foreach\n        depends_on: [s]\n        over: [1, 2]\n        body:\n          steps:\n            hold: {{kind: wait, on: event, timeout: 1m, subscribe: {{server: pd, event: incident.created}}}}\n      f: {{kind: finish, depends_on: [each], status: completed}}\n",
+            events_doc("")
+        );
+        let e = load_doc(&doc).unwrap_err().to_string();
+        assert!(
+            e.contains("which no `event_grants` entry grants") && e.contains("hold"),
+            "{e}"
+        );
     }
 
     #[cfg(not(feature = "mcp-events"))]

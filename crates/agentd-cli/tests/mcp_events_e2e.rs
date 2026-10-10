@@ -660,3 +660,376 @@ fn a_type_listed_later_is_armed_when_the_server_says_its_list_changed() {
         "the standing listen outlived the notification:\n{log}"
     );
 }
+
+/// A config with one granted event type on `mock` (and no binding): `extra`
+/// goes under the grant, `workflows` is the workflows section's body.
+fn granted(endpoint: &str, store: &str, grant_extra: &str, workflows: &str) -> String {
+    format!(
+        "agent:\n  name: runtime\nstore:\n{store}streams:\n  ticks: {{}}\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\n      tags: {{\"*\": [sensitive]}}\n      event_grants:\n        - name: mock.tick\n          delivery: [poll]\n          into: {{stream: ticks, subject: tick}}\n{grant_extra}workflows:\n{workflows}lifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n  log_content: true\n"
+    )
+}
+
+/// A workflow that waits on its own subscription to `topic` and finishes
+/// with the occurrence's `n`.
+fn waiter(name: &str, topic: &str) -> String {
+    format!(
+        "  - name: {name}\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, on: event, depends_on: [s], timeout: 120s, subscribe: {{server: mock, event: mock.tick, arguments: {{topic: {topic}}}}}}}\n      f: {{kind: finish, depends_on: [w], status: completed, output: \"{{{{ steps.w.output.data.payload.n }}}}\"}}\n"
+    )
+}
+
+fn done(log: &str, workflow: &str) -> Vec<Value> {
+    events(log, "run.done")
+        .into_iter()
+        .filter(|e| e["workflow"] == workflow)
+        .collect()
+}
+
+#[test]
+fn a_wait_that_subscribes_resolves_on_its_own_occurrence_and_lets_go() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let wfs = format!("{}{}", waiter("one", "w1"), waiter("two", "w2"));
+    let daemon = Daemon::start("events-wait-sub", &granted(&mock.uri(), MEMORY, "", &wfs));
+    daemon.wait_for("both subscriptions polling", |_| {
+        let p = polls(&mock);
+        ["w1", "w2"]
+            .iter()
+            .all(|t| p.iter().any(|x| x["arguments"]["topic"] == *t))
+    });
+    let log = daemon.log();
+    let subs = events(&log, "mcp.events.subscribed");
+    assert_eq!(subs.len(), 2, "{log}");
+    assert!(
+        subs.iter().all(|e| e["owner"]["kind"] == "wait"),
+        "{subs:?}"
+    );
+    // Only w1's occurrence: the run on w2 does not wake on it, though both
+    // read the same stream.
+    mock.control("mock.event", json!({"topic": "w1"}));
+    daemon.wait_for("the first wait resolved", |l| !done(l, "one").is_empty());
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = daemon.log();
+    assert_eq!(done(&log, "one")[0]["output"], 1, "{log}");
+    assert!(done(&log, "two").is_empty(), "the other wait woke:\n{log}");
+    // Its subscription is let go with the wait; the other stays.
+    daemon.wait_for("the first subscription let go", |l| {
+        events(l, "mcp.events.unsubscribed")
+            .iter()
+            .any(|e| e["reason"] == "wait_left")
+    });
+    let at = polls(&mock)
+        .iter()
+        .filter(|p| p["arguments"]["topic"] == "w1")
+        .count();
+    std::thread::sleep(Duration::from_secs(3));
+    let after = polls(&mock)
+        .iter()
+        .filter(|p| p["arguments"]["topic"] == "w1")
+        .count();
+    assert_eq!(at, after, "w1 is no longer polled");
+    assert!(
+        polls(&mock)
+            .iter()
+            .filter(|p| p["arguments"]["topic"] == "w2")
+            .count()
+            > 2,
+        "w2 is still polled"
+    );
+}
+
+#[test]
+fn a_grants_max_is_free_again_the_moment_a_wait_leaves() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    // Two waits in a row under `max: 1`: the second subscribes as the first
+    // resolves, not once a sweep has noticed it left.
+    let wf = "  - name: pair\n    steps:\n      s: {kind: once}\n      a: {kind: wait, on: event, depends_on: [s], timeout: 120s, subscribe: {server: mock, event: mock.tick, arguments: {topic: m1}}}\n      b: {kind: wait, on: event, depends_on: [a], timeout: 120s, subscribe: {server: mock, event: mock.tick, arguments: {topic: m2}}}\n      f: {kind: finish, depends_on: [b], status: completed, output: \"{{ steps.b.output.data.payload.n }}\"}\n";
+    let daemon = Daemon::start(
+        "events-max",
+        &granted(&mock.uri(), MEMORY, "          max: 1\n", wf),
+    );
+    let polled = |topic: &str| {
+        polls(&mock)
+            .iter()
+            .any(|p| p["arguments"]["topic"] == topic && !p["cursor"].is_null())
+    };
+    daemon.wait_for("the first wait polling", |_| polled("m1"));
+    mock.control("mock.event", json!({"topic": "m1"}));
+    daemon.wait_for("the second wait polling", |_| polled("m2"));
+    mock.control("mock.event", json!({"topic": "m2"}));
+    daemon.wait_for("the run done", |l| !done(l, "pair").is_empty());
+    let log = daemon.log();
+    assert_eq!(done(&log, "pair")[0]["status"], "completed", "{log}");
+    assert_eq!(done(&log, "pair")[0]["output"], 1, "{log}");
+}
+
+#[test]
+fn a_wait_whose_subscription_is_refused_fails_instead_of_waiting() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    // The mock answers topic `forbidden` with -32024: the wait fails at once,
+    // not at its two-minute timeout.
+    let daemon = Daemon::start(
+        "events-wait-refused",
+        &granted(&mock.uri(), MEMORY, "", &waiter("denied", "forbidden")),
+    );
+    daemon.wait_for("the run done", |l| !done(l, "denied").is_empty());
+    let log = daemon.log();
+    let run = &done(&log, "denied")[0];
+    assert_eq!(run["status"], "failed", "{log}");
+    assert!(
+        run["err"].to_string().contains("its subscription ended")
+            || log.contains("wait subscribe: its subscription ended"),
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.events.refused")
+            .iter()
+            .any(|e| e["reason"] == "forbidden"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_wait_the_grant_no_longer_allows_fails_on_reload_and_at_restart() {
+    // Reload: the grant now fixes an argument the subscription does not carry.
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-narrowed",
+        &granted(&mock.uri(), MEMORY, "", &waiter("one", "q1")),
+    );
+    daemon.wait_for("the wait polling", |_| {
+        polls(&mock).iter().any(|p| p["arguments"]["topic"] == "q1")
+    });
+    std::fs::write(
+        &daemon.cfg_path,
+        granted(
+            &mock.uri(),
+            MEMORY,
+            "          fixed: {region: eu}\n",
+            &waiter("one", "q1"),
+        ),
+    )
+    .unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    daemon.wait_for("the run done", |l| !done(l, "one").is_empty());
+    let log = daemon.log();
+    assert_eq!(done(&log, "one")[0]["status"], "failed", "{log}");
+    assert!(log.contains("no longer allows it"), "{log}");
+    assert!(
+        events(&log, "mcp.events.unsubscribed")
+            .iter()
+            .any(|e| e["reason"] == "grant_narrowed"),
+        "{log}"
+    );
+
+    // Restart: the same edit made while the daemon was down.
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let dir = tempfile::tempdir().unwrap();
+    let store = format!("  kind: file\n  file: {{path: {}}}\n", dir.path().display());
+    let cfg_path = common::unique_path("events-narrowed-restart", "yaml");
+    std::fs::write(
+        &cfg_path,
+        granted(&mock.uri(), &store, "", &waiter("one", "q2")),
+    )
+    .unwrap();
+    let mut first = Daemon::start_at("events-narrowed-restart-1", &cfg_path);
+    first.wait_for("the wait polling", |_| {
+        polls(&mock)
+            .iter()
+            .any(|p| p["arguments"]["topic"] == "q2" && !p["cursor"].is_null())
+    });
+    first.stop();
+    std::fs::write(
+        &cfg_path,
+        granted(
+            &mock.uri(),
+            &store,
+            "          fixed: {region: eu}\n",
+            &waiter("one", "q2"),
+        ),
+    )
+    .unwrap();
+    let second = Daemon::start_at("events-narrowed-restart-2", &cfg_path);
+    second.wait_for("the run done", |l| !done(l, "one").is_empty());
+    let log = second.log();
+    assert_eq!(done(&log, "one")[0]["status"], "failed", "{log}");
+    assert!(log.contains("no longer allows it"), "{log}");
+}
+
+#[test]
+fn subscribing_twice_from_one_run_holds_once() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let wf = "  - name: twice\n    steps:\n      s: {kind: once}\n      t1: {kind: tool, depends_on: [s], name: events.subscribe, args: {server: mock, event: mock.tick, arguments: {topic: tr}}}\n      t2: {kind: tool, depends_on: [t1], name: events.subscribe, args: {server: mock, event: mock.tick, arguments: {topic: tr}}}\n      u: {kind: tool, depends_on: [t2], name: events.unsubscribe, args: {subscription: \"{{ steps.t2.output.subscription }}\"}}\n      f: {kind: finish, depends_on: [u], status: completed}\n";
+    let daemon = Daemon::start(
+        "events-twice",
+        &granted(&mock.uri(), MEMORY, "          tools: true\n", wf),
+    );
+    daemon.wait_for("the run done", |l| !done(l, "twice").is_empty());
+    // Past a sweep: a second hold left behind would be let go as the run
+    // ended.
+    std::thread::sleep(Duration::from_secs(6));
+    let log = daemon.log();
+    assert_eq!(done(&log, "twice")[0]["status"], "completed", "{log}");
+    assert_eq!(events(&log, "mcp.events.subscribed").len(), 1, "{log}");
+    let released: Vec<Value> = events(&log, "mcp.events.unsubscribed");
+    assert_eq!(released.len(), 1, "{log}");
+    assert_eq!(released[0]["reason"], "unsubscribed", "{log}");
+}
+
+#[test]
+fn a_wait_subscribing_under_no_grant_is_refused_at_load() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    // A grant on another type: mock.tick has none.
+    let cfg = granted(&mock.uri(), MEMORY, "", &waiter("w", "t")).replace(
+        "        - name: mock.tick\n          delivery: [poll]",
+        "        - name: mock.other\n          delivery: [poll]",
+    );
+    let path = common::unique_path("events-no-grant", "yaml");
+    std::fs::write(&path, &cfg).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--validate-config", "--config", &path])
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("which no `event_grants` entry grants"),
+        "{text}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_fixed_argument_cannot_be_set_at_runtime() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let cfg = granted(
+        &mock.uri(),
+        MEMORY,
+        "          fixed: {topic: pinned}\n",
+        &waiter("w", "mine"),
+    );
+    let daemon = Daemon::start("events-fixed", &cfg);
+    daemon.wait_for("the step refused", |l| {
+        events(l, "run.done").iter().any(|e| {
+            e["workflow"] == "w"
+                && e["err"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("fixed by the operator's grant"))
+        })
+    });
+    assert!(
+        polls(&mock).is_empty(),
+        "nothing subscribed:\n{}",
+        mock.log()
+    );
+}
+
+#[test]
+fn the_events_tools_subscribe_list_deliver_and_unsubscribe() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let wf = "  - name: model\n    steps:\n      s: {kind: once}\n      l: {kind: tool, depends_on: [s], name: events.list, args: {}}\n      t: {kind: tool, depends_on: [l], name: events.subscribe, args: {server: mock, event: mock.tick, arguments: {topic: tt}}}\n      w: {kind: wait, on: event, depends_on: [t], stream: ticks, subject: tick, timeout: 120s}\n      u: {kind: tool, depends_on: [w], name: events.unsubscribe, args: {subscription: \"{{ steps.t.output.subscription }}\"}}\n      f: {kind: finish, depends_on: [u], status: completed, output: {n: \"{{ steps.w.output.data.payload.n }}\", listed: \"{{ steps.l.output.types }}\"}}\n";
+    let daemon = Daemon::start(
+        "events-tools",
+        &granted(
+            &mock.uri(),
+            MEMORY,
+            "          tools: true\n          lifetime: 1h\n",
+            wf,
+        ),
+    );
+    daemon.wait_for("the tool's subscription polling", |_| {
+        polls(&mock).iter().any(|p| p["arguments"]["topic"] == "tt")
+    });
+    mock.control("mock.event", json!({"topic": "tt"}));
+    daemon.wait_for("the run done", |l| !done(l, "model").is_empty());
+    let log = daemon.log();
+    let run = &done(&log, "model")[0];
+    assert_eq!(run["status"], "completed", "{log}");
+    assert_eq!(run["output"]["n"], 1, "{run}");
+    assert!(
+        run["output"]["listed"].to_string().contains("mock.tick"),
+        "{run}"
+    );
+    let subscribed = events(&log, "mcp.events.subscribed");
+    assert!(
+        subscribed.iter().any(|e| e["owner"]["kind"] == "tool"),
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.events.unsubscribed")
+            .iter()
+            .any(|e| e["reason"] == "unsubscribed"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_waits_subscription_survives_a_restart() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let dir = tempfile::tempdir().unwrap();
+    let store = format!("  kind: file\n  file: {{path: {}}}\n", dir.path().display());
+    let cfg_path = common::unique_path("events-wait-restart", "yaml");
+    std::fs::write(
+        &cfg_path,
+        granted(&mock.uri(), &store, "", &waiter("one", "r1")),
+    )
+    .unwrap();
+    let mut first = Daemon::start_at("events-wait-restart-1", &cfg_path);
+    first.wait_for("the wait's subscription polling", |_| {
+        polls(&mock)
+            .iter()
+            .any(|p| p["arguments"]["topic"] == "r1" && !p["cursor"].is_null())
+    });
+    first.stop();
+    // While it was down.
+    mock.control("mock.event", json!({"topic": "r1"}));
+    let second = Daemon::start_at("events-wait-restart-2", &cfg_path);
+    second.wait_for("the wait resolved after the restart", |l| {
+        !done(l, "one").is_empty()
+    });
+    assert_eq!(
+        done(&second.log(), "one")[0]["output"],
+        1,
+        "{}",
+        second.log()
+    );
+}
+
+#[test]
+fn the_events_tools_exist_only_where_a_grant_offers_them() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let wf = "  - name: model\n    steps:\n      s: {kind: once}\n      l: {kind: tool, depends_on: [s], name: events.list, args: {}}\n      f: {kind: finish, depends_on: [l], status: completed}\n";
+    // A grant without `tools: true`.
+    let path = common::unique_path("events-no-tools", "yaml");
+    std::fs::write(&path, granted(&mock.uri(), MEMORY, "", wf)).unwrap();
+    // Bounded: were the tool offered, the run would succeed and the daemon
+    // would keep serving — the test must fail, not hang.
+    let log = common::unique_path("events-no-tools", "log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let status = status.unwrap_or_else(|| panic!("agentd kept running: {text}"));
+    assert_ne!(status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("events.list") && text.contains("unknown, disabled or not granted"),
+        "{text}"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&log);
+}

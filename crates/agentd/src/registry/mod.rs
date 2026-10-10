@@ -230,11 +230,24 @@ impl Registry {
                     },
                     vec![TrifectaTag::Sensitive, TrifectaTag::Egress],
                 )
+            } else if c.family == "events" {
+                // Subscribing sends arguments to the server, so the tools
+                // carry the tags of every server a grant offers them on.
+                (Impl::BuiltIn, events_tool_tags(settings))
             } else if c.builtin {
                 (Impl::BuiltIn, Vec::new())
             } else {
                 (Impl::MappingOnly, Vec::new())
             };
+            // The events tools exist only where a grant offers them, in a
+            // build that has MCP Events.
+            let offered = c.family != "events"
+                || (cfg!(feature = "mcp-events")
+                    && settings
+                        .mcp
+                        .servers
+                        .iter()
+                        .any(|s| s.event_grants.iter().any(|g| g.tools)));
             reg.tools.insert(
                 c.name.to_string(),
                 ToolSpec {
@@ -254,7 +267,7 @@ impl Registry {
                             .map(|(_, r)| r)
                             .collect(),
                     },
-                    disabled: false,
+                    disabled: !offered,
                     family: c.family.to_string(),
                     tags,
                     server: None,
@@ -933,6 +946,28 @@ impl Registry {
             })).collect::<Vec<_>>(),
         })
     }
+}
+
+/// The tags the `events.*` tools carry: those of every server a grant offers
+/// them on, and `untrusted_input` for an untagged one — the rule a binding's
+/// stream follows (RFC 0045 §5.11.3).
+fn events_tool_tags(settings: &Settings) -> Vec<TrifectaTag> {
+    let mut out = Vec::new();
+    for s in &settings.mcp.servers {
+        if !s.event_grants.iter().any(|g| g.tools) {
+            continue;
+        }
+        let mut tags = s.tag_set().unwrap_or_default();
+        if tags.is_empty() {
+            tags.push(TrifectaTag::UntrustedInput);
+        }
+        for t in tags {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
 }
 
 /// The profile families whose mapping-only contracts a configured server

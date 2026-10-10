@@ -2380,6 +2380,7 @@
           "webhook",
           "stream",
           "subject",
+          "subscribe",
           "match",
           "timeout",
           "on_timeout"

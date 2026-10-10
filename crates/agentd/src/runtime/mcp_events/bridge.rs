@@ -73,6 +73,7 @@ pub enum Checked {
 pub fn check(
     server: &str,
     name: &str,
+    subscription: &str,
     raw: &Value,
     payload_schema: Option<&Value>,
     max_value_bytes: Option<usize>,
@@ -111,6 +112,7 @@ pub fn check(
             "event_id": o.event_id,
             "occurred_at": o.timestamp,
             "schema_ok": schema_ok,
+            "subscription": subscription,
             "payload": o.data,
         }),
         event_id: o.event_id,
@@ -258,6 +260,7 @@ mod tests {
         let c = check(
             "pd",
             "incident.created",
+            "sub-1",
             &occurrence("e-1", "incident.created"),
             None,
             None,
@@ -284,6 +287,7 @@ mod tests {
         let again = check(
             "pd",
             "incident.created",
+            "sub-1",
             &occurrence("e-1", "incident.created"),
             None,
             None,
@@ -307,7 +311,7 @@ mod tests {
         let mut big = occurrence("e-2", "n");
         big["data"]["blob"] = json!("y".repeat(MAX_OCCURRENCE_BYTES));
         assert_eq!(
-            check("s", "n", &big, None, None),
+            check("s", "n", "sub-1", &big, None, None),
             Checked::Rejected {
                 cause: "oversize",
                 event_id: Some("e-2".into())
@@ -315,7 +319,7 @@ mod tests {
         );
         // Under the profile, over the store's own limit.
         assert!(matches!(
-            check("s", "n", &occurrence("e-3", "n"), None, Some(10)),
+            check("s", "n", "sub-1", &occurrence("e-3", "n"), None, Some(10)),
             Checked::Rejected {
                 cause: "oversize",
                 ..
@@ -330,7 +334,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    check("s", "n", &raw, None, None),
+                    check("s", "n", "sub-1", &raw, None, None),
                     Checked::Rejected {
                         cause: "malformed",
                         ..
@@ -344,7 +348,14 @@ mod tests {
     #[test]
     fn a_payload_that_fails_its_schema_is_appended_and_flagged() {
         let schema = json!({"type": "object", "required": ["missing"]});
-        let c = check("s", "n", &occurrence("e-6", "n"), Some(&schema), None);
+        let c = check(
+            "s",
+            "n",
+            "sub-1",
+            &occurrence("e-6", "n"),
+            Some(&schema),
+            None,
+        );
         assert!(
             matches!(c, Checked::Append { schema_ok: false, ref data, .. } if data["schema_ok"] == false)
         );

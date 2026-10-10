@@ -571,6 +571,11 @@ impl Runtime {
                 _ => {}
             }
         }
+        // A wait that subscribes, at any depth, names an operator grant.
+        errs.extend(crate::config::settings::events::subscribe_refusals(
+            &self.settings,
+            w,
+        ));
         errs
     }
 
@@ -2785,6 +2790,23 @@ impl Runtime {
         // A terminal step may make dependents ready this very iteration — tell
         // the loop to re-run scheduling before it parks (the inline fixpoint).
         self.resched = true;
+        // A wait that subscribed lets go as it leaves the wait, so its
+        // grant's slot is free for the next one at once (RFC 0045 §5.15).
+        #[cfg(feature = "mcp-events")]
+        if let Some(key) = self
+            .runs
+            .get(run_id)
+            .and_then(|r| r.steps.get(step_id))
+            .and_then(|st| st.wait.as_ref())
+            .and_then(|w| w["subscription"].as_str())
+            .map(str::to_string)
+        {
+            let owner = super::mcp_events::Owner::Wait {
+                run: run_id.to_string(),
+                step: step_id.to_string(),
+            };
+            self.events_release(&key, &owner, "wait_left");
+        }
         let Some(wf) = self
             .runs
             .get(run_id)

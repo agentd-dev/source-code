@@ -99,3 +99,111 @@ fn login_discovers_the_issuer_from_the_401_challenge() {
         "the 401 challenge → resource metadata → authorization_servers[0] chain resolves the issuer"
     );
 }
+
+/// One request: method, path, lower-cased headers, body.
+fn read_request(s: &mut TcpStream) -> (String, String, Vec<(String, String)>, Vec<u8>) {
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    let mut start = String::new();
+    r.read_line(&mut start).ok();
+    let mut parts = start.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut headers = Vec::new();
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.trim_end().split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    let clen = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; clen];
+    let _ = r.read_exact(&mut body);
+    (method, path, headers, body)
+}
+
+/// A resource whose challenge names a same-origin metadata document, and
+/// whose well-known URL answers 404 — so only the challenge finds the issuer.
+/// `before_auth` decides, from a POST's headers and body, whether the server
+/// refuses it (400) before it gets to authentication.
+fn spawn_strict(
+    issuer: &str,
+    before_auth: fn(&[(String, String)], &serde_json::Value) -> bool,
+) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+    let endpoint = format!("http://{base}/mcp");
+    let meta = format!("http://{base}/meta");
+    let issuer = issuer.to_string();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten().take(8) {
+            let mut s = c;
+            let (method, path, headers, body) = read_request(&mut s);
+            if method == "GET" && path == "/meta" {
+                let body = format!(
+                    r#"{{"resource":"http://{base}/mcp","authorization_servers":["{issuer}"]}}"#
+                );
+                write_resp(&mut s, 200, "OK", &[], body.as_bytes());
+            } else if method == "GET" {
+                write_resp(&mut s, 404, "Not Found", &[], b"");
+            } else {
+                let msg: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                if before_auth(&headers, &msg) {
+                    let refusal = br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32020,"message":"header mismatch"}}"#;
+                    write_resp(&mut s, 400, "Bad Request", &[], refusal);
+                } else {
+                    let wa = format!(r#"Bearer resource_metadata="{meta}""#);
+                    write_resp(
+                        &mut s,
+                        401,
+                        "Unauthorized",
+                        &[("WWW-Authenticate", &wa)],
+                        b"",
+                    );
+                }
+            }
+        }
+    });
+    endpoint
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn a_server_that_checks_the_revision_before_auth_still_gives_its_challenge() {
+    // A 2025-11-25 server: a revision it does not speak is refused before
+    // anything else, so only a request without one reaches its challenge.
+    let ep = spawn_strict("https://as.example", |headers, _| {
+        header(headers, "mcp-protocol-version").is_some_and(|v| v != "2025-11-25")
+    });
+    assert_eq!(
+        discover_issuer(&ep, Duration::from_secs(5)).as_deref(),
+        Some("https://as.example")
+    );
+}
+
+#[test]
+fn a_server_that_checks_the_standard_headers_before_auth_still_gives_its_challenge() {
+    // A 2026-07-28 server: a request without the standard headers, or whose
+    // `Mcp-Method` is not its method, is refused before authentication.
+    let ep = spawn_strict("https://as.example", |headers, msg| {
+        header(headers, "mcp-protocol-version").is_none()
+            || header(headers, "mcp-method") != msg["method"].as_str()
+    });
+    assert_eq!(
+        discover_issuer(&ep, Duration::from_secs(5)).as_deref(),
+        Some("https://as.example")
+    );
+}

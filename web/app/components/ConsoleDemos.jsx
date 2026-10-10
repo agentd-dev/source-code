@@ -25,7 +25,7 @@ const DEMOS = [
       { t: "out", text: "         --mcp github=https://mcp-github.internal/mcp \\" },
       { t: "out", text: "         --intelligence https://gateway.internal/v1" },
       { t: "out", text: "", ms: 220 },
-      { t: "out", text: '{"event":"mcp.connect","server":"github","proto":"2026-07-28"}', cls: "comment" },
+      { t: "out", text: '{"event":"mcp.connect","server":"github","protocol":"2026-07-28"}', cls: "comment" },
       { t: "out", text: '{"event":"run.start","tools":11,"servers":1}', cls: "comment" },
       { t: "spin", text: "thinking · 1.2k tok", ms: 1000 },
       { t: "out", text: '{"event":"tool.call","tool":"list_issues"}', cls: "comment" },
@@ -48,7 +48,7 @@ const DEMOS = [
     title: "agentd — wake on an event",
     script: [
       { t: "in", text: "agentd --config triage.yaml" },
-      { t: "out", text: '{"event":"mcp.connect","server":"queue","proto":"2026-07-28"}', cls: "comment" },
+      { t: "out", text: '{"event":"mcp.connect","server":"queue","protocol":"2026-07-28"}', cls: "comment" },
       { t: "out", text: '{"event":"mcp.subscribe","uri":"queue://inbox"}', cls: "comment" },
       { t: "out", text: '{"event":"proc.ready","workflows":1,"job_shape":false}', cls: "comment" },
       { t: "spin", text: "idle · 0 turns · waiting on queue://inbox", ms: 1600 },

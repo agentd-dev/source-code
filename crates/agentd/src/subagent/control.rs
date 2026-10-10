@@ -267,7 +267,11 @@ pub fn run() -> i32 {
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
             Ok(mut c) => {
-                log.info("mcp.connect", serde_json::json!({"server": spec.name}));
+                crate::runtime::report_dropped_tools(&log, &spec.name, &c);
+                log.info(
+                    "mcp.connect",
+                    serde_json::json!({"server": spec.name, "protocol": c.protocol_version()}),
+                );
                 // The same meta the reactor stamps on its own connections, so a
                 // server sees one run whichever process made the call.
                 c.set_tool_meta(crate::mcp::tool_meta(
@@ -734,10 +738,15 @@ fn refresh_tools_if_changed(
         return;
     }
     match session.refresh_tools(orch) {
-        Ok(()) => log.info(
-            "mcp.tools_refreshed",
-            serde_json::json!({"tools": session.tools_len()}),
-        ),
+        Ok(()) => {
+            for s in servers {
+                crate::runtime::report_dropped_tools(log, s.name(), s);
+            }
+            log.info(
+                "mcp.tools_refreshed",
+                serde_json::json!({"tools": session.tools_len()}),
+            )
+        }
         Err(e) => {
             let msg = match e {
                 LoopAbort::Intel(m) | LoopAbort::Mcp(m) => m,

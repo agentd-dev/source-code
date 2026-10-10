@@ -453,7 +453,11 @@ impl Runtime {
                             .get(&s.name)
                             .map(|sp| sp.tags.clone())
                             .unwrap_or_default(),
-                        tools: c.list_tools().unwrap_or_default(),
+                        tools: {
+                            let tools = c.list_tools().unwrap_or_default();
+                            crate::runtime::report_dropped_tools(&self.log, &s.name, c);
+                            tools
+                        },
                     })
                 })
                 .collect();
@@ -691,8 +695,14 @@ impl Runtime {
                     .info("mcp.disconnect", json!({"server": r, "reason": "reload"}));
             }
             for name in &fresh {
-                self.log
-                    .info("mcp.connect", json!({"server": name, "reason": "reload"}));
+                let protocol = self.mcp.get(name).and_then(|c| c.protocol_version());
+                if let Some(c) = self.mcp.get(name) {
+                    crate::runtime::report_dropped_tools(&self.log, name, c);
+                }
+                self.log.info(
+                    "mcp.connect",
+                    json!({"server": name, "reason": "reload", "protocol": protocol}),
+                );
             }
             drop(previous);
         }

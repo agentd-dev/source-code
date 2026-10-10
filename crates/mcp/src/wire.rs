@@ -25,6 +25,23 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// `initialize`, reached with that request alone.
 pub const DISCOVER_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// The request headers the MCP client sets itself, at MCP 2026-07-28: the
+/// revision, the method and the name it routes on. An operator's copy would
+/// go out beside the client's, and a server refuses the duplicate (-32020).
+pub const PROTOCOL_HEADERS: &[&str] = &["mcp-protocol-version", "mcp-method", "mcp-name"];
+
+/// Prefixes of the request headers the client sets itself: a tool argument
+/// annotated with `x-mcp-header` travels as `Mcp-Param-<name>`.
+pub const PROTOCOL_HEADER_PREFIXES: &[&str] = &["mcp-param-"];
+
+/// Is `name` a header the MCP client sets itself ([`PROTOCOL_HEADERS`],
+/// [`PROTOCOL_HEADER_PREFIXES`]), whatever its case?
+pub fn is_protocol_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    PROTOCOL_HEADERS.contains(&name.as_str())
+        || PROTOCOL_HEADER_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 /// Method + notification names. Constants, so a typo is a compile error rather
 /// than a `-32601` at runtime.
 pub mod method {

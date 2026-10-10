@@ -162,3 +162,59 @@ fn a_failed_priming_list_fails_the_connect() {
         assert_eq!(count(&seen, "subscriptions/listen"), 0, "{err}");
     }
 }
+
+#[test]
+fn every_header_rmcp_adds_is_one_agentd_refuses() {
+    // The headers the MCP client sets on its own are the ones an operator may
+    // not set in config (a copy would be sent beside the client's, and the
+    // server refuses the duplicate). Every header that reaches a 2026-07-28
+    // server from discover, an annotated call, a read, a prompt and a listen
+    // is either the transport's own or one of those; a header a later rmcp
+    // adds fails here until the refusal covers it.
+    let (ep, seen) = server(
+        vec![regional()],
+        json!({"tools": {}, "prompts": {}, "resources": {"subscribe": true}}),
+        None,
+    );
+    let c = connect(&ep, FirstRequest::Discover).unwrap();
+    c.call_tool("regional", Some(json!({"region": "eu"})))
+        .unwrap();
+    let _ = c.read_resource("demo://x");
+    let _ = c.get_prompt("p", None);
+    let _ = c.subscribe("demo://x");
+    let transport = [
+        "host",
+        "content-type",
+        "accept",
+        "content-length",
+        "connection",
+        "authorization",
+    ];
+    let reqs = seen.lock().unwrap().clone();
+    let methods: Vec<&str> = reqs.iter().map(Req::method).collect();
+    for m in [
+        "server/discover",
+        "tools/call",
+        "resources/read",
+        "prompts/get",
+        "subscriptions/listen",
+    ] {
+        assert!(methods.contains(&m), "{m} was not sent: {methods:?}");
+    }
+    for r in &reqs {
+        for (name, _) in &r.headers {
+            assert!(
+                transport.contains(&name.as_str()) || mcp::wire::is_protocol_header(name),
+                "{}: '{name}' is set by the client but not refused in config",
+                r.method()
+            );
+        }
+        assert!(
+            r.headers
+                .iter()
+                .any(|(n, _)| mcp::wire::is_protocol_header(n)),
+            "{}: no protocol header at all",
+            r.method()
+        );
+    }
+}

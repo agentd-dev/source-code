@@ -47,23 +47,65 @@ pub fn discover_issuer(resource: &str, timeout: Duration) -> Option<String> {
         .find(|s| !s.trim().is_empty())
 }
 
-/// Probe the resource with one unauthenticated MCP request; on a `401`, return
+/// Probe the resource with an unauthenticated MCP request; on a `401`, return
 /// the `resource_metadata` URL named in the `WWW-Authenticate` challenge.
+///
+/// Two probes, because a server may check the request before it checks the
+/// caller. The first is a bare `initialize` with no revision header, which a
+/// 2025-11-25 server that checks `MCP-Protocol-Version` first still answers
+/// with its 401. Only when that draws no challenge, a `server/discover` with
+/// the MCP 2026-07-28 standard headers and `_meta`, which a 2026-07-28 server
+/// that validates those before auth answers with its 401 instead of a -32020.
 fn challenge_metadata_url(resource: &str, timeout: Duration) -> Option<String> {
+    let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    if let Some(url) = probe(
+        resource,
+        timeout,
+        &[("Accept", "application/json")],
+        initialize,
+    ) {
+        return Some(url);
+    }
+    let version = ::mcp::wire::DISCOVER_PROTOCOL_VERSION;
+    let discover = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": {"name": "agentd", "version": crate::VERSION},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }}
+    })
+    .to_string();
+    probe(
+        resource,
+        timeout,
+        &[
+            ("Accept", "application/json, text/event-stream"),
+            ("MCP-Protocol-Version", version),
+            ("Mcp-Method", "server/discover"),
+        ],
+        discover.as_bytes(),
+    )
+}
+
+/// One unauthenticated POST of `body` with `headers`; the challenge's
+/// `resource_metadata` URL if the answer carries a challenge that names one.
+fn probe(
+    resource: &str,
+    timeout: Duration,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Option<String> {
     let url = Url::parse(resource).ok()?;
     let mut stream = oauth2::connect(&url, timeout).ok()?;
-    // A minimal JSON-RPC `initialize` is the canonical MCP request; an
-    // unauthenticated server answers 401 with the challenge before processing it.
-    let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let mut all: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+    all.extend_from_slice(headers);
     let resp = http::send(
         stream.as_mut(),
         &url.host_header(),
         "POST",
         &url.path,
-        &[
-            ("Content-Type", "application/json"),
-            ("Accept", "application/json"),
-        ],
+        &all,
         body,
     )
     .ok()?;

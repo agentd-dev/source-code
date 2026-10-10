@@ -153,6 +153,12 @@ fn a_server_that_forgets_the_session_is_re_dialed_and_the_subscription_restored(
             .any(|e| e["server"] == "mock" && e["reason"] == "session_lost"),
         "the re-dial is said:\n{log}"
     );
+    // Both connections — at boot and the re-dial — say the revision they
+    // negotiated.
+    assert_eq!(back.len(), 2, "{log}");
+    for c in &back {
+        assert_eq!(c["protocol"], "2025-11-25", "{log}");
+    }
     assert!(
         events(&log, "start.subscribe.armed")
             .iter()
@@ -397,6 +403,41 @@ fn an_instruction_on_a_server_without_subscriptions_is_said_once_not_on_every_re
         events(&log, "instruction.subscribe.unsupported").len(),
         1,
         "said once:\n{log}"
+    );
+    let _ = std::fs::remove_file(&addr_file);
+}
+
+#[test]
+fn a_tool_rmcp_drops_is_logged_once_by_the_daemon() {
+    // At the stateless revision the MCP client drops, without a word, a tool
+    // whose `x-mcp-header` annotation it rejects. The daemon says it — once,
+    // though boot drains twice (after the connect's priming list and after
+    // the catalogue's own list).
+    let addr_file = common::unique_path("mock-dropped", "addr");
+    let _ = std::fs::remove_file(&addr_file);
+    let thread_file = addr_file.clone();
+    std::thread::spawn(move || {
+        agentd::mcp::mock_http::run_listening(&thread_file, WATCHED);
+    });
+    let endpoint = format!("http://{}", common::read_addr_file(&addr_file));
+    let daemon = Daemon::start(
+        "mcp-dropped",
+        &format!(
+            "agent:\n  name: dropped\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}/mcp\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n"
+        ),
+    );
+    daemon.wait_for("the connection", |log| {
+        !events(log, "mcp.connect").is_empty()
+    });
+    let log = daemon.log();
+    let dropped = events(&log, "mcp.tool.dropped");
+    assert_eq!(dropped.len(), 1, "{log}");
+    assert_eq!(dropped[0]["level"], "warn", "{log}");
+    assert_eq!(dropped[0]["server"], "mock", "{log}");
+    assert_eq!(dropped[0]["tool"], "mock.nested", "{log}");
+    assert_eq!(
+        dropped[0]["reason"], "invalid x-mcp-header annotation",
+        "{log}"
     );
     let _ = std::fs::remove_file(&addr_file);
 }

@@ -202,24 +202,27 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
         "tools/list" => (
             Response::ok(
                 req.id,
-                json!({"tools": [
-                    {"name": "state.put", "description": "checkpointer put", "inputSchema": {"type": "object"}},
-                    {"name": "state.get", "description": "checkpointer get", "inputSchema": {"type": "object"}},
-                    {"name": "state.list", "description": "checkpointer list", "inputSchema": {"type": "object"}},
-                    {"name": "state.delete", "description": "checkpointer delete", "inputSchema": {"type": "object"}},
-                    {"name": "flaky", "description": "fails once, then succeeds", "inputSchema": {"type": "object"}},
-                    {"name": "mock.fault", "description": "fail the next N state.* calls", "inputSchema": {"type": "object"}},
-                    {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
-                    {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
-                    {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
-                    {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
-                    {"name": "mock.refuse_subscribe", "description": "refuse the next `count` resources/subscribe calls", "inputSchema": {"type": "object"}},
-                    {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
-                    {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
-                    {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
-                    {"name": "search.query", "description": "mock web search", "inputSchema": {"type": "object"}},
-                    {"name": "search.fetch", "description": "mock page fetch", "inputSchema": {"type": "object"}},
-                ]}),
+                with_listen_tools(
+                    state,
+                    json!({"tools": [
+                        {"name": "state.put", "description": "checkpointer put", "inputSchema": {"type": "object"}},
+                        {"name": "state.get", "description": "checkpointer get", "inputSchema": {"type": "object"}},
+                        {"name": "state.list", "description": "checkpointer list", "inputSchema": {"type": "object"}},
+                        {"name": "state.delete", "description": "checkpointer delete", "inputSchema": {"type": "object"}},
+                        {"name": "flaky", "description": "fails once, then succeeds", "inputSchema": {"type": "object"}},
+                        {"name": "mock.fault", "description": "fail the next N state.* calls", "inputSchema": {"type": "object"}},
+                        {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
+                        {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
+                        {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
+                        {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
+                        {"name": "mock.refuse_subscribe", "description": "refuse the next `count` resources/subscribe calls", "inputSchema": {"type": "object"}},
+                        {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
+                        {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
+                        {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
+                        {"name": "search.query", "description": "mock web search", "inputSchema": {"type": "object"}},
+                        {"name": "search.fetch", "description": "mock page fetch", "inputSchema": {"type": "object"}},
+                    ]}),
+                ),
             ),
             false,
         ),
@@ -663,6 +666,24 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "Employees accrue 2 days of vacation per month; requests go to the manager two weeks ahead.",
         ),
     ]
+}
+
+/// The tool list, plus — at the stateless revision, where the client checks
+/// `x-mcp-header` annotations — `mock.nested`, whose annotation sits on a
+/// nested property, which the client rejects and drops: the tool a host must
+/// say it lost.
+fn with_listen_tools(state: &State, mut list: serde_json::Value) -> serde_json::Value {
+    if state.listen
+        && let Some(tools) = list["tools"].as_array_mut()
+    {
+        tools.push(json!({
+            "name": "mock.nested",
+            "description": "a nested x-mcp-header annotation the client drops",
+            "inputSchema": {"type": "object", "properties": {"outer": {"type": "object",
+                "properties": {"inner": {"type": "string", "x-mcp-header": "Inner"}}}}}
+        }));
+    }
+    list
 }
 
 /// One `subscriptions/listen`: acknowledge the filter (less what `mock.narrow`

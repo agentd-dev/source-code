@@ -6790,7 +6790,15 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(&mut d, e);
         }
         for (h, v) in &srv.headers {
-            if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
+            if ::mcp::wire::is_protocol_header(h) {
+                err(
+                    &mut d,
+                    format!(
+                        "mcp server '{}' header '{h}' is set by the MCP client itself (the protocol owns it); remove it",
+                        srv.name
+                    ),
+                );
+            } else if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
                 err(
                     &mut d,
                     format!(
@@ -6902,7 +6910,14 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
         for (h, v) in &svc.headers {
-            if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
+            if ::mcp::wire::is_protocol_header(h) {
+                err(
+                    &mut d,
+                    format!(
+                        "services.{name} header '{h}' is set by the MCP client itself (the protocol owns it); remove it"
+                    ),
+                );
+            } else if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
                 err(
                     &mut d,
                     format!(
@@ -12429,6 +12444,47 @@ mod tests {
         assert!(
             file_store_root_in(&Store::default(), &env(all[1..].to_vec()))
                 .ends_with("agentd/state")
+        );
+    }
+
+    #[test]
+    fn an_mcp_header_the_protocol_owns_is_refused_at_load() {
+        // The client sets these itself; an operator's copy would go out beside
+        // it, and a 2026-07-28 server refuses the duplicate.
+        let errors = |doc: &str| match load_doc(doc) {
+            Ok(l) => validate(&l).errors,
+            Err(e) => vec![e.to_string()],
+        };
+        for h in [
+            "MCP-Protocol-Version",
+            "mcp-method",
+            "Mcp-Name",
+            "Mcp-Param-Region",
+        ] {
+            for doc in [
+                format!(
+                    "mcp:\n  servers:\n    - {{name: m, endpoint: https://m/mcp, headers: {{\"{h}\": x}}}}\n"
+                ),
+                format!(
+                    "services:\n  m:\n    endpoint: https://m/mcp\n    headers: {{\"{h}\": x}}\n"
+                ),
+            ] {
+                let errs = errors(&doc);
+                assert!(
+                    errs.iter()
+                        .any(|e| e.contains("set by the MCP client itself")),
+                    "{h}: {errs:?}"
+                );
+            }
+        }
+        let errs = errors(
+            "mcp:\n  servers:\n    - {name: m, endpoint: https://m/mcp, headers: {X-Env: prod}}\n",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("set by the MCP client itself")),
+            "{errs:?}"
         );
     }
 

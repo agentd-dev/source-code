@@ -98,8 +98,9 @@ exhaustive.
 | `proc.ready` | readiness reached (see [Health](#health-shape-aware)) |
 | `proc.exit` | `code`, `uptime_ms` |
 | `config.invalid` / `config.warning` / `config.reloaded` | `error` / `warning` — one validation or reload finding, never a secret value; `config.reloaded` carries `trigger` and `changed` |
-| `mcp.connect` | `server`, `transport`, `tools` (count), `resources` (count) |
-| `mcp.connect.fail` | `server`, `transport`, `err` |
+| `mcp.connect` | `server`, `tools` (count, at boot), `protocol` (the MCP revision the connection negotiated: `2025-11-25` through the handshake, `2026-07-28` through `server/discover`), and `reason` on a reload or a re-dial |
+| `mcp.connect.fail` | `server`, `err`, and `reason` on a reload or a re-dial |
+| `mcp.tool.dropped` | `server`, `tool`, `reason` — at warn level, once per tool per connection: the server listed a tool the MCP client dropped (an `x-mcp-header` annotation it rejects, at 2026-07-28), so the agent cannot call it |
 | `mcp.disconnect` | `server`, `reason` (`reload`, `reload refused`, or `session_lost`: the server answered `404` to the connection's session, and agentd re-dials it) |
 | `mcp.connect` (`reason: session_lost`) / `mcp.connect.fail` (`reason: session_lost`) | `server` / `err` — the re-dial after a lost session; a failed one is retried on a 1s→30s backoff. A successful one restores the starts, waits and instruction on that server, each said under its own event with `reason: session_lost` |
 | `mcp.listen.ended` / `mcp.listen.resumed` | `server` + `reason`, `retry_ms` — a `subscriptions/listen` stream ended and is opened again after `retry_ms`. At info with `reason: "idle"` (and the cut in `detail`) when it was quiet past its idle bound, at warn otherwise. A URI whose content changed while it was being re-opened gets one `resources/updated`; that is not logged here, the wake it causes is (2026-07-28 connections only) |

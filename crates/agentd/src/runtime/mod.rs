@@ -390,10 +390,15 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                     &instance,
                     Some(&trace.trace_id),
                 ));
+                // Said after the connect (its priming list) and after the
+                // catalogue's own list.
+                report_dropped_tools(&log, &s.name, &c);
                 let tools = c.list_tools().unwrap_or_default();
+                report_dropped_tools(&log, &s.name, &c);
                 log.info(
                     "mcp.connect",
-                    json!({"server": s.name, "tools": tools.len()}),
+                    json!({"server": s.name, "tools": tools.len(),
+                           "protocol": c.protocol_version()}),
                 );
                 server_tools.push(ServerTools {
                     name: s.name.clone(),
@@ -2428,9 +2433,11 @@ impl Runtime {
             crate::obs::metrics::record_mcp_connect_failure(&name);
             return;
         }
+        report_dropped_tools(&self.log, &name, &c);
         self.log.info(
             "mcp.connect",
-            json!({"server": name, "reason": "session_lost"}),
+            json!({"server": name, "reason": "session_lost",
+                   "protocol": c.protocol_version()}),
         );
         // Everything is asked for below, a pending retry's URIs included.
         self.resubscribe_retry.remove(&name);
@@ -2520,6 +2527,24 @@ pub(crate) struct SubscribeRetry {
     /// Rounds in a row that left something to ask again.
     pub(crate) failures: u32,
     pub(crate) not_before_ms: u64,
+}
+
+/// Log, once per tool per connection, every tool the server listed that the
+/// MCP client dropped (an `x-mcp-header` annotation rmcp rejects, at
+/// 2026-07-28): otherwise the agent loses a tool with nothing in any log.
+/// Every place that dials a server or lists its tools calls this one function.
+pub(crate) fn report_dropped_tools(
+    log: &crate::obs::log::Logger,
+    server: &str,
+    client: &::mcp::client::McpClient,
+) {
+    for tool in client.drain_dropped_tools() {
+        log.warn(
+            "mcp.tool.dropped",
+            json!({"server": server, "tool": tool,
+                   "reason": "invalid x-mcp-header annotation"}),
+        );
+    }
 }
 
 /// How one listen event is logged: its level, its event name and its fields.

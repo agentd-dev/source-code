@@ -15,6 +15,9 @@
 //!   `400` body, an event-stream frame with no id — and the bootstrap messages
 //!   are handed to the SDK whole, so a refusal reaches the handshake as the
 //!   server's own error. A session is taken only from the `initialize` answer.
+//! * A response stream the SDK drops hangs up the HTTP exchange under it: at
+//!   2026-07-28 the closed stream is the request's cancellation, and a reader
+//!   that only noticed on its next frame would hold the server's side open.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -481,6 +484,7 @@ fn an_oversized_request_head_is_refused_431() {
 
 // ------------------------------- 4. the server's answer, whatever carries it
 
+use futures::StreamExt;
 use rmcp::model::ClientJsonRpcMessage;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
@@ -816,4 +820,225 @@ fn an_initialize_refused_with_a_json_rpc_error_says_the_servers_error() {
         Ok(_) => panic!("the server refused the handshake"),
     };
     assert!(err.contains("Unsupported protocol version"), "{err}");
+}
+
+// ------------------------------- 5. a dropped response stream hangs up
+
+/// The `tools/call` request (id 1) the SDK's worker posts for a call.
+fn tools_call() -> ClientJsonRpcMessage {
+    serde_json::from_value(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "slow", "arguments": {}}
+    }))
+    .expect("a tools/call request")
+}
+
+/// Watch a connection the server has finished writing to, until the client
+/// closes its side or `deadline` passes: the instant the close was seen, and
+/// whatever bytes the client sent meanwhile.
+///
+/// A read that times out (`WouldBlock` or `TimedOut`, depending on the
+/// platform) is a connection still open; only end-of-stream, or a reset or
+/// broken pipe, is the client hanging up. Counting a timeout as a close would
+/// see a hang-up within 50 ms of every exchange, hung up or not.
+fn watch_for_close(conn: &mut TcpStream, deadline: Instant) -> (Option<Instant>, Vec<u8>) {
+    conn.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    let mut sent = Vec::new();
+    while Instant::now() < deadline {
+        let mut b = [0u8; 1];
+        match conn.read(&mut b) {
+            Ok(0) => return (Some(Instant::now()), sent),
+            Ok(_) => sent.push(b[0]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return (Some(Instant::now()), sent),
+        }
+    }
+    (None, sent)
+}
+
+/// What a holding server saw of the client's side once it had answered: when
+/// the client closed, if it did, and any bytes it sent.
+type Watched = std::sync::mpsc::Receiver<(Option<Instant>, Vec<u8>)>;
+
+/// A server that answers one POST with an event stream carrying `frames`,
+/// then holds the connection and reports what it saw of the client's side
+/// (see [`watch_for_close`]) over the next 5 s.
+fn spawn_holding(frames: String) -> (String, Watched) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((conn, _)) = listener.accept() else {
+            return;
+        };
+        conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut w = conn.try_clone().unwrap();
+        let mut r = BufReader::new(conn);
+        let Some((_, headers)) = read_head(&mut r) else {
+            return;
+        };
+        let _ = read_body(&mut r, &headers);
+        let _ = w.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\r\n",
+        );
+        let _ = w.write_all(frames.as_bytes());
+        let _ = w.flush();
+        let _ = tx.send(watch_for_close(
+            &mut w,
+            Instant::now() + Duration::from_secs(5),
+        ));
+    });
+    (format!("http://{addr}/mcp"), rx)
+}
+
+/// POST `message` through agentd's socket and hand the response stream to
+/// `use_stream`, as the SDK's worker would — on a runtime that outlives it.
+fn with_stream<T>(
+    ep: &str,
+    message: ClientJsonRpcMessage,
+    use_stream: impl AsyncFnOnce(
+        futures::stream::BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>,
+    ) -> T,
+) -> T {
+    let http = Arc::new(HttpTransport::new(McpEndpoint::parse(ep).unwrap(), vec![]));
+    // A socket timeout far past every bound below: what ends the exchange
+    // must be the hang-up, not the socket giving up on a silent server.
+    let agentd = mcp::rmcp_transport::AgentdHttp::new(http, Duration::from_secs(30));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            match agentd
+                .post_message(Arc::from(ep), message, None, None, HashMap::new())
+                .await
+            {
+                Ok(StreamableHttpPostResponse::Sse(stream, _)) => use_stream(stream).await,
+                other => panic!("expected a response stream, got {other:?}"),
+            }
+        })
+}
+
+#[test]
+fn a_response_stream_the_sdk_drops_hangs_up_its_connection() {
+    // A call in progress: the server has said something (a progress
+    // notification) and is still working. Then the SDK drops the stream — a
+    // listen replaced, a request cancelled. At 2026-07-28 that close IS the
+    // cancellation, so the server must see the connection go, now — not
+    // whenever its next frame would have found the reader gone, and not at
+    // the socket's 30 s timeout.
+    let progress = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                          "params": {"progressToken": 1, "progress": 1}});
+    let (ep, seen) = spawn_holding(format!("data: {progress}\n\n"));
+    let dropped = with_stream(&ep, tools_call(), async |mut stream| {
+        let first = stream.next().await.expect("a frame").expect("an event");
+        assert!(
+            first
+                .data
+                .as_deref()
+                .unwrap_or("")
+                .contains("notifications/progress"),
+            "{first:?}"
+        );
+        drop(stream);
+        Instant::now()
+    });
+    let (closed, _) = seen.recv().expect("the server reports");
+    let closed = closed.expect("the server never saw the connection close");
+    assert!(
+        closed.saturating_duration_since(dropped) < Duration::from_secs(3),
+        "hung up {:?} after the drop",
+        closed.saturating_duration_since(dropped)
+    );
+}
+
+#[test]
+fn a_finished_exchange_hung_up_late_is_harmless() {
+    // The answer arrived and the stream ran to its end; the SDK drops it
+    // afterwards. The exchange is over, so the hang-up has nothing left to
+    // close: the client sends nothing more and nothing panics.
+    let answer = json!({"jsonrpc": "2.0", "id": 1,
+                        "result": {"content": [], "isError": false}});
+    let (ep, seen) = spawn_holding(format!("data: {answer}\n\n"));
+    let items = with_stream(&ep, tools_call(), async |stream| {
+        let items: Vec<_> = stream.collect().await;
+        items
+    });
+    assert_eq!(items.len(), 1, "the answer, then the end: {items:?}");
+    let got: Value =
+        serde_json::from_str(items[0].as_ref().unwrap().data.as_deref().unwrap()).unwrap();
+    assert_eq!(got["result"]["isError"], false, "{got}");
+    let (closed, sent) = seen.recv().expect("the server reports");
+    assert!(
+        closed.is_some(),
+        "the finished exchange closed its connection"
+    );
+    assert!(sent.is_empty(), "nothing after the request: {sent:?}");
+}
+
+#[test]
+fn a_finished_exchange_closes_with_its_answer_not_with_its_stream() {
+    // The hang-up handle keeps its own descriptor on the socket, and a socket
+    // closes only when its last descriptor does. So the exchange lets go of
+    // that descriptor when it ends: the connection closes once the answer is
+    // read, as it did before the handle existed — not whenever the SDK gets
+    // round to dropping a stream it has already read the answer from.
+    let answer = json!({"jsonrpc": "2.0", "id": 1,
+                        "result": {"content": [], "isError": false}});
+    let (ep, seen) = spawn_holding(format!("data: {answer}\n\n"));
+    let (closed, answered) = with_stream(&ep, tools_call(), async |mut stream| {
+        let first = stream.next().await.expect("a frame").expect("an event");
+        assert!(
+            first.data.as_deref().unwrap_or("").contains("isError"),
+            "{first:?}"
+        );
+        let answered = Instant::now();
+        // The stream is still held while the server reports.
+        let (closed, _) = seen.recv().expect("the server reports");
+        drop(stream);
+        (closed, answered)
+    });
+    let closed = closed.expect("the connection outlived its answer");
+    assert!(
+        closed.saturating_duration_since(answered) < Duration::from_secs(3),
+        "closed {:?} after the answer",
+        closed.saturating_duration_since(answered)
+    );
+}
+
+#[test]
+fn a_bootstrap_post_dropped_while_it_waits_hangs_up() {
+    // `server/discover` waits inside `post_message` for its whole answer. If
+    // the SDK drops that wait — its own bound on the bootstrap — the exchange
+    // goes with it, exactly as a dropped stream's does.
+    let (ep, seen) = spawn_holding(String::new());
+    let http = Arc::new(HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]));
+    let agentd = mcp::rmcp_transport::AgentdHttp::new(http, Duration::from_secs(30));
+    let dropped = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let post = agentd.post_message(
+                Arc::from(ep.as_str()),
+                discover(),
+                None,
+                None,
+                HashMap::new(),
+            );
+            let waited = tokio::time::timeout(Duration::from_millis(300), post).await;
+            assert!(waited.is_err(), "the server never answers");
+            Instant::now()
+        });
+    let (closed, _) = seen.recv().expect("the server reports");
+    let closed = closed.expect("the server never saw the connection close");
+    assert!(
+        closed.saturating_duration_since(dropped) < Duration::from_secs(3),
+        "hung up {:?} after the drop",
+        closed.saturating_duration_since(dropped)
+    );
 }

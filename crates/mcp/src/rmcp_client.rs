@@ -537,13 +537,19 @@ impl RmcpClient {
     ///
     /// A bound covers every round of the call, not one HTTP exchange — the
     /// operator's answer to an elicitation included; on expiry the call is
-    /// abandoned and the caller gets a timeout error. The abandoned exchange
-    /// runs on until the socket's own timeout without holding up the calls
-    /// behind it (see [`crate::rmcp_transport`]). No `notifications/cancelled`
-    /// is sent for it: the SDK's call helper, which drives the MRTR rounds,
-    /// does not expose the request id, so the server learns of the abandonment
-    /// only when the exchange closes. Without a bound, only the socket's
-    /// timeout on each silence can end the call.
+    /// abandoned and the caller gets a timeout error.
+    ///
+    /// **An abandoned call is not cancelled, and its exchange is not hung
+    /// up.** Dropping the SDK's call future drops a request handle that does
+    /// nothing when dropped — only a subscription cancels that way — so the
+    /// request stays pending in the SDK's worker, which keeps its response
+    /// stream open. The exchange therefore runs on until the server answers
+    /// or the socket's idle bound (this connection's timeout) fires, without
+    /// holding up the calls behind it (see [`crate::rmcp_transport`]). The
+    /// server is told nothing meanwhile: no `notifications/cancelled` (the
+    /// SDK's call helper, which drives the MRTR rounds, does not expose the
+    /// request id), and at 2026-07-28 no closed stream either. Without a
+    /// bound, only the socket's timeout on each silence can end the call.
     pub fn call_tool(
         &self,
         name: &str,

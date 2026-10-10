@@ -20,6 +20,7 @@ use net::http::{self, SseEvent, Url};
 use net::tls::ClientIdentity;
 use serde_json::Value;
 use std::io;
+use std::net::{Shutdown, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -110,6 +111,55 @@ pub fn authority_of(endpoint: &str) -> String {
     McpEndpoint::parse(endpoint)
         .map(|e| e.host_header().to_string())
         .unwrap_or_default()
+}
+
+/// A way to hang up one exchange from outside the thread that blocks on it.
+///
+/// The send reads its answer on a blocking socket, and the only thing that
+/// stops a blocking read early is the socket going away under it. So each
+/// connection the exchange opens is armed here — the raw TCP socket, beneath
+/// any TLS — and [`Hangup::hang_up`] shuts it down: the read fails, the send
+/// returns, its thread ends, and the server sees the connection close. At MCP
+/// 2026-07-28 that close IS the cancellation of the request it carried.
+#[derive(Debug, Default)]
+pub(crate) struct Hangup {
+    closed: AtomicBool,
+    socket: Mutex<Option<TcpStream>>,
+}
+
+impl Hangup {
+    /// Hang up: the armed connection is shut down now, and any connection the
+    /// exchange opens later is shut down as it is armed. Safe at any point,
+    /// after the exchange finished included.
+    pub(crate) fn hang_up(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let socket = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(s) = socket {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Arm the connection an attempt is about to use. `false` (and the
+    /// connection shut down) if the exchange was already hung up — between the
+    /// dial and here, or before an AAuth retry. The check and the store happen
+    /// under the lock [`Self::hang_up`] takes, so a hang-up racing this either
+    /// sees the socket or is seen by it.
+    fn arm(&self, s: TcpStream) -> bool {
+        let mut slot = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::SeqCst) {
+            let _ = s.shutdown(Shutdown::Both);
+            return false;
+        }
+        *slot = Some(s);
+        true
+    }
+
+    /// The exchange is over: let go of the armed socket without shutting it
+    /// down, so the connection closes with the exchange rather than with
+    /// whoever still holds this handle.
+    fn disarm(&self) {
+        self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
 }
 
 /// The classification of one [`HttpTransport::send_once`] attempt (AAuth loop).
@@ -268,19 +318,22 @@ impl HttpTransport {
 
     /// Open a fresh connection to the endpoint as a boxed byte stream, applying
     /// `timeout` as the connect + read/write bound (each request opens its own
-    /// connection, so the per-call timeout governs the whole exchange).
-    fn connect(&self, timeout: Duration) -> Result<Box<dyn http::Stream>, HttpError> {
+    /// connection, so the per-call timeout governs the whole exchange). Also
+    /// returns a handle on the raw TCP socket, taken before any TLS wrap: what
+    /// a [`Hangup`] shuts down to end the exchange from another thread.
+    fn connect(&self, timeout: Duration) -> Result<(Box<dyn http::Stream>, TcpStream), HttpError> {
         match &self.endpoint {
             McpEndpoint::Tcp {
                 host, port, tls, ..
             } => {
                 let tcp = http::connect_tcp(host, *port, timeout).map_err(HttpError::Connect)?;
+                let raw = tcp.try_clone().map_err(HttpError::Connect)?;
                 if *tls {
                     #[cfg(feature = "tls")]
                     {
                         let s = net::tls::connect(tcp, host, self.identity.as_ref())
                             .map_err(HttpError::Connect)?;
-                        Ok(Box::new(s))
+                        Ok((Box::new(s), raw))
                     }
                     #[cfg(not(feature = "tls"))]
                     {
@@ -289,7 +342,7 @@ impl HttpTransport {
                         ))
                     }
                 } else {
-                    Ok(Box::new(tcp))
+                    Ok((Box::new(tcp), raw))
                 }
             }
         }
@@ -340,7 +393,54 @@ impl HttpTransport {
         body: &[u8],
         timeout: Duration,
         extra_headers: &[(&str, &str)],
+        on_notification: F,
+    ) -> Result<Option<Value>, HttpError> {
+        // Nobody else holds this handle, so nothing hangs the exchange up.
+        self.send_until_hangup(
+            request_id,
+            body,
+            timeout,
+            extra_headers,
+            on_notification,
+            &Hangup::default(),
+        )
+    }
+
+    /// [`Self::send`], ended early when `hangup` is hung up: the connection
+    /// in use is shut down, the blocked read fails, and the send returns an
+    /// error. A hang-up before a connection is in use stops it from being
+    /// used — the request is never sent, and the answer is
+    /// [`HttpError::NoResponse`].
+    pub(crate) fn send_until_hangup<F: FnMut(Value)>(
+        &self,
+        request_id: Option<i64>,
+        body: &[u8],
+        timeout: Duration,
+        extra_headers: &[(&str, &str)],
         mut on_notification: F,
+        hangup: &Hangup,
+    ) -> Result<Option<Value>, HttpError> {
+        let out = self.send_attempts(
+            request_id,
+            body,
+            timeout,
+            extra_headers,
+            &mut on_notification,
+            hangup,
+        );
+        hangup.disarm();
+        out
+    }
+
+    /// The AAuth request loop behind [`Self::send_until_hangup`].
+    fn send_attempts<F: FnMut(Value)>(
+        &self,
+        request_id: Option<i64>,
+        body: &[u8],
+        timeout: Duration,
+        extra_headers: &[(&str, &str)],
+        on_notification: &mut F,
+        hangup: &Hangup,
     ) -> Result<Option<Value>, HttpError> {
         // AAuth request loop: send signed; if the server answers
         // with an `AAuth-Requirement` the signer can satisfy (adopt an access
@@ -359,7 +459,8 @@ impl HttpTransport {
                 body,
                 timeout,
                 extra_headers,
-                &mut on_notification,
+                on_notification,
+                hangup,
             )? {
                 SendOutcome::Result(v) => return Ok(v),
                 SendOutcome::Error(e) => return Err(e),
@@ -373,7 +474,8 @@ impl HttpTransport {
                         body,
                         timeout,
                         extra_headers,
-                        &mut on_notification,
+                        on_notification,
+                        hangup,
                     )? {
                         SendOutcome::Result(v) => Ok(v),
                         SendOutcome::Error(e) => Err(e),
@@ -388,7 +490,9 @@ impl HttpTransport {
     /// response — a parsed result, a terminal error, or `RetryAuth` (the signer
     /// satisfied an `AAuth-Requirement`; the caller re-signs and retries).
     /// `opens_session`: this is an `initialize`, whose answer's `Mcp-Session-Id`
-    /// is adopted.
+    /// is adopted. Every attempt arms its own connection on `hangup`, an AAuth
+    /// re-sign included, so a hang-up reaches whichever one is live.
+    #[allow(clippy::too_many_arguments)]
     fn send_once<F: FnMut(Value)>(
         &self,
         request_id: Option<i64>,
@@ -397,8 +501,14 @@ impl HttpTransport {
         timeout: Duration,
         extra_headers: &[(&str, &str)],
         on_notification: &mut F,
+        hangup: &Hangup,
     ) -> Result<SendOutcome, HttpError> {
-        let mut stream = self.connect(timeout)?;
+        let (mut stream, raw) = self.connect(timeout)?;
+        if !hangup.arm(raw) {
+            // Hung up before this connection carried anything: the caller no
+            // longer wants an answer, so the request is not sent at all.
+            return Ok(SendOutcome::Error(HttpError::NoResponse));
+        }
         let mut headers: Vec<(&str, &str)> = vec![
             ("Content-Type", "application/json"),
             ("Accept", "application/json, text/event-stream"),
@@ -550,7 +660,8 @@ impl HttpTransport {
         read_timeout: Duration,
         extra_headers: &[(&str, &str)],
     ) -> Result<EventStream, HttpError> {
-        let stream = self.connect(read_timeout)?;
+        // The raw handle goes unused: this stream ends when its reader stops.
+        let (stream, _) = self.connect(read_timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];
         let session = self
             .session
@@ -686,5 +797,31 @@ mod tests {
         let got = route_message(&r, Some(1), &mut |v| notes.push(v)).expect("response");
         assert_eq!(got["result"]["ok"], true);
         assert_eq!(notes.len(), 1, "response is not queued as a notification");
+    }
+
+    #[test]
+    fn an_exchange_hung_up_before_it_is_sent_sends_nothing() {
+        // The caller let go between the dial and the write — or before an
+        // AAuth retry dials again. The connection is shut down unused: the
+        // server sees it close with no request on it, and the send says it
+        // got no answer.
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut got = Vec::new();
+            let _ = conn.read_to_end(&mut got);
+            got
+        });
+        let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]);
+        let hangup = Hangup::default();
+        hangup.hang_up();
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let out = t.send_until_hangup(Some(1), body, Duration::from_secs(5), &[], |_| {}, &hangup);
+        assert!(matches!(out, Err(HttpError::NoResponse)), "{out:?}");
+        let got = server.join().unwrap();
+        assert!(got.is_empty(), "sent: {}", String::from_utf8_lossy(&got));
     }
 }

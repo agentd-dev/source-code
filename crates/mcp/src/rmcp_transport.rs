@@ -32,6 +32,19 @@
 //! `server/discover` and `initialize` — are handed back whole, as one JSON
 //! answer, because the SDK's bootstrap reader skips an error it meets on a
 //! stream and would never see a refusal.
+//!
+//! ## Dropping a stream hangs up its exchange
+//!
+//! Every response stream handed to the SDK owns its HTTP exchange: when the
+//! SDK drops the stream, the connection under it is shut down at once, and the
+//! thread blocked reading it ends. At MCP 2026-07-28 that is how a request is
+//! cancelled — the SDK sends no `notifications/cancelled` there, and the server
+//! takes the closed response stream as the cancellation — so a listen the SDK
+//! replaces, or a request it cancels, stops at the server too rather than
+//! holding a connection and a subscription until the socket's timeout. At
+//! 2025-11-25 a closed stream cancels nothing, and the SDK still sends the
+//! notification. A call its caller merely abandons is NOT hung up: the SDK
+//! keeps that stream until it ends (see `RmcpClient::call_tool`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,7 +58,7 @@ use rmcp::transport::streamable_http_client::{
 use serde_json::Value;
 use sse_stream::{Error as SseError, Sse};
 
-use crate::http::{HttpError, HttpTransport};
+use crate::http::{Hangup, HttpError, HttpTransport};
 
 /// The SDK's transport, backed by agentd's authenticated HTTP.
 #[derive(Clone)]
@@ -75,6 +88,18 @@ enum Pumped {
     /// The exchange ended: the reply (`None` when the POST was a notification
     /// and `202 Accepted` came back), or the transport error that ended it.
     Done(Result<Option<Value>, HttpError>),
+}
+
+/// Hangs up an exchange when dropped. It lives in the state of every stream
+/// handed to the SDK, so dropping the stream is what closes the connection —
+/// see the module doc. Hanging up an exchange that already finished does
+/// nothing.
+struct HangupOnDrop(Arc<Hangup>);
+
+impl Drop for HangupOnDrop {
+    fn drop(&mut self) {
+        self.0.hang_up();
+    }
 }
 
 /// One JSON value as the SDK expects to read it off a stream.
@@ -161,23 +186,36 @@ impl StreamableHttpClient for AgentdHttp {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pumped>();
         // Not awaited: the send owns a thread for as long as the server keeps
         // the exchange open, and this call must return before it finishes. The
-        // thread ends when the send does; a receiver dropped early makes the
-        // sends fail, which costs nothing since the send is already unwinding.
+        // thread ends when the send does — when the server finishes, or when
+        // whoever holds the exchange drops it. A dropped receiver alone would
+        // not end it: a send blocked reading a silent server notices nothing
+        // until its next frame or the socket's timeout. So `hangup` goes with
+        // the exchange, and dropping it shuts the connection down under the
+        // read (`HangupOnDrop`).
         //
         // A plain thread, not the runtime's blocking pool: a call its caller
-        // abandoned at its bound leaves its exchange running until the socket's
-        // own timeout, and the runtime waits for its pool when the client is
-        // dropped — so an abandoned call would hold whoever drops the client
-        // for up to that long.
+        // abandoned at its bound keeps its stream inside the SDK, so its
+        // exchange runs on until the socket's own timeout, and the runtime
+        // waits for its pool when the client is dropped — so an abandoned call
+        // would hold whoever drops the client for up to that long.
+        let hangup = Arc::new(Hangup::default());
+        let held = HangupOnDrop(Arc::clone(&hangup));
         let notes_tx = tx.clone();
         std::thread::spawn(move || {
             let refs: Vec<(&str, &str)> = extra
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let resp = http.send(request_id, &body, timeout, &refs, |n| {
-                let _ = notes_tx.send(Pumped::Message(n));
-            });
+            let resp = http.send_until_hangup(
+                request_id,
+                &body,
+                timeout,
+                &refs,
+                |n| {
+                    let _ = notes_tx.send(Pumped::Message(n));
+                },
+                &hangup,
+            );
             let _ = tx.send(Pumped::Done(resp));
         });
 
@@ -189,15 +227,17 @@ impl StreamableHttpClient for AgentdHttp {
         // one, and "HTTP 401" is what an operator needs to see.
         if let (Some(id), false) = (request_id, bootstrap) {
             let session = self.http.session_id();
-            let frames = futures::stream::unfold(Some(rx), move |rx| async move {
+            // The exchange's hang-up rides in the stream's state, so the
+            // stream dropped is the connection closed.
+            let frames = futures::stream::unfold((Some(rx), held), move |(rx, held)| async move {
                 let mut rx = rx?;
                 match rx.recv().await {
-                    Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), Some(rx))),
+                    Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), (Some(rx), held))),
                     Some(Pumped::Done(Ok(Some(v)))) => {
-                        Some((Ok(as_event(&answered(id, v, false))), Some(rx)))
+                        Some((Ok(as_event(&answered(id, v, false))), (Some(rx), held)))
                     }
                     Some(Pumped::Done(Err(e))) => {
-                        Some((Ok(as_event(&failed(id, &e.to_string()))), None))
+                        Some((Ok(as_event(&failed(id, &e.to_string()))), (None, held)))
                     }
                     // Accepted with no body, or the pump vanished: the stream
                     // is over, and the SDK fails the request for want of an
@@ -214,6 +254,9 @@ impl StreamableHttpClient for AgentdHttp {
         //
         // `server/discover` waits for its answer instead: nothing it is sent
         // before that has a lifecycle to arrive in yet.
+        //
+        // `held` is held across the wait, so a `post_message` future the SDK
+        // drops while it waits hangs the exchange up too.
         let first = loop {
             match rx.recv().await {
                 Some(Pumped::Message(_)) if discovers => continue,
@@ -259,15 +302,15 @@ impl StreamableHttpClient for AgentdHttp {
         };
         let session = self.http.session_id();
 
-        let rest = futures::stream::unfold(rx, move |mut rx| async move {
+        let rest = futures::stream::unfold((rx, held), move |(mut rx, held)| async move {
             match rx.recv().await {
-                Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), rx)),
+                Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), (rx, held))),
                 Some(Pumped::Done(Ok(Some(v)))) => {
                     let v = match request_id {
                         Some(id) => answered(id, v, true),
                         None => v,
                     };
-                    Some((Ok(as_event(&v)), rx))
+                    Some((Ok(as_event(&v)), (rx, held)))
                 }
                 // Done — cleanly, or with an error the first frame already
                 // outlived. Either way this POST's stream is over, and ending
@@ -344,8 +387,11 @@ impl StreamableHttpClient for AgentdHttp {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Sse, SseError>>();
 
         // A blocking reader pumping into a channel: the stream the SDK polls is
-        // the receiving end. When the SDK drops the stream the sends fail and
-        // the reader stops, so a closed stream closes the connection. The
+        // the receiving end. When the SDK drops the stream the next send fails
+        // and the reader stops, so a closed stream closes the connection at the
+        // server's next event or the socket's timeout. (This GET channel is
+        // 2025-11-25's alone, where a closed stream cancels nothing, so it is
+        // not hung up the way a POST's response stream is.) The
         // reader is not `Send`, so the thread that dials it is the one that
         // reads it, and it reports the dial's outcome first.
         std::thread::spawn(move || {

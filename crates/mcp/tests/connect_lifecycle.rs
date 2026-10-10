@@ -121,10 +121,13 @@ fn a_2026_07_28_server_is_reached_through_server_discover_alone() {
     c.call_tool("echo", Some(json!({}))).unwrap();
     c.read_resource("demo://x").unwrap();
 
+    // The first `tools/list` is the connection's priming list: rmcp sends a
+    // tool's headers only from a schema it listed on this connection.
     assert_eq!(
         methods(&seen),
         [
             "server/discover",
+            "tools/list",
             "tools/list",
             "tools/call",
             "resources/read"

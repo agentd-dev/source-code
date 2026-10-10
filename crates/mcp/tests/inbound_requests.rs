@@ -20,6 +20,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod common;
+
 use mcp::client::McpClient;
 use mcp::inbound::{Answer, Handler, Inbound};
 use serde_json::{Value, json};
@@ -274,4 +276,97 @@ fn an_undeclared_capability_is_refused_rather_than_ignored() {
     let resp = await_response(&seen, 5).expect("no refusal was sent");
     assert_eq!(resp["id"], 5);
     assert_eq!(resp["error"]["code"], -32601);
+}
+
+/// Answers every elicitation with `{x: 1}`.
+struct GivesOne;
+impl Handler for GivesOne {
+    fn handle(&self, _: Inbound) -> Option<Answer> {
+        Some(Answer::Accept(json!({"x": 1})))
+    }
+}
+
+#[test]
+fn an_elicitation_inside_a_2026_07_28_tool_call_round_trips() {
+    // At 2026-07-28 a server asks mid-call by answering the call
+    // `input_required` (SEP-2322); the client answers and calls again with a
+    // new id, echoing `requestState` and carrying its answers.
+    let (ep, seen) = common::spawn(|req, w| {
+        let id = req.id();
+        let supported = [common::MODERN.to_string()];
+        if let Some((status, body)) = common::stateless_refusal(req, &supported) {
+            return common::respond(w, status, &[], &body);
+        }
+        match req.method() {
+            "server/discover" => common::respond(
+                w,
+                200,
+                &[],
+                &common::discover_answer(&id, &common::StatelessOpts::default()),
+            ),
+            "tools/list" => common::respond(
+                w,
+                200,
+                &[],
+                &common::result(
+                    &id,
+                    json!({"tools": [{"name": "ask", "inputSchema": {"type": "object"}}]}),
+                ),
+            ),
+            "tools/call" if req.body["params"]["requestState"].is_null() => common::respond(
+                w,
+                200,
+                &[],
+                &common::result(
+                    &id,
+                    json!({
+                    "resultType": "input_required",
+                    "inputRequests": {"q": {"method": "elicitation/create", "params": {
+                        "message": "how many?",
+                        "requestedSchema": {"type": "object",
+                                            "properties": {"x": {"type": "number"}}}}}},
+                    "requestState": "s1"}),
+                ),
+            ),
+            "tools/call" => common::respond(
+                w,
+                200,
+                &[],
+                &common::result(
+                    &id,
+                    json!({
+                    "content": [{"type": "text", "text": "thanks"}], "isError": false}),
+                ),
+            ),
+            _ => common::respond(w, 404, &[], &common::error(&id, -32601, "Method not found")),
+        }
+    });
+    let mut c = McpClient::connect("mrtr", &ep, vec![], Duration::from_secs(5))
+        .unwrap()
+        .start_with(mcp::client::FirstRequest::Discover)
+        .with_elicitation(Arc::new(GivesOne));
+    c.initialize().unwrap();
+    let out = c
+        .call_tool("ask", Some(json!({})))
+        .expect("the call completes");
+    assert_eq!(out.content[0]["text"], "thanks", "{out:?}");
+
+    let calls = common::requests(&seen, "tools/call");
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0].id(), calls[1].id(), "the retry is a new request");
+    assert!(
+        calls[0]
+            .meta("clientCapabilities")
+            .is_some_and(|c| c.get("elicitation").is_some()),
+        "{:?}",
+        calls[0].meta("clientCapabilities")
+    );
+    let retry = &calls[1].body["params"];
+    assert_eq!(retry["requestState"], "s1");
+    assert_eq!(retry["inputResponses"]["q"]["action"], "accept", "{retry}");
+    assert_eq!(
+        retry["inputResponses"]["q"]["content"],
+        json!({"x": 1}),
+        "{retry}"
+    );
 }

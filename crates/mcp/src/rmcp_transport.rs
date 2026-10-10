@@ -84,6 +84,10 @@ pub struct AgentdHttp {
     /// How many listen streams this connection's idle bound has cut — read
     /// by the listen pump to tell an idle cut from any other end.
     idle_cuts: Arc<AtomicU64>,
+    /// Every tool name a `tools/list` answer named, as the server sent it:
+    /// what the SDK then hands back is what it kept, and the difference is
+    /// what it dropped without a word.
+    tools_seen: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl AgentdHttp {
@@ -95,6 +99,7 @@ impl AgentdHttp {
             raw_capabilities: Arc::default(),
             listen_idle: None,
             idle_cuts: Arc::default(),
+            tools_seen: Arc::default(),
         }
     }
 
@@ -108,6 +113,12 @@ impl AgentdHttp {
     /// The count of listen streams cut for idleness; see `idle_cuts`.
     pub fn idle_cuts(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.idle_cuts)
+    }
+
+    /// The tool names the server's `tools/list` answers named; see
+    /// `tools_seen`.
+    pub fn tools_seen(&self) -> Arc<Mutex<std::collections::BTreeSet<String>>> {
+        Arc::clone(&self.tools_seen)
     }
 
     /// See `bootstrap_failure`.
@@ -299,6 +310,11 @@ impl StreamableHttpClient for AgentdHttp {
             },
             _ => (false, false),
         };
+        let lists_tools = matches!(
+            &message,
+            rmcp::model::JsonRpcMessage::Request(r)
+                if matches!(r.request, rmcp::model::ClientRequest::ListToolsRequest(_))
+        );
         let listen_idle = match &message {
             rmcp::model::JsonRpcMessage::Request(r) => match r.request {
                 rmcp::model::ClientRequest::SubscriptionsListenRequest(_) => self.listen_idle,
@@ -337,6 +353,7 @@ impl StreamableHttpClient for AgentdHttp {
         // A listen whose stream went quiet past its idle bound ended for that
         // reason alone; counted, so the pump can say so.
         let idle_cuts = listen_idle.map(|_| Arc::clone(&self.idle_cuts));
+        let tools_seen = lists_tools.then(|| Arc::clone(&self.tools_seen));
         std::thread::spawn(move || {
             let refs: Vec<(&str, &str)> = extra
                 .iter()
@@ -359,6 +376,14 @@ impl StreamableHttpClient for AgentdHttp {
                 )
             {
                 n.fetch_add(1, Ordering::SeqCst);
+            }
+            if let (Some(seen), Ok(Some(v))) = (&tools_seen, &resp) {
+                let names = v["result"]["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t["name"].as_str().map(str::to_string));
+                seen.lock().unwrap_or_else(|e| e.into_inner()).extend(names);
             }
             let _ = tx.send(Pumped::Done(resp));
         });

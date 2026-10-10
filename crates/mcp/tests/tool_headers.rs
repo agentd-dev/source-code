@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Tool headers at MCP 2026-07-28.
+//!
+//! A tool whose schema annotates an argument with `x-mcp-header` must be
+//! called with that argument in an `Mcp-Param-*` header, and rmcp sends one
+//! only for a tool whose schema it listed on the same connection. A turn
+//! worker's connection is handed its tools and never lists, so every
+//! 2026-07-28 connection lists once when it starts. rmcp also drops, without
+//! a word, a tool whose annotation it rejects: the connection says which.
+
+mod common;
+
+use common::*;
+use mcp::client::{FirstRequest, McpClient};
+use serde_json::{Value, json};
+use std::time::Duration;
+
+/// A tool whose `region` argument travels as the `Mcp-Param-Region` header.
+fn regional() -> Value {
+    json!({"name": "regional", "inputSchema": {"type": "object", "properties": {
+        "region": {"type": "string", "x-mcp-header": "Region"}}}})
+}
+
+/// A 2026-07-28 server listing `tools`, refusing a `regional` call whose
+/// `Mcp-Param-Region` is missing or does not match the argument, the way
+/// rmcp's own server does (`-32020`). `caps` and `list` override the
+/// capabilities and the whole `tools/list` answer.
+fn server(tools: Vec<Value>, caps: Value, list: Option<(u16, Value)>) -> (String, Seen) {
+    spawn(move |req, w| {
+        let id = req.id();
+        let supported = [MODERN.to_string()];
+        if let Some((status, body)) = stateless_refusal(req, &supported) {
+            return respond(w, status, &[], &body);
+        }
+        match req.method() {
+            "server/discover" => respond(
+                w,
+                200,
+                &[],
+                &discover_answer(
+                    &id,
+                    &StatelessOpts {
+                        caps: caps.clone(),
+                        ..StatelessOpts::default()
+                    },
+                ),
+            ),
+            "tools/list" => match &list {
+                Some((status, body)) => {
+                    let mut body = body.clone();
+                    if body.get("id").is_some_and(|i| !i.is_null()) {
+                        body["id"] = id.clone();
+                    }
+                    respond(w, *status, &[], &body)
+                }
+                None => respond(w, 200, &[], &result(&id, json!({"tools": tools}))),
+            },
+            "tools/call" => {
+                let args = &req.body["params"]["arguments"];
+                if req.body["params"]["name"] == "regional"
+                    && req.header("mcp-param-region") != args["region"].as_str()
+                {
+                    return respond(w, 400, &[], &error(&id, -32020, "Mcp-Param-Region"));
+                }
+                respond(
+                    w,
+                    200,
+                    &[],
+                    &result(
+                        &id,
+                        json!({
+                    "content": [{"type": "text", "text": "ok"}], "isError": false}),
+                    ),
+                )
+            }
+            "subscriptions/listen" => respond(w, 400, &[], &error(&id, -32602, "no listens")),
+            _ => respond(w, 404, &[], &error(&id, -32601, "Method not found")),
+        }
+    })
+}
+
+fn connect(ep: &str, first: FirstRequest) -> Result<McpClient, String> {
+    let mut c = McpClient::connect("t", ep, vec![], Duration::from_secs(5))
+        .unwrap()
+        .start_with(first);
+    c.initialize().map_err(|e| e.to_string())?;
+    Ok(c)
+}
+
+#[test]
+fn a_fresh_connection_calls_an_annotated_tool_with_its_header() {
+    // As a turn worker does: connect and call, never list.
+    let (ep, seen) = server(vec![regional()], json!({"tools": {}}), None);
+    let c = connect(&ep, FirstRequest::Discover).unwrap();
+    c.call_tool("regional", Some(json!({"region": "eu"})))
+        .expect("the call carries its header");
+    let call = &requests(&seen, "tools/call")[0];
+    assert_eq!(call.header("mcp-param-region"), Some("eu"));
+    assert_eq!(
+        methods(&seen),
+        ["server/discover", "tools/list", "tools/call"]
+    );
+}
+
+#[test]
+fn a_tool_rmcp_drops_is_reported_once() {
+    let nested = json!({"name": "nested", "inputSchema": {"type": "object", "properties": {
+        "outer": {"type": "object", "properties": {
+            "inner": {"type": "string", "x-mcp-header": "Inner"}}}}}});
+    let ok = json!({"name": "ok", "inputSchema": {"type": "object"}});
+    let (ep, _) = server(vec![nested, ok], json!({"tools": {}}), None);
+    let c = connect(&ep, FirstRequest::Discover).unwrap();
+    let names: Vec<String> = c
+        .list_tools()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["ok"]);
+    assert_eq!(c.drain_dropped_tools(), ["nested"]);
+    c.list_tools().unwrap();
+    assert!(
+        c.drain_dropped_tools().is_empty(),
+        "named once per connection"
+    );
+}
+
+#[test]
+fn a_handshake_connection_is_not_primed() {
+    let (ep, seen) = legacy_server(LegacyOpts::default());
+    let _c = connect(&ep, FirstRequest::Initialize).unwrap();
+    assert_eq!(count(&seen, "tools/list"), 0);
+}
+
+#[test]
+fn a_failed_priming_list_fails_the_connect() {
+    let failures = [
+        (
+            500,
+            json!({"jsonrpc": "2.0", "id": null,
+                   "error": {"code": -32603, "message": "catalogue down"}}),
+            "catalogue down",
+        ),
+        (
+            200,
+            json!({"jsonrpc": "2.0", "id": 0, "result": {"nope": 1}}),
+            "tools/list",
+        ),
+    ];
+    for (status, body, says) in failures {
+        // It would hold a standing listen too, had it connected.
+        let (ep, seen) = server(
+            vec![],
+            json!({"tools": {"listChanged": true}}),
+            Some((status, body)),
+        );
+        let err = connect(&ep, FirstRequest::Discover).err().expect("refused");
+        assert!(err.contains("tools/list:"), "{err}");
+        assert!(err.contains(says), "{err}");
+        assert_eq!(count(&seen, "subscriptions/listen"), 0, "{err}");
+    }
+}

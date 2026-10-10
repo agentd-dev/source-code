@@ -387,7 +387,8 @@ fn every_post_carries_each_operator_header_exactly_once() {
             FirstRequest::Discover,
             modern_ep,
             modern,
-            &["server/discover", "tools/list", "tools/call"][..],
+            // The first `tools/list` is the connection's own priming list.
+            &["server/discover", "tools/list", "tools/list", "tools/call"][..],
             1,
         ),
     ];

@@ -243,6 +243,15 @@ impl McpClient {
         self.sdk().ok().and_then(|c| c.capability(name))
     }
 
+    /// Tools the server listed that the SDK dropped (an `x-mcp-header`
+    /// annotation it rejects, at 2026-07-28), each named once per connection,
+    /// for the host to log: otherwise a tool disappears without a word.
+    pub fn drain_dropped_tools(&self) -> Vec<String> {
+        self.sdk()
+            .map(|c| c.drain_dropped_tools())
+            .unwrap_or_default()
+    }
+
     /// What reached the server on the live connection:
     /// [`FirstRequest::Discover`] for a 2026-07-28 connection,
     /// [`FirstRequest::Initialize`] for one reached through the handshake,

@@ -299,6 +299,12 @@ pub struct RmcpClient {
     /// Set once the server refused a listen that asked for its
     /// `list_changed` notifications ([`ListenEvent::FlagsRefused`]).
     flags_refused: std::sync::atomic::AtomicBool,
+    /// Every tool name the server's `tools/list` answers named.
+    tools_seen: ToolNames,
+    /// The names rmcp handed back from those lists: the tools it kept.
+    tools_kept: Mutex<std::collections::BTreeSet<String>>,
+    /// Dropped tools already reported ([`Self::drain_dropped_tools`]).
+    tools_reported: Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// Builder state, so the host can declare capabilities before connecting (the
@@ -449,7 +455,7 @@ impl RmcpBuilder {
         };
         let first = self.first;
         let bound = self.handshake_bound;
-        let (service, raw_caps, idle_cuts) = rt
+        let (service, raw_caps, idle_cuts, tools_seen) = rt
             .block_on(async move {
                 match bound {
                     // The timer is built inside the runtime: it needs its clock.
@@ -502,7 +508,21 @@ impl RmcpBuilder {
             listen_events: Arc::default(),
             idle_cuts,
             flags_refused: std::sync::atomic::AtomicBool::new(false),
+            tools_seen,
+            tools_kept: Mutex::default(),
+            tools_reported: Mutex::default(),
         };
+        // rmcp sends a tool's `Mcp-Param-*` headers only for tools whose
+        // schema it has cached on this connection from a `tools/list` — and a
+        // connection that never lists (a turn worker's, handed its tools by
+        // the supervisor) would send a call its server refuses for the
+        // missing header. So a 2026-07-28 connection lists once before it is
+        // used — after the response cache is off, so the list is a real one —
+        // and a connection that cannot list cannot send those headers, and
+        // fails. One POST per dial, as the probe is for an older server.
+        if client.listens() && client.caps.tools.is_some() {
+            client.prime(bound)?;
+        }
         client.stand();
         Ok(client)
     }
@@ -616,13 +636,17 @@ struct Start {
     handler: Handler,
 }
 
-/// A started connection: the service, the server's capabilities as sent, and
-/// the transport's count of listen streams cut for idleness.
+/// A started connection: the service, the server's capabilities as sent, the
+/// transport's count of listen streams cut for idleness, and the tool names
+/// its `tools/list` answers named.
 type Started = (
     RunningService<RoleClient, Handler>,
     Option<Value>,
     Arc<std::sync::atomic::AtomicU64>,
+    ToolNames,
 );
+
+type ToolNames = Arc<Mutex<std::collections::BTreeSet<String>>>;
 
 /// A failed startup attempt: rmcp's error, and what the socket recorded when
 /// the request got no JSON-RPC answer at all. Boxed: rmcp's error is large.
@@ -658,7 +682,12 @@ impl Start {
         let mut handler = self.handler.clone();
         handler.info.protocol_version = offer;
         match handler.serve_with_lifecycle(transport, mode).await {
-            Ok(service) => Ok((service, client.raw_capabilities(), client.idle_cuts())),
+            Ok(service) => Ok((
+                service,
+                client.raw_capabilities(),
+                client.idle_cuts(),
+                client.tools_seen(),
+            )),
             Err(e) => Err(Box::new((e, client.bootstrap_failure()))),
         }
     }
@@ -787,7 +816,48 @@ impl RmcpClient {
             .rt
             .block_on(self.service.list_all_tools())
             .map_err(|e| self.fail("tools/list", e))?;
+        self.kept(&res);
         self.convert(&res, "tools/list")
+    }
+
+    /// The priming list (see `connect`), bounded like the startup.
+    fn prime(&self, bound: Option<Duration>) -> Result<(), McpError> {
+        let res = self
+            .bounded(bound, "tools/list", self.service.list_all_tools())?
+            .map_err(|e| self.fail("tools/list", e))?;
+        self.kept(&res);
+        Ok(())
+    }
+
+    fn kept(&self, tools: &[rmcp::model::Tool]) {
+        self.tools_kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(tools.iter().map(|t| t.name.to_string()));
+    }
+
+    /// Tools the server listed that rmcp dropped, each named once per
+    /// connection. At 2026-07-28 rmcp leaves out of a `tools/list` every tool
+    /// whose schema carries an `x-mcp-header` annotation it rejects, and says
+    /// so only to its own tracing — so the agent would lose a tool with
+    /// nothing in any log. This crate has no logger; the host says it.
+    pub fn drain_dropped_tools(&self) -> Vec<String> {
+        let seen = self
+            .tools_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let kept = self.tools_kept.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reported = self
+            .tools_reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dropped: Vec<String> = seen
+            .into_iter()
+            .filter(|t| !kept.contains(t) && !reported.contains(t))
+            .collect();
+        reported.extend(dropped.iter().cloned());
+        dropped
     }
 
     /// `tools/call`, bounded as a whole by `bound` when there is one. `meta`

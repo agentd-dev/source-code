@@ -293,9 +293,11 @@ fn capabilities_come_from_the_discover_answer() {
     assert_eq!(done.completion.values, ["x1"]);
     c.subscribe("file:///a.txt").expect("listen");
     assert_eq!(
-        methods(&seen)[..4],
+        methods(&seen)[..5],
         [
             "server/discover",
+            // The connection's priming list.
+            "tools/list",
             "prompts/get",
             "completion/complete",
             "subscriptions/listen"
@@ -318,7 +320,11 @@ fn capabilities_come_from_the_discover_answer() {
         Err(McpError::Capability(m)) => assert!(m.contains("resources.subscribe"), "{m}"),
         other => panic!("subscriptions were not offered: {other:?}"),
     }
-    assert_eq!(methods(&seen), ["server/discover"], "nothing reached it");
+    assert_eq!(
+        methods(&seen),
+        ["server/discover", "tools/list"],
+        "nothing after the startup and its priming list"
+    );
 }
 
 #[test]
@@ -560,9 +566,12 @@ fn every_read_reaches_the_server_even_when_it_offers_a_ttl() {
                 .list_resource_templates()
                 .expect("resources/templates/list");
         }
+        // A 2026-07-28 connection lists its tools once to start: rmcp sends
+        // a tool's headers only from a schema it listed on the connection.
+        let primed = usize::from(lifecycle == Lifecycle::Stateless);
         for (method, n) in [
             ("resources/read", 3),
-            ("tools/list", 2),
+            ("tools/list", 2 + primed),
             ("resources/list", 2),
             ("prompts/list", 2),
             ("resources/templates/list", 2),

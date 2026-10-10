@@ -1,6 +1,6 @@
 # RFC 0046: Kinds of intelligence — chat, reasoning and decision models, by role
 
-**Status:** Proposed
+**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1–P4 to be built in order
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-10
 **Depends on:** RFC 0031 (endpoint authentication: every provider is signed and credentialed like `intelligence.endpoints` is today), RFC 0037 (service catalog and egress: every provider endpoint is an egress destination), RFC 0042 (what a served document may configure), RFC 0038 (the prompt template).
@@ -332,10 +332,13 @@ Two loop-level uses of a decision model are left for after measurement (§11 Q3)
 **P3 — decisions in the loop.** The preflight, goal and approve roles on decision models; §8's untrusted-input rule for every approver.
 **P4 — reasoning.** `effort`, the per-dialect mapping, reasoning parts across tool rounds, `think` on `roles.think`.
 
-Open questions for the user:
+Decided by the user, 2026-10-10:
 
-- **Q1 — May a decision model approve on the operator's behalf at all?** Recommendation: yes, but only bound explicitly, operator-only, with a required threshold, and never over untrusted input (§8). The alternative is chat judges only.
-- **Q2 — Remove the three old keys outright?** Recommendation: yes, per the no-legacy rule; `--model`/`MODEL` are unaffected.
-- **Q3 — Per-turn model routing and decision guards (§7) now or after P4?** Recommendation: after, once decision calls are measured in real runs.
+- **Q1 — May a decision model approve on the operator's behalf?** Yes, guarded: only bound explicitly, operator-only, with a required threshold, and never over untrusted input (§8).
+- **Q2 — Remove the three old keys outright?** Yes, per the standing no-legacy rule; `--model`/`MODEL` are unaffected.
+- **Q3 — Per-turn model routing and decision guards (§7)?** After P4, once decision calls are measured in real runs.
+- **Scope:** all four phases, in order, each reviewed once, gated and pushed when green.
+
+Open, with recommendations:
 - **Q4 — Embeddings as a fourth kind?** Recommendation: not until something in agentd consumes vectors (knowledge, memory recall).
 - **Q5 — OpenAI's Decisions API** has no published request schema yet [OAI-DEC]. Recommendation: build `dialect: decisions` on the shape Jev, OpenRouter and Strands share, and verify OpenAI's when it is published.

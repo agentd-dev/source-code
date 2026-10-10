@@ -14,43 +14,21 @@
 //! * The `GET` notification stream carries the operator's credential, the
 //!   negotiated `MCP-Protocol-Version`, and on a reconnect the `Last-Event-ID`
 //!   it resumes from; a first dial that fails is dialled again.
-//! * Each operator header goes out exactly once per request: `Authorization`
-//!   is not a list-valued field (RFC 9110 §5.3), so a doubled one is ambiguous.
+//! * Each operator header goes out exactly once per request, at either
+//!   revision: `Authorization` is not a list-valued field (RFC 9110 §5.3), so
+//!   a doubled one is ambiguous. At 2026-07-28 the routing header
+//!   `Mcp-Method` goes out once too.
 
-use std::io::{BufRead, BufReader, Read, Write};
+mod common;
+
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mcp::client::McpClient;
+use common::{Req, Seen, StatelessOpts, read_req};
+use mcp::client::{FirstRequest, McpClient};
 use serde_json::{Value, json};
-
-/// One request as the stub saw it.
-#[derive(Clone, Debug)]
-struct Req {
-    line: String,
-    /// Every header line, name lowercased, in arrival order — duplicates kept,
-    /// because counting them is the point.
-    headers: Vec<(String, String)>,
-    body: Value,
-}
-
-impl Req {
-    fn count(&self, name: &str) -> usize {
-        self.headers.iter().filter(|(k, _)| k == name).count()
-    }
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    }
-    fn is_get(&self) -> bool {
-        self.line.starts_with("GET ")
-    }
-}
-
-type Seen = Arc<Mutex<Vec<Req>>>;
 
 /// How the stub answers the notification `GET`.
 #[derive(Clone, Copy)]
@@ -64,40 +42,6 @@ enum GetMode {
     /// The first dial gets `503` — a server mid-restart — and later dials
     /// open a stream carrying one notification, then stay open quietly.
     UnavailableOnce,
-}
-
-fn read_req(r: &mut BufReader<TcpStream>) -> Option<Req> {
-    let mut line = String::new();
-    if r.read_line(&mut line).ok()? == 0 {
-        return None;
-    }
-    let mut headers = Vec::new();
-    loop {
-        let mut h = String::new();
-        if r.read_line(&mut h).ok()? == 0 {
-            break;
-        }
-        if h.trim().is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':') {
-            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-        }
-    }
-    let len: usize = headers
-        .iter()
-        .find(|(k, _)| k == "content-length")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
-    let mut body = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut body).ok()?;
-    }
-    Some(Req {
-        line: line.trim_end().to_string(),
-        headers,
-        body: serde_json::from_slice(&body).unwrap_or(Value::Null),
-    })
 }
 
 fn respond(w: &mut TcpStream, extra: &str, body: &Value) {
@@ -414,33 +358,63 @@ fn a_call_whose_exchange_fails_reports_the_transports_reason() {
 
 #[test]
 fn every_post_carries_each_operator_header_exactly_once() {
-    let seen: Seen = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen), GetMode::NotAllowed);
-    let c = connect(
-        &ep,
+    // At either revision. At 2026-07-28 the routing header `Mcp-Method` goes
+    // out on every request too — once, like any other; the handshake's
+    // revision has none.
+    let headers = || {
         vec![
-            ("Authorization".into(), "Bearer op-token".into()),
-            ("X-Api-Key".into(), "k-1".into()),
-        ],
-        Duration::from_secs(10),
-    );
-    c.list_tools().expect("tools/list");
-    c.call_tool("echo", Some(json!({"s": "x"}))).expect("call");
+            ("Authorization".to_string(), "Bearer op-token".to_string()),
+            ("X-Api-Key".to_string(), "k-1".to_string()),
+        ]
+    };
+    let legacy: Seen = Arc::default();
+    let legacy_ep = spawn_server(Arc::clone(&legacy), GetMode::NotAllowed);
+    let (modern_ep, modern) = common::stateless_server(StatelessOpts::default());
+    let cases = [
+        (
+            FirstRequest::Initialize,
+            legacy_ep,
+            legacy,
+            &[
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+            ][..],
+            0,
+        ),
+        (
+            FirstRequest::Discover,
+            modern_ep,
+            modern,
+            &["server/discover", "tools/list", "tools/call"][..],
+            1,
+        ),
+    ];
+    for (first, ep, seen, sent, mcp_method) in cases {
+        let mut c = McpClient::connect("wire", &ep, headers(), Duration::from_secs(10))
+            .expect("connect")
+            .start_with(first);
+        c.initialize().expect("initialize");
+        c.list_tools().expect("tools/list");
+        c.call_tool("echo", Some(json!({"s": "x"}))).expect("call");
 
-    let posts: Vec<Req> = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|r| r.line.starts_with("POST "))
-        .cloned()
-        .collect();
-    // initialize, notifications/initialized, tools/list, tools/call.
-    assert!(posts.len() >= 4, "{posts:?}");
-    for p in &posts {
-        let what = p.body["method"].as_str().unwrap_or("?");
-        assert_eq!(p.count("authorization"), 1, "{what}: {:?}", p.headers);
-        assert_eq!(p.header("authorization"), Some("Bearer op-token"));
-        assert_eq!(p.count("x-api-key"), 1, "{what}: {:?}", p.headers);
+        let posts: Vec<Req> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.line.starts_with("POST "))
+            .cloned()
+            .collect();
+        let methods: Vec<&str> = posts.iter().map(Req::method).collect();
+        assert_eq!(methods, sent, "{first:?}");
+        for p in &posts {
+            let what = p.method();
+            assert_eq!(p.count("authorization"), 1, "{what}: {:?}", p.headers);
+            assert_eq!(p.header("authorization"), Some("Bearer op-token"));
+            assert_eq!(p.count("x-api-key"), 1, "{what}: {:?}", p.headers);
+            assert_eq!(p.count("mcp-method"), mcp_method, "{what}: {:?}", p.headers);
+        }
     }
 }
 

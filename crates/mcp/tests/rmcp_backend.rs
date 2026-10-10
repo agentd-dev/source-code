@@ -1,159 +1,195 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The MCP client against a real server.
+//! The MCP client against a real server, at both revisions agentd reaches: a
+//! 2025-11-25 server through the `initialize` handshake, and a 2026-07-28
+//! server through `server/discover` alone, which holds every request to that
+//! revision's header and `_meta` rules (`common::stateless_refusal`).
 //!
 //! These tests assert on the things that would silently break if the facade
 //! were wired wrong: that the revision offered in `initialize` is the one agentd
 //! pins (rmcp's `LATEST_WITH_INITIALIZE`, 2025-11-25), not the SDK's default
-//! (its `LATEST`, 2026-07-28, which has no `initialize`), that declared
-//! capabilities reach the handshake, and that tools and resources come back in
-//! agentd's own wire types.
+//! (its `LATEST`, 2026-07-28, which has no `initialize`); that declared
+//! capabilities reach the handshake; that the server's capabilities are read
+//! from whichever answer it gave, and gate what the client sends; that a
+//! subscription uses the method the revision defines; and that tools and
+//! resources come back in agentd's own wire types.
 //!
 //! It also pins the one SDK default agentd turns off: the SEP-2549 client
 //! response cache. A read here is a request to the server, every time, and a
 //! server that is gone or says no is an error — never the last answer replayed.
 
+mod common;
+
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::{
+    MODERN, Req, Seen, StatelessOpts, discover_answer, error, initialize_answer,
+    initialize_refusal, methods, read_req, requests, respond, respond_raw, result,
+    stateless_refusal,
+};
+use mcp::client::{FirstRequest, McpClient, McpError};
 use mcp::inbound::{Answer, Handler, Inbound};
-use mcp::rmcp_client::RmcpBuilder;
+use mcp::rmcp_client::{RmcpBuilder, RmcpClient};
 use rmcp::model::ProtocolVersion;
 use serde_json::{Value, json};
 
-#[derive(Default)]
-struct Seen {
-    init: Option<Value>,
-    /// Every JSON-RPC method the client called, in order.
-    methods: Vec<String>,
-}
-type Shared = Arc<Mutex<Seen>>;
-
-fn read_http(s: &mut BufReader<TcpStream>) -> Option<(String, Vec<u8>)> {
-    let mut start = String::new();
-    if s.read_line(&mut start).ok()? == 0 {
-        return None;
-    }
-    let mut len = 0usize;
-    loop {
-        let mut line = String::new();
-        if s.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        if line.trim().is_empty() {
-            break;
-        }
-        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            len = v.trim().parse().unwrap_or(0);
-        }
-    }
-    let mut body = vec![0u8; len];
-    if len > 0 {
-        s.read_exact(&mut body).ok()?;
-    }
-    Some((start, body))
+/// How the test server starts a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    /// The 2025-11-25 handshake: `initialize`, answered at this revision,
+    /// and a session.
+    Handshake(&'static str),
+    /// 2026-07-28: `server/discover`, no session, everything per request.
+    Stateless,
 }
 
-fn respond(w: &mut TcpStream, body: &Value) {
-    let b = serde_json::to_vec(body).unwrap();
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        b.len()
+const HANDSHAKE: Lifecycle = Lifecycle::Handshake("2025-11-25");
+const LIFECYCLES: [Lifecycle; 2] = [HANDSHAKE, Lifecycle::Stateless];
+
+impl Lifecycle {
+    /// What a client reaching this server starts with.
+    fn first(self) -> FirstRequest {
+        match self {
+            Lifecycle::Handshake(_) => FirstRequest::Initialize,
+            Lifecycle::Stateless => FirstRequest::Discover,
+        }
+    }
+
+    /// The revision the connection speaks.
+    fn revision(self) -> &'static str {
+        match self {
+            Lifecycle::Handshake(v) => v,
+            Lifecycle::Stateless => MODERN,
+        }
+    }
+}
+
+/// Answer what only the lifecycle decides: the handshake or discover, a
+/// request refused for breaking the revision's rules, and the subscription
+/// methods. `None` leaves `req` to the caller.
+fn lifecycle_answer(lifecycle: Lifecycle, req: &Req, caps: &Value) -> Option<(u16, Value)> {
+    let id = req.id();
+    let unknown = || Some((200, error(&id, -32601, "Method not found")));
+    match lifecycle {
+        Lifecycle::Handshake(revision) => match req.method() {
+            "initialize" => Some((200, initialize_answer(&id, revision, caps))),
+            "server/discover" | "subscriptions/listen" => unknown(),
+            _ => None,
+        },
+        Lifecycle::Stateless => {
+            let supported = [MODERN.to_string()];
+            if req.method() == "initialize" {
+                let asked = req.body["params"]["protocolVersion"]
+                    .as_str()
+                    .unwrap_or_default();
+                return Some((400, initialize_refusal(&id, asked, &supported)));
+            }
+            if let Some(refusal) = stateless_refusal(req, &supported) {
+                return Some(refusal);
+            }
+            match req.method() {
+                "server/discover" => {
+                    let opts = StatelessOpts {
+                        caps: caps.clone(),
+                        ..StatelessOpts::default()
+                    };
+                    Some((200, discover_answer(&id, &opts)))
+                }
+                // The revision removed them.
+                "resources/subscribe" | "resources/unsubscribe" => {
+                    Some((404, error(&id, -32601, "Method not found")))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The session a 2025-11-25 `initialize` answer issues; nothing else does.
+fn issued(lifecycle: Lifecycle, req: &Req) -> Vec<(&'static str, &'static str)> {
+    match lifecycle {
+        Lifecycle::Handshake(_) if req.method() == "initialize" => {
+            vec![("Mcp-Session-Id", "s-1")]
+        }
+        _ => vec![],
+    }
+}
+
+/// What the server offers unless a test says otherwise.
+fn default_caps() -> Value {
+    json!({"tools": {}, "resources": {"subscribe": true}})
+}
+
+/// A minimal Streamable-HTTP MCP server speaking `lifecycle`: answers tools,
+/// resources, prompts and completion, and the subscription method its
+/// revision defines — at 2026-07-28 a listen is acknowledged, then closed.
+/// Records every request.
+fn spawn_server(lifecycle: Lifecycle) -> (String, Seen) {
+    spawn_server_with(lifecycle, default_caps())
+}
+
+/// [`spawn_server`], advertising `caps`.
+fn spawn_server_with(lifecycle: Lifecycle, caps: Value) -> (String, Seen) {
+    common::spawn(move |req, w| {
+        if !req.line.starts_with("POST") {
+            return respond_raw(w, 405, &[], "");
+        }
+        if req.body.get("id").is_none() {
+            return respond_raw(w, 202, &[], "");
+        }
+        let id = req.id();
+        if let Some((status, body)) = lifecycle_answer(lifecycle, req, &caps) {
+            return respond(w, status, &issued(lifecycle, req), &body);
+        }
+        let answer = match req.method() {
+            "subscriptions/listen" => return acknowledge(req, w),
+            "tools/list" => json!({"tools": [{
+                "name": "echo",
+                "description": "echo a string",
+                "inputSchema": {"type": "object", "properties": {"s": {"type": "string"}}}
+            }]}),
+            "resources/list" => json!({"resources": [{"uri": "file:///a.txt", "name": "a"}]}),
+            "tools/call" => {
+                json!({"content": [{"type": "text", "text": "echoed"}], "isError": false})
+            }
+            "prompts/get" => json!({"messages": [
+                {"role": "user", "content": {"type": "text", "text": "hi"}}]}),
+            "completion/complete" => json!({"completion": {"values": ["x1"]}}),
+            "resources/subscribe" => json!({}),
+            _ => return respond(w, 200, &[], &error(&id, -32601, "Method not found")),
+        };
+        respond(w, 200, &[], &result(&id, answer))
+    })
+}
+
+/// Acknowledge a listen's URIs (this server offers no list-changed flag),
+/// then end the stream.
+fn acknowledge(req: &Req, w: &mut TcpStream) {
+    use std::io::Write;
+    let id = req.id();
+    let uris = req.body["params"]["notifications"]["resourceSubscriptions"].clone();
+    let ack = json!({
+        "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+        "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": id},
+                   "notifications": {"resourceSubscriptions": uris}}
+    });
+    let _ = write!(
+        w,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {ack}\n\n"
     );
-    let _ = w.write_all(head.as_bytes());
-    let _ = w.write_all(&b);
     let _ = w.flush();
 }
 
-/// A minimal Streamable-HTTP MCP server: answers initialize, tools/list and
-/// resources/list, and records the handshake for assertions.
-fn spawn_server(seen: Shared) -> String {
-    spawn_server_speaking(seen, None)
-}
-
-/// [`spawn_server`], answering `initialize` with `revision` instead of echoing
-/// the client's — the way a server settles on a revision of its own.
-fn spawn_server_speaking(seen: Shared, revision: Option<&'static str>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
-            let seen = Arc::clone(&seen);
-            std::thread::spawn(move || {
-                conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                let mut w = conn.try_clone().unwrap();
-                let mut r = BufReader::new(conn);
-                let Some((start, body)) = read_http(&mut r) else {
-                    return;
-                };
-                if start.starts_with("GET") || start.starts_with("DELETE") {
-                    let _ = w
-                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
-                    return;
-                }
-                let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-                if msg.get("id").is_none() {
-                    let _ = w.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
-                    return;
-                }
-                let id = msg["id"].clone();
-                seen.lock().unwrap().methods.push(method.to_string());
-                match method {
-                    "initialize" => {
-                        seen.lock().unwrap().init = Some(msg["params"].clone());
-                        respond(
-                            &mut w,
-                            &json!({
-                                "jsonrpc": "2.0", "id": id,
-                                "result": {
-                                    // Echo what the client asked for, the way a
-                                    // real server does when it can speak it —
-                                    // unless the test chose the revision.
-                                    "protocolVersion": revision
-                                        .map(Value::from)
-                                        .unwrap_or_else(|| msg["params"]["protocolVersion"].clone()),
-                                    "capabilities": {"tools": {}, "resources": {"subscribe": true}},
-                                    "serverInfo": {"name": "mock", "version": "0"}
-                                }
-                            }),
-                        );
-                    }
-                    "tools/list" => respond(
-                        &mut w,
-                        &json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": {"tools": [{
-                                "name": "echo",
-                                "description": "echo a string",
-                                "inputSchema": {"type": "object", "properties": {"s": {"type": "string"}}}
-                            }]}
-                        }),
-                    ),
-                    "resources/list" => respond(
-                        &mut w,
-                        &json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": {"resources": [{"uri": "file:///a.txt", "name": "a"}]}
-                        }),
-                    ),
-                    "tools/call" => respond(
-                        &mut w,
-                        &json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": {"content": [{"type": "text", "text": "echoed"}], "isError": false}
-                        }),
-                    ),
-                    _ => respond(&mut w, &json!({"jsonrpc": "2.0", "id": id, "result": {}})),
-                }
-            });
-        }
-    });
-    format!("http://{addr}/mcp")
+/// The SDK backend, connected the way `lifecycle` starts.
+fn connect(ep: &str, lifecycle: Lifecycle) -> RmcpClient {
+    RmcpBuilder::new("mock", ep, vec![], Duration::from_secs(5))
+        .start_with(lifecycle.first())
+        .connect()
+        .unwrap_or_else(|e| panic!("{lifecycle:?}: {e}"))
 }
 
 struct Yes;
@@ -169,17 +205,9 @@ fn the_handshake_offers_the_newest_revision_with_an_initialize() {
     // `initialize`; a handshake that offered it would ask for a revision the
     // handshake cannot be. agentd offers the newest one that still has one.
     let expected = "2025-11-25";
-    let seen: Shared = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen));
-    let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
-    let init = seen
-        .lock()
-        .unwrap()
-        .init
-        .clone()
-        .expect("no initialize seen");
+    let (ep, seen) = spawn_server(HANDSHAKE);
+    let client = connect(&ep, HANDSHAKE);
+    let init = &requests(&seen, "initialize")[0].body["params"];
     assert_eq!(init["protocolVersion"], expected, "handshake: {init}");
     assert_eq!(client.protocol_version(), Some(expected));
     // …and agentd's mock server answers the same revision, pinned to rmcp's
@@ -194,65 +222,114 @@ fn the_handshake_offers_the_newest_revision_with_an_initialize() {
 fn subscribing_uses_the_method_the_negotiated_revision_defines() {
     // The revisions disagree: up to 2025-11-25 a client calls
     // `resources/subscribe`; from 2026-07-28 on `subscriptions/listen` replaces
-    // it. Whichever revision the handshake settles on, we must call the one it
-    // defines — a `listen` against an older server is an unknown method, and a
-    // `subscribe` against a newer one is a method that revision removed. A
-    // revision LATER than 2026-07-28 still listens: it is compared the way rmcp
-    // compares it, not matched against one date.
-    let later = "2027-03-01";
-    assert!(ProtocolVersion::V_2026_07_28.as_str() < later);
-    let cases: [(Option<&'static str>, bool); 4] = [
-        // The revision agentd offers in `initialize` (2025-11-25), echoed back.
-        (None, false),
-        (Some(ProtocolVersion::V_2025_06_18.as_str()), false),
-        (Some(ProtocolVersion::V_2026_07_28.as_str()), true),
-        (Some(later), true),
+    // it. The connection must call the one its revision defines — a `listen`
+    // against an older server is an unknown method, and a `subscribe` against
+    // a newer one is a method that revision removed. A server that answers
+    // the handshake with an older revision than offered is held to that one.
+    let cases = [
+        (HANDSHAKE, "resources/subscribe", "subscriptions/listen"),
+        (
+            Lifecycle::Handshake(ProtocolVersion::V_2025_06_18.as_str()),
+            "resources/subscribe",
+            "subscriptions/listen",
+        ),
+        (
+            Lifecycle::Stateless,
+            "subscriptions/listen",
+            "resources/subscribe",
+        ),
     ];
-    for (revision, listens) in cases {
-        let seen: Shared = Arc::default();
-        let ep = spawn_server_speaking(Arc::clone(&seen), revision);
-        let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
-            .connect()
-            .expect("connect");
-        let result = client.subscribe("file:///a.txt");
-
-        let called = seen.lock().unwrap().methods.clone();
-        let at = client.protocol_version().unwrap_or("").to_string();
-        if listens {
-            // The mock does not acknowledge a listen, so the subscribe itself
-            // fails; which method it reached for is what is under test.
-            assert!(
-                called.iter().any(|m| m == "subscriptions/listen"),
-                "{at} should listen, saw: {called:?}"
-            );
-            assert!(
-                !called.iter().any(|m| m == "resources/subscribe"),
-                "{at} removed resources/subscribe: {called:?}"
-            );
-        } else {
-            result.expect("subscribe");
-            assert!(
-                called.iter().any(|m| m == "resources/subscribe"),
-                "{at} should subscribe, saw: {called:?}"
-            );
-            assert!(
-                !called.iter().any(|m| m == "subscriptions/listen"),
-                "listen is not defined at {at}: {called:?}"
-            );
-        }
+    for (lifecycle, calls, never) in cases {
+        let (ep, seen) = spawn_server(lifecycle);
+        let client = connect(&ep, lifecycle);
+        assert_eq!(
+            client.protocol_version(),
+            Some(lifecycle.revision()),
+            "{lifecycle:?}"
+        );
+        client
+            .subscribe("file:///a.txt")
+            .unwrap_or_else(|e| panic!("{lifecycle:?}: {e}"));
+        let called = methods(&seen);
+        assert!(
+            called.iter().any(|m| m == calls),
+            "{lifecycle:?} should call {calls}, saw: {called:?}"
+        );
+        assert!(
+            !called.iter().any(|m| m == never),
+            "{lifecycle:?} does not define {never}: {called:?}"
+        );
+        assert_eq!(client.subscribed(), ["file:///a.txt"], "{lifecycle:?}");
     }
 }
 
 #[test]
+fn capabilities_come_from_the_discover_answer() {
+    // What a 2026-07-28 server offers is in its discover answer, and that is
+    // what gates what the client sends: an operation the server offered
+    // reaches it, and one it did not is refused here, by name, with nothing
+    // on the wire.
+    let connect = |ep: &str| {
+        let mut c = McpClient::connect("mock", ep, vec![], Duration::from_secs(5))
+            .unwrap()
+            .start_with(FirstRequest::Discover);
+        c.initialize().expect("connect");
+        c
+    };
+    let prompt = || ("p", None);
+    let reference = || json!({"type": "ref/prompt", "name": "p"});
+    let argument = || json!({"name": "a", "value": "x"});
+
+    let offered = json!({"tools": {}, "prompts": {}, "completions": {},
+                         "resources": {"subscribe": true}});
+    let (ep, seen) = spawn_server_with(Lifecycle::Stateless, offered);
+    let c = connect(&ep);
+    let (name, args) = prompt();
+    let got = c.get_prompt(name, args).expect("prompts/get");
+    assert_eq!(got.messages.len(), 1);
+    let done = c
+        .complete(reference(), argument())
+        .expect("completion/complete");
+    assert_eq!(done.completion.values, ["x1"]);
+    c.subscribe("file:///a.txt").expect("listen");
+    assert_eq!(
+        methods(&seen)[..4],
+        [
+            "server/discover",
+            "prompts/get",
+            "completion/complete",
+            "subscriptions/listen"
+        ]
+    );
+
+    let withheld = json!({"tools": {}, "resources": {"subscribe": false}});
+    let (ep, seen) = spawn_server_with(Lifecycle::Stateless, withheld);
+    let c = connect(&ep);
+    let (name, args) = prompt();
+    match c.get_prompt(name, args) {
+        Err(McpError::Capability(m)) => assert!(m.contains("prompts"), "{m}"),
+        other => panic!("prompts were not offered: {other:?}"),
+    }
+    match c.complete(reference(), argument()) {
+        Err(McpError::Capability(m)) => assert!(m.contains("completions"), "{m}"),
+        other => panic!("completions were not offered: {other:?}"),
+    }
+    match c.subscribe("file:///a.txt") {
+        Err(McpError::Capability(m)) => assert!(m.contains("resources.subscribe"), "{m}"),
+        other => panic!("subscriptions were not offered: {other:?}"),
+    }
+    assert_eq!(methods(&seen), ["server/discover"], "nothing reached it");
+}
+
+#[test]
 fn declared_capabilities_reach_the_handshake() {
-    let seen: Shared = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen));
+    let (ep, seen) = spawn_server(HANDSHAKE);
     let h: Arc<dyn Handler> = Arc::new(Yes);
     let _client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
         .with_elicitation(h)
         .connect()
         .expect("connect");
-    let init = seen.lock().unwrap().init.clone().unwrap();
+    let init = &requests(&seen, "initialize")[0].body["params"];
     assert_eq!(
         init["capabilities"]["elicitation"],
         json!({}),
@@ -260,12 +337,9 @@ fn declared_capabilities_reach_the_handshake() {
     );
 
     // …and absent when the host cannot answer one.
-    let seen2: Shared = Arc::default();
-    let ep2 = spawn_server(Arc::clone(&seen2));
-    let _plain = RmcpBuilder::new("mock", &ep2, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
-    let init2 = seen2.lock().unwrap().init.clone().unwrap();
+    let (ep2, seen2) = spawn_server(HANDSHAKE);
+    let _plain = connect(&ep2, HANDSHAKE);
+    let init2 = &requests(&seen2, "initialize")[0].body["params"];
     assert!(
         init2["capabilities"].get("elicitation").is_none(),
         "undeclared: {init2}"
@@ -276,39 +350,59 @@ fn declared_capabilities_reach_the_handshake() {
 fn tools_and_resources_come_back_as_agentds_own_wire_types() {
     // The facade converts through JSON; this is the check that the two shapes
     // really do line up rather than silently dropping fields.
-    let seen: Shared = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen));
-    let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
+    for lifecycle in LIFECYCLES {
+        let (ep, _) = spawn_server(lifecycle);
+        let client = connect(&ep, lifecycle);
 
-    let tools = client.list_tools().expect("tools/list");
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name, "echo");
-    assert_eq!(tools[0].description.as_deref(), Some("echo a string"));
-    assert_eq!(tools[0].input_schema["properties"]["s"]["type"], "string");
+        let tools = client.list_tools().expect("tools/list");
+        assert_eq!(tools.len(), 1, "{lifecycle:?}");
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description.as_deref(), Some("echo a string"));
+        assert_eq!(tools[0].input_schema["properties"]["s"]["type"], "string");
 
-    let resources = client.list_resources().expect("resources/list");
-    assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0].uri, "file:///a.txt");
+        let resources = client.list_resources().expect("resources/list");
+        assert_eq!(resources.len(), 1, "{lifecycle:?}");
+        assert_eq!(resources[0].uri, "file:///a.txt");
 
-    // The negotiated server capabilities survive the translation.
-    assert!(client.capabilities().tools.is_some());
-    assert!(client.capabilities().resources.is_some());
+        // The negotiated server capabilities survive the translation.
+        assert!(client.capabilities().tools.is_some(), "{lifecycle:?}");
+        assert!(client.capabilities().resources.is_some(), "{lifecycle:?}");
+    }
 }
 
 #[test]
 fn a_tool_call_round_trips() {
-    let seen: Shared = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen));
-    let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
-    let meta = json!({"agent/run_id": "r1"}).as_object().cloned();
-    let out = client
-        .call_tool("echo", Some(json!({"s": "hi"})), meta, None)
+    for lifecycle in LIFECYCLES {
+        let (ep, seen) = spawn_server(lifecycle);
+        let client = connect(&ep, lifecycle);
+        let meta = json!({"agent/run_id": "r1"}).as_object().cloned();
+        let out = client
+            .call_tool("echo", Some(json!({"s": "hi"})), meta, None)
+            .unwrap_or_else(|e| panic!("{lifecycle:?}: {e}"));
+        assert_eq!(out["content"][0]["text"], "echoed", "{lifecycle:?}");
+        let call = &requests(&seen, "tools/call")[0].body["params"];
+        assert_eq!(call["arguments"], json!({"s": "hi"}), "{lifecycle:?}");
+        assert_eq!(call["_meta"]["agent/run_id"], "r1", "{lifecycle:?}");
+    }
+}
+
+#[test]
+fn the_run_meta_rides_beside_the_protocol_meta_at_2026_07_28() {
+    // At 2026-07-28 `params._meta` also carries the protocol itself — the
+    // revision, the client, its capabilities — on every request. agentd's own
+    // call meta (the run id a server dedupes a retried call by) must ride
+    // beside it, neither replaced by it nor replacing it.
+    let (ep, seen) = spawn_server(Lifecycle::Stateless);
+    let client = connect(&ep, Lifecycle::Stateless);
+    let meta = json!({"agent/run_id": "r-1"}).as_object().cloned();
+    client
+        .call_tool("echo", None, meta, None)
         .expect("tools/call");
-    assert_eq!(out["content"][0]["text"], "echoed");
+    let call = &requests(&seen, "tools/call")[0];
+    let m = &call.body["params"]["_meta"];
+    assert_eq!(m["agent/run_id"], "r-1", "{m}");
+    assert_eq!(m["io.modelcontextprotocol/protocolVersion"], MODERN, "{m}");
+    assert!(call.meta("clientInfo").is_some(), "{m}");
 }
 
 /// A server that offers a long `ttlMs` on every cacheable result, the way the
@@ -355,63 +449,61 @@ impl Stopper {
 /// An hour, as the server's own offer of reuse — far past any test.
 const TTL: u64 = 3_600_000;
 
-fn spawn_ttl_server(state: Arc<TtlState>) -> (String, Stopper) {
+/// The TTL server speaking `lifecycle`. At 2026-07-28 the discover answer
+/// offers the same hour as every list and read.
+fn spawn_ttl_server(state: Arc<TtlState>, lifecycle: Lifecycle) -> (String, Stopper) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
+    let caps = json!({"tools": {}, "resources": {"subscribe": true}, "prompts": {}});
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             if flag.load(Ordering::SeqCst) {
                 break;
             }
             let Ok(conn) = conn else { continue };
-            let state = Arc::clone(&state);
+            let (state, caps) = (Arc::clone(&state), caps.clone());
             std::thread::spawn(move || {
                 conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let mut w = conn.try_clone().unwrap();
                 let mut r = BufReader::new(conn);
-                let Some((start, body)) = read_http(&mut r) else {
+                let Some(req) = read_req(&mut r) else {
                     return;
                 };
-                if start.starts_with("GET") || start.starts_with("DELETE") {
-                    let _ = w
-                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
-                    return;
+                if !req.line.starts_with("POST") {
+                    return respond_raw(&mut w, 405, &[], "");
                 }
-                let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-                if msg.get("id").is_none() {
-                    let _ = w.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
-                    return;
+                if req.body.get("id").is_none() {
+                    return respond_raw(&mut w, 202, &[], "");
                 }
-                let id = msg["id"].clone();
+                let id = req.id();
+                let method = req.method();
                 let n = {
                     let mut calls = state.calls.lock().unwrap();
                     let n = calls.entry(method.to_string()).or_default();
                     *n += 1;
                     *n
                 };
-                let result = match method {
-                    "initialize" => json!({
-                        "protocolVersion": msg["params"]["protocolVersion"],
-                        "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {}},
-                        "serverInfo": {"name": "ttl", "version": "0"}
-                    }),
+                if let Some((status, mut body)) = lifecycle_answer(lifecycle, &req, &caps) {
+                    if method == "server/discover" && status == 200 {
+                        body["result"]["ttlMs"] = json!(TTL);
+                    }
+                    return respond(&mut w, status, &issued(lifecycle, &req), &body);
+                }
+                let answer = match method {
                     "resources/read" if state.fail_reads.load(Ordering::SeqCst) => {
-                        respond(
+                        return respond(
                             &mut w,
-                            &json!({
-                                "jsonrpc": "2.0", "id": id,
-                                "error": {"code": -32002, "message": "Resource not found"}
-                            }),
+                            200,
+                            &[],
+                            &error(&id, -32002, "Resource not found"),
                         );
-                        return;
                     }
                     // The text changes with every read, so a client that shows
                     // the previous text did not ask.
                     "resources/read" => json!({
-                        "contents": [{"uri": msg["params"]["uri"], "mimeType": "text/plain", "text": format!("v{n}")}],
+                        "contents": [{"uri": req.body["params"]["uri"], "mimeType": "text/plain", "text": format!("v{n}")}],
                         "ttlMs": TTL, "cacheScope": "private"
                     }),
                     "tools/list" => json!({
@@ -432,10 +524,7 @@ fn spawn_ttl_server(state: Arc<TtlState>) -> (String, Stopper) {
                     }),
                     _ => json!({}),
                 };
-                respond(
-                    &mut w,
-                    &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                );
+                respond(&mut w, 200, &[], &result(&id, answer));
             });
         }
     });
@@ -448,35 +537,39 @@ fn every_read_reaches_the_server_even_when_it_offers_a_ttl() {
     // take it: every call after the first answered from memory, no request on
     // the wire. agentd reads because it needs the current answer, so each call
     // must be one request — counted where it lands, on the server.
-    let state: Arc<TtlState> = Arc::default();
-    let (ep, _stop) = spawn_ttl_server(Arc::clone(&state));
-    let client = RmcpBuilder::new("ttl", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
+    for lifecycle in LIFECYCLES {
+        let state: Arc<TtlState> = Arc::default();
+        let (ep, _stop) = spawn_ttl_server(Arc::clone(&state), lifecycle);
+        let client = connect(&ep, lifecycle);
 
-    for i in 1..=3 {
-        let read = client
-            .read_resource("instruction://ins_x@stable")
-            .expect("read");
-        assert_eq!(
-            read.text(),
-            format!("v{i}"),
-            "read {i} was not the server's current answer"
-        );
+        for i in 1..=3 {
+            let read = client
+                .read_resource("instruction://ins_x@stable")
+                .unwrap_or_else(|e| panic!("{lifecycle:?}: {e}"));
+            assert_eq!(
+                read.text(),
+                format!("v{i}"),
+                "{lifecycle:?}: read {i} was not the server's current answer"
+            );
+        }
+        for _ in 0..2 {
+            client.list_tools().expect("tools/list");
+            client.list_resources().expect("resources/list");
+            client.list_prompts().expect("prompts/list");
+            client
+                .list_resource_templates()
+                .expect("resources/templates/list");
+        }
+        for (method, n) in [
+            ("resources/read", 3),
+            ("tools/list", 2),
+            ("resources/list", 2),
+            ("prompts/list", 2),
+            ("resources/templates/list", 2),
+        ] {
+            assert_eq!(state.calls(method), n, "{lifecycle:?}: {method}");
+        }
     }
-    for _ in 0..2 {
-        client.list_tools().expect("tools/list");
-        client.list_resources().expect("resources/list");
-        client.list_prompts().expect("prompts/list");
-        client
-            .list_resource_templates()
-            .expect("resources/templates/list");
-    }
-    assert_eq!(state.calls("resources/read"), 3);
-    assert_eq!(state.calls("tools/list"), 2);
-    assert_eq!(state.calls("resources/list"), 2);
-    assert_eq!(state.calls("prompts/list"), 2);
-    assert_eq!(state.calls("resources/templates/list"), 2);
 }
 
 #[test]
@@ -485,26 +578,29 @@ fn a_read_against_a_stopped_server_fails_instead_of_replaying_the_last_answer() 
     // a failed read, or `unavailable` never fires. rmcp's default serves the
     // cached answer while it is fresh and the expired one when a re-fetch
     // fails — either way a dead server "answers".
-    let state: Arc<TtlState> = Arc::default();
-    let (ep, stopper) = spawn_ttl_server(Arc::clone(&state));
-    let client = RmcpBuilder::new("ttl", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
-    let uri = "instruction://ins_x@stable";
-    assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
-    client.list_tools().expect("tools/list");
+    for lifecycle in LIFECYCLES {
+        let state: Arc<TtlState> = Arc::default();
+        let (ep, stopper) = spawn_ttl_server(Arc::clone(&state), lifecycle);
+        let client = connect(&ep, lifecycle);
+        let uri = "instruction://ins_x@stable";
+        assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
+        client.list_tools().expect("tools/list");
 
-    stopper.stop();
+        stopper.stop();
 
-    match client.read_resource(uri) {
-        Err(mcp::client::McpError::Transport(m)) => {
-            assert!(m.contains(&format!("resources/read {uri}")), "{m}")
+        match client.read_resource(uri) {
+            Err(McpError::Transport(m)) => {
+                assert!(
+                    m.contains(&format!("resources/read {uri}")),
+                    "{lifecycle:?}: {m}"
+                )
+            }
+            other => panic!("{lifecycle:?}: a stopped server answered resources/read: {other:?}"),
         }
-        other => panic!("a stopped server answered resources/read: {other:?}"),
-    }
-    match client.list_tools() {
-        Err(mcp::client::McpError::Transport(m)) => assert!(m.contains("tools/list"), "{m}"),
-        other => panic!("a stopped server answered tools/list: {other:?}"),
+        match client.list_tools() {
+            Err(McpError::Transport(m)) => assert!(m.contains("tools/list"), "{lifecycle:?}: {m}"),
+            other => panic!("{lifecycle:?}: a stopped server answered tools/list: {other:?}"),
+        }
     }
 }
 
@@ -513,19 +609,23 @@ fn a_refusal_from_the_server_is_not_masked_by_an_earlier_answer() {
     // A withdrawn instruction: the registry is up and says "not found". That
     // is the strongest signal there is, and a cache that answers with the
     // last good copy turns it into a confirmation.
-    let state: Arc<TtlState> = Arc::default();
-    let (ep, _stop) = spawn_ttl_server(Arc::clone(&state));
-    let client = RmcpBuilder::new("ttl", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
-    let uri = "instruction://ins_x@stable";
-    assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
+    for lifecycle in LIFECYCLES {
+        let state: Arc<TtlState> = Arc::default();
+        let (ep, _stop) = spawn_ttl_server(Arc::clone(&state), lifecycle);
+        let client = connect(&ep, lifecycle);
+        let uri = "instruction://ins_x@stable";
+        assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
 
-    state.fail_reads.store(true, Ordering::SeqCst);
+        state.fail_reads.store(true, Ordering::SeqCst);
 
-    let err = client
-        .read_resource(uri)
-        .expect_err("the server refused, the client must say so");
-    assert!(err.to_string().contains("Resource not found"), "{err}");
-    assert_eq!(state.calls("resources/read"), 2);
+        let err = match client.read_resource(uri) {
+            Err(e) => e,
+            Ok(r) => panic!("{lifecycle:?}: the server refused, the client must say so: {r:?}"),
+        };
+        assert!(
+            err.to_string().contains("Resource not found"),
+            "{lifecycle:?}: {err}"
+        );
+        assert_eq!(state.calls("resources/read"), 2, "{lifecycle:?}");
+    }
 }

@@ -859,31 +859,38 @@ impl RmcpClient {
         self.convert(&res, "resources/templates/list")
     }
 
-    /// Subscribe to a resource, by whichever mechanism the negotiated revision
-    /// actually defines.
+    /// Subscribe to a resource, by whichever mechanism the connection's
+    /// revision defines.
     ///
     /// The revisions disagree: up to 2025-11-25 a client calls
-    /// `resources/subscribe`, and from 2026-07-28 on `subscriptions/listen`
-    /// replaces it (rmcp marks the former deprecated *for those versions
-    /// only*). Because the server's answer decides the revision a connection
-    /// speaks, the choice is read off the negotiated version rather than
-    /// hard-coded — calling the wrong one leaves the host with a
-    /// subscription the server never honours.
+    /// `resources/subscribe` per URI, and the subscription lives on the
+    /// session; from 2026-07-28 on `subscriptions/listen` replaces it (rmcp
+    /// marks the former deprecated *for those versions only*), and the
+    /// subscription lives as long as the listen's response stream. Which
+    /// revision a connection speaks is decided by what reached the server —
+    /// `initialize` or `server/discover` — so the choice is read off the
+    /// negotiated version rather than hard-coded: calling the wrong one
+    /// leaves the host with a subscription the server never honours.
     ///
-    /// Either way the server must have advertised `resources.subscribe`: a
-    /// server that did not would accept the call, or ignore the URI in a
-    /// listen filter, and never notify — a wait that parks forever with
-    /// nothing in any log. That is a [`McpError::Capability`] here instead,
-    /// and so is a listen whose acknowledgment leaves the URI out: rmcp lets a
-    /// server accept a narrower filter than the one asked for, and then drops
-    /// every update for what it left out.
+    /// Either way the server must have advertised `resources.subscribe`, in
+    /// whichever answer started the connection: a server that did not would
+    /// accept the call, or ignore the URI in a listen filter, and never
+    /// notify — a wait that parks forever with nothing in any log. That is a
+    /// [`McpError::Capability`] here instead, with nothing sent, and so is a
+    /// listen whose acknowledgment leaves the URI out: rmcp lets a server
+    /// accept a narrower filter than the one asked for, and then drops every
+    /// update for what it left out.
     ///
     /// The URI is recorded only once the server accepted it, so a failed
     /// subscribe is a real retry next time rather than "already covered". At
     /// 2025-11-25 only the new URI is sent; the ones already held stay held.
-    /// From 2026-07-28 on, one subscription covers every tracked URI: adding a
-    /// URI reopens it with the widened filter, and its notifications pump into
-    /// the queue the host drains.
+    /// From 2026-07-28 on, one listen covers every tracked URI: adding a URI
+    /// opens a listen with the widened filter, and the one it replaces is
+    /// hung up once the server has acknowledged the new one, so the server
+    /// never holds the narrower listen beside it. Its notifications pump into
+    /// the queue the host drains, and a listen stream that ends — as it does
+    /// when the server restarts, there being no session to forget — is said
+    /// ([`ListenEvent`]) and opened again.
     ///
     /// Only the socket's timeout on each silence ends the server call; a
     /// caller on a thread that must not stall bounds it with
@@ -996,11 +1003,17 @@ impl RmcpClient {
         }
     }
 
-    /// (Re)open the single subscription covering `uris`, and pump its
-    /// notifications into the drain queue on a background task that listens
-    /// again whenever the stream ends. The previous pump is stopped only once
-    /// the new listen is acknowledged, so a refused widening leaves the URIs
-    /// already held still watched.
+    /// (Re)open the single listen covering `uris`, and pump its notifications
+    /// into the drain queue on a background task that listens again whenever
+    /// the stream ends. An empty set opens nothing and stops the pump.
+    ///
+    /// The new listen is opened before the old one is let go: the previous
+    /// pump is stopped only once the new listen is acknowledged, so a refused
+    /// widening leaves the URIs already held still watched. Stopping the pump
+    /// drops its subscription, and dropping a subscription hangs up its HTTP
+    /// exchange — at 2026-07-28 the closed stream is the cancellation, and no
+    /// `notifications/cancelled` is sent — so the server stops holding the
+    /// old filter at once, not when the socket's timeout ends it.
     ///
     /// Returns the URIs the acknowledgment names — the accepted set from now
     /// on, since the new listen replaces the old one. A held URI it leaves

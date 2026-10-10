@@ -217,8 +217,23 @@ impl ClientHandler for Handler {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenEvent {
     /// The stream ended (or a re-listen failed); the pump listens again in
-    /// `retry_ms`.
-    Ended { reason: String, retry_ms: u64 },
+    /// `retry_ms`. `idle`: the stream was quiet past its idle bound and cut
+    /// for that alone — routine, since a listen is quiet whenever nothing
+    /// changes, and followed by a resync of what it held.
+    Ended {
+        reason: String,
+        retry_ms: u64,
+        idle: bool,
+    },
+    /// The standing listen (the `list_changed` notifications, opened at
+    /// connect) was refused, failed or got no answer. Said once; it is asked
+    /// for again on the usual backoff without a word, and its acknowledgment
+    /// is said as [`Self::Resumed`]. The connection works without it.
+    Unavailable { reason: String, retry_ms: u64 },
+    /// The server refused a listen that asked for its `list_changed`
+    /// notifications beside URIs, and took the URIs alone: the connection
+    /// stops asking for them, so its URI subscriptions keep working.
+    FlagsRefused { reason: String },
     /// A re-listen succeeded: the subscription covers every URI again.
     Resumed,
     /// The server acknowledged a listen without these URIs, which it held
@@ -235,6 +250,12 @@ pub const RELISTEN_MIN: Duration = Duration::from_millis(250);
 /// stayed open for its end to start the backoff over. A server that closes
 /// every listen at once is re-asked at most this often, not in a tight loop.
 pub const RELISTEN_MAX: Duration = Duration::from_secs(30);
+
+/// How long a listen stream may stay silent before it is cut and opened again
+/// (never less than the connection's timeout). A listen is quiet whenever
+/// nothing changes; the connection's timeout, meant for a server that stopped
+/// answering, would cut every quiet one, and listens cannot be resumed.
+pub const LISTEN_IDLE: Duration = Duration::from_secs(600);
 
 /// A blocking MCP client backed by the official SDK.
 pub struct RmcpClient {
@@ -273,6 +294,11 @@ pub struct RmcpClient {
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// What the pump reports about the listen stream, until the host drains it.
     listen_events: Arc<Mutex<Vec<ListenEvent>>>,
+    /// Listen streams the socket cut for idleness, counted by the transport.
+    idle_cuts: Arc<std::sync::atomic::AtomicU64>,
+    /// Set once the server refused a listen that asked for its
+    /// `list_changed` notifications ([`ListenEvent::FlagsRefused`]).
+    flags_refused: std::sync::atomic::AtomicBool,
 }
 
 /// Builder state, so the host can declare capabilities before connecting (the
@@ -297,6 +323,8 @@ pub struct RmcpBuilder {
     handshake_bound: Option<Duration>,
     /// What the connection sends first; see [`FirstRequest`].
     first: FirstRequest,
+    /// How long a listen stream may stay silent; see [`LISTEN_IDLE`].
+    listen_idle: Duration,
 }
 
 impl RmcpBuilder {
@@ -320,7 +348,15 @@ impl RmcpBuilder {
             http: None,
             handshake_bound: None,
             first: FirstRequest::Initialize,
+            listen_idle: LISTEN_IDLE,
         }
+    }
+
+    /// Let a listen stream stay silent for `idle` (never less than the
+    /// connection's timeout) before it is cut; see [`LISTEN_IDLE`].
+    pub fn with_listen_idle(mut self, idle: Duration) -> Self {
+        self.listen_idle = idle;
+        self
     }
 
     /// Send `first` first; see [`FirstRequest`].
@@ -402,6 +438,7 @@ impl RmcpBuilder {
             endpoint: self.endpoint.clone(),
             socket: Arc::clone(&socket),
             timeout: self.timeout,
+            listen_idle: self.listen_idle,
             handler: Handler {
                 queue: Arc::clone(&notifications),
                 // Replaced per attempt: `initialize` carries the revision it
@@ -412,7 +449,7 @@ impl RmcpBuilder {
         };
         let first = self.first;
         let bound = self.handshake_bound;
-        let (service, raw_caps) = rt
+        let (service, raw_caps, idle_cuts) = rt
             .block_on(async move {
                 match bound {
                     // The timer is built inside the runtime: it needs its clock.
@@ -450,7 +487,7 @@ impl RmcpBuilder {
             .and_then(|c| serde_json::from_value(c.clone()).ok())
             .unwrap_or_default();
 
-        Ok(RmcpClient {
+        let client = RmcpClient {
             name: self.name,
             rt,
             service,
@@ -463,7 +500,11 @@ impl RmcpBuilder {
             subscribing: Mutex::new(()),
             pump: Mutex::new(None),
             listen_events: Arc::default(),
-        })
+            idle_cuts,
+            flags_refused: std::sync::atomic::AtomicBool::new(false),
+        };
+        client.stand();
+        Ok(client)
     }
 }
 
@@ -571,10 +612,17 @@ struct Start {
     endpoint: String,
     socket: Arc<crate::http::HttpTransport>,
     timeout: Duration,
+    listen_idle: Duration,
     handler: Handler,
 }
 
-type Started = (RunningService<RoleClient, Handler>, Option<Value>);
+/// A started connection: the service, the server's capabilities as sent, and
+/// the transport's count of listen streams cut for idleness.
+type Started = (
+    RunningService<RoleClient, Handler>,
+    Option<Value>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
 
 /// A failed startup attempt: rmcp's error, and what the socket recorded when
 /// the request got no JSON-RPC answer at all. Boxed: rmcp's error is large.
@@ -589,7 +637,8 @@ impl Start {
         mode: ClientLifecycleMode,
         offer: ProtocolVersion,
     ) -> Result<Started, Failed> {
-        let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&self.socket), self.timeout);
+        let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&self.socket), self.timeout)
+            .with_listen_idle(self.listen_idle);
         // The caller's headers are the socket's, never the SDK's too: the SDK
         // hands its custom headers to the socket on every request, so a copy
         // here put each one — `Authorization` included — on the wire twice.
@@ -609,7 +658,7 @@ impl Start {
         let mut handler = self.handler.clone();
         handler.info.protocol_version = offer;
         match handler.serve_with_lifecycle(transport, mode).await {
-            Ok(service) => Ok((service, client.raw_capabilities())),
+            Ok(service) => Ok((service, client.raw_capabilities(), client.idle_cuts())),
             Err(e) => Err(Box::new((e, client.bootstrap_failure()))),
         }
     }
@@ -1012,43 +1061,144 @@ impl RmcpClient {
         }
     }
 
-    /// (Re)open the single listen covering `uris`, and pump its notifications
-    /// into the drain queue on a background task that listens again whenever
-    /// the stream ends. An empty set opens nothing and stops the pump.
-    ///
-    /// The new listen is opened before the old one is let go: the previous
-    /// pump is stopped only once the new listen is acknowledged, so a refused
-    /// widening leaves the URIs already held still watched. Stopping the pump
-    /// drops its subscription, and dropping a subscription hangs up its HTTP
-    /// exchange — at 2026-07-28 the closed stream is the cancellation, and no
-    /// `notifications/cancelled` is sent — so the server stops holding the
-    /// old filter at once, not when the socket's timeout ends it.
+    /// The `list_changed` notifications this connection's listens ask for:
+    /// those the server advertised, unless it refused them in a filter
+    /// ([`ListenEvent::FlagsRefused`]).
+    fn list_flags(&self) -> (bool, bool, bool) {
+        if self.flags_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return (false, false, false);
+        }
+        let tools = self
+            .caps
+            .tools
+            .as_ref()
+            .and_then(|t| t.list_changed)
+            .unwrap_or(false);
+        let prompts = self
+            .caps
+            .prompts
+            .as_ref()
+            .and_then(|p| p.get("listChanged"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let resources = self
+            .caps
+            .resources
+            .as_ref()
+            .and_then(|r| r.list_changed)
+            .unwrap_or(false);
+        (tools, prompts, resources)
+    }
+
+    /// Does any listen on this connection ask for a `list_changed`? Then one
+    /// is held even with no URI subscribed: at 2026-07-28 a listen is the only
+    /// way a `list_changed` arrives.
+    fn wants_list_changed(&self) -> bool {
+        let (t, p, r) = self.list_flags();
+        t || p || r
+    }
+
+    /// The filter of a listen on `uris`, with the `list_changed` flags when
+    /// `flags`.
+    fn filter_for(
+        &self,
+        uris: &std::collections::BTreeSet<String>,
+        flags: bool,
+    ) -> SubscriptionFilter {
+        let mut b = SubscriptionFilter::builder();
+        if flags {
+            let (tools, prompts, resources) = self.list_flags();
+            if tools {
+                b = b.tools_list_changed();
+            }
+            if prompts {
+                b = b.prompts_list_changed();
+            }
+            if resources {
+                b = b.resources_list_changed();
+            }
+        }
+        for u in uris {
+            b = b.resource_subscription(u.clone());
+        }
+        b.build()
+    }
+
+    /// What a pump on this connection shares with it.
+    fn pump_ctx(&self) -> PumpCtx {
+        PumpCtx {
+            peer: self.service.peer().clone(),
+            queue: Arc::clone(&self.notifications),
+            events: Arc::clone(&self.listen_events),
+            held: Arc::clone(&self.uris),
+            idle_cuts: Arc::clone(&self.idle_cuts),
+        }
+    }
+
+    /// Open the standing listen in the background: the `list_changed`
+    /// notifications the server advertised, no URI. Never awaited — a server
+    /// that refuses it, fails it or is slow to acknowledge it must not fail or
+    /// delay a connection that works without it ([`establish`]).
+    fn stand(&self) {
+        if !self.listens() || !self.wants_list_changed() {
+            return;
+        }
+        let filter = self.filter_for(&Default::default(), true);
+        let handle = self.rt.spawn(pump(None, self.pump_ctx(), filter));
+        *self.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// (Re)open the single subscription covering `uris` (and the
+    /// `list_changed` notifications the server advertised), and pump its
+    /// notifications into the drain queue on a background task that listens
+    /// again whenever the stream ends. The previous pump is stopped only once
+    /// the new listen is acknowledged, so a refused widening leaves the URIs
+    /// already held still watched.
     ///
     /// Returns the URIs the acknowledgment names — the accepted set from now
     /// on, since the new listen replaces the old one. A held URI it leaves
     /// out (anything but `asking`, which the caller reports) is said as
     /// [`ListenEvent::Narrowed`].
+    ///
+    /// A server that advertises a `list_changed` but refuses that flag in a
+    /// filter keeps its URI subscriptions: the listen is asked for once more
+    /// without the flags, and the connection stops asking for them
+    /// ([`ListenEvent::FlagsRefused`]).
     fn listen_on(
         &self,
         uris: &std::collections::BTreeSet<String>,
         bound: Option<Duration>,
         asking: Option<&str>,
     ) -> Result<std::collections::BTreeSet<String>, McpError> {
-        if uris.is_empty() {
+        if uris.is_empty() && !self.wants_list_changed() {
             self.stop_pump();
             self.uris.lock().unwrap_or_else(|e| e.into_inner()).clear();
             return Ok(Default::default());
         }
-        let mut filter = SubscriptionFilter::builder().resources_list_changed();
-        for u in uris {
-            filter = filter.resource_subscription(u.clone());
-        }
-        let filter = filter.build();
-
         let peer = self.service.peer().clone();
-        let subscription = self
-            .bounded(bound, "subscriptions/listen", peer.listen(filter.clone()))?
-            .map_err(|e| self.fail("subscriptions/listen", e))?;
+        let flagged = self.filter_for(uris, true);
+        let subscription =
+            match self.bounded(bound, "subscriptions/listen", peer.listen(flagged.clone()))? {
+                Ok(s) => s,
+                Err(e) if !uris.is_empty() && self.wants_list_changed() => {
+                    let plain = self.filter_for(uris, false);
+                    match self.bounded(bound, "subscriptions/listen", peer.listen(plain))? {
+                        Ok(s) => {
+                            self.flags_refused
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            self.listen_events
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(ListenEvent::FlagsRefused {
+                                    reason: format!("subscriptions/listen: {e}"),
+                                });
+                            s
+                        }
+                        Err(_) => return Err(self.fail("subscriptions/listen", e)),
+                    }
+                }
+                Err(e) => return Err(self.fail("subscriptions/listen", e)),
+            };
         let acked = acknowledged(subscription.acknowledged());
         let dropped: Vec<String> = uris
             .iter()
@@ -1066,14 +1216,9 @@ impl RmcpClient {
         // Re-listen with what the server took, not with what was asked: the
         // URIs it left out are the host's to ask for again.
         let filter = subscription.acknowledged().clone();
-        let handle = self.rt.spawn(pump(
-            subscription,
-            peer,
-            filter,
-            Arc::clone(&self.notifications),
-            Arc::clone(&self.listen_events),
-            Arc::clone(&self.uris),
-        ));
+        let handle = self
+            .rt
+            .spawn(pump(Some(subscription), self.pump_ctx(), filter));
         *self.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(acked)
     }
@@ -1133,30 +1278,156 @@ fn acknowledged(filter: &SubscriptionFilter) -> std::collections::BTreeSet<Strin
         .collect()
 }
 
-/// Pump one listen subscription into `queue`, and when it ends — the server
-/// closed it, completed it, cancelled it, or the client lagged — say so on
-/// `events` and listen again with the same filter. A listen stream that ended
-/// and was not reopened left every subscribed URI without a wake, with nothing
-/// in any log; the wait before each retry doubles from [`RELISTEN_MIN`] to
-/// [`RELISTEN_MAX`], so a server that refuses to hold one is not hammered.
+/// What a listen pump shares with its connection.
+#[derive(Clone)]
+struct PumpCtx {
+    peer: rmcp::service::Peer<RoleClient>,
+    queue: Arc<Mutex<Vec<rpc::Notification>>>,
+    events: Arc<Mutex<Vec<ListenEvent>>>,
+    held: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Listen streams the socket cut for idleness, counted by the transport.
+    idle_cuts: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PumpCtx {
+    fn report(&self, e: ListenEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(e);
+    }
+
+    fn queue_update(&self, uri: &str) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(rpc::Notification::new(
+                crate::wire::method::NOTIFY_RESOURCES_UPDATED,
+                Some(json!({ "uri": uri })),
+            ));
+    }
+
+    /// The resource's content as one canonical string, or `None` when the
+    /// read failed. Through the connection's own peer, so it is a read on the
+    /// wire (the response cache is off).
+    async fn read(&self, uri: &str) -> Option<String> {
+        let r = self
+            .peer
+            .read_resource(ReadResourceRequestParams::new(uri.to_string()))
+            .await
+            .ok()?;
+        serde_json::to_value(&r.contents)
+            .ok()
+            .map(|v| v.to_string())
+    }
+}
+
+/// What the pump last saw of each URI it holds, while a listen was live.
+///
+/// Listens cannot be resumed — a re-opened one starts from now — so an update
+/// sent while one was being re-opened is gone. What agentd guarantees instead
+/// is that state converges: after every re-listen, a held URI whose content
+/// differs from what was last seen while a listen was live gets ONE wake
+/// (`resources/updated`), and the waits, starts and instruction it reaches
+/// read it as they would any update. Changes inside one gap are coalesced; a
+/// change reverted inside the gap is not delivered. A URI with no such
+/// baseline (`None`: never read while live, or a read that failed) is woken.
+#[derive(Default)]
+struct Baseline {
+    seen: std::collections::BTreeMap<String, Option<String>>,
+    /// URIs re-read after a live update, and when, since the stream last
+    /// proved alive with a frame: a read that finished just before the stream
+    /// was seen to end may have run in the gap.
+    unproven: std::collections::BTreeMap<String, std::time::Instant>,
+}
+
+/// How soon before a stream is seen to end a read must have finished to be
+/// doubted. A stream's end reaches the pump within milliseconds of the
+/// connection closing; a read that finished well before it saw a live stream.
+const UNPROVEN: Duration = Duration::from_secs(1);
+
+impl Baseline {
+    /// Record what every acknowledged URI holds now, while the listen is live.
+    async fn take(&mut self, ctx: &PumpCtx, filter: &SubscriptionFilter) {
+        for uri in acknowledged(filter) {
+            let now = ctx.read(&uri).await;
+            self.seen.insert(uri, now);
+        }
+    }
+
+    /// After a re-listen: wake each acknowledged URI that changed in the gap
+    /// (or cannot be compared), and take the new baseline.
+    async fn resync(&mut self, ctx: &PumpCtx, filter: &SubscriptionFilter) {
+        for uri in acknowledged(filter) {
+            let now = ctx.read(&uri).await;
+            let before = self.seen.get(&uri).cloned().flatten();
+            if now.is_none() || before.is_none() || before != now {
+                ctx.queue_update(&uri);
+            }
+            self.seen.insert(uri, now);
+        }
+    }
+}
+
+/// Open a listen on `filter`, retrying until the server takes it. Used for a
+/// listen nobody is waiting on — the standing one that carries `list_changed`,
+/// opened in the background at connect — so it must never fail anything: a
+/// refusal is said ONCE ([`ListenEvent::Unavailable`]), the listen is asked for
+/// again on the usual backoff without a word, and its acknowledgment is said
+/// as [`ListenEvent::Resumed`].
+async fn establish(ctx: &PumpCtx, filter: &SubscriptionFilter) -> Subscription {
+    let mut wait = RELISTEN_MIN;
+    let mut said = false;
+    loop {
+        match ctx.peer.listen(filter.clone()).await {
+            Ok(s) => {
+                if said {
+                    ctx.report(ListenEvent::Resumed);
+                }
+                return s;
+            }
+            Err(e) => {
+                if !said {
+                    ctx.report(ListenEvent::Unavailable {
+                        reason: format!("subscriptions/listen: {e}"),
+                        retry_ms: wait.as_millis() as u64,
+                    });
+                    said = true;
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(RELISTEN_MAX);
+            }
+        }
+    }
+}
+
+/// Pump one listen subscription into the drain queue, and when it ends — the
+/// server closed it, completed it, cancelled it, the socket cut it for
+/// idleness, or the client lagged — say so and listen again with the same
+/// filter. A listen stream that ended and was not reopened left every
+/// subscribed URI without a wake, with nothing in any log; the wait before
+/// each retry doubles from [`RELISTEN_MIN`] to [`RELISTEN_MAX`], so a server
+/// that refuses to hold one is not hammered.
+///
+/// `first` is the acknowledged listen to pump, or `None` for a standing one
+/// still to be opened ([`establish`]).
 ///
 /// A re-listen the server acknowledges with fewer URIs than it held leaves
 /// those out of `held` and says so ([`ListenEvent::Narrowed`]), and the pump
 /// listens on with what was acknowledged: rmcp drops every update outside the
 /// acknowledgment, so a URI kept in `held` would read as watched and never
-/// wake.
-async fn pump(
-    mut subscription: Subscription,
-    peer: rmcp::service::Peer<RoleClient>,
-    mut filter: SubscriptionFilter,
-    queue: Arc<Mutex<Vec<rpc::Notification>>>,
-    events: Arc<Mutex<Vec<ListenEvent>>>,
-    held: Arc<Mutex<std::collections::BTreeSet<String>>>,
-) {
-    let report = |e: ListenEvent| events.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+/// wake. Every re-listen is followed by a resync ([`Baseline`]).
+async fn pump(first: Option<Subscription>, ctx: PumpCtx, mut filter: SubscriptionFilter) {
+    let mut subscription = match first {
+        Some(s) => s,
+        None => establish(&ctx, &filter).await,
+    };
+    let mut baseline = Baseline::default();
+    baseline.take(&ctx, subscription.acknowledged()).await;
     let mut wait = RELISTEN_MIN;
     loop {
         let opened = tokio::time::Instant::now();
+        let cuts = ctx.idle_cuts.load(std::sync::atomic::Ordering::SeqCst);
         let mut reason = loop {
             match subscription.next().await {
                 // The SDK's notification serializes as `{method, params}` with
@@ -1164,32 +1435,62 @@ async fn pump(
                 // than parsed as a whole frame — which failed on every one of
                 // them and dropped each wake without a word.
                 Ok(Some(note)) => {
+                    // The stream is alive: reads since the last frame did not
+                    // run in a gap.
+                    baseline.unproven.clear();
                     if let Ok(v) = serde_json::to_value(&note)
                         && let Some(method) = v.get("method").and_then(Value::as_str)
                     {
-                        queue
+                        let params = v.get("params").cloned();
+                        let updated = (method == crate::wire::method::NOTIFY_RESOURCES_UPDATED)
+                            .then(|| {
+                                params
+                                    .as_ref()
+                                    .and_then(|p| p.get("uri"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .flatten();
+                        ctx.queue
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .push(rpc::Notification::new(method, v.get("params").cloned()));
+                            .push(rpc::Notification::new(method, params));
+                        // A live update moves the baseline, so the next resync
+                        // compares against what the host was just woken for.
+                        if let Some(uri) = updated
+                            && baseline.seen.contains_key(&uri)
+                        {
+                            let now = ctx.read(&uri).await;
+                            baseline.seen.insert(uri.clone(), now);
+                            baseline.unproven.insert(uri, std::time::Instant::now());
+                        }
                     }
                 }
                 Ok(None) => break ended(subscription.end()),
                 Err(e) => break format!("subscriptions/listen: {e}"),
             }
         };
+        for (uri, read_at) in std::mem::take(&mut baseline.unproven) {
+            if read_at.elapsed() < UNPROVEN {
+                baseline.seen.insert(uri, None);
+            }
+        }
+        let idle = ctx.idle_cuts.load(std::sync::atomic::Ordering::SeqCst) > cuts;
         // A stream that stayed open a good while ended for a reason of its
         // own, and starts the backoff over; one that ended at once did not.
-        if opened.elapsed() >= RELISTEN_MAX {
+        // An idle cut is the former by definition.
+        if idle || opened.elapsed() >= RELISTEN_MAX {
             wait = RELISTEN_MIN;
         }
         loop {
-            report(ListenEvent::Ended {
+            ctx.report(ListenEvent::Ended {
                 reason,
                 retry_ms: wait.as_millis() as u64,
+                idle,
             });
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(RELISTEN_MAX);
-            match peer.listen(filter.clone()).await {
+            match ctx.peer.listen(filter.clone()).await {
                 Ok(s) => {
                     let acked = acknowledged(s.acknowledged());
                     let dropped: Vec<String> = acknowledged(&filter)
@@ -1197,14 +1498,16 @@ async fn pump(
                         .filter(|u| !acked.contains(u))
                         .collect();
                     subscription = s;
-                    report(ListenEvent::Resumed);
+                    ctx.report(ListenEvent::Resumed);
                     if !dropped.is_empty() {
-                        held.lock()
+                        ctx.held
+                            .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .retain(|u| acked.contains(u));
                         filter = subscription.acknowledged().clone();
-                        report(ListenEvent::Narrowed { dropped });
+                        ctx.report(ListenEvent::Narrowed { dropped });
                     }
+                    baseline.resync(&ctx, subscription.acknowledged()).await;
                     break;
                 }
                 Err(e) => reason = format!("subscriptions/listen: {e}"),

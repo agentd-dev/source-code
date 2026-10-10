@@ -288,6 +288,33 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
    leaves one out has refused it — the wait on it fails, the start on it is
    `start.subscribe.unsupported`.
 
+   A listen is quiet whenever nothing changes, so it is not cut at the
+   connection's timeout: it may stay silent for 10 minutes (never less than
+   the timeout) before it is cut and opened again, which is logged as
+   `mcp.listen.ended` at info with `reason: "idle"`. Any other end is a warn.
+
+   Listens cannot be resumed — a re-opened one starts from now — so an update
+   sent while one was being re-opened is gone. What agentd guarantees instead
+   is that state converges: it reads every URI the listen holds when the
+   listen opens and after each update, and after every re-listen it reads
+   them again; a URI whose content changed meanwhile (or could not be read)
+   gets one `resources/updated`, and the waits, starts and instruction on it
+   wake as for any update. Changes inside one gap are coalesced, and a change
+   reverted inside the gap is not delivered. That costs one `resources/read`
+   per held URI per (re-)listen and per update.
+
+   At this revision a `list_changed` arrives only on a listen that asks for
+   it. So a connection whose server advertises `tools`, `prompts` or
+   `resources` `listChanged` holds a listen for them from the moment it
+   connects, even with no URI subscribed. It is opened in the background:
+   a server that refuses it, fails it or is slow to answer never fails or
+   delays the connection. A refusal is logged once, `mcp.listen.unavailable`,
+   and the listen is asked for again on the same backoff until it is held
+   (`mcp.listen.resumed`). A server that advertises a `listChanged` but
+   refuses that flag in a filter keeps its URI subscriptions: the listen is
+   asked for once more without the flags, and the connection stops asking
+   for them (`mcp.listen.flags_refused`).
+
 **Two distinct mechanisms — never conflated:**
 
 | Trigger | Capability needed | Subscribe call | Notification | Payload |

@@ -126,6 +126,9 @@ pub struct McpClient {
     /// What the first connection sends first ([`Self::start_with`]). A
     /// re-dial starts the way the connection it replaces was reached.
     first: FirstRequest,
+    /// How long a listen stream may stay silent before it is cut and opened
+    /// again; see [`crate::rmcp_client::LISTEN_IDLE`].
+    listen_idle: Duration,
 }
 
 impl McpClient {
@@ -170,7 +173,15 @@ impl McpClient {
                 title: None,
             },
             first: FirstRequest::Initialize,
+            listen_idle: crate::rmcp_client::LISTEN_IDLE,
         })
+    }
+
+    /// Let a listen stream stay silent for `idle` (never less than the
+    /// connection's timeout) before it is cut and opened again.
+    pub fn with_listen_idle(mut self, idle: Duration) -> Self {
+        self.listen_idle = idle;
+        self
     }
 
     /// Start the connection with `first` — `server/discover` (MCP 2026-07-28)
@@ -285,7 +296,8 @@ impl McpClient {
             crate::rmcp_client::RmcpBuilder::new(&self.name, &self.endpoint, Vec::new(), timeout)
                 .with_http(http)
                 .with_client_info(self.client_info.clone())
-                .start_with(first);
+                .start_with(first)
+                .with_listen_idle(self.listen_idle);
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
         }

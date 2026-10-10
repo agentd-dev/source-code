@@ -136,9 +136,38 @@ fn is_json_rpc_error(v: &Value) -> bool {
 pub(crate) struct Hangup {
     closed: AtomicBool,
     socket: Mutex<Option<TcpStream>>,
+    /// How long the exchange's event stream may stay silent once its head
+    /// has arrived, when that differs from the connection's timeout (which
+    /// still bounds the dial, the request and the head).
+    stream_idle: Option<std::time::Duration>,
 }
 
 impl Hangup {
+    /// A handle whose exchange, once its event stream is open, may stay
+    /// silent for `idle` rather than the connection's timeout: a listen,
+    /// which is quiet whenever nothing changes.
+    pub(crate) fn with_stream_idle(idle: std::time::Duration) -> Hangup {
+        Hangup {
+            stream_idle: Some(idle),
+            ..Hangup::default()
+        }
+    }
+
+    /// Give the armed connection the stream's own idle bound, now that the
+    /// head has arrived. The socket is shared with whatever wraps it (TLS
+    /// included), so its read timeout bounds every read the stream makes.
+    fn open_stream(&self) {
+        let Some(idle) = self.stream_idle else { return };
+        if let Some(s) = self
+            .socket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = s.set_read_timeout(Some(idle));
+        }
+    }
+
     /// Hang up: the armed connection is shut down now, and any connection the
     /// exchange opens later is shut down as it is armed. Safe at any point,
     /// after the exchange finished included.
@@ -641,6 +670,7 @@ impl HttpTransport {
         }
 
         if resp.is_event_stream() {
+            hangup.open_stream();
             let mut sse = resp.sse();
             while let Some(ev) = sse.next_event().map_err(HttpError::Http)? {
                 if let Some(msg) = route_message(&ev, request_id, on_notification) {

@@ -48,6 +48,7 @@
 //! `RmcpClient::call_tool`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,6 +75,15 @@ pub struct AgentdHttp {
     /// The `capabilities` object of the last bootstrap answer, exactly as the
     /// server sent it: the SDK's typed copy drops members it does not model.
     raw_capabilities: Arc<Mutex<Option<Value>>>,
+    /// How long a `subscriptions/listen` stream may stay silent, when that is
+    /// longer than `timeout`. A listen is quiet whenever nothing changes, so
+    /// the connection's timeout — meant for a server that stopped answering —
+    /// would cut every quiet one, and updates sent while it is re-opened are
+    /// lost.
+    listen_idle: Option<Duration>,
+    /// How many listen streams this connection's idle bound has cut — read
+    /// by the listen pump to tell an idle cut from any other end.
+    idle_cuts: Arc<AtomicU64>,
 }
 
 impl AgentdHttp {
@@ -83,7 +93,21 @@ impl AgentdHttp {
             timeout,
             bootstrap_failure: Arc::default(),
             raw_capabilities: Arc::default(),
+            listen_idle: None,
+            idle_cuts: Arc::default(),
         }
+    }
+
+    /// Let a listen stream stay silent for `idle` — never less than the
+    /// connection's timeout — before it is cut.
+    pub fn with_listen_idle(mut self, idle: Duration) -> AgentdHttp {
+        self.listen_idle = Some(idle.max(self.timeout));
+        self
+    }
+
+    /// The count of listen streams cut for idleness; see `idle_cuts`.
+    pub fn idle_cuts(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.idle_cuts)
     }
 
     /// See `bootstrap_failure`.
@@ -275,6 +299,13 @@ impl StreamableHttpClient for AgentdHttp {
             },
             _ => (false, false),
         };
+        let listen_idle = match &message {
+            rmcp::model::JsonRpcMessage::Request(r) => match r.request {
+                rmcp::model::ClientRequest::SubscriptionsListenRequest(_) => self.listen_idle,
+                _ => None,
+            },
+            _ => None,
+        };
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
@@ -300,9 +331,12 @@ impl StreamableHttpClient for AgentdHttp {
         // exchange runs on until the socket's own timeout, and the runtime
         // waits for its pool when the client is dropped — so an abandoned call
         // would hold whoever drops the client for up to that long.
-        let hangup = Arc::new(Hangup::default());
+        let hangup = Arc::new(listen_idle.map_or_else(Hangup::default, Hangup::with_stream_idle));
         let held = HangupOnDrop(Arc::clone(&hangup));
         let notes_tx = tx.clone();
+        // A listen whose stream went quiet past its idle bound ended for that
+        // reason alone; counted, so the pump can say so.
+        let idle_cuts = listen_idle.map(|_| Arc::clone(&self.idle_cuts));
         std::thread::spawn(move || {
             let refs: Vec<(&str, &str)> = extra
                 .iter()
@@ -318,6 +352,14 @@ impl StreamableHttpClient for AgentdHttp {
                 },
                 &hangup,
             );
+            if let (Some(n), Err(HttpError::Http(io))) = (&idle_cuts, &resp)
+                && matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            {
+                n.fetch_add(1, Ordering::SeqCst);
+            }
             let _ = tx.send(Pumped::Done(resp));
         });
 

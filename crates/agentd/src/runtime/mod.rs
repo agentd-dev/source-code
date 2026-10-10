@@ -2307,22 +2307,11 @@ impl Runtime {
         let mut narrowed: Vec<(String, String)> = Vec::new();
         for (name, c) in &self.mcp {
             for e in c.drain_listen_events() {
-                match e {
-                    ::mcp::rmcp_client::ListenEvent::Ended { reason, retry_ms } => self.log.warn(
-                        "mcp.listen.ended",
-                        json!({"server": name, "reason": reason, "retry_ms": retry_ms}),
-                    ),
-                    ::mcp::rmcp_client::ListenEvent::Resumed => {
-                        self.log.info("mcp.listen.resumed", json!({"server": name}))
-                    }
-                    ::mcp::rmcp_client::ListenEvent::Narrowed { dropped } => {
-                        self.log.warn(
-                            "mcp.listen.narrowed",
-                            json!({"server": name, "dropped": dropped}),
-                        );
-                        narrowed.extend(dropped.into_iter().map(|u| (name.clone(), u)));
-                    }
+                if let ::mcp::rmcp_client::ListenEvent::Narrowed { dropped } = &e {
+                    narrowed.extend(dropped.iter().map(|u| (name.clone(), u.clone())));
                 }
+                let (level, event, fields) = listen_event_line(name, e);
+                self.log.event(level, event, fields);
             }
         }
         // Asked for again: a server that keeps leaving a URI out answers the
@@ -2531,6 +2520,94 @@ pub(crate) struct SubscribeRetry {
     /// Rounds in a row that left something to ask again.
     pub(crate) failures: u32,
     pub(crate) not_before_ms: u64,
+}
+
+/// How one listen event is logged: its level, its event name and its fields.
+/// The one place the choice is made, so what a test asserts is what the
+/// daemon logs.
+///
+/// An idle cut is routine — a listen is quiet whenever nothing changes, and
+/// the pump re-opens it and re-reads what it holds — so it is said at info;
+/// any other end, and a standing listen the server will not hold, is a warn.
+pub(crate) fn listen_event_line(
+    server: &str,
+    e: ::mcp::rmcp_client::ListenEvent,
+) -> (crate::obs::log::Level, &'static str, Value) {
+    use crate::obs::log::Level;
+    use ::mcp::rmcp_client::ListenEvent;
+    match e {
+        ListenEvent::Ended {
+            reason,
+            retry_ms,
+            idle: true,
+        } => (
+            Level::Info,
+            "mcp.listen.ended",
+            json!({"server": server, "reason": "idle", "detail": reason, "retry_ms": retry_ms}),
+        ),
+        ListenEvent::Ended {
+            reason, retry_ms, ..
+        } => (
+            Level::Warn,
+            "mcp.listen.ended",
+            json!({"server": server, "reason": reason, "retry_ms": retry_ms}),
+        ),
+        ListenEvent::Unavailable { reason, retry_ms } => (
+            Level::Warn,
+            "mcp.listen.unavailable",
+            json!({"server": server, "reason": reason, "retry_ms": retry_ms}),
+        ),
+        ListenEvent::FlagsRefused { reason } => (
+            Level::Warn,
+            "mcp.listen.flags_refused",
+            json!({"server": server, "reason": reason}),
+        ),
+        ListenEvent::Resumed => (Level::Info, "mcp.listen.resumed", json!({"server": server})),
+        ListenEvent::Narrowed { dropped } => (
+            Level::Warn,
+            "mcp.listen.narrowed",
+            json!({"server": server, "dropped": dropped}),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod listen_log_tests {
+    use super::*;
+    use crate::obs::log::Level;
+    use ::mcp::rmcp_client::ListenEvent;
+
+    #[test]
+    fn an_idle_cut_is_logged_at_info_as_idle_and_any_other_end_at_warn() {
+        let (level, event, fields) = listen_event_line(
+            "m",
+            ListenEvent::Ended {
+                reason: "mcp-http: timed out".into(),
+                retry_ms: 250,
+                idle: true,
+            },
+        );
+        assert_eq!((level, event), (Level::Info, "mcp.listen.ended"));
+        assert_eq!(fields["reason"], "idle");
+        let (level, _, fields) = listen_event_line(
+            "m",
+            ListenEvent::Ended {
+                reason: "the stream closed".into(),
+                retry_ms: 250,
+                idle: false,
+            },
+        );
+        assert_eq!(level, Level::Warn);
+        assert_eq!(fields["reason"], "the stream closed");
+        let (level, event, _) = listen_event_line(
+            "m",
+            ListenEvent::Unavailable {
+                reason: "refused".into(),
+                retry_ms: 250,
+            },
+        );
+        assert_eq!((level, event), (Level::Warn, "mcp.listen.unavailable"));
+    }
 }
 
 #[cfg(test)]

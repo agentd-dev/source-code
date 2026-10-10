@@ -118,6 +118,23 @@ struct Server {
     streams: Mutex<Vec<TcpStream>>,
     /// Held listen streams (2026-07-28), ended by a restart.
     listens: Mutex<Vec<Held>>,
+    /// The `list_changed` notifications it advertises (2026-07-28):
+    /// `"tools"`, `"prompts"`. Acknowledged when a listen asks for them.
+    list_changed: Mutex<Vec<&'static str>>,
+    /// What `resources/read` answers for a URI (`"x"` when absent): changed
+    /// without a notification, it is a change a listen gap would lose.
+    content: Mutex<std::collections::HashMap<String, String>>,
+    /// Fail every `resources/read`.
+    fail_reads: AtomicBool,
+    /// Refuse this many flags-only listens (no URI), as `refuse_flags_how`.
+    refuse_flags_only: AtomicU64,
+    /// 0: JSON-RPC -32602; 1: a plain 500; 2: a stream closed before its
+    /// acknowledgment.
+    refuse_flags_how: AtomicU64,
+    /// Refuse every listen whose filter asks for `toolsListChanged`.
+    refuse_flagged: AtomicBool,
+    /// Hold a flags-only listen's response head this long.
+    slow_flags_head_ms: AtomicU64,
 }
 
 impl Server {
@@ -196,6 +213,24 @@ impl Server {
 
     fn open_listens(&self) -> u64 {
         self.open_listens.load(Ordering::SeqCst)
+    }
+
+    /// Send `method` (a notification without params) down every held listen.
+    fn notify(&self, method: &str) {
+        for h in self.listens.lock().unwrap().iter_mut() {
+            let note = json!({"jsonrpc": "2.0", "method": method,
+                              "params": {"_meta": {SUBSCRIPTION_ID: h.id}}});
+            let _ = h.stream.write_all(format!("data: {note}\n\n").as_bytes());
+            let _ = h.stream.flush();
+        }
+    }
+
+    /// The listens a flags-only filter asked for (no URI), in order.
+    fn flags_only_listens(&self) -> Vec<Req> {
+        self.requests("subscriptions/listen")
+            .into_iter()
+            .filter(|r| r.body["params"]["notifications"]["resourceSubscriptions"].is_null())
+            .collect()
     }
 
     /// Record a refusal and send it.
@@ -342,8 +377,10 @@ fn stateless(req: &Req, w: &mut TcpStream, server: &Server) {
     }
     match req.method() {
         "server/discover" => {
-            // No listChanged flag: this server offers none.
-            let caps = json!({"tools": {},
+            // A listChanged flag only where a test asks for one.
+            let lc = server.list_changed.lock().unwrap().clone();
+            let caps = json!({"tools": {"listChanged": lc.contains(&"tools")},
+                              "prompts": {"listChanged": lc.contains(&"prompts")},
                               "resources": {"subscribe": !server.no_subscribe.load(Ordering::SeqCst)}});
             let opts = StatelessOpts {
                 caps,
@@ -357,15 +394,25 @@ fn stateless(req: &Req, w: &mut TcpStream, server: &Server) {
             respond(w, 404, &[], &error(&id, -32601, "Method not found"))
         }
         "tools/list" => respond(w, 200, &[], &tools(&id)),
-        "resources/read" => respond(
-            w,
-            200,
-            &[],
-            &result(
-                &id,
-                json!({"contents": [{"uri": req.body["params"]["uri"], "text": "x"}]}),
-            ),
-        ),
+        "resources/read" => {
+            if server.fail_reads.load(Ordering::SeqCst) {
+                return respond(w, 200, &[], &error(&id, -32603, "read failed"));
+            }
+            let uri = req.body["params"]["uri"].as_str().unwrap_or_default();
+            let text = server
+                .content
+                .lock()
+                .unwrap()
+                .get(uri)
+                .cloned()
+                .unwrap_or_else(|| "x".into());
+            respond(
+                w,
+                200,
+                &[],
+                &result(&id, json!({"contents": [{"uri": uri, "text": text}]})),
+            )
+        }
         m if m.starts_with("notifications/") => respond_raw(w, 202, &[], ""),
         _ => respond(w, 200, &[], &error(&id, -32601, "Method not found")),
     }
@@ -384,9 +431,51 @@ fn listen(req: &Req, w: &mut TcpStream, server: &Server) {
     if server.refuse_listen_once.swap(false, Ordering::SeqCst) {
         return respond(w, 200, &[], &error(&id, -32603, "listen refused"));
     }
-    let mut filter = req.body["params"]["notifications"].clone();
+    let asked = &req.body["params"]["notifications"];
+    if server.refuse_flagged.load(Ordering::SeqCst) && asked["toolsListChanged"] == true {
+        return respond(
+            w,
+            400,
+            &[],
+            &error(&id, -32602, "toolsListChanged is not offered"),
+        );
+    }
+    let flags_only = asked["resourceSubscriptions"].is_null();
+    // Listens arrive one at a time here, so a load then a decrement is not
+    // a race.
+    if flags_only && server.refuse_flags_only.load(Ordering::SeqCst) > 0 {
+        server.refuse_flags_only.fetch_sub(1, Ordering::SeqCst);
+        return match server.refuse_flags_how.load(Ordering::SeqCst) {
+            0 => respond(
+                w,
+                400,
+                &[],
+                &error(&id, -32602, "flags-only listens refused"),
+            ),
+            1 => respond_raw(w, 500, &[], "boom"),
+            _ => {
+                let _ = w.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                );
+                let _ = w.flush();
+            }
+        };
+    }
+    if flags_only {
+        std::thread::sleep(Duration::from_millis(
+            server.slow_flags_head_ms.load(Ordering::SeqCst),
+        ));
+    }
+    // What it takes of the filter: the URIs (less `narrow`), and a
+    // list-changed flag only if it offers that notification.
+    let offered = server.list_changed.lock().unwrap().clone();
+    let mut filter = asked.clone();
     if let Some(f) = filter.as_object_mut() {
-        f.retain(|k, _| k == "resourceSubscriptions");
+        f.retain(|k, v| {
+            k == "resourceSubscriptions"
+                || (k == "toolsListChanged" && offered.contains(&"tools") && v == true)
+                || (k == "promptsListChanged" && offered.contains(&"prompts") && v == true)
+        });
     }
     let narrow = server.narrow.lock().unwrap().clone();
     if let Some(uris) = filter["resourceSubscriptions"].as_array_mut() {
@@ -844,6 +933,7 @@ fn the_listen_pump_re_listens_after_its_stream_ends_whichever_way_it_ends() {
                 ListenEvent::Ended {
                     reason,
                     retry_ms: 250,
+                    idle: false,
                 },
                 ListenEvent::Resumed,
             ] => {
@@ -1119,4 +1209,328 @@ fn a_bounded_subscribe_gives_up_at_its_bound() {
             }
         }
     }
+}
+
+// --------------------------------------------------- listens at 2026-07-28
+
+/// A 2026-07-28 connection with its own timeout and listen idle bound.
+fn listening_with(server: &Arc<Server>, timeout: Duration, idle: Duration) -> RmcpClient {
+    let ep = spawn(Arc::clone(server), Lifecycle::Stateless);
+    RmcpBuilder::new("forgetful", &ep, vec![], timeout)
+        .start_with(FirstRequest::Discover)
+        .with_listen_idle(idle)
+        .connect()
+        .expect("connect")
+}
+
+/// Wait for the next listen event matching `want`, keeping every event seen.
+fn wait_event(
+    c: &RmcpClient,
+    seen: &mut Vec<ListenEvent>,
+    what: &str,
+    want: impl Fn(&ListenEvent) -> bool,
+) {
+    wait_until(what, || {
+        seen.extend(c.drain_listen_events());
+        seen.iter().any(&want)
+    });
+}
+
+/// The `resources/updated` the pump queued itself after a re-listen: the
+/// server's own updates carry `_meta`, a resync's carries only the URI.
+fn synthetic(notes: &[mcp::rpc::Notification]) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|n| n.method == "notifications/resources/updated")
+        .filter_map(|n| n.params.as_ref())
+        .filter(|p| p.get("_meta").is_none())
+        .filter_map(|p| p["uri"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn a_quiet_listen_outlives_the_connection_timeout_and_an_idle_cut_is_said_as_idle() {
+    let server = Arc::new(Server::default());
+    server.hold_listen.store(true, Ordering::SeqCst);
+    let c = listening_with(&server, Duration::from_secs(1), Duration::from_secs(3));
+    c.subscribe("demo://a").expect("subscribe");
+    let acked = Instant::now();
+    let mut events = Vec::new();
+    // Quiet past the connection's 1 s: still open.
+    while acked.elapsed() < Duration::from_millis(2500) {
+        events.extend(c.drain_listen_events());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(events.is_empty(), "cut before its idle bound: {events:?}");
+    wait_event(&c, &mut events, "the idle cut", |e| {
+        matches!(e, ListenEvent::Ended { idle: true, .. })
+    });
+    wait_event(&c, &mut events, "the re-listen", |e| {
+        *e == ListenEvent::Resumed
+    });
+    // Any other end is not idle.
+    events.clear();
+    server.restart();
+    wait_event(&c, &mut events, "the closed stream", |e| {
+        matches!(e, ListenEvent::Ended { .. })
+    });
+    assert!(
+        matches!(events[0], ListenEvent::Ended { idle: false, .. }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_listen_idle_bound_below_the_connection_timeout_is_raised_to_it() {
+    let server = Arc::new(Server::default());
+    server.hold_listen.store(true, Ordering::SeqCst);
+    let c = listening_with(&server, Duration::from_secs(3), Duration::from_secs(1));
+    c.subscribe("demo://a").expect("subscribe");
+    let acked = Instant::now();
+    let mut events = Vec::new();
+    while acked.elapsed() < Duration::from_millis(2500) {
+        events.extend(c.drain_listen_events());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(events.is_empty(), "cut at the 1 s idle bound: {events:?}");
+    wait_event(&c, &mut events, "the idle cut", |e| {
+        matches!(e, ListenEvent::Ended { idle: true, .. })
+    });
+}
+
+/// Subscribe `uris` on a held listen and let the pump settle: the baseline
+/// read, the updates the listen opens with and their re-reads, then long
+/// enough that those reads count as seen on a live stream.
+fn settled(server: &Arc<Server>, uris: &[&str]) -> RmcpClient {
+    server.hold_listen.store(true, Ordering::SeqCst);
+    let c = listening_with(server, Duration::from_secs(5), Duration::from_secs(60));
+    for u in uris {
+        c.subscribe(u).expect("subscribe");
+    }
+    // A baseline read and a re-read per URI on the last listen.
+    wait_until("the pump's reads", || {
+        server.count("resources/read") >= 2 * uris.len()
+    });
+    std::thread::sleep(Duration::from_millis(1300));
+    let _ = c.drain_notifications();
+    let _ = c.drain_listen_events();
+    c
+}
+
+/// End every held listen and change nothing, or what `in_gap` changes, while
+/// the next one is being opened; wait until the re-listen's resync is done.
+fn re_listen(server: &Arc<Server>, c: &RmcpClient, in_gap: impl FnOnce()) {
+    let reads = server.count("resources/read");
+    let held = c.subscribed().len();
+    server.slow_subscribe_ms.store(300, Ordering::SeqCst);
+    server.restart();
+    in_gap();
+    let mut events = Vec::new();
+    wait_event(c, &mut events, "the re-listen", |e| {
+        *e == ListenEvent::Resumed
+    });
+    wait_until("the resync's reads", || {
+        server.count("resources/read") >= reads + held
+    });
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+#[test]
+fn a_change_during_a_re_listen_gap_wakes_once_and_an_unchanged_resource_does_not() {
+    let server = Arc::new(Server::default());
+    let c = settled(&server, &["demo://a", "demo://b"]);
+    re_listen(&server, &c, || {
+        server
+            .content
+            .lock()
+            .unwrap()
+            .insert("demo://a".into(), "changed in the gap".into());
+    });
+    assert_eq!(synthetic(&c.drain_notifications()), ["demo://a"]);
+}
+
+#[test]
+fn a_live_update_moves_the_baseline() {
+    let server = Arc::new(Server::default());
+    let c = settled(&server, &["demo://a"]);
+    // Changed and notified while the listen is live: the host is woken by
+    // the update itself, and the gap that follows changes nothing.
+    server
+        .content
+        .lock()
+        .unwrap()
+        .insert("demo://a".into(), "changed live".into());
+    let reads = server.count("resources/read");
+    server.push("demo://a");
+    wait_until("the live update's re-read", || {
+        server.count("resources/read") > reads
+    });
+    std::thread::sleep(Duration::from_millis(1300));
+    let _ = c.drain_notifications();
+    re_listen(&server, &c, || {});
+    assert!(synthetic(&c.drain_notifications()).is_empty());
+}
+
+#[test]
+fn a_read_that_fails_after_a_re_listen_wakes_conservatively() {
+    let server = Arc::new(Server::default());
+    let c = settled(&server, &["demo://a"]);
+    re_listen(&server, &c, || {
+        server.fail_reads.store(true, Ordering::SeqCst)
+    });
+    assert_eq!(synthetic(&c.drain_notifications()), ["demo://a"]);
+}
+
+/// A 2026-07-28 connection, through the client hosts use, to a server
+/// advertising `list_changed` for `kinds`.
+fn standing(server: &Arc<Server>, kinds: &[&'static str]) -> McpClient {
+    *server.list_changed.lock().unwrap() = kinds.to_vec();
+    server.hold_listen.store(true, Ordering::SeqCst);
+    let ep = spawn(Arc::clone(server), Lifecycle::Stateless);
+    connect(&ep, Lifecycle::Stateless)
+}
+
+fn drained(c: &McpClient, method: &str) -> bool {
+    c.drain_notifications().iter().any(|n| n.method == method)
+}
+
+#[test]
+fn a_standing_listen_carries_list_changed_without_any_uri() {
+    for (kind, flag, note) in [
+        (
+            "tools",
+            "toolsListChanged",
+            "notifications/tools/list_changed",
+        ),
+        (
+            "prompts",
+            "promptsListChanged",
+            "notifications/prompts/list_changed",
+        ),
+    ] {
+        let server = Arc::new(Server::default());
+        let c = standing(&server, &[kind]);
+        wait_until("the standing listen", || server.open_listens() == 1);
+        let listens = server.flags_only_listens();
+        assert_eq!(listens.len(), 1, "{kind}");
+        assert_eq!(
+            listens[0].body["params"]["notifications"][flag], true,
+            "{kind}"
+        );
+        server.notify(note);
+        wait_until(note, || drained(&c, note));
+    }
+    // Nothing advertised: no listen at all.
+    let server = Arc::new(Server::default());
+    let _c = standing(&server, &[]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(server.count("subscriptions/listen"), 0);
+}
+
+#[test]
+fn unsubscribing_the_last_uri_keeps_the_standing_listen() {
+    let server = Arc::new(Server::default());
+    let c = standing(&server, &["tools"]);
+    wait_until("the standing listen", || server.open_listens() == 1);
+    c.subscribe("demo://a").expect("subscribe");
+    c.unsubscribe("demo://a").expect("unsubscribe");
+    let last = server.requests("subscriptions/listen").pop().unwrap();
+    let filter = &last.body["params"]["notifications"];
+    assert_eq!(filter["toolsListChanged"], true, "{filter}");
+    assert!(filter["resourceSubscriptions"].is_null(), "{filter}");
+    wait_until("one listen held", || server.open_listens() == 1);
+    server.notify("notifications/tools/list_changed");
+    wait_until("the list_changed", || {
+        drained(&c, "notifications/tools/list_changed")
+    });
+}
+
+#[test]
+fn a_handshake_connection_opens_no_listen() {
+    // The 2025-11-25 server advertises `resources.listChanged`, which reaches
+    // a handshake connection on its `GET` stream: no listen is opened for it.
+    let server = Arc::new(Server::default());
+    let ep = spawn(Arc::clone(&server), Lifecycle::Handshake);
+    let _c = connect(&ep, Lifecycle::Handshake);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(server.count("subscriptions/listen"), 0);
+}
+
+#[test]
+fn a_refused_standing_listen_does_not_fail_the_connect_and_is_said_once() {
+    for how in 0..3 {
+        let server = Arc::new(Server::default());
+        server.refuse_flags_only.store(3, Ordering::SeqCst);
+        server.refuse_flags_how.store(how, Ordering::SeqCst);
+        let c = standing(&server, &["tools"]);
+        c.list_tools().expect("the connection works without it");
+        let mut events = Vec::new();
+        wait_until("the standing listen held", || {
+            events.extend(c.drain_listen_events());
+            events.contains(&ListenEvent::Resumed)
+        });
+        let unavailable = events
+            .iter()
+            .filter(|e| matches!(e, ListenEvent::Unavailable { .. }))
+            .count();
+        assert_eq!(
+            unavailable, 1,
+            "said once, refused three times ({how}): {events:?}"
+        );
+        assert_eq!(server.flags_only_listens().len(), 4, "({how})");
+        wait_until("the accepted listen open", || server.open_listens() == 1);
+        server.notify("notifications/tools/list_changed");
+        wait_until("the list_changed", || {
+            drained(&c, "notifications/tools/list_changed")
+        });
+    }
+}
+
+#[test]
+fn a_slow_standing_listen_does_not_delay_the_connect() {
+    let server = Arc::new(Server::default());
+    *server.list_changed.lock().unwrap() = vec!["tools"];
+    server.hold_listen.store(true, Ordering::SeqCst);
+    server.slow_flags_head_ms.store(3000, Ordering::SeqCst);
+    let ep = spawn(Arc::clone(&server), Lifecycle::Stateless);
+    let started = Instant::now();
+    let c = connect(&ep, Lifecycle::Stateless);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    wait_until("the standing listen", || server.open_listens() == 1);
+    server.notify("notifications/tools/list_changed");
+    wait_until("the list_changed", || {
+        drained(&c, "notifications/tools/list_changed")
+    });
+}
+
+#[test]
+fn a_server_refusing_the_list_changed_flag_keeps_its_uri_subscriptions() {
+    // It advertises `tools.listChanged` and refuses any filter asking for it:
+    // the standing listen can never open, and a URI must still be watched.
+    let server = Arc::new(Server::default());
+    server.refuse_flagged.store(true, Ordering::SeqCst);
+    let c = standing(&server, &["tools"]);
+    c.subscribe("demo://a")
+        .expect("subscribed without the flag");
+    let last = server.requests("subscriptions/listen").pop().unwrap();
+    assert!(last.body["params"]["notifications"]["toolsListChanged"].is_null());
+    let mut events = Vec::new();
+    wait_until("the downgrade said", || {
+        events.extend(c.drain_listen_events());
+        events
+            .iter()
+            .any(|e| matches!(e, ListenEvent::FlagsRefused { .. }))
+    });
+    wait_until("one listen held", || server.open_listens() == 1);
+    let _ = c.drain_notifications();
+    server.push("demo://a");
+    wait_until("the update", || {
+        c.drain_notifications()
+            .iter()
+            .any(|n| n.method == "notifications/resources/updated")
+    });
 }

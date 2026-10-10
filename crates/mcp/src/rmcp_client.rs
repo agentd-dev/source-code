@@ -14,15 +14,16 @@
 //! [`RmcpBuilder::connect`]) and blocks on it, exposing synchronous methods.
 //! The runtime lives as long as the client and dies with it.
 //!
-//! **agentd chooses the revision it offers in `initialize`.** rmcp 3.5's
-//! `ProtocolVersion::default()` is its `LATEST`, 2026-07-28 — a revision with
-//! no `initialize` at all (its lifecycle moved into per-request `_meta`). A
-//! handshake that offered it would ask the server for something the handshake
-//! itself cannot be. So `initialize` offers `INITIALIZE_OFFER`, rmcp's
-//! `LATEST_WITH_INITIALIZE`, named in exactly one place. Everything
-//! version-dependent here (notably [`RmcpClient::subscribe`]) still branches on
-//! the *negotiated* version the server answered with, compared against rmcp's
-//! own constants.
+//! **Two ways in, one revision offered on each.** A 2026-07-28 server is
+//! reached with `server/discover`, which offers 2026-07-28 and nothing else
+//! (`discover_lifecycle`); an older one with the `initialize` handshake, which
+//! offers `INITIALIZE_OFFER` — rmcp's `LATEST_WITH_INITIALIZE`, the newest
+//! revision that still has an `initialize` — or the newest older one a server
+//! lists. [`FirstRequest`] says which goes first, and [`classify`] decides
+//! when a refusal means the other era. Both pins are named in exactly one
+//! place each, and a test holds them to rmcp's constants. Everything
+//! version-dependent here (notably [`RmcpClient::subscribe`]) branches on the
+//! *negotiated* version, compared against rmcp's own constants.
 //!
 //! **No response cache.** SEP-2549 lets a client reuse a `resources/read` or
 //! list result for the server's `ttlMs`, and serve an expired one when a
@@ -43,14 +44,17 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::rmcp_transport::BootstrapFailure;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult,
-    ElicitationAction, ElicitationCapability, Implementation as RmcpImpl, ProtocolVersion,
-    ReadResourceRequestParams, RequestMetaObject, SubscriptionFilter,
+    ElicitationAction, ElicitationCapability, ErrorCode, Implementation as RmcpImpl,
+    ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, SubscriptionFilter,
 };
-use rmcp::service::{RoleClient, RunningService, Subscription, SubscriptionEnd};
+use rmcp::service::{
+    ClientInitializeError, RoleClient, RunningService, Subscription, SubscriptionEnd,
+};
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{ClientHandler, ServiceExt};
+use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt};
 
 /// The revision agentd offers in `initialize`, and the only place it is named.
 ///
@@ -241,6 +245,9 @@ pub struct RmcpClient {
     /// forgotten the session ([`crate::http::HttpTransport::session_lost`]).
     http: Arc<crate::http::HttpTransport>,
     caps: ServerCapabilities,
+    /// The server's `capabilities` object exactly as it sent it, for members
+    /// `caps` does not model ([`Self::capability`]).
+    raw_caps: Option<Value>,
     /// The revision the handshake settled on, kept as rmcp's own type so the
     /// version-dependent branches compare it the way rmcp does.
     protocol_version: Option<ProtocolVersion>,
@@ -288,6 +295,8 @@ pub struct RmcpBuilder {
     /// re-dials from a thread that must not stall — the reactor — passes its
     /// short management bound here.
     handshake_bound: Option<Duration>,
+    /// What the connection sends first; see [`FirstRequest`].
+    first: FirstRequest,
 }
 
 impl RmcpBuilder {
@@ -310,7 +319,14 @@ impl RmcpBuilder {
             elicitation: None,
             http: None,
             handshake_bound: None,
+            first: FirstRequest::Initialize,
         }
+    }
+
+    /// Send `first` first; see [`FirstRequest`].
+    pub fn start_with(mut self, first: FirstRequest) -> Self {
+        self.first = first;
+        self
     }
 
     /// Bound the handshake as a whole; see `handshake_bound`.
@@ -338,7 +354,9 @@ impl RmcpBuilder {
         self
     }
 
-    /// Connect and run the `initialize` handshake.
+    /// Connect: reach the server through `server/discover` or `initialize`, as
+    /// [`Self::start_with`] says, falling back to the other when the server's
+    /// answer shows it speaks the other era.
     pub fn connect(self) -> Result<RmcpClient, McpError> {
         // A *multi-threaded* runtime, deliberately. The SDK runs the transport
         // and the service dispatch as background tasks, and a server pushing a
@@ -355,6 +373,215 @@ impl RmcpBuilder {
                 McpError::Transport(format!("mcp server '{}': runtime: {e}", self.name))
             })?;
 
+        let mut caps = ClientCapabilities::default();
+        if self.elicitation.is_some() {
+            caps.elicitation = Some(ElicitationCapability::new());
+        }
+
+        // Notifications arrive on the `listen` subscription, not through the
+        // handler — rmcp routes one or the other, never both.
+        let notifications: Arc<Mutex<Vec<rpc::Notification>>> = Arc::default();
+        let mut implementation = RmcpImpl::new(
+            self.client_info.name.clone(),
+            self.client_info.version.clone(),
+        );
+        implementation.title = self.client_info.title.clone();
+
+        let name = self.name.clone();
+        // The SDK speaks the protocol; agentd supplies the socket, so a
+        // connection keeps its signer and its mTLS identity.
+        let socket = match &self.http {
+            Some(h) => Arc::clone(h),
+            None => Arc::new(crate::http::HttpTransport::new(
+                crate::http::McpEndpoint::parse(&self.endpoint)
+                    .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?,
+                self.headers.clone(),
+            )),
+        };
+        let start = Start {
+            endpoint: self.endpoint.clone(),
+            socket: Arc::clone(&socket),
+            timeout: self.timeout,
+            handler: Handler {
+                queue: Arc::clone(&notifications),
+                // Replaced per attempt: `initialize` carries the revision it
+                // offers here, and `server/discover` its own in `_meta`.
+                info: client_config(caps, implementation, INITIALIZE_OFFER),
+                elicitation: self.elicitation.clone(),
+            },
+        };
+        let first = self.first;
+        let bound = self.handshake_bound;
+        let (service, raw_caps) = rt
+            .block_on(async move {
+                match bound {
+                    // The timer is built inside the runtime: it needs its clock.
+                    Some(b) => tokio::time::timeout(b, start.run(first))
+                        .await
+                        .map_err(|_| format!("handshake timed out after {} ms", b.as_millis()))?,
+                    None => start.run(first).await,
+                }
+            })
+            .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
+        // Before any request can be issued (neither startup goes through the
+        // cache): the cache is per peer and the peer only exists once the
+        // startup returns. With it on, a read inside the server's `ttlMs`
+        // never reaches the server, and a failed read past it is answered with
+        // the expired copy — so a dead or refusing registry would keep
+        // "confirming" freshness.
+        rt.block_on(
+            service
+                .peer()
+                .set_response_cache_config(rmcp::ClientCacheConfig::disabled()),
+        );
+
+        let info = service.peer_info();
+        let protocol_version = info.as_ref().map(|i| i.protocol_version.clone());
+        // The server's own capabilities object, exactly as sent — members
+        // rmcp does not model (`events`) included. rmcp's typed view is the
+        // fallback for a startup whose answer was not captured whole.
+        let raw_caps = raw_caps.or_else(|| {
+            info.as_ref()
+                .and_then(|i| serde_json::to_value(i.as_ref()).ok())
+                .and_then(|v| v.get("capabilities").cloned())
+        });
+        let caps = raw_caps
+            .as_ref()
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+            .unwrap_or_default();
+
+        Ok(RmcpClient {
+            name: self.name,
+            rt,
+            service,
+            http: socket,
+            caps,
+            raw_caps,
+            protocol_version,
+            notifications,
+            uris: Arc::default(),
+            subscribing: Mutex::new(()),
+            pump: Mutex::new(None),
+            listen_events: Arc::default(),
+        })
+    }
+}
+
+/// What a connection sends first, named by mechanism rather than by revision.
+///
+/// Either way, a server of the other era is still reached: a refusal of the
+/// first request that shows the server speaks the other one leads to the
+/// other request, once. The host remembers what reached a server
+/// ([`RmcpClient::first_request`]) and starts its next connection to it the
+/// same way — the spec lets a client cache the era per origin and re-probe
+/// when the assumption fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstRequest {
+    /// `server/discover`, the 2026-07-28 lifecycle: no handshake and no
+    /// session, everything per request. A server that predates it is reached
+    /// through `initialize`.
+    Discover,
+    /// `initialize`, the 2025-11-25 handshake and its session. A server that
+    /// refuses it is re-probed with `server/discover`.
+    Initialize,
+}
+
+/// The 2026-07-28 lifecycle, and the only revision `server/discover` offers.
+///
+/// Not rmcp's `ClientLifecycleMode::Auto`, which probes with this and falls
+/// back by itself: its probe has a fixed 10 s timer, and over agentd's socket
+/// an answer that arrives after it fails the connection instead of falling
+/// back; and it does not fall back when a server answers that it speaks only
+/// older revisions. agentd falls back itself ([`classify`]), and the probe is
+/// bounded like every other request, by the connection's timeout (or the
+/// handshake bound when one is set).
+fn discover_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Discover {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+    }
+}
+
+/// What to do after `server/discover` failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Next {
+    /// Nothing `initialize` could fix: say the discover failure.
+    Refuse,
+    /// The server speaks an older era: send `initialize` offering this.
+    Initialize(ProtocolVersion),
+}
+
+/// Classify a failed `server/discover`. The fallback is broad on purpose:
+/// every server that answers `initialize` today must keep being reached, so
+/// anything that does not PROVE the server modern-but-unwilling, or unreachable,
+/// falls back. `failure` is what the socket recorded when the probe got no
+/// JSON-RPC answer at all.
+fn classify(e: &ClientInitializeError, failure: Option<BootstrapFailure>) -> Next {
+    use ClientInitializeError as E;
+    match e {
+        // A modern server refusing agentd's own request (a header it holds
+        // wrong, a capability it requires): `initialize` would fare no better.
+        E::JsonRpcError(d)
+            if d.code == ErrorCode::HEADER_MISMATCH
+                || d.code == ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY =>
+        {
+            Next::Refuse
+        }
+        // The server listed what it speaks and 2026-07-28 is not there (a
+        // `-32022`, or a DiscoverResult): reach it at the newest
+        // `initialize`-era revision it lists that rmcp knows, else nothing.
+        E::NoCompatibleProtocolVersion {
+            server_supported, ..
+        } => server_supported
+            .iter()
+            .filter(|v| v.has_initialize() && ProtocolVersion::KNOWN_VERSIONS.contains(v))
+            .max_by(|a, b| a.as_str().cmp(b.as_str()))
+            .map_or(Next::Refuse, |v| Next::Initialize(v.clone())),
+        _ => match failure {
+            // The challenge an operator logs in with: never hidden behind a
+            // second request. (403 falls back: a proxy that allow-lists
+            // methods refuses one it does not know and still passes
+            // `initialize`.)
+            Some(BootstrapFailure::Status(401)) => Next::Refuse,
+            // The server never saw the request; there is no era to learn.
+            Some(BootstrapFailure::Unreached) => Next::Refuse,
+            _ => Next::Initialize(INITIALIZE_OFFER),
+        },
+    }
+}
+
+/// Should a refused `initialize` be followed by `server/discover`? Only when
+/// the server answered — a JSON-RPC refusal, or a 4xx other than 401 — which
+/// is how a 2026-07-28-only server refuses a handshake it does not have.
+fn re_probes(e: &ClientInitializeError, failure: Option<BootstrapFailure>) -> bool {
+    matches!(e, ClientInitializeError::JsonRpcError(_))
+        || matches!(failure, Some(BootstrapFailure::Status(s)) if (400..500).contains(&s) && s != 401)
+}
+
+/// Everything one startup attempt needs, built once per connection.
+struct Start {
+    endpoint: String,
+    socket: Arc<crate::http::HttpTransport>,
+    timeout: Duration,
+    handler: Handler,
+}
+
+type Started = (RunningService<RoleClient, Handler>, Option<Value>);
+
+/// A failed startup attempt: rmcp's error, and what the socket recorded when
+/// the request got no JSON-RPC answer at all. Boxed: rmcp's error is large.
+type Failed = Box<(ClientInitializeError, Option<BootstrapFailure>)>;
+
+impl Start {
+    /// One attempt in `mode`: a fresh transport over the same socket (which
+    /// holds no session until an `initialize` answer issues one), the startup,
+    /// and what the socket recorded about it.
+    async fn attempt(
+        &self,
+        mode: ClientLifecycleMode,
+        offer: ProtocolVersion,
+    ) -> Result<Started, Failed> {
+        let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&self.socket), self.timeout);
         // The caller's headers are the socket's, never the SDK's too: the SDK
         // hands its custom headers to the socket on every request, so a copy
         // here put each one — `Authorization` included — on the wire twice.
@@ -370,99 +597,60 @@ impl RmcpBuilder {
                 self.endpoint.clone(),
             )
             .reinit_on_expired_session(false);
-
-        let mut caps = ClientCapabilities::default();
-        if self.elicitation.is_some() {
-            caps.elicitation = Some(ElicitationCapability::new());
+        let transport = StreamableHttpClientTransport::with_client(client.clone(), config);
+        let mut handler = self.handler.clone();
+        handler.info.protocol_version = offer;
+        match handler.serve_with_lifecycle(transport, mode).await {
+            Ok(service) => Ok((service, client.raw_capabilities())),
+            Err(e) => Err(Box::new((e, client.bootstrap_failure()))),
         }
+    }
 
-        // Notifications arrive on the `listen` subscription, not through the
-        // handler — rmcp routes one or the other, never both.
-        let notifications: Arc<Mutex<Vec<rpc::Notification>>> = Arc::default();
-        let mut implementation = RmcpImpl::new(
-            self.client_info.name.clone(),
-            self.client_info.version.clone(),
-        );
-        implementation.title = self.client_info.title.clone();
-
-        let handler = Handler {
-            queue: Arc::clone(&notifications),
-            // Never `ClientConfig::new`'s own default: that is rmcp's `LATEST`,
-            // 2026-07-28, which has no `initialize`, so offering it here would
-            // ask for a revision this handshake cannot be.
-            info: client_config(caps, implementation, INITIALIZE_OFFER),
-            elicitation: self.elicitation.clone(),
-        };
-
-        let name = self.name.clone();
-        // The SDK speaks the protocol; agentd supplies the socket, so a
-        // connection keeps its signer and its mTLS identity.
-        let socket = match &self.http {
-            Some(h) => Arc::clone(h),
-            None => Arc::new(crate::http::HttpTransport::new(
-                crate::http::McpEndpoint::parse(&self.endpoint)
-                    .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?,
-                self.headers.clone(),
-            )),
-        };
-        let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&socket), self.timeout);
-        let bound = self.handshake_bound;
-        let service = rt
-            .block_on(async move {
-                let transport = StreamableHttpClientTransport::with_client(client, config);
-                match bound {
-                    // The timer is built inside the runtime: it needs its clock.
-                    Some(b) => tokio::time::timeout(b, handler.serve(transport))
-                        .await
-                        .map_err(|_| format!("handshake timed out after {} ms", b.as_millis()))?
-                        .map_err(|e| e.to_string()),
-                    None => handler.serve(transport).await.map_err(|e| e.to_string()),
+    /// The whole startup, starting with `first`. Each request goes out at most
+    /// once: a fallback that is refused too is said with both refusals, never
+    /// answered with a third request.
+    async fn run(&self, first: FirstRequest) -> Result<Started, String> {
+        let initialize = |v: ProtocolVersion| self.attempt(ClientLifecycleMode::Initialize, v);
+        match first {
+            FirstRequest::Discover => {
+                let (d, failure) = match self.attempt(discover_lifecycle(), INITIALIZE_OFFER).await
+                {
+                    Ok(s) => return Ok(s),
+                    Err(e) => *e,
+                };
+                match classify(&d, failure) {
+                    Next::Refuse => Err(format!("server/discover: {}", said(&d))),
+                    Next::Initialize(v) => initialize(v).await.map_err(|f| {
+                        format!("server/discover: {}; initialize: {}", said(&d), said(&f.0))
+                    }),
                 }
-            })
-            .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
-        // Before any request can be issued (`initialize` itself is not cached):
-        // the cache is per peer and the peer only exists once `serve` returns.
-        // With it on, a read inside the server's `ttlMs` never reaches the
-        // server, and a failed read past it is answered with the expired copy —
-        // so a dead or refusing registry would keep "confirming" freshness.
-        rt.block_on(
-            service
-                .peer()
-                .set_response_cache_config(rmcp::ClientCacheConfig::disabled()),
-        );
-
-        let info = service.peer_info();
-        let protocol_version = info.as_ref().map(|i| i.protocol_version.clone());
-        let info_json = info
-            .as_ref()
-            .and_then(|i| serde_json::to_value(i.as_ref()).ok());
-        let caps = server_capabilities(info_json.as_ref());
-
-        Ok(RmcpClient {
-            name: self.name,
-            rt,
-            service,
-            http: socket,
-            caps,
-            protocol_version,
-            notifications,
-            uris: Arc::default(),
-            subscribing: Mutex::new(()),
-            pump: Mutex::new(None),
-            listen_events: Arc::default(),
-        })
+            }
+            FirstRequest::Initialize => {
+                let (f, failure) = match initialize(INITIALIZE_OFFER).await {
+                    Ok(s) => return Ok(s),
+                    Err(e) => *e,
+                };
+                if !re_probes(&f, failure) {
+                    return Err(format!("initialize: {}", said(&f)));
+                }
+                // The re-probe never leads back to a second `initialize`.
+                self.attempt(discover_lifecycle(), INITIALIZE_OFFER)
+                    .await
+                    .map_err(|d| {
+                        format!("initialize: {}; server/discover: {}", said(&f), said(&d.0))
+                    })
+            }
+        }
     }
 }
 
-/// Translate rmcp's negotiated server capabilities into ours.
-///
-/// Deliberately via JSON rather than field-by-field: both sides are the same
-/// wire shape, so a round trip is exact today and does not break the day rmcp
-/// adds a capability we have not heard of.
-fn server_capabilities(info: Option<&serde_json::Value>) -> ServerCapabilities {
-    info.and_then(|v| v.get("capabilities"))
-        .and_then(|c| serde_json::from_value(c.clone()).ok())
-        .unwrap_or_default()
+/// A startup error as an operator reads it: rmcp's text, with a JSON-RPC
+/// refusal's code and the server's own message.
+fn said(e: &ClientInitializeError) -> String {
+    match e {
+        ClientInitializeError::JsonRpcError(d) => format!("{} ({})", d.message, d.code.0),
+        other => other.to_string(),
+    }
 }
 
 fn rpc_err(name: &str, op: &str, e: impl std::fmt::Display) -> McpError {
@@ -472,6 +660,21 @@ fn rpc_err(name: &str, op: &str, e: impl std::fmt::Display) -> McpError {
 impl RmcpClient {
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.caps
+    }
+
+    /// The member `name` of the server's capabilities, exactly as sent.
+    pub fn capability(&self, name: &str) -> Option<Value> {
+        self.raw_caps.as_ref().and_then(|c| c.get(name)).cloned()
+    }
+
+    /// What reached the server: `server/discover` for a connection at a
+    /// revision without `initialize`, the handshake otherwise.
+    pub fn first_request(&self) -> FirstRequest {
+        if self.listens() {
+            FirstRequest::Discover
+        } else {
+            FirstRequest::Initialize
+        }
     }
 
     pub fn protocol_version(&self) -> Option<&str> {
@@ -1005,15 +1208,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_handshake_offers_the_newest_revision_that_has_one() {
-        // `initialize` offers 2025-11-25 because it is the newest revision
-        // with an `initialize`, not because it is the SDK's default (that is
-        // 2026-07-28 now). agentd's mock answers `wire::PROTOCOL_VERSION`, so
-        // pinning it to the offer keeps the mock and the handshake on one
-        // revision.
-        assert_eq!(INITIALIZE_OFFER, ProtocolVersion::LATEST_WITH_INITIALIZE);
-        assert_eq!(INITIALIZE_OFFER, ProtocolVersion::V_2025_11_25);
-        assert_eq!(crate::wire::PROTOCOL_VERSION, INITIALIZE_OFFER.as_str());
+    fn the_revisions_agentd_offers_are_pinned() {
+        // `server/discover` offers 2026-07-28 alone; `initialize` offers the
+        // newest revision that still has one. Neither follows rmcp's default:
+        // when rmcp promotes a newer revision, this fails and asks for a
+        // decision instead of moving agentd silently.
+        assert_eq!(
+            discover_lifecycle(),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28]
+            }
+        );
+        let offered = client_config(
+            ClientCapabilities::default(),
+            RmcpImpl::new("a", "0"),
+            INITIALIZE_OFFER,
+        )
+        .protocol_version;
+        assert_eq!(offered, ProtocolVersion::LATEST_WITH_INITIALIZE);
+        assert_eq!(offered, ProtocolVersion::V_2025_11_25);
+        assert_eq!(
+            ProtocolVersion::LATEST,
+            ProtocolVersion::V_2026_07_28,
+            "rmcp promoted a newer revision: decide whether agentd offers it"
+        );
+        assert_eq!(
+            ProtocolVersion::NO_INITIALIZE,
+            ProtocolVersion::V_2026_07_28
+        );
+        assert_eq!(crate::wire::PROTOCOL_VERSION, "2025-11-25");
+        assert_eq!(crate::wire::DISCOVER_PROTOCOL_VERSION, "2026-07-28");
+    }
+
+    #[test]
+    fn classify_refuses_what_a_fallback_cannot_fix_and_falls_back_on_the_rest() {
+        use BootstrapFailure::*;
+        use ClientInitializeError as E;
+        let rpc = |code: i32| E::JsonRpcError(rmcp::ErrorData::new(ErrorCode(code), "x", None));
+        let listed = |vs: &[&str]| E::NoCompatibleProtocolVersion {
+            client_supported: vec![ProtocolVersion::V_2026_07_28],
+            server_supported: vs
+                .iter()
+                .map(|v| serde_json::from_value(json!(v)).unwrap())
+                .collect(),
+        };
+        let closed = || E::ConnectionClosed("gone".into());
+        let at = |v: ProtocolVersion| Next::Initialize(v);
+        let rows: Vec<(E, Option<BootstrapFailure>, Next)> = vec![
+            (rpc(-32020), None, Next::Refuse),
+            (rpc(-32021), None, Next::Refuse),
+            (closed(), Some(Status(401)), Next::Refuse),
+            (closed(), Some(Unreached), Next::Refuse),
+            (listed(&["2027-01-01"]), None, Next::Refuse),
+            (
+                listed(&["2025-06-18"]),
+                None,
+                at(ProtocolVersion::V_2025_06_18),
+            ),
+            (
+                listed(&["2024-11-05", "2025-11-25"]),
+                None,
+                at(ProtocolVersion::V_2025_11_25),
+            ),
+            (rpc(-32601), None, at(INITIALIZE_OFFER)),
+            (closed(), Some(Status(403)), at(INITIALIZE_OFFER)),
+            (closed(), Some(Status(404)), at(INITIALIZE_OFFER)),
+            (closed(), Some(Status(500)), at(INITIALIZE_OFFER)),
+            (closed(), Some(NoAnswer), at(INITIALIZE_OFFER)),
+            (E::ExpectedInitResult(None), None, at(INITIALIZE_OFFER)),
+            (
+                E::ConflictInitResponseId(
+                    rmcp::model::NumberOrString::Number(0),
+                    rmcp::model::NumberOrString::Number(1),
+                ),
+                None,
+                at(INITIALIZE_OFFER),
+            ),
+            (closed(), None, at(INITIALIZE_OFFER)),
+        ];
+        for (e, failure, want) in rows {
+            assert_eq!(classify(&e, failure), want, "{e} / {failure:?}");
+        }
     }
 
     /// The SDK's own messages — a notification it sends, the answer to a

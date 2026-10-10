@@ -21,6 +21,10 @@ use serde_json::Value;
 /// `rmcp_client::tests` and `tests/rmcp_backend.rs`.
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
+/// The MCP revision agentd offers in `server/discover`: the first without an
+/// `initialize`, reached with that request alone.
+pub const DISCOVER_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// Method + notification names. Constants, so a typo is a compile error rather
 /// than a `-32601` at runtime.
 pub mod method {

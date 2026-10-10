@@ -5,8 +5,17 @@
 //! [`McpClient`] is a connection *builder* until [`McpClient::initialize`]: it
 //! collects the endpoint, the caller's headers, a request signer, an mTLS
 //! identity and the elicitation handler, then hands them to the official SDK
-//! ([`crate::rmcp_client`]), which runs the handshake and answers every
+//! ([`crate::rmcp_client`]), which starts the connection and answers every
 //! operation after it over agentd's own socket ([`crate::http`]).
+//!
+//! **Starting a connection.** A 2026-07-28 server is reached with
+//! `server/discover` alone — no handshake, no session; an older one with the
+//! 2025-11-25 `initialize` handshake. [`McpClient::start_with`] says which to
+//! send first, and either way a server of the other era is still reached: a
+//! refusal that shows it speaks the other one leads to the other request, once.
+//! [`McpClient::initialize`] keeps its name for whichever it turns out to be.
+
+pub use crate::rmcp_client::FirstRequest;
 
 use crate::http::{HttpTransport, McpEndpoint};
 use crate::inbound;
@@ -110,10 +119,13 @@ pub struct McpClient {
     /// effect. The one copy of it: every call path merges from here, so no path
     /// can send a call without it.
     tool_meta: Option<Value>,
-    /// The client identity sent in `initialize`. Defaults to this crate's
+    /// The client identity sent to the server. Defaults to this crate's
     /// identity; the host overrides it via [`Self::with_client_info`] (agentd
     /// sets its own name + version).
     client_info: Implementation,
+    /// What the first connection sends first ([`Self::start_with`]). A
+    /// re-dial starts the way the connection it replaces was reached.
+    first: FirstRequest,
 }
 
 impl McpClient {
@@ -157,7 +169,16 @@ impl McpClient {
                 version: env!("CARGO_PKG_VERSION").into(),
                 title: None,
             },
+            first: FirstRequest::Initialize,
         })
+    }
+
+    /// Start the connection with `first` — `server/discover` (MCP 2026-07-28)
+    /// or `initialize` (2025-11-25). A server of the other era is reached
+    /// either way; this only decides which request it sees first.
+    pub fn start_with(mut self, first: FirstRequest) -> Self {
+        self.first = first;
+        self
     }
 
     /// Override the client identity sent to servers (name + version). agentd sets
@@ -203,6 +224,22 @@ impl McpClient {
             .unwrap_or_default()
     }
 
+    /// The member `name` of the capabilities the server advertised on the live
+    /// connection, exactly as it sent it — including capabilities this crate
+    /// does not model (an extension's, for one). `None` before `initialize`,
+    /// and when the server did not advertise it.
+    pub fn capability(&self, name: &str) -> Option<Value> {
+        self.sdk().ok().and_then(|c| c.capability(name))
+    }
+
+    /// What reached the server on the live connection:
+    /// [`FirstRequest::Discover`] for a 2026-07-28 connection,
+    /// [`FirstRequest::Initialize`] for one reached through the handshake,
+    /// first or by fallback. `None` before `initialize`.
+    pub fn first_request(&self) -> Option<FirstRequest> {
+        self.sdk().ok().map(|c| c.first_request())
+    }
+
     /// Set the `_meta` stamped onto every `tools/call` (e.g. the run id), so a
     /// server can recognize a retried call and dedupe its side effect. Call
     /// after `initialize`.
@@ -210,21 +247,18 @@ impl McpClient {
         self.tool_meta = Some(meta);
     }
 
-    /// MCP lifecycle handshake: `initialize` → store capabilities →
-    /// `notifications/initialized`. Uses the default per-request timeout.
+    /// Start the connection: `server/discover` or the `initialize` handshake,
+    /// as [`Self::start_with`] says, then the server's capabilities are
+    /// stored. Uses the default per-request timeout.
     pub fn initialize(&mut self) -> Result<(), McpError> {
         self.initialize_within(self.timeout)
     }
 
-    /// [`Self::initialize`] with a caller-supplied timeout for the `initialize`
-    /// round-trip — the SHORT management bound. Used by the hot-reload
-    /// re-handshake, which adds a server ON the reactor thread mid-loop: a
-    /// slow-but-alive added server must not block the reactor (and starve the
-    /// liveness heartbeat) for the full default bound. A timeout is contained,
-    /// reported as `mcp.connect.fail`, and the server is simply treated as
-    /// absent rather than failing the reload.
+    /// [`Self::initialize`] with a caller-supplied per-request timeout for
+    /// the startup — for a host that must not wait the full default bound on
+    /// a slow-but-alive server. A timeout is the caller's to contain.
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
-        let c = self.dial(Arc::clone(&self.http), timeout, None)?;
+        let c = self.dial(Arc::clone(&self.http), timeout, None, self.first)?;
         *self.rmcp.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(c));
         self.redial
             .get_mut()
@@ -233,12 +267,13 @@ impl McpClient {
         Ok(())
     }
 
-    /// One handshake on `http`.
+    /// One connection start on `http`, beginning with `first`.
     fn dial(
         &self,
         http: Arc<HttpTransport>,
         timeout: Duration,
         handshake_bound: Option<Duration>,
+        first: FirstRequest,
     ) -> Result<crate::rmcp_client::RmcpClient, McpError> {
         // The SDK owns the handshake and every operation after it — over *this*
         // connection's transport, so a request signer (AAuth's challenge loop,
@@ -249,7 +284,8 @@ impl McpClient {
         let mut b =
             crate::rmcp_client::RmcpBuilder::new(&self.name, &self.endpoint, Vec::new(), timeout)
                 .with_http(http)
-                .with_client_info(self.client_info.clone());
+                .with_client_info(self.client_info.clone())
+                .start_with(first);
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
         }
@@ -307,7 +343,16 @@ impl McpClient {
     /// moves to the new one, so the drain after the re-dial still sees it.
     pub fn redial_within(&self, bound: Duration) -> Result<Vec<String>, McpError> {
         let lost = self.sdk()?;
-        let fresh = match self.dial(Arc::new(self.http.redial_copy()), self.timeout, Some(bound)) {
+        // Started the way the lost connection was reached. Only a handshake
+        // connection has a session to lose, so this is `initialize`: two
+        // POSTs, inside the bound, as before discover existed — and a server
+        // that now refuses it is re-probed with `server/discover`.
+        let fresh = match self.dial(
+            Arc::new(self.http.redial_copy()),
+            self.timeout,
+            Some(bound),
+            lost.first_request(),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 let mut r = self.redial.lock().unwrap_or_else(|p| p.into_inner());

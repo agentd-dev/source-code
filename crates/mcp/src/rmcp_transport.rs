@@ -48,7 +48,7 @@
 //! `RmcpClient::call_tool`).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -66,12 +66,104 @@ use crate::http::{Hangup, HttpError, HttpTransport};
 pub struct AgentdHttp {
     http: Arc<HttpTransport>,
     timeout: Duration,
+    /// Why the last bootstrap request (`server/discover`, `initialize`) got no
+    /// JSON-RPC answer at all, when it did not. The SDK sees only "the
+    /// transport failed"; whether the server refused the request, never saw
+    /// it, or went silent is what decides the fallback.
+    bootstrap_failure: Arc<Mutex<Option<BootstrapFailure>>>,
+    /// The `capabilities` object of the last bootstrap answer, exactly as the
+    /// server sent it: the SDK's typed copy drops members it does not model.
+    raw_capabilities: Arc<Mutex<Option<Value>>>,
 }
 
 impl AgentdHttp {
     pub fn new(http: Arc<HttpTransport>, timeout: Duration) -> AgentdHttp {
-        AgentdHttp { http, timeout }
+        AgentdHttp {
+            http,
+            timeout,
+            bootstrap_failure: Arc::default(),
+            raw_capabilities: Arc::default(),
+        }
     }
+
+    /// See `bootstrap_failure`.
+    pub(crate) fn bootstrap_failure(&self) -> Option<BootstrapFailure> {
+        *self
+            .bootstrap_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record why a bootstrap exchange got no JSON-RPC answer.
+    fn record(&self, failure: BootstrapFailure) {
+        *self
+            .bootstrap_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(failure);
+    }
+
+    /// See `raw_capabilities`.
+    pub(crate) fn raw_capabilities(&self) -> Option<Value> {
+        self.raw_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// How a bootstrap exchange failed when it carried no JSON-RPC answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootstrapFailure {
+    /// The server answered with this status and no JSON-RPC body.
+    Status(u16),
+    /// The request never reached a server: the dial (TCP, DNS, TLS) failed,
+    /// or this build cannot speak the endpoint's scheme.
+    Unreached,
+    /// The server took the request and gave no answer: it went silent past
+    /// the timeout, reset the connection, or answered with no body.
+    NoAnswer,
+}
+
+impl BootstrapFailure {
+    fn of(e: &HttpError) -> BootstrapFailure {
+        match e {
+            HttpError::Status(s) => BootstrapFailure::Status(*s),
+            HttpError::Connect(_) | HttpError::Unsupported(_) => BootstrapFailure::Unreached,
+            HttpError::Http(_) | HttpError::NoResponse | HttpError::NoEventStream => {
+                BootstrapFailure::NoAnswer
+            }
+        }
+    }
+}
+
+/// Keep a successful bootstrap answer's `capabilities` as sent.
+fn keep_capabilities(slot: &Mutex<Option<Value>>, answer: &Value) {
+    if let Some(caps) = answer.get("result").and_then(|r| r.get("capabilities")) {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(caps.clone());
+    }
+}
+
+/// Fill in what a `server/discover` answer may leave out and rmcp requires.
+///
+/// A workaround for rmcp's strictness, not a protocol choice: rmcp refuses a
+/// DiscoverResult without `resultType`, `ttlMs` or `cacheScope`, while the
+/// caching rules say a client SHOULD read an absent `ttlMs` as 0 (fresh for no
+/// time at all). The values filled in are the most cautious ones: complete,
+/// never cached, and scoped to this client.
+fn complete_discover_answer(answer: &mut Value) {
+    let Some(result) = answer.get_mut("result").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if !result.contains_key("supportedVersions") {
+        return;
+    }
+    result
+        .entry("resultType")
+        .or_insert_with(|| Value::from("complete"));
+    result.entry("ttlMs").or_insert_with(|| Value::from(0));
+    result
+        .entry("cacheScope")
+        .or_insert_with(|| Value::from("private"));
 }
 
 /// What can go wrong at the socket. The protocol's own errors are the SDK's;
@@ -183,6 +275,12 @@ impl StreamableHttpClient for AgentdHttp {
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
+        if bootstrap {
+            *self
+                .bootstrap_failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pumped>();
         // Not awaited: the send owns a thread for as long as the server keeps
@@ -268,10 +366,16 @@ impl StreamableHttpClient for AgentdHttp {
             Some(Pumped::Message(v)) => v,
             // The whole answer, as one message: see this method's doc.
             Some(Pumped::Done(Ok(Some(v)))) => {
-                let v = match request_id {
+                let mut v = match request_id {
                     Some(id) => answered(id, v, true),
                     None => v,
                 };
+                if discovers {
+                    complete_discover_answer(&mut v);
+                }
+                if bootstrap {
+                    keep_capabilities(&self.raw_capabilities, &v);
+                }
                 let message =
                     serde_json::from_value(v).map_err(StreamableHttpError::Deserialize)?;
                 return Ok(StreamableHttpPostResponse::Json(
@@ -291,11 +395,17 @@ impl StreamableHttpClient for AgentdHttp {
                 return Err(StreamableHttpError::SessionExpired);
             }
             Some(Pumped::Done(Err(e))) => {
+                if bootstrap {
+                    self.record(BootstrapFailure::of(&e));
+                }
                 return Err(StreamableHttpError::Client(TransportError(e.to_string())));
             }
             // The pump vanished without reporting — only reachable if the
             // blocking thread itself died, which is a dead socket either way.
             None => {
+                if bootstrap {
+                    self.record(BootstrapFailure::NoAnswer);
+                }
                 return Err(StreamableHttpError::Client(TransportError(
                     "mcp: response stream ended with no reply".into(),
                 )));
@@ -303,20 +413,29 @@ impl StreamableHttpClient for AgentdHttp {
         };
         let session = self.http.session_id();
 
-        let rest = futures::stream::unfold((rx, held), move |(mut rx, held)| async move {
-            match rx.recv().await {
-                Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), (rx, held))),
-                Some(Pumped::Done(Ok(Some(v)))) => {
-                    let v = match request_id {
-                        Some(id) => answered(id, v, true),
-                        None => v,
-                    };
-                    Some((Ok(as_event(&v)), (rx, held)))
+        // An `initialize` answered at the end of a stream: its capabilities
+        // are kept as they arrive, like a whole answer's.
+        let caps_slot = bootstrap.then(|| Arc::clone(&self.raw_capabilities));
+        let rest = futures::stream::unfold((rx, held), move |(mut rx, held)| {
+            let caps_slot = caps_slot.clone();
+            async move {
+                match rx.recv().await {
+                    Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), (rx, held))),
+                    Some(Pumped::Done(Ok(Some(v)))) => {
+                        let v = match request_id {
+                            Some(id) => answered(id, v, true),
+                            None => v,
+                        };
+                        if let Some(slot) = &caps_slot {
+                            keep_capabilities(slot, &v);
+                        }
+                        Some((Ok(as_event(&v)), (rx, held)))
+                    }
+                    // Done — cleanly, or with an error the first frame already
+                    // outlived. Either way this POST's stream is over, and ending
+                    // the stream is how the SDK is told so.
+                    _ => None,
                 }
-                // Done — cleanly, or with an error the first frame already
-                // outlived. Either way this POST's stream is over, and ending
-                // the stream is how the SDK is told so.
-                _ => None,
             }
         });
         let head: Vec<Result<Sse, SseError>> = vec![Ok(as_event(&first))];
@@ -508,4 +627,106 @@ fn header_pairs(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    /// A server that answers one request with `reply` (or holds it, for
+    /// `None`), reading the request first.
+    fn serve_once(reply: Option<&'static str>) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = format!("http://{}/mcp", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((conn, _)) = l.accept() else { return };
+            let mut w = conn.try_clone().unwrap();
+            let mut r = BufReader::new(conn);
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let _ = r.read_exact(&mut vec![0u8; len]);
+            match reply {
+                Some(bytes) => {
+                    let _ = w.write_all(bytes.as_bytes());
+                }
+                None => std::thread::sleep(Duration::from_secs(3)),
+            }
+        });
+        ep
+    }
+
+    /// POST a `server/discover` and return what the socket recorded.
+    fn recorded(ep: &str, timeout: Duration) -> Option<BootstrapFailure> {
+        let http = Arc::new(HttpTransport::new(
+            crate::http::McpEndpoint::parse(ep).unwrap(),
+            vec![],
+        ));
+        let agentd = AgentdHttp::new(http, timeout);
+        let discover: rmcp::model::ClientJsonRpcMessage = serde_json::from_value(
+            serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "server/discover", "params": {}}),
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(agentd.post_message(Arc::from(ep), discover, None, None, HashMap::new()))
+            .ok();
+        agentd.bootstrap_failure()
+    }
+
+    #[test]
+    fn a_bootstrap_failure_is_recorded_by_kind() {
+        use BootstrapFailure::*;
+        let t = Duration::from_secs(5);
+        let rpc_401 = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 63\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32001,\"message\":\"no\"}}";
+        assert_eq!(
+            recorded(&serve_once(Some(rpc_401)), t),
+            Some(Status(401)),
+            "an auth failure is its status, whatever its body"
+        );
+        for (reply, status) in [
+            (
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                401,
+            ),
+            ("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", 403),
+            ("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", 404),
+            (
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\ndown",
+                503,
+            ),
+        ] {
+            assert_eq!(recorded(&serve_once(Some(reply)), t), Some(Status(status)));
+        }
+        assert_eq!(
+            recorded(
+                &serve_once(Some("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")),
+                t
+            ),
+            Some(NoAnswer),
+            "accepted and never answered"
+        );
+        assert_eq!(
+            recorded(&serve_once(None), Duration::from_millis(300)),
+            Some(NoAnswer),
+            "silent past the timeout"
+        );
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/mcp", l.local_addr().unwrap())
+        };
+        assert_eq!(recorded(&closed, t), Some(Unreached), "nothing listening");
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 145\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":0,\"cacheScope\":\"private\"}}";
+        assert_eq!(recorded(&serve_once(Some(ok)), t), None, "answered");
+    }
 }

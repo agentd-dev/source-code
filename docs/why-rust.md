@@ -88,7 +88,7 @@ in-tree workspace crates it also lists — `agentd-cli`, `agentd-core`,
 `agentd-net`, `agentd-mcp` and `agentd-instruction` — which are this repository,
 not somebody else's code inside the trust boundary. The third row is the default
 features plus the list `.github/workflows/release.yml` hands to `cross build`
-(`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`),
+(`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events`),
 and it comes out the same for the host target and for
 `--target x86_64-unknown-linux-musl`, the one that actually ships. Measured on
 cargo 1.98.0 against the committed `Cargo.lock`.

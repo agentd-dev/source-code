@@ -133,7 +133,7 @@ tells you what a given binary can actually do:
 ```console
 $ cargo build -p agentd-cli --release
 $ cargo build -p agentd-cli --release \
-    --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"   # the shipped set
+    --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"   # the shipped set
 $ cargo build -p agentd-cli --release --features a2a,exec   # + the local command runner
 ```
 
@@ -482,7 +482,7 @@ time. A flag whose feature is absent exits `2` loudly — never a silent no-op.
 | `hot-reload` / `config-watch` | SIGHUP / inotify restart-free reconfig | — |
 
 Shipped release feature set:
-`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`.
+`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events`.
 
 ## Footprint (measured)
 

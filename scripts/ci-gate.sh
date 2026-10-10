@@ -29,7 +29,8 @@ ROWS=(
   "--features sign"
   "--features oci"
   "--features decrypt"
-  "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
+  "--features mcp-events"
+  "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
   "--all-features"
 )
 

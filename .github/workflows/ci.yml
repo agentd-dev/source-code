@@ -227,7 +227,8 @@ jobs:
           - "--features sign" # §7 signing/verification — in the release set
           - "--features oci" # oci:// instruction pulls + cosign — in the release set
           - "--features decrypt" # encrypted instruction envelopes — in the release set
-          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt" # the release-artifact set, exactly (pinned by release_matrix.rs)
+          - "--features mcp-events" # MCP Events bindings (RFC 0045, a draft extension) — in the release set
+          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events" # the release-artifact set, exactly (pinned by release_matrix.rs)
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
@@ -284,7 +285,7 @@ jobs:
         run: |
           cargo build --release --locked -p agentd-cli \
             --target x86_64-unknown-linux-musl \
-            --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
+            --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
       - name: Assert it is statically linked and runs
         run: |
           bin=target/x86_64-unknown-linux-musl/release/agentd

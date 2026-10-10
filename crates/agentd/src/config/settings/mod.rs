@@ -12,6 +12,7 @@
 //! never merged); flags apply in argument order — a generic `--<path>` SETS,
 //! while a named repeatable alias (`--mcp`, `--a2a-peer`) ADDS to its list.
 
+pub mod events;
 pub mod schema;
 
 use super::file::{self, Format};
@@ -2118,6 +2119,14 @@ pub struct McpServer {
     pub auth: Option<Auth>,
     #[serde(default)]
     pub timeout: Option<Dur>,
+    /// MCP Events bindings (RFC 0045 §5.2). Not part of the dial spec: a
+    /// change to one never re-dials the server.
+    #[serde(default)]
+    pub events: Vec<events::EventBinding>,
+    /// The event types runtime subscriptions may be made for (RFC 0045
+    /// §5.15).
+    #[serde(default)]
+    pub event_grants: Vec<events::EventGrant>,
 }
 
 impl McpServer {
@@ -4362,6 +4371,13 @@ impl Settings {
                         return Err(format!(
                             "{source}: the instruction's :::!config writes {} — operator configuration is not a document's to set (§6 rule 4). A document that could grant itself capabilities, relax a security gate, or re-point its own source would be deciding the terms it is judged by.",
                             forbidden.join(", ")
+                        ));
+                    }
+                    let events = events::document_declared(&ex.config);
+                    if !events.is_empty() {
+                        return Err(format!(
+                            "{source}: the instruction declares {} — MCP Events bindings and grants are the operator's to declare: a document would choose an upstream subscription and decide how often runs start (RFC 0045 §5.11.6)",
+                            events.join(", ")
                         ));
                     }
                     // `workflows` is the document's to write, but a route on
@@ -6752,6 +6768,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(&mut d, format!("intelligence.headers['{name}']: {e}"));
         }
     }
+
+    // MCP Events bindings and grants.
+    events::validate(s, &mut d);
 
     // mcp servers
     let mut names = std::collections::HashSet::new();
@@ -9692,6 +9711,8 @@ mod tests {
             }),
             auth: None,
             timeout: None,
+            events: Vec::new(),
+            event_grants: Vec::new(),
         };
         let spec = s.to_spec().unwrap();
         let o = spec.oauth.expect("oauth reaches the runtime spec");
@@ -12883,5 +12904,188 @@ mod tests {
         assert!(!pattern_subsumes("charge_*", "charge_lookup"));
         assert!(!pattern_subsumes("refund_all", "charge_*"));
         assert!(pattern_subsumes("anything", "*"));
+    }
+
+    /// A config with one MCP server and the given `events:` / `event_grants:`
+    /// YAML under it; `tags` set on the server when given.
+    fn events_doc(server_extra: &str) -> String {
+        format!(
+            "store: {{kind: memory}}\nstreams:\n  incidents: {{}}\nmcp:\n  servers:\n    - name: pd\n      endpoint: https://mcp.example/mcp\n{server_extra}"
+        )
+    }
+
+    #[cfg(feature = "mcp-events")]
+    #[test]
+    fn an_events_binding_that_names_what_it_needs_loads_and_says_it_tracks_a_draft() {
+        let l = load_doc(&events_doc(
+            "      tags: {\"*\": [sensitive]}\n      events:\n        - name: incident.created\n          arguments: {severity: P1}\n          delivery: [poll]\n          into: {stream: incidents, subject: incident.created}\n          replay: none\n      event_grants:\n        - name: incident.updated\n          fixed: {service: web}\n          delivery: [poll]\n          into: {stream: incidents, subject: incident.updated}\n          max: 4\n          lifetime: 7d\n          tools: true\n",
+        ))
+        .unwrap();
+        let srv = &l.settings.mcp.servers[0];
+        assert_eq!(srv.events[0].replay, events::Replay::None);
+        assert_eq!(srv.event_grants[0].max, 4);
+        // Not part of the dial spec: editing a binding never re-dials.
+        let spec = serde_json::to_string(&format!("{:?}", srv.to_spec().unwrap())).unwrap();
+        assert!(!spec.contains("incident"), "{spec}");
+        let d = validate(&l);
+        assert!(d.errors.is_empty(), "{:?}", d.errors);
+        assert!(
+            d.warnings.iter().any(|w| w.contains("SEP-3415")),
+            "{:?}",
+            d.warnings
+        );
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("memory store") && w.contains("cursor")),
+            "{:?}",
+            d.warnings
+        );
+    }
+
+    #[cfg(feature = "mcp-events")]
+    #[test]
+    fn an_events_binding_or_grant_is_refused_for_what_it_gets_wrong() {
+        let binding = |body: &str| {
+            events_doc(&format!(
+                "      events:\n        - name: incident.created\n{body}"
+            ))
+        };
+        let grant = |body: &str| {
+            events_doc(&format!(
+                "      tags: {{\"*\": [sensitive]}}\n      event_grants:\n        - name: incident.created\n{body}"
+            ))
+        };
+        let into = "          into: {stream: incidents, subject: s}\n";
+        let cases: Vec<(String, &str)> = vec![
+            (
+                binding(
+                    "          delivery: [poll]\n          into: {stream: nope, subject: s}\n          rate: 1/1s\n",
+                ),
+                "into.stream: 'nope' is not declared",
+            ),
+            (
+                binding(
+                    "          delivery: [poll]\n          into: {stream: incidents, subject: \"\"}\n          rate: 1/1s\n",
+                ),
+                "into.subject: a subject is required",
+            ),
+            (
+                binding(&format!(
+                    "          delivery: []\n{into}          rate: 1/1s\n"
+                )),
+                "list the acceptable modes",
+            ),
+            (
+                binding(&format!(
+                    "          delivery: [poll, poll]\n{into}          rate: 1/1s\n"
+                )),
+                "`poll` is listed twice",
+            ),
+            (
+                binding(&format!(
+                    "          delivery: [webhook]\n{into}          rate: 1/1s\n"
+                )),
+                "`webhook` is not built yet",
+            ),
+            (
+                binding(&format!("          delivery: [poll]\n{into}")),
+                "rate: required on an untagged",
+            ),
+            (
+                binding(&format!(
+                    "          delivery: [poll]\n{into}          rate: lots\n"
+                )),
+                ".rate:",
+            ),
+            (
+                events_doc(&format!(
+                    "      events:\n        - name: e\n          delivery: [poll]\n{into}          rate: 1/1s\n        - name: e\n          delivery: [poll]\n{into}          rate: 1/1s\n"
+                )),
+                "declared twice with the same arguments",
+            ),
+            (
+                grant(&format!(
+                    "          delivery: [poll]\n{into}          max: 0\n"
+                )),
+                ".max: 0",
+            ),
+            (
+                grant(&format!(
+                    "          delivery: [poll]\n{into}          max: 65\n"
+                )),
+                ".max: 65",
+            ),
+            (
+                grant(&format!(
+                    "          delivery: [poll]\n{into}          lifetime: 31d\n"
+                )),
+                "lifetime: at most 30d",
+            ),
+            (
+                events_doc(&format!(
+                    "      tags: {{\"*\": [sensitive]}}\n      event_grants:\n        - name: g\n          delivery: [poll]\n{into}        - name: g\n          delivery: [poll]\n{into}"
+                )),
+                "one grant per event type",
+            ),
+            (
+                binding(&format!(
+                    "          delivery: [push]\n{into}          rate: 1/1s\n"
+                )),
+                "unknown variant `push`",
+            ),
+        ];
+        for (doc, says) in cases {
+            let e = load_doc(&doc)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(e.contains(says), "want {says:?}:\n{e}\n---\n{doc}");
+        }
+    }
+
+    #[cfg(not(feature = "mcp-events"))]
+    #[test]
+    fn an_events_binding_without_the_feature_is_refused_by_name() {
+        let e = load_doc(&events_doc(
+            "      events:\n        - name: e\n          delivery: [poll]\n          into: {stream: incidents, subject: s}\n          rate: 1/1s\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("require building with --features mcp-events"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_document_may_not_declare_an_events_binding_or_grant() {
+        let frag = json!({"mcp": {"servers": [
+            {"name": "a", "endpoint": "https://a", "events": []},
+            {"name": "b", "endpoint": "https://b"},
+            {"name": "c", "endpoint": "https://c", "event_grants": []}]}});
+        assert_eq!(
+            events::document_declared(frag.as_object().unwrap()),
+            ["mcp.servers[a].events", "mcp.servers[c].event_grants"]
+        );
+        // Through the instruction's own fold.
+        let dir = tempfile::tempdir().unwrap();
+        let instr = dir.path().join("events.md");
+        std::fs::write(
+            &instr,
+            "You are the desk.\n\n:::!config\nmcp:\n  servers:\n    - name: gh\n      endpoint: https://mcp.example/mcp\n      events:\n        - name: push\n          delivery: [poll]\n          into: {stream: s, subject: s}\n:::\n",
+        )
+        .unwrap();
+        let e = Settings::from_document(
+            json!({"agent": {"name": "a", "preflight": "never",
+                          "instruction": {"file": instr.to_str().unwrap()}},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("mcp.servers[gh].events") && e.contains("operator's to declare"),
+            "{e}"
+        );
     }
 }

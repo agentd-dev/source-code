@@ -44,6 +44,7 @@ aauth = ["tls", "agentd/aauth"]
 sign = ["aauth", "agentd/sign"]
 # Instruction pull from an OCI artifact registry (RFC 0040).
 oci = ["tls", "agentd/oci"]
+mcp-events = ["agentd/mcp-events"]
 # On-the-fly decryption of encrypted instruction envelopes (RFC 0041).
 decrypt = ["sign", "agentd/decrypt"]
 internal-mocks = ["agentd/internal-mocks"]

@@ -403,6 +403,16 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
             forbidden.join(", ")
         )));
     }
+    // An instance child's subscriptions would be the model's to make by
+    // spawning children, and a mirrored stream would start one run per child
+    // for each occurrence (RFC 0045 §5.11.6).
+    let events = crate::config::settings::events::document_declared(&ex.config);
+    if !events.is_empty() {
+        errs.push(at(format!(
+            "machinery declares {} — MCP Events bindings and grants are the operator's to declare (RFC 0045 §5.11.6)",
+            events.join(", ")
+        )));
+    }
     for k in CHILD_COMPOSED_SECTIONS {
         if ex.config.contains_key(*k) {
             errs.push(at(format!(
@@ -765,6 +775,20 @@ mod tests {
                 "the refusal names the setting and why ({want}): {e:?}"
             );
         }
+
+        // An MCP Events binding: a child's subscriptions would be the
+        // model's to make by spawning children (RFC 0045 §5.11.6).
+        let s = settings_with(
+            "    room:\n      instruction: |\n        Be the room.\n        :::!config\n        mcp:\n          servers:\n            - name: gh\n              endpoint: https://mcp.example/mcp\n              events:\n                - name: push\n                  delivery: [poll]\n                  into: {stream: s, subject: s}\n        :::\n",
+        );
+        let e = compile_templates(&s)
+            .expect_err("a template declaring an events binding must be REFUSED");
+        assert!(
+            e.iter().any(
+                |m| m.contains("mcp.servers[gh].events") && m.contains("operator's to declare")
+            ),
+            "{e:?}"
+        );
 
         // …and a template may still carry the machinery it exists for.
         let s = settings_with(

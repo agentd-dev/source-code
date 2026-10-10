@@ -423,7 +423,34 @@ fn defs_properties(
                 "oauth": { "type": "object", "additionalProperties": false, "required": ["token_url", "client_id", "client_secret"], "properties": {
                     "token_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": secret, "scope": { "type": "string" } } },
                 "auth": { "$ref": "#/$defs/Auth" },
-                "timeout": duration } }));
+                "timeout": duration,
+                "events": { "type": "array", "items": { "$ref": "#/$defs/EventBinding" }, "description": "MCP Events bindings (RFC 0045): each event type subscribed with fixed arguments, every occurrence appended to a declared stream; requires the mcp-events build feature" },
+                "event_grants": { "type": "array", "items": { "$ref": "#/$defs/EventGrant" }, "description": "event types runtime subscriptions may be made for — by a wait that subscribes or the events.* tools — and what each of them gets fixed (RFC 0045 §5.15)" } } }));
+    let event_into = json!({ "type": "object", "additionalProperties": false, "required": ["stream", "subject"], "properties": {
+                "stream": { "type": "string", "description": "a stream declared under streams:" },
+                "subject": { "type": "string" } } });
+    let delivery = json!({ "type": "array", "minItems": 1, "items": { "enum": ["poll", "webhook"] }, "description": "the acceptable delivery modes, in preference order" });
+    let replay = json!({ "type": ["string", "integer"], "description": "how far back to catch up after downtime (maxAgeMs): a duration, or `none` to always start from now; default 1h" });
+    let event_rate = json!({ "type": "string", "description": "intake ceiling `<burst>/<per>`; required on an untagged or untrusted_input server" });
+    m.insert("EventBinding".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "delivery", "into"], "properties": {
+                "name": { "type": "string", "description": "the event type, as the server's events/list names it" },
+                "arguments": { "type": "object", "description": "subscription arguments, validated against the type's inputSchema" },
+                "delivery": delivery.clone(),
+                "into": event_into.clone(),
+                "replay": replay.clone(),
+                "rate": event_rate.clone(),
+                "ttl": duration } }));
+    m.insert("EventGrant".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "delivery", "into"], "properties": {
+                "name": { "type": "string", "description": "the event type, as the server's events/list names it" },
+                "fixed": { "type": "object", "description": "arguments no runtime subscription may set" },
+                "delivery": delivery,
+                "into": event_into,
+                "replay": replay,
+                "rate": event_rate,
+                "ttl": duration,
+                "max": { "type": "integer", "minimum": 1, "maximum": 64, "description": "live runtime subscriptions under this grant; default 8" },
+                "lifetime": duration,
+                "tools": { "type": "boolean", "description": "offer the events.* tools for this event type" } } }));
     m.insert("Auth".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["kind"],
                 "description": "A unified credential provider.", "properties": {
                 "kind": { "enum": ["static", "oauth2", "aws", "spiffe"] },

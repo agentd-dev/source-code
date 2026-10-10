@@ -441,6 +441,7 @@ dependencies.
 | `sign` | none new — reuses `ring` | §7 instruction signature verification |
 | `oci` | none new — reuses `ring` | `oci://` instruction pulls, cosign verification |
 | `decrypt` | none | age v1 and JWE instruction envelopes |
+| `mcp-events` | none | MCP Events bindings and grants, polled into declared streams (RFC 0045; the extension is a draft, SEP-3415) |
 | `cel` | **+22** | CEL predicates and expressions |
 | `internal-mocks` | none | the mock LLM and MCP servers the tests drive |
 
@@ -563,7 +564,7 @@ The resulting footprint, on a stripped x86_64 glibc release build of 1.16.0
 (`opt-level = "z"`, LTO, `panic = "abort"`, one codegen unit): 5,376,480 B
 (5.13 MiB) with `--no-default-features`, 6,365,288 B (6.07 MiB) with default
 `tls`, 10,235,536 B (9.76 MiB) with the shipped
-set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`. Release
+set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events`. Release
 artifacts are cross-compiled static-musl for `x86_64` and `aarch64`, plus a
 multi-arch, cosign-signed OCI image with an SPDX SBOM.
 

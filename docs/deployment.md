@@ -228,7 +228,7 @@ own process tree. You do **not** need an external `tini`.
 
 The published image (`Dockerfile` at the repo root) ships the **cloud-native
 feature set** by default —
-`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"` (the same
+`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"` (the same
 set the release workflow builds). `a2a` brings the A2A SDK and the async stack
 its listener runs on; `cel` is the one dependency-bearing member; `aauth`,
 `sign`, `oci` and `decrypt` are direct edges on `ring`, already in the tree as
@@ -249,6 +249,7 @@ each adds:
 | `sign` | §7 instruction signature verification: `agent.instruction.trust` pins a publisher, and without this feature a pin is a startup refusal rather than a silent pass. |
 | `oci` | `oci://` instruction pulls over the Distribution API, and the cosign artifact check (`oci: {ref, cosign_key}`). |
 | `decrypt` | Encrypted instruction envelopes — age v1 and JWE (`agent.instruction.decrypt`). |
+| `mcp-events` | MCP Events: `mcp.servers[].events` bindings and `event_grants`, each event type polled into a declared stream (RFC 0045). The extension is a draft (SEP-3415), and a config that declares a binding says so at load. |
 
 Build a narrower (or wider) surface with `--build-arg FEATURES=…`. Other features
 are `exec` (the guarded local-command tool, off at runtime too), `workflow`
@@ -262,7 +263,7 @@ posture.
 # syntax=docker/dockerfile:1
 # Static musl binary on scratch — the cloud-native feature set.
 FROM rust:1-alpine AS build
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .

@@ -471,6 +471,56 @@ fn the_2026_07_28_mock_enforces_what_the_revision_requires() {
     // No Mcp-Method.
     let (status, b) = raw(addr, post, &[v], &body("tools/list", json!({}), json!({})));
     assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    // No MCP-Protocol-Version, or two of them.
+    let list = || body("tools/list", json!({}), json!({}));
+    let (status, b) = raw(addr, post, &[("Mcp-Method", "tools/list")], &list());
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    let (status, b) = raw(addr, post, &[v, v, ("Mcp-Method", "tools/list")], &list());
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    // A revision it does not speak, on a request other than `initialize`.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[
+            ("MCP-Protocol-Version", "2025-11-25"),
+            ("Mcp-Method", "tools/list"),
+        ],
+        &body(
+            "tools/list",
+            json!({}),
+            json!({"io.modelcontextprotocol/protocolVersion": "2025-11-25"}),
+        ),
+    );
+    assert_eq!((status, code(&b)), (400, Some(-32022)), "{b}");
+    assert_eq!(b["error"]["data"]["requested"], "2025-11-25", "{b}");
+    // Mcp-Name naming another tool than the body, or missing.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[
+            v,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "mock.other"),
+            ("Mcp-Param-Region", "eu"),
+        ],
+        &regional(),
+    );
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    let (status, b) = raw(
+        addr,
+        post,
+        &[v, ("Mcp-Method", "tools/call"), ("Mcp-Param-Region", "eu")],
+        &regional(),
+    );
+    assert_eq!((status, code(&b)), (400, Some(-32020)), "{b}");
+    // A method it does not have.
+    let (status, b) = raw(
+        addr,
+        post,
+        &[v, ("Mcp-Method", "mock/nothing")],
+        &body("mock/nothing", json!({}), json!({})),
+    );
+    assert_eq!((status, code(&b)), (404, Some(-32601)), "{b}");
     // The header and `_meta` name different revisions.
     let (status, b) = raw(
         addr,

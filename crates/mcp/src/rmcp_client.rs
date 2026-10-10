@@ -39,6 +39,7 @@
 use crate::client::McpError;
 use crate::inbound;
 use crate::rpc;
+use crate::wire::method;
 use crate::wire::{Implementation, Prompt, ReadResourceResult, Resource, ServerCapabilities, Tool};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -91,6 +92,19 @@ struct Handler {
     /// Where a server's notifications land until the reactor drains them.
     queue: Arc<Mutex<Vec<rpc::Notification>>>,
 }
+
+/// The server notifications [`Handler`] queues for the host. One the transport
+/// takes off a stream itself (ahead of a `tools/list` answer, see
+/// [`crate::rmcp_transport::AgentdHttp::with_notifications`]) is queued only if
+/// it is one of these, as the handler would have queued it.
+pub(crate) const QUEUED_NOTIFICATIONS: [&str; 6] = [
+    method::NOTIFY_RESOURCES_UPDATED,
+    method::NOTIFY_RESOURCES_LIST_CHANGED,
+    method::NOTIFY_TOOLS_LIST_CHANGED,
+    method::NOTIFY_PROMPTS_LIST_CHANGED,
+    method::NOTIFY_MESSAGE,
+    method::NOTIFY_PROGRESS,
+];
 
 impl Handler {
     fn queue(&self, method: &str, params: Value) {
@@ -167,21 +181,21 @@ impl ClientHandler for Handler {
         _ctx: rmcp::service::NotificationContext<RoleClient>,
     ) {
         self.queue(
-            "notifications/resources/updated",
+            method::NOTIFY_RESOURCES_UPDATED,
             serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
         );
     }
 
     async fn on_resource_list_changed(&self, _ctx: rmcp::service::NotificationContext<RoleClient>) {
-        self.queue("notifications/resources/list_changed", json!({}));
+        self.queue(method::NOTIFY_RESOURCES_LIST_CHANGED, json!({}));
     }
 
     async fn on_tool_list_changed(&self, _ctx: rmcp::service::NotificationContext<RoleClient>) {
-        self.queue("notifications/tools/list_changed", json!({}));
+        self.queue(method::NOTIFY_TOOLS_LIST_CHANGED, json!({}));
     }
 
     async fn on_prompt_list_changed(&self, _ctx: rmcp::service::NotificationContext<RoleClient>) {
-        self.queue("notifications/prompts/list_changed", json!({}));
+        self.queue(method::NOTIFY_PROMPTS_LIST_CHANGED, json!({}));
     }
 
     // Upstream marks logging notifications deprecated, but a server that still
@@ -193,7 +207,7 @@ impl ClientHandler for Handler {
         _ctx: rmcp::service::NotificationContext<RoleClient>,
     ) {
         self.queue(
-            "notifications/message",
+            method::NOTIFY_MESSAGE,
             serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
         );
     }
@@ -204,7 +218,7 @@ impl ClientHandler for Handler {
         _ctx: rmcp::service::NotificationContext<RoleClient>,
     ) {
         self.queue(
-            "notifications/progress",
+            method::NOTIFY_PROGRESS,
             serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
         );
     }
@@ -666,7 +680,8 @@ impl Start {
         offer: ProtocolVersion,
     ) -> Result<Started, Failed> {
         let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&self.socket), self.timeout)
-            .with_listen_idle(self.listen_idle);
+            .with_listen_idle(self.listen_idle)
+            .with_notifications(Arc::clone(&self.handler.queue));
         // The caller's headers are the socket's, never the SDK's too: the SDK
         // hands its custom headers to the socket on every request, so a copy
         // here put each one — `Authorization` included — on the wire twice.

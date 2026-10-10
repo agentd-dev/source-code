@@ -21,11 +21,22 @@ fn regional() -> Value {
         "region": {"type": "string", "x-mcp-header": "Region"}}}})
 }
 
+/// What a test server answers `tools/list` with.
+#[derive(Clone)]
+enum List {
+    /// Its tools, as one JSON answer.
+    Tools,
+    /// This status and body instead.
+    Answer(u16, Value),
+    /// Its tools on an event stream, behind a log notification.
+    Streamed,
+}
+
 /// A 2026-07-28 server listing `tools`, refusing a `regional` call whose
 /// `Mcp-Param-Region` is missing or does not match the argument, the way
 /// rmcp's own server does (`-32020`). `caps` and `list` override the
-/// capabilities and the whole `tools/list` answer.
-fn server(tools: Vec<Value>, caps: Value, list: Option<(u16, Value)>) -> (String, Seen) {
+/// capabilities and the `tools/list` answer.
+fn server(tools: Vec<Value>, caps: Value, list: List) -> (String, Seen) {
     spawn(move |req, w| {
         let id = req.id();
         let supported = [MODERN.to_string()];
@@ -46,14 +57,23 @@ fn server(tools: Vec<Value>, caps: Value, list: Option<(u16, Value)>) -> (String
                 ),
             ),
             "tools/list" => match &list {
-                Some((status, body)) => {
+                List::Answer(status, body) => {
                     let mut body = body.clone();
                     if body.get("id").is_some_and(|i| !i.is_null()) {
                         body["id"] = id.clone();
                     }
                     respond(w, *status, &[], &body)
                 }
-                None => respond(w, 200, &[], &result(&id, json!({"tools": tools}))),
+                List::Tools => respond(w, 200, &[], &result(&id, json!({"tools": tools}))),
+                List::Streamed => respond_sse(
+                    w,
+                    &[],
+                    &[
+                        json!({"jsonrpc": "2.0", "method": "notifications/message",
+                               "params": {"level": "info", "data": "listing"}}),
+                        result(&id, json!({"tools": tools})),
+                    ],
+                ),
             },
             "tools/call" => {
                 let args = &req.body["params"]["arguments"];
@@ -90,7 +110,7 @@ fn connect(ep: &str, first: FirstRequest) -> Result<McpClient, String> {
 #[test]
 fn a_fresh_connection_calls_an_annotated_tool_with_its_header() {
     // As a turn worker does: connect and call, never list.
-    let (ep, seen) = server(vec![regional()], json!({"tools": {}}), None);
+    let (ep, seen) = server(vec![regional()], json!({"tools": {}}), List::Tools);
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     c.call_tool("regional", Some(json!({"region": "eu"})))
         .expect("the call carries its header");
@@ -103,12 +123,39 @@ fn a_fresh_connection_calls_an_annotated_tool_with_its_header() {
 }
 
 #[test]
+fn a_list_streamed_behind_a_notification_still_gives_its_tools_their_headers() {
+    // rmcp records a tool's `x-mcp-header` only from a list answer it takes
+    // off the wire; one it drains from a stream that has just ended skips
+    // that, and which of the two happens is a race inside rmcp. An answer the
+    // server streams behind a notification is taken whole all the same, and
+    // the notification reaches the host's queue. Several fresh connections,
+    // so a lost race shows.
+    for round in 0..20 {
+        let (ep, seen) = server(vec![regional()], json!({"tools": {}}), List::Streamed);
+        let c = connect(&ep, FirstRequest::Discover).unwrap();
+        c.call_tool("regional", Some(json!({"region": "eu"})))
+            .unwrap_or_else(|e| panic!("round {round}: the call carries its header: {e}"));
+        assert_eq!(
+            requests(&seen, "tools/call")[0].header("mcp-param-region"),
+            Some("eu"),
+            "round {round}"
+        );
+        let notes = c.drain_notifications();
+        assert!(
+            notes.iter().any(|n| n.method == "notifications/message"
+                && n.params.as_ref().is_some_and(|p| p["data"] == "listing")),
+            "round {round}: the notification ahead of the answer is queued: {notes:?}"
+        );
+    }
+}
+
+#[test]
 fn a_tool_rmcp_drops_is_reported_once() {
     let nested = json!({"name": "nested", "inputSchema": {"type": "object", "properties": {
         "outer": {"type": "object", "properties": {
             "inner": {"type": "string", "x-mcp-header": "Inner"}}}}}});
     let ok = json!({"name": "ok", "inputSchema": {"type": "object"}});
-    let (ep, _) = server(vec![nested, ok], json!({"tools": {}}), None);
+    let (ep, _) = server(vec![nested, ok], json!({"tools": {}}), List::Tools);
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     let names: Vec<String> = c
         .list_tools()
@@ -152,7 +199,7 @@ fn a_failed_priming_list_fails_the_connect() {
         let (ep, seen) = server(
             vec![],
             json!({"tools": {"listChanged": true}}),
-            Some((status, body)),
+            List::Answer(status, body),
         );
         let err = connect(&ep, FirstRequest::Discover).err().expect("refused");
         // Long enough for a listen opened in the background to have arrived.
@@ -174,7 +221,7 @@ fn every_header_rmcp_adds_is_one_agentd_refuses() {
     let (ep, seen) = server(
         vec![regional()],
         json!({"tools": {}, "prompts": {}, "resources": {"subscribe": true}}),
-        None,
+        List::Tools,
     );
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     c.call_tool("regional", Some(json!({"region": "eu"})))

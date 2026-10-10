@@ -88,6 +88,11 @@ pub struct AgentdHttp {
     /// what the SDK then hands back is what it kept, and the difference is
     /// what it dropped without a word.
     tools_seen: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// The host's notification queue — the one the SDK's handler fills —
+    /// when the connection has one: what a server streams ahead of a
+    /// `tools/list` answer goes there directly, so the answer can still come
+    /// back whole.
+    notifications: Option<Arc<Mutex<Vec<crate::rpc::Notification>>>>,
 }
 
 impl AgentdHttp {
@@ -100,7 +105,47 @@ impl AgentdHttp {
             listen_idle: None,
             idle_cuts: Arc::default(),
             tools_seen: Arc::default(),
+            notifications: None,
         }
+    }
+
+    /// Queue what a server streams ahead of a `tools/list` answer onto
+    /// `queue` — the handler's — rather than handing the answer back on a
+    /// stream (see `post_message`).
+    pub fn with_notifications(
+        mut self,
+        queue: Arc<Mutex<Vec<crate::rpc::Notification>>>,
+    ) -> AgentdHttp {
+        self.notifications = Some(queue);
+        self
+    }
+
+    /// Take `v`, a message a server sent ahead of a `tools/list` answer, off
+    /// the stream: a notification goes to the host's queue if it is one the
+    /// handler would have queued (any other the handler would have ignored).
+    /// `false` — not taken — for a request, which only the handler can
+    /// answer, and on a connection with no queue.
+    fn queue_ahead(&self, v: &Value) -> bool {
+        let Some(queue) = &self.notifications else {
+            return false;
+        };
+        let Some(method) = v.get("method").and_then(Value::as_str) else {
+            return false;
+        };
+        if v.get("id").is_some() {
+            return false;
+        }
+        if crate::rmcp_client::QUEUED_NOTIFICATIONS.contains(&method) {
+            let params = v
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(crate::rpc::Notification::new(method, Some(params)));
+        }
+        true
     }
 
     /// Let a listen stream stay silent for `idle` — never less than the
@@ -432,13 +477,18 @@ impl StreamableHttpClient for AgentdHttp {
         // reach us, so reading it here is not early.
         //
         // `server/discover` waits for its answer instead: nothing it is sent
-        // before that has a lifecycle to arrive in yet.
+        // before that has a lifecycle to arrive in yet. So does `tools/list`,
+        // whose answer must come back whole: a notification sent ahead of it
+        // goes to the host's queue directly. A request sent ahead of it cannot
+        // wait — the handler answers it — so it, and the answer after it, go
+        // on the stream.
         //
         // `held` is held across the wait, so a `post_message` future the SDK
         // drops while it waits hangs the exchange up too.
         let first = loop {
             match rx.recv().await {
                 Some(Pumped::Message(_)) if discovers => continue,
+                Some(Pumped::Message(v)) if lists_tools && self.queue_ahead(&v) => continue,
                 first => break first,
             }
         };
@@ -522,6 +572,12 @@ impl StreamableHttpClient for AgentdHttp {
                             keep_capabilities(slot, &v);
                         }
                         Some((Ok(as_event(&v)), (rx, held)))
+                    }
+                    // A request's exchange that failed after its first frame:
+                    // its answer is the transport's reason, as on any other
+                    // request's stream, not the SDK's generic "closed early".
+                    Some(Pumped::Done(Err(e))) if !bootstrap => {
+                        request_id.map(|id| (Ok(as_event(&failed(id, &e.to_string()))), (rx, held)))
                     }
                     // Done — cleanly, or with an error the first frame already
                     // outlived. Either way this POST's stream is over, and ending

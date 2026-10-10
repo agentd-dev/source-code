@@ -578,8 +578,20 @@ type Posted =
 
 /// POST one message through agentd's socket, as the SDK's worker does.
 fn post(ep: &str, message: ClientJsonRpcMessage) -> Posted {
+    post_via(agentd(ep), ep, message)
+}
+
+/// agentd's socket to `ep`, as a connection builds it (without its queue).
+fn agentd(ep: &str) -> mcp::rmcp_transport::AgentdHttp {
     let http = Arc::new(HttpTransport::new(McpEndpoint::parse(ep).unwrap(), vec![]));
-    let agentd = mcp::rmcp_transport::AgentdHttp::new(http, Duration::from_secs(5));
+    mcp::rmcp_transport::AgentdHttp::new(http, Duration::from_secs(5))
+}
+
+fn post_via(
+    agentd: mcp::rmcp_transport::AgentdHttp,
+    ep: &str,
+    message: ClientJsonRpcMessage,
+) -> Posted {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1150,4 +1162,119 @@ fn a_tools_list_answer_comes_back_whole() {
     .unwrap();
     let got = whole(post(&ep, list));
     assert_eq!(got["result"]["tools"][0]["name"], "t", "{got}");
+}
+
+#[test]
+fn what_a_server_streams_ahead_of_a_tools_list_answer_goes_to_the_queue() {
+    // The answer still comes back whole; a notification the handler would
+    // have queued is queued, one it would have ignored is not, in order.
+    let ep = spawn_scripted(|msg| {
+        let log = json!({"jsonrpc": "2.0", "method": "notifications/message",
+                         "params": {"level": "info", "data": "listing"}});
+        let other = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": 1}});
+        let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+        let answer = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
+            {"name": "t", "inputSchema": {"type": "object"}}]}});
+        raw(
+            "200 OK",
+            &["Content-Type: text/event-stream"],
+            &format!("data: {log}\n\ndata: {other}\n\ndata: {changed}\n\ndata: {answer}\n\n"),
+        )
+    });
+    let list = || -> ClientJsonRpcMessage {
+        serde_json::from_value(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+        )
+        .unwrap()
+    };
+    let queue: Arc<Mutex<Vec<mcp::rpc::Notification>>> = Arc::default();
+    let got = whole(post_via(
+        agentd(&ep).with_notifications(Arc::clone(&queue)),
+        &ep,
+        list(),
+    ));
+    assert_eq!(got["result"]["tools"][0]["name"], "t", "{got}");
+    let queued: Vec<(String, Value)> = queue
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|n| (n.method.clone(), n.params.clone().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            (
+                "notifications/message".to_string(),
+                json!({"level": "info", "data": "listing"})
+            ),
+            ("notifications/tools/list_changed".to_string(), json!({})),
+        ]
+    );
+
+    // A connection with no queue hands the stream on as it came.
+    assert!(
+        matches!(post(&ep, list()), Ok(StreamableHttpPostResponse::Sse(..))),
+        "no queue, no hand-off"
+    );
+
+    // A request ahead of the answer is not taken: only the handler can answer
+    // it, so it and the answer go on the stream.
+    let ep = spawn_scripted(|msg| {
+        let ask = json!({"jsonrpc": "2.0", "id": 9, "method": "ping"});
+        let answer = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": []}});
+        raw(
+            "200 OK",
+            &["Content-Type: text/event-stream"],
+            &format!("data: {ask}\n\ndata: {answer}\n\n"),
+        )
+    });
+    let queue: Arc<Mutex<Vec<mcp::rpc::Notification>>> = Arc::default();
+    let out = post_via(
+        agentd(&ep).with_notifications(Arc::clone(&queue)),
+        &ep,
+        list(),
+    );
+    assert!(
+        matches!(out, Ok(StreamableHttpPostResponse::Sse(..))),
+        "a request ahead goes on the stream: {out:?}"
+    );
+    assert!(queue.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_list_stream_that_ends_unanswered_answers_with_the_reason() {
+    // A request ahead of the answer sends the list down the stream; a stream
+    // that then ends with no answer answers the list with the transport's
+    // reason, as any other request's stream does — not with the SDK's generic
+    // "closed before its final response".
+    let ep = spawn_scripted(|_| {
+        let ask = json!({"jsonrpc": "2.0", "id": 9, "method": "ping"});
+        raw(
+            "200 OK",
+            &["Content-Type: text/event-stream"],
+            &format!("data: {ask}\n\n"),
+        )
+    });
+    let list: ClientJsonRpcMessage = serde_json::from_value(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+    )
+    .unwrap();
+    let frames: Vec<Value> = with_stream(&ep, list, async |stream| {
+        use futures::StreamExt;
+        stream
+            .filter_map(|e| async move { e.ok()?.data })
+            .map(|d| serde_json::from_str(&d).unwrap())
+            .collect()
+            .await
+    });
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(frames[0]["method"], "ping", "{frames:?}");
+    assert_eq!(frames[1]["id"], 3, "{frames:?}");
+    assert!(
+        frames[1]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{frames:?}"
+    );
 }

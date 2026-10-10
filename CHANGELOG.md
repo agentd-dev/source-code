@@ -69,18 +69,22 @@ the switch landed.
   revision a connection negotiated (`protocol`).
 - On a 2026-07-28 connection: a listen stream has its own idle bound (10
   minutes, never below the timeout) and an idle cut is said at info; after
-  every re-listen the URIs it holds are read again and a changed one is woken
-  once (state converges; a URI is never woken on suspicion); a listen for the
+  every re-listen the URIs it holds are read again and one that changed, or
+  that could not be compared, is woken once (state converges); a listen for the
   server's advertised `list_changed` notifications is held from connect, so
   `mcp.tools_changed` and a warm subagent's tool refresh keep working
   (`mcp.listen.unavailable` once when the server will not hold it); the
   connection lists its tools once at connect, so every call carries its
-  `Mcp-Param-*` headers.
+  `Mcp-Param-*` headers. A `tools/list` answer comes back to the SDK whole —
+  a notification a server streams ahead of it goes to the host's queue
+  directly — so the headers do not depend on timing inside rmcp (unless the
+  server sends a request of its own ahead of the answer).
 - `mcp.tool.dropped`: a tool rmcp drops for an `x-mcp-header` annotation it
   rejects is logged, once per tool per connection.
 - agentd-mcp: `FirstRequest` and `start_with`, `first_request()`,
   `capability(name)` (any capability member as the server sent it),
-  `drain_dropped_tools()`, `with_listen_idle`, `wire::DISCOVER_PROTOCOL_VERSION`,
+  `drain_dropped_tools()`, `with_listen_idle`, `AgentdHttp::with_notifications`,
+  `wire::DISCOVER_PROTOCOL_VERSION`,
   `wire::PROTOCOL_HEADERS`/`is_protocol_header`, and the
   `server/discover`/`subscriptions/listen` method names.
 

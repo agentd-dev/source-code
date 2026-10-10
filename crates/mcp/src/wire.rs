@@ -77,6 +77,7 @@ pub mod method {
     pub const NOTIFY_RESOURCES_UPDATED: &str = "notifications/resources/updated";
     pub const NOTIFY_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
     pub const NOTIFY_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+    pub const NOTIFY_PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
     pub const NOTIFY_CANCELLED: &str = "notifications/cancelled";
     pub const NOTIFY_PROGRESS: &str = "notifications/progress";
     pub const NOTIFY_MESSAGE: &str = "notifications/message";

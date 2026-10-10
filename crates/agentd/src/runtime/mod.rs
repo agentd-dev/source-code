@@ -2470,12 +2470,6 @@ impl Runtime {
         }
     }
 
-    /// An owner's subscribe to `uri` on `server` failed in a way that may
-    /// pass — a timeout, a `5xx`, the session lost mid-call, a listen the
-    /// server acknowledged without it. Left there, the URI is in no set and
-    /// nothing asks for it again: the start never fires, the wait parks until
-    /// its timeout or for ever. So it is asked for again from the loop, on
-    /// the schedule a re-dial keeps (1s doubling to 30s).
     /// The spec a spawned child dials `name` with: the configured one, plus
     /// what reached the server on this process's live connection, so the
     /// child starts the same way.
@@ -2485,6 +2479,13 @@ impl Runtime {
         Some(spec)
     }
 
+    /// An owner's subscribe to `uri` on `server` failed in a way that may
+    /// pass — a timeout, a `5xx`, the session lost mid-call. (A listen the
+    /// server acknowledged without the URI is its answer, not a failure that
+    /// may pass: it is not asked for again.) Left there, the URI is in no set
+    /// and nothing asks for it again: the start never fires, the wait parks
+    /// until its timeout or for ever. So it is asked for again from the loop,
+    /// on the schedule a re-dial keeps (1s doubling to 30s).
     pub(crate) fn retry_subscribe(&mut self, server: &str, uri: &str) {
         self.resubscribe_retry
             .entry(server.to_string())

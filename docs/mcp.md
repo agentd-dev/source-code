@@ -362,12 +362,14 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
    a server that refuses it, fails it or is slow to answer never fails or
    delays the connection. A failure (a `5xx`, a dropped stream, no answer) is
    logged once, `mcp.listen.unavailable`, and the listen is asked for again on
-   the same backoff until it is held (`mcp.listen.resumed`); a JSON-RPC refusal
-   of the filter is logged once and not asked for again, and the connection
-   works without its `list_changed`. A server that advertises a `listChanged` but
-   refuses that flag in a filter keeps its URI subscriptions: the listen is
-   asked for once more without the flags, and the connection stops asking
-   for them (`mcp.listen.flags_refused`).
+   the same backoff until it is held (`mcp.listen.resumed`). A refusal of the
+   method or of the filter (`-32601` or `-32602`) is logged once and not asked
+   for again, and the connection works without its `list_changed`; any other
+   JSON-RPC error, and an acknowledgment the client cannot read, is a failure
+   and asked for again. A server that advertises a `listChanged` but refuses
+   that flag in a filter (`-32601` or `-32602`) keeps its URI subscriptions:
+   the listen is asked for once more without the flags, and the connection
+   stops asking for them (`mcp.listen.flags_refused`).
 
 **Two distinct mechanisms — never conflated:**
 
@@ -506,6 +508,19 @@ copy would go out beside the client's own.
   `initialize`, or when a reload dials it afresh.
 - A server that answers the probe only after the connection's timeout is
   reached through `initialize` after that wait.
+- The revision is chosen by the probe alone. A server that answers
+  `server/discover` but serves `subscriptions/listen` in a shape the client
+  cannot read holds no listens: its `list_changed` listen is asked for again
+  on the listen backoff (said once, `mcp.listen.unavailable`), each
+  subscribed URI on the subscribe backoff (said on every attempt,
+  `start.subscribe.fail` for a start), and none is ever held, although the
+  same server reached through `initialize` might have accepted them. There is no setting that makes
+  agentd start with `initialize`.
+- A server streams a notification ahead of a `tools/list` answer: it goes to
+  the host's queue directly, so the answer still comes back whole. A server
+  *request* ahead of it sends the answer down the stream, where rmcp may
+  miss the tools' `x-mcp-header` schemas, and an annotated call then lacks
+  its `Mcp-Param-*` headers until the next list.
 
 ### What agentd still owns
 

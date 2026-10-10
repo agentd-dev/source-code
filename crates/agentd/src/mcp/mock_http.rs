@@ -361,7 +361,14 @@ fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
                         .entry("resultType")
                         .or_insert_with(|| json!("complete"));
                 }
-                write_json(stream, 200, &payload, None);
+                // A method it does not have is a `404`, as rmcp's server
+                // answers one.
+                let status = if payload["error"]["code"] == json::METHOD_NOT_FOUND {
+                    404
+                } else {
+                    200
+                };
+                write_json(stream, status, &payload, None);
             }
             Err(_) => accepted(stream),
         },

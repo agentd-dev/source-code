@@ -409,10 +409,7 @@ impl Runtime {
                 aws_auth: self.intel_aws_auth(),
                 dialect: self.intel_dialect(),
             },
-            mcp_servers: servers
-                .iter()
-                .filter_map(|s| self.mcp_specs.get(s).cloned())
-                .collect(),
+            mcp_servers: servers.iter().filter_map(|s| self.spawn_spec(s)).collect(),
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
             aauth: None,

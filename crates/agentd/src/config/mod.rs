@@ -385,6 +385,13 @@ pub struct McpServerSpec {
     /// their own in-loop calls too. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<String>,
+    /// What reached this server on the supervisor's connection — the
+    /// `server/discover` of MCP 2026-07-28 or the `initialize` handshake — so a
+    /// worker's dial starts the same way and a server reached through the
+    /// handshake costs it no probe. Filled when a spawn payload is built;
+    /// never configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_request: Option<::mcp::client::FirstRequest>,
 }
 
 /// The runtime shape of an MCP server's OAuth 2.1 client-credentials config.

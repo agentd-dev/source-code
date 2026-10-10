@@ -2476,6 +2476,15 @@ impl Runtime {
     /// nothing asks for it again: the start never fires, the wait parks until
     /// its timeout or for ever. So it is asked for again from the loop, on
     /// the schedule a re-dial keeps (1s doubling to 30s).
+    /// The spec a spawned child dials `name` with: the configured one, plus
+    /// what reached the server on this process's live connection, so the
+    /// child starts the same way.
+    pub(crate) fn spawn_spec(&self, name: &str) -> Option<crate::config::McpServerSpec> {
+        let mut spec = self.mcp_specs.get(name)?.clone();
+        spec.first_request = self.mcp.get(name).and_then(|c| c.first_request());
+        Some(spec)
+    }
+
     pub(crate) fn retry_subscribe(&mut self, server: &str, uri: &str) {
         self.resubscribe_retry
             .entry(server.to_string())

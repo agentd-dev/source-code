@@ -984,7 +984,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         let servers: Vec<crate::config::McpServerSpec> = launch
             .servers
             .iter()
-            .filter_map(|n| self.mcp_specs.get(n).cloned())
+            .filter_map(|n| self.spawn_spec(n))
             .collect();
         let payload = SpawnPayload {
             instruction: String::new(),

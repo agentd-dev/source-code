@@ -166,6 +166,11 @@ pub fn from_spec(
         Some(id) => client.with_identity(id),
         None => client,
     };
+    // A worker starts the way the supervisor reached the server.
+    let client = match spec.first_request {
+        Some(first) => client.start_with(first),
+        None => client,
+    };
     Ok(client)
 }
 

@@ -355,7 +355,7 @@ impl RmcpBuilder {
             elicitation: None,
             http: None,
             handshake_bound: None,
-            first: FirstRequest::Initialize,
+            first: FirstRequest::Discover,
             listen_idle: LISTEN_IDLE,
         }
     }
@@ -1716,6 +1716,14 @@ mod tests {
         );
         assert_eq!(crate::wire::PROTOCOL_VERSION, "2025-11-25");
         assert_eq!(crate::wire::DISCOVER_PROTOCOL_VERSION, "2026-07-28");
+        // A connection starts with `server/discover` unless told otherwise.
+        let b = RmcpBuilder::new(
+            "a",
+            "http://127.0.0.1:1/mcp",
+            vec![],
+            Duration::from_secs(1),
+        );
+        assert_eq!(b.first, FirstRequest::Discover);
     }
 
     #[test]

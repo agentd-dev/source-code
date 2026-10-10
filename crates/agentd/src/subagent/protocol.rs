@@ -782,4 +782,23 @@ mod tests {
             ControlMsg::Resume
         ));
     }
+
+    #[test]
+    fn a_server_spec_carries_what_reached_the_server() {
+        // A worker starts its dial the way the supervisor reached the server;
+        // a spec without the field (nothing reached it yet) parses to none.
+        let spec = McpServerSpec {
+            name: "gw".into(),
+            endpoint: "https://gw/mcp".into(),
+            first_request: Some(::mcp::client::FirstRequest::Initialize),
+            ..Default::default()
+        };
+        let back: McpServerSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back, spec);
+        let bare: McpServerSpec =
+            serde_json::from_value(serde_json::json!({"name": "gw", "endpoint": "https://gw/mcp"}))
+                .unwrap();
+        assert_eq!(bare.first_request, None);
+    }
 }

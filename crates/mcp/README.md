@@ -49,6 +49,12 @@ let out = mcp.call_tool("list_issues", None)?;
 - **Notifications reach you** — `resources/updated` and the list-changed family
   land in a queue you drain, which is what makes a subscribe-and-react daemon
   possible.
+- **Both lifecycles** — a connection starts with `server/discover` (MCP
+  2026-07-28: no handshake, no session, everything per request) and falls back
+  to the 2025-11-25 `initialize` handshake for a server that predates it;
+  `McpClient::start_with` picks the first request, `first_request()` says what
+  reached the server, and `capability(name)` returns any capability member as
+  the server sent it.
 - **Subscriptions by the negotiated revision** — `resources/subscribe` up to
   2025-11-25, `subscriptions/listen` from 2026-07-28 on, decided from the
   revision rmcp negotiated rather than one this crate picks. Only on a server

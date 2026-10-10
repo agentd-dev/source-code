@@ -1129,3 +1129,25 @@ fn a_bootstrap_post_dropped_while_it_waits_hangs_up() {
         closed.saturating_duration_since(dropped)
     );
 }
+
+#[test]
+fn a_tools_list_answer_comes_back_whole() {
+    // rmcp records each tool's `x-mcp-header` schema only from a list answer
+    // it takes off the wire, not from one it drains from a stream that just
+    // ended, so a list answered on a stream could leave the next call without
+    // its `Mcp-Param-*` headers, depending on timing. Handed back whole, the
+    // answer is always recorded.
+    let ep = spawn_scripted(|msg| {
+        json_body(
+            "200 OK",
+            &json!({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
+                {"name": "t", "inputSchema": {"type": "object"}}]}}),
+        )
+    });
+    let list: ClientJsonRpcMessage = serde_json::from_value(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}),
+    )
+    .unwrap();
+    let got = whole(post(&ep, list));
+    assert_eq!(got["result"]["tools"][0]["name"], "t", "{got}");
+}

@@ -172,7 +172,7 @@ impl McpClient {
                 version: env!("CARGO_PKG_VERSION").into(),
                 title: None,
             },
-            first: FirstRequest::Initialize,
+            first: FirstRequest::Discover,
             listen_idle: crate::rmcp_client::LISTEN_IDLE,
         })
     }

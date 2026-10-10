@@ -2,7 +2,8 @@
 
 agentd has no opinions about *what* it can do — it ships almost no task tools of
 its own. Everything an agent can touch arrives over the **Model Context Protocol**
-(MCP, target spec **2025-11-25**): agentd is an MCP **client**, and the tools and
+(MCP **2026-07-28** through `server/discover`, **2025-11-25** and older through
+`initialize`): agentd is an MCP **client**, and the tools and
 resources of the servers you declare become the agent's entire action space.
 
 The other direction — a parent agent, a peer, or an operator driving *this*
@@ -408,13 +409,18 @@ supplies — push callbacks, the `http` node, an AAuth person server.
 
 ### Which revision agentd speaks
 
-agentd connects with `initialize` and offers `2025-11-25`: rmcp's
-`LATEST_WITH_INITIALIZE`, the newest revision that still has an `initialize`.
-It deliberately does not offer rmcp's `LATEST`, `2026-07-28`, because that
-revision has no `initialize` to offer it in. The server's answer decides the
-revision a connection speaks, and the subscription mechanism follows it:
-`resources/subscribe` at a revision with an `initialize`, `subscriptions/listen`
-at one without, chosen from what was actually negotiated.
+A connection starts with `server/discover`, offering `2026-07-28`, the
+revision without a handshake or a session. A server that predates it refuses
+the probe — in whichever shape (a `-32601`, a `4xx` or `5xx`, `{}`, a `202`,
+silence) — and is reached through the `initialize` handshake offering
+`2025-11-25`, or the newest older revision it lists. What cannot be helped by
+a handshake is said instead of retried: a `401` (its challenge is what
+`agentd login` follows), a modern server refusing agentd's own request
+(`-32020`/`-32021`), a server that was never reached. A re-dial, and a turn
+worker's dial, start the way the connection they follow was reached. The
+subscription mechanism follows the revision negotiated: `resources/subscribe`
+up to `2025-11-25`, `subscriptions/listen` from `2026-07-28` on. `mcp.connect`
+logs the revision as `protocol`.
 
 ### What agentd still owns
 

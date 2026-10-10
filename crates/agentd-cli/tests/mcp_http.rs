@@ -191,10 +191,10 @@ fn spawn_mock() -> (String, Arc<Mutex<Seen>>) {
     (endpoint, seen)
 }
 
-// Scope: the handshake dialect belongs to the official SDK. agentd's
-// `initialize` offers 2025-11-25 (rmcp's LATEST_WITH_INITIALIZE), not the SDK's
-// LATEST (2026-07-28, which has no `initialize`); exercising a dialect agentd
-// does not connect with would be testing the mocks, not agentd.
+// Scope: a connection starts with `server/discover` (MCP 2026-07-28); this
+// mock predates it, refuses it as a method it does not have, and is reached
+// through the 2025-11-25 `initialize` handshake. The revision dialects
+// themselves are the SDK's and crates/mcp's tests'.
 //
 // So what these cover is the part that is agentd's own: that a real server's
 // lifecycle works end to end over agentd's own credentialed transport, that
@@ -263,6 +263,12 @@ fn streamable_http_full_lifecycle() {
     // post-initialize request; the `initialize` request itself carries neither
     // (nothing agreed yet — the version header is a "subsequent request" MUST).
     let g = seen.lock().unwrap();
+    // First the probe, at 2026-07-28 and without a session; then, refused, the
+    // handshake offering 2025-11-25.
+    assert_eq!(g.methods[0], "server/discover");
+    assert_eq!(g.protocol_versions[0].as_deref(), Some("2026-07-28"));
+    assert_eq!(g.session_ids[0], None);
+    assert_eq!(g.methods[1], "initialize");
     let init_idx = g.methods.iter().position(|m| m == "initialize").unwrap();
     assert_eq!(
         g.protocol_versions[init_idx], None,

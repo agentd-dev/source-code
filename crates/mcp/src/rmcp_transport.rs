@@ -395,7 +395,16 @@ impl StreamableHttpClient for AgentdHttp {
         // this request carrying the transport's reason — the SDK itself answers
         // a stream that closed early with a synthesised error, but a generic
         // one, and "HTTP 401" is what an operator needs to see.
-        if let (Some(id), false) = (request_id, bootstrap) {
+        // A `tools/list` answer is handed back whole too, as the bootstrap's
+        // is: rmcp records each tool's `x-mcp-header` schema from a list
+        // answer — what a call's `Mcp-Param-*` headers are built from — only
+        // as it takes the answer off the wire, and an answer it drains from a
+        // stream that has just ended skips that step. A list answered on a
+        // stream could then leave the next call without its headers (and the
+        // tools rmcp would drop undropped), depending on timing. Whole, it is
+        // always recorded.
+        let whole = bootstrap || lists_tools;
+        if let (Some(id), false) = (request_id, whole) {
             let session = self.http.session_id();
             // The exchange's hang-up rides in the stream's state, so the
             // stream dropped is the connection closed.
@@ -438,7 +447,7 @@ impl StreamableHttpClient for AgentdHttp {
             // The whole answer, as one message: see this method's doc.
             Some(Pumped::Done(Ok(Some(v)))) => {
                 let mut v = match request_id {
-                    Some(id) => answered(id, v, true),
+                    Some(id) => answered(id, v, bootstrap),
                     None => v,
                 };
                 if discovers {
@@ -462,6 +471,18 @@ impl StreamableHttpClient for AgentdHttp {
             // so the SDK hands it back rather than handshaking again behind the
             // host's back — and the host, which knows what the lost session
             // held, re-dials and re-subscribes.
+            // A list whose exchange failed fails as any request does: an
+            // error answer carrying the transport's reason (and a lost session
+            // is told apart by the client, as for every request).
+            Some(Pumped::Done(Err(e))) if lists_tools => {
+                let id = request_id.unwrap_or_default();
+                let message = serde_json::from_value(failed(id, &e.to_string()))
+                    .map_err(StreamableHttpError::Deserialize)?;
+                return Ok(StreamableHttpPostResponse::Json(
+                    message,
+                    self.http.session_id(),
+                ));
+            }
             Some(Pumped::Done(Err(_))) if self.http.session_lost() => {
                 return Err(StreamableHttpError::SessionExpired);
             }
@@ -494,7 +515,7 @@ impl StreamableHttpClient for AgentdHttp {
                     Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), (rx, held))),
                     Some(Pumped::Done(Ok(Some(v)))) => {
                         let v = match request_id {
-                            Some(id) => answered(id, v, true),
+                            Some(id) => answered(id, v, bootstrap),
                             None => v,
                         };
                         if let Some(slot) = &caps_slot {

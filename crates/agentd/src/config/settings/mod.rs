@@ -2163,6 +2163,7 @@ impl McpServer {
             auth: self.auth.as_ref().map(|a| a.to_spec()),
             service: self.service.clone(),
             rate: self.service_rate.clone(),
+            first_request: None,
         })
     }
 }

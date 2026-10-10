@@ -26,7 +26,7 @@
 use instruction_core::Refusal;
 
 use crate::aauth::AgentKey;
-use crate::aauth::b64;
+use crate::b64;
 
 /// The §7.2 digests, the claims, and §7.6 verification — the crate's, so the
 /// bytes agentd signs and the checks it verifies with are one definition.
@@ -68,7 +68,7 @@ pub fn load_key_file(path: &str) -> Option<Vec<u8>> {
             .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
             .collect();
     }
-    crate::config::envelope::b64url_decode(&text).filter(|v| v.len() == 32)
+    crate::b64::url_decode(&text).ok().filter(|v| v.len() == 32)
 }
 
 /// What verifying a document against the pinned publishers concluded.

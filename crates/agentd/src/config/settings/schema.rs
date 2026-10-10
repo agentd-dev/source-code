@@ -314,6 +314,7 @@ fn top_level_properties(
                     "allow_private": { "type": "boolean", "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)" } } } } }));
     m.insert("webhooks".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev) — the inbound webhook surface" },
+                "url": { "type": "string", "description": "the URL the listener is reached at from outside (https://host[:port][/prefix]); callback URLs are built on it" },
                 "tls": { "type": "object", "additionalProperties": false, "properties": {
                     "cert": { "type": "string" }, "key": { "type": "string" }, "client_ca": { "type": "string" } } },
                 "default_auth": { "$ref": "#/$defs/WebhookAuth" } } }));

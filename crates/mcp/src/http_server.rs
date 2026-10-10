@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-/// Cap on a request body (webhook payloads are small; this bounds a hostile peer).
-const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Cap on a request body (webhook payloads are small; this bounds a hostile
+/// peer). A handler may set a lower one per path ([`RawHandler::body_limit`]).
+pub const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Cap on the whole request HEAD — request line plus every header line. A body
 /// is bounded by its declared `Content-Length`; a head is bounded by nothing the
@@ -160,6 +161,13 @@ impl RawResponse {
 /// request; the embedder routes and authenticates itself.
 pub trait RawHandler: Send + Sync + 'static {
     fn handle(&self, req: &RawRequest) -> RawResponse;
+
+    /// The largest body a request to `path` may carry: a declared
+    /// `Content-Length` over it is answered `413` once the head is read,
+    /// before the body is. At most [`MAX_BODY`].
+    fn body_limit(&self, _method: &str, _path: &str) -> usize {
+        MAX_BODY
+    }
 }
 
 /// Spawn a raw-HTTP accept loop — one blocking thread per connection,
@@ -205,8 +213,23 @@ fn serve_conn_raw<S: Read + Write + Send + 'static>(
     handler: &Arc<dyn RawHandler>,
 ) {
     let mut reader = BufReader::new(stream);
-    let req = match read_request(&mut reader) {
+    let limit = |method: &str, target: &str| {
+        let path = target.split('?').next().unwrap_or(target);
+        handler.body_limit(method, path).min(MAX_BODY)
+    };
+    let req = match read_request(&mut reader, &limit) {
         Ok(req) => req,
+        Err(ReadError::BodyTooLarge) => {
+            // Refused on the declared length: the body is never read, so a
+            // peer cannot make the listener buffer what it will not keep.
+            let _ = write_simple(
+                reader.get_mut(),
+                413,
+                "Payload Too Large",
+                b"request body exceeds this path's size limit",
+            );
+            return;
+        }
         Err(ReadError::HeadTooLarge) => {
             // A refused head is answered, not just dropped: 431 is a real answer
             // a client can act on, and it costs nothing — the peer never got
@@ -324,6 +347,8 @@ enum ReadError {
     /// The head blew [`MAX_HEAD_BYTES`] / [`MAX_HEADERS`]. Answered `431` so the
     /// peer learns why, rather than being cut off mid-sentence.
     HeadTooLarge,
+    /// The declared `Content-Length` is over the path's limit. Answered `413`.
+    BodyTooLarge,
 }
 
 /// Read one head line (request line or header), spending from `budget`. The
@@ -349,8 +374,11 @@ fn read_head_line<S: Read>(
 }
 
 /// Read one HTTP/1.1 request (request line, headers, `Content-Length` body)
-/// under the head bounds above.
-fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<HttpRequest, ReadError> {
+/// under the head bounds above and the body limit `limit(method, target)`.
+fn read_request<S: Read>(
+    reader: &mut BufReader<S>,
+    limit: &dyn Fn(&str, &str) -> usize,
+) -> Result<HttpRequest, ReadError> {
     let mut budget = MAX_HEAD_BYTES;
     let mut request_line = String::new();
     if read_head_line(reader, &mut budget, &mut request_line)? == 0 {
@@ -383,8 +411,8 @@ fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<HttpRequest, ReadE
             headers.push((name, value));
         }
     }
-    if content_length > MAX_BODY {
-        return Err(ReadError::Incomplete);
+    if content_length > limit(&method, &target) {
+        return Err(ReadError::BodyTooLarge);
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
@@ -447,6 +475,56 @@ mod tests {
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// [`Echo`], with a 16-byte cap on `/small` — and a count of the requests
+    /// that reached it.
+    struct Capped(std::sync::atomic::AtomicUsize);
+    impl RawHandler for Capped {
+        fn handle(&self, req: &RawRequest) -> RawResponse {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RawResponse::text(200, "OK", req.path().to_string())
+        }
+        fn body_limit(&self, _method: &str, path: &str) -> usize {
+            if path == "/small" { 16 } else { MAX_BODY }
+        }
+    }
+
+    #[test]
+    fn a_body_over_the_paths_limit_is_answered_413_unread() {
+        let listener = bind_tcp("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handler = Arc::new(Capped(std::sync::atomic::AtomicUsize::new(0)));
+        spawn_accept_raw(
+            listener,
+            Arc::new(HttpAcceptor::Plain),
+            Arc::clone(&handler) as Arc<dyn RawHandler>,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let status = |path: &str, declared: usize, sent: usize| {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            let head = format!(
+                "POST {path}?q=1 HTTP/1.1\r\nHost: x\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            // Only part of a refused body is ever sent: the answer must not
+            // wait for the rest.
+            let _ = s.write_all(&vec![b'x'; sent]);
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut line = String::new();
+            BufReader::new(s).read_line(&mut line).unwrap();
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(0)
+        };
+        assert_eq!(status("/small", 16, 16), 200);
+        assert_eq!(status("/small", 17, 0), 413);
+        assert_eq!(status("/small", 1 << 20, 10), 413);
+        assert_eq!(status("/big", 17, 17), 200);
+        assert_eq!(status("/big", MAX_BODY + 1, 0), 413);
+        assert_eq!(handler.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

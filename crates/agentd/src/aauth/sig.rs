@@ -14,8 +14,8 @@
 //! delegated to [`AgentKey`](super::key::AgentKey), so this module is pure,
 //! deterministic string assembly (unit-tested against a hand-computed base).
 
-use super::b64;
 use super::key::AgentKey;
+use crate::b64;
 
 /// What the `Signature-Key` presents — `sig=jwt;jwt="…"` for a request (the
 /// agent/auth token), or `sig=hwk` presenting the raw public key for the

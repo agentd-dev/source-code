@@ -339,7 +339,8 @@ fn load_cosign_key(path: &str) -> Result<CosignKey, String> {
         .filter(|l| !l.starts_with("-----"))
         .collect::<Vec<_>>()
         .concat();
-    let der = crate::config::envelope::b64url_decode(body.trim())
+    let der = crate::b64::url_decode(body.trim())
+        .ok()
         .ok_or_else(|| format!("oci: cosign key {path}: not base64/PEM"))?;
     match der.len() {
         // SPKI(P-256) = 91 bytes, the uncompressed point at 26..91 (0x04 X Y).
@@ -411,7 +412,7 @@ fn verify_cosign(
         let Some(sig_b64) = layer["annotations"][COSIGN_SIG_ANNOTATION].as_str() else {
             continue;
         };
-        let Some(sig) = crate::config::envelope::b64url_decode(sig_b64) else {
+        let Some(sig) = crate::b64::url_decode(sig_b64).ok() else {
             continue;
         };
         let Some(digest) = layer["digest"].as_str() else {

@@ -1591,7 +1591,7 @@ fn registry_contents(uri: &str) -> serde_json::Value {
 #[cfg(feature = "sign")]
 fn mock_jwks() -> String {
     let key = crate::aauth::AgentKey::from_seed(&MOCK_SIGN_SEED).expect("test seed");
-    let x = crate::aauth::b64::url_nopad(key.public_bytes());
+    let x = crate::b64::url_nopad(key.public_bytes());
     // The registry's real document carries more than `keys` + `publisher`;
     // served here so a consumer that denies unknown fields fails in CI
     // rather than in production.
@@ -1608,7 +1608,7 @@ fn mock_jwks() -> String {
 #[cfg(feature = "sign")]
 fn mock_delivery_jwks() -> String {
     let key = crate::aauth::AgentKey::from_seed(&MOCK_DELIVERY_SEED).expect("test seed");
-    let x = crate::aauth::b64::url_nopad(key.public_bytes());
+    let x = crate::b64::url_nopad(key.public_bytes());
     json!({"issuer": "https://instruction.md/pub",
            "keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
                      "kid": MOCK_DELIVERY_KID, "x": x}]})

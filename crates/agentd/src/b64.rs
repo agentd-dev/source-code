@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! base64 helpers for AAuth: url-safe **unpadded** (JWK/JWT, per RFC 4648 §5
-//! and RFC 7515) and standard **padded** (the RFC 9421 `:…:` signature
-//! byte-sequence). The two alphabets are not interchangeable on the wire — a
-//! JWK member encoded with `+/` is rejected, so pick by consumer, not by taste.
-//! Hand-rolled — no `base64` crate (the minimalism moat).
+//! base64, hand-rolled (no `base64` crate — the minimalism moat), always
+//! compiled: url-safe **unpadded** (JWK/JWT, RFC 4648 §5 and RFC 7515),
+//! standard **padded** (the RFC 9421 `:…:` byte-sequence, Standard Webhooks
+//! secrets and signatures), and their decoders. The two alphabets are not
+//! interchangeable on the wire — a JWK member encoded with `+/` is rejected —
+//! so pick by consumer, not by taste.
+
+#![allow(dead_code)] // which helpers a build uses depends on its features
 
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -33,7 +36,7 @@ fn encode(input: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
     out
 }
 
-/// Standard base64, padded (RFC 9421 signature/byte-sequence values).
+/// Standard base64, padded.
 pub(crate) fn std_pad(input: &[u8]) -> String {
     encode(input, STD, true)
 }
@@ -70,6 +73,37 @@ pub(crate) fn url_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Decode standard base64, strictly: the `+/` alphabet only, padding only at
+/// the end, a length that padding completes to a multiple of four. For values
+/// a peer must have encoded exactly (a Standard Webhooks secret).
+pub(crate) fn std_decode(s: &str) -> Result<Vec<u8>, String> {
+    let body = s.trim_end_matches('=');
+    let pad = s.len() - body.len();
+    if pad > 2 || (pad > 0 && !s.len().is_multiple_of(4)) || body.len() % 4 == 1 {
+        return Err("not standard base64: bad length or padding".into());
+    }
+    let mut bits: u32 = 0;
+    let mut nbits = 0;
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    for c in body.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err("not standard base64: a character outside A–Z a–z 0–9 + /".into()),
+        };
+        bits = bits << 6 | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +126,27 @@ mod tests {
         }
         // URL alphabet uses -_ not +/ (0xfb 0xff 0xbf → "-_-_" region).
         assert_eq!(url_nopad(&[0xfb, 0xff]), "-_8");
+    }
+
+    #[test]
+    fn std_decode_is_strict() {
+        for v in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foobar",
+            &[0xfb, 0xff, 0x00],
+        ] {
+            assert_eq!(std_decode(&std_pad(v)).unwrap(), v);
+        }
+        // Unpadded input of a whole length is fine; a stray `=` or the url
+        // alphabet is not, nor is a length padding cannot complete.
+        assert_eq!(std_decode("Zm9vYmFy").unwrap(), b"foobar");
+        assert!(std_decode("Zg=").is_err());
+        assert!(std_decode("Z===").is_err());
+        assert!(std_decode("-_8=").is_err());
+        assert!(std_decode("Zm9vY").is_err());
+        assert!(std_decode("Zm 9v").is_err());
     }
 }

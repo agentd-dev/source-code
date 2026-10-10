@@ -33,7 +33,7 @@ pub fn browser_login(
 
     // PKCE (RFC 7636): a high-entropy verifier and its S256 challenge.
     let verifier = rand_b64url(32);
-    let challenge = b64url_nopad(&sha256(verifier.as_bytes()));
+    let challenge = crate::b64::url_nopad(&sha256(verifier.as_bytes()));
     let state = rand_b64url(16);
 
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("oauth: loopback: {e}"))?;
@@ -133,28 +133,7 @@ fn rand_b64url(n: usize) -> String {
             *b = (x >> 24) as u8;
         }
     }
-    b64url_nopad(&buf)
-}
-
-/// base64url without padding (RFC 4648 §5).
-fn b64url_nopad(input: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        out.push(A[((n >> 18) & 63) as usize] as char);
-        out.push(A[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(A[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(A[(n & 63) as usize] as char);
-        }
-    }
-    out
+    crate::b64::url_nopad(&buf)
 }
 
 /// Percent-encode a query component (unreserved set passes through).
@@ -212,11 +191,11 @@ mod tests {
     fn b64url_matches_rfc7636_example() {
         // The S256 challenge is this encoding applied to the SHA-256 of the
         // verifier, so the encoder is checked against known vectors here.
-        assert_eq!(b64url_nopad(b""), "");
-        assert_eq!(b64url_nopad(b"f"), "Zg");
-        assert_eq!(b64url_nopad(b"foobar"), "Zm9vYmFy");
+        assert_eq!(crate::b64::url_nopad(b""), "");
+        assert_eq!(crate::b64::url_nopad(b"f"), "Zg");
+        assert_eq!(crate::b64::url_nopad(b"foobar"), "Zm9vYmFy");
         // url-safe alphabet: bytes that would be + / in standard base64.
-        assert_eq!(b64url_nopad(&[0xfb, 0xff]), "-_8");
+        assert_eq!(crate::b64::url_nopad(&[0xfb, 0xff]), "-_8");
     }
 
     #[test]

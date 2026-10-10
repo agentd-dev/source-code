@@ -1411,7 +1411,15 @@ impl crate::runtime::reactor::Runtime {
         timeout_ms: Option<u64>,
     ) {
         use crate::engine::run::StepStatus;
-        let Some(base) = self.settings.webhooks.listen.clone() else {
+        // The URL handed out is the one callers reach: `webhooks.url` behind a
+        // proxy, the bound `listen` otherwise.
+        let Some(base) = self
+            .settings
+            .webhooks
+            .url
+            .clone()
+            .or_else(|| self.settings.webhooks.listen.clone())
+        else {
             self.finish_step_pub(
                 run_id,
                 step_id,

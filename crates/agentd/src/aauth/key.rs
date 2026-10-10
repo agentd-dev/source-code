@@ -4,7 +4,7 @@
 //! rustls already links; no new crate). The private key is a 32-byte seed,
 //! stored base64url in a 0600 file; the file is the agent's durable identity.
 
-use super::b64;
+use crate::b64;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::Path;
 

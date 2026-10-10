@@ -25,7 +25,6 @@
 //! and no signing path.
 
 mod apd;
-pub(crate) mod b64; // base64url — reused by instruction attestation (config::attest)
 mod discover;
 mod key;
 mod ps;

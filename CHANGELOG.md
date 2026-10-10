@@ -102,6 +102,13 @@ tracks a draft.
   extension adds to a connection's listen).
 - The built-in mock serves Events on its 2026-07-28 edge (`--events
   extension|top-level|none`).
+- `webhooks.url` (restart-only): the URL the webhook listener is reached at
+  from outside, behind a proxy — `https://` (loopback `http://` aside), never
+  a wildcard host, with an optional path prefix. A `wait {on: webhook}`'s
+  callback URL is built on it, where it was built on the bound `listen`.
+- agentd-mcp: `RawHandler::body_limit` — a per-path body cap, answered `413`
+  on the declared `Content-Length` before the body is read (an over-long body
+  was dropped without an answer).
 
 ### MCP 2026-07-28 (RFC 0045 P1)
 

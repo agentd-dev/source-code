@@ -53,31 +53,9 @@ fn page_size_of(asked: Option<i64>) -> Result<usize, Value> {
     }
 }
 
-/// base64url (RFC 4648 §5, unpadded): the page tokens' outer form, so a token
-/// is opaque to the caller and safe in any transport. Decoded with
-/// [`crate::config::envelope::b64url_decode`].
-fn b64url(bytes: &[u8]) -> String {
-    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
-            | chunk.get(2).copied().unwrap_or(0) as u32;
-        out.push(URL[(n >> 18 & 63) as usize] as char);
-        out.push(URL[(n >> 12 & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(URL[(n >> 6 & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(URL[(n & 63) as usize] as char);
-        }
-    }
-    out
-}
-
 /// A page token's payload, or `None` for anything this server did not issue.
 fn token_payload(token: &str) -> Option<String> {
-    String::from_utf8(crate::config::envelope::b64url_decode(token)?).ok()
+    String::from_utf8(crate::b64::url_decode(token).ok()?).ok()
 }
 
 /// A task's place in the listing order: newest status first, ties broken by id
@@ -91,7 +69,7 @@ fn list_key(t: &Task) -> (u64, &str) {
 /// task that moves or disappears between pages cannot shift the next one onto
 /// something already seen.
 fn list_cursor(t: &Task) -> String {
-    b64url(format!("{}:{}", t.updated, t.id).as_bytes())
+    crate::b64::url_nopad(format!("{}:{}", t.updated, t.id).as_bytes())
 }
 
 fn parse_list_cursor(token: &str) -> Option<(u64, String)> {
@@ -278,7 +256,7 @@ fn config_id(params: &Value) -> Result<&str, Value> {
 
 /// The push-config cursor: the id the previous page ended on.
 fn push_cursor(id: &str) -> String {
-    b64url(format!("push:{id}").as_bytes())
+    crate::b64::url_nopad(format!("push:{id}").as_bytes())
 }
 
 fn parse_push_cursor(token: &str) -> Option<String> {
@@ -995,7 +973,7 @@ mod tests {
             json!({"pageSize": -1}),
             json!({"historyLength": -1}),
             json!({"pageToken": "!!not-a-token"}),
-            json!({"pageToken": b64url(b"no-colon-here")}),
+            json!({"pageToken": crate::b64::url_nopad(b"no-colon-here")}),
             json!({"statusTimestampAfter": "yesterday"}),
             json!({"status": "TASK_STATE_SLEEPING"}),
         ] {
@@ -1214,7 +1192,7 @@ mod tests {
         for bad in [
             json!({"pageToken": "garbage!"}),
             // A ListTasks cursor is not a push-config cursor.
-            json!({"pageToken": b64url(b"2000:t-a")}),
+            json!({"pageToken": crate::b64::url_nopad(b"2000:t-a")}),
             json!({"pageSize": 101}),
         ] {
             let e = push_page(&targets, "task-1", &bad).expect_err(&bad.to_string());

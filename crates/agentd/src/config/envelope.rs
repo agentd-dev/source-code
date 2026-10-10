@@ -52,7 +52,7 @@ fn looks_like_jwe(bytes: &[u8]) -> bool {
     if !parts.iter().all(|p| b64url(p)) {
         return false;
     }
-    let Some(header) = b64url_decode(parts[0]) else {
+    let Ok(header) = crate::b64::url_decode(parts[0]) else {
         return false;
     };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&header) else {
@@ -61,58 +61,12 @@ fn looks_like_jwe(bytes: &[u8]) -> bool {
     v.get("enc").is_some()
 }
 
-/// Decode unpadded url-safe base64 (also tolerating standard alphabet).
-/// Duplicated from `aauth::b64` deliberately: this module must compile with NO
-/// crypto feature, and the twenty lines are cheaper than re-gating that module.
-pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
-    let mut bits: u32 = 0;
-    let mut nbits = 0;
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' => break,
-            b'\n' | b'\r' => continue,
-            _ => return None,
-        };
-        bits = bits << 6 | v as u32;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((bits >> nbits) as u8);
-        }
-    }
-    Some(out)
-}
-
 /// Wrap a BINARY age file in its standard ASCII armor, so an envelope can
 /// travel through string-shaped config (`agent.instruction`) losslessly. The
 /// output is exactly what `age --armor` produces: std base64 with padding,
 /// 64-column lines, between the BEGIN/END markers.
 pub fn armor(bytes: &[u8]) -> String {
-    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut b64 = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
-            | chunk.get(2).copied().unwrap_or(0) as u32;
-        b64.push(STD[(n >> 18 & 63) as usize] as char);
-        b64.push(STD[(n >> 12 & 63) as usize] as char);
-        b64.push(if chunk.len() > 1 {
-            STD[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        b64.push(if chunk.len() > 2 {
-            STD[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
+    let b64 = crate::b64::std_pad(bytes);
     let mut out = String::from("-----BEGIN AGE ENCRYPTED FILE-----\n");
     for line in b64.as_bytes().chunks(64) {
         out.push_str(std::str::from_utf8(line).unwrap());

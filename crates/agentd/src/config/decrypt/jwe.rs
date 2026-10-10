@@ -17,7 +17,6 @@
 use serde_json::Value;
 
 use super::x25519;
-use crate::config::envelope::b64url_decode;
 
 /// Decrypt a compact JWE with X25519 identities and/or pre-shared 32-byte
 /// content keys.
@@ -30,14 +29,22 @@ pub fn decrypt(
     if parts.len() != 5 {
         return Err("jwe: not a compact serialization (want 5 segments)".into());
     }
-    let header_b: Vec<u8> = b64url_decode(parts[0]).ok_or("jwe: bad header base64")?;
+    let header_b: Vec<u8> = crate::b64::url_decode(parts[0])
+        .ok()
+        .ok_or("jwe: bad header base64")?;
     let header: Value =
         serde_json::from_slice(&header_b).map_err(|e| format!("jwe: header: {e}"))?;
     let alg = header["alg"].as_str().unwrap_or("");
     let enc = header["enc"].as_str().unwrap_or("");
-    let iv = b64url_decode(parts[2]).ok_or("jwe: bad iv base64")?;
-    let ct = b64url_decode(parts[3]).ok_or("jwe: bad ciphertext base64")?;
-    let tag = b64url_decode(parts[4]).ok_or("jwe: bad tag base64")?;
+    let iv = crate::b64::url_decode(parts[2])
+        .ok()
+        .ok_or("jwe: bad iv base64")?;
+    let ct = crate::b64::url_decode(parts[3])
+        .ok()
+        .ok_or("jwe: bad ciphertext base64")?;
+    let tag = crate::b64::url_decode(parts[4])
+        .ok()
+        .ok_or("jwe: bad tag base64")?;
 
     let (aead, key_len): (&'static ring::aead::Algorithm, usize) = match enc {
         "A256GCM" => (&ring::aead::AES_256_GCM, 32),
@@ -60,16 +67,16 @@ pub fn decrypt(
             }
             let peer: [u8; 32] = epk["x"]
                 .as_str()
-                .and_then(b64url_decode)
+                .and_then(|v| crate::b64::url_decode(v).ok())
                 .and_then(|v| v.try_into().ok())
                 .ok_or("jwe: bad epk.x")?;
             let apu = header["apu"]
                 .as_str()
-                .and_then(b64url_decode)
+                .and_then(|v| crate::b64::url_decode(v).ok())
                 .unwrap_or_default();
             let apv = header["apv"]
                 .as_str()
-                .and_then(b64url_decode)
+                .and_then(|v| crate::b64::url_decode(v).ok())
                 .unwrap_or_default();
             let mut last = String::from("no X25519 identity configured");
             let mut derived = None;
@@ -135,7 +142,7 @@ pub fn encrypt_ecdh_es(plaintext: &[u8], recipient_pk: &[u8; 32]) -> Result<Stri
     let cek = concat_kdf(&z, "A256GCM", &[], &[], 32);
     let header = serde_json::json!({
         "alg": "ECDH-ES", "enc": "A256GCM",
-        "epk": {"kty": "OKP", "crv": "X25519", "x": b64url_encode(&eph_pub)},
+        "epk": {"kty": "OKP", "crv": "X25519", "x": crate::b64::url_nopad(&eph_pub)},
     });
     seal_compact(&header, &cek, plaintext)
 }
@@ -148,7 +155,7 @@ pub fn encrypt_dir(plaintext: &[u8], key: &[u8; 32]) -> Result<String, String> {
 fn seal_compact(header: &Value, cek: &[u8], plaintext: &[u8]) -> Result<String, String> {
     use ring::rand::SecureRandom;
     let rng = ring::rand::SystemRandom::new();
-    let hb64 = b64url_encode(header.to_string().as_bytes());
+    let hb64 = crate::b64::url_nopad(header.to_string().as_bytes());
     let mut nonce = [0u8; 12];
     rng.fill(&mut nonce).map_err(|_| "rng")?;
     let k = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, cek).map_err(|_| "key")?;
@@ -163,9 +170,9 @@ fn seal_compact(header: &Value, cek: &[u8], plaintext: &[u8]) -> Result<String, 
     let tag_at = buf.len() - 16;
     Ok(format!(
         "{hb64}..{}.{}.{}",
-        b64url_encode(&nonce),
-        b64url_encode(&buf[..tag_at]),
-        b64url_encode(&buf[tag_at..])
+        crate::b64::url_nopad(&nonce),
+        crate::b64::url_nopad(&buf[..tag_at]),
+        crate::b64::url_nopad(&buf[tag_at..])
     ))
 }
 
@@ -187,25 +194,6 @@ fn concat_kdf(z: &[u8], enc: &str, apu: &[u8], apv: &[u8], key_len: usize) -> Ve
     digest.as_ref()[..key_len].to_vec()
 }
 
-fn b64url_encode(b: &[u8]) -> String {
-    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
-    for chunk in b.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
-            | chunk.get(2).copied().unwrap_or(0) as u32;
-        out.push(URL[(n >> 18 & 63) as usize] as char);
-        out.push(URL[(n >> 12 & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(URL[(n >> 6 & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(URL[(n & 63) as usize] as char);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +207,7 @@ mod tests {
             110, 163, 218, 128, 106, 72, 246, 218, 167, 121, 140, 254, 144, 196,
         ];
         let derived = concat_kdf(&z, "A128GCM", b"Alice", b"Bob", 16);
-        assert_eq!(b64url_encode(&derived), "VqqN6vgjbSBcIijNcacQGg");
+        assert_eq!(crate::b64::url_nopad(&derived), "VqqN6vgjbSBcIijNcacQGg");
     }
 
     #[test]
@@ -251,7 +239,7 @@ mod tests {
         let e = decrypt(&jwe, &[], &[]).unwrap_err();
         assert!(e.contains("32-byte shared key"), "{e}");
         // An unsupported alg is refused by name with the supported set.
-        let h = b64url_encode(br#"{"alg":"A256KW","enc":"A256GCM"}"#);
+        let h = crate::b64::url_nopad(br#"{"alg":"A256KW","enc":"A256GCM"}"#);
         let e = decrypt(&format!("{h}.a.aXZpdml2aXZpdml2.Y3Q.dGFn"), &[], &[]).unwrap_err();
         assert!(e.contains("A256KW") && e.contains("ECDH-ES"), "{e}");
     }

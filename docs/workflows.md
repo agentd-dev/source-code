@@ -222,7 +222,8 @@ and `manual` ignores it in favour of the `inputs` its caller supplies.
 ```yaml
 # A `webhook` node needs a listener to arrive on, or validation refuses the
 # config. A loopback `http://` bind is allowed; a public bind must be `https://`
-# with `webhooks.tls: {cert, key}`.
+# with `webhooks.tls: {cert, key}`. Behind a proxy, `webhooks.url` is where
+# callers reach it — the URL a `wait {on: webhook}` hands out is built on it.
 webhooks:
   listen: http://127.0.0.1:8088
 

@@ -18,6 +18,7 @@ pub mod a2a; // A2A surface: principals/roles/authorization + durable tasks
 pub mod aauth; // agent-side AAuth signing for AAuth-protected MCP endpoints
 pub mod agentloop; // the in-child ReAct loop + terminal-status state machine
 pub mod auth; // endpoint credential providers + durable token cache: OAuth, AWS SigV4, SPIFFE
+pub(crate) mod b64; // base64, std padded + url unpadded — hand-rolled, always compiled
 pub mod cel; // CEL expression seam (feature `cel`; always compiled, fail-closed without it)
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup; config::{file,yaml,paths,watch}
 pub mod context; // durable transcripts, plan, memory, compaction, skills

@@ -264,7 +264,8 @@ fn unarmor_if_needed(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut b64 = String::new();
     for line in s.lines().skip(1) {
         if line.as_bytes() == ARMOR_END {
-            return crate::config::envelope::b64url_decode(&b64)
+            return crate::b64::url_decode(&b64)
+                .ok()
                 .ok_or_else(|| "age: bad armor base64".into());
         }
         b64.push_str(line.trim());
@@ -468,7 +469,7 @@ fn b64_decode_nopad(s: &str) -> Option<Vec<u8>> {
     if s.contains('=') {
         return None; // age forbids padding in stanza bodies
     }
-    crate::config::envelope::b64url_decode(s)
+    crate::b64::url_decode(s).ok()
 }
 
 fn b64_encode_nopad(b: &[u8]) -> String {

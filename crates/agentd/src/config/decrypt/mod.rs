@@ -19,7 +19,7 @@ pub mod jwe;
 mod scrypt;
 pub mod x25519;
 
-use crate::config::envelope::{self, b64url_decode};
+use crate::config::envelope;
 use crate::config::settings::InstructionDecrypt;
 
 /// The loaded recipient-key material, resolved from operator config once.
@@ -118,7 +118,9 @@ fn parse_key_line(line: &str) -> Option<[u8; 32]> {
         }
         return Some(out);
     }
-    b64url_decode(line).and_then(|v| v.try_into().ok())
+    crate::b64::url_decode(line)
+        .ok()
+        .and_then(|v| v.try_into().ok())
 }
 
 #[cfg(test)]

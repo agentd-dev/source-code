@@ -3219,6 +3219,13 @@ pub struct Webhooks {
     /// `https://host:port` (loopback `http://` for dev). Required when any
     /// `webhook` start node or `wait: {on: webhook}` is used.
     pub listen: Option<String>,
+    /// The URL the listener's root is reached at from outside — through a
+    /// proxy or a load balancer, not what `listen` binds: `https://host[:port]`
+    /// with an optional path prefix. The callback URLs agentd hands out (a
+    /// `wait {on: webhook}`'s, MCP Events webhook delivery's) are built on
+    /// it; unset, on `listen`. Restart-only: it is part of every MCP Events
+    /// webhook subscription's key.
+    pub url: Option<String>,
     pub tls: A2aTls,
     /// A default auth applied to `webhook` nodes that declare none.
     pub default_auth: Option<WebhookAuth>,
@@ -6327,6 +6334,35 @@ fn validate_a2a_url(url: &str) -> Result<Origin, String> {
     Ok(o)
 }
 
+/// `webhooks.url`: `scheme://host[:port]` and an optional path prefix, the way
+/// the outside world reaches the webhook listener. `https://` unless the host
+/// is loopback — a callback URL travels to whoever is to call it — and never a
+/// wildcard host, which no caller can reach. Errors are whole diagnostics.
+pub(crate) fn validate_webhooks_url(url: &str) -> Result<Origin, String> {
+    if url.contains(['?', '#']) {
+        return Err(format!(
+            "webhooks.url: {url:?} carries a query or fragment; it is a base URL (scheme://host[:port][/prefix])"
+        ));
+    }
+    let authority_end = url.find("://").map_or(0, |i| i + 3);
+    let origin = match url[authority_end..].find('/') {
+        None => url,
+        Some(i) => &url[..authority_end + i],
+    };
+    let o = parse_origin(origin).map_err(|e| format!("webhooks.url: {url:?}: {e}"))?;
+    if o.scheme != "https" && !crate::net::http::is_loopback_host(&o.host) {
+        return Err(format!(
+            "webhooks.url: {url:?}: plaintext http:// is allowed for a loopback host only; use https://"
+        ));
+    }
+    if is_wildcard_host(&o.host) {
+        return Err(format!(
+            "webhooks.url: {url:?} names a wildcard host, which no caller can reach — give the host callers use"
+        ));
+    }
+    Ok(o)
+}
+
 /// The device grant's own rules. The shape rules hold whether or not it is
 /// enabled, so a typo is caught before the day somebody switches it on.
 fn validate_device_grant(a2a: &A2a, listen: Option<&super::ServeTarget>, d: &mut Diagnostics) {
@@ -7687,6 +7723,17 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             Err(e) => err(&mut d, format!("webhooks.listen: {e}")),
         }
     }
+    if let Some(u) = &s.webhooks.url {
+        if s.webhooks.listen.is_none() {
+            err(
+                &mut d,
+                "webhooks.url is set but webhooks.listen is not — the URL names a listener that does not exist".into(),
+            );
+        }
+        if let Err(e) = validate_webhooks_url(u) {
+            err(&mut d, e);
+        }
+    }
 
     // goal watchdog
     if let Some(g) = &s.goal {
@@ -8326,6 +8373,9 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // rebuilt into the live handler on reload.
     "webhooks.listen",
     "webhooks.tls",
+    // Part of every MCP Events webhook subscription's key: a new one at
+    // runtime would orphan the old subscriptions until their lease ends.
+    "webhooks.url",
     "observability.otel",
     "observability.metrics_addr",
     "observability.health_file",
@@ -11450,6 +11500,38 @@ mod tests {
         }
         // `fallback` is the default and needs nothing.
         assert_eq!(load_errors("agent: {ask_human_unowned: fallback}\n"), "");
+    }
+
+    #[test]
+    fn webhooks_url_is_https_or_loopback_and_reachable() {
+        for ok in [
+            "https://hooks.example.com",
+            "https://hooks.example.com:8443/agentd",
+            "http://127.0.0.1:8088",
+            "https://127.0.0.1:9443",
+        ] {
+            assert!(validate_webhooks_url(ok).is_ok(), "{ok}");
+        }
+        for (bad, says) in [
+            (
+                "http://hooks.example.com",
+                "plaintext http:// is allowed for a loopback host only",
+            ),
+            ("https://0.0.0.0:8443", "wildcard host"),
+            ("https://hooks.example.com/x?y=1", "query or fragment"),
+            ("ftp://hooks.example.com", "scheme must be http or https"),
+        ] {
+            let e = validate_webhooks_url(bad).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+        // It names the listener `listen` binds, so it needs one.
+        let e = load_doc("store: {kind: memory}\nwebhooks:\n  url: https://hooks.example.com\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("webhooks.url is set but webhooks.listen is not"),
+            "{e}"
+        );
     }
 
     #[test]

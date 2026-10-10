@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "sign")]
 fn jws_kid(jws: &str) -> Option<String> {
     let head = jws.split('.').next()?;
-    let bytes = crate::config::envelope::b64url_decode(head)?;
+    let bytes = crate::b64::url_decode(head).ok()?;
     serde_json::from_slice::<Value>(&bytes)
         .ok()?
         .get("kid")
@@ -109,10 +109,7 @@ fn resolve_verify_key(
                 {
                     continue;
                 }
-                if let Some(key) = k["x"]
-                    .as_str()
-                    .and_then(crate::config::envelope::b64url_decode)
-                {
+                if let Some(key) = k["x"].as_str().and_then(|t| crate::b64::url_decode(t).ok()) {
                     let state = k["state"].as_str().unwrap_or("active").to_string();
                     return Some((key, state));
                 }
@@ -127,7 +124,7 @@ fn resolve_verify_key(
                             .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
                             .collect()
                     } else {
-                        crate::config::envelope::b64url_decode(&text).filter(|v| v.len() == 32)
+                        crate::b64::url_decode(&text).ok().filter(|v| v.len() == 32)
                     }
                 }
             };

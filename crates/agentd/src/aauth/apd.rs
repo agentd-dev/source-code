@@ -6,9 +6,9 @@
 //!
 //! Dependency-free beyond the in-house HTTP client + `ring` (via [`super::key`]).
 
-use super::b64;
 use super::key::AgentKey;
 use super::sig::{self, SigKey};
+use crate::b64;
 use crate::net::http::{self, Url};
 use serde::Deserialize;
 use std::sync::Mutex;

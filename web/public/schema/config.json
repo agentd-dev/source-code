@@ -195,6 +195,153 @@
       ],
       "type": "object"
     },
+    "EventBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": {
+          "description": "subscription arguments, validated against the type's inputSchema",
+          "type": "object"
+        },
+        "delivery": {
+          "description": "the acceptable delivery modes, in preference order",
+          "items": {
+            "enum": [
+              "poll",
+              "webhook"
+            ]
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "into": {
+          "additionalProperties": false,
+          "properties": {
+            "stream": {
+              "description": "a stream declared under streams:",
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream",
+            "subject"
+          ],
+          "type": "object"
+        },
+        "name": {
+          "description": "the event type, as the server's events/list names it",
+          "type": "string"
+        },
+        "rate": {
+          "description": "intake ceiling `<burst>/<per>`; required on an untagged or untrusted_input server",
+          "type": "string"
+        },
+        "replay": {
+          "description": "how far back to catch up after downtime (maxAgeMs): a duration, or `none` to always start from now; default 1h",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "ttl": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "delivery",
+        "into"
+      ],
+      "type": "object"
+    },
+    "EventGrant": {
+      "additionalProperties": false,
+      "properties": {
+        "delivery": {
+          "description": "the acceptable delivery modes, in preference order",
+          "items": {
+            "enum": [
+              "poll",
+              "webhook"
+            ]
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "fixed": {
+          "description": "arguments no runtime subscription may set",
+          "type": "object"
+        },
+        "into": {
+          "additionalProperties": false,
+          "properties": {
+            "stream": {
+              "description": "a stream declared under streams:",
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stream",
+            "subject"
+          ],
+          "type": "object"
+        },
+        "lifetime": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "max": {
+          "description": "live runtime subscriptions under this grant; default 8",
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "name": {
+          "description": "the event type, as the server's events/list names it",
+          "type": "string"
+        },
+        "rate": {
+          "description": "intake ceiling `<burst>/<per>`; required on an untagged or untrusted_input server",
+          "type": "string"
+        },
+        "replay": {
+          "description": "how far back to catch up after downtime (maxAgeMs): a duration, or `none` to always start from now; default 1h",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "tools": {
+          "description": "offer the events.* tools for this event type",
+          "type": "boolean"
+        },
+        "ttl": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "delivery",
+        "into"
+      ],
+      "type": "object"
+    },
     "GoalAction": {
       "oneOf": [
         {
@@ -283,6 +430,20 @@
         },
         "endpoint": {
           "type": "string"
+        },
+        "event_grants": {
+          "description": "event types runtime subscriptions may be made for — by a wait that subscribes or the events.* tools — and what each of them gets fixed (RFC 0045 §5.15)",
+          "items": {
+            "$ref": "#/$defs/EventGrant"
+          },
+          "type": "array"
+        },
+        "events": {
+          "description": "MCP Events bindings (RFC 0045): each event type subscribed with fixed arguments, every occurrence appended to a declared stream; requires the mcp-events build feature",
+          "items": {
+            "$ref": "#/$defs/EventBinding"
+          },
+          "type": "array"
         },
         "exclude": {
           "description": "never admit advertised tools matching these globs (beats allow)",

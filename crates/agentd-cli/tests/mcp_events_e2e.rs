@@ -134,6 +134,16 @@ fn tick_binding(extra: &str) -> String {
     )
 }
 
+/// Wait until the binding on `event` is armed AND its first poll has reached
+/// the mock: the first poll asks from "now" [SEP L690], so an occurrence the
+/// test appends before it is — rightly — never delivered.
+fn ready(daemon: &Daemon, mock: &common::MockMcp, event: &str) {
+    daemon.wait_for("the binding armed", |l| armed(l, event));
+    daemon.wait_for("its first poll", |_| {
+        polls(mock).iter().any(|p| p["name"] == event)
+    });
+}
+
 fn armed(log: &str, event: &str) -> bool {
     events(log, "mcp.events.armed")
         .iter()
@@ -147,7 +157,7 @@ fn a_binding_polls_its_occurrences_into_its_stream_and_each_starts_a_run() {
         "events-happy",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1", "count": 3}));
     daemon.wait_for("three runs", |l| ticks(l).len() >= 3);
     let log = daemon.log();
@@ -195,7 +205,7 @@ fn a_restart_catches_up_from_the_stored_cursor_and_fires_nothing_twice() {
     let cfg_path = common::unique_path("events-restart", "yaml");
     std::fs::write(&cfg_path, config(&mock.uri(), &store, &tick_binding(""))).unwrap();
     let mut first = Daemon::start_at("events-restart-1", &cfg_path);
-    first.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&first, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1", "count": 1}));
     // The cursor is written in the pass that appended, before the run fires.
     first.wait_for("the first run", |l| ticks(l).len() == 1);
@@ -225,7 +235,7 @@ fn what_the_bridge_refuses_flags_or_dedupes_is_said_and_counted_right() {
         "events-bridge",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     // A payload that fails its schema is appended, flagged.
     mock.control("mock.event", json!({"topic": "t1", "bad_schema": true}));
     daemon.wait_for("the flagged run", |l| ticks(l).len() == 1);
@@ -279,7 +289,7 @@ fn a_page_answered_twice_is_appended_once() {
         "observability:\n  log_level: info\n  metrics_addr: 127.0.0.1:0\n",
     );
     let daemon = Daemon::start("events-dedup", &cfg);
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1", "count": 2}));
     daemon.wait_for("two runs", |l| ticks(l).len() == 2);
     mock.control("mock.events_flags", json!({"repeat": true}));
@@ -377,7 +387,7 @@ fn the_sketchs_top_level_declaration_is_read_too() {
         "events-top-level",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
 }
 
 #[test]
@@ -388,7 +398,7 @@ fn a_server_that_always_says_has_more_is_not_polled_in_a_loop() {
         "events-has-more",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1", "count": 30}));
     daemon.wait_for("the backlog drained", |l| ticks(l).len() >= 30);
     let at = polls(&mock).len();
@@ -410,7 +420,7 @@ fn a_binding_rate_paces_intake_and_each_poll_asks_for_what_it_may_take() {
             &tick_binding("          rate: 2/60s\n"),
         ),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1", "count": 10}));
     daemon.wait_for("the first two runs", |l| ticks(l).len() >= 2);
     std::thread::sleep(Duration::from_secs(3));
@@ -438,7 +448,7 @@ fn a_failure_that_may_pass_backs_off_and_resumes_from_the_cursor() {
         "events-backoff",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control(
         "mock.events_fail",
         json!({"code": -32025, "times": 2,
@@ -469,7 +479,7 @@ fn editing_a_binding_or_adding_one_dials_nothing() {
         "events-reload",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     let discovers = mock.discovers();
     // A rate on the first, and a second binding.
     let two = format!(
@@ -510,7 +520,7 @@ fn a_server_that_ignores_max_events_is_still_held_to_the_rate() {
             &tick_binding("          rate: 2/60s\n"),
         ),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1", "count": 10}));
     daemon.wait_for("the paced pause", |l| {
         events(l, "mcp.events.paused")
@@ -533,7 +543,7 @@ fn a_schema_changed_in_place_lets_the_cursor_go_and_says_the_gap() {
         "events-schema-changed",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    daemon.wait_for("the binding armed", |l| armed(l, "mock.tick"));
+    ready(&daemon, &mock, "mock.tick");
     mock.control("mock.event", json!({"topic": "t1"}));
     daemon.wait_for("the first run", |l| ticks(l).len() == 1);
     // Answered so three times: each is a gap and a listing, and the polls

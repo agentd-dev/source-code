@@ -66,6 +66,7 @@ export async function startFakeA2a(opts = {}) {
   const requests = [];
   const handlers = new Map();
   const failures = new Map();
+  const delays = new Map();
   const tasks = new Map();
   let seq = 0;
 
@@ -127,6 +128,10 @@ export async function startFakeA2a(opts = {}) {
      */
     fail(method, { code, message = 'injected', data, status = 200, headers = {}, times = Infinity }) {
       failures.set(method, { code, message, data, status, headers, times });
+    },
+    /** Answer every call of `method` `ms` later. */
+    delay(method, ms) {
+      delays.set(method, ms);
     },
     /** Put a task in the store (a full A2A Task object). */
     putTask(t) {
@@ -311,6 +316,8 @@ export async function startFakeA2a(opts = {}) {
       f.times--;
       return rpcError(res, env.id, f);
     }
+    const wait = delays.get(env.method);
+    if (wait) await new Promise((r) => setTimeout(r, wait));
     const handler = handlers.get(env.method) ?? defaults[env.method];
     if (!handler) return rpcError(res, env.id, { code: -32601, message: `method not found: ${env.method}`, status: 200, headers: {} });
     let result;

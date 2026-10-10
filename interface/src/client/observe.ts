@@ -22,6 +22,7 @@
 
 import { AgentdClient } from './client.js';
 import { Mirror } from './mirror.js';
+import type { ConnState } from './types.js';
 import {
   ClientError,
   FeedEvent,
@@ -209,6 +210,17 @@ export class Observation {
     this.opts.onTerminal?.(f);
   }
 
+  /**
+   * Say the connection's state — unless the observation has ended. A request
+   * still out when a terminal failure (an expired session, say) ended it may
+   * come back afterwards; what it would say is no longer true, and the
+   * terminal word stays the last one.
+   */
+  private say(conn: ConnState, error?: string): void {
+    if (this.ended || this.stopped) return;
+    this.mirror.setConn(conn, error);
+  }
+
   private resetBackoff(): void {
     this.backoff = Math.min(MIN_BACKOFF, this.opts.backoffCapMs);
   }
@@ -224,7 +236,7 @@ export class Observation {
       this.terminate(f);
       return undefined;
     }
-    this.mirror.setConn('error', describe(f));
+    this.say('error', describe(f));
     switch (f.kind) {
       case 'rate-limited':
         return f.retryAfterMs ?? this.backoff;
@@ -247,7 +259,7 @@ export class Observation {
       const session = new AbortController();
       this.session = session;
       try {
-        this.mirror.setConn('connecting');
+        this.say('connecting');
         const s = await openSession(this.opts.configured, {
           credential: this.opts.credential,
           noExtensions: this.opts.noExtensions,
@@ -335,7 +347,7 @@ export class Observation {
     let cursor: number | undefined;
     while (!signal.aborted) {
       if (!bootstrapped) {
-        this.mirror.setConn('connecting');
+        this.say('connecting');
         await this.bootstrap(client);
         bootstrapped = true;
       }
@@ -345,7 +357,7 @@ export class Observation {
           cursor ?? this.mirror.getState().lastSeq,
           (hello) => {
             this.mirror.onHello(hello);
-            this.mirror.setConn('ready');
+            this.say('ready');
             this.resetBackoff();
             if (hello.resync) {
               // The mirror reset its cursor already; the sections and tasks
@@ -426,16 +438,16 @@ export class Observation {
    * and follow moving tasks with SubscribeToTask when the agent streams.
    */
   private async coreLoop(client: AgentdClient, signal: AbortSignal): Promise<void> {
-    this.mirror.setConn('connecting');
+    this.say('connecting');
     await this.bootstrap(client);
-    this.mirror.setConn('polling');
+    this.say('polling');
     this.resetBackoff();
     while (!signal.aborted) {
       this.follow(client, signal);
       await sleep(this.opts.pollMs, signal);
       if (signal.aborted) return;
       await this.poll(client);
-      this.mirror.setConn('polling');
+      this.say('polling');
     }
   }
 

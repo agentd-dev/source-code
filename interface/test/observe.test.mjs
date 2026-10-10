@@ -171,6 +171,25 @@ test('an expired session ends observation', async (t) => {
   assert.equal(fake.requests.length, seen, 'polling stopped');
 });
 
+test('a request still out when the session expires does not undo the end', async (t) => {
+  // Every listing answers after the expiry: the bootstrap is in flight when
+  // the session ends, and its late answer must not put the observation back.
+  const fake = await feedAgent();
+  t.after(() => fake.close());
+  fake.card.capabilities.extensions = [];
+  fake.delay('ListTasks', 400);
+  const mirror = new Mirror();
+  const terminal = [];
+  const credential = { token: 'agentd_at_x', expiresAt: Date.now() + 150 };
+  const obs = new Observation({ configured: fake.url, credential, pollMs: 20, onTerminal: (f) => terminal.push(f) }, mirror);
+  obs.start();
+  t.after(() => obs.stop());
+  await until(() => mirror.getState().conn === 'unauthenticated', 3000, 'the expiry');
+  await sleep(700);
+  assert.equal(mirror.getState().conn, 'unauthenticated', 'the late answer said nothing');
+  assert.equal(terminal.length, 1);
+});
+
 test('bootstrap replaces sections and clears the ones a scoped status omits', () => {
   const m = new Mirror();
   const s = m.getState();

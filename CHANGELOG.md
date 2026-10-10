@@ -356,6 +356,11 @@ sent one at a time); agentd's answers to a server's requests are bounded at
 
 ### Fixed
 
+- **The TUI and web UI keep saying a session expired.** When a session
+  expired while a listing was still out (a slow agent, a slow runner), the
+  listing's late answer set the connection back to `polling`, and the UI
+  showed a live observation that had ended. Once a terminal failure ends an
+  observation, nothing else reports the connection's state.
 - **A resource subscription no owner wants any more is let go of.** The set
   a connection held only grew: a wait that resolved or timed out, a run that
   ended, an instruction that moved left its URI subscribed for the life of

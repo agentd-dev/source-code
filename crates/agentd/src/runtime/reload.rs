@@ -854,6 +854,24 @@ impl Runtime {
         // armed subscribed on the new connections already; the instruction
         // was read and subscribed through its connection above.)
         self.resubscribe_on(&touched, &anew);
+        // MCP Events bindings follow `mcp.servers` (RFC 0045 §5.7): an edited
+        // binding applies in place, a removed one stops, and a server dialed
+        // afresh has its event types listed again. A binding is not part of
+        // the dial spec, so editing one dials nothing.
+        #[cfg(feature = "mcp-events")]
+        {
+            self.events_sync("reload", &touched);
+            let declared = |s: &cfg::Settings| {
+                s.mcp
+                    .servers
+                    .iter()
+                    .map(|x| (x.name.clone(), x.events.clone(), x.event_grants.clone()))
+                    .collect::<Vec<_>>()
+            };
+            if declared(old) != declared(&new) {
+                changed.push("mcp.events");
+            }
+        }
         if registry_rebuilt {
             self.log_workflow_tools();
         }

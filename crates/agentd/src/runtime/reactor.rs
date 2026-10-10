@@ -378,6 +378,9 @@ pub struct Runtime {
     /// ([`Runtime::retry_subscribe`]). In memory: a restart subscribes every
     /// owner again anyway.
     pub(crate) resubscribe_retry: BTreeMap<String, super::SubscribeRetry>,
+    /// MCP Events bindings (RFC 0045).
+    #[cfg(feature = "mcp-events")]
+    pub(crate) mcp_events: super::mcp_events::Events,
     /// When [`Runtime::release_unowned_subscriptions`] next looks.
     pub(crate) release_due_ms: u64,
     pub(crate) registry: Registry,
@@ -683,6 +686,8 @@ impl Runtime {
             // 8. Pending waits + MCP notifications.
             self.poll_pending();
             self.poll_mcp_notifications();
+            #[cfg(feature = "mcp-events")]
+            self.events_tick();
             // 9. Children maintenance.
             for (node, health) in self.children.tick() {
                 self.on_unhealthy_child(node, health);
@@ -774,6 +779,8 @@ impl Runtime {
                 uri,
                 content,
             } => self.on_subscribe_read(&server, &uri, content),
+            #[cfg(feature = "mcp-events")]
+            Event::McpEvents(done) => self.on_events_done(*done),
             Event::Background { .. } | Event::Tick => {}
         }
     }
@@ -1637,7 +1644,18 @@ impl Runtime {
     }
 
     fn counters_value(&self) -> Value {
-        json!({"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out})
+        #[allow(unused_mut)]
+        let mut c = json!({"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out});
+        // MCP Events bindings, by state — counts only (RFC 0045 Q9), and
+        // only where a binding is declared.
+        #[cfg(feature = "mcp-events")]
+        if !self.mcp_events.bindings.is_empty() {
+            let (active, paused, refused) = self.mcp_events.counts();
+            c["mcp_event_bindings_active"] = json!(active);
+            c["mcp_event_bindings_paused"] = json!(paused);
+            c["mcp_event_bindings_refused"] = json!(refused);
+        }
+        c
     }
 
     /// The conversations as `status` and the feed show them, each with the

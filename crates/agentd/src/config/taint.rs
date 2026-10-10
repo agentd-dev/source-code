@@ -668,6 +668,25 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
             feed(m, &untrusted, producer.clone(), producer);
         }
     }
+    // MCP Events bindings and grants (RFC 0045 §5.11.3): a server's
+    // occurrences carry the server's tags, and `untrusted_input` when it is
+    // untagged — the rule the root-grant fold applies to the server itself.
+    // Whatever writes into the watched upstream writes into the stream.
+    for srv in &ctx.s.mcp.servers {
+        let mut tags = srv.tag_set().unwrap_or_default();
+        if tags.is_empty() {
+            tags.push(TrifectaTag::UntrustedInput);
+        }
+        let declared = srv
+            .events
+            .iter()
+            .map(|b| ("binding", &b.name, &b.into))
+            .chain(srv.event_grants.iter().map(|g| ("grant", &g.name, &g.into)));
+        for (kind, name, into) in declared {
+            let producer = format!("MCP Events {kind} {name:?} on mcp server {:?}", srv.name);
+            feed(&into.stream, &tags, producer.clone(), producer);
+        }
+    }
     // The runs an outside caller hands its text to directly. Not judged on
     // their own reach (see [`RunTaint::outside`]); seeded so what they emit
     // and start carries it.
@@ -1714,6 +1733,50 @@ mod tests {
             "{}",
             errs[0]
         );
+    }
+
+    #[test]
+    fn an_events_binding_taints_its_stream_with_its_server() {
+        // An untagged server's occurrences are untrusted: a workflow reading
+        // its stream and handing an agent a sensitive + egress server is
+        // refused, naming the binding.
+        let mut s = servers(json!({}));
+        let feed: crate::config::settings::McpServer = serde_json::from_value(json!({
+            "name": "feed", "endpoint": "https://feed.invalid/mcp",
+            "events": [{"name": "item.created", "delivery": ["poll"],
+                        "into": {"stream": "inbox", "subject": "item"}, "rate": "1/1s"}]
+        }))
+        .unwrap();
+        s.mcp.servers.push(feed);
+        let errs = check(&s, &[consumer("inbox", &["mail"])]);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("MCP Events binding \"item.created\" on mcp server \"feed\""),
+            "{}",
+            errs[0]
+        );
+        // A grant feeds the stream it names the same way.
+        let mut s = servers(json!({}));
+        let feed: crate::config::settings::McpServer = serde_json::from_value(json!({
+            "name": "feed", "endpoint": "https://feed.invalid/mcp",
+            "event_grants": [{"name": "item.created", "delivery": ["poll"],
+                              "into": {"stream": "inbox", "subject": "item"}, "rate": "1/1s"}]
+        }))
+        .unwrap();
+        s.mcp.servers.push(feed);
+        assert_eq!(check(&s, &[consumer("inbox", &["mail"])]).len(), 1);
+        // A server tagged sensitive only brings one leg: with the consumer's
+        // mail server that is two kinds, not the trifecta.
+        let mut s = servers(json!({}));
+        let feed: crate::config::settings::McpServer = serde_json::from_value(json!({
+            "name": "feed", "endpoint": "https://feed.invalid/mcp",
+            "tags": {"*": ["sensitive"]},
+            "events": [{"name": "item.created", "delivery": ["poll"],
+                        "into": {"stream": "inbox", "subject": "item"}}]
+        }))
+        .unwrap();
+        s.mcp.servers.push(feed);
+        assert!(check(&s, &[consumer("inbox", &["mail"])]).is_empty());
     }
 
     #[test]

@@ -65,6 +65,9 @@ pub enum Event {
         uri: String,
         content: Option<Value>,
     },
+    /// An MCP Events request finished on the events worker pool.
+    #[cfg(feature = "mcp-events")]
+    McpEvents(Box<super::mcp_events::pool::Done>),
     /// The 200 ms tick.
     Tick,
 }

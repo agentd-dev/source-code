@@ -125,6 +125,16 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
 /// every request held to the revision's rules, subscriptions as
 /// `subscriptions/listen` streams).
 pub fn spawn_mock_mcp_at(protocol_version: &str, uri: &str, emit: bool) -> MockMcp {
+    spawn_mock_mcp_with(protocol_version, uri, emit, &[])
+}
+
+/// [`spawn_mock_mcp_at`] with more of the mock's flags (`--events none`).
+pub fn spawn_mock_mcp_with(
+    protocol_version: &str,
+    uri: &str,
+    emit: bool,
+    extra: &[&str],
+) -> MockMcp {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let addr_file = unique_path("mock-mcp", "addr");
     let _ = std::fs::remove_file(&addr_file);
@@ -138,6 +148,7 @@ pub fn spawn_mock_mcp_at(protocol_version: &str, uri: &str, emit: bool) -> MockM
     if !emit {
         args.push("--no-emit".to_string());
     }
+    args.extend(extra.iter().map(|a| a.to_string()));
     let log_path = unique_path("mock-mcp", "log");
     let log = std::fs::File::create(&log_path).expect("mock log");
     let child = Command::new(exe)

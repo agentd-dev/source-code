@@ -452,6 +452,111 @@ pub fn set_stream_lag(kind: &'static str, lags: Vec<(String, String, u64)>) {
 /// fold into `other`.
 pub const STREAM_LAG_SLOTS: usize = 32;
 
+/// How many series one MCP Events family exports before the rest fold into
+/// one whose labels all read `other`.
+pub const EVENT_SERIES_SLOTS: usize = 512;
+
+/// What became of one MCP Events occurrence
+/// (`agent_mcp_events_total{server,event,mode,outcome}`). `outcome` ∈
+/// `appended`\|`duplicate`\|`rejected`\|`schema_mismatch`\|`refused_pressure`
+/// (an unknown value buckets `other`). `server` and `event` come from the
+/// operator's bindings, at most 256 of them.
+pub fn record_mcp_event(server: &str, event: &str, mode: &str, outcome: &str) {
+    #[cfg(feature = "metrics")]
+    {
+        const OUTCOMES: &[&str] = &[
+            "appended",
+            "duplicate",
+            "rejected",
+            "schema_mismatch",
+            "refused_pressure",
+        ];
+        let outcome = if OUTCOMES.contains(&outcome) {
+            outcome
+        } else {
+            "other"
+        };
+        imp::REGISTRY.event_add(
+            "agent_mcp_events_total",
+            vec![server.into(), event.into(), mode.into(), outcome.into()],
+            1,
+        );
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (server, event, mode, outcome);
+}
+
+/// One `events/*` request agentd sent
+/// (`agent_mcp_events_requests_total{server,method,outcome}`): `outcome` ∈
+/// `ok`\|`refused` (a JSON-RPC error answer)\|`failed` (no usable answer).
+pub fn record_mcp_events_request(server: &str, method: &str, outcome: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_mcp_events_requests_total",
+        vec![server.into(), method.into(), outcome.into()],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (server, method, outcome);
+}
+
+/// A gap a binding saw (`agent_mcp_event_gaps_total{server,event,cause}`):
+/// `cause` ∈ `truncated`\|`no_replay`.
+pub fn record_mcp_event_gap(server: &str, event: &str, cause: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_mcp_event_gaps_total",
+        vec![server.into(), event.into(), cause.into()],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (server, event, cause);
+}
+
+/// Dedup entries a binding dropped to stay under its cap
+/// (`agent_mcp_events_dedup_evicted_total{server,event}`).
+pub fn record_mcp_events_dedup_evicted(server: &str, event: &str, n: u64) {
+    #[cfg(feature = "metrics")]
+    if n > 0 {
+        imp::REGISTRY.event_add(
+            "agent_mcp_events_dedup_evicted_total",
+            vec![server.into(), event.into()],
+            n,
+        );
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (server, event, n);
+}
+
+/// Append time minus the occurrence's server-reported timestamp, clamped at 0
+/// (`agent_mcp_event_lag_ms{server,event}`): server-reported, so only as true
+/// as the server's clock.
+pub fn set_mcp_event_lag(server: &str, event: &str, ms: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_set(
+        "agent_mcp_event_lag_ms",
+        vec![server.into(), event.into()],
+        ms,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (server, event, ms);
+}
+
+/// The active MCP Events subscriptions, by delivery mode — the `kind="event"`
+/// series of `agent_subscriptions_active{kind,mode}`, replaced whole.
+pub fn set_event_subscriptions(by_mode: Vec<(String, u64)>) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_replace(
+        "agent_subscriptions_active",
+        by_mode
+            .into_iter()
+            .map(|(mode, n)| (vec!["event".to_string(), mode], n))
+            .collect(),
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = by_mode;
+}
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -647,6 +752,67 @@ mod imp {
         // --- stream consumer lag, by start kind ------------------------------
         // Replaced whole per kind on every consumer pass; see `set_stream_lag`.
         stream_lag: std::sync::Mutex<std::collections::BTreeMap<&'static str, StreamLag>>,
+
+        // --- MCP Events, by binding ------------------------------------------
+        // Each family by name, each series by its label values. Bounded:
+        // `server` and `event` come from the operator's bindings (at most 256),
+        // the rest from closed domains, and a family past
+        // `EVENT_SERIES_SLOTS` folds the rest into one `other` series.
+        events: std::sync::Mutex<EventFamilies>,
+    }
+
+    type EventFamilies =
+        std::collections::BTreeMap<&'static str, std::collections::BTreeMap<Vec<String>, u64>>;
+
+    /// The MCP Events families: name, type, help, label names.
+    const EVENT_FAMILIES: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "agent_mcp_events_total",
+            "counter",
+            "MCP Events occurrences, by what became of them.",
+            &["server", "event", "mode", "outcome"],
+        ),
+        (
+            "agent_mcp_events_requests_total",
+            "counter",
+            "events/* requests agentd sent, by outcome.",
+            &["server", "method", "outcome"],
+        ),
+        (
+            "agent_mcp_event_gaps_total",
+            "counter",
+            "Gaps a binding saw: a truncated answer, or a re-arm with no replay.",
+            &["server", "event", "cause"],
+        ),
+        (
+            "agent_mcp_events_dedup_evicted_total",
+            "counter",
+            "Dedup entries a binding dropped to stay under its cap.",
+            &["server", "event"],
+        ),
+        (
+            "agent_mcp_event_lag_ms",
+            "gauge",
+            "Append time minus the occurrence's server-reported timestamp (ms).",
+            &["server", "event"],
+        ),
+    ];
+
+    /// A Prometheus label value, escaped.
+    fn escape_label(v: &str) -> String {
+        v.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
+    /// One series line: `name{l1="v1",…} value`.
+    fn series_line(s: &mut String, name: &str, labels: &[&str], values: &[String], value: u64) {
+        let pairs: Vec<String> = labels
+            .iter()
+            .zip(values)
+            .map(|(l, v)| format!("{l}=\"{}\"", escape_label(v)))
+            .collect();
+        let _ = writeln!(s, "{name}{{{}}} {value}", pairs.join(","));
     }
 
     /// One start kind's consumers as of their last pass: the named series, and
@@ -707,7 +873,48 @@ mod imp {
                 inbox_pending: AtomicU64::new(0),
                 context_tokens: AtomicU64::new(0),
                 stream_lag: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                events: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             }
+        }
+
+        /// The series of `family` a write lands in: its own, or `other` once
+        /// the family holds its slots.
+        fn event_series(
+            fam: &std::collections::BTreeMap<Vec<String>, u64>,
+            labels: Vec<String>,
+        ) -> Vec<String> {
+            if fam.len() >= super::EVENT_SERIES_SLOTS && !fam.contains_key(&labels) {
+                vec!["other".to_string(); labels.len()]
+            } else {
+                labels
+            }
+        }
+
+        pub(super) fn event_add(&self, family: &'static str, labels: Vec<String>, by: u64) {
+            let mut t = self.events.lock().unwrap_or_else(|p| p.into_inner());
+            let fam = t.entry(family).or_default();
+            let key = Self::event_series(fam, labels);
+            *fam.entry(key).or_default() += by;
+        }
+
+        pub(super) fn event_set(&self, family: &'static str, labels: Vec<String>, value: u64) {
+            let mut t = self.events.lock().unwrap_or_else(|p| p.into_inner());
+            let fam = t.entry(family).or_default();
+            let key = Self::event_series(fam, labels);
+            fam.insert(key, value);
+        }
+
+        pub(super) fn event_replace(&self, family: &'static str, series: Vec<(Vec<String>, u64)>) {
+            let mut t = self.events.lock().unwrap_or_else(|p| p.into_inner());
+            t.insert(family, series.into_iter().collect());
+        }
+
+        /// The series of `family`, as written.
+        fn event_family(&self, family: &str) -> Vec<(Vec<String>, u64)> {
+            let t = self.events.lock().unwrap_or_else(|p| p.into_inner());
+            t.get(family)
+                .map(|f| f.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                .unwrap_or_default()
         }
 
         pub(super) fn set_stream_lag(
@@ -1206,6 +1413,17 @@ mod imp {
                 "Reconciled declared subscriptions.",
                 g(&self.subscriptions_active),
             );
+            // The same family's labelled series: MCP Events subscriptions by
+            // delivery mode (RFC 0045 §5.12).
+            for (values, n) in self.event_family("agent_subscriptions_active") {
+                series_line(
+                    &mut s,
+                    "agent_subscriptions_active",
+                    &["kind", "mode"],
+                    &values,
+                    n,
+                );
+            }
             gauge(
                 &mut s,
                 "agent_reaction_lag_ms",
@@ -1333,6 +1551,14 @@ mod imp {
                 }
                 if let Some(other) = table.values().filter_map(|k| k.other).max() {
                     let _ = writeln!(s, "{name}{{stream=\"other\",consumer=\"other\"}} {other}");
+                }
+            }
+            // --- MCP Events (RFC 0045 §5.12) ----------------------------------
+            for (name, kind, help, labels) in EVENT_FAMILIES {
+                let _ = writeln!(s, "# HELP {name} {help}");
+                let _ = writeln!(s, "# TYPE {name} {kind}");
+                for (values, n) in self.event_family(name) {
+                    series_line(&mut s, name, labels, &values, n);
                 }
             }
             s
@@ -1618,6 +1844,74 @@ mod imp {
             assert!(out.contains("agent_inflight_reactions 1"));
             assert!(out.contains("agent_subscriptions_active 9"));
             assert!(out.contains("agent_reaction_lag_ms 250"));
+        }
+
+        #[test]
+        fn mcp_events_families_label_by_binding_escape_and_fold_overflow() {
+            let r = Registry::new();
+            let out = r.render();
+            assert!(out.contains("# TYPE agent_mcp_events_total counter"));
+            assert!(out.contains("# TYPE agent_mcp_event_lag_ms gauge"));
+            r.event_add(
+                "agent_mcp_events_total",
+                vec![
+                    "pd".into(),
+                    "incident.created".into(),
+                    "poll".into(),
+                    "appended".into(),
+                ],
+                2,
+            );
+            r.event_add(
+                "agent_mcp_events_total",
+                vec![
+                    "pd".into(),
+                    "incident.created".into(),
+                    "poll".into(),
+                    "appended".into(),
+                ],
+                1,
+            );
+            r.event_set(
+                "agent_mcp_event_lag_ms",
+                vec!["pd".into(), "a\"b".into()],
+                40,
+            );
+            r.event_replace(
+                "agent_subscriptions_active",
+                vec![(vec!["event".into(), "poll".into()], 3)],
+            );
+            let out = r.render();
+            assert!(out.contains(
+                "agent_mcp_events_total{server=\"pd\",event=\"incident.created\",mode=\"poll\",outcome=\"appended\"} 3"
+            ), "{out}");
+            assert!(
+                out.contains("agent_mcp_event_lag_ms{server=\"pd\",event=\"a\\\"b\"} 40"),
+                "{out}"
+            );
+            assert!(
+                out.contains("agent_subscriptions_active{kind=\"event\",mode=\"poll\"} 3"),
+                "{out}"
+            );
+            assert_eq!(
+                out.matches("# TYPE agent_subscriptions_active gauge")
+                    .count(),
+                1
+            );
+            for i in 0..super::super::EVENT_SERIES_SLOTS + 2 {
+                r.event_add(
+                    "agent_mcp_event_gaps_total",
+                    vec![format!("s{i}"), "e".into(), "truncated".into()],
+                    1,
+                );
+            }
+            let out = r.render();
+            assert!(
+                out.contains(
+                    "agent_mcp_event_gaps_total{server=\"other\",event=\"other\",cause=\"other\"} 2"
+                ),
+                "{out}"
+            );
         }
 
         #[test]

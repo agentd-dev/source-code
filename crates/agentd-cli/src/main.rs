@@ -87,9 +87,11 @@ fn dispatch() -> i32 {
 }
 
 /// `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]
-/// [--protocol-version <v>]`: the mock at 2025-11-25 (the `initialize`
-/// handshake; the default) or 2026-07-28 (`server/discover`). Any other
-/// revision is a usage error.
+/// [--protocol-version <v>] [--events <extension|top-level|none>]`: the mock
+/// at 2025-11-25 (the `initialize` handshake; the default) or 2026-07-28
+/// (`server/discover`), its MCP Events declared in SEP-3415's spelling (the
+/// default), the design sketch's, or not at all. Anything else is a usage
+/// error.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 fn mock_mcp_http(args: &[String]) -> i32 {
     use agentd::mcp::mock_http::{Lifecycle, Options, run_with};
@@ -108,6 +110,20 @@ fn mock_mcp_http(args: &[String]) -> i32 {
                     return exit::USAGE;
                 };
                 opts.lifecycle = lifecycle;
+            }
+            "--events" => {
+                use agentd::mcp::mock_events::Spelling;
+                opts.events = match it.next().map(String::as_str) {
+                    Some("extension") => Spelling::Extension,
+                    Some("top-level") => Spelling::TopLevel,
+                    Some("none") => Spelling::None,
+                    other => {
+                        eprintln!(
+                            "--internal-mock-mcp-http: --events {other:?}: extension, top-level or none"
+                        );
+                        return exit::USAGE;
+                    }
+                };
             }
             _ => positional.push(arg.as_str()),
         }

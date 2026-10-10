@@ -219,6 +219,8 @@ pub mod oauth;
 // ships only under `internal-mocks`, so the production binary carries no test
 // scaffolding.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
+pub mod mock_events;
+#[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
 
 // agentd-as-A2A-client: the remote-A2A-agent delegation backend. Reads a

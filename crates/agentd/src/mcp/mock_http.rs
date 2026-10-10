@@ -97,6 +97,8 @@ pub struct Options {
     /// Hold a `subscriptions/listen` stream open until the client hangs up or
     /// the server restarts; off, close each one 50 ms after its frames.
     pub hold_listen: bool,
+    /// How the 2026-07-28 edge declares MCP Events (`mock_events`).
+    pub events: super::mock_events::Spelling,
 }
 
 impl Options {
@@ -108,6 +110,7 @@ impl Options {
             subscribe: true,
             lifecycle: Lifecycle::Initialize,
             hold_listen: true,
+            events: super::mock_events::Spelling::Extension,
         }
     }
 }
@@ -160,6 +163,9 @@ struct State {
     /// The name of every tool called so far, which `mock.tools_changed` can
     /// wait for.
     called: Mutex<std::collections::BTreeSet<String>>,
+    /// The MCP Events surface (2026-07-28 edge), and how it is declared.
+    events: super::mock_events::Events,
+    events_spelling: super::mock_events::Spelling,
 }
 
 impl State {
@@ -236,6 +242,8 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         fail_next: AtomicU64::new(0),
         ops: Mutex::new(Vec::new()),
         called: Mutex::new(std::collections::BTreeSet::new()),
+        events: super::mock_events::Events::default(),
+        events_spelling: opts.events,
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -340,6 +348,32 @@ fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
             write_json(stream, 200, &payload, None);
         }
         "subscriptions/listen" => serve_listen(stream, &id, &body, state),
+        // MCP Events (SEP-3415): only where it is declared [SEP L94].
+        m if m.starts_with("events/")
+            && state.events_spelling != super::mock_events::Spelling::None =>
+        {
+            match super::mock_events::handle(&state.events, m, &body["params"]) {
+                Ok(result) => write_json(
+                    stream,
+                    200,
+                    &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    None,
+                ),
+                Err(error) => {
+                    let status = if error["code"] == json::METHOD_NOT_FOUND {
+                        404
+                    } else {
+                        200
+                    };
+                    write_json(
+                        stream,
+                        status,
+                        &json!({"jsonrpc": "2.0", "id": id, "error": error}),
+                        None,
+                    )
+                }
+            }
+        }
         // The revision removed them: a subscription is a listen.
         method::RESOURCES_SUBSCRIBE | method::RESOURCES_UNSUBSCRIBE => refuse(
             stream,
@@ -459,14 +493,16 @@ fn refuse(
 
 /// The answer to `server/discover`: every field the revision requires.
 fn discover_result(state: &State) -> Value {
+    let mut capabilities = json!({
+        "resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true},
+        "tools": {"listChanged": true},
+        "prompts": {"listChanged": true}
+    });
+    super::mock_events::declare(&mut capabilities, state.events_spelling);
     json!({
         "resultType": "complete",
         "supportedVersions": [DISCOVER_PROTOCOL_VERSION],
-        "capabilities": {
-            "resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true},
-            "tools": {"listChanged": true},
-            "prompts": {"listChanged": true}
-        },
+        "capabilities": capabilities,
         "ttlMs": 0,
         "cacheScope": "private",
         "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}}
@@ -738,6 +774,11 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
     // The registry's consumer-alignment tools (RFC-0028 §3.3). The call is
     // echoed on stderr so an e2e can assert WHAT the consumer reported
     // without needing a live registry.
+    if let Some(n) = name
+        && let Some(out) = super::mock_events::control(&state.events, n, &args)
+    {
+        return tool_ok(req.id, out);
+    }
     if let Some(n) = name
         && n.starts_with("instructions.bindings.")
     {

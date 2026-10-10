@@ -31,6 +31,8 @@ pub mod human; // human-in-the-loop: ask_human gates + fallbacks
 #[cfg(feature = "a2a")]
 pub mod identities; // the identity registry: principal names that survive restarts
 pub(crate) mod instances; // instance-tier template children (a full daemon each)
+#[cfg(feature = "mcp-events")]
+pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
 pub mod nested;
 pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
 pub mod reactor;
@@ -631,6 +633,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),
         release_due_ms: 0,
+        #[cfg(feature = "mcp-events")]
+        mcp_events: Default::default(),
         registry,
         contexts: Contexts::new(model_window),
         memory: Memory::new(
@@ -1152,6 +1156,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // a wait that can never be woken fails its step, and failing a step
     // resolves it against the definition its run started with.
     rt.resubscribe_waits(&|_, _| true, "boot");
+    // MCP Events bindings: listed and polled from the loop, from the cursors
+    // the store kept.
+    #[cfg(feature = "mcp-events")]
+    rt.events_sync("boot", &[]);
     rt.arm_goal();
     rt.arm_freshness();
     rt.respawn_restored_subagents();

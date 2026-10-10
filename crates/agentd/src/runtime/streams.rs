@@ -84,7 +84,7 @@ impl super::reactor::Runtime {
             .map_err(|e| e.to_string())
     }
 
-    fn append(
+    pub(crate) fn append(
         &mut self,
         stream: &str,
         subject: &str,

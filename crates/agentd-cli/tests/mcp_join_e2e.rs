@@ -26,7 +26,7 @@ fn a_server_down_at_boot_joins_when_it_comes_up() {
     std::fs::write(
         &cfg,
         format!(
-            "agent:\n  name: joiner\nstore:\n  kind: file\n  file: {{path: {}}}\nmcp:\n  servers:\n    - name: late\n      endpoint: http://127.0.0.1:{port}/mcp\nworkflows:\n  - name: on_change\n    steps:\n      s: {{kind: subscribe, server: late, uri: \"mock://res\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n",
+            "agent:\n  name: joiner\nstore:\n  kind: file\n  file: {{path: {}}}\nmcp:\n  servers:\n    - name: late\n      endpoint: http://127.0.0.1:{port}/mcp\nworkflows:\n  - name: on_change\n    steps:\n      s: {{kind: subscribe, server: late, uri: \"mock://res\"}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n  - name: bootstrap\n    steps:\n      s: {{kind: once, policy: always}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n",
             dir.path().display()
         ),
     )
@@ -85,6 +85,18 @@ fn a_server_down_at_boot_joins_when_it_comes_up() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Nothing else moved: a start that fires at every arming did not fire
+    // again, and the join re-read nothing.
+    let l = log();
+    assert_eq!(
+        events(&l, "run.done")
+            .iter()
+            .filter(|e| e["workflow"] == "bootstrap")
+            .count(),
+        1,
+        "{l}"
+    );
+    assert_eq!(events(&l, "workflow.loaded").len(), 2, "{l}");
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let _ = child.wait();
     let _ = std::fs::remove_file(&cfg);

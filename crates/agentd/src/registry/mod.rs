@@ -196,9 +196,18 @@ pub struct Registry {
     withholding: crate::config::taint::Withholding,
     /// Non-fatal findings from the build (collisions, missing profile tools).
     pub warnings: Vec<String>,
+    /// The server tool lists it was built from: a server that joins later
+    /// (`runtime::join`) is added to these, never re-listed beside them — a
+    /// server's catalogue changes only at a reload the operator starts.
+    built_from: Vec<ServerTools>,
 }
 
 impl Registry {
+    /// The server tool lists this registry was built from.
+    pub(crate) fn built_from(&self) -> &[ServerTools] {
+        &self.built_from
+    }
+
     /// Build from settings and the connected servers' tool lists.
     ///
     /// Every override is resolved here, at startup, so a misconfiguration
@@ -208,7 +217,10 @@ impl Registry {
     /// mapping expression that does not compile, a tool that is both disabled
     /// and overridden, and disabling a tool that does not exist.
     pub fn build(settings: &Settings, servers: &[ServerTools]) -> Result<Registry, Vec<String>> {
-        let mut reg = Registry::default();
+        let mut reg = Registry {
+            built_from: servers.to_vec(),
+            ..Registry::default()
+        };
         let mut errors = Vec::new();
         // 1. Internal contracts.
         for c in internal::contracts() {

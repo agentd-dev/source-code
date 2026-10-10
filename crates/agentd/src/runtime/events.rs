@@ -72,7 +72,7 @@ pub enum Event {
     #[cfg(feature = "mcp-events")]
     McpEventHook(Box<super::mcp_events::hook::Arrival>),
     /// A probe of a server down since boot answered (`runtime::join`).
-    McpReachable { server: String, ok: bool },
+    McpReachable(Box<super::join::Reachable>),
     /// The 200 ms tick.
     Tick,
 }

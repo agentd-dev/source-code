@@ -128,13 +128,16 @@ tracks a draft.
   through a stream.
 - Webhook idempotency markers are swept on a store without `list` too (an
   MCP or HTTP store that offers none): each period's markers are recorded in
-  a small paged index, written before the marker, and the sweep deletes
-  through it. They were kept for ever there.
-- An MCP server down at boot joins when it comes up: probed off the loop
-  (1 s, doubling to 60 s), then dialed through a reload of the running
-  configuration, so its tools, the workflows that name it, and its
-  subscriptions, waits and Events bindings come with it (`mcp.joined`). Until
-  now it joined only through a reload that dialed it, or a restart.
+  a small paged index (pages of at most 4 KiB), written before the marker —
+  an index write that fails does not keep the marker from being written —
+  and the sweep deletes through it, keeping a marker whose delete failed on
+  its page until it goes. They were kept for ever there.
+- An MCP server down at boot joins when it comes up: dialed again off the
+  loop (1 s after the first failure, doubling to 60 s), and the connection
+  adopted — its tools added to the registry beside the others' as last
+  built, its `subscribe` starts, resource waits and Events bindings restored
+  on it (`mcp.joined`); nothing else moves. Until now it joined only through
+  a reload that dialed it, or a restart.
 - `webhooks.url` (restart-only): the URL the webhook listener is reached at
   from outside, behind a proxy — `https://` (loopback `http://` aside), never
   a wildcard host, with an optional path prefix. A `wait {on: webhook}`'s

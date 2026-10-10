@@ -429,13 +429,16 @@ answers, its socket's timeout fires, or the client closes.
 
 **A server down at boot joins when it comes up.** Startup dials every server
 once and carries on without the ones that do not answer — under compose or
-Kubernetes start ordering that is the common case. Each is probed off the loop
-(a handshake, 1 s apart at first, doubling to at most 60 s); when one answers,
-it is dialed through a reload of the running configuration, so it joins
-exactly as a reload joins a server down until it: the registry gains its
-tools, the workflows that name it load, and its subscriptions, waits and MCP
-Events bindings are restored (`mcp.connect` with `reason: joined`, then
-`mcp.joined`). Nothing else moves, and no file is re-read.
+Kubernetes start ordering that is the common case. Each is dialed again off
+the loop (the handshake and its tool list, 1 s after the first failure,
+doubling to at most 60 s); when one answers, that connection is adopted: the
+server's tools join the registry beside every other server's as last built
+(no other server is listed again — a catalogue changes only at a reload),
+the workflow tools are registered over the installed definitions, and its
+`subscribe` starts, resource waits and MCP Events bindings are restored on it
+(`mcp.connect` with `reason: joined`, then `mcp.joined`). No file is read and
+no start fires again. A definition the agent stored that was left out at boot
+because it named the server loads at the next reload or restart.
 
 Because agentd spawns no process for an MCP server, there is no child to signal
 or reap — closing the HTTP connection *is* the shutdown. The notification thread

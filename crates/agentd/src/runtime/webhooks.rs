@@ -84,10 +84,16 @@ pub(crate) struct IdemSweep {
     page: Option<(u64, u64, Vec<String>)>,
     /// Sweeping by index: the next page of the floor bucket to read.
     index_next: u64,
+    /// Sweeping by index: the page whose ids are queued, and those of them
+    /// whose delete failed — kept on the page, which goes only once they do.
+    sweeping: Option<String>,
+    failed: Vec<String>,
 }
 
-/// Marker ids one index page holds.
-const INDEX_PAGE: usize = 128;
+/// The most an index page holds, serialized: well under any store's value
+/// limit (`store.max_value_bytes`), since the page is written whole with
+/// every marker.
+const INDEX_PAGE_BYTES: usize = 4096;
 
 /// The index of bucket `b`'s markers, for a store that cannot `list`: pages
 /// `p0`, `p1`, … and a `head` naming the last (absent: page 0). Beside the
@@ -100,18 +106,25 @@ fn index_head_id(bucket: u64) -> String {
     format!("{IDEM_PREFIX}x{bucket}/head")
 }
 
-/// Whether the store can `list`: asked once, with a listing of one key.
-fn listable(d: &Durable, sweep: &mut IdemSweep) -> Result<bool, crate::store::StoreError> {
+/// Whether the store can `list`: asked once, with a listing of one key. A
+/// listing that failed for another reason is asked again next time, and
+/// meanwhile counts as "cannot": an index written needlessly costs a write,
+/// one missing would keep markers for ever.
+fn listable(d: &Durable, sweep: &mut IdemSweep) -> bool {
     if let Some(l) = sweep.listable {
-        return Ok(l);
+        return l;
     }
-    let l = match d.list_prefix(Kind::Memory, IDEM_FLOOR) {
-        Ok(_) => true,
-        Err(crate::store::StoreError::Unsupported(_)) => false,
-        Err(e) => return Err(e),
-    };
-    sweep.listable = Some(l);
-    Ok(l)
+    match d.list_prefix(Kind::Memory, IDEM_FLOOR) {
+        Ok(_) => {
+            sweep.listable = Some(true);
+            true
+        }
+        Err(crate::store::StoreError::Unsupported(_)) => {
+            sweep.listable = Some(false);
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Add `id` to its bucket's index — before the marker is written, so the
@@ -138,7 +151,9 @@ fn index_marker(
             (page, ids)
         }
     };
-    let (page, mut ids) = if ids.len() >= INDEX_PAGE {
+    let full =
+        serde_json::to_string(&ids).map_or(0, |t| t.len()) + id.len() + 16 > INDEX_PAGE_BYTES;
+    let (page, mut ids) = if full && !ids.is_empty() {
         d.put(
             Kind::Memory,
             &index_head_id(bucket),
@@ -224,7 +239,11 @@ fn idem_floor(d: &Durable) -> Result<Option<u64>, crate::store::StoreError> {
         .and_then(|env| env.state.get("bucket").and_then(Value::as_u64)))
 }
 
-/// Write the marker for a delivery of `key` kept at `now`.
+/// Write the marker for a delivery of `key` kept at `now`. On a store that
+/// cannot `list`, it is indexed first; an index write that fails does not
+/// keep the marker from being written — a marker the sweep cannot find is a
+/// leak, a marker missing is a duplicate run — and is answered as
+/// `Ok(Some(error))`.
 ///
 /// The recorded floor is made to cover the marker's bucket first: the sweep
 /// starts at the floor, so a marker below it would never be deleted. The
@@ -237,7 +256,7 @@ fn record_marker(
     node: &str,
     key: &str,
     now: u64,
-) -> Result<(), crate::store::StoreError> {
+) -> Result<Option<crate::store::StoreError>, crate::store::StoreError> {
     let bucket = idem_bucket(now);
     let floor = match sweep.floor {
         Some(f) => f,
@@ -248,11 +267,13 @@ fn record_marker(
         sweep.floor = Some(Some(bucket));
     }
     let id = idem_marker_id(workflow, node, key, now);
-    if !listable(d, sweep)? {
-        index_marker(d, sweep, bucket, &id)?;
-    }
+    let unindexed = if listable(d, sweep) {
+        None
+    } else {
+        index_marker(d, sweep, bucket, &id).err()
+    };
     d.put(Kind::Memory, &id, json!({"at": now}), None)?;
-    Ok(())
+    Ok(unindexed)
 }
 
 /// One sweep pass's result.
@@ -284,16 +305,33 @@ fn sweep_pass(
             more: false,
         });
     };
-    if sweep.queue.is_empty() && !listable(d, sweep)? {
-        // By index: the floor bucket's next page — its ids, and the page —
-        // until the pages the head names are done; then the head goes and
-        // the floor moves on.
-        let head = d
-            .get(Kind::Memory, &index_head_id(floor))?
+    if sweep.queue.is_empty() && !listable(d, sweep) {
+        // The page just worked through: gone with its ids, or kept holding
+        // the ones whose delete failed, and read again.
+        if let Some(page) = sweep.sweeping.take() {
+            if sweep.failed.is_empty() {
+                d.delete(Kind::Memory, &page)?;
+            } else {
+                let kept = std::mem::take(&mut sweep.failed);
+                d.put(Kind::Memory, &page, json!({"ids": kept}), None)?;
+                sweep.index_next = sweep.index_next.saturating_sub(1);
+                return Ok(SweepPass {
+                    removed: 0,
+                    more: true,
+                });
+            }
+        }
+        // By index: the floor bucket's next page, until the pages the head
+        // names are done; then the head goes and the floor moves on.
+        let head = d.get(Kind::Memory, &index_head_id(floor))?;
+        let last = head
+            .as_ref()
             .and_then(|e| e.state.get("page").and_then(Value::as_u64))
             .unwrap_or(0);
-        if sweep.index_next > head {
-            d.delete(Kind::Memory, &index_head_id(floor))?;
+        if sweep.index_next > last {
+            if head.is_some() {
+                d.delete(Kind::Memory, &index_head_id(floor))?;
+            }
             d.put(Kind::Memory, IDEM_FLOOR, json!({"bucket": floor + 1}), None)?;
             sweep.floor = Some(Some(floor + 1));
             sweep.index_next = 0;
@@ -305,7 +343,7 @@ fn sweep_pass(
         let page = index_page_id(floor, sweep.index_next);
         if let Some(env) = d.get(Kind::Memory, &page)? {
             sweep.queue = page_ids(&env.state);
-            sweep.queue.push(page);
+            sweep.sweeping = Some(page);
         }
         sweep.index_next += 1;
         if sweep.queue.is_empty() {
@@ -332,11 +370,12 @@ fn sweep_pass(
     }
     let take = sweep.queue.len().min(budget);
     let mut removed = 0;
-    for id in sweep.queue.drain(..take) {
-        // An index page is not a marker: it is deleted, not counted.
-        let marker = !id.starts_with(&format!("{IDEM_PREFIX}x"));
-        if d.delete(Kind::Memory, &id).is_ok() && marker {
+    let indexed = sweep.sweeping.is_some();
+    for id in sweep.queue.drain(..take).collect::<Vec<_>>() {
+        if d.delete(Kind::Memory, &id).is_ok() {
             removed += 1;
+        } else if indexed {
+            sweep.failed.push(id);
         }
     }
     // A bucket is listed again once its queue is used up, so a delete that
@@ -1473,7 +1512,7 @@ impl crate::runtime::reactor::Runtime {
         let Some(key) = key else {
             return;
         };
-        if let Err(e) = record_marker(
+        match record_marker(
             &self.durable,
             &mut self.idem_sweep,
             workflow,
@@ -1481,10 +1520,17 @@ impl crate::runtime::reactor::Runtime {
             key,
             now_ms(),
         ) {
-            self.log.warn(
+            Ok(None) => {}
+            // Recorded, and kept out of the index: the sweep of a store that
+            // cannot `list` will not find it.
+            Ok(Some(e)) => self.log.warn(
+                "webhook.idempotency.unindexed",
+                json!({"workflow": workflow, "node": node, "err": e.to_string()}),
+            ),
+            Err(e) => self.log.warn(
                 "webhook.idempotency.unrecorded",
                 json!({"workflow": workflow, "node": node, "err": e.to_string()}),
-            );
+            ),
         }
     }
 
@@ -1832,9 +1878,13 @@ mod idempotency_tests {
     }
 
     /// A store with no `list` (an MCP or HTTP store without one): every
-    /// write goes to `inner`, listing is refused.
+    /// write goes to `inner`, listing is refused, deleting a key that is not
+    /// there is an error (as many adapters answer), and each key in `fail`
+    /// refuses its next deletes, as many as its count — more than a
+    /// `Durable`'s retries, so the sweep sees the failure.
     struct NoList {
         inner: MemoryStore,
+        fail: std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
     }
     impl crate::store::Store for NoList {
         fn put(
@@ -1859,6 +1909,15 @@ mod idempotency_tests {
             Err(crate::store::StoreError::Unsupported("list"))
         }
         fn delete(&self, key: &str) -> Result<(), crate::store::StoreError> {
+            if let Some(n) = self.fail.lock().unwrap().get_mut(key)
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(crate::store::StoreError::Io("injected".into()));
+            }
+            if self.inner.get(key, None)?.is_none() {
+                return Err(crate::store::StoreError::Io(format!("{key}: no such key")));
+            }
             self.inner.delete(key)
         }
         fn kind(&self) -> &'static str {
@@ -1871,8 +1930,10 @@ mod idempotency_tests {
     /// a restart of the writer — and the index goes with them.
     #[test]
     fn a_store_without_list_is_swept_through_the_marker_index() {
-        let inner = MemoryStore::new();
-        let store = Arc::new(NoList { inner });
+        let store = Arc::new(NoList {
+            inner: MemoryStore::new(),
+            fail: Default::default(),
+        });
         let d = Durable::new(store.clone(), "agentd", "i", Policy::default(), None);
         let now = 10 * IDEM_TTL_MS + 5;
         let old_at = 7 * IDEM_TTL_MS + 1;
@@ -1881,7 +1942,7 @@ mod idempotency_tests {
         // from the page the first left.
         for life in 0..2 {
             let mut writer = IdemSweep::default();
-            for i in 0..(INDEX_PAGE + 3) {
+            for i in 0..60 {
                 let key = format!("k{life}-{i}");
                 record_marker(&d, &mut writer, "w", "h", &key, old_at + i as u64).unwrap();
                 old.push(idem_marker_id("w", "h", &key, old_at + i as u64));
@@ -1890,10 +1951,25 @@ mod idempotency_tests {
         let mut writer = IdemSweep::default();
         record_marker(&d, &mut writer, "w", "h", "live", now - 1).unwrap();
         let live = idem_marker_id("w", "h", "live", now - 1);
-        assert!(
-            d.get(Kind::Memory, &index_head_id(7)).unwrap().is_some(),
-            "more than a page: a head names the last"
-        );
+        let head = d.get(Kind::Memory, &index_head_id(7)).unwrap();
+        let pages = head.and_then(|e| e.state["page"].as_u64()).unwrap() + 1;
+        assert!(pages > 2, "more than a page: a head names the last");
+        for p in 0..pages {
+            let page = d.get(Kind::Memory, &index_page_id(7, p)).unwrap().unwrap();
+            assert!(
+                page.state.to_string().len() <= INDEX_PAGE_BYTES,
+                "page {p} fits"
+            );
+        }
+        // One marker's delete fails once: it is kept on its page and deleted
+        // when the page is read again. The empty buckets between, with no
+        // head and no page, are passed on a store that refuses to delete what
+        // is not there.
+        store
+            .fail
+            .lock()
+            .unwrap()
+            .insert(format!("agentd/i/memory/{}", old[5]), 8);
 
         let mut sweep = IdemSweep::default();
         let mut removed = 0;
@@ -1909,7 +1985,7 @@ mod idempotency_tests {
             assert!(d.get(Kind::Memory, gone).unwrap().is_none(), "{gone}");
         }
         assert!(d.get(Kind::Memory, &live).unwrap().is_some());
-        for page in 0..3 {
+        for page in 0..pages {
             assert!(
                 d.get(Kind::Memory, &index_page_id(7, page))
                     .unwrap()

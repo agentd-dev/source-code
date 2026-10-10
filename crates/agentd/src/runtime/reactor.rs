@@ -383,9 +383,6 @@ pub struct Runtime {
     pub(crate) mcp_events: super::mcp_events::Events,
     /// Servers down at boot, probed until they answer (`runtime::join`).
     pub(crate) joining: super::join::Joining,
-    /// A reload of the running configuration is joining such a server:
-    /// staging dials it, and the commit says so.
-    pub(crate) rejoining: bool,
     /// When [`Runtime::release_unowned_subscriptions`] next looks.
     pub(crate) release_due_ms: u64,
     pub(crate) registry: Registry,
@@ -789,7 +786,7 @@ impl Runtime {
             Event::McpEvents(done) => self.on_events_done(*done),
             #[cfg(feature = "mcp-events")]
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
-            Event::McpReachable { server, ok } => self.on_mcp_reachable(&server, ok),
+            Event::McpReachable(r) => self.on_mcp_reachable(*r),
             Event::Background { .. } | Event::Tick => {}
         }
     }

@@ -101,6 +101,8 @@ pub struct Options {
     pub events: super::mock_events::Spelling,
     /// The CA its webhook deliveries trust (a PEM file).
     pub hook_ca: Option<String>,
+    /// Where it listens (`127.0.0.1:0`, a free port, when unset).
+    pub listen: Option<String>,
 }
 
 impl Options {
@@ -114,6 +116,7 @@ impl Options {
             hold_listen: true,
             events: super::mock_events::Spelling::Extension,
             hook_ca: None,
+            listen: None,
         }
     }
 }
@@ -223,10 +226,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Serve the mock on loopback TCP until the process is killed, announcing the
 /// bound address through `addr_file`. Returns the process exit code.
 pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
-    let listener = match TcpListener::bind("127.0.0.1:0") {
+    let at = opts.listen.as_deref().unwrap_or("127.0.0.1:0");
+    let listener = match TcpListener::bind(at) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("internal-mock-mcp-http: bind 127.0.0.1:0: {e}");
+            eprintln!("internal-mock-mcp-http: bind {at}: {e}");
             return 1;
         }
     };

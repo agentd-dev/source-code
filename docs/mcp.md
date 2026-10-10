@@ -427,6 +427,16 @@ the run carries on. A call abandoned at its bound holds up no other call on
 the same connection; it is not hung up either, and runs on until the server
 answers, its socket's timeout fires, or the client closes.
 
+**A server down at boot joins when it comes up.** Startup dials every server
+once and carries on without the ones that do not answer — under compose or
+Kubernetes start ordering that is the common case. Each is probed off the loop
+(a handshake, 1 s apart at first, doubling to at most 60 s); when one answers,
+it is dialed through a reload of the running configuration, so it joins
+exactly as a reload joins a server down until it: the registry gains its
+tools, the workflows that name it load, and its subscriptions, waits and MCP
+Events bindings are restored (`mcp.connect` with `reason: joined`, then
+`mcp.joined`). Nothing else moves, and no file is re-read.
+
 Because agentd spawns no process for an MCP server, there is no child to signal
 or reap — closing the HTTP connection *is* the shutdown. The notification thread
 stops with it, and the whole drain counts inside `lifecycle.drain_timeout`

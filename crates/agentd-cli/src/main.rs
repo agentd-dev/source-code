@@ -88,7 +88,7 @@ fn dispatch() -> i32 {
 
 /// `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]
 /// [--protocol-version <v>] [--events <extension|top-level|none>]
-/// [--hook-ca <pem>]`: the mock
+/// [--hook-ca <pem>] [--listen <addr>]`: the mock
 /// at 2025-11-25 (the `initialize` handshake; the default) or 2026-07-28
 /// (`server/discover`), its MCP Events declared in SEP-3415's spelling (the
 /// default), the design sketch's, or not at all; its webhook deliveries
@@ -127,6 +127,7 @@ fn mock_mcp_http(args: &[String]) -> i32 {
                 };
             }
             "--hook-ca" => opts.hook_ca = it.next().cloned(),
+            "--listen" => opts.listen = it.next().cloned(),
             _ => positional.push(arg.as_str()),
         }
     }

@@ -31,6 +31,7 @@ pub mod human; // human-in-the-loop: ask_human gates + fallbacks
 #[cfg(feature = "a2a")]
 pub mod identities; // the identity registry: principal names that survive restarts
 pub(crate) mod instances; // instance-tier template children (a full daemon each)
+pub(crate) mod join; // servers down at boot join when they come up
 #[cfg(feature = "mcp-events")]
 pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
 pub mod nested;
@@ -634,6 +635,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         release_due_ms: 0,
         #[cfg(feature = "mcp-events")]
         mcp_events: Default::default(),
+        joining: Default::default(),
+        rejoining: false,
         registry,
         contexts: Contexts::new(model_window),
         memory: Memory::new(

@@ -98,7 +98,8 @@ exhaustive.
 | `proc.ready` | readiness reached (see [Health](#health-shape-aware)) |
 | `proc.exit` | `code`, `uptime_ms` |
 | `config.invalid` / `config.warning` / `config.reloaded` | `error` / `warning` — one validation or reload finding, never a secret value; `config.reloaded` carries `trigger` and `changed` |
-| `mcp.connect` | `server`, `tools` (count, at boot), `protocol` (the MCP revision the connection negotiated: `2025-11-25` through the handshake, `2026-07-28` through `server/discover`), and `reason` on a reload or a re-dial |
+| `mcp.connect` | `server`, `tools` (count, at boot), `protocol` (the MCP revision the connection negotiated: `2025-11-25` through the handshake, `2026-07-28` through `server/discover`), and `reason` on a reload, a re-dial or a join (`joined`: a server down at boot came up) |
+| `mcp.joined` / `mcp.join.refused` | `server`, and `changed` (what the join's reload of the running configuration moved) / `errors` — a server down at boot joined, or its join was refused (and is tried again on the probe's backoff, 1 s → 60 s) |
 | `mcp.connect.fail` | `server`, `err`, and `reason` on a reload or a re-dial |
 | `mcp.tool.dropped` | `server`, `tool`, `reason` — at warn level, once per tool per connection: the server listed a tool the MCP client dropped (an `x-mcp-header` annotation it rejects, at 2026-07-28), so the agent cannot call it |
 | `mcp.disconnect` | `server`, `reason` (`reload`, `reload refused`, or `session_lost`: the server answered `404` to the connection's session, and agentd re-dials it) |

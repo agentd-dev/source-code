@@ -71,6 +71,8 @@ pub enum Event {
     /// A verified MCP Events webhook delivery, for the loop to keep.
     #[cfg(feature = "mcp-events")]
     McpEventHook(Box<super::mcp_events::hook::Arrival>),
+    /// A probe of a server down since boot answered (`runtime::join`).
+    McpReachable { server: String, ok: bool },
     /// The 200 ms tick.
     Tick,
 }

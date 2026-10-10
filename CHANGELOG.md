@@ -121,6 +121,11 @@ tracks a draft.
 - A `wait {on: webhook}` survives a restart: its record keeps the callback
   route and its auth references (never a resolved secret), and boot serves
   the route again. It could only time out after one before.
+- An MCP server down at boot joins when it comes up: probed off the loop
+  (1 s, doubling to 60 s), then dialed through a reload of the running
+  configuration, so its tools, the workflows that name it, and its
+  subscriptions, waits and Events bindings come with it (`mcp.joined`). Until
+  now it joined only through a reload that dialed it, or a restart.
 - `webhooks.url` (restart-only): the URL the webhook listener is reached at
   from outside, behind a proxy — `https://` (loopback `http://` aside), never
   a wildcard host, with an optional path prefix. A `wait {on: webhook}`'s

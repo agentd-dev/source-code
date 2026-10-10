@@ -381,6 +381,11 @@ pub struct Runtime {
     /// MCP Events bindings (RFC 0045).
     #[cfg(feature = "mcp-events")]
     pub(crate) mcp_events: super::mcp_events::Events,
+    /// Servers down at boot, probed until they answer (`runtime::join`).
+    pub(crate) joining: super::join::Joining,
+    /// A reload of the running configuration is joining such a server:
+    /// staging dials it, and the commit says so.
+    pub(crate) rejoining: bool,
     /// When [`Runtime::release_unowned_subscriptions`] next looks.
     pub(crate) release_due_ms: u64,
     pub(crate) registry: Registry,
@@ -688,6 +693,7 @@ impl Runtime {
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
+            self.join_tick();
             // 9. Children maintenance.
             for (node, health) in self.children.tick() {
                 self.on_unhealthy_child(node, health);
@@ -783,6 +789,7 @@ impl Runtime {
             Event::McpEvents(done) => self.on_events_done(*done),
             #[cfg(feature = "mcp-events")]
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
+            Event::McpReachable { server, ok } => self.on_mcp_reachable(&server, ok),
             Event::Background { .. } | Event::Tick => {}
         }
     }

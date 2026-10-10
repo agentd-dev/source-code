@@ -108,6 +108,19 @@ impl Runtime {
         }
     }
 
+    /// Dial the configured servers that have no live connection — through
+    /// a reload of the running configuration, so a server down until now
+    /// joins exactly as a reload would join it (`runtime::join`). What moved,
+    /// or why it could not.
+    pub(crate) fn join_servers(&mut self) -> Result<Vec<&'static str>, Vec<String>> {
+        let old = self.settings.clone();
+        self.rejoining = true;
+        let staged = self.stage_reload(&old);
+        let changed = staged.map(|s| self.commit_reload(&old, s));
+        self.rejoining = false;
+        changed
+    }
+
     fn reload_inner(&mut self) -> Result<Vec<&'static str>, ReloadRefused> {
         let (loaded, _ask) = cfg::load(&self.args, &self.env)
             .map_err(|e| ReloadRefused::Invalid(vec![e.to_string()]))?;
@@ -165,7 +178,7 @@ impl Runtime {
         // stay, nothing retires, and the next gate is announced on the new
         // channel.
         let channels_moved = old.agent.document_gate_channels != new.agent.document_gate_channels;
-        let servers_change = old.mcp != new.mcp;
+        let servers_change = old.mcp != new.mcp || self.rejoining;
         // …and whenever the servers or the registry the definitions are
         // checked against change: a step naming a tool or a server the
         // reload takes away refuses it, as it refuses a start, rather than
@@ -437,6 +450,7 @@ impl Runtime {
         });
         let rebuild = old.tools != new.tools
             || old.mcp != new.mcp
+            || self.rejoining
             || old.knowledge != new.knowledge
             || old.search != new.search
             || tools_moved;
@@ -710,7 +724,9 @@ impl Runtime {
                 }
                 self.log.info(
                     "mcp.connect",
-                    json!({"server": name, "reason": "reload", "protocol": protocol}),
+                    json!({"server": name,
+                           "reason": if self.rejoining { "joined" } else { "reload" },
+                           "protocol": protocol}),
                 );
             }
             drop(previous);

@@ -1,11 +1,11 @@
 # RFC 0045: MCP Events
 
-**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8), with the two follow-ups decided 2026-10-01 (a stored definition needs the `interface` grant to open a route; a tainted run's read-back result taints its caller) built after it, and the second replaced on 2026-10-02 by withholding: a tainted result read back by a context holding `sensitive` and `egress` is answered with its text withheld, and implicit notes are opt-in (§8 item 13, §5.11.3, §11). The Events surface itself (P1 onwards) is not built. It tracks an external **draft**: MCP Events is a design sketch in an MCP incubation repository. No SEP has been filed or numbered, and it is not part of the MCP specification (§2.1). Anything marked **[draft may change]** follows text that is still open upstream.
+**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8), with the two follow-ups decided 2026-10-01 (a stored definition needs the `interface` grant to open a route; a tainted run's read-back result taints its caller) built after it, and the second replaced on 2026-10-02 by withholding: a tainted result read back by a context holding `sensitive` and `egress` is answered with its text withheld, and implicit notes are opt-in (§8 item 13, §5.11.3, §11). P1 (rmcp 3.5.0 and MCP `2026-07-28`) is implemented (§8). The Events surface itself (P2 onwards) is not built. It tracks an external **draft**: SEP-3415, "Events Extension" (Draft, Extensions Track, opened 2026-10-05), which is the design sketch written in SEP format and is not yet part of the MCP specification (§2.1, §2.15). Anything marked **[draft may change]** follows text that is still open upstream.
 **Author:** Andrii Tsok (drafted with Claude)
-**Date:** 2026-09-29. Revised 2026-09-30 after three adversarial reviews (spec fidelity, codebase fidelity, design completeness). Decisions Q1, Q3 and Q8, the order of work, and the two item-13 follow-ups recorded 2026-10-01; the read-back one revised 2026-10-02 (§11). P0 implemented 2026-10-01/02, and §8 P0 corrected to what it proved.
+**Date:** 2026-09-29. Revised 2026-09-30 after three adversarial reviews (spec fidelity, codebase fidelity, design completeness). Decisions Q1, Q3 and Q8, the order of work, and the two item-13 follow-ups recorded 2026-10-01; the read-back one revised 2026-10-02 (§11). P0 implemented 2026-10-01/02, and §8 P0 corrected to what it proved. P1 implemented 2026-10-03/10. Revised 2026-10-10 for SEP-3415 (§2.15), with the decisions Q2, Q4, Q6 and Q9 recorded and Q6's dynamic subscriptions designed (§5.15, §11).
 **Extends:** RFC 0035 (event streams). MCP events land in declared streams and are consumed by the existing `stream` and `correlate` starts and by `wait {on: event}`. **Supersedes only the consumption half of RFC 0035 Phase D** ("the MCP broker profile"). Phase D was never built. Its publish half, a broker exposed as an MCP server with `publish` tools (`rfcs/0035-event-streams.md:175-179`), needs no profile, and MCP Events has no publish operation. RFC 0035 is annotated with a pointer, not rewritten (§4, row 1).
 **Depends on:** RFC 0031 (endpoint authentication: every `events/*` call is signed like any other MCP request), RFC 0037 (service catalog and egress policy), RFC 0042 (what a served document may configure), RFC 0043 (the A2A boundary, v1.17.0). It also depends on an **rmcp upgrade to ≥ 3.5.0** so that agentd can speak MCP `2026-07-28`, the revision both known Events implementations require. That upgrade changes every MCP connection, so it was a decision in its own right, and the user took it: upgrade, with the `Auto` lifecycle (§6, §11 Q1).
-**Standards basis:** *MCP Events — Design Sketch* (status "Draft proposal", Peter Alexander, dated 2026-02-19, merged into the incubation repository `modelcontextprotocol/experimental-ext-triggers-events` on 2026-09-08 at `6682596d`). Standard Webhooks, as the draft profiles it. MCP revision `2026-07-28`: extension negotiation (SEP-2133), stateless requests, `subscriptions/listen`, the standard request headers, and the error-code allocation policy.
+**Standards basis:** SEP-3415, "Events Extension" ([SEP]; Draft, opened 2026-10-05), normative for P2 onwards. Before it, *MCP Events — Design Sketch* (status "Draft proposal", Peter Alexander, dated 2026-02-19, merged into the incubation repository `modelcontextprotocol/experimental-ext-triggers-events` on 2026-09-08 at `6682596d`). Standard Webhooks, as the draft profiles it. MCP revision `2026-07-28`: extension negotiation (SEP-2133), stateless requests, `subscriptions/listen`, the standard request headers, and the error-code allocation policy.
 **Scheduling:** decided 2026-10-01 (§11): P0 first, on its own, after v1.17.0; then the instruction-core Spec 1.1 re-vendor; then P1 and the phases after it. P0 is on `main` (§8).
 
 Citation keys used below:
@@ -16,6 +16,7 @@ Citation keys used below:
 - **[WG]** = https://modelcontextprotocol.io/community/working-groups/triggers-events
 - **[MTG]** = https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/3096 (MCP Core Maintainer Meeting, July 15, 2026; notes posted 2026-07-16)
 - **[I4]** = https://github.com/modelcontextprotocol/experimental-ext-triggers-events/issues/4
+- **[SEP]** = https://github.com/modelcontextprotocol/modelcontextprotocol/blob/c47fd2451c91ad11708dd498ddee060a1d73aedc/seps/0000-events-extension.md (SEP-3415, PR #3415 at `c47fd245`, updated 2026-10-08). `[SEP L<n>]` is a line of that file.
 
 agentd paths are relative to `crates/agentd/src` unless they start with `crates/`, `docs/`, `rfcs/`, `examples/` or `web/`. Every agentd reference was checked read-only against `main` at `04607fb5` ("release: v1.17.0"), and line numbers are that commit's: P0 has since moved some of them. rmcp references are to the 3.1.2 source that agentd locks, unless marked 3.5.0.
 
@@ -106,7 +107,8 @@ MCP Events addresses all three with a standard wire. It offers server-side filte
 
 | Source | What it is | Date | Status |
 |---|---|---|---|
-| [DS] design sketch | The only normative text | Header 2026-02-19. PR #1 opened 2026-04-09 and merged 2026-09-08 as `6682596d`, still `main` today. | **Draft proposal.** No SEP number. Not official MCP. |
+| [SEP] SEP-3415, "Events Extension" | The normative text from P2 on: the design sketch in SEP format, fitted to `2026-07-28` | Opened 2026-10-05 by `pja-ant`; head `c47fd245`, 2026-10-08 | **Draft**, Extensions Track, open. Its own reference implementation in an official SDK is "outstanding" [SEP L922-928]. What it changes is §2.15. |
+| [DS] design sketch | The text this RFC was first written against | Header 2026-02-19. PR #1 opened 2026-04-09 and merged 2026-09-08 as `6682596d`. PR #11 (`d5316be2`, 2026-10-09) renumbered its error codes to SEP-3415's. | **Draft proposal.** Superseded as the normative text by [SEP]. |
 | Triggers & Events WG [WG] | Owner. Leads: Clare Liguori (Amazon Web Services) and Peter Alexander (Anthropic). | Chartered 2026-03-24 | Work item "SEP: Events in MCP v1 RFC", status "Ideating", target "End April", champion "TBD". Success means "An accepted SEP …", "Reference implementations in at least two Tier-1 SDKs", and "Conformance test coverage". The incubation README lists as out of scope "General-purpose pub/sub infrastructure beyond what the MCP protocol requires". |
 | Core Maintainer review [MTG] | Direction check on the Events primitive | 2026-07-15 (notes posted 2026-07-16) | "direction check, not a vote". "The SEP is ~90% there". Poll and push were questioned (§1.1). "**Outcome:** Keep poll, push, and webhook as supported delivery modes for now". Before the next review the SEP needs "explicit per-mode use-case justification" and the webhook security model in the spec text. "Early implementers (Slack, an earthquake-monitoring server, Discord integrations) have been testing". |
 | Issue #4 [I4] | Field report on long-polling | Opened 2026-08-24 | Open. It answers "the v1 show-stopper question from 2026-08-20, and the suggestion of merging streaming and polling via long-polling". |
@@ -216,7 +218,7 @@ The client calls `events/subscribe {name, arguments, delivery: {mode: "webhook",
 
 - **Resources:** "`notifications/resources/updated` remains unchanged." [DS L882].
 - **`subscriptions/listen`:** MCP `2026-07-28` replaced `resources/subscribe` and the HTTP GET stream with `subscriptions/listen`, which "replaces the former `resources/subscribe` RPC and the HTTP GET endpoint" (spec `basic/patterns/subscriptions.mdx`). It also removed `Last-Event-ID` resumption: "Workloads that need durability or resumability **MUST** use the tasks primitive instead" (SEP-2575, https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2575). Events push is a *separate* per-subscription POST stream. It reuses only the `subscriptionId` correlation convention [DS L252].
-- **`events/list_changed` has no way onto the listen stream.** On `subscriptions/listen`, "The server **MUST NOT** send notification types the client has not explicitly requested" (spec `basic/patterns/subscriptions.mdx`). The core filter has four fields. MCP's pattern is for an extension to add its own filter key: the Tasks extension adds `taskIds` (SEP-2663, status "Final", `seps/2663-tasks-extension.md`). The sketch defines no filter key for `notifications/events/list_changed` and never mentions `subscriptions/listen`. So on `2026-07-28`, **no conformant server can deliver `events/list_changed` to any client.** TypeScript SDK issue #2569, which raised the SDK side of this, was closed as a duplicate on 2026-09-28, with a maintainer pointing to the Tasks `taskIds` field (https://github.com/modelcontextprotocol/typescript-sdk/issues/2569).
+- **`events/list_changed` has no way onto the listen stream.** On `subscriptions/listen`, "The server **MUST NOT** send notification types the client has not explicitly requested" (spec `basic/patterns/subscriptions.mdx`). The core filter has four fields. MCP's pattern is for an extension to add its own filter key: the Tasks extension adds `taskIds` (SEP-2663, status "Final", `seps/2663-tasks-extension.md`). The sketch defines no filter key for `notifications/events/list_changed` and never mentions `subscriptions/listen`. So on `2026-07-28`, as the sketch stood, **no conformant server could deliver `events/list_changed` to any client.** *SEP-3415 closes this:* it adds an `eventsListChanged` field to the `subscriptions/listen` filter (§2.15). TypeScript SDK issue #2569, which raised the SDK side of this, was closed as a duplicate on 2026-09-28, with a maintainer pointing to the Tasks `taskIds` field (https://github.com/modelcontextprotocol/typescript-sdk/issues/2569).
 - **Tasks:** whether task status becomes an event is Open Question 5 [DS L910] and PR #2. The maintainers agreed to "keep them distinct for now" [MTG].
 
 ### 2.12 Error codes — **[draft may change]**
@@ -224,13 +226,13 @@ The client calls `events/subscribe {name, arguments, delivery: {mode: "webhook",
 | Code | Name | Meaning [DS L111-120] |
 |---|---|---|
 | `-32602` | InvalidParams | arguments don't match `inputSchema`; bad callback URL or secret |
-| `-32011` | NotFound | unknown event name (`data.kind: "event"`), or unknown subscription on unsubscribe |
-| `-32012` | Forbidden | principal not permitted, or access revoked |
-| `-32013` | ResourceExhausted | a server limit (`data.limit`) |
-| `-32014` | Unsupported | e.g. `{feature: "deliveryMode"}` or `{reason: "schema_changed"}` |
-| `-32015` | CallbackEndpointError | callback verification or reachability failed (`data.reason` is a `lastError` category) |
+| `-32023` | NotFound | unknown event name (`data.kind: "event"`), or unknown subscription on unsubscribe |
+| `-32024` | Forbidden | principal not permitted, or access revoked |
+| `-32025` | ResourceExhausted | a server limit (`data.limit`) |
+| `-32026` | Unsupported | e.g. `{feature: "deliveryMode"}` or `{reason: "schema_changed"}` |
+| `-32027` | CallbackEndpointError | callback verification or reachability failed (`data.reason` is a `lastError` category) |
 
-The draft places these "alongside MCP's existing `-32003`/`-32004`/`-32042`" in `[-32000, -32099]` [DS L122]. `2026-07-28` has since split that range: "`-32000` to `-32019` remains implementation-defined …, `-32020` to `-32099` is reserved for the MCP specification", and `-32003` became `-32021` (MCP changelog 2026-07-28, item 12). The draft's codes therefore sit in the implementation-defined range and are likely to be renumbered when promoted. `-32020` is now `HeaderMismatch` (§6).
+The draft places these "alongside MCP's existing `-32003`/`-32004`/`-32042`" in `[-32000, -32099]` [DS L122]. `2026-07-28` has since split that range: "`-32000` to `-32019` remains implementation-defined …, `-32020` to `-32099` is reserved for the MCP specification", and `-32003` became `-32021` (MCP changelog 2026-07-28, item 12). The sketch's first numbers (`-32011`..`-32015`) sat in the implementation-defined range. SEP-3415 requests the next five codes of the specification's range, `-32023`..`-32027`, "provisional until" it is accepted, assuming `-32020`..`-32022` are the only ones allocated by then [SEP L763], and the sketch was renumbered to match (PR #11, 2026-10-09). The table above uses them. Whether to allocate codes at all or fold them into `InvalidParams` is the SEP's open question 7 [SEP L944], so the numbers stay in one constant (§6.4). `-32020` is `HeaderMismatch` (§6).
 
 ### 2.13 The protocol in one diagram
 
@@ -275,14 +277,28 @@ sequenceDiagram
 | Long-poll `waitMs` | PR #5 |
 | Multi-name subscriptions under one cursor ("*wire-breaking if adopted*") | [DS L908], Open Question 4 |
 | Resources, `list_changed` and tasks re-expressed as events | [DS L904, L910]; PR #2; SEP-2694 (https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2694) |
-| **A `subscriptions/listen` filter key for `events/list_changed`** (none exists, §2.11) | Not raised in the WG repository's six issues and PRs as of 2026-09-30. agentd raises it with the WG (§6). |
+| ~~A `subscriptions/listen` filter key for `events/list_changed`~~ | Settled by SEP-3415: `eventsListChanged` (§2.15). |
 | **A wire signal for abandoned webhook deliveries** (none exists, §2.7) | Not raised in the WG repository's six issues and PRs as of 2026-09-30. agentd raises it with the WG (§6). |
-| Error-code numbers | §2.12 |
+| Error-code numbers | `-32023`..`-32027`, provisional until SEP-3415 is accepted; SEP open question 7 (§2.12) |
 | Endpoint-verification scheme (a secret-proving variant was proposed by the Standard Webhooks author in the PR #1 review) | PR #1 review thread |
 | Server-identity `v1a,` key discovery ("Exactly one of these will be normative") | [DS L515] |
 | The webhook security model (allow-listing, verification challenge, identity proofing) written into the SEP | [MTG] outcome |
 
 The design keeps every one of these behind one module (§6), so a change upstream is a change in one place.
+
+### 2.15 SEP-3415: what it settles and what it changes
+
+SEP-3415 (opened 2026-10-05) is the design sketch in SEP format. "The methods and payloads are otherwise as the sketch defined them, apart from the error code numbers and the `resultType` field" [SEP L866]. What it settles or changes for agentd:
+
+- **`2026-07-28` and later only.** "This extension is defined for protocol revision `2026-07-28` and later. It relies on per-request client capabilities, `server/discover` and `subscriptions/listen`" [SEP L37]; "The extension is not defined under protocol revision `2025-11-25` or earlier" [SEP L865]. A binding on a connection that reached `2025-11-25` is refused (`revision`, §5.13), and the `2025-11-25` paths this RFC first planned (the extension in the `initialize` capabilities, `list_changed` on the GET stream through `on_custom_notification`) are not built.
+- **The capability.** A server declares `capabilities.extensions["io.modelcontextprotocol/events"] = {listChanged?: boolean}` in its `server/discover` answer [SEP L54-75]. The top-level `events` key of the sketch "is not part of this extension", though "at least one deployed client reads it" [SEP L866] — ChatGPT's profile tells servers to send it [OAI]. Q2 is decided: agentd accepts both spellings, in one constant (§5.3, §11).
+- **The client's declaration** is `extensions: {"io.modelcontextprotocol/events": {}}` in the per-request `_meta["io.modelcontextprotocol/clientCapabilities"]` (a MAY) [SEP L77-92]. A client "MUST NOT send" `events/*` to a server that has not advertised the extension [SEP L94].
+- **`list_changed` has a way onto the listen stream.** The extension adds `eventsListChanged` to the `subscriptions/listen` filter, echoed in the acknowledgment when the server honours it; a server that did not declare `listChanged: true` leaves it out [SEP L192-208]. rmcp cannot carry it either way: its filter is a closed struct of four fields (`rmcp-3.5.0/src/model.rs:2080-2093`), and a listen subscription that receives any notification outside those four — a custom one included — is cancelled as "outside the acknowledged filter" (`Subscription::accepts`, `rmcp-3.5.0/src/service/client.rs:558-580`), which would end the standing listen that also carries `tools/list_changed` and every resource subscription. So agentd's socket does both itself, through one generic hook in `agentd-mcp` named for no extension (§6.4): it adds the member to the body of the connection's standing listen when the server declared `listChanged`, and it takes `notifications/events/list_changed` off that listen's stream before rmcp sees it, onto the host's notification queue — the hand-off the socket already makes for a notification streamed ahead of a `tools/list` answer (§8 P1).
+- **Error codes** are `-32023`..`-32027`, provisional (§2.12).
+- **`resultType: "complete"`** is carried by every result [SEP L41].
+- **`Mcp-Name` on `events/*`** is not defined (open question 8, [SEP L946]); `call_raw` sends `Mcp-Method` only.
+- **Runtime subscriptions are the expected client shape.** "Event names and arguments are not known at code time. They are discovered at runtime through `events/list`, typically driven by the LLM. The client SDK provides a dynamic subscription API" [SEP L1105]. This is Q6, decided for dynamic subscriptions inside an operator grant (§5.15).
+- **Reservations:** the `events/` and `notifications/events/` prefixes, the `io.modelcontextprotocol/events` label, the `eventsListChanged` filter field, the `X-MCP-Subscription-Id` header and two well-known paths [SEP L765-770].
 
 ---
 
@@ -520,7 +536,7 @@ The `stream` start's `payload` is the stream event (`runtime/streams.rs:356`), s
 ### 5.3 Negotiation and discovery at connect
 
 1. **Declare the client extension.** When built with `mcp-events`, agentd declares the extension to **every** server, whether or not it has bindings. Adding the first binding at reload then needs no new handshake (§5.7). Building the feature is the developer's opt-in, and "Extensions are always disabled by default and require explicit opt-in from the developer" (MCP `docs/extensions/overview.mdx`). **[draft may change]**
-   - On `2025-11-25`: `extensions["io.modelcontextprotocol/events"] = {}` in the `initialize` `ClientCapabilities` (rmcp carries the map, `rmcp-3.1.2/src/model/capabilities.rs:180-185`). That member is outside the `2025-11-25` schema (§2.2), so a server may ignore it.
+   - *Since SEP-3415:* the extension is defined only from `2026-07-28` (§2.15). A connection that reached `2025-11-25` gets no declaration, sends no `events/*`, and its bindings are refused (`revision`).
    - On `2026-07-28`: in `_meta["io.modelcontextprotocol/clientCapabilities"]` of every `events/*` request. `call_raw` sets it, because it bypasses rmcp's per-request metadata (§5.6).
 2. **Read the server's declaration from the raw answer.** On `2025-11-25` that is the `initialize` answer. On `2026-07-28` it is the `server/discover` answer. rmcp's `ServerCapabilities` has no `events` field and no catch-all (`rmcp-3.1.2/src/model/capabilities.rs:219-240`). agentd builds its own capabilities by round-tripping rmcp's typed `peer_info` through JSON (`crates/mcp/src/rmcp_client.rs:349, 369-373`), so a top-level `capabilities.events` is lost before agentd sees it. rmcp does keep `extensions`, but agentd's own `wire::ServerCapabilities` has no field for it either (`crates/mcp/src/wire.rs:64-75`). *Implemented in P1:* agentd's socket keeps the raw `capabilities` object of whichever bootstrap answer reached the server (`AgentdHttp::raw_capabilities`), and `McpClient::capability(name)` returns any member as sent, `events` included. The accepted spellings live in **one constant**, each entry citing the external text it comes from. Which spellings go in it is **Q2** (§11).
 3. **List.** `events/list`, following `nextCursor`, up to 20 pages and 1000 descriptors. A longer list refuses the server's bindings (`list_too_large`).
@@ -529,11 +545,11 @@ The `stream` start's `payload` is the stream event (`runtime/streams.rs:356`), s
    - `delivery` ∩ descriptor `delivery` is non-empty, and the first operator-listed mode in the intersection is chosen;
    - `arguments` validate against `inputSchema` with the dependency-free subset validator (`crate::jsonschema`, `lib.rs:29`). Keywords outside the subset are not enforced, and agentd says so once per type.
 5. **Arm** the chosen driver (§5.6), or **refuse** (§5.13).
-6. **Move down the operator's list** only on a definitive mode failure: `-32014 {feature: "deliveryMode"}`, or `-32015` on five consecutive attempts (for example, a callback the server cannot reach from behind NAT). The binding takes the next listed mode that the descriptor also offers and logs `mcp.events.mode_changed` at `warn`. It stays in that mode until a reload, a re-dial or a re-list. When no listed mode is left, the binding is refused.
+6. **Move down the operator's list** only on a definitive mode failure: `-32026 {feature: "deliveryMode"}`, or `-32027` on five consecutive attempts (for example, a callback the server cannot reach from behind NAT). The binding takes the next listed mode that the descriptor also offers and logs `mcp.events.mode_changed` at `warn`. It stays in that mode until a reload, a re-dial or a re-list. When no listed mode is left, the binding is refused.
 
 Descriptors are refreshed:
 
-- on `notifications/events/list_changed`, on revisions ≤ 2025-11-25 only. It arrives on the GET stream, through rmcp's `on_custom_notification`, which agentd will override. On `2026-07-28` it cannot arrive at all (§2.11);
+- on `notifications/events/list_changed`. *Since SEP-3415* it arrives on the connection's standing listen, which asks for it with `eventsListChanged` when the server declared `listChanged: true` (§2.15). A server that does not honour the field leaves it out of the acknowledgment, and the periodic re-list below covers it;
 - at every webhook refresh;
 - every 15 minutes otherwise. **This interval is agentd's own choice.** The nearest draft text is a SHOULD for no-expiry webhook subscriptions: "clients SHOULD still re-call `events/subscribe` (and `events/list`) occasionally: … a periodic `events/list` bounds how long a descriptor change can go unnoticed by a client with no live connection" [DS L381]. On `2026-07-28` the periodic re-list is the only way agentd learns of a changed descriptor.
 
@@ -841,7 +857,7 @@ agentd promises, per binding:
 | `mcp.events.armed` | info | server, event, mode, cursor_present, truncated |
 | `mcp.events.subscribed` / `.unsubscribed` | info | server, event, mode. Each also writes an audit entry, because it creates or removes a persistent subscription on a third party under a credential. |
 | `mcp.events.mode_changed` | **warn** | server, event, from, to, cause |
-| `mcp.events.refused` | **error** | server, event, reason (`no_capability`, `unknown_event`, `no_common_mode`, `invalid_arguments`, `forbidden`, `not_supported`, `method_not_found`, `list_too_large`) |
+| `mcp.events.refused` | **error** | server, event, reason (`revision`, `no_capability`, `unknown_event`, `no_common_mode`, `invalid_arguments`, `forbidden`, `not_supported`, `method_not_found`, `list_too_large`, `no_grant`) |
 | `mcp.events.terminated` | **error** | server, event, code |
 | `mcp.events.gap` | warn | server, event, cause (`truncated`, `no_replay`) |
 | `mcp.events.rejected` | warn | server, event, event_id, cause (`oversize`, `malformed`) |
@@ -899,19 +915,84 @@ agentd promises, per binding:
 | Event name not listed | connect / re-list | `refused: unknown_event`, re-evaluated at every re-list |
 | No common delivery mode | connect / re-list | `refused: no_common_mode` (lists both sides), re-evaluated at every re-list |
 | `arguments` fail `inputSchema` locally, or the server answers `-32602` | connect | `refused: invalid_arguments` (validator messages) |
-| `-32012` at subscribe, or `terminated` with `-32012` | any | `refused: forbidden` / `terminated`. The driver never retries it. It is re-evaluated only on reload, on re-dial (a new session may carry a new credential), or on a re-list. |
-| `terminated` with `-32011` | running | `terminated` (the type was removed) |
-| `-32014 {reason: "schema_changed"}` | running | Re-list. Re-arm once if `arguments` still validate. Otherwise `refused`. |
-| `-32014 {feature: "deliveryMode"}` | subscribe | Next listed mode (§5.3, step 6). `refused: not_supported` when no listed mode is left. |
-| `-32013` ResourceExhausted | subscribe | Back off (max 15 min) and warn. Transient. |
-| `-32015` CallbackEndpointError (webhook) | subscribe | Back off and error-log the `data.reason` category. The usual cause is `webhooks.url` not being reachable from the server. After five consecutive failures, the next listed mode. |
+| The connection reached `2025-11-25` | connect | `refused: revision`. The extension is not defined there (§2.15); no `events/*` is sent. Re-evaluated on reload and re-dial. |
+| `-32024` Forbidden at subscribe, or `terminated` with `-32024` | any | `refused: forbidden` / `terminated`. The driver never retries it. It is re-evaluated only on reload, on re-dial (a new session may carry a new credential), or on a re-list. |
+| `terminated` with `-32023` | running | `terminated` (the type was removed) |
+| `-32026 {reason: "schema_changed"}` | running | Re-list. Re-arm once if `arguments` still validate. Otherwise `refused`. |
+| `-32026 {feature: "deliveryMode"}` | subscribe | Next listed mode (§5.3, step 6). `refused: not_supported` when no listed mode is left. |
+| `-32025` ResourceExhausted | subscribe | Back off (max 15 min) and warn. Transient. |
+| `-32027` CallbackEndpointError (webhook) | subscribe | Back off and error-log the `data.reason` category. The usual cause is `webhooks.url` not being reachable from the server. After five consecutive failures, the next listed mode. |
 | `-32020` HeaderMismatch | any | A defect in `call_raw`. Error-logged, and the binding backs off. |
 | Transport error, `5xx`, timeout | any | Back off (1 s → 5 min, with jitter). Cursor kept. |
 | Session `404` (≤ 2025-11-25) | any | Re-dial and re-arm (§5.7) |
 | Store degraded | any | Poll paused, webhook `503` (§5.1) |
-| The server requires `2026-07-28` | connect | With rmcp 3.1.2 (today), agentd negotiates at most `2025-11-25`, so such a server cannot be reached for any purpose, not just Events. That covers every ChatGPT-profile server [OAI] and `mcp.d`'s Events. After P1 (rmcp ≥ 3.5.0), `2026-07-28` is agentd's default (§6). |
+| The server requires `2026-07-28` | connect | Reached since P1, which made `server/discover` agentd's first request (§8 P1). |
 
 A refused binding keeps its records, including its cursor. It is re-evaluated on reload, on re-dial, on `list_changed` (≤ 2025-11-25), and at every re-list.
+
+### 5.15 Runtime subscriptions inside an operator grant (Q6, decided 2026-10-10)
+
+SEP-3415 expects subscriptions to be made at runtime: "Event names and arguments are not known at code time. They are discovered at runtime through `events/list`, typically driven by the LLM" [SEP L1105]. Q6 is decided for that, beside the static bindings of §5.2. agentd offers two runtime surfaces, a `wait` that subscribes and model-facing tools, and both work only inside an **operator grant**. Nothing made at runtime can name a server or an event type the operator did not grant, pick its own stream, mode, rate or retention, or outlive the grant.
+
+**The grant (operator-only).**
+
+```yaml
+mcp:
+  servers:
+    - name: github
+      service: github
+      tags: [untrusted_input]
+      event_grants:
+        - name: pull_request.closed          # the server's event type
+          fixed: {repo: acme/webapp}          # arguments no runtime subscription may set
+          delivery: [poll]                    # as for a binding (§5.2)
+          into: {stream: github, subject: pr.closed}
+          rate: 60/1m                         # per subscription; required on an untrusted server
+          max: 32                             # live runtime subscriptions under this grant
+          ttl: 7d                             # the longest a tool-made subscription lives
+          tools: true                         # offer the events.* tools for it (default false)
+```
+
+- **Validation at load** is a binding's (§5.2): `into.stream` declared, `delivery` from the closed set, `rate` on an untagged or `untrusted_input` server, the webhook requirements. Also `1 ≤ max ≤ 64`, `ttl ≤ 30d`, at most one grant per `(server, name)`, and the instance cap counts static bindings and live runtime subscriptions together (256).
+- **Classification.** `event_grants` is operator-only and refused at both document fold sites, as `events` is (§5.2, §5.11.6). A served document, a template or a stored definition can use a grant; it cannot make one.
+- **Taint** is static, because the grant fixes the stream: `into.stream` gets the server's tags, plus `untrusted_input` when the server is untagged, exactly as a binding's stream does (§5.11.3).
+
+**Identity and sharing.** A runtime subscription is a binding whose arguments are the grant's `fixed` arguments merged with the runtime ones. A runtime value for a `fixed` key is refused, never overridden. The merged arguments are validated against `inputSchema`, and the identity is a binding's: `(server, name, canonical(arguments))` (§5.5). Equal identities share one upstream subscription and one record, whoever made them, a static binding included; the record keeps the list of **owners**, and the subscription stops when its last owner goes. Every stream event a runtime subscription appends carries `data.subscription`, the binding hash, so a consumer can tell whose it is.
+
+**(a) A wait that subscribes.** `wait {on: event}` gains `subscribe:`, in place of `stream` and `subject`, which come from the grant:
+
+```yaml
+merged:
+  kind: wait
+  on: event
+  subscribe:
+    server: github
+    event: pull_request.closed
+    arguments: {number: "{{ inputs.pr }}"}    # rendered when the step dispatches
+  match: "event.data.payload.merged == true"
+  timeout: 2d
+```
+
+- **What resolves it:** an occurrence of its own subscription (`event.data.subscription` is its binding hash) that also passes `match`.
+- **Lifecycle.** The wait subscribes from "now" (`cursor: null`, §2.8) when it suspends, as an owner. When the step leaves `suspended` — resolved, timed out, cancelled, or its run ended — it stops owning, and with the last owner the subscription stops: poll stops, webhook unsubscribes (P3), the records go. The owner list is durable, so after a restart every wait still suspended is an owner again and the subscription resumes from its stored cursor (at-least-once, as for a binding). This is the owner-and-release model resource subscriptions already have (`Runtime::wanted_resources`).
+- **Where it is checked.** A `subscribe:` naming a `(server, event)` with no grant is refused wherever a definition is checked: load, reload, `workflow.create`/`update`, a stored definition (left out, `workflow.stored.invalid`). `subscribe.server` and `subscribe.event` may not be templated, as `wait.on` may not (§5.11.3); only `arguments` render at dispatch, and a rendered value for a `fixed` key or one that fails `inputSchema` fails the step, naming the argument.
+- **The check-then-wait pattern** of §5.8 still applies: a subscription that starts when the wait suspends sees nothing from before.
+
+**(b) Model-facing tools.** Under a grant with `tools: true`, the registry offers four internal tools:
+
+| Tool | Arguments | Answer |
+|---|---|---|
+| `events.list` | `server?` | The granted event types with the server's current descriptors (`description`, `inputSchema` minus the `fixed` keys, `payloadSchema`, `delivery`), and the stream each lands in |
+| `events.subscribe` | `server`, `event`, `arguments` | `{subscription, stream, subject, expires_at}` |
+| `events.unsubscribe` | `subscription` | `{stopped}` |
+| `events.subscriptions` | — | The caller's live subscriptions |
+
+- **Owner.** A tool-made subscription is owned by the calling context: the root conversation, or a workflow run's `agent` step. It lives until that owner unsubscribes it, until the grant's `ttl`, or until a reload removes the grant or the server. It survives a restart. A run's subscriptions are released when the run ends. Subagent children run out of process and are not offered the tools in v1; a child asking for one gets the registry's usual "not offered" refusal.
+- **Reach and tags.** Subscribing sends arguments to the server, so the tools count as reaching it: they are offered only to a context whose reach includes the server, and they carry the server's tags in the trifecta check.
+- **What reaches the model** is decided as for a binding (§5.10): the operator wires consumers to the grant's stream — a `stream` start whose workflow hands the event to an `agent` step, or `message`s the root. The tool's answer names the stream and subject, so the model can be told where its events land. `events.subscribe` never wakes anyone by itself.
+- **Bounds and audit.** `max` per grant and the instance cap bound what a model can create; a subscribe beyond them is refused naming the cap. Every subscribe and unsubscribe, by a wait or a tool, logs `mcp.events.subscribed` / `.unsubscribed` with `owner` and writes an audit entry, as a binding's does.
+
+**What stays out of v1.** A document or template declaring a grant (Q10 still open). Runtime subscriptions in subagent children. A runtime choice of mode, stream, rate or retention.
 
 ### 5.14 Runtime flow
 
@@ -1064,7 +1145,7 @@ SEP review needs one reference implementation in an official SDK: "Build at leas
 The hand-rolled wire is small:
 
 - **five methods:** `events/list`, `events/poll`, `events/stream`, `events/subscribe`, `events/unsubscribe`;
-- **six notifications:** `list_changed`, `active`, `event`, `heartbeat`, `error`, `terminated` [DS L95-97, L223-277, L861-867];
+- **six notifications:** `list_changed`, `active`, `event`, `heartbeat`, `error`, `terminated` [DS L95-97, L223-277, L861-867]; `list_changed` rides the standing listen, asked for with `eventsListChanged` (§2.15);
 - **three control envelopes:** `gap`, `terminated`, `verification`.
 
 It sits on a socket agentd already owns. When rmcp ships typed Events, the wire types in `runtime/mcp_events/` are **deleted** in the same change that adopts rmcp's (rule 1). `call_raw` goes too, unless something else still uses it.
@@ -1243,7 +1324,9 @@ All of these exist: `crates/agentd-cli/tests/store_kill_e2e.rs`, `streams_e2e.rs
 - **Unit tests** cover id derivation, absent-equals-null cursors, the pagination caps, and the seen set's expiry and cap. A drift check runs the draft's own JSON examples [DS L40-93, L141-181, L232-265] through the wire types, and checks the `Mcp-Method` and `resultType` rules.
 - **Interop, outside CI:** against `Poita/mcp.d`, the only implementation found that offers poll, and against conformance PR #521's client scenarios once they settle.
 
-**Depends on:** P0 items 1, 2, 4, 6, 10 and 11. It can be built before P1, but without P1 it reaches no real server, because both known Events implementations require `2026-07-28`.
+**Since SEP-3415 and the 2026-10-10 decisions:** P2 is built against [SEP], for `2026-07-28` connections only (a `2025-11-25` connection's bindings are refused `revision`); the mock's Events surface is on its 2026-07-28 edge; the codes are `-32023`..`-32027`; `list_changed` is tested through the standing listen's `eventsListChanged`; it also builds the grants, the `wait` that subscribes and the `events.*` tools (§5.15); and `mcp-events` joins the release feature set (Q4), with the one-line draft warning at load.
+
+**Depends on:** P0 items 1, 2, 4, 6, 10 and 11, and P1 (both are on `main`).
 
 ### P3 — Webhook mode (the ChatGPT-deployed subset)
 
@@ -1367,7 +1450,14 @@ Only genuine decisions are listed. Everything else is decided above.
 
 - **§5.11.3, a result read back — "narrow the root's exposure":** the strict model refused every root holding `sensitive` and `egress` beside a tainted run unless it gave up its read-back tools, its plan, its subagents and its notes. Instead, implicit notes are opt-in (`on_workflow_finished: ignore` and no `subagent_result` by default), and a tainted result read back by any context holding both legs is withheld at runtime — its status, with the text replaced by a marker — from the same reach the load-time check uses. The static check stops refusing on read-backs and keeps every edge that brings outside text in or hands it on (§5.11.3).
 
-Q2, Q4, Q5, Q6, Q7, Q9 and Q10 are still open. None of them blocks P1.
+**Decided by the user on 2026-10-10** (asked after P1, before P2):
+
+- **Q2:** (a). Accept both spellings, the top-level `capabilities.events` and the extension key, in one constant. SEP-3415 now names the extension key the extension's and the top-level key a prototype's (§2.15).
+- **Q4:** ship `mcp-events` **in the release binaries** (the release feature set), not build-from-source, with the one-line "tracking a draft" warning at load.
+- **Q6:** **also dynamic.** Beside the operator's static bindings, a `wait` that subscribes with run-specific arguments and model-facing `events.*` tools, both inside an operator grant (§5.15).
+- **Q9:** counts only, in the existing `counters` object (§5.12).
+
+Q5, Q7 and Q10 are still open. None of them blocks P2.
 
 1. **Upgrade rmcp to ≥ 3.5.0 and adopt the `Auto` lifecycle (P1)?** Both known Events implementations require `2026-07-28`, so without this agentd reaches no Events server. The change affects every MCP connection.
    - (a) Yes, as P1, before the bridge ships.
@@ -1378,9 +1468,9 @@ Q2, Q4, Q5, Q6, Q7, Q9 and Q10 are still open. None of them blocks P1.
    - (a) Both current external spellings: the top-level `capabilities.events` (the draft on `main` [DS L17-29], and ChatGPT's profile [OAI]) *and* `capabilities.extensions["io.modelcontextprotocol/events"]` (PR #7, the conformance draft, `mcp.d`). They live in one constant, and the loser is deleted when the SEP decides. On `2025-11-25` both are tolerance, since neither is in that schema. On `2026-07-28` they are read from `server/discover`.
    - (b) Only the extension key, MCP's sanctioned mechanism (SEP-2133). That excludes ChatGPT-profile servers until they move.
 
-   Recommendation: (a). Both are external text in force today (user rule 3), and neither is an agentd-owned name.
+   Recommendation: (a). Both are external text in force today (user rule 3), and neither is an agentd-owned name. **Decided 2026-10-10: (a).**
 3. **Poll first or webhook first?** Poll (P2) needs no inbound exposure, exercises the whole bridge, and has `mcp.d` as an interop peer. Webhook (P3) is what ChatGPT-profile servers offer, and they are the only production servers known. Recommendation: poll first, webhook directly after. Swap them if reaching servers built for ChatGPT matters more to you than a smaller first step. **Decided 2026-10-01: poll first, webhook directly after.**
-4. **Ship in release binaries while the extension is a draft?** Recommendation: keep `mcp-events` out of the release feature set (build-from-source, like `exec` and `cel`) until an SEP number exists, and log a one-line "tracking a draft" warning at load when it is built in.
+4. **Ship in release binaries while the extension is a draft?** Recommendation: keep `mcp-events` out of the release feature set (build-from-source, like `exec` and `cel`) until an SEP number exists, and log a one-line "tracking a draft" warning at load when it is built in. **Decided 2026-10-10: in the release binaries, with the warning.** (SEP-3415 now exists, still a draft.)
 5. **Webhook secret and replicas.**
    - (a) Mint a secret at every arm, as designed. Replicas each need a distinct `webhooks.url`.
    - (b) Derive the secret from an operator secret, so that replicas behind one load-balanced URL share a subscription. Cursors are then per replica, and re-arms replay into each replica's store.
@@ -1390,10 +1480,10 @@ Q2, Q4, Q5, Q6, Q7, Q9 and Q10 are still open. None of them blocks P1.
    - v1 as designed: operator-declared bindings, with fixed arguments and client-side CEL `match` for per-run correlation.
    - Also wanted: a `wait` that subscribes with run-specific `arguments` (server-side filtering per run), and/or an agent tool that lets the model subscribe, which is ChatGPT's "tell it what to monitor" flow [OAI]. Each needs its own lifecycle and authority rules.
 
-   Recommendation: static only for v1.
+   Recommendation: static only for v1. **Decided 2026-10-10: also dynamic, inside an operator grant (§5.15).**
 7. **Subscriptions as a user.** Once RFC 0044's per-principal credentials exist, should a binding be ownable by a principal: subscribed with that principal's credential, with the runs it starts owned by that principal? Or should MCP events stay autonomous (`identity.autonomous_as`) by design? Recommendation: stay autonomous until someone needs a user's events. The draft's "receipt is not authority" rule fits autonomy best.
 8. **D4's taint check: refuse at load, or warn first?** Refusing is the only form in which the check is not decorative. But it can refuse existing configurations, and the only existing escape hatch, `security.allow_trifecta`, disables every trifecta check, not just this one. Recommendation: refuse at load, with a release note that names the pattern and the reader/actor split as the fix. **Decided 2026-10-01: refuse at load.** Implemented in P0.
-9. **A per-binding view on the A2A feed** (for the TUI and web UI). Adding one is an incompatible change to a closed schema, which the extension's rule answers with a new name. Recommendation: counts only in v1. Decide the name only if the UI needs more.
+9. **A per-binding view on the A2A feed** (for the TUI and web UI). Adding one is an incompatible change to a closed schema, which the extension's rule answers with a new name. Recommendation: counts only in v1. Decide the name only if the UI needs more. **Decided 2026-10-10: counts only.**
 10. **Documents declaring bindings.** v1 refuses them. Recommendation: revisit after P3, with a rule such as "poll only, on servers the operator catalogued".
 
 ---

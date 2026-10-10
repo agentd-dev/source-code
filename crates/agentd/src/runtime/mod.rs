@@ -361,25 +361,22 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         .default_timeout
         .map(|d| d.0)
         .unwrap_or(Duration::from_secs(60));
-    for s in &settings.mcp.servers {
-        // The dial-time backstop behind boot validation: under `closed`
-        // egress an endpoint with no service-catalog entry must never reach
-        // the socket, whichever path assembled it.
-        if let Err(e) = crate::config::settings::egress_allows(
-            &settings.services,
-            settings.security.egress,
-            crate::config::settings::ServiceKind::Mcp,
-            &s.endpoint,
-        ) {
-            log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+    // The dial-time backstop behind boot validation: under `closed` egress
+    // an endpoint with no service-catalog entry must never reach the socket,
+    // whichever path assembled it; nor may a spec that cannot be built.
+    let mut dial = match reload::dial_specs(&settings) {
+        Ok(specs) => specs,
+        Err(errs) => {
+            log.error(
+                "proc.exit",
+                json!({"code": crate::exit::USAGE, "err": errs.join("; ")}),
+            );
             return crate::exit::USAGE;
         }
-        let spec = match s.to_spec() {
-            Ok(sp) => sp,
-            Err(e) => {
-                log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
-                return crate::exit::USAGE;
-            }
+    };
+    for s in &settings.mcp.servers {
+        let Some(spec) = dial.remove(&s.name) else {
+            continue;
         };
         let per_timeout = s.timeout.map(|d| d.0).unwrap_or(mcp_timeout);
         match crate::mcp::from_spec(&spec, per_timeout)

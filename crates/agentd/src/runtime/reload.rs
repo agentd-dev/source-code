@@ -315,31 +315,8 @@ impl Runtime {
     fn stage_mcp(&self, old: &cfg::Settings) -> Result<StagedMcp, Vec<String>> {
         let new = &self.settings;
         // Every spec first: one that cannot be built refuses the reload
-        // before any server is dialed, as it refuses a start. So does an
-        // endpoint closed egress does not admit — the dial-time backstop a
-        // start applies behind validation, for whichever path assembled it.
-        let mut specs = std::collections::BTreeMap::new();
-        let mut errs = Vec::new();
-        for s in &new.mcp.servers {
-            if let Err(e) = cfg::egress_allows(
-                &new.services,
-                new.security.egress,
-                cfg::ServiceKind::Mcp,
-                &s.endpoint,
-            ) {
-                errs.push(e);
-                continue;
-            }
-            match s.to_spec() {
-                Ok(spec) => {
-                    specs.insert(s.name.clone(), spec);
-                }
-                Err(e) => errs.push(format!("mcp server {:?}: {e}", s.name)),
-            }
-        }
-        if !errs.is_empty() {
-            return Err(errs);
-        }
+        // before any server is dialed, as it refuses a start.
+        let specs = dial_specs(new)?;
         let mut set = std::collections::BTreeMap::new();
         let mut fresh = Vec::new();
         for s in &new.mcp.servers {
@@ -1080,6 +1057,71 @@ fn reads_a_resource(entry: &serde_json::Value) -> bool {
 enum ReloadRefused {
     Invalid(Vec<String>),
     RestartRequired(Vec<String>),
+}
+
+/// Every configured MCP server's dial spec, or every reason one cannot be
+/// dialed: a spec that cannot be built, and an endpoint closed egress does
+/// not admit — the dial-time backstop behind validation, for whichever path
+/// assembled the settings. Startup and a reload both ask it before any server
+/// is dialed.
+pub(crate) fn dial_specs(
+    s: &cfg::Settings,
+) -> Result<std::collections::BTreeMap<String, crate::config::McpServerSpec>, Vec<String>> {
+    let mut specs = std::collections::BTreeMap::new();
+    let mut errs = Vec::new();
+    for srv in &s.mcp.servers {
+        if let Err(e) = cfg::egress_allows(
+            &s.services,
+            s.security.egress,
+            cfg::ServiceKind::Mcp,
+            &srv.endpoint,
+        ) {
+            errs.push(e);
+            continue;
+        }
+        match srv.to_spec() {
+            Ok(spec) => {
+                specs.insert(srv.name.clone(), spec);
+            }
+            Err(e) => errs.push(format!("mcp server {:?}: {e}", srv.name)),
+        }
+    }
+    if errs.is_empty() {
+        Ok(specs)
+    } else {
+        Err(errs)
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::*;
+
+    /// The dial-time egress backstop refuses an endpoint closed egress does
+    /// not admit, whatever assembled the settings — validation refuses the
+    /// same configuration first, so these are settings it never saw — and
+    /// admits one the service catalogue names.
+    #[test]
+    fn closed_egress_refuses_an_uncatalogued_endpoint_before_any_dial() {
+        let settings = |services: &str| {
+            cfg::Settings::from_document(
+                crate::config::yaml::parse(&format!(
+                    "security: {{egress: closed}}\n{services}mcp:\n  servers:\n    - {{name: crm, endpoint: \"https://crm.example/mcp\"}}\n"
+                ))
+                .unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        let errs = dial_specs(&settings("")).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("crm.example"), "{errs:?}");
+        let specs = dial_specs(&settings(
+            "services:\n  crm: {kind: mcp, endpoint: \"https://crm.example/mcp\"}\n",
+        ))
+        .unwrap();
+        assert!(specs.contains_key("crm"));
+    }
 }
 
 #[cfg(all(test, feature = "a2a"))]

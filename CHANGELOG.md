@@ -121,6 +121,10 @@ tracks a draft.
 - A `wait {on: webhook}` survives a restart: its record keeps the callback
   route and its auth references (never a resolved secret), and boot serves
   the route again. It could only time out after one before.
+- Webhook idempotency markers are swept on a store without `list` too (an
+  MCP or HTTP store that offers none): each period's markers are recorded in
+  a small paged index, written before the marker, and the sweep deletes
+  through it. They were kept for ever there.
 - An MCP server down at boot joins when it comes up: probed off the loop
   (1 s, doubling to 60 s), then dialed through a reload of the running
   configuration, so its tools, the workflows that name it, and its

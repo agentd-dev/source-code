@@ -76,6 +76,99 @@ pub(crate) struct IdemSweep {
     next: Option<std::time::Instant>,
     floor: Option<Option<u64>>,
     queue: Vec<String>,
+    /// Whether the store can `list` (asked once a life). One that cannot
+    /// keeps an index of each bucket's markers, which the sweep reads in
+    /// place of a listing.
+    listable: Option<bool>,
+    /// The index page markers are appended to now: `(bucket, page, ids)`.
+    page: Option<(u64, u64, Vec<String>)>,
+    /// Sweeping by index: the next page of the floor bucket to read.
+    index_next: u64,
+}
+
+/// Marker ids one index page holds.
+const INDEX_PAGE: usize = 128;
+
+/// The index of bucket `b`'s markers, for a store that cannot `list`: pages
+/// `p0`, `p1`, … and a `head` naming the last (absent: page 0). Beside the
+/// buckets, never inside one, so no route's markers can collide with it.
+fn index_page_id(bucket: u64, page: u64) -> String {
+    format!("{IDEM_PREFIX}x{bucket}/p{page}")
+}
+
+fn index_head_id(bucket: u64) -> String {
+    format!("{IDEM_PREFIX}x{bucket}/head")
+}
+
+/// Whether the store can `list`: asked once, with a listing of one key.
+fn listable(d: &Durable, sweep: &mut IdemSweep) -> Result<bool, crate::store::StoreError> {
+    if let Some(l) = sweep.listable {
+        return Ok(l);
+    }
+    let l = match d.list_prefix(Kind::Memory, IDEM_FLOOR) {
+        Ok(_) => true,
+        Err(crate::store::StoreError::Unsupported(_)) => false,
+        Err(e) => return Err(e),
+    };
+    sweep.listable = Some(l);
+    Ok(l)
+}
+
+/// Add `id` to its bucket's index — before the marker is written, so the
+/// index never misses a marker that exists.
+fn index_marker(
+    d: &Durable,
+    sweep: &mut IdemSweep,
+    bucket: u64,
+    id: &str,
+) -> Result<(), crate::store::StoreError> {
+    let (page, ids) = match sweep.page.take() {
+        Some((b, page, ids)) if b == bucket => (page, ids),
+        // The first marker of this bucket in this life: carry on from the
+        // page its head names.
+        _ => {
+            let page = d
+                .get(Kind::Memory, &index_head_id(bucket))?
+                .and_then(|e| e.state.get("page").and_then(Value::as_u64))
+                .unwrap_or(0);
+            let ids = d
+                .get(Kind::Memory, &index_page_id(bucket, page))?
+                .map(|e| page_ids(&e.state))
+                .unwrap_or_default();
+            (page, ids)
+        }
+    };
+    let (page, mut ids) = if ids.len() >= INDEX_PAGE {
+        d.put(
+            Kind::Memory,
+            &index_head_id(bucket),
+            json!({"page": page + 1}),
+            None,
+        )?;
+        (page + 1, Vec::new())
+    } else {
+        (page, ids)
+    };
+    ids.push(id.to_string());
+    d.put(
+        Kind::Memory,
+        &index_page_id(bucket, page),
+        json!({"ids": ids}),
+        None,
+    )?;
+    sweep.page = Some((bucket, page, ids));
+    Ok(())
+}
+
+fn page_ids(state: &Value) -> Vec<String> {
+    state
+        .get("ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 /// The bucket a marker written at `at` lives in: [`IDEM_TTL_MS`]-wide,
@@ -154,12 +247,11 @@ fn record_marker(
         d.put(Kind::Memory, IDEM_FLOOR, json!({"bucket": bucket}), None)?;
         sweep.floor = Some(Some(bucket));
     }
-    d.put(
-        Kind::Memory,
-        &idem_marker_id(workflow, node, key, now),
-        json!({"at": now}),
-        None,
-    )?;
+    let id = idem_marker_id(workflow, node, key, now);
+    if !listable(d, sweep)? {
+        index_marker(d, sweep, bucket, &id)?;
+    }
+    d.put(Kind::Memory, &id, json!({"at": now}), None)?;
     Ok(())
 }
 
@@ -192,7 +284,37 @@ fn sweep_pass(
             more: false,
         });
     };
-    if sweep.queue.is_empty() {
+    if sweep.queue.is_empty() && !listable(d, sweep)? {
+        // By index: the floor bucket's next page — its ids, and the page —
+        // until the pages the head names are done; then the head goes and
+        // the floor moves on.
+        let head = d
+            .get(Kind::Memory, &index_head_id(floor))?
+            .and_then(|e| e.state.get("page").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if sweep.index_next > head {
+            d.delete(Kind::Memory, &index_head_id(floor))?;
+            d.put(Kind::Memory, IDEM_FLOOR, json!({"bucket": floor + 1}), None)?;
+            sweep.floor = Some(Some(floor + 1));
+            sweep.index_next = 0;
+            return Ok(SweepPass {
+                removed: 0,
+                more: floor + 2 < idem_bucket(now),
+            });
+        }
+        let page = index_page_id(floor, sweep.index_next);
+        if let Some(env) = d.get(Kind::Memory, &page)? {
+            sweep.queue = page_ids(&env.state);
+            sweep.queue.push(page);
+        }
+        sweep.index_next += 1;
+        if sweep.queue.is_empty() {
+            return Ok(SweepPass {
+                removed: 0,
+                more: true,
+            });
+        }
+    } else if sweep.queue.is_empty() {
         sweep.queue = d
             .list_prefix(Kind::Memory, &format!("{IDEM_PREFIX}b{floor}/"))?
             .iter()
@@ -211,7 +333,9 @@ fn sweep_pass(
     let take = sweep.queue.len().min(budget);
     let mut removed = 0;
     for id in sweep.queue.drain(..take) {
-        if d.delete(Kind::Memory, &id).is_ok() {
+        // An index page is not a marker: it is deleted, not counted.
+        let marker = !id.starts_with(&format!("{IDEM_PREFIX}x"));
+        if d.delete(Kind::Memory, &id).is_ok() && marker {
             removed += 1;
         }
     }
@@ -1370,8 +1494,8 @@ impl crate::runtime::reactor::Runtime {
     ///
     /// A marker past its TTL already answers nothing — the read checks the
     /// age — so this is about the store, which would otherwise keep one record
-    /// per delivery for ever. A store that cannot `list` cannot be swept; its
-    /// expired markers stay where they are, ignored.
+    /// per delivery for ever. A store that cannot `list` is swept through the
+    /// index its markers were recorded in.
     pub(crate) fn sweep_idem_markers(&mut self) {
         let now = std::time::Instant::now();
         if self.idem_sweep.next.is_some_and(|next| now < next) {
@@ -1707,6 +1831,96 @@ mod idempotency_tests {
         }
     }
 
+    /// A store with no `list` (an MCP or HTTP store without one): every
+    /// write goes to `inner`, listing is refused.
+    struct NoList {
+        inner: MemoryStore,
+    }
+    impl crate::store::Store for NoList {
+        fn put(
+            &self,
+            key: &str,
+            seq: u64,
+            env: &Value,
+        ) -> Result<crate::store::PutOutcome, crate::store::StoreError> {
+            self.inner.put(key, seq, env)
+        }
+        fn get(
+            &self,
+            key: &str,
+            seq: Option<u64>,
+        ) -> Result<Option<Value>, crate::store::StoreError> {
+            self.inner.get(key, seq)
+        }
+        fn list(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<crate::store::KeySeq>, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unsupported("list"))
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::store::StoreError> {
+            self.inner.delete(key)
+        }
+        fn kind(&self) -> &'static str {
+            "memory"
+        }
+    }
+
+    /// On a store that cannot `list`, the markers are swept through the index
+    /// they were recorded in — more than a page of them in one bucket, across
+    /// a restart of the writer — and the index goes with them.
+    #[test]
+    fn a_store_without_list_is_swept_through_the_marker_index() {
+        let inner = MemoryStore::new();
+        let store = Arc::new(NoList { inner });
+        let d = Durable::new(store.clone(), "agentd", "i", Policy::default(), None);
+        let now = 10 * IDEM_TTL_MS + 5;
+        let old_at = 7 * IDEM_TTL_MS + 1;
+        let mut old = Vec::new();
+        // Two lives write into the same expired bucket: the second carries on
+        // from the page the first left.
+        for life in 0..2 {
+            let mut writer = IdemSweep::default();
+            for i in 0..(INDEX_PAGE + 3) {
+                let key = format!("k{life}-{i}");
+                record_marker(&d, &mut writer, "w", "h", &key, old_at + i as u64).unwrap();
+                old.push(idem_marker_id("w", "h", &key, old_at + i as u64));
+            }
+        }
+        let mut writer = IdemSweep::default();
+        record_marker(&d, &mut writer, "w", "h", "live", now - 1).unwrap();
+        let live = idem_marker_id("w", "h", "live", now - 1);
+        assert!(
+            d.get(Kind::Memory, &index_head_id(7)).unwrap().is_some(),
+            "more than a page: a head names the last"
+        );
+
+        let mut sweep = IdemSweep::default();
+        let mut removed = 0;
+        for _ in 0..200 {
+            let pass = sweep_pass(&d, &mut sweep, now, 64).unwrap();
+            removed += pass.removed;
+            if !pass.more {
+                break;
+            }
+        }
+        assert_eq!(removed, old.len());
+        for gone in &old {
+            assert!(d.get(Kind::Memory, gone).unwrap().is_none(), "{gone}");
+        }
+        assert!(d.get(Kind::Memory, &live).unwrap().is_some());
+        for page in 0..3 {
+            assert!(
+                d.get(Kind::Memory, &index_page_id(7, page))
+                    .unwrap()
+                    .is_none(),
+                "page {page} went with its markers"
+            );
+        }
+        assert!(d.get(Kind::Memory, &index_head_id(7)).unwrap().is_none());
+        assert_eq!(idem_floor(&d).unwrap(), Some(idem_bucket(now) - 1));
+    }
+
     /// The sweep deletes what has expired and nothing else — not a live
     /// marker, not another `_` system key, not a user key — and the work it
     /// does is bounded by what it deletes: it lists only buckets that have
@@ -1764,6 +1978,13 @@ mod idempotency_tests {
 
         let marker = |k: &str| k.contains(IDEM_PREFIX) && !k.ends_with("/floor");
         assert!(
+            !d.list_prefix(Kind::Memory, &format!("{IDEM_PREFIX}x"))
+                .unwrap()
+                .iter()
+                .any(|_| true),
+            "a store that lists keeps no index"
+        );
+        assert!(
             !ops.iter().any(|(op, k)| *op == "get" && marker(k)),
             "no marker is read: {ops:?}"
         );
@@ -1772,11 +1993,18 @@ mod idempotency_tests {
             .filter(|(op, _)| *op == "list")
             .map(|(_, k)| k)
             .collect();
+        // Only buckets that expired whole — and, once a life, the one-key
+        // listing that asks whether the store lists at all.
         assert!(
-            listed
-                .iter()
-                .all(|k| k.ends_with("/_wh_idem/b7/") || k.ends_with("/_wh_idem/b8/")),
+            listed.iter().all(|k| k.ends_with("/_wh_idem/b7/")
+                || k.ends_with("/_wh_idem/b8/")
+                || k.ends_with("/_wh_idem/floor")),
             "only buckets that expired whole are listed: {listed:?}"
+        );
+        assert_eq!(
+            listed.iter().filter(|k| k.ends_with("/floor")).count(),
+            1,
+            "{listed:?}"
         );
         // Nothing more to do now: the next pass touches nothing but the
         // floor it already holds.

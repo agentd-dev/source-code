@@ -1135,7 +1135,8 @@ request is in:
   the sender retries; a route's `signal:` waits for the same point, so a retried delivery
   wakes a waiter once. Under `store.on_error: degrade` a failed write is reported as made,
   and "kept" is only as true as the store. A marker answers replays for seven days, and a
-  sweep removes it after that (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`).
+  sweep removes it after that (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`) — on a store
+  that cannot `list`, through an index of each period's markers.
 - **A webhook wait outlives a restart without its secret at rest.** Its durable wait record
   keeps the route's path and its `auth` as written — `{{secret:…}}` references, never a
   resolved value — and boot serves the callback again, resolving them then

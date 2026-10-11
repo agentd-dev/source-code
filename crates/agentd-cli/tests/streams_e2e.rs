@@ -9,6 +9,44 @@
 
 mod common;
 
+#[cfg(any(
+    feature = "hot-reload",
+    feature = "metrics",
+    feature = "internal-mocks"
+))]
+use daemon::Daemon;
+
+#[cfg(any(
+    feature = "hot-reload",
+    feature = "metrics",
+    feature = "internal-mocks"
+))]
+mod daemon {
+    /// A daemon a test started, killed however the test ends: a failed wait
+    /// panics past the test's own teardown, and the daemon outlived it.
+    pub struct Daemon(pub std::process::Child);
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl std::ops::Deref for Daemon {
+        type Target = std::process::Child;
+        fn deref(&self) -> &std::process::Child {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Daemon {
+        fn deref_mut(&mut self) -> &mut std::process::Child {
+            &mut self.0
+        }
+    }
+}
+
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
@@ -908,13 +946,15 @@ fn a_consumer_removed_while_held_says_so_again_when_it_returns() {
     let cfg_path = common::unique_path("streams-held-reload", "json");
     std::fs::write(&cfg_path, cfg(true)).unwrap();
     let err_path = common::unique_path("streams-held-reload", "log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg_path])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
-        .spawn()
-        .expect("spawn");
+    let mut child = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+            .spawn()
+            .expect("spawn"),
+    );
     let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
     let wait_for = |what: &str, cond: &dyn Fn(&str) -> bool| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1235,13 +1275,15 @@ fn the_lag_gauge_counts_what_a_held_consumer_has_not_consumed() {
     let cfg_path = common::unique_path("streams-lag", "json");
     std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
     let err_path = common::unique_path("streams-lag", "log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg_path])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
-        .spawn()
-        .expect("spawn");
+    let mut child = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+            .spawn()
+            .expect("spawn"),
+    );
     let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
     let want = "agent_stream_lag{stream=\"ticks\",consumer=\"tail/take\"} 3";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1316,13 +1358,15 @@ fn a_frozen_consumer_holds_its_events_until_it_can_fire_them() {
     let cfg_path = common::unique_path("streams-frozen", "json");
     std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
     let err_path = common::unique_path("streams-frozen", "log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg_path])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
-        .spawn()
-        .expect("spawn");
+    let mut child = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+            .spawn()
+            .expect("spawn"),
+    );
     let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
     let wait_for = |what: &str, cond: &dyn Fn(&str) -> bool| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

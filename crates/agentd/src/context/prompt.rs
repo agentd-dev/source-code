@@ -111,7 +111,7 @@ impl Template {
     /// an absent-at-runtime value (no peers yet) is normal, not an error.
     pub fn render(&self, data: &Data) -> Result<String, String> {
         let mut out = String::new();
-        render_nodes(&self.nodes, data, &mut out, 0)?;
+        render_nodes(&self.nodes, Scope { data, locals: None }, &mut out, 0)?;
         Ok(out)
     }
 }
@@ -284,7 +284,47 @@ fn bare_path(expr: &str) -> Option<&str> {
     }
 }
 
-fn render_nodes(nodes: &[Node], data: &Data, out: &mut String, depth: usize) -> Result<(), String> {
+/// What a node renders against: the template's data, with the innermost
+/// `#each`'s `this` and `@index` laid over it. Laid over, not copied in: a
+/// copy of the data per item made an `#each` over a long list cost the list's
+/// length times everything the template can see.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    data: &'a Data,
+    locals: Option<&'a Data>,
+}
+
+impl Scope<'_> {
+    fn lookup(&self, path: &str) -> Option<Value> {
+        let head = path.split('.').next().unwrap_or(path);
+        match self.locals {
+            Some(l) if l.contains_key(head) => lookup(path, l),
+            _ => lookup(path, self.data),
+        }
+    }
+
+    /// Every name in scope, a local hiding the data's of the same name.
+    fn vars(&self) -> Vec<(&str, &Value)> {
+        let local = |k: &str| self.locals.is_some_and(|l| l.contains_key(k));
+        let mut vars: Vec<(&str, &Value)> = self
+            .data
+            .iter()
+            .filter(|(k, _)| !local(k))
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        if let Some(l) = self.locals {
+            vars.extend(l.iter().map(|(k, v)| (k.as_str(), v)));
+        }
+        vars
+    }
+}
+
+fn render_nodes(
+    nodes: &[Node],
+    scope: Scope,
+    out: &mut String,
+    depth: usize,
+) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err("template recursion exceeded".into());
     }
@@ -297,7 +337,7 @@ fn render_nodes(nodes: &[Node], data: &Data, out: &mut String, depth: usize) -> 
         match n {
             Node::Text(t) => out.push_str(t),
             Node::Interp(e) => {
-                let v = eval(e, data)?;
+                let v = eval(e, scope)?;
                 out.push_str(&stringify(&v));
             }
             Node::If {
@@ -305,12 +345,12 @@ fn render_nodes(nodes: &[Node], data: &Data, out: &mut String, depth: usize) -> 
                 then,
                 otherwise,
             } => {
-                let v = eval(expr, data)?;
+                let v = eval(expr, scope)?;
                 let branch = if truthy(&v) { then } else { otherwise };
-                render_nodes(branch, data, out, depth + 1)?;
+                render_nodes(branch, scope, out, depth + 1)?;
             }
             Node::Each { expr, body } => {
-                let v = eval(expr, data)?;
+                let v = eval(expr, scope)?;
                 let items: Vec<Value> = match v {
                     Value::Array(a) => a,
                     Value::Null => Vec::new(),
@@ -319,11 +359,16 @@ fn render_nodes(nodes: &[Node], data: &Data, out: &mut String, depth: usize) -> 
                     Value::Object(o) => o.into_values().collect(),
                     other => vec![other],
                 };
-                for (i, item) in items.iter().enumerate() {
-                    let mut scoped = data.clone();
-                    scoped.insert("this".into(), item.clone());
-                    scoped.insert("@index".into(), Value::from(i as u64));
-                    render_nodes(body, &scoped, out, depth + 1)?;
+                for (i, item) in items.into_iter().enumerate() {
+                    let locals = Data::from([
+                        ("this".to_string(), item),
+                        ("@index".to_string(), Value::from(i as u64)),
+                    ]);
+                    let inner = Scope {
+                        data: scope.data,
+                        locals: Some(&locals),
+                    };
+                    render_nodes(body, inner, out, depth + 1)?;
                 }
             }
         }
@@ -332,12 +377,11 @@ fn render_nodes(nodes: &[Node], data: &Data, out: &mut String, depth: usize) -> 
 }
 
 /// Path first, CEL second. A missing path is empty (see `Template::render`).
-fn eval(expr: &str, data: &Data) -> Result<Value, String> {
+fn eval(expr: &str, scope: Scope) -> Result<Value, String> {
     if let Some(p) = bare_path(expr) {
-        return Ok(lookup(p, data).unwrap_or(Value::Null));
+        return Ok(scope.lookup(p).unwrap_or(Value::Null));
     }
-    let vars: Vec<(&str, &Value)> = data.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    crate::cel::eval_value(expr, &vars).map_err(|e| format!("{expr:?}: {e}"))
+    crate::cel::eval_value(expr, &scope.vars()).map_err(|e| format!("{expr:?}: {e}"))
 }
 
 fn stringify(v: &Value) -> String {
@@ -474,8 +518,33 @@ mod tests {
     fn a_runaway_each_is_capped_not_unbounded() {
         let t = Template::parse("{{#each xs}}{{this}}{{/each}}").unwrap();
         let big: Vec<Value> = (0..60_000).map(|_| json!("0123456789")).collect();
+        // Capped quickly, too: each item is laid over the data, not a copy
+        // of it — which made this one render take over a minute.
+        let started = std::time::Instant::now();
         let e = t.render(&data(&[("xs", Value::Array(big))])).unwrap_err();
         assert!(e.contains("exceeds"), "{e}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An inner `#each` sees its own `this` and `@index`, and the data around
+    /// both stays in scope.
+    #[test]
+    fn a_nested_each_scopes_this_to_its_own_items() {
+        let t = Template::parse(
+            "{{#each groups}}[{{this.name}}:{{#each members}}{{this}}{{@index}}{{/each}}]{{/each}}",
+        )
+        .unwrap();
+        let out = t
+            .render(&data(&[
+                ("groups", json!([{"name": "a"}, {"name": "b"}])),
+                ("members", json!(["x", "y"])),
+            ]))
+            .unwrap();
+        assert_eq!(out, "[a:x0y1][b:x0y1]");
     }
 
     #[test]

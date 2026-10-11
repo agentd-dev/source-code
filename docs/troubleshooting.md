@@ -148,9 +148,9 @@ where nothing was ready and nothing was in flight. The usual causes:
   dependency was pruned is pruned too, and a `finish` that depends only on
   an untaken `switch` case or a false guard never runs. Make the `finish`
   depend on every arm, or give each arm its own `finish`.
-- **A step depends on a wait's `on_timeout` target.** The target runs only
-  when the timeout routes to it. When the wait succeeds instead, a step that
-  depends on the target never becomes ready. Give the timeout branch its own
+- **A step depends on a wait and on its `on_timeout` target.** When the
+  wait times out, it did not succeed, so that step never becomes ready and
+  the run ends without reaching a `finish`. Give the timeout branch its own
   path to a `finish`.
 - **A step failed first.** The error then names it: `step "x" failed first:
   …`. The run ends `failed`, not `stalled`. Look at that step, not the one
@@ -197,8 +197,6 @@ These behave as designed, and surprise people anyway:
 - **Workflows loaded from files get no default store.** An instance whose
   long-lived workflows all come from `file:` or `dir:` entries starts with
   no durable store. Set `store.kind` explicitly.
-- **A `race` ignores `min_success`.** It completes with the first branch
-  to succeed.
 
 ## MCP connection problems
 

@@ -564,19 +564,7 @@ impl Runtime {
         // person is still there and a second try is cheaper than a dead run.
         let mut shaped: Option<Value> = None;
         if let Some(schema) = schema.clone() {
-            let value = match crate::mcp::elicit::shape_reply(&json!(text), &schema) {
-                ::mcp::inbound::Answer::Accept(v) => v,
-                // Cancel/Decline: the person declined to answer in the declared
-                // shape, which is a real answer, not a validation failure — but
-                // a primitive schema's answer is that primitive (`"true"` for
-                // `{type: boolean}`).
-                _ => schema
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .filter(|t| matches!(*t, "boolean" | "number" | "integer"))
-                    .and_then(|t| crate::mcp::elicit::coerce(text.trim(), t))
-                    .unwrap_or_else(|| json!(text)),
-            };
+            let value = shape_answer(text, &schema);
             shaped = Some(value.clone());
             if let Err(errs) = crate::jsonschema::validate(&schema, &value) {
                 let q = question.clone();
@@ -661,7 +649,9 @@ impl Runtime {
         //
         // A workflow `human` step is NOT a tool result: the answer itself is
         // the step's output, and later steps template on
-        // `steps.<gate>.output`, so a step keeps the bare reply.
+        // `steps.<gate>.output` — in its declared shape when the step has a
+        // schema, so `steps.<gate>.output.<field>` reads the answer, else the
+        // bare reply.
         //
         // A policy gate's answer is neither: it is a decision about the call
         // the gate holds, and the asker is owed that call's own result.
@@ -676,7 +666,9 @@ impl Runtime {
         }
         let result = match &p.target {
             Target::Child(..) => json!({"reply": text, "timed_out": false, "via": via}),
-            Target::Step(..) => Value::String(text.to_string()),
+            Target::Step(..) => shaped
+                .clone()
+                .unwrap_or_else(|| Value::String(text.to_string())),
         };
         self.reply(&p.target, result, false);
     }
@@ -1347,6 +1339,22 @@ fn human_decision_call(
         ),
     };
     json!({"answer": answer, "usage": super::goal::usage_value(usage), "decision": record})
+}
+
+/// A reply in the shape its schema declares: the object or value the reply
+/// parses to, or — a reply that does not parse, which is a real answer, not a
+/// validation failure — a primitive schema's primitive (`true` for
+/// `{type: boolean}`), else the text.
+pub(crate) fn shape_answer(text: &str, schema: &Value) -> Value {
+    match crate::mcp::elicit::shape_reply(&json!(text), schema) {
+        ::mcp::inbound::Answer::Accept(v) => v,
+        _ => schema
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|t| matches!(*t, "boolean" | "number" | "integer"))
+            .and_then(|t| crate::mcp::elicit::coerce(text.trim(), t))
+            .unwrap_or_else(|| json!(text)),
+    }
 }
 
 #[cfg(test)]

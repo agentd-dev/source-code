@@ -338,10 +338,12 @@ route:
 
 Runs named branches at once and keeps every result.
 
-- **Fields:** **`branches`**, `on_error`.
+- **Fields:** **`branches`**, `on_error`, `min_success`.
 - **Output:** an object keyed by branch name, each branch's result, plus
   `_errors` when a branch failed.
 - A branch failure fails the step only when `on_error` is `fail` (default).
+  `min_success: n` fails it when fewer than `n` branches succeed; its
+  `on_error` then decides what follows, as for any failure.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -358,13 +360,10 @@ gather:
 
 Runs named branches at once and keeps the first to finish.
 
-- **Fields:** **`branches`**, `timeout`, `min_success`.
+- **Fields:** **`branches`**, `timeout`.
 - **Output:** `{winner, output}`. The other branches are cancelled.
 - If every branch fails, the step fails; if `timeout` passes first, it ends
   `timeout`.
-
-> **Limit.** `min_success` is accepted but has no effect: a race always
-> completes with its first finished branch.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -673,10 +672,11 @@ Asks a person a question and suspends until they answer, across restarts.
 answer.
 
 - **Fields:** **`question`**, `schema`, `to`, `timeout`.
-- **Output:** the answer as the text the person sent.
+- **Output:** the answer: in the `schema`'s shape when the step declares
+  one (an object whose fields `steps.<gate>.output.<field>` reads, or a
+  boolean or number), else the text the person sent.
 - `schema` is enforced: a reply that does not match re-asks with the
-  reason. The step's output is still the reply text, not a parsed object;
-  branch on it with a `switch` over an `enum` schema.
+  reason.
 - `to` names who must answer: `{role: operator}`, optionally narrowed by
   `labels`, or the id `operator`. A `to` that names anyone else is refused
   at load. In an instruction document, `to: "@human/<name>"` addresses one of

@@ -346,11 +346,11 @@ Required fields in **bold**.
 | Kind | What it does |
 |---|---|
 | `switch` | branch on a value — **`on`**, **`cases`**, `default` |
-| `parallel` | run **`branches`** concurrently; `on_error` |
+| `parallel` | run **`branches`** concurrently; `on_error`, `min_success` |
 | `foreach` | run **`body`** per element of **`over`**; `batch`, `collect`, `on_error`, `as` |
 | `batch` | like `foreach` but in groups — **`over`**, **`body`**, `by`, `size`, `parallel`, `rate` |
 | `iterate` | repeat **`body`** while/until a condition; `max_iterations`, `collect` |
-| `race` | first of **`branches`** to finish wins; `timeout`, `min_success` |
+| `race` | first of **`branches`** to finish wins; `timeout` |
 | `join` | await **`handles`** from async children; `timeout`, `min`, `partials` |
 | `subgraph` | an inline nested graph — **`body`** |
 | `workflow` | start a child run — **`name`**, `mode: sync\|async\|detached`, `inputs`, `start`, `cascade` |

@@ -470,7 +470,10 @@ impl Runtime {
             output_schema: None,
             max_rounds: 0,
             budget_admission: self.governor.is_active(),
-            idempotency_prefix: format!("{}/{ctx_id}", self.instance),
+            // The process's nonce keeps a key from repeating after a
+            // restart, where turn ids begin again: a server that dedupes on
+            // it would otherwise answer a new call with an old result.
+            idempotency_prefix: format!("{}/{}/{ctx_id}", self.instance, self.process_nonce),
             tool_meta: Some(json!({"agent/ctx": ctx_id, "agent/instance": self.instance})),
             temperature: None,
             max_tokens_per_call: 0,

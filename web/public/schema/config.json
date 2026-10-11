@@ -2050,7 +2050,8 @@
       "parallel": {
         "fields": [
           "branches",
-          "on_error"
+          "on_error",
+          "min_success"
         ],
         "implemented": true,
         "required": [
@@ -2072,8 +2073,7 @@
       "race": {
         "fields": [
           "branches",
-          "timeout",
-          "min_success"
+          "timeout"
         ],
         "implemented": true,
         "required": [

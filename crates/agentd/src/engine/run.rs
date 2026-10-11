@@ -611,7 +611,12 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
             // An `on_timeout` target is reached by ROUTING only: dep-less by
             // design (depending on the wait would also fire it on success),
             // it stays parked until the timeout forces it — and so does its
-            // decision guard, which inherits its (absent) dependencies.
+            // decision guard, which inherits its (absent) dependencies. Once
+            // every step that could route to it (by `on_timeout`, by
+            // `on_error: goto`, or as a `switch` case) has ended without
+            // doing so, it is pruned, as a body prunes one: left parked, a
+            // step depending on it could never run, and the run stalled when
+            // the wait succeeded.
             let parked = step.guarding.as_deref().unwrap_or(id.as_str());
             if step.depends_on.is_empty()
                 && !step.is_start()
@@ -620,6 +625,16 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
                     .values()
                     .any(|s| s.field_str("on_timeout") == Some(parked))
             {
+                let ended = wf
+                    .steps
+                    .values()
+                    .filter(|s| s.routes_to(parked))
+                    .all(|s| run.steps.get(&s.id).is_some_and(|t| t.status.is_terminal()));
+                let routed = run.steps.get(parked).is_some_and(|t| t.forced);
+                if ended && !routed {
+                    run.end_step(&id, StepStatus::Pruned, None, None);
+                    changed = true;
+                }
                 continue;
             }
             // Transitive pruning. A step whose dependencies are ALL pruned can

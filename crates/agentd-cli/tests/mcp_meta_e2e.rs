@@ -225,3 +225,97 @@ fn probe(protocol_version: &str) -> common::MockMcp {
     let _ = std::fs::remove_file(&cfg);
     mock
 }
+
+/// A turn's `agent/idempotency_key` does not repeat across the lives of an
+/// instance. Turn ids begin again in every process, so two runs of the same
+/// prompt sent the same key, and a server that dedupes on it would have
+/// answered the second call with the first one's result.
+#[test]
+fn a_turns_idempotency_key_does_not_repeat_across_restarts() {
+    let mock = common::spawn_mock_mcp("mock://noop", false);
+    let llm = spawn_mock_llm(&json!({"turns": [
+        {"tool_calls": [{"name": "mock.ops", "arguments": {}}]},
+        {"content": "counted"}
+    ]}));
+    // The same run id in both lives, as an operator who pins it to the unit
+    // of work has: the key is still each life's own.
+    let life = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([
+                "--prompt",
+                "count the operations",
+                "--intelligence",
+                &llm.uri,
+                "--model",
+                "mock",
+                "--mcp",
+                &format!("mock={}", mock.uri()),
+                "--run-id",
+                "pinned-run",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run agentd");
+        let log = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(out.status.code(), Some(0), "{log}");
+    };
+    life();
+    life();
+    let keys: Vec<String> = calls(&mock)
+        .into_iter()
+        .filter(|p| p["name"] == "mock.ops")
+        .filter_map(|p| {
+            p["_meta"]["agent/idempotency_key"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(keys.len(), 2, "{}", mock.log());
+    assert_ne!(keys[0], keys[1], "the second life repeated the first's key");
+}
+
+/// A call the supervisor makes for a turn — here a `knowledge.search` the
+/// profile server implements — carries a key of this process and this
+/// child: the child's request ids begin at 1 in every turn, so the key
+/// repeated across turns and across lives.
+#[test]
+fn a_supervisor_call_for_a_turn_has_a_key_of_its_own() {
+    let mock = common::spawn_mock_mcp("mock://noop", false);
+    let llm = spawn_mock_llm(&json!({"turns": [
+        {"tool_calls": [{"name": "knowledge.search", "arguments": {"query": "q"}}]},
+        {"content": "found"}
+    ]}));
+    let life = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([
+                "--prompt",
+                "look it up",
+                "--intelligence",
+                &llm.uri,
+                "--model",
+                "mock",
+                "--mcp",
+                &format!("mock={}", mock.uri()),
+                "--knowledge.server",
+                "mock",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run agentd");
+        let log = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(out.status.code(), Some(0), "{log}");
+    };
+    life();
+    life();
+    let keys: Vec<String> = calls(&mock)
+        .into_iter()
+        .filter(|p| p["name"] == "knowledge.search")
+        .filter_map(|p| {
+            p["_meta"]["agent/idempotency_key"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(keys.len(), 2, "{}", mock.log());
+    assert_ne!(keys[0], keys[1], "the second life repeated the first's key");
+}

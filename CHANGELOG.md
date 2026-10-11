@@ -41,6 +41,20 @@ named; those are fixed below.
   signal, or torn down by the supervisor. It stayed `running`, so a wait on
   it never answered and it held a `breadth` slot for ever. A child's
   deadline also bounds its model call in flight.
+- After a restart, a new subagent is not handed a restored one's handle,
+  which replaced the restored record. A turn's or a subagent's MCP
+  `agent/idempotency_key` is its process's and its child's own — they
+  repeated across turns and across lives, even with a pinned run id, and a
+  server that dedupes would have answered a new call with an old result. A
+  workflow step's key still holds across its retries.
+- A gate answer that is a whole number stays one (`5`, not `5.0`).
+- A wait's `on_timeout` target that the timeout never routes to is pruned
+  once the wait has ended, so a step depending on both paths goes on with
+  the live one; the run stalled when the wait succeeded.
+- A `human` step with a `schema` outputs the answer in that shape — a
+  person's, or the one `agent.approval: accept` takes — so a later step
+  reads `steps.<gate>.output.<field>`; the output was the reply text, and a
+  path into it never resolved.
 
 **Security.**
 
@@ -79,6 +93,8 @@ it, `a2a.listen`, `webhooks.listen` and `a2a.peers` (`a2a`),
 `auth` or `oauth` (`oauth`), and `lifecycle.watch_config` (`config-watch`).
 A subagent's `tools` grant names tools as the agent's catalogue does: with a
 server's `ns` prefix, and `<server>.<tool>` where the name is taken.
+`min_success` belongs to `parallel`, which reads it, and is refused on a
+`race`, which accepted it and did nothing with it.
 
 **Removed.** Keys that were accepted and read by nothing:
 `observability.report_file` (`--report-file`), `observability.otel.traces`,

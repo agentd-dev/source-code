@@ -639,6 +639,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         trace_id: Some(trace.trace_id.clone()),
         started: Instant::now(),
         seq: 0,
+        process_nonce: crate::state::ulid::new(),
         counters: Default::default(),
         job_runs: Vec::new(),
         executing: BTreeMap::new(),
@@ -756,6 +757,15 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             ),
         }
     }
+    // Ids carry on above the highest a restored record holds. The counter
+    // began at 0 in every process, so a new child could be handed `sub-1`
+    // while a restored `sub-1` stood, and its record replaced the old one.
+    rt.seq = rt
+        .subagents
+        .keys()
+        .filter_map(|h| h.rsplit_once('-').and_then(|(_, n)| n.parse::<u64>().ok()))
+        .max()
+        .unwrap_or(0);
     #[cfg(feature = "a2a")]
     {
         rt.restore_a2a_tasks(restored.of(Kind::Task));

@@ -59,6 +59,28 @@ impl ToolCaller {
     }
 }
 
+impl Runtime {
+    /// A tool call's `agent/idempotency_key`. A workflow step's says which
+    /// call it is by its run and step, and stays the same across the step's
+    /// retries and a restart. A turn's or a subagent's carries this process
+    /// and the child: a child's request ids begin at 1 in every child, so
+    /// two turns of one conversation sent the same key, and so did two lives
+    /// of the instance.
+    pub(crate) fn idempotency_key(&self, caller: &ToolCaller) -> String {
+        if caller.subagent.is_none() && caller.run.is_some() && caller.step.is_some() {
+            return format!("{}/{}#{}", self.instance, caller.label(), caller.req);
+        }
+        format!(
+            "{}/{}@{}.{}#{}",
+            self.instance,
+            caller.label(),
+            self.process_nonce,
+            caller.node.map_or(0, |n| n.0),
+            caller.req
+        )
+    }
+}
+
 /// The result of executing a tool.
 pub(crate) enum ToolOutcome {
     Ready(Value, bool),
@@ -365,7 +387,7 @@ impl Runtime {
         // `_meta` carried run, step, instance, idempotency key and attempt —
         // and nothing about WHO the work is for, so a server could neither
         // authorize nor attribute per person.
-        let mut meta = json!({"agent/idempotency_key": format!("{}/{}#{}", self.instance, caller.label(), caller.req), "agent/instance": self.instance});
+        let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
         meta["agent/acting_for"] = json!(
             caller.principal.clone().unwrap_or_else(|| self
                 .settings
@@ -439,7 +461,7 @@ impl Runtime {
         // `_meta` carried run, step, instance, idempotency key and attempt —
         // and nothing about WHO the work is for, so a server could neither
         // authorize nor attribute per person.
-        let mut meta = json!({"agent/idempotency_key": format!("{}/{}#{}", self.instance, caller.label(), caller.req), "agent/instance": self.instance});
+        let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
         meta["agent/acting_for"] = json!(
             caller.principal.clone().unwrap_or_else(|| self
                 .settings

@@ -167,10 +167,13 @@ pub(crate) fn coerce(text: &str, declared: &str) -> Option<Value> {
             _ => None,
         },
         "integer" => text.parse::<i64>().ok().map(|n| json!(n)),
-        "number" => text
-            .parse::<f64>()
-            .ok()
-            .and_then(|n| serde_json::Number::from_f64(n).map(Value::Number)),
+        // A whole number stays whole: `5`, not `5.0`, which a template would
+        // render and a `switch` would key on.
+        "number" => text.parse::<i64>().ok().map(|n| json!(n)).or_else(|| {
+            text.parse::<f64>()
+                .ok()
+                .and_then(|n| serde_json::Number::from_f64(n).map(Value::Number))
+        }),
         _ => None,
     }
 }
@@ -178,6 +181,14 @@ pub(crate) fn coerce(text: &str, declared: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole number stays whole: `5`, which renders as `5`, not `5.0`.
+    #[test]
+    fn a_whole_number_coerces_to_a_whole_number() {
+        assert_eq!(coerce("5", "number"), Some(json!(5)));
+        assert_eq!(coerce("5.5", "number"), Some(json!(5.5)));
+        assert_eq!(coerce("x", "number"), None);
+    }
 
     fn one_prop(name: &str, ty: &str) -> Value {
         json!({"type": "object", "properties": { name: {"type": ty} }})

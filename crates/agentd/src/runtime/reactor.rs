@@ -460,6 +460,10 @@ pub struct Runtime {
     pub(crate) trace_id: Option<String>,
     pub(crate) started: Instant,
     pub(crate) seq: u64,
+    /// Minted once per process, so a key made of counters that begin again
+    /// in every process — turn ids, a child's request ids — is this life's
+    /// alone. Not the run id, which an operator may pin across lives.
+    pub(crate) process_nonce: String,
     pub(crate) counters: Counters,
     /// The `once`-started run(s) whose finish decides a job's exit code.
     pub(crate) job_runs: Vec<String>,

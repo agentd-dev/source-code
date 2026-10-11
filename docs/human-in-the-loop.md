@@ -112,15 +112,12 @@ accepted: the question is asked again with the reason appended, such as
 
 ## Route on the answer
 
-The `human` step's output is the text the person sent, such as `"publish"`,
-even when the schema describes an object. Branch on it with a `switch`, as
-above, and give the answer a closed shape with an `enum`, so the `switch`
-cases are exactly the answers the schema allows.
-
-> **Note.** Because the output is text, a path into it such as
-> `{{ steps.approve.output.approved }}` never resolves, and a fallback
-> (`| false`) always applies. Use an `enum` and a `switch`, or a `parse`
-> step on the reply when the schema is an object.
+The `human` step's output is the answer in its schema's shape: the string
+`"publish"` here, `true` for a boolean schema, and an object for an object
+schema, whose fields later steps read as `{{ steps.approve.output.approved }}`.
+Without a schema it is the text the person sent. Branch on it with a
+`switch`, as above, and give the answer a closed shape with an `enum`, so
+the `switch` cases are exactly the answers the schema allows.
 
 A gate that is not answered before its `timeout` (24 hours when unset)
 fails the step. With `on_error: continue` it is marked done with an error

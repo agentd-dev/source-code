@@ -243,7 +243,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "parallel",
         false,
-        &["branches", "on_error"],
+        &["branches", "on_error", "min_success"],
         &["branches"],
         true,
         true,
@@ -277,7 +277,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "race",
         false,
-        &["branches", "timeout", "min_success"],
+        &["branches", "timeout"],
         &["branches"],
         true,
         true,
@@ -977,6 +977,20 @@ impl Step {
     }
     pub fn field_str(&self, name: &str) -> Option<&str> {
         self.spec.get(name).and_then(Value::as_str)
+    }
+    /// Whether one of this step's routing edges can run `target`: its
+    /// `on_timeout`, its `on_error: goto`, or — a `switch` — a case or the
+    /// default naming it.
+    pub fn routes_to(&self, target: &str) -> bool {
+        self.field_str("on_timeout") == Some(target)
+            || matches!(&self.on_error, OnError::Goto(t) if t == target)
+            || (self.kind == "switch"
+                && (self.field_str("default") == Some(target)
+                    || self
+                        .spec
+                        .get("cases")
+                        .and_then(Value::as_object)
+                        .is_some_and(|c| c.values().any(|v| v.as_str() == Some(target)))))
     }
 }
 
@@ -3383,6 +3397,27 @@ mod tests {
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {
         parse_workflow(&doc)
+    }
+
+    /// `min_success` is a `parallel`'s: how many branches must succeed. A
+    /// race keeps its first finisher, so the field is refused there rather
+    /// than accepted to do nothing.
+    #[test]
+    fn min_success_is_a_parallels() {
+        let with = |kind: &str| {
+            wf(serde_json::json!({
+                "name": "w",
+                "steps": {
+                    "go": {"kind": "manual"},
+                    "p": {"kind": kind, "depends_on": ["go"], "min_success": 1,
+                          "branches": {"a": {"steps": {"x": {"kind": "assign", "value": 1}}}}},
+                    "fin": {"kind": "finish", "depends_on": ["p"]}
+                }
+            }))
+        };
+        assert!(with("parallel").is_ok(), "{:?}", with("parallel"));
+        let e = with("race").unwrap_err().join("; ");
+        assert!(e.contains("unknown field \"min_success\""), "{e}");
     }
 
     /// A message wait says whose message it waits for. `a2a.wait` must — a

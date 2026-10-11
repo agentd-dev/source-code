@@ -400,3 +400,54 @@ fn each_body_step_runs_once() {
         );
     }
 }
+
+/// A wait's `on_timeout` target that the timeout never routes to is pruned
+/// once the wait has ended, as a body prunes one — so a step depending on
+/// both paths goes on with the live one. At the top level the target stayed
+/// parked, and the run stalled when the wait succeeded.
+#[cfg(feature = "cel")]
+#[test]
+fn an_unrouted_timeout_target_is_pruned_and_the_run_goes_on() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:    {{ kind: once }}\n\
+         \x20     w:    {{ kind: wait, depends_on: [s], on: condition, condition: \"true\", timeout: 30s, on_timeout: late }}\n\
+         \x20     late: {{ kind: assign, value: \"timed out\" }}\n\
+         \x20     f:    {{ kind: finish, depends_on: [w, late], status: completed, output: {{ late: \"{{{{ /steps/late/status }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["late"], "pruned", "{out}\n{log}");
+    assert!(!started(&log, "late"), "{log}");
+}
+
+/// A target a `switch` can still route to is not pruned when its wait ends:
+/// the switch's case is an edge to it as much as the timeout is.
+#[cfg(feature = "cel")]
+#[test]
+fn a_timeout_target_a_switch_can_still_route_to_waits_for_the_switch() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:    {{ kind: once }}\n\
+         \x20     w:    {{ kind: wait, depends_on: [s], on: condition, condition: \"true\", timeout: 30s, on_timeout: page }}\n\
+         \x20     r:    {{ kind: switch, depends_on: [w], on: urgent, cases: {{ urgent: page }} }}\n\
+         \x20     page: {{ kind: assign, value: paged }}\n\
+         \x20     fin:  {{ kind: finish, depends_on: [page], status: completed, output: {{ v: \"{{{{ steps.page.output }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["v"], "paged", "{out}\n{log}");
+}
+
+/// A gate the approval policy answers at once — `accept` takes the schema's
+/// default — outputs it in the schema's shape, as a person's answer is.
+#[test]
+fn a_gate_accepted_by_policy_outputs_the_shaped_answer() {
+    let (code, out, log) = run(&format!(
+        "{}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:    {{ kind: once }}\n\
+         \x20     gate: {{ kind: human, depends_on: [s], question: \"Ship it?\", schema: {{ type: object, properties: {{ approved: {{ type: boolean }} }}, default: {{ approved: true }} }} }}\n\
+         \x20     fin:  {{ kind: finish, depends_on: [gate], status: completed, output: {{ v: \"approved={{{{ steps.gate.output.approved }}}}\" }} }}\n",
+        BASE.replace("agent: { name: r }", "agent: { name: r, approval: accept }")
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["v"], "approved=true", "{out}\n{log}");
+}

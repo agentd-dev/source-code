@@ -220,3 +220,46 @@ fn a_childs_deadline_cuts_off_its_model_call() {
     let _ = std::fs::remove_file(&cfg);
     let _ = std::fs::remove_file(&play);
 }
+
+/// Handles carry on after a restart. The counter began at 0 in every
+/// process, so the second life's first child was handed `sub-1` again while
+/// the first life's `sub-1` record stood, and replaced it.
+#[test]
+fn a_restart_does_not_hand_out_a_restored_handle_again() {
+    let play = playbook(json!({"turns": [{"content": "done"}]}));
+    let store = common::unique_path("outcomes-store", "d");
+    let life = |workflow: &str| {
+        let path = common::unique_path("outcomes", "yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "agent: {{ name: o }}\nstore: {{ kind: file, file: {{ path: {store} }} }}\nobservability: {{ log_level: info }}\n\
+                 intelligence: {{ endpoints: \"mock:file:{play}\", model: m }}\n\
+                 workflows:\n  - name: {workflow}\n    steps:\n\
+                 \x20     s: {{ kind: once }}\n\
+                 \x20     sub: {{ kind: subagent, depends_on: [s], durable: true, instruction: \"Say done.\" }}\n\
+                 \x20     f: {{ kind: finish, depends_on: [sub], status: completed }}\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &path])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        let _ = std::fs::remove_file(&path);
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    let handle = |log: &str| {
+        events(log, "subagent.spawn")
+            .first()
+            .and_then(|e| e["handle"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("no spawn: {log}"))
+    };
+    let first = life("one");
+    assert_eq!(handle(&first), "sub-1", "{first}");
+    let second = life("two");
+    assert_eq!(handle(&second), "sub-2", "{second}");
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_file(&play);
+}

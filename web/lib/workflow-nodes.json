@@ -696,7 +696,8 @@
     "category": "control",
     "fields": [
       "branches",
-      "on_error"
+      "on_error",
+      "min_success"
     ],
     "implemented": true,
     "kind": "parallel",
@@ -722,8 +723,7 @@
     "category": "control",
     "fields": [
       "branches",
-      "timeout",
-      "min_success"
+      "timeout"
     ],
     "implemented": true,
     "kind": "race",

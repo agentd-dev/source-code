@@ -534,6 +534,36 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// A gate with a schema answers in that shape: the step's output is the
+/// shaped answer, so a later step reads `steps.<gate>.output.<field>` —
+/// which never resolved while the output was the reply text.
+#[test]
+fn a_human_node_with_a_schema_outputs_the_shaped_answer() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the deploy?\", depends_on: [s], schema: {type: object, properties: {approved: {type: boolean}}, required: [approved]}}\n      f: {kind: finish, depends_on: [gate], output: \"approved={{ steps.gate.output.approved }}\"}\n";
+    let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
+    let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
+    let task_id = started["task"]["id"].as_str().unwrap().to_string();
+    wait_task(&addr, &task_id, 10, "run gate", |t| {
+        t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+    });
+    SendMessage::text("{\"approved\": true}")
+        .task(&task_id)
+        .return_immediately()
+        .result(&addr);
+    let done = wait_task(&addr, &task_id, 10, "run completion", |t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+    });
+    assert!(
+        done["artifacts"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approved=true"),
+        "{done}"
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
 /// A gate that names a decider is only worth declaring if someone else cannot
 /// satisfy it. An OPERATOR can — refusing them would be theatre, since they
 /// can already rewrite the config, the store or the definition — but the

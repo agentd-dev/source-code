@@ -583,7 +583,7 @@ impl Runtime {
                 }
                 // An `on_timeout` target is reached by routing only: parked
                 // until an edge forces it — its decision guard with it — and
-                // pruned once every step that could route to it (by
+                // pruned once every step that could route to it (by a `switch`,
                 // `on_timeout`, or by `on_error: goto` as well) has ended
                 // without doing so.
                 let parked = step.guarding.as_deref().unwrap_or(id.as_str());
@@ -596,10 +596,7 @@ impl Runtime {
                     let sources: Vec<&String> = body
                         .steps
                         .values()
-                        .filter(|s| {
-                            s.field_str("on_timeout") == Some(parked)
-                                || matches!(&s.on_error, OnError::Goto(t) if t == parked)
-                        })
+                        .filter(|s| s.routes_to(parked))
                         .map(|s| &s.id)
                         .collect();
                     let routed = snapshot

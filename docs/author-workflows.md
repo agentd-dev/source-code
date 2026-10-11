@@ -535,9 +535,10 @@ workflows:
   event about its own order rather than the first one to arrive.
 - `on_timeout` makes the deadline a branch: `chase` runs, and the wait's
   dependents do not. The timeout target has no `depends_on`; it is reached
-  only by the edge. Give it its own path to a `finish`. A step that depends
-  on both the wait's success path and the timeout target never becomes
-  ready when the wait succeeds, and the run stalls.
+  only by the edge. Give it its own path to a `finish`. When the wait
+  succeeds instead, the target is pruned, so a step that depends on both
+  paths still runs; when it times out, that step does not, because the wait
+  ended without succeeding.
 - Signals are edge-triggered: a signal wakes only waits that are already
   suspended. Send one with the `workflow.signal` tool, a `workflow.signal`
   step, `/signal <name>` in the terminal UI, or a webhook's `signal:` field.

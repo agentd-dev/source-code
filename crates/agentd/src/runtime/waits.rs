@@ -332,6 +332,16 @@ impl Runtime {
                 }
                 match self.execute_tool(caller, "ask_human", args) {
                     ToolOutcome::Ready(v, is_error) => {
+                        // An answer the approval policy gave at once (the
+                        // recommended or default value) is the step's output
+                        // as a person's is: in the schema's shape, else text.
+                        let v = match (v.get("reply").and_then(Value::as_str), spec.get("schema")) {
+                            (Some(reply), Some(schema)) if !is_error => {
+                                super::human::shape_answer(reply, schema)
+                            }
+                            (Some(reply), None) if !is_error => Value::String(reply.to_string()),
+                            _ => v,
+                        };
                         let err = is_error.then(|| v.to_string());
                         self.finish_step_pub(
                             run_id,

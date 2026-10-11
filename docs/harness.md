@@ -443,13 +443,8 @@ These are accepted by design:
   manifest.
 - **cgroup limits may silently not apply** (above).
 
-And these are known gaps, stated here rather than discovered later:
+And this is a known gap, stated here rather than discovered later:
 
-- **Ids restart at 1.** The node and handle counter is process-local, so
-  after a restart a new subagent handle (`sub-1`) can collide with a
-  restored record, and a conversation turn's idempotency key can repeat.
-  Workflow runs are unaffected: they use ULIDs and a durable attempt
-  counter.
 - **A child that dies during setup is found by the reaper**, on the next
   tick, rather than the moment it fails. The reaper does fail its unit:
   a worker reaped while its step is still running fails the step and logs

@@ -135,7 +135,22 @@ fn top_level_properties(
             }));
     let endpoints = json!({ "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" });
     let dialect = json!({ "enum": ["openai", "anthropic", "bedrock", "decisions"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)" });
-    let role = |what: &str| json!({ "type": "string", "description": format!("the model {what}; default: roles.turn") });
+    // A role that writes takes a model; one that decides, a threshold too.
+    let writing_role = |what: &str| {
+        json!({ "oneOf": [
+        { "type": "string" },
+        { "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
+            "model": { "type": "string" } } }
+    ], "description": format!("the model {what} — a name, or {{model}}; default: roles.turn") })
+    };
+    let role = |what: &str| {
+        json!({ "oneOf": [
+        { "type": "string" },
+        { "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
+            "model": { "type": "string" },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "the least confidence the role's decisions are acted on with" } } }
+    ], "description": format!("the model {what} — a name, or {{model, confidence}}; default: roles.turn") })
+    };
     m.insert("intelligence".to_string(), json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -159,11 +174,14 @@ fn top_level_properties(
                             "window": { "type": "integer", "minimum": 1, "description": "this model's context window, so compaction stops guessing from the model NAME" },
                             "fallback": { "type": "string", "description": "the model used when this one is unavailable (every endpoint failed or broken open) — a ladder that walks down, across providers, instead of failing" } } } },
                     "roles": { "type": "object", "additionalProperties": false, "description": "which model each job runs on; each defaults to turn, and turn to intelligence.model", "properties": {
-                        "turn": { "type": "string", "description": "the model the agent's turns, agent/extract/summarize nodes and subagents run on; the same setting as intelligence.model (set one)" },
-                        "think": role("the think tool and think nodes run on"),
+                        "turn": { "oneOf": [
+                            { "type": "string" },
+                            { "type": "object", "additionalProperties": false, "required": ["model"], "properties": { "model": { "type": "string" } } }
+                        ], "description": "the model the agent's turns, agent/extract/summarize nodes and subagents run on; the same setting as intelligence.model (set one)" },
+                        "think": writing_role("the think tool and think nodes run on"),
                         "decide": role("classify, route and judge nodes run on"),
                         "preflight": role("preflight triage of an inbound message runs on"),
-                        "compaction": role("summarising the transcript runs on"),
+                        "compaction": writing_role("summarising the transcript runs on"),
                         "goal": role("the goal check runs on"),
                         "approve": role("that answers asks on the operator's behalf (approval: auto) runs on. Operator-only") } },
                     "dialect": dialect,

@@ -320,6 +320,25 @@ else. A node with no `model:` runs on its kind's role: `agent`, `extract` and
 `decide`. The goal check runs on `goal` and the `approval: auto` judge on
 `approve`.
 
+A role is a model's name, or `{model, confidence}` for a role that decides —
+`decide`, `preflight`, `goal`, `approve` — where `confidence` is the least
+sureness its decisions are acted on with; `turn`, `think` and `compaction`
+write and take no threshold. What a deciding role does on each kind:
+
+| Role | on a chat model | on a decision model |
+|---|---|---|
+| `preflight` | the structured triage it always was | one decision: `intent` (choice), `needs_plan` (noul), `risk` (choice), one noul per catalogued skill (up to 13, the decision's 16 questions; `preflight.skills_capped` says when more are left out); a plan it calls for is the turn's to write, and the turn is told |
+| `goal` | the judge it always was | `achieved` and `stuck` as two statements about the status, each true at 0.5 and, with a `confidence`, only when that sure |
+| `approve` | the judge it always was | a closed ask — its answer an `enum` or a boolean, at the top of its schema or as the schema's one property — as a choice; an open one to the `escalate` model when that model writes, else `UNDECIDED`; bound only with a `confidence`, which an escalated answer is held to as well |
+| `decide` | emulated decisions | native decisions; its `confidence` is the threshold of every deciding node and `decide` call that sets none |
+
+An answer under a role's `confidence` is asked once more on the model's
+`escalate` model when it names one; otherwise it reads as no answer:
+preflight treats the message as a `task` (as a missing verdict always did),
+the goal is neither achieved nor stuck, an approval stays `UNDECIDED`.
+Whatever the model, the `approve` judge never answers an ask whose run carries
+outside input ([experience.md](experience.md#approvals-and-steering)).
+
 **Providers.** Each provider gets its own client, endpoint failover, breakers
 and credential refresh. Every endpoint of a provider dials with the
 provider's own `token` (or `auth:`); the positional `AGENTD_INTELLIGENCE_TOKEN`

@@ -1296,6 +1296,11 @@ impl Runtime {
         let sure = args
             .get("confidence")
             .and_then(Value::as_f64)
+            .or_else(|| {
+                self.settings
+                    .intelligence
+                    .role_confidence(crate::config::settings::ModelRole::Decide)
+            })
             .map(|confidence| crate::subagent::protocol::Sureness {
                 confidence: confidence.clamp(0.0, 1.0),
                 on_unsure: if escalate.is_some() {

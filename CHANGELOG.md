@@ -219,7 +219,40 @@ tracks a draft.
 sent one at a time); agentd's answers to a server's requests are bounded at
 5s; an elicitation's `$schema` and property order are kept.
 
-### Kinds of intelligence (RFC 0046 P1, P2)
+### Kinds of intelligence (RFC 0046 P1, P2, P3)
+
+**Added (P3 — decisions in the loop).**
+
+- A role is a model's name or `{model, confidence}`: the threshold a
+  deciding role's answers are acted on with (`decide`, `preflight`, `goal`,
+  `approve`; refused on `turn`, `think`, `compaction`).
+- `roles.preflight` on a decision model: the message's intent, whether it
+  needs a plan, its risk and the skills it calls for, as one decision; a plan
+  it calls for, or a question it says must be asked, is the turn's to write
+  and the turn is told. An unsure answer leaves no verdict (the message is a
+  task).
+- `roles.goal` on a decision model: `achieved` and `stuck` as two
+  statements about the status.
+- `roles.approve` on a decision model: a closed ask (an `enum` or boolean
+  answer, at the top of its schema or as its one property) is a choice among
+  its answers, acted on only above the role's `confidence` — which a
+  decision-model approver must set, and which an escalated answer is held to
+  as well; an open question goes to the model's `escalate` model when that
+  model writes, or stays `UNDECIDED`. The judges' decisions are logged
+  (`intel.decision`, with the role).
+- `roles.decide`'s `confidence` is the threshold of every deciding node and
+  `decide` call that sets none.
+
+**Changed (P3).** No judge, on any kind of model, answers an ask on the
+operator's behalf when the run, subagent or peer conversation asking
+carries outside input: the ask fails with that reason
+(`human.judge.withheld`). The goal check's and the ask judge's tokens are
+charged to the instance budget and counted in the status tokens. A
+preflight that says a plan is needed (and wrote none) or the message is
+ambiguous now tells the turn so, on a chat model too — only when a turn
+runs. An auto-answer that does not fit the gate's schema fails the ask and
+answers the asker (it waited until its deadline); a gate whose schema is a
+bare boolean or number takes the answer as that value.
 
 **Added (P2 — decisions).**
 

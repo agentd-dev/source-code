@@ -158,7 +158,7 @@ pub(crate) fn shape_reply(reply: &Value, schema: &Value) -> Answer {
 
 /// Coerce a human's text to the schema's declared primitive. `None` when it
 /// plainly is not one (a word where a number was demanded).
-fn coerce(text: &str, declared: &str) -> Option<Value> {
+pub(crate) fn coerce(text: &str, declared: &str) -> Option<Value> {
     match declared {
         "string" => Some(Value::String(text.to_string())),
         "boolean" => match text.to_ascii_lowercase().as_str() {

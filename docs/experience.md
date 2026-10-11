@@ -398,7 +398,7 @@ stateDiagram-v2
   InputRequired --> AutoAnswering: timeout and fallback auto
   InputRequired --> Failed: timeout, other fallbacks
   AutoAnswering --> Completed: judge answers, marked auto
-  AutoAnswering --> Failed: judge returns UNDECIDED
+  AutoAnswering --> Failed: judge returns UNDECIDED, or the run carries outside input
   InputRequired --> Canceled: Esc, or CancelTask
   Completed --> [*]
   Failed --> [*]
@@ -408,10 +408,19 @@ stateDiagram-v2
 `agent.ask_human_fallback` decides what happens when nobody *can* answer, and
 the default is `fail`: with no A2A listener to ask on, an agent that asks a
 question errors immediately rather than blocking forever. `wait` parks until the ask
-timeout (24 h by default). `auto` hands the decision to an LLM judge — and it
-also fires when a *rendered* gate times out unanswered, so an unattended
-terminal can delegate with nobody watching. Auto answers are marked as such in
-the task, log and audit stream.
+timeout (24 h by default). `auto` hands the decision to a judge on
+`intelligence.roles.approve` — and it also fires when a *rendered* gate times
+out unanswered, so an unattended terminal can delegate with nobody watching.
+Auto answers are marked as such in the task, log and audit stream. No judge
+answers an ask whose run, subagent or peer conversation carries outside input
+— a webhook's body, an A2A agent's text, a tainted stream — whatever the
+model and its confidence: the ask fails with that reason
+(`human.judge.withheld`). On a decision model the judge answers only a
+*closed* ask — its answer an `enum` or a boolean, at the top of its `schema`
+or as the schema's one property — as a choice among those answers, above the
+role's `confidence` (an escalated answer too); an open question goes to the
+model's `escalate` model when that model writes, or stays `UNDECIDED`. Every
+judge's decision is logged (`intel.decision`, `role: approve`).
 
 Gates on workflow **runs** survive a daemon restart, rebuilt from the durable
 task and the suspended step — including their `schema` and their addressee, so

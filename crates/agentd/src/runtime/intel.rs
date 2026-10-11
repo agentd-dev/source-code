@@ -182,18 +182,23 @@ impl Runtime {
     /// left the choice of every model to the document, does the judge run on
     /// the agent's.
     pub(crate) fn role_config(&self, role: ModelRole) -> IntelConfig {
+        let section = self.role_section(role);
+        self.resolve_in(section, section.reference(role).as_deref())
+    }
+
+    /// The `intelligence` section `role` resolves in: the operator's own for
+    /// `approve` when a served document merged into it and the operator
+    /// names a model, else the live one ([`Self::role_config`]).
+    pub(crate) fn role_section(&self, role: ModelRole) -> &Intelligence {
         let intel = &self.settings.intelligence;
-        if role == ModelRole::Approve
-            && let Some(op) = intel.operator.as_deref()
-            && let Some(reference) = op.reference(role)
-        {
-            return self.resolve_in(op, Some(&reference));
+        match intel.operator.as_deref() {
+            Some(op) if role == ModelRole::Approve && op.reference(role).is_some() => op,
+            _ => intel,
         }
-        self.intel_config(intel.reference(role).as_deref())
     }
 
     /// [`Self::intel_config`] against a given `intelligence` section.
-    fn resolve_in(&self, intel: &Intelligence, reference: Option<&str>) -> IntelConfig {
+    pub(crate) fn resolve_in(&self, intel: &Intelligence, reference: Option<&str>) -> IntelConfig {
         let resolved = reference
             .map(str::to_string)
             .or_else(|| intel.reference(ModelRole::Turn));

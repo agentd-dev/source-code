@@ -19,7 +19,7 @@
 
 use serde_json::{Value, json};
 
-use crate::config::settings::{Goal, GoalAction, ModelRole};
+use crate::config::settings::{Goal, GoalAction, ModelKind, ModelRole};
 use crate::runtime::events::Event;
 use crate::state::{Kind, now_ms};
 use crate::subagent::protocol::IntelConfig;
@@ -189,13 +189,44 @@ impl crate::runtime::reactor::Runtime {
         }
     }
 
+    /// Charge what a judge on an executor thread spent — the goal check, the
+    /// ask judge — to the instance: it ran outside every turn, and nothing
+    /// else would.
+    pub(crate) fn charge_judge(&mut self, role: &str, result: &Value) {
+        let u = &result["usage"];
+        let usage = crate::wire::intel::Usage {
+            input_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+            output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+        };
+        if usage.total() > 0 {
+            self.governor.charge(usage, &[]);
+            self.counters.tokens_in += usage.input_tokens;
+            self.counters.tokens_out += usage.output_tokens;
+            crate::obs::metrics::record_tokens(usage.input_tokens, usage.output_tokens);
+        }
+        // What a decision model decided on the operator's behalf, or about
+        // the goal, is on the record whatever came of it (RFC 0046 §8).
+        if let Some(d) = result.get("decision") {
+            let mut line = d.clone();
+            line["role"] = json!(role);
+            self.log.info("intel.decision", line);
+        }
+    }
+
     /// Spawn the LLM judge on an executor thread. It posts an [`Event::Background`]
     /// (`goal.judge`) with `{achieved, stuck, reason}` (+ the counter's `stuck_det`).
     fn spawn_goal_judge(&mut self, g: &Goal, state: &Value, no_progress: u64, stuck_after: u64) {
         self.goal_judge_at = Some(now_ms());
         // The goal check runs on its own role's model (`roles.goal`), on that
-        // model's connection, with its fallbacks.
+        // model's connection, with its fallbacks — and, on a decision model,
+        // as a decision.
         let intel = self.role_config(ModelRole::Goal);
+        let reference = self.settings.intelligence.reference(ModelRole::Goal);
+        let decided = reference
+            .as_deref()
+            .is_some_and(|r| self.settings.intelligence.kind_of(r) == ModelKind::Decision);
+        let escalate = self.escalate_config(reference.as_deref());
+        let confidence = self.settings.intelligence.role_confidence(ModelRole::Goal);
         let tx = self.events_tx.clone();
         let statement = g.statement.clone().unwrap_or_default();
         let stuck_det = no_progress >= stuck_after;
@@ -215,7 +246,11 @@ impl crate::runtime::reactor::Runtime {
         std::thread::Builder::new()
             .name("goal-judge".into())
             .spawn(move || {
-                let mut result = goal_judge_call(&intel, &statement, &summary);
+                let mut result = if decided {
+                    goal_decision_call(&intel, escalate.as_ref(), confidence, &statement, &summary)
+                } else {
+                    goal_judge_call(&intel, &statement, &summary)
+                };
                 if let Value::Object(m) = &mut result {
                     m.insert("stuck_det".into(), json!(stuck_det));
                 }
@@ -325,9 +360,122 @@ fn goal_judge_call(intel: &IntelConfig, statement: &str, summary: &Value) -> Val
         ..Default::default()
     };
     match client.complete(&req) {
-        Ok(resp) => parse_verdict(&resp.text.unwrap_or_default()),
+        Ok(resp) => {
+            let mut v = parse_verdict(resp.text.as_deref().unwrap_or_default());
+            v["usage"] = usage_value(resp.usage);
+            v
+        }
         Err(e) => json!({"achieved": false, "stuck": false, "error": format!("intel: {e}")}),
     }
+}
+
+/// A judge's token usage as its result carries it to the loop, which
+/// charges it ([`Runtime::charge_judge`]).
+pub(crate) fn usage_value(u: crate::wire::intel::Usage) -> Value {
+    json!({"input_tokens": u.input_tokens, "output_tokens": u.output_tokens})
+}
+
+/// The goal check on a decision model (RFC 0046 §5.4): `achieved` and
+/// `stuck` as two statements about the status, each true at 0.5 — and,
+/// with the role's `confidence`, only when the answer is that sure; an
+/// unsure answer asked once more on the `escalate` model when there is one,
+/// else read as neither (§5.6).
+pub(crate) fn goal_decision_call(
+    intel: &IntelConfig,
+    escalate: Option<&IntelConfig>,
+    confidence: Option<f64>,
+    statement: &str,
+    summary: &Value,
+) -> Value {
+    use crate::wire::decision::{Decision, Question, unsure};
+    let decision = Decision {
+        state: json!({"goal": statement, "state": summary}),
+        questions: std::collections::BTreeMap::from([
+            (
+                "achieved".to_string(),
+                Question::Noul {
+                    instructions: format!("The agent has achieved its goal: {statement}"),
+                },
+            ),
+            (
+                "stuck".to_string(),
+                Question::Noul {
+                    instructions:
+                        "The agent is stuck: it is making no meaningful progress toward its goal."
+                            .into(),
+                },
+            ),
+        ]),
+    };
+    let mut usage = crate::wire::intel::Usage::default();
+    let mut ask = |cfg: &IntelConfig| -> Result<(crate::wire::decision::Answers, String), String> {
+        let client = cfg.client().map_err(|e| format!("intel: {e}"))?;
+        let model = cfg.model.clone().unwrap_or_default();
+        let resp = client
+            .complete(&Request {
+                model: model.clone(),
+                max_tokens: 384,
+                temperature: Some(0.0),
+                decision: Some(decision.clone()),
+                ..Default::default()
+            })
+            .map_err(|e| format!("intel: {e}"))?;
+        usage.input_tokens += resp.usage.input_tokens;
+        usage.output_tokens += resp.usage.output_tokens;
+        let served = resp.fallback.clone().unwrap_or(model);
+        resp.decision
+            .map(|a| (a, served))
+            .ok_or_else(|| "intel: the goal check's answer is not a decision".to_string())
+    };
+    let first = ask(intel);
+    let (mut answers, mut model) = match first {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({"achieved": false, "stuck": false, "error": e, "usage": usage_value(usage)});
+        }
+    };
+    let mut escalated = false;
+    if let (Some(c), Some(e)) = (confidence, escalate)
+        && !unsure(&answers, c).is_empty()
+    {
+        match ask(e) {
+            Ok((a, m)) => {
+                answers = a;
+                model = m;
+                escalated = true;
+            }
+            Err(e) => {
+                return json!({"achieved": false, "stuck": false, "error": e, "usage": usage_value(usage)});
+            }
+        }
+    }
+    let decision = json!({
+        "model": model,
+        "escalated": escalated,
+        "answers": answers
+            .iter()
+            .map(|(id, a)| (id.clone(), a.to_output(decision.questions.get(id))))
+            .collect::<serde_json::Map<String, Value>>(),
+    });
+    let read = |id: &str| -> (bool, f64) {
+        let Some(a) = answers.get(id) else {
+            return (false, 0.0);
+        };
+        let p = match a.value {
+            crate::wire::decision::AnswerValue::Noul(p) => p,
+            _ => 0.0,
+        };
+        let sure = escalated || confidence.is_none_or(|c| a.sureness().is_some_and(|s| s >= c));
+        (p >= 0.5 && sure, p)
+    };
+    let ((achieved, pa), (stuck, ps)) = (read("achieved"), read("stuck"));
+    json!({
+        "achieved": achieved,
+        "stuck": stuck,
+        "reason": format!("decided by {}: achieved p={pa:.2}, stuck p={ps:.2}{}", decision["model"].as_str().unwrap_or_default(), if escalated { ", escalated" } else { "" }),
+        "usage": usage_value(usage),
+        "decision": decision,
+    })
 }
 
 /// Extract `{achieved, stuck, reason}` from the model's reply (tolerant of prose

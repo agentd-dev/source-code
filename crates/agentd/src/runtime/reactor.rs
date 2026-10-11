@@ -764,8 +764,12 @@ impl Runtime {
             Event::A2a(req) => self.on_a2a_request(*req),
             #[cfg(feature = "a2a")]
             Event::Webhook(req) => self.on_webhook_request(*req),
-            Event::Background { id, result } if id == "goal.judge" => self.on_goal_judge(&result),
+            Event::Background { id, result } if id == "goal.judge" => {
+                self.charge_judge("goal", &result);
+                self.on_goal_judge(&result)
+            }
             Event::Background { id, result } if id.starts_with("human.judge:") => {
+                self.charge_judge("approve", &result);
                 let ask = id.trim_start_matches("human.judge:").to_string();
                 self.on_human_judge(&ask, &result);
             }

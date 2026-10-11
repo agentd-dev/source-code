@@ -254,7 +254,8 @@ impl Runtime {
                     );
                 }
                 let ask = self.next_id("ask");
-                self.spawn_human_judge(&ask, &question);
+                let carries = self.caller_carries(caller);
+                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries);
                 return ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,
                     question,
@@ -268,7 +269,8 @@ impl Runtime {
             }
             crate::config::settings::Approval::Auto => {
                 let ask = self.next_id("ask");
-                self.spawn_human_judge(&ask, &question);
+                let carries = self.caller_carries(caller);
+                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries);
                 return ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,
                     question,
@@ -352,7 +354,8 @@ impl Runtime {
             }
             AskHumanFallback::Auto => {
                 let ask = self.next_id("ask");
-                self.spawn_human_judge(&ask, &question);
+                let carries = self.caller_carries(caller);
+                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries);
                 ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,
                     question,
@@ -564,8 +567,15 @@ impl Runtime {
             let value = match crate::mcp::elicit::shape_reply(&json!(text), &schema) {
                 ::mcp::inbound::Answer::Accept(v) => v,
                 // Cancel/Decline: the person declined to answer in the declared
-                // shape, which is a real answer, not a validation failure.
-                _ => json!(text),
+                // shape, which is a real answer, not a validation failure — but
+                // a primitive schema's answer is that primitive (`"true"` for
+                // `{type: boolean}`).
+                _ => schema
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .filter(|t| matches!(*t, "boolean" | "number" | "integer"))
+                    .and_then(|t| crate::mcp::elicit::coerce(text.trim(), t))
+                    .unwrap_or_else(|| json!(text)),
             };
             shaped = Some(value.clone());
             if let Err(errs) = crate::jsonschema::validate(&schema, &value) {
@@ -576,13 +586,15 @@ impl Runtime {
                 );
                 // An `auto` judge that cannot produce the shape must not spin.
                 if via == "auto" {
-                    self.human_task_fail(
-                        &task,
-                        &format!(
-                            "auto-answer does not match the declared schema: {}",
-                            errs.join("; ")
-                        ),
+                    let why = format!(
+                        "ask_human: the auto-answer does not match the declared schema: {}",
+                        errs.join("; ")
                     );
+                    self.human_task_fail(&task, &why);
+                    // The asker is waiting on this reply, and the pending
+                    // ask is already gone: it is told, not left to its
+                    // deadline.
+                    self.reply(&p.target, Value::String(why), true);
                     return;
                 }
                 self.reask_human(p, &q, &errs.join("; "));
@@ -839,6 +851,7 @@ impl Runtime {
                 question,
                 deadline_ms,
                 auto_fired,
+                schema,
                 ..
             } = &mut p.kind
             else {
@@ -846,7 +859,7 @@ impl Runtime {
             };
             *auto_fired = true;
             *deadline_ms = now + AUTO_GRACE_MS;
-            let (task, question) = (task.clone(), question.clone());
+            let (task, question, schema) = (task.clone(), question.clone(), schema.clone());
             #[cfg(feature = "a2a")]
             {
                 use crate::a2a::tasks::State;
@@ -858,7 +871,8 @@ impl Runtime {
                 }
                 self.task_sync(&task);
             }
-            self.spawn_human_judge(&task, &question);
+            let carries = self.target_carries(&target);
+            self.spawn_human_judge(&task, &question, schema.as_ref(), &carries);
         }
         for (target, end) in ends {
             // Re-find the entry by target on every iteration: ending an earlier
@@ -897,20 +911,75 @@ impl Runtime {
 
     /// Spawn the `auto` judge on a background thread — same shape as the goal
     /// judge: an intel dial folded back through [`super::events::Event::Background`].
-    pub(crate) fn spawn_human_judge(&mut self, ask: &str, question: &str) {
-        // The operator's stand-in runs on the model the operator bound to
-        // `roles.approve` — a role no served document may set.
-        let intel = self.role_config(crate::config::settings::ModelRole::Approve);
+    pub(crate) fn spawn_human_judge(
+        &mut self,
+        ask: &str,
+        question: &str,
+        schema: Option<&Value>,
+        carries: &crate::engine::run::Carries,
+    ) {
         let tx = self.events_tx.clone();
+        // Never over outside input (RFC 0046 §8): a judge's answer is no
+        // more trusted than what it reads, and text in the ask can steer any
+        // model to approve. Whatever the model and its confidence, the ask
+        // stays the operator's.
+        if !carries.is_empty() {
+            let why = carries
+                .why
+                .clone()
+                .unwrap_or_else(|| "outside input".into());
+            self.log.warn(
+                "human.judge.withheld",
+                json!({"ask": ask, "origins": carries.origins, "why": why}),
+            );
+            let _ = tx.send(super::events::Event::Background {
+                id: format!("human.judge:{ask}"),
+                result: json!({"refused": format!(
+                    "not answered on the operator's behalf: the ask carries outside input ({why})"
+                )}),
+            });
+            return;
+        }
+        // The operator's stand-in runs on the model the operator bound to
+        // `roles.approve` — a role no served document may set — and, on a
+        // decision model, as a decision.
+        let section = self.role_section(crate::config::settings::ModelRole::Approve);
+        let reference = section.reference(crate::config::settings::ModelRole::Approve);
+        let decided = reference
+            .as_deref()
+            .is_some_and(|r| section.kind_of(r) == crate::config::settings::ModelKind::Decision);
+        // The escalate model, and whether it writes — only one that writes
+        // can answer an open question.
+        let escalate = reference
+            .as_deref()
+            .and_then(|r| section.tier(r))
+            .and_then(|t| t.escalate.clone())
+            .map(|e| {
+                let writes = section.kind_of(&e) != crate::config::settings::ModelKind::Decision;
+                (self.resolve_in(section, Some(&e)), writes)
+            });
+        let confidence = section.role_confidence(crate::config::settings::ModelRole::Approve);
+        let intel = self.role_config(crate::config::settings::ModelRole::Approve);
+        let schema = schema.cloned();
         let (ask, question) = (ask.to_string(), question.to_string());
         self.log.info(
             "human.judge.start",
-            json!({"ask": ask, "question": question}),
+            json!({"ask": ask, "question": question, "decided": decided}),
         );
         std::thread::Builder::new()
             .name("human-judge".into())
             .spawn(move || {
-                let result = human_judge_call(&intel, &question);
+                let result = if decided {
+                    human_decision_call(
+                        &intel,
+                        escalate.as_ref().map(|(c, w)| (c, *w)),
+                        confidence,
+                        &question,
+                        schema.as_ref(),
+                    )
+                } else {
+                    human_judge_call(&intel, &question)
+                };
                 let _ = tx.send(super::events::Event::Background {
                     id: format!("human.judge:{ask}"),
                     result,
@@ -928,6 +997,10 @@ impl Runtime {
         else {
             return; // answered by a human / cancelled while the judge ran
         };
+        if let Some(why) = result["refused"].as_str() {
+            self.human_fail(i, &format!("ask_human: {why}"));
+            return;
+        }
         match result["answer"].as_str() {
             Some(a) if !a.trim().is_empty() && a.trim() != UNDECIDED => {
                 let answer = a.trim().to_string();
@@ -1104,67 +1177,168 @@ UNDECIDED.";
         ..Default::default()
     };
     match client.complete(&req) {
-        Ok(resp) => json!({"answer": resp.text.unwrap_or_default()}),
+        Ok(resp) => {
+            json!({"answer": resp.text.unwrap_or_default(), "usage": super::goal::usage_value(resp.usage)})
+        }
         Err(e) => json!({"error": format!("intel: {e}")}),
     }
 }
 
-#[cfg(all(test, feature = "a2a"))]
-mod tests {
-    use super::*;
-    use crate::config::settings::PolicyAction;
-
-    /// A step's policy gate is rebuilt from its wait record after a restart,
-    /// and the call it holds must come back whole — an approval then runs the
-    /// call it approved, and an `on_timeout` of deny is never read back as
-    /// allow.
-    #[test]
-    fn a_held_call_survives_its_own_record() {
-        for on_timeout in [
-            PolicyAction::Allow,
-            PolicyAction::Deny,
-            PolicyAction::Shadow,
-        ] {
-            let call = super::super::reactor::PolicyCall {
-                tool: "memory.set".into(),
-                args: json!({"key": "k", "value": 1}),
-                rule: 3,
-                on_timeout,
-            };
-            let back = policy_call_of(&policy_call_json(&call)).expect("read back");
-            assert_eq!(
-                (back.tool.as_str(), &back.args, back.rule, back.on_timeout),
-                ("memory.set", &call.args, 3, on_timeout)
-            );
-        }
-        // A record whose fallback cannot be read denies.
-        let unreadable = json!({"tool": "t", "args": {}, "rule": 0, "on_timeout": "maybe"});
-        assert_eq!(
-            policy_call_of(&unreadable).unwrap().on_timeout,
-            PolicyAction::Deny
-        );
+/// The answers a closed ask allows: its schema's `enum`, or `true`/`false`
+/// for a boolean — at the top, or as the one property of an object schema
+/// (`{decision: {enum: […]}}`, `{approved: {type: boolean}}`), which is how
+/// a gate's answer shape is usually written and how a reply is shaped back
+/// into it. `None` for an open question.
+fn closed_answers(schema: Option<&Value>) -> Option<Vec<String>> {
+    let s = schema?;
+    let field = match s.get("properties").and_then(Value::as_object) {
+        Some(props) if props.len() == 1 => props.values().next()?,
+        Some(_) => return None,
+        None => s,
+    };
+    if let Some(values) = field.get("enum").and_then(Value::as_array) {
+        let names: Vec<String> = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        return (names.len() >= 2 && names.len() == values.len()).then_some(names);
     }
+    (field.get("type").and_then(Value::as_str) == Some("boolean"))
+        .then(|| vec!["true".to_string(), "false".to_string()])
+}
 
-    /// The answer shape a policy gate declares admits exactly the two
-    /// decisions, whatever a person types.
-    #[test]
-    fn a_policy_gate_takes_a_decision_and_nothing_else() {
-        let schema = policy_answer_schema();
-        let shaped = |text: &str| match crate::mcp::elicit::shape_reply(&json!(text), &schema) {
-            ::mcp::inbound::Answer::Accept(v) => v,
-            _ => json!(text),
+/// The ask judge on a decision model (RFC 0046 §5.4, §8): a closed ask —
+/// its answer an `enum` or a boolean — is a choice over its answers, acted
+/// on only above the role's confidence; an unsure one is asked once more on
+/// the `escalate` model, held to the same threshold — an approval is never
+/// acted on at a model's argmax alone. An open question goes to the
+/// `escalate` model when that model writes. Anything else is `UNDECIDED`:
+/// the ask stays the operator's. The result carries what was decided, for
+/// the log.
+fn human_decision_call(
+    intel: &crate::subagent::protocol::IntelConfig,
+    escalate: Option<(&crate::subagent::protocol::IntelConfig, bool)>,
+    confidence: Option<f64>,
+    question: &str,
+    schema: Option<&Value>,
+) -> Value {
+    use crate::wire::decision::{Decision, Question, unsure};
+    let Some(options) = closed_answers(schema) else {
+        return match escalate {
+            Some((e, true)) => {
+                let mut r = human_judge_call(e, question);
+                r["escalated"] = json!(true);
+                r
+            }
+            _ => json!({"answer": UNDECIDED}),
         };
-        for ok in [POLICY_APPROVE, POLICY_DENY] {
-            assert!(
-                crate::jsonschema::validate(&schema, &shaped(ok)).is_ok(),
-                "{ok}"
-            );
-        }
-        for no in ["yes", "ok", "Approve please", ""] {
-            assert!(
-                crate::jsonschema::validate(&schema, &shaped(no)).is_err(),
-                "{no:?}"
-            );
-        }
+    };
+    let decision = Decision {
+        state: Value::String(question.to_string()),
+        questions: std::collections::BTreeMap::from([(
+            "answer".to_string(),
+            Question::Choice {
+                instructions: "The agent asked its unavailable operator this question. Which \
+                    answer would the operator give? Prefer the safe, reversible one; never \
+                    approve a destructive or irreversible action on their behalf."
+                    .into(),
+                options: options.into_iter().map(|o| (o, String::new())).collect(),
+            },
+        )]),
+    };
+    let mut usage = crate::wire::intel::Usage::default();
+    let mut ask = |cfg: &crate::subagent::protocol::IntelConfig|
+     -> Option<(crate::wire::decision::Answers, String)> {
+        let client = cfg.client().ok()?;
+        let model = cfg.model.clone().unwrap_or_default();
+        let resp = client
+            .complete(&Request {
+                model: model.clone(),
+                max_tokens: 256,
+                temperature: Some(0.0),
+                decision: Some(decision.clone()),
+                ..Default::default()
+            })
+            .ok()?;
+        usage.input_tokens += resp.usage.input_tokens;
+        usage.output_tokens += resp.usage.output_tokens;
+        let served = resp.fallback.clone().unwrap_or(model);
+        resp.decision.map(|a| (a, served))
+    };
+    let sure =
+        |a: &crate::wire::decision::Answers| confidence.is_none_or(|c| unsure(a, c).is_empty());
+    let mut decided = ask(intel);
+    let mut escalated = false;
+    if let Some((a, _)) = &decided
+        && !sure(a)
+    {
+        decided = escalate.and_then(|(e, _)| ask(e));
+        escalated = true;
+    }
+    let chosen = decided
+        .as_ref()
+        .filter(|(a, _)| sure(a))
+        .and_then(|(a, model)| {
+            let answer = a.get("answer")?;
+            match &answer.value {
+                crate::wire::decision::AnswerValue::Choice(c) => Some((
+                    c.clone(),
+                    answer.confidence,
+                    answer.calibrated,
+                    model.clone(),
+                )),
+                _ => None,
+            }
+        });
+    let (answer, record) = match chosen {
+        Some((c, conf, calibrated, model)) => (
+            c.clone(),
+            json!({"model": model, "answer": c, "confidence": conf, "calibrated": calibrated, "escalated": escalated}),
+        ),
+        None => (
+            UNDECIDED.to_string(),
+            json!({"model": decided.as_ref().map(|(_, m)| m.clone()), "answer": UNDECIDED, "escalated": escalated}),
+        ),
+    };
+    json!({"answer": answer, "usage": super::goal::usage_value(usage), "decision": record})
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_ask_is_an_enum_or_a_boolean() {
+        assert_eq!(
+            closed_answers(Some(&json!({"enum": ["approve", "deny"]}))),
+            Some(vec!["approve".to_string(), "deny".to_string()])
+        );
+        assert_eq!(
+            closed_answers(Some(&json!({"type": "boolean"}))),
+            Some(vec!["true".to_string(), "false".to_string()])
+        );
+        assert_eq!(
+            closed_answers(Some(
+                &json!({"type": "object", "properties": {"decision": {"enum": ["approve", "decline"]}}})
+            )),
+            Some(vec!["approve".to_string(), "decline".to_string()])
+        );
+        assert_eq!(
+            closed_answers(Some(
+                &json!({"type": "object", "required": ["approved"], "properties": {"approved": {"type": "boolean"}}})
+            )),
+            Some(vec!["true".to_string(), "false".to_string()])
+        );
+        assert_eq!(
+            closed_answers(Some(
+                &json!({"properties": {"a": {"type": "boolean"}, "b": {"type": "string"}}})
+            )),
+            None
+        );
+        assert_eq!(closed_answers(Some(&json!({"type": "string"}))), None);
+        assert_eq!(closed_answers(Some(&json!({"enum": ["only"]}))), None);
+        assert_eq!(closed_answers(Some(&json!({"enum": [1, 2]}))), None);
+        assert_eq!(closed_answers(None), None);
     }
 }

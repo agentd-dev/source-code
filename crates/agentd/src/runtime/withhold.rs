@@ -377,6 +377,38 @@ impl Runtime {
         c
     }
 
+    /// What the asker behind a deferred reply to `target` carries — a run's
+    /// or a child's record, or, for a conversation an A2A peer (an `agent`
+    /// principal) holds, the peer's text.
+    pub(crate) fn target_carries(&self, target: &Target) -> Carries {
+        use super::children::ChildKind;
+        match self.reader_at(target) {
+            Reader::Run(r) => self.run_carries(&r),
+            Reader::Child(h) => self.child_carries(&h),
+            Reader::Conversation => {
+                let principal = match target {
+                    Target::Child(node, _) => match self.children.get(*node).map(|c| &c.kind) {
+                        Some(ChildKind::RootTurn { ctx, .. }) => {
+                            self.contexts.get(ctx).and_then(|c| c.principal.clone())
+                        }
+                        _ => None,
+                    },
+                    Target::Step(..) => None,
+                };
+                let mut c = Carries::default();
+                if let Some(p) = principal.as_deref()
+                    && self
+                        .principal_index
+                        .get(p)
+                        .is_some_and(|p| p.role == Role::Agent)
+                {
+                    c.union(&peer_carries(p, "handed text"));
+                }
+                c
+            }
+        }
+    }
+
     /// Add `carries` to child `handle`'s record — text a run, a child, a
     /// conversation or a peer steered into it (`subagent.send`).
     pub(crate) fn steer_carries(&mut self, handle: &str, carries: &Carries) {

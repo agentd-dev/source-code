@@ -241,6 +241,7 @@
     "start": true
   },
   "decide": {
+    "category": "intelligence",
     "fields": [
       "state",
       "questions",

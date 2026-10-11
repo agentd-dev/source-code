@@ -269,6 +269,11 @@ impl Catalogue {
     pub fn names(&self) -> Vec<String> {
         self.skills.keys().cloned().collect()
     }
+
+    /// Every catalogued skill's metadata, by name.
+    pub fn metas(&self) -> impl Iterator<Item = &SkillMeta> {
+        self.skills.values()
+    }
     pub fn len(&self) -> usize {
         self.skills.len()
     }

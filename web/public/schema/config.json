@@ -3675,32 +3675,168 @@
           "description": "which model each job runs on; each defaults to turn, and turn to intelligence.model",
           "properties": {
             "approve": {
-              "description": "the model that answers asks on the operator's behalf (approval: auto) runs on. Operator-only; default: roles.turn",
-              "type": "string"
+              "description": "the model that answers asks on the operator's behalf (approval: auto) runs on. Operator-only — a name, or {model, confidence}; default: roles.turn",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "confidence": {
+                      "description": "the least confidence the role's decisions are acted on with",
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             },
             "compaction": {
-              "description": "the model summarising the transcript runs on; default: roles.turn",
-              "type": "string"
+              "description": "the model summarising the transcript runs on — a name, or {model}; default: roles.turn",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             },
             "decide": {
-              "description": "the model classify, route and judge nodes run on; default: roles.turn",
-              "type": "string"
+              "description": "the model classify, route and judge nodes run on — a name, or {model, confidence}; default: roles.turn",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "confidence": {
+                      "description": "the least confidence the role's decisions are acted on with",
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             },
             "goal": {
-              "description": "the model the goal check runs on; default: roles.turn",
-              "type": "string"
+              "description": "the model the goal check runs on — a name, or {model, confidence}; default: roles.turn",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "confidence": {
+                      "description": "the least confidence the role's decisions are acted on with",
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             },
             "preflight": {
-              "description": "the model preflight triage of an inbound message runs on; default: roles.turn",
-              "type": "string"
+              "description": "the model preflight triage of an inbound message runs on — a name, or {model, confidence}; default: roles.turn",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "confidence": {
+                      "description": "the least confidence the role's decisions are acted on with",
+                      "maximum": 1,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             },
             "think": {
-              "description": "the model the think tool and think nodes run on; default: roles.turn",
-              "type": "string"
+              "description": "the model the think tool and think nodes run on — a name, or {model}; default: roles.turn",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             },
             "turn": {
               "description": "the model the agent's turns, agent/extract/summarize nodes and subagents run on; the same setting as intelligence.model (set one)",
-              "type": "string"
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "type": "object"
+                }
+              ]
             }
           },
           "type": "object"

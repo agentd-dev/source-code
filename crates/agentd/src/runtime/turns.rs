@@ -13,7 +13,7 @@ use crate::governor::Admission;
 use crate::registry::{Caller, ToolClass};
 use crate::state::now_ms;
 use crate::subagent::protocol::{
-    ControlMsg, Limits, Role, SpawnPayload, Telemetry, TurnKind, TurnResult, TurnSpec,
+    ControlMsg, Limits, OnUnsure, Role, SpawnPayload, Telemetry, TurnKind, TurnResult, TurnSpec,
 };
 use crate::supervisor::tree::NodeId;
 use serde_json::{Value, json};
@@ -575,23 +575,49 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             catalogue,
             plan_block
         );
-        let spec = TurnSpec {
-            kind: TurnKind::Think,
-            system,
-            messages: vec![Msg::user(job.text.clone(), job.principal.clone())],
-            tools: Vec::new(),
-            internal: Vec::new(),
-            mcp_routes: BTreeMap::new(),
-            output_schema: Some(Self::preflight_schema()),
-            max_rounds: 3,
-            budget_admission: false,
-            idempotency_prefix: String::new(),
-            tool_meta: None,
-            temperature: Some(0.0),
-            max_tokens_per_call: 1024,
-            turn_id: self.next_id("preflight"),
-            decision: None,
-            sure: None,
+        // On a decision model, preflight's typed part is one decision
+        // (RFC 0046 §5.4); the plan and any clarifying question are written,
+        // so they move into the turn.
+        let decided = self
+            .settings
+            .intelligence
+            .reference(ModelRole::Preflight)
+            .is_some_and(|r| {
+                self.settings.intelligence.kind_of(&r)
+                    == crate::config::settings::ModelKind::Decision
+            });
+        let mut asked_skills: Vec<String> = Vec::new();
+        let spec = if decided {
+            let (decision, skills) = self.preflight_decision(&job.text);
+            asked_skills = skills;
+            let work =
+                self.decision_work_for_role(ModelRole::Preflight, decision, OnUnsure::Continue);
+            TurnSpec {
+                kind: TurnKind::Decide,
+                turn_id: self.next_id("preflight"),
+                decision: work.decision,
+                sure: work.sure,
+                ..Default::default()
+            }
+        } else {
+            TurnSpec {
+                kind: TurnKind::Think,
+                system,
+                messages: vec![Msg::user(job.text.clone(), job.principal.clone())],
+                tools: Vec::new(),
+                internal: Vec::new(),
+                mcp_routes: BTreeMap::new(),
+                output_schema: Some(Self::preflight_schema()),
+                max_rounds: 3,
+                budget_admission: false,
+                idempotency_prefix: String::new(),
+                tool_meta: None,
+                temperature: Some(0.0),
+                max_tokens_per_call: 1024,
+                turn_id: self.next_id("preflight"),
+                decision: None,
+                sure: None,
+            }
         };
         let stage_id = {
             self.seq += 1;
@@ -603,7 +629,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 purpose: "preflight".into(),
                 ctx: Some(ctx_id.clone()),
                 reply_to: None,
-                extra: json!({"job": stage_id}),
+                extra: json!({"job": stage_id, "decided": decided, "skills": asked_skills}),
                 reservation: None,
             },
             servers: Vec::new(),
@@ -632,16 +658,140 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         }
     }
 
+    /// Preflight's typed part as one decision about the message: its intent,
+    /// whether it needs a plan, its risk, and — one statement each — which
+    /// catalogued skills it calls for. Returns the decision and the skill
+    /// each `skill_<i>` question asks about. A catalogue too large for one
+    /// decision is asked about in part, and says so.
+    fn preflight_decision(&self, text: &str) -> (crate::wire::decision::Decision, Vec<String>) {
+        use crate::wire::decision::{Decision, MAX_QUESTIONS, Question};
+        let options = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let mut questions = BTreeMap::from([
+            (
+                "intent".to_string(),
+                Question::Choice {
+                    instructions: "What does the message ask of the agent?".into(),
+                    options: options(&[
+                        ("chat", "a remark or small talk that needs no action"),
+                        ("question", "a question to answer from what is known"),
+                        ("status", "a request for the agent's own status or progress"),
+                        ("command", "an instruction to run one specific operation"),
+                        ("task", "work that takes several steps or tools"),
+                        (
+                            "steer",
+                            "a correction or change of direction for work in progress",
+                        ),
+                        ("clarify", "too ambiguous to act on without asking"),
+                    ]),
+                },
+            ),
+            (
+                "needs_plan".to_string(),
+                Question::Noul {
+                    instructions: "The message calls for a multi-step working plan before acting."
+                        .into(),
+                },
+            ),
+            (
+                "risk".to_string(),
+                Question::Choice {
+                    instructions: "How much harm could acting on it wrongly do?".into(),
+                    options: options(&[
+                        ("low", "little or none, easily undone"),
+                        ("medium", "some, and undoing it takes work"),
+                        ("high", "serious, or it cannot be undone"),
+                    ]),
+                },
+            ),
+        ]);
+        let room = MAX_QUESTIONS - questions.len();
+        let metas: Vec<_> = self.skills.metas().collect();
+        if metas.len() > room {
+            self.log.warn(
+                "preflight.skills_capped",
+                json!({"asked": room, "catalogued": metas.len()}),
+            );
+        }
+        let mut asked = Vec::new();
+        for (i, m) in metas.into_iter().take(room).enumerate() {
+            let when = m
+                .when_to_use
+                .as_deref()
+                .map(|w| format!(" Use it when: {w}"))
+                .unwrap_or_default();
+            questions.insert(
+                format!("skill_{i}"),
+                Question::Noul {
+                    instructions: format!(
+                        "The message calls for the skill `{}`: {}.{when}",
+                        m.name, m.description
+                    ),
+                },
+            );
+            asked.push(m.name.clone());
+        }
+        (
+            Decision {
+                state: Value::String(text.to_string()),
+                questions,
+            },
+            asked,
+        )
+    }
+
+    /// A decision model's preflight answers as the verdict preflight has
+    /// always produced. An answer under the role's confidence on the intent,
+    /// the plan or the risk leaves no verdict at all — the message is a
+    /// task, as a missing verdict always made it (RFC 0046 §5.6).
+    fn preflight_verdict(&self, ctx_id: &str, v: &Value, extra: &Value) -> Option<Value> {
+        let unsure: Vec<&str> = ["intent", "needs_plan", "risk"]
+            .into_iter()
+            .filter(|k| v[*k]["unsure"] == json!(true))
+            .collect();
+        if !unsure.is_empty() {
+            self.log.info(
+                "preflight.unsure",
+                json!({"ctx": ctx_id, "unsure": unsure, "model": v["model"]}),
+            );
+            return None;
+        }
+        let skills: Vec<Value> = extra["skills"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(i, _)| {
+                let a = &v[format!("skill_{i}")];
+                a["noul"].as_f64().is_some_and(|p| p >= 0.5) && a["unsure"] != json!(true)
+            })
+            .map(|(_, name)| name.clone())
+            .collect();
+        Some(json!({
+            "intent": v["intent"]["choice"],
+            "needs_plan": v["needs_plan"]["noul"].as_f64().is_some_and(|p| p >= 0.5),
+            "risk": v["risk"]["choice"],
+            "skills": skills,
+            "model": v["model"],
+        }))
+    }
+
     /// The preflight verdict arrived: record it, apply the short-circuits, seed
     /// the plan, preload skills, then queue the main turn.
-    fn on_preflight_done(&mut self, stage_id: u64, ctx_id: &str, turn: &TurnResult) {
+    fn on_preflight_done(&mut self, stage_id: u64, ctx_id: &str, turn: &TurnResult, extra: &Value) {
         let Some(mut job) = self.staged_turns.remove(&stage_id) else {
             return;
         };
-        let verdict = if turn.status == "completed" {
-            turn.value.clone()
-        } else {
-            None
+        let verdict = match (turn.status.as_str(), &turn.value) {
+            ("completed", Some(v)) if extra["decided"] == json!(true) => {
+                self.preflight_verdict(ctx_id, v, extra)
+            }
+            ("completed", v) => v.clone(),
+            _ => None,
         };
         match &verdict {
             Some(v) => {
@@ -698,6 +848,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                         json!({"ctx": ctx_id, "op": "preflight", "progress": progress}),
                     );
                 }
+
                 if !skills.is_empty() {
                     let unknown = self.preload_skills(ctx_id, &skills, job.principal.as_deref());
                     if !unknown.is_empty() {
@@ -726,6 +877,25 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                         return;
                     }
                     _ => {}
+                }
+                // A turn will run. What preflight decided and did not write —
+                // a plan it says is needed, a question it says must be asked —
+                // is the turn's to write, and the turn is told.
+                let mut tell = Vec::new();
+                if needs_plan
+                    && plan_items.is_empty()
+                    && self.contexts.get(ctx_id).is_some_and(|c| c.plan.is_none())
+                {
+                    tell.push("Preflight: this message calls for a working plan — make one with plan.create before acting.");
+                }
+                if intent == "clarify" {
+                    tell.push("Preflight: this message is ambiguous — ask what you need to know before acting.");
+                }
+                if !tell.is_empty() {
+                    let c = self.context_for(ctx_id, job.principal.as_deref());
+                    for t in tell {
+                        c.append(Msg::note(t));
+                    }
                 }
             }
             None => self.log.warn(
@@ -1472,7 +1642,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         match purpose {
             "preflight" => {
                 let stage = extra["job"].as_u64().unwrap_or(0);
-                self.on_preflight_done(stage, ctx_id.unwrap_or(ROOT), &turn);
+                self.on_preflight_done(stage, ctx_id.unwrap_or(ROOT), &turn, &extra);
             }
             "compaction" => {
                 let ctx_id = ctx_id.unwrap_or(ROOT);

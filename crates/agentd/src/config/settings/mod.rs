@@ -1753,21 +1753,64 @@ impl ModelKind {
 pub struct Roles {
     /// The agent's turns, `agent`, `extract` and `summarize` nodes, and
     /// subagents that name no model.
-    pub turn: Option<String>,
+    pub turn: Option<RoleBinding>,
     /// The `think` tool and `think` nodes.
-    pub think: Option<String>,
-    /// `classify`, `route` and `judge` nodes.
-    pub decide: Option<String>,
+    pub think: Option<RoleBinding>,
+    /// `decide`, `classify`, `route` and `judge` nodes and the `decide` tool.
+    pub decide: Option<RoleBinding>,
     /// Triage of an inbound message before its turn.
-    pub preflight: Option<String>,
+    pub preflight: Option<RoleBinding>,
     /// Summarising the transcript when it outgrows the window.
-    pub compaction: Option<String>,
+    pub compaction: Option<RoleBinding>,
     /// The goal check: achieved? stuck?
-    pub goal: Option<String>,
+    pub goal: Option<RoleBinding>,
     /// Asks answered on the operator's behalf (`approval: auto`). The
     /// operator's alone: a served document must not pick the judge of its
     /// own gates.
-    pub approve: Option<String>,
+    pub approve: Option<RoleBinding>,
+}
+
+/// What a role is bound to: a model, and — for a role that acts on
+/// decisions — the least confidence its answers are acted on with (RFC 0046
+/// §5.4, §5.6). Written as the model's name, or `{model, confidence}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleBinding {
+    pub model: String,
+    pub confidence: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for RoleBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Long {
+            model: String,
+            #[serde(default)]
+            confidence: Option<f64>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Name(String),
+            Long(Long),
+        }
+        Ok(
+            match Either::deserialize(d).map_err(|_| {
+                serde::de::Error::custom(
+                "a role is a model's name, or {model, confidence} — a confidence is written with its model beside it",
+            )
+            })? {
+                Either::Name(model) => RoleBinding {
+                    model,
+                    confidence: None,
+                },
+                Either::Long(l) => RoleBinding {
+                    model: l.model,
+                    confidence: l.confidence,
+                },
+            },
+        )
+    }
 }
 
 /// A job a model is bound to by [`Roles`].
@@ -1807,8 +1850,8 @@ impl ModelRole {
 }
 
 impl Roles {
-    /// The model `role` names here, if it names one.
-    pub fn get(&self, role: ModelRole) -> Option<&String> {
+    /// What `role` is bound to here, if anything.
+    pub fn binding(&self, role: ModelRole) -> Option<&RoleBinding> {
         match role {
             ModelRole::Turn => self.turn.as_ref(),
             ModelRole::Think => self.think.as_ref(),
@@ -1818,6 +1861,22 @@ impl Roles {
             ModelRole::Goal => self.goal.as_ref(),
             ModelRole::Approve => self.approve.as_ref(),
         }
+    }
+
+    /// The model `role` names here, if it names one.
+    pub fn get(&self, role: ModelRole) -> Option<&String> {
+        self.binding(role).map(|b| &b.model)
+    }
+}
+
+impl ModelRole {
+    /// Whether the role writes — and so needs a model that writes, and has
+    /// no answers a confidence could be a threshold for.
+    pub fn writes(self) -> bool {
+        matches!(
+            self,
+            ModelRole::Turn | ModelRole::Think | ModelRole::Compaction
+        )
     }
 }
 
@@ -1846,9 +1905,15 @@ impl Intelligence {
     pub fn reference(&self, role: ModelRole) -> Option<String> {
         self.roles
             .get(role)
-            .or(self.roles.turn.as_ref())
+            .or(self.roles.get(ModelRole::Turn))
             .or(self.model.as_ref())
             .cloned()
+    }
+
+    /// The confidence `role`'s own binding sets — never inherited: a
+    /// threshold is about the answers of the model it was written beside.
+    pub fn role_confidence(&self, role: ModelRole) -> Option<f64> {
+        self.roles.binding(role).and_then(|b| b.confidence)
     }
 
     /// The wire model `role` sends, through [`Self::reference`] and
@@ -7061,7 +7126,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     }
     // intelligence.roles — `turn` and `model` are one setting said two ways;
     // two answers to one question would leave the reader guessing which won.
-    if let (Some(turn), Some(model)) = (&s.intelligence.roles.turn, &s.intelligence.model) {
+    if let (Some(turn), Some(model)) = (
+        s.intelligence.roles.get(ModelRole::Turn),
+        &s.intelligence.model,
+    ) {
         err(
             &mut d,
             format!(
@@ -7079,23 +7147,53 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             (ModelRole::Approve, Some(op)) => &op.models,
             _ => &s.intelligence.models,
         };
-        // Every role but `decide` writes, and so needs a chat model.
-        // Decision models in preflight, the goal check and approvals are
-        // RFC 0046 phase 3; until then they write too.
+        // `turn`, `think` and `compaction` write, so they need a chat model
+        // and have no answers a confidence could be a threshold for. The
+        // others decide, on either kind (RFC 0046 §5.4).
         let in_section = match (role, s.intelligence.operator.as_deref()) {
             (ModelRole::Approve, Some(op)) => op,
             _ => &s.intelligence,
         };
-        if role != ModelRole::Decide
-            && let Some(r) = in_section.reference(role)
-            && in_section.kind_of(&r) == ModelKind::Decision
-        {
+        let reference = in_section.reference(role);
+        let decision =
+            reference.as_deref().map(|r| in_section.kind_of(r)) == Some(ModelKind::Decision);
+        let confidence = in_section.roles.binding(role).and_then(|b| b.confidence);
+        if role.writes() && decision {
             err(
                 &mut d,
                 format!(
-                    "intelligence.roles.{}: {r:?} is a decision model; this role needs one that writes (a chat model)",
-                    role.as_str()
+                    "intelligence.roles.{}: {:?} is a decision model; this role needs one that writes (a chat model)",
+                    role.as_str(),
+                    reference.as_deref().unwrap_or_default()
                 ),
+            );
+        }
+        if let Some(c) = confidence {
+            if role.writes() {
+                err(
+                    &mut d,
+                    format!(
+                        "intelligence.roles.{}.confidence: this role writes; there are no answers to be sure of",
+                        role.as_str()
+                    ),
+                );
+            } else if !(0.0..=1.0).contains(&c) {
+                err(
+                    &mut d,
+                    format!(
+                        "intelligence.roles.{}.confidence: a number from 0 to 1",
+                        role.as_str()
+                    ),
+                );
+            }
+        }
+        // A decision model answering on the operator's behalf is acted on
+        // only above a threshold the operator set — never at its argmax
+        // alone (RFC 0046 §8).
+        if role == ModelRole::Approve && decision && confidence.is_none() {
+            err(
+                &mut d,
+                "intelligence.roles.approve: a decision model approves on the operator's behalf only above a threshold — write {model, confidence}".into(),
             );
         }
         if let Some(r) = s.intelligence.roles.get(role)
@@ -14124,6 +14222,48 @@ mod tests {
         ] {
             let e = errors(extra);
             assert!(e.contains(why), "{extra}\n→ {e}");
+        }
+    }
+
+    /// A role is a model's name or `{model, confidence}`; a threshold is for
+    /// a role that decides, and a decision-model approver needs one.
+    #[test]
+    fn role_bindings_carry_a_threshold_where_a_role_decides() {
+        let doc = |roles: &str| {
+            format!(
+                "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jevp: {{endpoints: \"https://jev.example/v1/decisions\", dialect: decisions}}\n  models:\n    smart: {{model: s-1}}\n    jev: {{kind: decision, provider: jevp, model: j-1}}\n  roles: {roles}\n"
+            )
+        };
+        let l = load_doc(&doc(
+            "{turn: smart, goal: {model: jev, confidence: 0.7}, preflight: jev, approve: {model: jev, confidence: 0.9}}",
+        ))
+        .unwrap();
+        let i = &l.settings.intelligence;
+        assert_eq!(i.reference(ModelRole::Goal).as_deref(), Some("jev"));
+        assert_eq!(i.role_confidence(ModelRole::Goal), Some(0.7));
+        assert_eq!(i.role_confidence(ModelRole::Preflight), None);
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+        let errors = |roles: &str| match load_doc(&doc(roles)) {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        for (roles, why) in [
+            (
+                "{turn: {model: smart, confidence: 0.5}}",
+                "this role writes",
+            ),
+            (
+                "{turn: smart, goal: {model: jev, confidence: 1.5}}",
+                "a number from 0 to 1",
+            ),
+            ("{turn: smart, approve: jev}", "only above a threshold"),
+            (
+                "{turn: smart, goal: {model: jev, temperature: 1}}",
+                "a model's name, or {model, confidence}",
+            ),
+        ] {
+            let e = errors(roles);
+            assert!(e.contains(why), "{roles} → {e}");
         }
     }
 

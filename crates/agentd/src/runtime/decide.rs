@@ -93,12 +93,20 @@ pub(crate) fn node_decision(kind: &str, spec: &Map<String, Value>) -> Result<Dec
     Ok(Decision { state, questions })
 }
 
-/// A deciding node's threshold: its `confidence`, and what an answer under
+/// A deciding node's threshold: its `confidence` — else `roles.decide`'s —
+/// and what an answer under
 /// it does — `on_unsure` as written, else `escalate` where there is a model
 /// to escalate to, else `fail`. A threshold the author set is never quietly
 /// ignored. `None` without `confidence`: nothing is unsure.
-pub(crate) fn node_sureness(spec: &Map<String, Value>, can_escalate: bool) -> Option<Sureness> {
-    let confidence = spec.get("confidence").and_then(Value::as_f64)?;
+pub(crate) fn node_sureness(
+    spec: &Map<String, Value>,
+    can_escalate: bool,
+    role_confidence: Option<f64>,
+) -> Option<Sureness> {
+    let confidence = spec
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .or(role_confidence)?;
     let on_unsure = spec
         .get("on_unsure")
         .and_then(Value::as_str)
@@ -143,7 +151,7 @@ impl Runtime {
 
     /// The model an unsure decision on `reference` is asked again on,
     /// resolved.
-    fn escalate_config(
+    pub(crate) fn escalate_config(
         &self,
         reference: Option<&str>,
     ) -> Option<crate::subagent::protocol::IntelConfig> {
@@ -165,7 +173,13 @@ impl Runtime {
     ) -> Result<StepWork, String> {
         let decision = node_decision(kind, spec)?;
         let escalate = self.escalate_config(self.deciding_reference(spec).as_deref());
-        let sure = node_sureness(spec, escalate.is_some());
+        let sure = node_sureness(
+            spec,
+            escalate.is_some(),
+            self.settings
+                .intelligence
+                .role_confidence(ModelRole::Decide),
+        );
         Ok(StepWork {
             decision: Some(Box::new(DecisionJob {
                 decision,
@@ -174,6 +188,36 @@ impl Runtime {
             })),
             sure,
         })
+    }
+
+    /// The work for a decision a ROLE asks (preflight, the goal check): on
+    /// the role's model, with the role's `confidence` — an unsure answer
+    /// escalated where the model names an `escalate` model, else
+    /// `unsure_default`.
+    pub(crate) fn decision_work_for_role(
+        &self,
+        role: ModelRole,
+        decision: Decision,
+        unsure_default: OnUnsure,
+    ) -> StepWork {
+        let intel = &self.settings.intelligence;
+        let escalate = self.escalate_config(intel.reference(role).as_deref());
+        let sure = intel.role_confidence(role).map(|confidence| Sureness {
+            confidence,
+            on_unsure: if escalate.is_some() {
+                OnUnsure::Escalate
+            } else {
+                unsure_default
+            },
+        });
+        StepWork {
+            decision: Some(Box::new(DecisionJob {
+                decision,
+                shape: Shape::Decide,
+                escalate,
+            })),
+            sure,
+        }
     }
 
     /// A deciding step answered as a decision.
@@ -256,16 +300,22 @@ mod tests {
 
     #[test]
     fn a_threshold_is_never_quietly_ignored() {
-        assert!(node_sureness(&spec(json!({})), true).is_none());
-        let s = node_sureness(&spec(json!({"confidence": 0.8})), true).unwrap();
+        assert!(node_sureness(&spec(json!({})), true, None).is_none());
+        let s = node_sureness(&spec(json!({"confidence": 0.8})), true, None).unwrap();
         assert_eq!(s.on_unsure, OnUnsure::Escalate);
-        let s = node_sureness(&spec(json!({"confidence": 0.8})), false).unwrap();
+        let s = node_sureness(&spec(json!({"confidence": 0.8})), false, None).unwrap();
         assert_eq!(s.on_unsure, OnUnsure::Fail);
         let s = node_sureness(
             &spec(json!({"confidence": 0.8, "on_unsure": "continue"})),
             true,
+            None,
         )
         .unwrap();
         assert_eq!(s.on_unsure, OnUnsure::Continue);
+        // `roles.decide`'s confidence is the default a node's own replaces.
+        let s = node_sureness(&spec(json!({})), false, Some(0.6)).unwrap();
+        assert_eq!(s.confidence, 0.6);
+        let s = node_sureness(&spec(json!({"confidence": 0.9})), false, Some(0.6)).unwrap();
+        assert_eq!(s.confidence, 0.9);
     }
 }

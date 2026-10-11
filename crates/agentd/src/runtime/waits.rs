@@ -2096,7 +2096,13 @@ impl Runtime {
         // self-report); there is no model to escalate to.
         let work = super::steps::StepWork {
             decision: None,
-            sure: super::decide::node_sureness(spec, false),
+            sure: super::decide::node_sureness(
+                spec,
+                false,
+                self.settings
+                    .intelligence
+                    .role_confidence(crate::config::settings::ModelRole::Decide),
+            ),
         };
         self.step_turn_pub(run_id, step_id, &think, &think_spec, data, role, work);
     }

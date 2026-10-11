@@ -49,11 +49,18 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 
 /// Like `read_exact`, but distinguishes clean EOF (no bytes read → `false`)
 /// from a truncated read (some bytes then EOF → error).
+///
+/// An interrupted read is retried, as `read_exact` retries one. The
+/// supervisor installs its signal handlers without `SA_RESTART` — so its
+/// loop wakes on them — and a `SIGCHLD` landing on a thread blocked here
+/// failed the read: the reader of a child's frames took it for the end of
+/// the stream, stopped, and every later frame of that child was lost (a
+/// turn's tool request answered by nobody, until its deadline).
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
-        match r.read(&mut buf[filled..])? {
-            0 => {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => {
                 return if filled == 0 {
                     Ok(false)
                 } else {
@@ -63,7 +70,9 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
                     ))
                 };
             }
-            n => filled += n,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(true)
@@ -96,6 +105,34 @@ mod tests {
         let frame = read_frame(&mut cur).unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
         assert_eq!(v["text"], "line1\nline2");
+    }
+
+    /// A read interrupted by a signal is not the end of the stream.
+    #[test]
+    fn an_interrupted_read_is_retried() {
+        struct Flaky {
+            inner: Cursor<Vec<u8>>,
+            interrupts: usize,
+        }
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.interrupts > 0 {
+                    self.interrupts -= 1;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                self.inner.read(buf)
+            }
+        }
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &serde_json::json!({"tool": "plan.get"})).unwrap();
+        let mut r = Flaky {
+            inner: Cursor::new(buf),
+            interrupts: 2,
+        };
+        let frame = read_frame(&mut r).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(v["tool"], "plan.get");
+        assert!(read_frame(&mut r).unwrap().is_none());
     }
 
     #[test]

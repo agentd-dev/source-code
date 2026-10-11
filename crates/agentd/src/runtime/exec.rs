@@ -152,6 +152,9 @@ fn read_capped<R: Read>(mut r: R, cap: usize) -> String {
                     buf.extend_from_slice(&chunk[..take]);
                 }
             }
+            // A signal (the supervisor's `SIGCHLD`, which restarts nothing)
+            // interrupting the read is not the end of the output.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }

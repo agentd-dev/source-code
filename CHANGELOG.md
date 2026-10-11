@@ -520,6 +520,14 @@ the instance and to the conversation they ran for.
 
 ### Fixed
 
+- **A child's frames are no longer lost when a signal interrupts their
+  read.** The supervisor's handlers are installed without `SA_RESTART`, so a
+  `SIGCHLD` — any child exiting — could interrupt the thread reading another
+  child's frames; the reader took the interrupted read for the end of the
+  stream and stopped, and every later frame of that child was lost: a turn's
+  tool request went unanswered until the turn's deadline. Seen in CI as a turn
+  that asked `plan.get` the moment a subagent exited. An interrupted read is
+  retried now, there and in `exec`'s output capture (which truncated).
 - **A subagent template's gate channels are announced in its child.** A
   template whose `human` steps were addressed to a `::!human` with a channel
   loaded, but its child announced nothing, since the prose the child reads no

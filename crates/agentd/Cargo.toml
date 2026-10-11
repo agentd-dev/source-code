@@ -26,18 +26,20 @@ default = ["tls"]
 # `--no-default-features` to reach https only via a TLS-terminating sidecar.
 tls = ["net/tls", "mcp/tls"]
 # A2A (Agent2Agent): agentd's channel to other agents and to its own
-# display clients. The protocol itself is `a2a-rs` — an implementation of the
-# published A2A specification, so method dispatch, the typed request/response
-# shapes, the streaming events, the error mapping and the agent card come from
-# the spec's own model rather than from our reading of it. agentd supplies the
-# ports (`a2a::ports`): identity, the role matrix, and the durable tasks the
-# reactor owns. The listener is axum over tokio-rustls, which is where mTLS
-# client identity is read, so this rides `tls`.
+# display clients. The protocol itself is the A2A project's official Rust SDK
+# (github.com/a2aproject/a2a-rs): the specification's types (`a2a-lf`), its
+# canonical ProtoJSON (`a2a-pb`), and its server (`a2a-server-lf`) — method
+# dispatch, the typed request/response shapes, SSE framing and the error
+# mapping come from the spec's own model rather than from our reading of it.
+# agentd implements its `RequestHandler` (`a2a::ports`): identity, the role
+# matrix, and the durable tasks the reactor owns. The listener is axum over
+# tokio-rustls, which is where mTLS client identity is read, so this rides `tls`.
 a2a = [
     "tls",
-    "dep:a2a-rs",
-    "dep:buffa",
-    "dep:buffa-types",
+    "dep:a2a-types",
+    "dep:a2a-pb",
+    "dep:a2a-server",
+    "dep:chrono",
     "dep:tokio",
     "dep:axum",
     "dep:tokio-rustls",
@@ -138,33 +140,35 @@ mcp-events = []
 decrypt = ["sign"]
 
 [dependencies]
-# The A2A protocol itself (feature `a2a`): domain types generated from the
-# specification's protocol buffers, the JSON-RPC method dispatch, the streaming
-# events and the error mapping. agentd implements its ports; it does not
-# re-implement the protocol.
+# The A2A protocol itself (feature `a2a`), from the A2A project's official Rust
+# SDK: `a2a` the specification's types, `a2a-pb` the canonical ProtoJSON every
+# binding puts on the wire (a type's serde form is not it — the SDK transcodes
+# through protobuf), `a2a-server` the JSON-RPC router agentd's `RequestHandler`
+# serves behind. agentd implements the handler; it does not re-implement the
+# protocol.
 #
-# `jsonrpc-client` is deliberately NOT enabled: agentd's outbound A2A builds the
-# spec's types over its own credentialed transport (`a2a::peer`), because
-# a2a-rs's client is reqwest with a static bearer and would drop request
-# signing, mTLS and the SSRF guard. Leaving it off keeps reqwest and four other
-# crates out of the tree.
-a2a-rs = { version = "0.10.0", optional = true, default-features = false, features = ["jsonrpc-server"] }
-# a2a-rs's protobuf runtime, pinned to the version it builds its domain types
-# with. agentd constructs those types directly rather than hand-writing their
-# JSON, so `MessageField`/`Struct`/`Timestamp` have to be the same types — a
-# mismatch is a compile error, which is the point.
-buffa = { version = "0.9.2", optional = true, features = ["json"] }
-buffa-types = { version = "0.9.2", optional = true, features = ["json"] }
+# `a2a-server`'s default `rustls-tls` is off: agentd terminates TLS itself
+# (that is where mTLS identity is read) and delivers push notifications over
+# its own credentialed, SSRF-guarded transport (`a2a::push`), so neither the
+# SDK's TLS listener nor its push sender is used.
+# Named `a2a-types` here because the SDK's library is called `a2a`, which is
+# also agentd's own `crate::a2a` module.
+a2a-types = { package = "a2a-lf", version = "0.4.1", optional = true }
+# The SDK's types carry instants as `chrono::DateTime<Utc>`.
+chrono = { version = "0.4", optional = true, default-features = false, features = ["std"] }
+a2a-pb = { version = "0.3.1", optional = true }
+a2a-server = { package = "a2a-server-lf", version = "0.5.1", optional = true, default-features = false }
 # The async runtime + HTTP server the A2A listener runs on (feature `a2a`).
-# a2a-rs's server adapter is an axum `Router`, so agentd serves it directly and
-# merges its own routes onto the same listener.
+# The SDK's JSON-RPC router is an axum `Router`, so agentd serves it directly
+# and merges its own routes onto the same listener.
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 hyper = { version = "1", optional = true, features = ["http1", "server"] }
 hyper-util = { version = "0.1", optional = true, features = ["server", "tokio"] }
 tower = { version = "0.5", optional = true, default-features = false }
-# a2a-rs's ports are `#[async_trait]`; implementing them needs the same macro.
+# The SDK's `RequestHandler` is `#[async_trait]`; implementing it needs the
+# same macro.
 async-trait = { version = "0.1", optional = true }
 # A channel receiver as a `Stream`, for the observation feed's SSE response.
 tokio-stream = { version = "0.1", optional = true }

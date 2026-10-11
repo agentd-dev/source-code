@@ -166,7 +166,7 @@ fn agent_card_of(
     let binding = if advertised_url.starts_with("unix:") {
         UNIX_BINDING
     } else {
-        a2a_rs::domain::PROTOCOL_BINDING_JSONRPC
+        a2a_types::TRANSPORT_PROTOCOL_JSONRPC
     };
     let name = settings
         .agent
@@ -180,7 +180,7 @@ fn agent_card_of(
         .as_deref()
         .filter(|d| !d.trim().is_empty())
         .unwrap_or(DEFAULT_DESCRIPTION);
-    let mut card = json!({
+    let card = json!({
         // `agent.name` as the operator wrote it, else the product. Never the
         // instance name: its fallbacks are the pod and the host, and those
         // are not for an unauthenticated reader.
@@ -197,31 +197,28 @@ fn agent_card_of(
         "defaultOutputModes": ["text/plain", "application/json"],
         "skills": skills,
     });
+    // Emit what the SDK emits. The card is a protocol document, and the only
+    // authority on its wire form is the type generated from the A2A protobuf:
+    // proto3 JSON omits a field at its default, so `required: false` on an
+    // extension is ABSENT on a conformant wire and a peer reads absence as
+    // false. The security fields are set on the typed card, so they reach the
+    // wire in the protobuf's shape too.
+    //
+    // A conversion failure would mean the card is not an `AgentCard`, which the
+    // unit tests make impossible; were it ever to happen, sending the
+    // hand-built form beats sending nothing.
+    let Ok(mut typed) = crate::a2a::wire::from_wire::<a2a_types::AgentCard>(card.clone()) else {
+        return card;
+    };
     if let Some(sec) = security_of(
         &posture,
         origin_of(advertised_url).as_deref(),
         &settings.a2a.device_grant.scopes,
     ) {
-        card["securitySchemes"] = serde_json::to_value(&sec.schemes).unwrap_or(Value::Null);
-        card["securityRequirements"] =
-            serde_json::to_value(&sec.requirements).unwrap_or(Value::Null);
+        typed.security_schemes = Some(sec.schemes);
+        typed.security_requirements = Some(sec.requirements);
     }
-    // Emit what the SDK emits. The card is a protocol document, and the only
-    // authority on its wire form is the type generated from the A2A protobuf:
-    // proto3 JSON omits a field at its default, so `required: false` on an
-    // extension is ABSENT on a conformant wire and a peer reads absence as
-    // false.
-    //
-    // A conversion failure would mean the card is not an `AgentCard`, which the
-    // unit tests make impossible; were it ever to happen, sending the
-    // hand-built form beats sending nothing.
-    match serde_json::from_value::<a2a_rs::domain::AgentCard>(card.clone())
-        .ok()
-        .and_then(|c| serde_json::to_value(c).ok())
-    {
-        Some(canonical) => canonical,
-        None => card,
-    }
+    crate::a2a::wire::to_wire(&typed)
 }
 
 /// Narrow an extension's public declaration to what `caller` may use.
@@ -383,10 +380,10 @@ mod tests {
 
     /// A card is a fixpoint of the SDK's typed `AgentCard`: nothing it sets is
     /// outside the message, so nothing is dropped by a typed reader.
-    fn assert_fixpoint(card: &Value, what: &str) -> a2a_rs::domain::AgentCard {
-        let typed: a2a_rs::domain::AgentCard = serde_json::from_value(card.clone())
+    fn assert_fixpoint(card: &Value, what: &str) -> a2a_types::AgentCard {
+        let typed: a2a_types::AgentCard = crate::a2a::wire::from_wire(card.clone())
             .unwrap_or_else(|e| panic!("{what}: not an AgentCard ({e}): {card}"));
-        let back = serde_json::to_value(&typed).expect("and serializes again");
+        let back = crate::a2a::wire::to_wire(&typed);
         assert_eq!(card, &back, "{what}: not a fixpoint of the SDK's type");
         typed
     }
@@ -530,35 +527,41 @@ mod tests {
         assert_eq!(described("workflow:said"), Some(json!("Says so")));
     }
 
-    /// A stock a2a-rs client, handed our card, selects our interface.
+    /// A stock client of the A2A project's Rust SDK, handed our card, selects
+    /// our interface.
     ///
-    /// a2a-rs's `TransportNegotiator::select` offers a transport factory an
-    /// interface only when its `protocolBinding` is the factory's protocol and
-    /// its `protocolVersion` passes `version_compatible` — empty, or major
-    /// `1`; nothing else is a compatible transport. The negotiator itself cannot be
-    /// linked here: a2a-rs 0.10's `client` feature does not compile without
-    /// the reqwest transports this crate keeps out of its tree. So its rule is
-    /// applied, as written there, to the card the SDK's own type parsed.
+    /// Its `A2AClientFactory` offers a transport factory an interface only
+    /// when the interface's `protocolBinding` is the factory's protocol and the
+    /// major version of its `protocolVersion` (1 when it does not parse) is
+    /// the factory's — the JSON-RPC factory being `JSONRPC` at major 1. The
+    /// client crate is not linked here (its reqwest transports have no place
+    /// in this tree), so its rule is applied, as written there, to the card
+    /// the SDK's own type parsed.
     #[test]
-    fn a2a_rs_negotiates_a_transport_from_our_card() {
-        // a2a-rs 0.10 `adapter/transport/negotiation.rs`, `version_compatible`.
+    fn the_sdk_client_negotiates_a_transport_from_our_card() {
+        // a2a-client-lf 0.2.7 `factory.rs`, `TransportKey::from_interface`.
         fn version_compatible(version: &str) -> bool {
-            version.is_empty() || version.split('.').next() == Some("1")
+            version
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1)
+                == 1
         }
-        // The copy is only as good as the version it was copied from: a
-        // dependency bump fails here until the rule above is re-read against
-        // the new release's negotiator and this pin moved with it.
+        // The copy is only as good as the release it was read from: a bump of
+        // the SDK fails here until the rule above is re-read against the new
+        // release's client and this pin moved with it.
         let lock =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
                 .expect("the workspace lockfile");
         let locked = lock
             .split("[[package]]")
-            .find(|p| p.contains("\nname = \"a2a-rs\"\n"))
+            .find(|p| p.contains("\nname = \"a2a-lf\"\n"))
             .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = ")))
-            .expect("a2a-rs is locked");
+            .expect("a2a-lf is locked");
         assert_eq!(
-            locked, "\"0.10.0\"",
-            "a2a-rs moved: re-check version_compatible against its negotiation.rs"
+            locked, "\"0.4.1\"",
+            "the A2A SDK moved: re-check version_compatible against a2a-client's factory.rs"
         );
         let s = settings(
             json!({"listen": "https://agent.example:8443", "bearer": "{{secret:B}}",
@@ -569,13 +572,13 @@ mod tests {
             ("public", CardView::Public),
             ("extended", CardView::Extended(&operator)),
         ] {
-            let typed: a2a_rs::domain::AgentCard =
-                serde_json::from_value(card(&s, &no_workflows(), view)).unwrap();
+            let typed: a2a_types::AgentCard =
+                crate::a2a::wire::from_wire(card(&s, &no_workflows(), view)).unwrap();
             let offered: Vec<&str> = typed
                 .supported_interfaces
                 .iter()
                 .filter(|i| {
-                    i.protocol_binding == a2a_rs::domain::PROTOCOL_BINDING_JSONRPC
+                    i.protocol_binding == a2a_types::TRANSPORT_PROTOCOL_JSONRPC
                         && version_compatible(&i.protocol_version)
                 })
                 .map(|i| i.url.as_str())
@@ -904,7 +907,10 @@ mod tests {
                 "{name}: requirements without schemes, or schemes without requirements: {c}"
             );
             assert_eq!(
-                typed.security_requirements.is_empty(),
+                typed
+                    .security_requirements
+                    .as_ref()
+                    .is_none_or(Vec::is_empty),
                 !posture.declares_any(),
                 "{name}"
             );

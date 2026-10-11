@@ -505,6 +505,33 @@ sent one at a time); agentd's answers to a server's requests are bounded at
 
 ### Changed (breaking)
 
+- **A2A runs on the A2A project's official Rust SDK.** The listener is the
+  official server (`a2a-server-lf`) over agentd's own `RequestHandler`, the
+  wire is its canonical ProtoJSON (`a2a-pb`) and the types are `a2a-lf`, from
+  [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs); the community
+  `a2a-rs` crate, `buffa`, `buffa-types` and the vendored `connectrpc` are
+  gone, and so is the crates.io build's need for `cmake` and a C++ compiler.
+  agentd's identity, roles, admission and error fidelity are unchanged in
+  front of it. Where the old library differed from the specification, agentd
+  now follows the specification:
+  - a streaming send and `SubscribeToTask` close at a terminal state only
+    (A2A 1.0 §3.1.2, §3.1.6) — a task waiting at a gate keeps its stream;
+  - `SubscribeToTask` on a task that has ended is `-32004` whatever the
+    request carries: `Last-Event-ID` no longer replays a task's past
+    transitions (a reconnecting client subscribes again and gets the task as
+    it is, or reads an ended one with `GetTask`). The TUI and web UI let a
+    stream go at a gate themselves and follow the task again when it moves;
+  - a `pageSize` of 0 or less in `ListTasks` or
+    `ListTaskPushNotificationConfigs` is "not specified" (the default page),
+    as proto3 and the SDK read it, rather than refused;
+  - task and context ids are the SDK's UUIDv7s (time plus 74 random bits);
+  - a message that names a task and a different `contextId` is refused
+    (`-32602`) by agentd's runtime, as the old library refused it (§3.4.1).
+- **A2A streams are agentd's own.** Each task's transitions are published
+  into a per-task channel, and every stream opens with the task as it is and
+  carries only the transitions after that snapshot, in the reactor's order. A
+  blocking `SendMessage` still waits at most 25 seconds for its task to
+  settle.
 - **A `schedule` that could never fire is refused at load.** The runtime
   drops a clock it cannot read, so a schedule with no `cron`, `every` or
   `at`, an `every` or `at` that is not a duration (the docs offered

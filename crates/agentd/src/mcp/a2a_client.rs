@@ -57,7 +57,7 @@ use crate::a2a::peer::{self as a2a, PeerCard};
 use crate::config::A2aEndpoint;
 use crate::runtime::surface::{A2A_PROTOCOL_VERSION, COMMAND_EXTENSION};
 use ::mcp::rpc::{Id, Request};
-use a2a_rs::domain::TaskState;
+use a2a_types::TaskState;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -359,17 +359,15 @@ trait Caller {
 /// terminal states → a descriptive error observation.
 fn terminal_outcome(task: &Value) -> Option<DelegateOutcome> {
     let state = a2a::task_state_of(task);
-    if !a2a::is_terminal(state) {
+    if !a2a::is_terminal(&state) {
         return None;
     }
     Some(match state {
-        TaskState::TASK_STATE_COMPLETED => DelegateOutcome::Distillate(a2a::artifact_text_of(task)),
-        TaskState::TASK_STATE_REJECTED => {
+        TaskState::Completed => DelegateOutcome::Distillate(a2a::artifact_text_of(task)),
+        TaskState::Rejected => {
             DelegateOutcome::Error("a2a: remote agent rejected the objective".into())
         }
-        TaskState::TASK_STATE_CANCELED => {
-            DelegateOutcome::Error("a2a: remote task was canceled".into())
-        }
+        TaskState::Canceled => DelegateOutcome::Error("a2a: remote task was canceled".into()),
         // Failed (and any other terminal mapped here) — the remote run did not
         // reach a clean conclusion.
         _ => DelegateOutcome::Error("a2a: remote task failed".into()),
@@ -691,7 +689,7 @@ impl HttpConn {
                 "a2a: peer requires the extension {uri}, which agentd does not implement"
             ));
         }
-        self.tenant = Some(interface.tenant.clone()).filter(|t| !t.is_empty());
+        self.tenant = interface.tenant.clone().filter(|t| !t.is_empty());
         self.required = card.required_extensions().map(str::to_string).collect();
         Ok(())
     }
@@ -852,8 +850,7 @@ impl HttpConn {
                 // and a conformant peer signals termination by the state plus
                 // closing the stream, so the state is the only signal to trust.
                 if a2a::is_terminal(
-                    serde_json::from_value(json!(state))
-                        .unwrap_or(TaskState::TASK_STATE_UNSPECIFIED),
+                    &serde_json::from_value(json!(state)).unwrap_or(TaskState::Unspecified),
                 ) {
                     let outcome = match state {
                         "TASK_STATE_COMPLETED" if !artifacts.is_empty() => {
@@ -1258,11 +1255,7 @@ mod tests {
         // terminal Task over unary GetTask instead of erroring or re-sending.
         let url = serve_sse_fixture(
             vec![status_frame("s-2", "TASK_STATE_WORKING", false)],
-            vec![task(
-                "s-2",
-                TaskState::TASK_STATE_COMPLETED,
-                Some("recovered answer"),
-            )],
+            vec![task("s-2", TaskState::Completed, Some("recovered answer"))],
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1293,13 +1286,9 @@ mod tests {
     fn delegate_over_http_send_then_poll_returns_the_distillate() {
         // Send → WORKING; GetTask → WORKING then COMPLETED — over HTTP.
         let url = serve_http_fixture(vec![
-            task("h-1", TaskState::TASK_STATE_WORKING, None),
-            task("h-1", TaskState::TASK_STATE_WORKING, None),
-            task(
-                "h-1",
-                TaskState::TASK_STATE_COMPLETED,
-                Some("http distilled answer"),
-            ),
+            task("h-1", TaskState::Working, None),
+            task("h-1", TaskState::Working, None),
+            task("h-1", TaskState::Completed, Some("http distilled answer")),
         ]);
         let ep = A2aEndpoint::parse(&url).expect("parse https endpoint");
         assert!(matches!(ep, A2aEndpoint::Https(_)));
@@ -1327,7 +1316,7 @@ mod tests {
                 return no_card();
             }
             // Reply terminal immediately so the client stops after one call.
-            let result = task("h-a", TaskState::TASK_STATE_COMPLETED, Some("authed"));
+            let result = task("h-a", TaskState::Completed, Some("authed"));
             Answer::Rpc(json!({ "result": result }))
         });
         let ep = A2aEndpoint::parse(&url).unwrap();
@@ -1355,11 +1344,7 @@ mod tests {
     #[test]
     fn delegate_over_http_send_message_already_terminal_skips_polling() {
         // A blocking peer returns COMPLETED straight from the send.
-        let url = serve_http_fixture(vec![task(
-            "h-t",
-            TaskState::TASK_STATE_COMPLETED,
-            Some("immediate"),
-        )]);
+        let url = serve_http_fixture(vec![task("h-t", TaskState::Completed, Some("immediate"))]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
@@ -1370,7 +1355,7 @@ mod tests {
 
     #[test]
     fn delegate_over_http_surfaces_a_failed_task() {
-        let url = serve_http_fixture(vec![task("h-2", TaskState::TASK_STATE_FAILED, None)]);
+        let url = serve_http_fixture(vec![task("h-2", TaskState::Failed, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(matches!(
@@ -1382,7 +1367,7 @@ mod tests {
     #[test]
     fn delegate_over_http_deadline_while_polling_is_a_timeout() {
         // The task never terminates (WORKING repeats) → give up on the deadline.
-        let url = serve_http_fixture(vec![task("h-w", TaskState::TASK_STATE_WORKING, None)]);
+        let url = serve_http_fixture(vec![task("h-w", TaskState::Working, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
         match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
@@ -1405,7 +1390,7 @@ mod tests {
             if !std::mem::take(&mut first) {
                 thread::sleep(Duration::from_millis(900));
             }
-            Answer::Rpc(json!({ "result": task("h-d", TaskState::TASK_STATE_WORKING, None) }))
+            Answer::Rpc(json!({ "result": task("h-d", TaskState::Working, None) }))
         })
         .0;
         let ep = A2aEndpoint::parse(&url).unwrap();
@@ -1485,16 +1470,14 @@ mod tests {
                     return card.as_ref().map_or_else(no_card, serve_card);
                 }
                 match req.body["method"].as_str() {
-                    Some("GetTask") => {
-                        result(task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done")))
-                    }
+                    Some("GetTask") => result(task("t-1", TaskState::Completed, Some("done"))),
                     _ => send(),
                 }
             })
         }
 
         fn working() -> Answer {
-            result(json!({"task": task("t-1", TaskState::TASK_STATE_WORKING, None)}))
+            result(json!({"task": task("t-1", TaskState::Working, None)}))
         }
 
         fn delegated(url: &str) -> DelegateOutcome {
@@ -1658,7 +1641,7 @@ mod tests {
                         card.to_string(),
                     );
                 }
-                result(json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done"))}))
+                result(json!({"task": task("t-1", TaskState::Completed, Some("done"))}))
             });
             assert_eq!(answer_of(delegated(&url)), "done");
             assert_eq!(answer_of(delegated(&url)), "done");
@@ -1706,9 +1689,7 @@ mod tests {
                     ));
                 }
                 match req.body["method"].as_str() {
-                    Some("GetTask") => {
-                        result(task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done")))
-                    }
+                    Some("GetTask") => result(task("t-1", TaskState::Completed, Some("done"))),
                     _ => working(),
                 }
             });
@@ -1747,7 +1728,7 @@ mod tests {
                         card.to_string(),
                     );
                 }
-                result(json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done"))}))
+                result(json!({"task": task("t-1", TaskState::Completed, Some("done"))}))
             });
             let e = error_of(delegated(&url));
             assert!(e.contains("https://example.com/ext/unknown"), "{e}");
@@ -1773,7 +1754,7 @@ mod tests {
                         card.to_string(),
                     );
                 }
-                result(json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done"))}))
+                result(json!({"task": task("t-1", TaskState::Completed, Some("done"))}))
             });
             let as_bearer = |b: &str| {
                 let ep = A2aEndpoint::parse(&url).unwrap();
@@ -1921,7 +1902,7 @@ mod tests {
                     match req.body["method"].as_str() {
                         Some("SendStreamingMessage") => refusal.take().unwrap(),
                         _ => result(
-                            json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("unary"))}),
+                            json!({"task": task("t-1", TaskState::Completed, Some("unary"))}),
                         ),
                     }
                 });
@@ -2008,7 +1989,7 @@ mod tests {
                         return serve_card(&card);
                     }
                     result(
-                        json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("over the socket"))}),
+                        json!({"task": task("t-1", TaskState::Completed, Some("over the socket"))}),
                     )
                 })
             };
@@ -2025,7 +2006,7 @@ mod tests {
                     if is_card_get(req) {
                         return serve_card(&card);
                     }
-                    result(json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("x"))}))
+                    result(json!({"task": task("t-1", TaskState::Completed, Some("x"))}))
                 })
             };
             let e = error_of(delegated(&url));

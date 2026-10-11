@@ -190,8 +190,8 @@ pub fn join(origin: &str, path: &str) -> String {
 #[cfg(feature = "a2a")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardSecurity {
-    pub schemes: std::collections::HashMap<String, a2a_rs::domain::SecurityScheme>,
-    pub requirements: Vec<a2a_rs::domain::SecurityRequirement>,
+    pub schemes: std::collections::HashMap<String, a2a_types::SecurityScheme>,
+    pub requirements: Vec<a2a_types::SecurityRequirement>,
 }
 
 /// The card's security fields, from the posture the listener enforces and the
@@ -202,16 +202,17 @@ pub struct CardSecurity {
 /// declares. So every mechanism the listener accepts is declared here, and
 /// nothing it does not: a unix socket declares none (the kernel names the
 /// peer), and a loopback daemon with no mechanism declares none (the caller is
-/// the operator by the bind). Built with the SDK's constructors, so the typed
-/// round trip the card goes through keeps every field.
+/// the operator by the bind). Built from the SDK's types, so the typed round
+/// trip the card goes through keeps every field.
 #[cfg(feature = "a2a")]
 pub fn security_of(
     posture: &ListenerAuth,
     origin: Option<&str>,
     scopes: &[crate::config::settings::DeviceScope],
 ) -> Option<CardSecurity> {
-    use a2a_rs::domain::{
-        DeviceCodeOAuthFlow, OAuthFlows, SecurityRequirement, SecurityScheme, StringList,
+    use a2a_types::{
+        DeviceCodeOAuthFlow, HttpAuthSecurityScheme, MutualTlsSecurityScheme, OAuth2SecurityScheme,
+        OAuthFlows, SecurityRequirement, SecurityScheme,
     };
     if !posture.declares_any() {
         return None;
@@ -229,7 +230,11 @@ pub fn security_of(
         };
         schemes.insert(
             "bearer".to_string(),
-            SecurityScheme::http("Bearer".into(), None, Some(how.into())),
+            SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
+                scheme: "Bearer".into(),
+                description: Some(how.into()),
+                bearer_format: None,
+            }),
         );
     }
     // The grant's endpoints live at the origin root, which is why `a2a.url` is
@@ -245,7 +250,7 @@ pub fn security_of(
                 .iter()
                 .map(|s| (s.as_str().to_string(), scope_description(*s).to_string()))
                 .collect(),
-            ..Default::default()
+            refresh_url: None,
         };
         // RFC 8414 metadata is only worth pointing at over TLS: a client that
         // trusts discovery over plaintext trusts whoever answers it.
@@ -254,31 +259,29 @@ pub fn security_of(
             .then(|| join(origin, "/.well-known/oauth-authorization-server"));
         schemes.insert(
             "device_code".to_string(),
-            SecurityScheme::oauth2(
-                OAuthFlows::device_code(flow),
-                Some(
+            SecurityScheme::OAuth2(OAuth2SecurityScheme {
+                flows: OAuthFlows::DeviceCode(flow),
+                description: Some(
                     "Sign in with the OAuth 2.0 device authorization grant (RFC 8628); an \
                      operator approves the code"
                         .into(),
                 ),
-                metadata,
-            ),
+                oauth2_metadata_url: metadata,
+            }),
         );
     }
     if posture.mtls {
         schemes.insert(
             "mtls".to_string(),
-            SecurityScheme::mutual_tls(Some(
-                "A client certificate that chains to this agent's client CA".into(),
-            )),
+            SecurityScheme::MutualTls(MutualTlsSecurityScheme {
+                description: Some(
+                    "A client certificate that chains to this agent's client CA".into(),
+                ),
+            }),
         );
     }
-    let all_of = |names: &[&str]| SecurityRequirement {
-        schemes: names
-            .iter()
-            .map(|n| (n.to_string(), StringList::default()))
-            .collect(),
-        ..Default::default()
+    let all_of = |names: &[&str]| -> SecurityRequirement {
+        names.iter().map(|n| (n.to_string(), Vec::new())).collect()
     };
     let requirements = if posture.mtls {
         // The handshake demands the certificate before any header is read, so

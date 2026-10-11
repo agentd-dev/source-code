@@ -157,7 +157,7 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
         let v = post_rpc(&addr, id, "SendMessage", params.clone())
             .unwrap_or_else(|e| panic!("params {params} killed the request: {e}"));
         // Invalid params, whichever layer saw it first: the listener's
-        // envelope check for params that are not an object, a2a-rs's typed
+        // envelope check for params that are not an object, the SDK's typed
         // read for an object whose `message` is not one.
         assert_eq!(
             v["error"]["code"], -32602,

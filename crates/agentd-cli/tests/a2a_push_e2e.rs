@@ -325,9 +325,9 @@ fn a_registered_webhook_receives_the_task_and_the_callers_credentials() {
 }
 
 /// `ListTaskPushNotificationConfigs` pages on the wire, not only inside the
-/// runtime: a2a-rs 0.10 drops the request's `pageSize` and `pageToken`, so a
-/// listing passed down to it would answer everything to a caller that asked
-/// for two, accept a page size of 101, and never say whether more remained.
+/// runtime: a caller that asks for two gets two, a page size of 101 is
+/// refused, and every page says whether more remain (`nextPageToken`, `""` on
+/// the last).
 #[test]
 fn push_configs_page_on_the_wire() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "ok"}]}));

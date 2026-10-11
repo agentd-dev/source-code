@@ -415,11 +415,11 @@ fn a_subagents_gate_is_unowned_even_under_an_owned_turn() {
 /// The path: a `workflow.signal` releases a wait inside a `foreach` body, and
 /// the body's next step — a call an `ask` policy gates, in a run nobody owns
 /// — opens its gate before the signal command's own task is created. The
-/// reservation is the id a2a-rs generated for the command's task and has
-/// already subscribed to; a caller cannot name it (a command carries no task
+/// reservation is the id the handler minted for the command's task and is
+/// already watching; a caller cannot name it (a command carries no task
 /// id). Had the gate taken it, the command's task would come back under an id
 /// nobody is watching — and the send refuses to answer with any task but the
-/// one a2a-rs watches, so the caller would get an error instead of its task.
+/// one the handler watches, so the caller would get an error instead of its task.
 #[test]
 fn a_gate_opened_mid_request_never_takes_the_requests_task_id() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));

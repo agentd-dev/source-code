@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **What a2a-rs 0.10 changed on the wire, and what it must not have.**
+//! **A task's stream, and a send's wait, against the real listener.**
 //!
-//! agentd answers the specification's methods through a2a-rs, so a version bump
-//! of that library is a change to agentd's protocol surface even when not a
-//! line of agentd's own code moves. These tests pin the two places 0.10 reaches
-//! agentd, against the real listener:
+//! agentd answers the specification's methods through the A2A SDK's router
+//! over its own handler (`a2a::ports`), whose streams and waits are agentd's:
 //!
 //! * **`SubscribeToTask` on a settled task is refused** with the spec's
-//!   -32004, as plain JSON. 0.6 opened a stream that carried nothing and closed
-//!   — indistinguishable, for a client, from an agent that has yet to speak. A
-//!   `Last-Event-ID` still replays: reconnecting to a stream the caller already
-//!   held is exactly when the missed events matter, and the task having
-//!   finished in the meantime is the usual reason they were missed.
-//! * **A send's own task is watchable.** 0.10 reads the task a send names
-//!   before it attaches the send's subscription, and the name is the id the
-//!   listener pre-minted for a task that does not exist yet — so the read finds
-//!   nothing. Taken as a refusal, that fails the attach: a blocking send stops
-//!   waiting and answers `WORKING`, and a streaming send is refused as "task
-//!   not found" for the task it was about to create. `ports::StreamAuthz::
-//!   record_read` is the guard, and these are the tests that fail without it.
+//!   -32004, as plain JSON (A2A 1.0 §3.1.6) — never a stream that opens and
+//!   closes with nothing in it, which a client could not tell from an agent
+//!   that has yet to speak. A `Last-Event-ID` changes nothing: the
+//!   specification has a client reconnect by opening a new stream, which
+//!   opens with the task as it is, and a task that has ended is read with
+//!   `GetTask`.
+//! * **A send's own task is watchable.** The handler starts watching the task
+//!   a send will create before the work starts, under the id it minted for it,
+//!   so a blocking send holds until that task settles and a streaming send
+//!   carries it to its end.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -162,23 +158,21 @@ fn subscribe_to_a_completed_task() {
     );
     assert_eq!(v["id"], 2, "the refusal answers the request: {v}");
 
-    // With Last-Event-ID: 0 the stored events replay — the reconnect case.
-    let replay = a2a_post_within(
+    // A reconnecting client's `Last-Event-ID` changes nothing: the task has
+    // ended, and is read with GetTask.
+    let again = a2a_post_within(
         &addr,
         &rpc_body(3, "SubscribeToTask", json!({"id": id})),
         &[("Last-Event-ID", "0")],
         Duration::from_secs(10),
     );
     assert!(
-        replay
+        again
             .header("content-type")
-            .is_some_and(|t| t.contains("text/event-stream")),
-        "a resumed subscribe is a stream: {replay:?}"
+            .is_some_and(|t| t.contains("application/json")),
+        "still answered, not streamed: {again:?}"
     );
-    assert!(
-        replay.body.contains("data:") && replay.body.contains(&id),
-        "the stored events replay for the task: {replay:?}"
-    );
+    assert_eq!(again.json()["error"]["code"], -32004, "{again:?}");
 }
 
 /// The blocking half of the guard: the send holds the connection until the

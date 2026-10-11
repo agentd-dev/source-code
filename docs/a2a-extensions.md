@@ -318,10 +318,11 @@ when it stops being true:
 
 - **The method table is the SDK's.** `spec_methods_are_exactly_the_sdks`
   (`runtime/surface/methods.rs`) holds the eleven core names to the constants
-  of a2a-rs, the library the listener is built on, in both directions; and
-  `route_table_is_exact` routes those and the declared extension methods, and
-  nothing else. a2a-rs is the same library the listener uses, so this checks
-  agentd against its own dependency, not against an independent reading.
+  of the A2A project's official SDK, which the listener is built on, in both
+  directions; and `route_table_is_exact` routes those and the declared
+  extension methods, and nothing else. The SDK is the same library the
+  listener uses, so this checks agentd against its own dependency, not against
+  an independent reading.
 - **Negotiation is an intersection.**
   `negotiation_intersects_requested_declared_and_applicable`
   (`runtime/surface/ext.rs`) runs every method against every subset of the

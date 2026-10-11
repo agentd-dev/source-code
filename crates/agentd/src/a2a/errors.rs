@@ -4,7 +4,8 @@
 //!
 //! One table, so a refusal means the same thing whichever layer raises it —
 //! the listener before a request reaches the runtime, the runtime on its
-//! single-writer loop, or the filter that rewrites what the SDK answered. The
+//! single-writer loop, or the filter that keeps the runtime's words when the SDK
+//! renders an error. The
 //! table is always compiled: code outside the `a2a` feature (the manifest, the
 //! reload path, a test) names a code from here instead of retyping the number.
 //!
@@ -150,30 +151,6 @@ pub fn rpc_error(id: Value, code: i64, message: &str, details: Vec<Value>) -> Va
     json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
-/// An error the SDK raised on its own, made one a spec client can read and
-/// one that says nothing about anyone else.
-///
-/// a2a-rs answers some failures with codes of its own invention — `-32100`
-/// (its store), `-32101` (a version conflict) and `-32102` (a context another
-/// principal owns). They sit inside JSON-RPC's reserved range but in none of
-/// its defined blocks, so no client can interpret them. `error` is the
-/// JSON-RPC `error` object; one carrying such a code becomes
-/// [`INTERNAL_ERROR`] with a generic message and no `data`. All three parts
-/// go together, which is why this takes the whole object and not the code:
-/// for `-32102` the SDK's message reads "Context belongs to another
-/// principal" and its `ErrorInfo` names the `context_id`, so folding the code
-/// alone would still confirm that someone else's context exists and which
-/// one it is. Every other error passes unchanged.
-pub fn normalize_native(error: &mut Value) {
-    let native = error
-        .get("code")
-        .and_then(Value::as_i64)
-        .is_some_and(|c| (-32102..=-32100).contains(&c));
-    if native {
-        *error = json!({"code": INTERNAL_ERROR, "message": "internal error"});
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,38 +191,6 @@ mod tests {
         }
     }
 
-    /// The code an error with `code` comes out of [`normalize_native`] with.
-    fn fold(code: i64) -> i64 {
-        let mut e = json!({"code": code, "message": "m"});
-        normalize_native(&mut e);
-        e["code"].as_i64().expect("a code")
-    }
-
-    #[test]
-    fn native_out_of_range_codes_normalise() {
-        for code in [-32100, -32101, -32102] {
-            assert_eq!(fold(code), INTERNAL_ERROR, "{code}");
-        }
-        for &code in ALL {
-            assert_eq!(fold(code), code, "{code} must pass unchanged");
-        }
-        assert_eq!(fold(TASK_NOT_FOUND), -32001);
-        // The neighbours of the band are not swept up with it.
-        assert_eq!(fold(-32099), -32099);
-        assert_eq!(fold(-32103), -32103);
-        // An error that passes keeps its message and details.
-        let mut kept = rpc_error(
-            json!(1),
-            TASK_NOT_FOUND,
-            "no such task",
-            vec![bad_request(&[("id", "x")])],
-        )["error"]
-            .take();
-        let before = kept.clone();
-        normalize_native(&mut kept);
-        assert_eq!(kept, before);
-    }
-
     #[test]
     fn reasons_are_published_under_their_owners_domain() {
         // Spelled out rather than read from SPEC_REASONS, so dropping one from
@@ -282,12 +227,11 @@ mod tests {
         assert_eq!(full["error"]["data"], json!([info]));
     }
 
-    /// The table and the SDK agree on every code both define, and the band
-    /// [`normalize_native`] folds is exactly the SDK's own invention.
+    /// The table and the A2A project's SDK agree on every code both define.
     #[cfg(feature = "a2a")]
     #[test]
     fn codes_match_the_sdk() {
-        use a2a_rs::domain::error as sdk;
+        use a2a_types::error_code as sdk;
         let pairs = [
             (PARSE_ERROR, sdk::PARSE_ERROR),
             (INVALID_REQUEST, sdk::INVALID_REQUEST),
@@ -305,85 +249,66 @@ mod tests {
             (INVALID_AGENT_RESPONSE, sdk::INVALID_AGENT_RESPONSE),
             (
                 EXTENDED_AGENT_CARD_NOT_CONFIGURED,
-                sdk::AUTHENTICATED_EXTENDED_CARD_NOT_CONFIGURED,
+                sdk::EXTENDED_CARD_NOT_CONFIGURED,
             ),
+            (EXTENSION_SUPPORT_REQUIRED, sdk::EXTENSION_SUPPORT_REQUIRED),
+            (VERSION_NOT_SUPPORTED, sdk::VERSION_NOT_SUPPORTED),
         ];
         for (ours, theirs) in pairs {
             assert_eq!(ours, i64::from(theirs));
         }
-        for native in [
-            sdk::DATABASE_ERROR,
-            sdk::VERSION_CONFLICT,
-            sdk::CONTEXT_ACCESS_DENIED,
-        ] {
-            assert_eq!(fold(i64::from(native)), INTERNAL_ERROR);
-        }
-    }
-
-    /// The SDK's own refusal for someone else's context, as its server puts
-    /// it on the wire, comes out saying nothing about that context: not the
-    /// code, not the message, not the id in the details.
-    #[cfg(feature = "a2a")]
-    #[test]
-    fn a_foreign_context_refusal_names_no_context() {
-        let denied = a2a_rs::domain::A2AError::ContextAccessDenied {
-            context_id: "ctx-victim".into(),
-        };
-        let mut error = denied.to_jsonrpc_error();
-        error["data"] = serde_json::to_value(denied.error_details()).unwrap();
-        let wire = error.to_string();
-        assert!(
-            wire.contains("ctx-victim") && wire.contains("another principal"),
-            "{wire}"
-        );
-
-        normalize_native(&mut error);
-        assert_eq!(
-            error,
-            json!({"code": INTERNAL_ERROR, "message": "internal error"})
-        );
+        assert_eq!(A2A_DOMAIN, a2a_types::PROTOCOL_DOMAIN);
     }
 
     /// What the builders emit is what the SDK's typed details read back —
     /// the shape a Go, Python or Rust client decodes — and re-encodes to the
-    /// same bytes.
+    /// same object.
     #[cfg(feature = "a2a")]
     #[test]
     fn error_info_round_trips_as_google_rpc() {
-        use a2a_rs::{ErrorDetail, ErrorInfo, FieldViolation};
+        use a2a_types::{FieldViolation, TypedDetail};
+        use std::collections::HashMap;
         let info = error_info(
             A2A_DOMAIN,
             reason::VERSION_NOT_SUPPORTED,
             &[("supported", "1.0"), ("requested", "0.3")],
         );
-        let typed: ErrorDetail = serde_json::from_value(info.clone()).expect("ErrorInfo");
-        let mut want = ErrorInfo::new("VERSION_NOT_SUPPORTED")
-            .with_metadata("supported", "1.0")
-            .with_metadata("requested", "0.3");
-        want.domain = "a2a-protocol.org".into();
-        assert_eq!(typed, ErrorDetail::ErrorInfo(want));
+        let typed: TypedDetail = serde_json::from_value(info.clone()).expect("ErrorInfo");
+        let want = TypedDetail::error_info(
+            "VERSION_NOT_SUPPORTED",
+            a2a_types::PROTOCOL_DOMAIN,
+            Some(HashMap::from([
+                ("supported".to_string(), "1.0".to_string()),
+                ("requested".to_string(), "0.3".to_string()),
+            ])),
+        );
+        assert_eq!(typed, want);
         assert_eq!(serde_json::to_value(&typed).unwrap(), info);
 
         let bare = error_info(AGENTD_DOMAIN, reason::DRAINING, &[]);
-        let typed: ErrorDetail = serde_json::from_value(bare.clone()).expect("bare ErrorInfo");
+        let typed: TypedDetail = serde_json::from_value(bare.clone()).expect("bare ErrorInfo");
         assert_eq!(serde_json::to_value(&typed).unwrap(), bare);
 
         let bad = bad_request(&[("message.parts", "empty"), ("configuration", "bad")]);
-        let typed: ErrorDetail = serde_json::from_value(bad.clone()).expect("BadRequest");
+        let typed: TypedDetail = serde_json::from_value(bad.clone()).expect("BadRequest");
         assert_eq!(
             typed,
-            ErrorDetail::BadRequest {
-                field_violations: vec![
-                    FieldViolation::new("message.parts", "empty"),
-                    FieldViolation::new("configuration", "bad"),
-                ],
-            }
+            TypedDetail::bad_request(vec![
+                FieldViolation {
+                    field: "message.parts".into(),
+                    description: "empty".into(),
+                },
+                FieldViolation {
+                    field: "configuration".into(),
+                    description: "bad".into(),
+                },
+            ])
         );
         assert_eq!(serde_json::to_value(&typed).unwrap(), bad);
 
         // And the whole error: `data` is the list the SDK's client reads.
         let whole = rpc_error(json!("r1"), VERSION_NOT_SUPPORTED, "no", vec![info, bad]);
-        let data: Vec<ErrorDetail> =
+        let data: Vec<TypedDetail> =
             serde_json::from_value(whole["error"]["data"].clone()).expect("detail list");
         assert_eq!(data.len(), 2);
     }

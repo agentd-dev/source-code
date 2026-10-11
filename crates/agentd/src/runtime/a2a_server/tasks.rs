@@ -13,16 +13,17 @@ use crate::runtime::surface::{Active, Ext};
 use serde_json::{Value, json};
 
 /// A fresh durable task id, for a task the runtime opens on its own — a
-/// gate's. A task a send creates takes the id a2a-rs generated for it instead,
-/// and this is the same generator, so every task id has one shape.
+/// gate's. A task a send creates takes the id the handler minted for it
+/// instead, and this is the same generator — the A2A SDK's — so every task id
+/// has one shape.
 ///
 /// Never the reactor's `seq` counter: `seq` starts at 0 in every life while
 /// tasks are RESTORED from the store, so a counter-minted id names a task from
 /// a PREVIOUS life — and a message naming it would be read as a continuation,
-/// handing the caller someone else's task and history. A random UUIDv4 cannot
-/// collide with an id already in the store.
+/// handing the caller someone else's task and history. A UUIDv7 — the time
+/// and 74 random bits — cannot collide with an id already in the store.
 pub(super) fn new_task_id() -> String {
-    a2a_rs::domain::TaskId::generate().into_string()
+    a2a_types::new_task_id()
 }
 
 /// A fresh push-config id, for a registration that named none.
@@ -84,17 +85,17 @@ fn parse_list_cursor(token: &str) -> Option<(u64, String)> {
 /// rounding down would admit a task that moved a fraction of a millisecond
 /// before the instant asked for. Parsed by the spec's own `Timestamp`, so every
 /// offset form the proto JSON mapping accepts is accepted here.
-fn instant_ms(s: &str) -> Option<u64> {
-    let t: buffa_types::google::protobuf::Timestamp =
-        serde_json::from_value(Value::String(s.to_string())).ok()?;
+fn instant_ms(t: &chrono::DateTime<chrono::Utc>) -> u64 {
+    // Inclusive of the named instant: a sub-millisecond fraction rounds up,
+    // so a task that moved within the same millisecond is not kept back.
     let ms =
-        t.seconds.saturating_mul(1000) + (u32::try_from(t.nanos).ok()?).div_ceil(1_000_000) as i64;
-    Some(ms.max(0) as u64)
+        t.timestamp_millis() + i64::from(!t.timestamp_subsec_nanos().is_multiple_of(1_000_000));
+    ms.max(0) as u64
 }
 
 /// One page of `ListTasks` over `tasks`, as `principal` may see them.
 ///
-/// `params` is the serde form of the spec's `ListTasksParams`, whole — every
+/// `params` is the spec's `ListTasksRequest` as the wire carries it, whole — every
 /// filter the caller named is applied, and one this cannot honour is refused
 /// with `-32602` rather than ignored:
 ///
@@ -113,7 +114,7 @@ fn list_tasks<'a>(
     params: &Value,
     ann: Annotations,
 ) -> Result<Value, Value> {
-    let p: a2a_rs::domain::ListTasksParams = serde_json::from_value(params.clone())
+    let p: a2a_types::ListTasksRequest = crate::a2a::wire::from_wire(params.clone())
         .map_err(|e| invalid(&format!("ListTasks params: {e}")))?;
     let page_size = page_size_of(p.page_size.map(i64::from))?;
     let history_length = match p.history_length {
@@ -128,19 +129,12 @@ fn list_tasks<'a>(
         include_artifacts: p.include_artifacts == Some(true),
     };
     let status = match p.status {
-        Some(a2a_rs::domain::TaskState::TASK_STATE_UNSPECIFIED) => {
+        Some(a2a_types::TaskState::Unspecified) => {
             return Err(invalid("status is not a task state"));
         }
         other => other,
     };
-    let after = match p.status_timestamp_after.as_deref() {
-        None => None,
-        Some(s) => Some(instant_ms(s).ok_or_else(|| {
-            invalid(&format!(
-                "statusTimestampAfter is not an RFC 3339 instant: {s:?}"
-            ))
-        })?),
-    };
+    let after = p.status_timestamp_after.as_ref().map(instant_ms);
     let cursor = match p.page_token.as_deref() {
         None | Some("") => None,
         Some(tok) => Some(
@@ -157,7 +151,7 @@ fn list_tasks<'a>(
                 .as_deref()
                 .is_none_or(|c| t.matches_context(c, operator))
         })
-        .filter(|t| status.is_none_or(|s| t.state.to_wire() == s))
+        .filter(|t| status.as_ref().is_none_or(|s| t.state.to_wire() == *s))
         .filter(|t| after.is_none_or(|ms| t.updated >= ms))
         .collect();
     hits.sort_by(|a, b| list_key(b).cmp(&list_key(a)));
@@ -193,8 +187,8 @@ const TASK_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long a settled task nobody has read back yet is kept past the bound.
 ///
 /// A blocking `SendMessage` is answered in two trips through the reactor: the
-/// terminal event ends a2a-rs's wait, and a2a-rs then fetches the task with a
-/// separate `GetTask` to build the reply. Between the two, any other task
+/// terminal event ends the handler's wait, and the handler then fetches the
+/// task with a separate `GetTask` to build the reply. Between the two, any other task
 /// finishing — or the tick — applies the bound, and with `keep_last: 0`, or
 /// `keep_last: N` under N concurrent callers, it would drop the task before
 /// that `GetTask` lands and answer its caller "not found" for a task that
@@ -858,19 +852,20 @@ mod tests {
     #[test]
     fn task_ids_are_random_so_two_lives_cannot_mint_the_same_one() {
         // `seq` restarts at 0 with the process, and the ids of a previous life
-        // are still in the store; a gate's id is a2a-rs's UUIDv4, the shape
-        // of every task id a send creates.
+        // are still in the store; a gate's id is the A2A SDK's UUIDv7 — 74
+        // random bits beside the time — the shape of every task id a send
+        // creates.
         let a = new_task_id();
         let b = new_task_id();
         assert_ne!(a, b);
-        let v4 = |id: &str| {
+        let v7 = |id: &str| {
             id.len() == 36
-                && id.as_bytes()[14] == b'4'
+                && id.as_bytes()[14] == b'7'
                 && id
                     .chars()
                     .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         };
-        assert!(v4(&a) && v4(&b), "{a} / {b}");
+        assert!(v7(&a) && v7(&b), "{a} / {b}");
     }
 
     fn who(id: &str, role: crate::config::settings::Role) -> Principal {
@@ -966,11 +961,17 @@ mod tests {
             "result of t-a"
         );
 
+        // A `pageSize` of 0 is proto3's "not specified", and the SDK reads a
+        // negative one the same way: the default page.
+        for unset in [0, -1] {
+            assert_eq!(
+                list(&alice, json!({"pageSize": unset})).unwrap()["pageSize"],
+                50
+            );
+        }
         // What cannot be honoured is refused with a reason.
         for bad in [
-            json!({"pageSize": 0}),
             json!({"pageSize": 101}),
-            json!({"pageSize": -1}),
             json!({"historyLength": -1}),
             json!({"pageToken": "!!not-a-token"}),
             json!({"pageToken": crate::b64::url_nopad(b"no-colon-here")}),
@@ -1071,7 +1072,7 @@ mod tests {
 
     /// A settled task its caller has not read back is spared by every bound
     /// — `keep_last: 0` and `ttl: 0s` included — until it is read or the
-    /// grace is over. A blocking send is answered by a `GetTask` a2a-rs makes
+    /// grace is over. A blocking send is answered by a `GetTask` the handler makes
     /// after the terminal event, and a task dropped in between answers the
     /// caller whose task COMPLETED with "not found".
     #[test]

@@ -56,8 +56,11 @@ the wire shape comes from types generated off the protocol's own schema and
 there is nothing left to misread. ([a2a.md](a2a.md) has the account.)
 
 So MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the
-official Rust SDK, and A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs),
-an implementation generated from the specification's protocol buffers. They own
+official Rust SDK, and A2A is the A2A project's own Rust SDK,
+[`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs) — its types
+(`a2a-lf`), its canonical ProtoJSON generated from the specification's protocol
+buffers (`a2a-pb`) and its server (`a2a-server-lf`). Only official SDKs: a
+third party's reading of a protocol is one more reading to be wrong. They own
 the handshakes, the typed request and response shapes, capability negotiation,
 the streaming rules, the error codes and the version tables. agentd tracks the
 specifications by upgrading a dependency rather than by re-reading a document.
@@ -67,16 +70,16 @@ socket**. Both SDKs plug into agentd's own HTTP transport, so everything that
 hangs off a dial applies under them unchanged — an AAuth request signature with
 its challenge/re-sign loop, an AWS SigV4 signature per request, an mTLS client
 identity, a refreshed OAuth token, the SSRF guard on every dial. rmcp's
-`StreamableHttpClient` and a2a-rs's ports are both traits; that seam is the whole
-integration.
+`StreamableHttpClient` and the A2A server's `RequestHandler` are both traits;
+that seam is the whole integration.
 
 ### What that costs, and what it does not
 
 | Build | Crates resolved | Of them, external |
 |---|---|---|
-| `--no-default-features` | 75 | 70 |
-| default (`tls` + MCP) | 87 | 82 |
-| shipped release feature set (adds A2A and CEL) | 172 | 167 |
+| `--no-default-features` | 82 | 77 |
+| default (`tls` + MCP) | 89 | 84 |
+| shipped release feature set (adds A2A and CEL) | 163 | 158 |
 
 The convention carries more weight than the totals, because it is what makes
 them reproducible instead of quoted: unique package names printed by
@@ -93,10 +96,10 @@ and it comes out the same for the host target and for
 `--target x86_64-unknown-linux-musl`, the one that actually ships. Measured on
 cargo 1.98.0 against the committed `Cargo.lock`.
 
-Two of those twelve features account for the whole jump from 87 to 172: adding
-`a2a` to the default build resolves 151 crates and adding `cel` resolves 109,
-the two overlap in exactly one crate (`uuid`), and the remaining ten add nothing
-at all. That is the honest shape of the trade — the graph is wide because of one
+Two of those thirteen features account for the whole jump from 89 to 163: adding
+`a2a` to the default build resolves 146 crates and adding `cel` resolves 111,
+the two overlap in five (`uuid` and the `parking_lot` family), and the remaining
+eleven add nothing at all. That is the honest shape of the trade — the graph is wide because of one
 protocol stack and one expression language, not because a hundred small
 conveniences were waved through.
 
@@ -113,14 +116,13 @@ build-time dependency graph and a narrow shipped attack surface are separate
 questions, and it is the second one that is enforced.
 
 The build must also stay free of a C toolchain, and one transitive default is
-enough to lose it. `connectrpc`, underneath `a2a-rs`, asks for `rustls` with
-default features, which selects the C/assembly `aws-lc-rs` provider — and
-because Cargo unifies features additively, that single default applies to the
-entire graph no matter how carefully every other crate asks for `ring`. The
-symptom is not a compile error but a cross build that hangs for tens of minutes
-looking for a compiler. Three corrected dependency entries in a vendored copy
-(`third_party/connectrpc/PATCH.md`) keep it out, and CI fails the build if
-`aws-lc` reappears anywhere in the tree.
+enough to lose it: a crate that asks for `rustls` with default features selects
+the C/assembly `aws-lc-rs` provider — and because Cargo unifies features
+additively, that single default applies to the entire graph no matter how
+carefully every other crate asks for `ring`. The symptom is not a compile error
+but a cross build that hangs for tens of minutes looking for a compiler. The A2A
+server's own TLS features are off (agentd terminates TLS itself), and CI fails
+the build if `aws-lc` reappears anywhere in the tree.
 
 Quarantine is a habit rather than a rule: third-party code reaches the engine
 through `crates/net` and `crates/mcp`, and `deny.toml` denies wildcards and
@@ -136,7 +138,7 @@ flowchart LR
   CORE --> MCP["agentd-mcp"]
   MCP --> RMCP["rmcp · the official MCP SDK"]
   MCP --> NET
-  CORE -. "feature: a2a" .-> A2A["a2a-rs · A2A from the spec's protobufs"]
+  CORE -. "feature: a2a" .-> A2A["a2aproject/a2a-rs · the official A2A SDK"]
   RMCP -. "over agentd's socket" .-> NET
   A2A -. "over agentd's socket" .-> NET
   CORE --> SERDE["serde · serde_json · libc"]

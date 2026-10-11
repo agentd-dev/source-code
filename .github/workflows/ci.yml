@@ -251,12 +251,12 @@ jobs:
         run: cargo test -p agentd-cli ${{ matrix.features }} --no-fail-fast
 
   # What ships is one static binary on an empty base. That is now the claim
-  # worth guarding: MCP and A2A are the official/published implementations
-  # (`rmcp`, `a2a-rs`), which bring an async runtime into the *build*, so "few
-  # dependencies" stopped being the thing to assert — while "no runtime, no
-  # shell, no libc, nothing to attack" did not. `musl-tools` is the only build
-  # package: the crypto provider is `ring` throughout, so no C is compiled
-  # (see third_party/connectrpc/PATCH.md) — this job is also what would catch
+  # worth guarding: MCP and A2A are the official SDKs (`rmcp`, and the A2A
+  # project's `a2a-lf`/`a2a-pb`/`a2a-server-lf`), which bring an async runtime
+  # into the *build*, so "few dependencies" stopped being the thing to assert —
+  # while "no runtime, no shell, no libc, nothing to attack" did not.
+  # `musl-tools` is the only build package: the crypto provider is `ring`
+  # throughout, so no C is compiled — this job is also what would catch
   # `aws-lc-sys` returning, since it installs no cmake.
   static-binary:
     runs-on: ubuntu-latest
@@ -278,7 +278,7 @@ jobs:
         run: |
           if cargo tree -p agentd-cli --features a2a --target x86_64-unknown-linux-musl \
                | grep -qE 'aws-lc'; then
-            echo "::error::aws-lc is back in the dependency graph — a crate is pulling rustls with default features. See third_party/connectrpc/PATCH.md; run 'cargo tree -i aws-lc-sys' to find it."
+            echo "::error::aws-lc is back in the dependency graph — a crate is pulling rustls with default features; run 'cargo tree -i aws-lc-sys' to find it."
             exit 1
           fi
       - name: Build the release binary the image ships

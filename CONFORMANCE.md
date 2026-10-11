@@ -120,10 +120,11 @@ Two further checks hold the A2A surface to the specification rather than to
 agentd's reading of it:
 
 - the listener's method table is compared, name by name, with the constants of
-  the official `a2a-rs` SDK, so a method agentd invented or misspelled fails, and
-  so does a specification method it forgot to answer;
-- every task, message and card agentd emits is serialized by the types that SDK
-  generates from the A2A protobuf, so the wire shape is the schema's.
+  the A2A project's official Rust SDK (`a2a-lf`), so a method agentd invented or
+  misspelled fails, and so does a specification method it forgot to answer;
+- every task, message and card agentd emits is built from that SDK's types and
+  written by its canonical ProtoJSON, generated from the A2A protobuf, so the
+  wire shape is the schema's.
 
 ## Adding a check
 

@@ -4,9 +4,11 @@
 //! What arrives here is HTTP; what leaves is a decision about *who is calling*.
 //! Everything after that — parsing the JSON-RPC envelope, typing the params,
 //! dispatching the method, framing SSE, mapping errors to the spec's codes — is
-//! [`a2a_rs`]'s, reached by handing it the request with an authenticated
-//! principal attached. agentd's job is the two things a protocol crate cannot
-//! know: which caller a connection represents, and which of them may do what.
+//! the A2A project's official server's ([`a2a_server`]), reached by handing it
+//! the request with the authenticated caller in scope. agentd's job is the two
+//! things a protocol crate cannot know: which caller a connection represents,
+//! and which of them may do what — and, behind the SDK's handler trait, what
+//! each operation does ([`crate::a2a::ports`]).
 //!
 //! ## Identity
 //!
@@ -49,17 +51,16 @@
 //! `/.well-known/agent-card.json` — and any other name, an earlier
 //! specification's included, is `-32601`.
 //!
-//! Most of the table is a2a-rs's to answer. A few calls are answered here:
-//! the command ops that reply with a Message (a read has no task for the
-//! protocol layer to frame), the push-config listing (a2a-rs 0.10 drops its
-//! paging), and the observation feed a display client reads, which a2a-rs
-//! correctly does not know. Operator admin is not a method family: `admin.*`
-//! rides in as a command DataPart on `SendMessage` and is handled in
+//! Most of the table is the SDK's to answer. A few calls are answered here:
+//! the command ops that reply with a Message (a read has no task to track),
+//! and the observation feed a display client reads, which the SDK correctly
+//! does not know. Operator admin is not a method family: `admin.*` rides in as
+//! a command DataPart on `SendMessage` and is handled in
 //! [`crate::runtime::a2a_server`].
 //!
-//! What a2a-rs answers passes back through one filter on the way out, so a
+//! What the SDK answers passes back through one filter on the way out, so a
 //! refusal the runtime made reaches the caller as the runtime made it rather
-//! than as a2a-rs reworded it (see [`ports::RequestScope::error`]).
+//! than as the SDK reworded it (see [`ports::RequestScope::error`]).
 //!
 //! ## Signing in
 //!
@@ -97,7 +98,7 @@ mod identity;
 /// Per-source failure limits and per-principal admission.
 pub(crate) mod limits;
 
-use card::{CardFromRuntime, card, card_preflight};
+use card::{card, card_preflight};
 use cors::preflight;
 use dispatch::rpc;
 pub use identity::{Auth, PeerId};
@@ -152,7 +153,8 @@ impl App {
 }
 
 struct App {
-    /// a2a-rs's JSON-RPC surface, delegated to for every spec method.
+    /// The SDK's JSON-RPC surface over agentd's handler, delegated to for
+    /// every spec method.
     protocol: Router,
     bridge: Arc<A2aBridge>,
     auth: Auth,
@@ -168,7 +170,7 @@ struct App {
     /// listener that stops honouring it, not a reload that reported success
     /// and changed nothing.
     cors_origins: OriginList,
-    /// How long a call handed to a2a-rs may take to produce its first byte:
+    /// How long a call handed to the SDK may take to produce its first byte:
     /// the fidelity filter waits this long for a stream's first event.
     request_timeout: Duration,
     stream_deadline: Duration,
@@ -181,7 +183,7 @@ struct App {
 /// For a caller, the check that says whether its session is still alive — or
 /// `None` when the caller holds no session that could end.
 ///
-/// A revoked session must not keep what it already opened: a stream a2a-rs
+/// A revoked session must not keep what it already opened: a stream the SDK
 /// is serving outlives the request that authenticated it, and a unary call
 /// can wait on a turn for minutes. While the check answers `false`, an SSE
 /// body ends within one tick and a unary wait is answered with the 401 a
@@ -217,18 +219,16 @@ pub fn spawn(
         .build()
         .map_err(|e| format!("a2a runtime: {e}"))?;
 
-    // The fan-out over a log the sink keeps a handle to as well, so a task
-    // retention drops can take its replay ring with it.
-    let events = a2a_rs::adapter::InMemoryEventLog::new();
-    let updates = Arc::new(a2a_rs::adapter::StreamingFanout::over(events.clone()));
+    // The per-task channels the reactor publishes into (through the sink)
+    // and every stream the handler serves reads from.
+    let streams = Arc::new(ports::Fanout::default());
     let sink = Arc::new(ports::StreamSink::new(
-        Arc::clone(&updates),
-        events,
+        Arc::clone(&streams),
         runtime.handle().clone(),
         log.clone(),
     ));
     let tls = opts.tls.clone();
-    let app = Arc::new(App::new(bridge, opts, updates, log.clone()));
+    let app = Arc::new(App::new(bridge, opts, streams, log.clone()));
     let _ = feed;
     let router = router(app);
 
@@ -311,21 +311,9 @@ pub fn spawn(
 }
 
 impl App {
-    /// The listener's state, with a2a-rs wired to the runtime's ports.
-    fn new(
-        bridge: Arc<A2aBridge>,
-        opts: Opts,
-        updates: Arc<a2a_rs::adapter::InMemoryStreamingHandler>,
-        log: Logger,
-    ) -> App {
-        let ports = RuntimePorts::new(Arc::clone(&bridge), Arc::clone(&updates));
-        let adapter = Arc::new(
-            a2a_rs::adapter::JsonRpcAdapter::with_handler(
-                ports,
-                CardFromRuntime(Arc::clone(&bridge)),
-            )
-            .with_streaming_handler(ports::SharedStreaming(updates)),
-        );
+    /// The listener's state, with the SDK's router over agentd's handler.
+    fn new(bridge: Arc<A2aBridge>, opts: Opts, streams: Arc<ports::Fanout>, log: Logger) -> App {
+        let handler = Arc::new(RuntimePorts::new(Arc::clone(&bridge), streams));
         // The liveness hook comes from the sessions: a caller holding one is
         // served only while that session — its sid — lives.
         let liveness = opts
@@ -334,7 +322,7 @@ impl App {
             .as_ref()
             .map(|s| crate::a2a::oauth::Sessions::liveness(Arc::clone(s)));
         App {
-            protocol: a2a_rs::adapter::jsonrpc_router(adapter),
+            protocol: a2a_server::jsonrpc::jsonrpc_router(handler),
             bridge,
             auth: opts.auth,
             failures: limits::SourceLimiter::auth_failures(),
@@ -754,8 +742,12 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             stream_deadline: Duration::from_secs(5),
         };
-        let updates = Arc::new(a2a_rs::adapter::InMemoryStreamingHandler::new());
-        let mut app = App::new(A2aBridge::new(tx, resolver), opts, updates, log);
+        let mut app = App::new(
+            A2aBridge::new(tx, resolver),
+            opts,
+            Arc::new(ports::Fanout::default()),
+            log,
+        );
         if liveness.is_some() {
             app.liveness = liveness;
         }
@@ -994,10 +986,10 @@ mod tests {
         assert_eq!(v["error"]["code"], -32001, "{v}");
     }
 
-    /// An error envelope as a2a-rs writes it.
+    /// An error envelope as the SDK writes it.
     fn sdk_error(code: i64, message: &str) -> Value {
         json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": message,
-            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "JSON_RPC_ERROR", "domain": "a2a-rs"}]}})
+            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "INVALID_PARAMS", "domain": "a2a-protocol.org"}]}})
     }
 
     fn unary_response(v: &Value) -> Response {
@@ -1015,7 +1007,8 @@ mod tests {
         dispatch::Fidelity {
             kept,
             bearer_used,
-            list_tasks: false,
+            page: None,
+            empty_result: false,
         }
     }
 
@@ -1023,11 +1016,11 @@ mod tests {
         dispatch::faithful(resp, f, Duration::from_secs(5), None).await
     }
 
-    /// What a2a-rs answers reaches the caller in the runtime's words: the
-    /// runtime's error object replaces a2a-rs's rendering of it byte for
-    /// byte, with the status its code travels with; an error a2a-rs raised
-    /// on its own keeps a2a-rs's answer, minus the codes it invented; and a
-    /// stream that opens with an error is answered as JSON.
+    /// What the SDK answers reaches the caller in the runtime's words: the
+    /// runtime's error object replaces the SDK's rendering of it byte for
+    /// byte, with the status its code travels with; an error the SDK raised
+    /// on its own keeps the SDK's answer; and a stream that opens with an
+    /// error is answered as JSON.
     #[tokio::test]
     async fn error_fidelity_filter() {
         let draining = json!({"code": -32603, "message": "the agent is draining",
@@ -1058,17 +1051,7 @@ mod tests {
         );
         assert_eq!(json_of(resp).await["error"], denied);
 
-        // a2a-rs's own error: its band of invented codes is folded, and the
-        // rest is left as a2a-rs wrote it.
-        let v = json_of(
-            filtered(
-                unary_response(&sdk_error(-32102, "Context belongs to another principal")),
-                fidelity(None, false),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(v["error"]["code"], -32603, "{v}");
+        // The SDK's own error is left as it wrote it.
         let own = sdk_error(-32602, "Invalid params: x");
         let v = json_of(filtered(unary_response(&own), fidelity(None, false)).await).await;
         assert_eq!(v, own);
@@ -1098,9 +1081,9 @@ mod tests {
             sse_response(concat!(
                 ":keep-alive\n\n",
                 "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t\"}}}\nid: 3\n\n",
-                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32102,\"message\":\"Context belongs to another principal\"}}\nid: 4\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}\nid: 4\n\n",
             )),
-            fidelity(None, false),
+            fidelity(Some(draining.clone()), false),
         )
         .await;
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
@@ -1120,10 +1103,7 @@ mod tests {
         let frame: Value =
             serde_json::from_str(last.lines().next().unwrap().strip_prefix("data: ").unwrap())
                 .unwrap();
-        assert_eq!(
-            frame["error"],
-            json!({"code": -32603, "message": "internal error"})
-        );
+        assert_eq!(frame["error"], draining);
 
         // The last page of a listing says so, as the spec's response does.
         let page = json!({"jsonrpc": "2.0", "id": 1, "result": {"pageSize": 50}});
@@ -1132,7 +1112,8 @@ mod tests {
             dispatch::Fidelity {
                 kept: None,
                 bearer_used: false,
-                list_tasks: true,
+                page: Some(dispatch::Page::Tasks),
+                empty_result: false,
             },
             Duration::from_secs(5),
             None,
@@ -1150,11 +1131,8 @@ mod tests {
         assert_eq!(v, page, "only a listing is completed");
     }
 
-    /// A subscription is read first, by the listener, as the caller: a task
-    /// the runtime will not show this caller is refused as JSON, and a2a-rs —
-    /// which in 0.10 opens a stream on a task it cannot find — is never asked.
-    /// The stand-in shows the pre-check alone the task as missing, so only
-    /// the listener's own read can be what refuses it.
+    /// A subscription reads its task first, as the caller: a task the runtime
+    /// will not show this caller is refused as JSON, and no stream opens.
     #[tokio::test]
     async fn a_subscription_is_read_first_as_the_caller() {
         let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1166,11 +1144,7 @@ mod tests {
                     req.params.clone(),
                     req.principal.id.clone(),
                 ));
-                if req.params.get("historyLength").is_some() {
-                    return task_not_found();
-                }
-                json!({"id": req.params["id"], "contextId": "ctx-1",
-                    "status": {"state": "TASK_STATE_WORKING"}})
+                task_not_found()
             },
             None,
         );
@@ -1186,15 +1160,15 @@ mod tests {
         assert_eq!(v["error"]["code"], -32001, "{v}");
         assert_eq!(v["id"], 9, "{v}");
         let reads = reads.lock().unwrap().clone();
-        assert_eq!(reads.len(), 1, "only the listener's read: {reads:?}");
+        assert_eq!(reads.len(), 1, "one read: {reads:?}");
         let (verb, params, who) = &reads[0];
         assert_eq!(verb, "GetTask");
-        assert_eq!(params, &json!({"id": "task-1", "historyLength": 0}));
+        assert_eq!(params, &json!({"id": "task-1", "_attach": true}));
         assert_eq!(who, "operator", "read as the caller");
     }
 
     /// A caller whose session dies loses what it already opened: a stream
-    /// a2a-rs is serving ends within a tick, and a unary call still waiting
+    /// the SDK is serving ends within a tick, and a unary call still waiting
     /// on the runtime is answered with the 401 a revoked token gets.
     #[tokio::test]
     async fn liveness_hook_ends_streams() {

@@ -2,8 +2,10 @@
 //! **Talking to another agent**: the outbound half of A2A, in the
 //! specification's types.
 //!
-//! What agentd sends a peer and what it reads back are [`a2a_rs`] domain types —
-//! the same ones the peer's own generated code uses. Nothing here writes or
+//! What agentd sends a peer and what it reads back are types of the A2A
+//! project's official SDK ([`a2a_types`]), put on the wire and read from it by
+//! its canonical ProtoJSON — the same shapes the peer's own generated code
+//! uses. Nothing here writes or
 //! pattern-matches JSON by hand, which is the point: a delegation that fails
 //! because we spelled `role` or a task state our own way would fail *silently*,
 //! in the peer, as a message that never arrived or a task that never looked
@@ -16,24 +18,24 @@
 //! built typed, and its document is placed into the serialized part afterwards
 //! — the same rule [`crate::a2a::reply`] follows on the way in.
 //!
-//! What is **not** delegated to a2a-rs is the transport. agentd presents real
+//! What is **not** delegated to the SDK is the transport. agentd presents real
 //! credentials to a peer — a bearer that may be an OAuth token it refreshes, an
 //! mTLS client identity, a per-request AWS SigV4 signature, an AAuth HTTP
 //! Message Signature — and it does so from a blocking turn worker
-//! with no async runtime in sight. a2a-rs's own client is reqwest with a static
-//! bearer, so adopting it would mean dropping four kinds of peer authentication
-//! to gain a wire format we can build from its types anyway. The types are the
-//! part that has to be right; the socket is agentd's.
+//! with no async runtime in sight. The SDK's client is async reqwest, so
+//! adopting it would mean an async runtime in every worker and dropping the
+//! kinds of peer authentication it does not carry, to gain a wire format we
+//! build from its types anyway. The types are the part that has to be right;
+//! the socket is agentd's.
 
-use a2a_rs::domain::generated::{
-    GetTaskRequest, SendMessageConfiguration, SendMessageRequest, TaskArtifactUpdateEvent,
+use a2a_types::{
+    AgentCard, AgentInterface, GetTaskRequest, Message, Part, PartContent, Role,
+    SendMessageConfiguration, SendMessageRequest, StreamResponse, TRANSPORT_PROTOCOL_JSONRPC, Task,
+    TaskState,
 };
-use a2a_rs::domain::{
-    AgentCard, AgentInterface, Message, PROTOCOL_BINDING_JSONRPC, Part, Role, Task, TaskState,
-    part::Content,
-};
-use buffa::MessageField;
 use serde_json::{Value, json};
+
+use crate::a2a::wire::{from_wire, message_from_wire, to_wire};
 
 use crate::runtime::surface::{A2A_PROTOCOL_VERSION, COMMAND_EXTENSION, UNIX_BINDING};
 
@@ -47,12 +49,10 @@ struct Outgoing {
 
 impl Outgoing {
     fn new(message_id: &str) -> Outgoing {
+        let mut message = Message::new(Role::User, Vec::new());
+        message.message_id = message_id.to_string();
         Outgoing {
-            message: Message {
-                role: Role::ROLE_USER.into(),
-                message_id: message_id.to_string(),
-                ..Default::default()
-            },
+            message,
             documents: Vec::new(),
         }
     }
@@ -60,7 +60,7 @@ impl Outgoing {
     /// Append a DataPart whose document is `doc`, byte for byte.
     fn push_document(&mut self, doc: Value) {
         self.documents.push((self.message.parts.len(), doc));
-        self.message.parts.push(Part::data(Default::default()));
+        self.message.parts.push(Part::data(json!({})));
     }
 
     /// The `SendMessageRequest` params, as the SDK serializes them.
@@ -71,18 +71,18 @@ impl Outgoing {
     /// rather than inheriting a peer's blocking default. A streaming send has
     /// no such choice to make and carries no configuration.
     fn into_params(self, tenant: Option<&str>, return_immediately: bool) -> Value {
-        let mut req = SendMessageRequest {
-            tenant: tenant.unwrap_or_default().to_string(),
-            message: MessageField::some(self.message),
-            ..Default::default()
+        let req = SendMessageRequest {
+            message: self.message,
+            configuration: return_immediately.then_some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: None,
+                history_length: None,
+                return_immediately: Some(true),
+            }),
+            metadata: None,
+            tenant: tenant.filter(|t| !t.is_empty()).map(str::to_string),
         };
-        if return_immediately {
-            req.configuration = MessageField::some(SendMessageConfiguration {
-                return_immediately: true,
-                ..Default::default()
-            });
-        }
-        let mut v = serde_json::to_value(&req).unwrap_or(Value::Null);
+        let mut v = to_wire(&req);
         for (i, doc) in self.documents {
             if let Some(part) = v
                 .pointer_mut(&format!("/message/parts/{i}"))
@@ -92,6 +92,44 @@ impl Outgoing {
             }
         }
         v
+    }
+}
+
+/// `v` with every part's document blanked, for reading with the SDK's types.
+///
+/// A DataPart's document is a `google.protobuf.Value`, and the SDK's ProtoJSON
+/// refuses a number no double holds exactly (past ±2^53) — rightly, for a
+/// protobuf reader, but it would make a whole reply unreadable for one
+/// cursor in one document. agentd never needs a document typed: it renders
+/// each from the bytes the peer sent (see the module note). So the reply is
+/// read with its documents emptied, and they are taken from the raw JSON.
+fn without_documents(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, val)| {
+                    let val = match (k.as_str(), val) {
+                        ("parts", Value::Array(parts)) => Value::Array(
+                            parts
+                                .iter()
+                                .map(|p| match p {
+                                    Value::Object(part) if part.contains_key("data") => {
+                                        let mut part = part.clone();
+                                        part.insert("data".into(), json!({}));
+                                        Value::Object(part)
+                                    }
+                                    other => without_documents(other),
+                                })
+                                .collect(),
+                        ),
+                        _ => without_documents(val),
+                    };
+                    (k.clone(), val)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(without_documents).collect()),
+        other => other.clone(),
     }
 }
 
@@ -126,7 +164,7 @@ pub fn send_message_params_cmd(
     }
     if let Some(env) = command {
         out.push_document(json!({ "agentd": env }));
-        out.message.extensions = vec![COMMAND_EXTENSION.to_string()];
+        out.message.extensions = Some(vec![COMMAND_EXTENSION.to_string()]);
     }
     if let Some(contract) = output_contract.filter(|c| !c.is_empty()) {
         out.message
@@ -159,21 +197,21 @@ pub fn send_message_params_parts(
     };
     let mut out = Outgoing::new(message_id);
     if let Some(ctx) = context.filter(|c| !c.is_empty()) {
-        out.message.context_id = ctx.to_string();
+        out.message.context_id = Some(ctx.to_string());
     }
     for (i, p) in raw.iter().enumerate() {
         let part: Part = serde_json::from_value(p.clone())
             .map_err(|e| format!("a2a: part {i} is not an A2A Part: {e}"))?;
         if let Some(doc) = p
             .get("data")
-            .filter(|_| matches!(part.content, Some(Content::Data(_))))
+            .filter(|_| matches!(part.content, PartContent::Data(_)))
         {
             out.documents.push((out.message.parts.len(), doc.clone()));
         }
         out.message.parts.push(part);
     }
     if raw.iter().any(is_command_part) {
-        out.message.extensions = vec![COMMAND_EXTENSION.to_string()];
+        out.message.extensions = Some(vec![COMMAND_EXTENSION.to_string()]);
     }
     Ok(out.into_params(tenant, true))
 }
@@ -184,20 +222,19 @@ pub fn send_message_params_parts(
 pub fn extensions_of(params: &Value) -> Vec<String> {
     params
         .get("message")
-        .and_then(|m| serde_json::from_value::<Message>(m.clone()).ok())
-        .map(|m| m.extensions)
+        .and_then(|m| message_from_wire(&without_documents(m)).ok())
+        .and_then(|m| m.extensions)
         .unwrap_or_default()
 }
 
 /// The `GetTask` params for polling `task_id`, echoing the tenant the peer's
 /// interface declared.
 pub fn get_task_params(task_id: &str, tenant: Option<&str>) -> Value {
-    let req = GetTaskRequest {
-        tenant: tenant.unwrap_or_default().to_string(),
+    to_wire(&GetTaskRequest {
         id: task_id.to_string(),
-        ..Default::default()
-    };
-    serde_json::to_value(&req).unwrap_or(Value::Null)
+        history_length: None,
+        tenant: tenant.filter(|t| !t.is_empty()).map(str::to_string),
+    })
 }
 
 /// What a peer answered a `SendMessage` with: the spec allows either a task
@@ -212,7 +249,9 @@ pub enum Reply {
 /// answers with one unwrapped).
 pub fn reply_of(v: &Value) -> Option<Reply> {
     if let Some(m) = v.get("message") {
-        return serde_json::from_value(m.clone()).ok().map(Reply::Message);
+        return message_from_wire(&without_documents(m))
+            .ok()
+            .map(Reply::Message);
     }
     task_of(v).map(Reply::Task)
 }
@@ -222,7 +261,9 @@ pub fn reply_of(v: &Value) -> Option<Reply> {
 /// `None` is a reply we could not read as a task at all — which the caller
 /// surfaces as an error rather than treating as "not finished yet", because a
 /// peer we cannot parse is not a peer we should keep polling. A `{message}`
-/// reply is not a task either, however leniently its fields would default.
+/// reply is not a task either, however leniently its fields would default —
+/// and nor is an object that names no task: proto3 defaults every field, so
+/// anything at all would otherwise read as a task with an empty id.
 pub fn task_of(v: &Value) -> Option<Task> {
     if v.get("message").is_some() {
         return None;
@@ -231,7 +272,9 @@ pub fn task_of(v: &Value) -> Option<Task> {
         Some(t) => t,
         None => v,
     };
-    serde_json::from_value(body.clone()).ok()
+    from_wire::<Task>(without_documents(body))
+        .ok()
+        .filter(|t| !t.id.is_empty())
 }
 
 /// The task handle to poll, from a reply that may or may not be one.
@@ -244,19 +287,13 @@ pub fn task_id_of(v: &Value) -> String {
 /// declaring a result it does not have.
 pub fn task_state_of(v: &Value) -> TaskState {
     task_of(v)
-        .and_then(|t| t.status.as_option().and_then(|s| s.state.as_known()))
-        .unwrap_or(TaskState::TASK_STATE_UNSPECIFIED)
+        .map(|t| t.status.state)
+        .unwrap_or(TaskState::Unspecified)
 }
 
 /// Whether a state ends the delegation.
-pub fn is_terminal(state: TaskState) -> bool {
-    matches!(
-        state,
-        TaskState::TASK_STATE_COMPLETED
-            | TaskState::TASK_STATE_FAILED
-            | TaskState::TASK_STATE_CANCELED
-            | TaskState::TASK_STATE_REJECTED
-    )
+pub fn is_terminal(state: &TaskState) -> bool {
+    state.is_terminal()
 }
 
 /// The readable pieces of `parts`, in order: a text part as its text, a
@@ -268,8 +305,8 @@ fn rendered(parts: &[Part], raw: Option<&Value>) -> Vec<String> {
     let mut out = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         match &part.content {
-            Some(Content::Text(t)) => out.push(t.clone()),
-            Some(Content::Data(d)) => {
+            PartContent::Text(t) => out.push(t.clone()),
+            PartContent::Data(d) => {
                 let doc = raw
                     .and_then(|r| r.get(i))
                     .and_then(|p| p.get("data"))
@@ -297,7 +334,7 @@ pub fn artifact_text_of(v: &Value) -> String {
     };
     let raw_task = v.get("task").unwrap_or(v);
     let mut out = Vec::new();
-    for (j, artifact) in task.artifacts.iter().enumerate() {
+    for (j, artifact) in task.artifacts.iter().flatten().enumerate() {
         let raw = raw_task.pointer(&format!("/artifacts/{j}/parts"));
         out.extend(rendered(&artifact.parts, raw));
     }
@@ -316,24 +353,31 @@ pub fn reply_text_of(v: &Value) -> String {
 /// One `artifactUpdate` stream frame: the artifact it belongs to, whether it
 /// appends to that artifact's earlier chunks, and its rendered text.
 pub fn artifact_update_of(update: &Value) -> Option<(String, bool, String)> {
-    let ev: TaskArtifactUpdateEvent = serde_json::from_value(update.clone()).ok()?;
-    let artifact = ev.artifact.as_option()?;
-    let text = rendered(&artifact.parts, update.pointer("/artifact/parts")).join("\n");
-    Some((artifact.artifact_id.clone(), ev.append, text))
+    let StreamResponse::ArtifactUpdate(ev) =
+        from_wire::<StreamResponse>(json!({ "artifactUpdate": without_documents(update) })).ok()?
+    else {
+        return None;
+    };
+    let text = rendered(&ev.artifact.parts, update.pointer("/artifact/parts")).join("\n");
+    Some((
+        ev.artifact.artifact_id.clone(),
+        ev.append.unwrap_or(false),
+        text,
+    ))
 }
 
 /// How a peer's terminal state reads to the caller.
-pub fn describe(state: TaskState) -> &'static str {
+pub fn describe(state: &TaskState) -> &'static str {
     match state {
-        TaskState::TASK_STATE_COMPLETED => "completed",
-        TaskState::TASK_STATE_FAILED => "failed",
-        TaskState::TASK_STATE_CANCELED => "canceled",
-        TaskState::TASK_STATE_REJECTED => "rejected",
-        TaskState::TASK_STATE_INPUT_REQUIRED => "input-required",
-        TaskState::TASK_STATE_AUTH_REQUIRED => "auth-required",
-        TaskState::TASK_STATE_WORKING => "working",
-        TaskState::TASK_STATE_SUBMITTED => "submitted",
-        _ => "unspecified",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Canceled => "canceled",
+        TaskState::Rejected => "rejected",
+        TaskState::InputRequired => "input-required",
+        TaskState::AuthRequired => "auth-required",
+        TaskState::Working => "working",
+        TaskState::Submitted => "submitted",
+        TaskState::Unspecified => "unspecified",
     }
 }
 
@@ -379,7 +423,8 @@ impl PeerCard {
     /// Parse a card body. `None` is a body that is not an `AgentCard`, which
     /// the caller treats like a card it could not fetch.
     pub fn parse(body: &[u8]) -> Option<PeerCard> {
-        serde_json::from_slice(body).ok().map(PeerCard)
+        let v: Value = serde_json::from_slice(body).ok()?;
+        from_wire::<AgentCard>(v).ok().map(PeerCard)
     }
 
     /// The interface this client speaks to the endpoint the operator
@@ -404,7 +449,7 @@ impl PeerCard {
         let want_binding = if unix {
             UNIX_BINDING
         } else {
-            PROTOCOL_BINDING_JSONRPC
+            TRANSPORT_PROTOCOL_JSONRPC
         };
         let want_version = major_minor(A2A_PROTOCOL_VERSION);
         let mut found = Vec::new();
@@ -438,10 +483,10 @@ impl PeerCard {
     pub fn required_extensions(&self) -> impl Iterator<Item = &str> {
         self.0
             .capabilities
-            .as_option()
-            .into_iter()
-            .flat_map(|c| c.extensions.iter())
-            .filter(|e| e.required)
+            .extensions
+            .iter()
+            .flatten()
+            .filter(|e| e.required == Some(true))
             .map(|e| e.uri.as_str())
     }
 
@@ -456,11 +501,7 @@ impl PeerCard {
     /// counts: the spec has a peer answer the streaming methods with
     /// UnsupportedOperation unless its card says it streams.
     pub fn streams(&self) -> bool {
-        self.0
-            .capabilities
-            .as_option()
-            .and_then(|c| c.streaming)
-            .unwrap_or(false)
+        self.0.capabilities.streaming.unwrap_or(false)
     }
 }
 
@@ -490,8 +531,8 @@ mod tests {
         assert!(extensions_of(&p).is_empty(), "{p}");
         assert!(p.get("tenant").is_none(), "no tenant unless declared: {p}");
         // …and it round-trips back through the same type.
-        let back: SendMessageRequest = serde_json::from_value(p.clone()).expect("their request");
-        assert_eq!(back.message.as_option().map(|m| m.parts.len()), Some(2));
+        let back: SendMessageRequest = from_wire(p.clone()).expect("their request");
+        assert_eq!(back.message.parts.len(), 2);
     }
 
     /// The plain `send` path: one typed builder, whatever shape the caller
@@ -533,8 +574,8 @@ mod tests {
             ]
         }});
         assert_eq!(task_id_of(&reply), "t-9");
-        assert_eq!(task_state_of(&reply), TaskState::TASK_STATE_COMPLETED);
-        assert!(is_terminal(task_state_of(&reply)));
+        assert_eq!(task_state_of(&reply), TaskState::Completed);
+        assert!(is_terminal(&task_state_of(&reply)));
         assert_eq!(artifact_text_of(&reply), "first\nsecond");
     }
 
@@ -571,15 +612,15 @@ mod tests {
     #[test]
     fn an_unfinished_or_unreadable_reply_is_not_mistaken_for_an_answer() {
         let working = json!({"task": {"id": "t", "contextId": "c", "status": {"state": "TASK_STATE_WORKING"}}});
-        assert!(!is_terminal(task_state_of(&working)));
+        assert!(!is_terminal(&task_state_of(&working)));
         assert_eq!(artifact_text_of(&working), "");
 
         // A reply we cannot read is unspecified — non-terminal, so the caller
         // waits (and eventually times out) instead of returning an empty answer
         // as though the peer had finished.
         let garbage = json!({"nope": true});
-        assert_eq!(task_state_of(&garbage), TaskState::TASK_STATE_UNSPECIFIED);
-        assert!(!is_terminal(task_state_of(&garbage)));
+        assert_eq!(task_state_of(&garbage), TaskState::Unspecified);
+        assert!(!is_terminal(&task_state_of(&garbage)));
     }
 
     /// What counts as "the configured endpoint" when a card names several:

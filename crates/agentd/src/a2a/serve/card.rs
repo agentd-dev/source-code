@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The agent card, read from the runtime: the well-known route and the
-//! provider a2a-rs asks for the extended card.
+//! The agent card, read from the runtime: the well-known route. (The extended
+//! card is a method, `GetExtendedAgentCard`, answered by the handler.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,53 +13,7 @@ use serde_json::{Value, json};
 use super::{App, cors};
 use crate::a2a::Principal;
 use crate::a2a::ports;
-use crate::runtime::a2a_server::A2aBridge;
 use crate::runtime::surface::Active;
-
-/// The agent card, read from the runtime so its skills reflect the workflows
-/// that are actually loaded rather than a snapshot taken at boot.
-pub(super) struct CardFromRuntime(pub(super) Arc<A2aBridge>);
-
-#[async_trait::async_trait]
-impl a2a_rs::services::AgentInfoProvider for CardFromRuntime {
-    /// The public card. No wire method reads it — the spec publishes it at
-    /// `.well-known` — but the port is a2a-rs's to call, so it answers the
-    /// same document the route does.
-    async fn get_agent_card(&self) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
-        self.card("PublicCard", Principal::anonymous()).await
-    }
-
-    /// The authenticated card, scoped to whoever is asking. The caller travels
-    /// on the request's scope, because the port takes none.
-    async fn get_authenticated_extended_card(
-        &self,
-    ) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
-        self.card("GetExtendedAgentCard", ports::caller()).await
-    }
-}
-
-impl CardFromRuntime {
-    async fn card(
-        &self,
-        verb: &'static str,
-        who: Principal,
-    ) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
-        let bridge = Arc::clone(&self.0);
-        // No extension applies to a card, so none is ever active for one.
-        let v =
-            tokio::task::spawn_blocking(move || bridge.call(verb, json!({}), who, Active::NONE))
-                .await
-                .map_err(|e| a2a_rs::domain::A2AError::Internal(e.to_string()))?;
-        // The runtime's refusal — no extended card for an anonymous caller,
-        // say — is recorded whole, like every port's, so the listener answers
-        // with the runtime's code and words rather than a2a-rs's rendering.
-        if let Some(e) = ports::error_of(&v) {
-            ports::record_error(e);
-            return Err(ports::from_error_object(e));
-        }
-        serde_json::from_value(v).map_err(a2a_rs::domain::A2AError::JsonParse)
-    }
-}
 
 /// How long the card route waits on the runtime. Discovery is the first thing
 /// a client does and a busy reactor should not hold it for the two minutes a
@@ -145,7 +99,7 @@ fn card_response(reply: Option<Value>, headers: &HeaderMap) -> Response {
 /// or the runtime's `{"_error": …}` — for a card.
 fn is_agent_card(v: &Value) -> bool {
     ports::error_of(v).is_none()
-        && serde_json::from_value::<a2a_rs::domain::AgentCard>(v.clone())
+        && crate::a2a::wire::from_wire::<a2a_types::AgentCard>(v.clone())
             .is_ok_and(|c| !c.name.is_empty() && !c.supported_interfaces.is_empty())
 }
 
@@ -324,7 +278,8 @@ mod tests {
         );
         let served: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(served, card);
-        serde_json::from_slice::<a2a_rs::domain::AgentCard>(&body).expect("an AgentCard");
+        crate::a2a::wire::from_wire::<a2a_types::AgentCard>(serde_json::from_slice(&body).unwrap())
+            .expect("an AgentCard");
 
         // One card, one tag; another card, another.
         let again = super::card_response(Some(card.clone()), &HeaderMap::new());
@@ -483,9 +438,9 @@ mod tests {
             stream_deadline: Duration::from_secs(5),
         };
         let app = App::new(
-            A2aBridge::new(tx, resolver),
+            crate::runtime::a2a_server::A2aBridge::new(tx, resolver),
             opts,
-            Arc::new(a2a_rs::adapter::InMemoryStreamingHandler::new()),
+            Arc::new(ports::Fanout::default()),
             log,
         );
         let router = super::super::router(Arc::new(app));

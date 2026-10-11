@@ -86,7 +86,7 @@ pub(crate) fn advertised_url(a2a: &crate::config::settings::A2a, bound: &str) ->
 
 /// Bind and start the A2A listener.
 ///
-/// Everything protocol-shaped below this line belongs to `a2a-rs`; what is
+/// Everything protocol-shaped below this line belongs to the A2A SDK; what is
 /// assembled here is the TLS identity that makes a client certificate readable
 /// in the first place, and the bridge that carries the resolver — the rules and
 /// the posture — every request is resolved under.

@@ -499,7 +499,7 @@ fn device_grant_end_to_end() {
     assert!(daemon.alive(), "{}", daemon.stderr());
 }
 
-/// Revocation reaches what a2a-rs is already serving: a session-token
+/// Revocation reaches what the SDK is already serving: a session-token
 /// `SubscribeToTask` on a WORKING task closes within 200 ms of the revoke,
 /// and a blocking `SendMessage` still waiting on its turn is answered with
 /// the dead token's 401.

@@ -34,25 +34,24 @@ pub(crate) fn command_data(message: &Value) -> Option<Value> {
         .find_map(|p| p.get("data").and_then(|d| d.get("agentd")).cloned())
 }
 
-/// The `contextId` a message names, as its sender knows it. a2a-rs stamps
-/// one on every message it forwards, so only a path around it arrives
-/// without; that one gets an id minted the way a2a-rs would have.
+/// The `contextId` a message names, as its sender knows it — or, for a message
+/// that names none, a new one, minted as the A2A SDK mints them.
 pub(super) fn context_wire(message: &Value) -> String {
     message["contextId"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| a2a_rs::domain::ContextId::generate().to_string())
+        .unwrap_or_else(a2a_types::new_context_id)
 }
 
 /// The task a send names, when it names one.
 ///
-/// Through the protocol layer `taskId` is always set — a2a-rs generates one
-/// for a message that named none — so `newTask` says which it is (see
-/// `ports::RequestScope::named_task`); anything but `true` is read as named,
-/// so a malformed bridge request can never create a task under an id it did
-/// not reserve. A read op the listener answers itself carries the message
-/// exactly as the caller sent it.
+/// Through the handler `taskId` is always set — it mints one for a message
+/// that named none, and watches it before the work starts — so `newTask` says
+/// which it is (see `ports::RuntimePorts::send_message`); anything but `true`
+/// is read as named, so a malformed bridge request can never create a task
+/// under an id it did not reserve. A read op the listener answers itself
+/// carries the message exactly as the caller sent it.
 fn named_task(params: &Value) -> Option<&str> {
     let named = match params.get("newTask") {
         Some(new) => (new.as_bool() != Some(true))
@@ -60,7 +59,7 @@ fn named_task(params: &Value) -> Option<&str> {
             .flatten(),
         None => params["message"]["taskId"].as_str(),
     };
-    // Blank is unnamed, as the listener and a2a-rs both read it.
+    // Blank is unnamed, as the listener and the handler both read it.
     named.filter(|t| !t.trim().is_empty())
 }
 
@@ -149,7 +148,7 @@ impl Runtime {
     ///
     /// - a draining agent takes no new work (`-32603`, `DRAINING`) — the same
     ///   object on every path, which the listener's fidelity filter keeps
-    ///   whole when a2a-rs answered;
+    ///   whole when the SDK rendered it;
     /// - a task id is the server's: a message that names a task continues it,
     ///   and one it cannot see is "not found" (`-32001`) rather than a new task
     ///   under the caller's id; a settled task takes no more (`-32004`);
@@ -200,6 +199,23 @@ impl Runtime {
                             &format!(
                                 "task {tid} is {}; it accepts no further messages",
                                 t.state.wire()
+                            ),
+                        );
+                    }
+                    // A task belongs to one conversation. A message that
+                    // names the task and another conversation is refused
+                    // rather than answered in either (A2A 1.0 §3.4.1: a
+                    // `contextId` the agent cannot accept is an error, never
+                    // swapped for another).
+                    if let Some(ctx) = message["contextId"]
+                        .as_str()
+                        .filter(|c| !c.trim().is_empty())
+                        && !t.matches_context(ctx, principal.is_operator())
+                    {
+                        return err_obj(
+                            errors::INVALID_PARAMS,
+                            &format!(
+                                "message.contextId {ctx:?} is not the conversation task {tid} belongs to"
                             ),
                         );
                     }

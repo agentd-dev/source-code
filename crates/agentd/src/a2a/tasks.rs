@@ -198,7 +198,7 @@ pub struct Task {
     #[serde(skip)]
     pub dirty: bool,
     /// Settled, and not read back since. A blocking `SendMessage` answers
-    /// with a `GetTask` a2a-rs makes AFTER the terminal event — a second
+    /// with a `GetTask` the handler makes AFTER the terminal event — a second
     /// round trip — so retention spares a task so marked for a short grace
     /// rather than answer that caller "not found" for a task that completed.
     /// In memory only: after a restart no send is waiting on anything.

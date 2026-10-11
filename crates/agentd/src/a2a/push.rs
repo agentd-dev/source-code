@@ -239,15 +239,15 @@ mod tests {
         assert!(check_url("https://93.184.216.34/agentd", false).is_ok());
     }
 
-    /// The spec's config, as a2a-rs hands it over: parsed into the typed
+    /// The spec's config, as the SDK hands it over: parsed into the typed
     /// `TaskPushNotificationConfig` and serialized back. Going through the
     /// type is the point — it is what strips any shape the spec does not have,
     /// so a test that fed raw JSON would pass against fields no caller can
     /// actually send.
     fn typed(v: Value) -> Value {
-        let t: a2a_rs::domain::TaskPushNotificationConfig =
-            serde_json::from_value(v).expect("a TaskPushNotificationConfig");
-        serde_json::to_value(t).expect("serialize")
+        let t: a2a_types::TaskPushNotificationConfig =
+            crate::a2a::wire::from_wire(v).expect("a TaskPushNotificationConfig");
+        crate::a2a::wire::to_wire(&t)
     }
 
     #[test]

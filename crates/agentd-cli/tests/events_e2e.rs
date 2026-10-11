@@ -1131,7 +1131,7 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
         .find(|a| a["task"] == task_id.as_str())
         .expect("the A2A turn's activity binds to its task");
     // The conversation is the one the task names. A send that names none gets
-    // the id a2a-rs mints for it (a UUIDv4), so the check is against
+    // the id the A2A SDK mints for it (a UUIDv7), so the check is against
     // the task rather than a spelling of agentd's own.
     assert!(
         bound["ctx"].as_str().is_some_and(|c| !c.is_empty())

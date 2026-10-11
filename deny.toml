@@ -49,9 +49,9 @@ allow = [
     "ISC",
     "Unicode-3.0",
     # Permissive (the zlib licence: use, alter and redistribute, keep the
-    # notice). Only the shipped `a2a` graph carries it: foldhash (the hasher
-    # of buffa and its hashbrown) and zlib-rs (the pure-Rust deflate behind
-    # connectrpc's flate2).
+    # notice). Only the `a2a` graph carries it: foldhash, the hasher of the
+    # hashbrown under prost-build, which generates the A2A SDK's protobuf code
+    # at build time.
     "Zlib",
     "CDLA-Permissive-2.0",
 ]

@@ -132,7 +132,7 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn spec_methods_are_exactly_the_sdks() {
-        use a2a_rs::adapter::transport::jsonrpc_wire::methods as m;
+        use a2a_types::methods as m;
         let sdk = [
             m::SEND_MESSAGE,
             m::SEND_STREAMING_MESSAGE,

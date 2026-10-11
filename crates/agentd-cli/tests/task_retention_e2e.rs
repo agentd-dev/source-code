@@ -292,17 +292,17 @@ fn terminal_tasks_are_evicted_and_announced() {
 }
 
 /// A caller blocked on its own send is answered with its task, however many
-/// others finish around it. a2a-rs answers a blocking send with a `GetTask`
+/// others finish around it. The handler answers a blocking send with a `GetTask`
 /// it makes AFTER the terminal event, a second trip through the reactor; with
 /// `keep_last: 0` every finished task is over the bound the moment it
 /// finishes, and concurrent callers finish between one another's event and
 /// read. Evicting in that gap answered a caller whose task COMPLETED with
 /// "task not found". Once read, each is still dropped as the bound says.
 ///
-/// The race is between the reactor's eviction and a2a-rs's read, and no
+/// The race is between the reactor's eviction and the handler's read, and no
 /// store takes part in it, so the daemon keeps its tasks in memory. On a file
 /// store every checkpoint is two fsyncs on the single-writer loop, and on a
-/// disk other builds were writing to, the 40 turns ran past a2a-rs's 25 s
+/// disk other builds were writing to, the 40 turns ran past the handler's 25 s
 /// send-wait. A send whose wait runs out is answered with its task still
 /// unsettled. That is a slow host, not this defect, so an unsettled answer is
 /// held only to being the caller's own task. The race needs settled answers
@@ -368,7 +368,7 @@ fn a_blocking_send_is_answered_with_its_task_under_any_bound() {
     );
     assert!(
         settled > 0,
-        "none of the {} sends settled within a2a-rs's send-wait, so no answer \
+        "none of the {} sends settled within the handler's send-wait, so no answer \
          was read after its task finished and the race never ran",
         answers.len()
     );

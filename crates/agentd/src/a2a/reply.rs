@@ -4,11 +4,12 @@
 //! A read creates no task: `SendMessage` may answer with a Message when no
 //! work is tracked, and a display client polls these reads — a durable task
 //! per poll filled the task list every client of the same principal lists.
-//! The Message is built from a2a-rs's own types, so its shape is the
-//! specification's `SendMessageResponse{message}` by construction rather than
-//! by agentd spelling `role` or `mediaType` the way it believes the proto does.
+//! The Message is built from the A2A SDK's own types and put on the wire by its
+//! canonical ProtoJSON, so its shape is the specification's
+//! `SendMessageResponse{message}` by construction rather than by agentd
+//! spelling `role` or `mediaType` the way it believes the proto does.
 
-use a2a_rs::domain::{Message, Part, Role};
+use a2a_types::{Message, Part, Role};
 use serde_json::{Value, json};
 
 /// The `{message}` answer to a read op: `doc` as one JSON DataPart of an
@@ -22,17 +23,14 @@ use serde_json::{Value, json};
 /// 2^53 would come back wrong. JSON is a valid rendering of a `Value` as it
 /// stands, so the bytes a caller reads are the document the op produced.
 pub fn read_reply(context_id: &str, doc: Value) -> Value {
-    let mut part = Part::data(Default::default());
-    part.media_type = "application/json".to_string();
-    let message = Message {
-        role: Role::ROLE_AGENT.into(),
-        message_id: format!("msg-{}", crate::state::ulid::new()),
-        context_id: context_id.to_string(),
-        parts: vec![part],
-        extensions: vec![crate::runtime::surface::COMMAND_EXTENSION.to_string()],
-        ..Default::default()
-    };
-    let mut message = serde_json::to_value(&message).unwrap_or(Value::Null);
+    let mut message = Message::new(
+        Role::Agent,
+        vec![Part::data(json!({})).with_media_type("application/json")],
+    );
+    message.message_id = format!("msg-{}", crate::state::ulid::new());
+    message.context_id = Some(context_id.to_string());
+    message.extensions = Some(vec![crate::runtime::surface::COMMAND_EXTENSION.to_string()]);
+    let mut message = crate::a2a::wire::message_to_wire(&message);
     if let Some(part) = message
         .get_mut("parts")
         .and_then(|p| p.get_mut(0))
@@ -52,11 +50,17 @@ mod tests {
     /// unchanged in a JSON DataPart.
     #[test]
     fn a_read_reply_is_a_spec_message_carrying_the_document() {
-        // An integer past 2^53 survives, which a protobuf double would not.
-        let doc = json!({"runs": [{"run": "r1", "status": "running"}], "n": 3, "seq": 9_007_199_254_740_993u64});
+        let doc = json!({"runs": [{"run": "r1", "status": "running"}], "n": 3});
         let v = read_reply("ctx-1", doc.clone());
-        let resp: a2a_rs::domain::generated::SendMessageResponse =
-            serde_json::from_value(v.clone()).expect("a SendMessageResponse");
+        let resp: a2a_types::SendMessageResponse =
+            crate::a2a::wire::from_wire(v.clone()).expect("a SendMessageResponse");
+        // An integer past 2^53 is carried exactly, which a protobuf double
+        // would not do — a JSON reader gets the cursor the op produced.
+        let big = json!({"seq": 9_007_199_254_740_993u64});
+        assert_eq!(
+            read_reply("ctx-1", big.clone())["message"]["parts"][0]["data"],
+            big
+        );
         assert!(v.get("task").is_none(), "a read creates no task: {v}");
         let m = &v["message"];
         assert_eq!(m["role"], "ROLE_AGENT");

@@ -122,9 +122,9 @@ carries the other: the official `rmcp` SDK and the async runtime it needs
 its own three (`serde`, `serde_json`, `libc`), the engine names fourteen further
 external crates, every one optional and every one off by default: `ring` for
 `aauth`, `sign` and `oci`, `cel-interpreter` for `cel`, and the A2A stack behind
-`a2a` — `a2a-rs`, `buffa`, `buffa-types`, `tokio`, `axum`, `tokio-rustls`,
-`hyper`, `hyper-util`, `tower`, `async-trait`, `tokio-stream` and
-`futures-util`. `instruction` names `ring` unconditionally, for the §7.2
+`a2a` — the official A2A SDK's `a2a-lf`, `a2a-pb` and `a2a-server-lf`, with
+`chrono`, `tokio`, `axum`, `tokio-rustls`, `hyper`, `hyper-util`, `tower`,
+`async-trait`, `tokio-stream` and `futures-util`. `instruction` names `ring` unconditionally, for the §7.2
 digests its resolution manifest is made of, so `ring` is in every build of
 the engine. `net`, `mcp` and `instruction` also contain **zero** `unsafe`;
 in the engine every `unsafe` block outside `#[cfg(test)]` is libc FFI: thirty
@@ -385,7 +385,7 @@ that talk to other people's software:
 | | Implementation | Why not ours |
 |---|---|---|
 | MCP | [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) — the official Rust SDK | a live specification, and a misreading fails in the *peer* |
-| A2A | [`a2a-rs`](https://github.com/emillindfors/a2a-rs) — generated from the spec's protobufs | same, and demonstrable: checking agentd's output against an independent reading of the spec turns up faults that are valid JSON |
+| A2A | [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs) — the A2A project's official Rust SDK, its wire generated from the spec's protobufs | same, and demonstrable: checking agentd's output against an independent reading of the spec turns up faults that are valid JSON |
 
 Both plug into agentd's own HTTP transport, so the credentials only agentd knows
 about — AAuth signatures, SigV4, mTLS identities, refreshed OAuth tokens — and
@@ -405,12 +405,12 @@ actually receives: the release binary must be a statically linked musl artifact
 that runs on `scratch` — about 8.5 MiB for the shipped feature set, with no
 shell, no libc and no package manager.
 
-The build stays pure Rust. The SDKs pull `rustls` with its default features,
-which selects the C/assembly `aws-lc-rs` provider; because feature unification
-is additive, that one default would have imposed `cmake` and a C++ compiler on
-every build, however carefully our own manifests ask for `ring`. A vendored
-`connectrpc` with three corrected dependency entries removes it — see
-`third_party/connectrpc/PATCH.md`. CI asserts `aws-lc` stays out of the graph.
+The build stays pure Rust. A crate that pulls `rustls` with its default
+features selects the C/assembly `aws-lc-rs` provider; because feature
+unification is additive, that one default would impose `cmake` and a C++
+compiler on every build, however carefully our own manifests ask for `ring`.
+The A2A server's TLS features are off — agentd terminates TLS itself — and CI
+asserts `aws-lc` stays out of the graph.
 
 Two gates remain: the feature matrix compiles, clippies and tests 18 combinations
 including every shipped feature solo, because `--all-features` unification hides
@@ -428,7 +428,7 @@ dependencies.
 | Feature | Adds crates | Gates |
 |---|---|---|
 | `tls` *(default)* | rustls, ring, webpki-roots, … | HTTPS in and out |
-| `a2a` | `a2a-rs`, axum, tokio, … | the inbound A2A / interface listener |
+| `a2a` | the official A2A SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`), axum, tokio, … | the inbound A2A / interface listener |
 | `cron` | none | the five-field UTC parser |
 | `oauth` | none | OAuth 2.1 device, PKCE and client-credentials tokens |
 | `metrics` | none | the atomic registry and Prometheus text |

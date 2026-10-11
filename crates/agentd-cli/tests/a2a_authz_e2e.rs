@@ -7,13 +7,13 @@
 //!
 //! ## Ownership does not stop at the task read
 //!
-//! Every task-facing port asks the reactor, and the reactor answers with the
+//! Every task-facing method asks the reactor, and the reactor answers with the
 //! ownership matrix already applied: another principal's task is "not found",
-//! so its existence is not even disclosed. The *streaming* port must apply it
-//! too — a2a-rs's fan-out is keyed by task id alone, so without an ownership
-//! check naming somebody else's task id is enough to attach to it, and with a
-//! `Last-Event-ID` to replay what it has already emitted: every transition, and
-//! the result artifact that carries the agent's answer.
+//! so its existence is not even disclosed. The *streaming* methods must apply
+//! it too — the fan-out is keyed by task id alone, so without an ownership
+//! check naming somebody else's task id would be enough to attach to it and
+//! receive what it emits: every transition, and the result artifact that
+//! carries the agent's answer.
 //!
 //! The test therefore drives two *different* principals through the real
 //! listener. The first assertion is that the subscribe is refused with the same
@@ -245,10 +245,9 @@ fn one_principals_task_stream_is_not_readable_by_another() {
         "B's cancel: {cancelled}"
     );
 
-    // The surface under test. `Last-Event-ID: 0` asks for everything the task
-    // has ever emitted, which is what makes this deterministic: a live
-    // subscription would depend on catching a transition, but a replay is owed
-    // the whole buffer the moment it attaches.
+    // The surface under test, asked as a reconnecting client would ask it —
+    // `Last-Event-ID: 0` is "everything you have" to an SSE server, and must
+    // buy B nothing either.
     // `a2a_post_within` bounds the read rather than the connection: a refused
     // subscribe closes at once, but an *unguarded* one answers with an SSE
     // stream that stays open, and the test has to be able to say what it
@@ -294,8 +293,10 @@ fn one_principals_task_stream_is_not_readable_by_another() {
         "B's subscribe is refused as not-found: {refused}"
     );
 
-    // The control: the same call, from the owner, does deliver. Without it a
-    // subscribe that was broken for everybody would pass the assertions above.
+    // The control: the same call, from the owner, finds the task — which
+    // has ended, so it is the spec's "already ended" (`-32004`, A2A 1.0
+    // §3.1.6), not "not found". Without it a subscribe that was broken for
+    // everybody would pass the assertions above.
     let auth_a = format!("Bearer {TOKEN_A}");
     let owner = a2a_post_within(
         &addr,
@@ -304,9 +305,11 @@ fn one_principals_task_stream_is_not_readable_by_another() {
         Duration::from_secs(10),
     );
     let (a_status, a_body) = (owner.status, owner.body);
-    assert!(
-        a_body.contains("data:") && a_body.contains(&task_id),
-        "the owner still receives its own task's events: {a_status} / {a_body}"
+    let answered: Value = serde_json::from_str(&a_body)
+        .unwrap_or_else(|e| panic!("non-JSON answer ({e}): {a_status} {a_body:?}"));
+    assert_eq!(
+        answered["error"]["code"], -32004,
+        "the owner's subscribe finds its task, which has ended: {answered}"
     );
 
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
@@ -316,14 +319,14 @@ fn one_principals_task_stream_is_not_readable_by_another() {
 /// A send that NAMES another principal's live task does not attach its caller
 /// to that task's stream.
 ///
-/// a2a-rs 0.10 reads the task a send names, then attaches the send's
-/// subscription to that id, before the message is processed. The read is the
-/// reactor's `GetTask`, which answers B "not found" for A's task, and the
-/// ports record that as B's verdict on A's id — so the attach is refused, and
-/// the send is answered -32001 with no task created, exactly as for an id
-/// nobody holds. The subscribe test above never goes through a send, so
-/// nothing else pins this path. A's task is held live by a slow model, so a
-/// stream attached to it would carry A's transitions and its answer.
+/// A streaming send starts watching the task it names before the message is
+/// processed — so that a task settling at once is not missed — and the
+/// runtime then refuses B's message for A's task as "not found". The send is
+/// answered -32001 with no task created, exactly as for an id nobody holds,
+/// and the watch it opened is never handed a frame. The subscribe test above
+/// never goes through a send, so nothing else pins this path. A's task is held
+/// live by a slow model, so a stream attached to it would carry A's
+/// transitions and its answer.
 #[test]
 fn a_send_naming_another_principals_live_task_streams_none_of_it() {
     let llm = spawn_mock_llm(&json!({
@@ -1796,7 +1799,7 @@ fn a_subagent_reads_status_as_its_owner() {
 /// one it was never told of by a different answer than a stranger gets.
 /// Every name off the caller's card is HTTP 403 with PERMISSION_DENIED, the
 /// start-roles refusal the runtime makes included, carried out through the
-/// a2a-rs path that serves a Task-reply command.
+/// SDK path that serves a Task-reply command.
 #[test]
 fn listed_workflows_are_exactly_the_runnable_ones() {
     let (mut daemon, cfg) = spawn_daemon(|port| {

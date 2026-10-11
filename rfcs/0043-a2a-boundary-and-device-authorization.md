@@ -1,6 +1,7 @@
 # RFC 0043: The A2A boundary, extensions and the device authorization grant
 
 **Status:** Accepted — being implemented for v1.17.0
+**Note (2026-10-11):** where this RFC says `a2a-rs` it means the community crate of that name (EmilLindfors), which it wrongly calls the official Rust library. agentd now runs A2A on the A2A project's official Rust SDK ([`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs): `a2a-lf`, `a2a-pb`, `a2a-server-lf`) behind the same pipeline; the few places the old library departed from A2A 1.0 (streams closing at a gate, `Last-Event-ID` replay of an ended task, `pageSize: 0` refused) now follow the specification. See the CHANGELOG's Unreleased section.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Supersedes:** RFC 0032 §3 (discovery), §4 (the feed), §5 (the taskless reads) and §12–§16 (daemon-driven chrome, pairing, `config.set`, composer affordances, human-in-the-loop availability). RFC 0032's `interface` configuration section (§2), its authorization additions (§6), its browser rule (§7), its client description (§8) and its passthrough (§9) are replaced here as well; RFC 0032 carries a dated note at each place.

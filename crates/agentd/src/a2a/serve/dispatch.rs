@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The JSON-RPC endpoint: the listener's pipeline, the few calls answered
-//! here, and the filter that keeps what a2a-rs answers in the runtime's words.
+//! here, and the filter that keeps what the SDK answers in the runtime's words.
 
 use std::sync::Arc;
 
@@ -80,11 +80,10 @@ fn echoed(mut resp: Response, active: Active) -> Response {
 ///    refusal of an extension method whose extension it does not;
 /// 10. the method's authorization (and the extended card's credential gate);
 /// 11. the checks that need the params: a send's request shape, the task it
-///     names, its command envelope and the caller's reach to the op, a
-///     subscribe's task;
-/// 12. the answer — here for the few calls answered locally, else a2a-rs's,
-///     filtered back to the runtime's own words on the way out, and echoing
-///     the extensions it was given under.
+///     names, its command envelope and the caller's reach to the op;
+/// 12. the answer — here for the few calls answered locally, else the SDK's
+///     over agentd's handler, filtered back to the runtime's own words on the
+///     way out, and echoing the extensions it was given under.
 ///
 /// The order is the point. Nothing that costs the runtime anything runs before
 /// the caller is known and has asked in the protocol this listener speaks, and
@@ -304,7 +303,7 @@ async fn dispatch(
     // The spec makes the extended card an authenticated read (§13.3): on a
     // listener that declares a scheme, a caller the scheme did not name — an
     // `any` rule, the implicit operator — is asked for a credential rather
-    // than handed it. The card itself is a2a-rs's to serve.
+    // than handed it. The card itself is the handler's to serve.
     if route == Route::Spec(SpecMethod::GetExtendedAgentCard)
         && posture.declares_any()
         && !matches!(via, Via::Bearer | Via::Session | Via::Cert)
@@ -329,18 +328,14 @@ async fn dispatch(
     );
 
     // A send's params are the spec's `SendMessageRequest`, read with its own
-    // type before anything is done on the caller's behalf. What the type does
-    // not know is ignored, as ProtoJSON says it must be — a newer client's
-    // field is not a malformed request — and the task the message names, if
-    // any, is what the caller meant: continue that task. Only this layer sees
-    // the message as the caller sent it (a2a-rs writes a generated id into an
-    // empty `taskId` before any port runs), so it says so to the ports. A
-    // blank id names nothing, by a2a-rs's own rule (`supplied`, which trims):
-    // were the two layers to disagree, a whitespace id would be looked up as
-    // the task a2a-rs generated in its place.
+    // type before anything is done on the caller's behalf, and the task the
+    // message names, if any, is what the caller meant: continue that task. A
+    // blank id names nothing — the handler reads it by the same rule
+    // (`ports::named_task`), so the two can never disagree about which task a
+    // command addresses.
     let named_task = if send {
         match sent_message(&params) {
-            Ok(message) => Some(message.task_id).filter(|t| !t.trim().is_empty()),
+            Ok(message) => message.task_id.filter(|t| !t.trim().is_empty()),
             Err(why) => return err(id, errors::INVALID_PARAMS, &why),
         }
     } else {
@@ -398,30 +393,6 @@ async fn dispatch(
         );
     }
 
-    // a2a-rs 0.10's subscribe reads the task first and, finding nothing,
-    // opens a stream anyway — which a caller cannot tell from a task that has
-    // yet to speak, and which for someone else's task would say nothing
-    // either way. So the listener reads it first, as the caller: an unknown
-    // id and a task the caller may not see get the runtime's "not found", as
-    // JSON, and no stream is opened.
-    if route == Route::Spec(SpecMethod::SubscribeToTask)
-        && let Some(task) = params.get("id").and_then(Value::as_str)
-    {
-        let bridge = Arc::clone(&app.bridge);
-        let who = principal.clone();
-        let read = json!({"id": task, "historyLength": 0});
-        let v = tokio::task::spawn_blocking(move || {
-            bridge.call("GetTask", read, who, Active::NONE)
-        })
-        .await
-        .unwrap_or_else(
-            |e| json!({"_error": {"code": errors::INTERNAL_ERROR, "message": e.to_string()}}),
-        );
-        if let Some(e) = ports::error_of(&v) {
-            return error_response(json!({"jsonrpc": "2.0", "id": id, "error": e}), bearer_used);
-        }
-    }
-
     // Every check has passed: the handler runs, and its answer — only its
     // answer — echoes what the request activated.
     let resp = answer(
@@ -434,7 +405,6 @@ async fn dispatch(
             headers,
             principal,
             via,
-            named_task,
             command,
             bearer_used,
             active,
@@ -452,8 +422,6 @@ struct Admitted {
     headers: HeaderMap,
     principal: Principal,
     via: Via,
-    /// The task the send's message named (see `ports::RequestScope`).
-    named_task: Option<String>,
     /// The command a send carries, held to the command extension.
     command: Option<Command>,
     bearer_used: bool,
@@ -469,7 +437,6 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         headers,
         principal,
         via,
-        named_task,
         command,
         bearer_used,
         active,
@@ -479,34 +446,7 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         Route::Spec(SpecMethod::SendMessage | SpecMethod::SendStreamingMessage)
     );
     match route {
-        // Answered here because a2a-rs 0.10 cannot: its JSON-RPC adapter
-        // hands the port the task id alone, dropping `pageSize` and
-        // `pageToken`, and its response has no `nextPageToken`. Passed
-        // down, a caller asking for two configs would get all of them and
-        // a page size of 500 would be accepted. The caller's request is
-        // read with the spec's own type and crosses whole to the runtime,
-        // which pages it and refuses what it cannot honour — with the same
-        // codes the runtime gives every caller.
-        Route::Spec(SpecMethod::ListTaskPushNotificationConfigs) => {
-            let req = match serde_json::from_value::<
-                a2a_rs::domain::generated::ListTaskPushNotificationConfigsRequest,
-            >(params)
-            {
-                Ok(req) => req,
-                Err(e) => {
-                    return err(id, errors::INVALID_PARAMS, &format!("invalid params: {e}"));
-                }
-            };
-            let Ok(params) = serde_json::to_value(&req) else {
-                return err(
-                    id,
-                    errors::INTERNAL_ERROR,
-                    "could not re-encode the listing request",
-                );
-            };
-            return unary(app, id, "PushConfigList", params, principal, bearer_used).await;
-        }
-        // agentd's own method, which a2a-rs correctly does not know.
+        // agentd's own method, which the SDK correctly does not know.
         // Negotiation has already refused it wherever the listener holds no
         // feed to serve it from. Served only as the events extension's own:
         // a method some other extension declares is not the feed, and until
@@ -541,11 +481,10 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
     }
 
     // A read op answers with a Message, not a Task, so there is nothing
-    // for the protocol layer to track or frame — forcing it through a
-    // port that must return a `Task` would mean inventing one. The
-    // runtime answers it here, as one JSON body or, to a caller that
-    // asked for a stream, exactly one frame. Every command that does work
-    // is a task like any other message, and goes to a2a-rs below.
+    // to track: the runtime answers it here, as one JSON body or, to a
+    // caller that asked for a stream, exactly one frame. Every command
+    // that does work is a task like any other message, and goes to the
+    // SDK's router below.
     if send
         && command
             .as_ref()
@@ -556,24 +495,17 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         return message_reply(app, id, params, principal, streamed, bearer_used, active).await;
     }
 
-    // Everything else is the specification's, and a2a-rs answers it.
+    // Everything else is the specification's: the SDK's router parses it,
+    // dispatches it to agentd's handler with the caller in scope, and frames
+    // the answer.
     let mut request = axum::http::Request::builder()
         .method("POST")
         .uri("/")
         .body(Body::from(body))
         .expect("build request");
     *request.headers_mut() = headers;
-    request
-        .extensions_mut()
-        .insert(a2a_rs::port::AuthPrincipal::new(
-            principal.id.clone(),
-            "agentd".to_string(),
-        ));
     let alive = app.liveness.as_ref().and_then(|l| l(&principal));
-    let mut scope = ports::RequestScope::new(principal, via, active);
-    if send {
-        scope = scope.send(named_task);
-    }
+    let scope = ports::RequestScope::new(principal, via, active);
     let kept = Arc::clone(&scope.error);
     let protocol = app.protocol.clone();
     let answered = ports::with_request(scope, async move {
@@ -592,7 +524,12 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
     let fidelity = Fidelity {
         kept: kept.lock().map(|k| k.clone()).unwrap_or_default(),
         bearer_used,
-        list_tasks: route == Route::Spec(SpecMethod::ListTasks),
+        page: match route {
+            Route::Spec(SpecMethod::ListTasks) => Some(Page::Tasks),
+            Route::Spec(SpecMethod::ListTaskPushNotificationConfigs) => Some(Page::PushConfigs),
+            _ => None,
+        },
+        empty_result: route == Route::Spec(SpecMethod::DeleteTaskPushNotificationConfig),
     };
     faithful(resp, fidelity, app.request_timeout, alive).await
 }
@@ -759,37 +696,20 @@ fn denied(
 /// A send's message, read as the spec's `SendMessageRequest`, or why it is
 /// not one. The message is a user's: `ROLE_AGENT` is the agent's own voice,
 /// and a caller does not get to speak in it.
-fn sent_message(params: &Value) -> Result<a2a_rs::domain::Message, String> {
-    let req =
-        serde_json::from_value::<a2a_rs::domain::generated::SendMessageRequest>(params.clone())
-            .map_err(|e| format!("invalid params: {e}"))?;
-    let Some(message) = req.message.into_option() else {
+fn sent_message(params: &Value) -> Result<a2a_types::Message, String> {
+    if params.get("message").is_none_or(Value::is_null) {
         return Err("invalid params: a send carries a message".to_string());
-    };
-    if message.role != a2a_rs::domain::Role::ROLE_USER {
+    }
+    let req = crate::a2a::wire::from_wire::<a2a_types::SendMessageRequest>(params.clone())
+        .map_err(|e| format!("invalid params: {e}"))?;
+    if req.message.role != a2a_types::Role::User {
+        let role = serde_json::to_value(&req.message.role).unwrap_or_default();
         return Err(format!(
             "invalid params: message.role must be ROLE_USER, not {}",
-            message.role
+            role.as_str().unwrap_or("?")
         ));
     }
-    Ok(message)
-}
-
-/// One reactor round trip, answered as a JSON-RPC envelope.
-async fn unary(
-    app: &Arc<App>,
-    id: Value,
-    verb: &str,
-    params: Value,
-    principal: Principal,
-    bearer_used: bool,
-) -> Response {
-    // No extension applies to what is answered this way.
-    let envelope = round_trip(app, id, verb, params, principal, Active::NONE).await;
-    if envelope.get("error").is_some() {
-        return error_response(envelope, bearer_used);
-    }
-    json_response(envelope)
+    Ok(req.message)
 }
 
 /// The runtime's answer to `verb`, as a JSON-RPC envelope for `id`.
@@ -875,14 +795,14 @@ fn error_response(envelope: Value, bearer_used: bool) -> Response {
     resp
 }
 
-// ---- what a2a-rs answered, in the runtime's words ---------------------------
+// ---- what the SDK answered, in the runtime's words --------------------------
 
 /// How long a revoked session's in-flight request may outlive it.
 const LIVENESS_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The most a stream's first event may take before the listener gives up
-/// reading it. a2a-rs opens every stream with a task snapshot, so this is a
-/// bound on a pathological task, not a limit a real one approaches.
+/// reading it. Every stream opens with a task snapshot, so this is a bound on
+/// a pathological task, not a limit a real one approaches.
 const FIRST_EVENT_CAP: usize = 8 * 1024 * 1024;
 
 /// What the filter needs to know about the request whose answer it filters.
@@ -891,55 +811,70 @@ pub(super) struct Fidelity {
     /// ([`ports::RequestScope::error`]).
     pub(super) kept: Option<Value>,
     pub(super) bearer_used: bool,
-    /// The answer is a `ListTasks` result, whose empty fields a2a-rs drops.
-    pub(super) list_tasks: bool,
+    /// The answer is a page of a listing, whose empty fields ProtoJSON drops.
+    pub(super) page: Option<Page>,
+    /// The answer is the spec's `google.protobuf.Empty`, which the SDK writes
+    /// as `null`; its ProtoJSON is `{}`.
+    pub(super) empty_result: bool,
+}
+
+/// A listing whose page is completed (see [`Fidelity::complete_page`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Page {
+    Tasks,
+    PushConfigs,
 }
 
 impl Fidelity {
-    /// Put the runtime's error in place of a2a-rs's rendering of it.
+    /// Put the runtime's error in place of the SDK's rendering of it.
     ///
-    /// When a port recorded the runtime's refusal, the error a2a-rs answered
-    /// with IS that refusal — a port that fails returns at once — reworded:
-    /// its message prefixed, its `data` replaced by a2a-rs's own `ErrorInfo`.
-    /// The runtime's object goes back in whole. The codes must agree, which
-    /// they always do for the error a port returned (every code crosses the
-    /// typed error unchanged); an error a2a-rs raised on its own after a
-    /// refusal it swallowed keeps its own answer rather than borrowing the
-    /// swallowed one's.
-    ///
-    /// Otherwise the error is a2a-rs's own, and only the codes it invented
-    /// outside the spec are folded ([`errors::normalize_native`]).
+    /// When the handler recorded the runtime's refusal, the error the SDK
+    /// answered with IS that refusal — a method that fails returns at once —
+    /// in the SDK's words: its `data` an `ErrorInfo` under the protocol's
+    /// domain, stamped with the time. The runtime's object goes back in whole.
+    /// The codes must agree, which they always do for the error the handler
+    /// returned (every code crosses the typed error unchanged); an error the
+    /// SDK raised on its own keeps its own answer rather than borrowing a
+    /// refusal it did not make.
     fn restore(&self, error: &mut Value) {
-        match &self.kept {
-            Some(kept) if kept.get("code") == error.get("code") => *error = kept.clone(),
-            _ => errors::normalize_native(error),
+        if let Some(kept) = &self.kept
+            && kept.get("code") == error.get("code")
+        {
+            *error = kept.clone();
         }
     }
 
-    /// A `ListTasks` page with the fields the spec's response always carries.
-    /// a2a-rs writes ProtoJSON, which leaves out an empty string, an empty
-    /// list and a zero — so the last page came back with no `nextPageToken`
-    /// and an empty one with no `tasks` and no `totalSize`, and a client
-    /// reading "no token" as "more to come" (or any of the four as the
-    /// REQUIRED fields A2A marks them) broke on exactly the page that ends
-    /// the listing. Returns whether anything was added.
+    /// A listing's page with the fields the spec's response always carries,
+    /// and an empty answer as the object it is. The SDK writes ProtoJSON,
+    /// which leaves out an empty string, an empty list and a zero — so the
+    /// last page came back with no `nextPageToken` and an empty one with no
+    /// list, and a client reading "no token" as "more to come" (or any of
+    /// them as the REQUIRED fields A2A marks them) broke on exactly the page
+    /// that ends the listing. Returns whether anything changed.
     fn complete_page(&self, envelope: &mut Value) -> bool {
-        let Some(result) = envelope
-            .get_mut("result")
-            .and_then(Value::as_object_mut)
-            .filter(|_| self.list_tasks)
-        else {
+        if self.empty_result && envelope.get("result").is_some_and(Value::is_null) {
+            envelope["result"] = json!({});
+            return true;
+        }
+        let Some(page) = self.page else {
             return false;
         };
+        let Some(result) = envelope.get_mut("result").and_then(Value::as_object_mut) else {
+            return false;
+        };
+        let fields: &[(&str, Value)] = match page {
+            Page::Tasks => &[
+                ("nextPageToken", json!("")),
+                ("tasks", json!([])),
+                ("totalSize", json!(0)),
+                ("pageSize", json!(0)),
+            ],
+            Page::PushConfigs => &[("nextPageToken", json!("")), ("configs", json!([]))],
+        };
         let mut changed = false;
-        for (field, empty) in [
-            ("nextPageToken", json!("")),
-            ("tasks", json!([])),
-            ("totalSize", json!(0)),
-            ("pageSize", json!(0)),
-        ] {
-            if !result.contains_key(field) {
-                result.insert(field.to_string(), empty);
+        for (field, empty) in fields {
+            if !result.contains_key(*field) {
+                result.insert(field.to_string(), empty.clone());
                 changed = true;
             }
         }
@@ -947,7 +882,7 @@ impl Fidelity {
     }
 }
 
-/// a2a-rs's response, with every error in it the runtime's own.
+/// The SDK's response, with every error in it the runtime's own.
 ///
 /// A unary answer is read whole and its `error`, if any, restored — with the
 /// HTTP status the restored code travels with. A stream's first event is read
@@ -1101,7 +1036,7 @@ fn restore_event(event: &[u8], fidelity: &Fidelity) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The rest of a2a-rs's stream, event by event: error frames restored, every
+/// The rest of the SDK's stream, event by event: error frames restored, every
 /// other byte passed through, and the whole ended within a tick of the
 /// caller's session dying.
 struct Frames {

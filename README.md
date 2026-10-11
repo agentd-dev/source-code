@@ -37,8 +37,10 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
 
 1. **The protocols are not ours to get wrong.** MCP is
    [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust
-   SDK; A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs), generated from
-   the specification's protocol buffers. Both run over agentd's own socket, so
+   SDK; A2A is the A2A project's own Rust SDK,
+   [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs), its wire
+   generated from the specification's protocol buffers. Both run over agentd's
+   own socket, so
    request signing and mTLS survive the adoption. Everything
    small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
    export, the inotify watch — is still hand-rolled on `std` + `libc`. What

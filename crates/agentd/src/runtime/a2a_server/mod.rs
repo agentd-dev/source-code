@@ -279,9 +279,9 @@ impl Runtime {
         // the whole principal. (The declared rate is admission, and the
         // listener applies it before a request reaches this loop.)
         self.note_principal(&principal);
-        // A send that creates a task creates it under the id a2a-rs generated
-        // for it, because the protocol layer subscribed to that id before the
-        // work started. Whichever path creates it — a conversation turn or a
+        // A send that creates a task creates it under the id the handler minted
+        // for it, because the handler started watching that id before the work
+        // started. Whichever path creates it — a conversation turn or a
         // command — takes the id from here, so the caller is watching the task
         // it is actually given. Only a new task's id is reserved: the id a
         // caller named is for a task that must already exist (see `a2a_send`).
@@ -308,6 +308,20 @@ impl Runtime {
         };
         self.reserved_task_id = None;
         self.a2a_active = Active::NONE;
+        // A stream opening on the task this answers: the position of the last
+        // transition published for it, read here on the loop that publishes
+        // them, so the stream skips exactly the transitions this answer
+        // already shows (`a2a::ports::Fanout`).
+        let mut out = out;
+        if params["_attach"] == json!(true)
+            && let Some(sink) = &self.a2a_sink
+            && let Some(id) = out["task"]["id"].as_str().or(out["id"].as_str())
+        {
+            let seq = sink.seq(id);
+            if let Some(o) = out.as_object_mut() {
+                o.insert("_seq".into(), json!(seq));
+            }
+        }
         // Audit every A2A call: who (principal + role), what (method + command
         // op), and the outcome. This is the record of who authorized what, so
         // it is emitted for refusals as well as successes.

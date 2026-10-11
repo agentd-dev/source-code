@@ -501,11 +501,13 @@ export class Observation {
   }
 
   /**
-   * Follow one task. The stream closes when the task ends or stops at a gate;
-   * one that ends while the task is still moving is resumed after its last
-   * SSE id, a few times, before the poll takes over again — and keeps it:
-   * the task is not followed again until its state moves on, or a failure's
-   * wait (Retry-After, the backoff) has passed.
+   * Follow one task while it moves. The server closes the stream when the
+   * task ends; this client also lets it go when the task stops at a gate, so
+   * a task waiting on a person does not hold one of the capped streams — it
+   * is followed again once its state moves on. A stream that ends while the
+   * task is still moving is resumed, a few times, before the poll takes over
+   * again — and keeps it: the task is not followed again until its state
+   * moves on, or a failure's wait (Retry-After, the backoff) has passed.
    */
   private startFollower(client: AgentdClient, id: string, parent: AbortSignal): void {
     const ac = new AbortController();
@@ -527,6 +529,8 @@ export class Observation {
               (frame, sseId) => {
                 if (sseId !== undefined) this.lastEventIds.set(id, sseId);
                 this.mirror.applyStream(frame);
+                const now = this.mirror.getState().tasks.get(id);
+                if (now && !followable(now)) ac.abort();
               },
               ac.signal,
               this.lastEventIds.get(id),

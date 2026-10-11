@@ -242,9 +242,8 @@ ErrorInfo naming `supportedVersions: "1.0"`. A missing header is refused rather
 than assumed, because the specification reads its absence as 0.3, and a 0.3
 client that happened to use a 1.0 method name would otherwise be answered in
 1.0 semantics. The header is read from the header only — never the query
-string. Note that **clients built on a2a-rs up to 0.10 send no `A2A-Version`
-header**, so they get `-32009` from agentd, as the specification says they
-must.
+string. A client that sends no `A2A-Version` header gets `-32009`, as the
+specification says it must.
 
 The card, the `OPTIONS` preflights and the `/oauth2/*` endpoints take no
 `A2A-Version`: they are not JSON-RPC.
@@ -290,16 +289,15 @@ the specification defines and `agentd.dev` for one agentd coined.
 The HTTP statuses outside JSON-RPC are `403` with an empty body (an origin not
 listed), `415` (not `application/json`) and, on the card, `304` and `503`.
 
-**Error fidelity.** Most methods are answered by
-[a2a-rs](https://github.com/emillindfors/a2a-rs), whose own rendering of an
-error would reword it and replace its details. When the refusal came from
-agentd's runtime, the listener puts the runtime's own error object back —
-code, message and data, byte for byte — and sets the HTTP status from the code,
-so a refusal reads the same whichever path produced it. That includes the first
-frame of a stream: an error there becomes the plain JSON answer the same refusal
-gets on a unary call. The few codes a2a-rs invents outside the specification
-(`-32100`…`-32102`) become `-32603` "internal error" with no data, because one
-of them would otherwise name another principal's context.
+**Error fidelity.** Most methods are answered through the A2A project's
+official server ([`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs)),
+whose own rendering of an error replaces its details with an `ErrorInfo` under
+the protocol's domain. When the refusal came from agentd's runtime, the
+listener puts the runtime's own error object back — code, message and data,
+byte for byte — and sets the HTTP status from the code, so a refusal reads the
+same whichever path produced it. That includes the first frame of a stream: an
+error there becomes the plain JSON answer the same refusal gets on a unary
+call.
 
 ### The wire is proto3 JSON
 
@@ -318,10 +316,14 @@ getting them wrong fails silently in the *peer*:
   unknown field is ignored as proto3 JSON says it must be. `GetTask` names its
   task with `id`.
 
-Behind the pipeline the listener is a2a-rs's JSON-RPC adapter, and every task,
-message and card agentd emits is serialized by the types that crate generates
+Behind the pipeline the listener is the official SDK's JSON-RPC router over
+agentd's own `RequestHandler`, and every task, message and card agentd emits is
+built from the SDK's types and written by its canonical ProtoJSON, generated
 from the A2A protobuf — so the wire shape is the schema's, not our reading of
-it.
+it. Two places where proto3 JSON would drop a field the specification marks
+REQUIRED are completed on the way out: a listing's last page carries
+`nextPageToken: ""` (and an empty one its empty list), and a deleted push
+config answers `{}`, the JSON of `google.protobuf.Empty`.
 
 ## Who is calling
 
@@ -689,17 +691,23 @@ How long a finished task is kept is `store.retention.tasks`; unset keeps them.
 ### Streams and reconnection
 
 `SendStreamingMessage` answers `text/event-stream`: a Task frame, then status and
-artifact updates, closing at a terminal or interrupted state. A read op answers
-with exactly one frame carrying its Message, then closes. Any refusal before the
+artifact updates, closing when the task reaches a terminal state (A2A 1.0
+§3.1.2) — a task waiting at a gate keeps its stream. A read op answers with
+exactly one frame carrying its Message, then closes. Any refusal before the
 first frame is plain JSON with its status, never an error inside a `200` stream.
 
-`SubscribeToTask` follows one task the caller may see. An unknown or unseen task
-is `-32001` as JSON, and no stream is opened. A task that already finished is
-`-32004` — unless the request carries **`Last-Event-ID`**: that is SSE
-reconnection of a stream the caller already held, and the stored events are
-replayed from that point. It is the transport's reconnection rule, not a
-protocol extension, and the usual reason for it is that the task finished while
-the caller was away.
+`SubscribeToTask` follows one task the caller may see: the task as it is, then
+each transition after it, closing at a terminal state (§3.1.6). An unknown or
+unseen task is `-32001` as JSON, and no stream is opened; a task that has
+already ended is `-32004`, as JSON — read it with `GetTask`. A client that lost
+its stream reconnects by subscribing again, which opens with the task as it
+now is; transitions are not replayed (`Last-Event-ID` is ignored), as the
+specification allows: a status message is not a reliable channel, and the
+task carries everything that is.
+
+A blocking `SendMessage` waits for its task to reach a terminal or interrupted
+state (§3.1.1), at most 25 seconds, and then answers with the task as it
+stands — a `TASK_STATE_WORKING` task is the truth, and its id is what to follow.
 
 ### Rate limits
 

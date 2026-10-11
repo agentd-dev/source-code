@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **The listener's protocol surface, against a real daemon.**
 //!
-//! What a spec client can send, and what it gets back, before and after
-//! a2a-rs has had its turn:
+//! What a spec client can send, and what it gets back, before and after the
+//! A2A SDK's router has had its turn:
 //!
 //! * every JSON-RPC request states the protocol version it speaks
 //!   (`A2A-Version`), and one that does not is refused `-32009` without
@@ -11,12 +11,12 @@
 //! * the method table is the specification's plus the declared extension
 //!   methods, matched exactly — any other name is `-32601` for an operator
 //!   and a user alike, and changes nothing;
-//! * a stream is either exactly one frame (a read's Message) or a2a-rs's
-//!   task stream, and a refusal is never a frame;
+//! * a stream is either exactly one frame (a read's Message) or the task's
+//!   stream, and a refusal is never a frame;
 //! * a subscription to a task the caller cannot see is refused as JSON
 //!   before any stream is opened;
 //! * a refusal the RUNTIME made reaches the caller in the runtime's words,
-//!   even when a2a-rs was the layer that answered — a draining agent's above
+//!   even when the SDK was the layer that answered — a draining agent's above
 //!   all, which is the same object whichever path the send took;
 //! * a task id is the server's: a message names a task only to continue it,
 //!   and a new task's id is generated, never the caller's;
@@ -190,18 +190,20 @@ fn is_json(r: &HttpReply) -> bool {
         .is_some_and(|t| t.starts_with("application/json"))
 }
 
-/// No part of an error says it came from a2a-rs.
+/// No part of an error is the SDK's own rendering of it — the time-stamped
+/// `ErrorInfo` it writes in place of the runtime's details.
 fn no_sdk_domain(error: &Value) {
     let data = error["data"].as_array().cloned().unwrap_or_default();
     assert!(
-        data.iter().all(|d| d["domain"] != "a2a-rs"),
-        "a runtime refusal carries a2a-rs's ErrorInfo: {error}"
+        data.iter()
+            .all(|d| d["metadata"].get("timestamp").is_none()),
+        "a runtime refusal carries the SDK's ErrorInfo: {error}"
     );
 }
 
-/// A client that does not state the version — every a2a-rs client up to 0.10
-/// among them — is refused -32009 at HTTP 200, told which version is served,
-/// and nothing is done for it. A 1.0 client with a patch number is fine.
+/// A client that does not state the version is refused -32009 at HTTP 200,
+/// told which version is served, and nothing is done for it. A 1.0 client
+/// with a patch number is fine.
 #[test]
 fn version_gate() {
     let d = boot();
@@ -306,7 +308,7 @@ fn content_type() {
 
 /// A read op streamed is exactly one frame — the Message, under the
 /// request's own id, with no SSE `id:` — and then the stream ends. Work is
-/// a2a-rs's task stream: the task first, then its transitions to a settled
+/// the task's stream: the task first, then its transitions to a terminal
 /// state. A refusal before the first frame is JSON, never a frame.
 #[test]
 fn stream_shapes() {
@@ -395,9 +397,9 @@ fn stream_shapes() {
     assert_eq!(reply.json()["error"]["code"], -32602, "{reply:?}");
 }
 
-/// a2a-rs 0.10 would open a stream on a task it could not find. The
-/// listener reads the task first, as the caller: another principal's task
-/// and an id nobody holds both get "not found" as JSON, and no stream opens.
+/// A subscription reads its task first, as the caller: another principal's
+/// task and an id nobody holds both get "not found" as JSON, and no stream
+/// opens.
 #[test]
 fn subscribe_to_an_invisible_task() {
     let d = boot();
@@ -417,14 +419,14 @@ fn subscribe_to_an_invisible_task() {
 }
 
 /// A refusal the runtime made reaches the caller exactly as the runtime made
-/// it — code, message and data — even though a2a-rs answered the call. Left
-/// to a2a-rs, the message came back prefixed and the runtime's reasons were
-/// replaced by an `ErrorInfo` naming a2a-rs.
+/// it — code, message and data — even though the SDK answered the call. Left
+/// to the SDK, the runtime's reasons would be replaced by an `ErrorInfo` of
+/// its own.
 #[test]
 fn runtime_refusals_survive_the_sdk() {
     let d = boot();
     // A message with nothing a turn could be made of: the runtime refuses the
-    // turn, on the natural-language path a2a-rs serves.
+    // turn, on the natural-language path the SDK serves.
     let empty = json!({"message": {"role": "ROLE_USER", "messageId": "m-blank",
         "parts": [{"text": " "}]}, "configuration": {"returnImmediately": true}});
     for method in ["SendMessage", "SendStreamingMessage"] {
@@ -454,7 +456,7 @@ fn runtime_refusals_survive_the_sdk() {
         "{v}"
     );
 
-    // A command no table row names travels a2a-rs's path too (only a read's
+    // A command no table row names travels the SDK's path too (only a read's
     // Message is answered by the listener), and its reason survives.
     let v = SendMessage::command("no.such.op", json!({}))
         .bearer(OPERATOR)
@@ -467,11 +469,11 @@ fn runtime_refusals_survive_the_sdk() {
     no_sdk_domain(error);
 }
 
-/// Whether `id` is a UUIDv4 in its canonical lower-case form — the id a2a-rs
-/// generates, and so the shape of every task id a send creates.
-fn is_uuid_v4(id: &str) -> bool {
+/// Whether `id` is a UUIDv7 in its canonical lower-case form — the id the
+/// A2A SDK generates, and so the shape of every task id a send creates.
+fn is_uuid_v7(id: &str) -> bool {
     id.len() == 36
-        && id.as_bytes()[14] == b'4'
+        && id.as_bytes()[14] == b'7'
         && id.char_indices().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',
             _ => c.is_ascii_hexdigit() && !c.is_ascii_uppercase(),
@@ -492,7 +494,7 @@ fn assert_no_task_named(d: &Daemon, id: &str) {
 /// A task id is the server's (A2A 1.0 §3.4.2).
 ///
 /// - A send that names no task — or names it empty — gets a new task under an
-///   id a2a-rs generated.
+///   id the server minted (the A2A SDK's UUIDv7).
 /// - A named task must exist and be the caller's: an unknown id and another
 ///   principal's task are "not found", and no task is created under the id.
 /// - A settled task takes no further messages.
@@ -505,20 +507,20 @@ fn task_id_rules() {
 
     let done = SendMessage::text("hello").bearer(USER_A).result(&d.addr);
     let id = done["task"]["id"].as_str().expect("a task id").to_string();
-    assert!(is_uuid_v4(&id), "a generated id: {done}");
+    assert!(is_uuid_v7(&id), "a generated id: {done}");
     assert_eq!(
         done["task"]["status"]["state"], "TASK_STATE_COMPLETED",
         "{done}"
     );
-    // Empty or blank alike: the listener reads a blank id as a2a-rs does,
-    // as none, so the send is a new task rather than a lookup of the id
-    // generated in its place.
+    // Empty or blank alike: the listener and the handler both read a blank
+    // id as none, so the send is a new task rather than a lookup of the id
+    // minted in its place.
     for (n, none) in ["", "  "].into_iter().enumerate() {
         let mut blank = SendMessage::text("hello").return_immediately().params();
         blank["message"]["taskId"] = json!(none);
         let fresh = call(&d, USER_A, 20 + n as i64, "SendMessage", blank).json();
         let fresh_id = fresh["result"]["task"]["id"].as_str().unwrap_or_default();
-        assert!(is_uuid_v4(fresh_id) && fresh_id != id, "{none:?}: {fresh}");
+        assert!(is_uuid_v7(fresh_id) && fresh_id != id, "{none:?}: {fresh}");
     }
     // A command with a blank id names no task either.
     let status = SendMessage::command("status", json!({}))
@@ -708,7 +710,7 @@ fn unknown_fields_are_ignored() {
 }
 
 /// While the agent drains, every send is refused with one object — code,
-/// message and reason — whichever path answers it: a2a-rs's for a message and
+/// message and reason — whichever path answers it: the SDK's for a message and
 /// for a command that does work, the listener's own for a read. A stream asked
 /// for is answered as JSON: a refusal is never a frame.
 #[test]

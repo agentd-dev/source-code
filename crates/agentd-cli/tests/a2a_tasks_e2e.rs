@@ -200,9 +200,13 @@ fn list_tasks() {
         "{full}"
     );
 
+    // A `pageSize` of 0 is proto3's "not specified": the default page.
+    assert_eq!(
+        rpc_result(&addr, 29, "ListTasks", json!({"pageSize": 0}))["pageSize"],
+        50
+    );
     // What cannot be honoured is refused, never quietly ignored.
     for (n, bad) in [
-        json!({"pageSize": 0}),
         json!({"pageSize": 101}),
         json!({"historyLength": -1}),
         json!({"pageToken": "not-a-token-this-server-issued!"}),

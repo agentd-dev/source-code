@@ -45,7 +45,8 @@ pub const TOOL_CALL_CAP: Duration = Duration::from_secs(600);
 pub struct BudgetReply {
     pub ok: bool,
     pub wait_ms: u64,
-    pub model: Option<String>,
+    /// The cheaper model to continue on, on its own connection.
+    pub degrade: Option<Box<crate::subagent::protocol::IntelConfig>>,
     pub reason: Option<String>,
 }
 
@@ -101,12 +102,12 @@ impl Bridge for ChildBridge<'_> {
             Reply::Budget {
                 ok,
                 wait_ms,
-                model,
+                degrade,
                 reason,
             } => Some(BudgetReply {
                 ok,
                 wait_ms,
-                model,
+                degrade,
                 reason,
             }),
             Reply::Tool { .. } => None,
@@ -212,6 +213,12 @@ pub fn run_turn(
         spec.tools.clone()
     };
     let mut model = limits.model.clone();
+    // The client a budget degrade moved the turn to, on the degrade model's
+    // own connection; `None` while the turn runs on the one it was given.
+    let mut degraded: Option<IntelClient> = None;
+    // The fallback that answered the last call, so a switch is logged once
+    // rather than every round.
+    let mut serving: Option<String> = None;
     let max_rounds = if spec.max_rounds > 0 {
         spec.max_rounds
     } else if limits.max_rounds > 0 {
@@ -284,19 +291,31 @@ pub fn run_turn(
                 match bridge.budget_request(estimate, limits.deadline) {
                     None => finish_with!("cancelled"),
                     Some(BudgetReply {
-                        ok: true, model: m, ..
-                    }) => {
-                        if let Some(m) = m
-                            && m != model
-                        {
-                            log.info(
-                                "turn.model_degraded",
-                                json!({"turn": spec.turn_id, "from": model, "to": m}),
-                            );
-                            model = m;
+                        ok: true,
+                        degrade: Some(cfg),
+                        ..
+                    }) if cfg.model.as_deref().unwrap_or_default() != model => {
+                        let to = cfg.model.clone().unwrap_or_default();
+                        match cfg.client() {
+                            Ok(mut c) => {
+                                c.set_trace_id(intel.trace_id().map(str::to_string));
+                                log.info(
+                                    "turn.model_degraded",
+                                    json!({"turn": spec.turn_id, "from": model, "to": to, "provider": cfg.provider}),
+                                );
+                                model = to;
+                                degraded = Some(c);
+                            }
+                            // The turn goes on on the model it has: a degrade
+                            // is a saving, not a reason to fail the work.
+                            Err(e) => log.warn(
+                                "turn.model_degrade_failed",
+                                json!({"turn": spec.turn_id, "to": to, "err": e.to_string()}),
+                            ),
                         }
                         break;
                     }
+                    Some(BudgetReply { ok: true, .. }) => break,
                     Some(BudgetReply {
                         ok: false,
                         wait_ms,
@@ -343,7 +362,7 @@ pub fn run_turn(
             temperature: spec.temperature.or(Some(0.0)),
         };
         let chat_start = crate::obs::otel::now_unix_nanos();
-        let resp = match intel.complete(&req) {
+        let resp = match degraded.as_ref().unwrap_or(intel).complete(&req) {
             Ok(r) => r,
             Err(e) => {
                 if let Some(rs) = run_span.as_mut() {
@@ -354,11 +373,20 @@ pub fn run_turn(
             }
         };
         result.rounds += 1;
+        // The model was unavailable and its fallback answered — or it is
+        // back. Said when it changes, not every round.
+        if resp.fallback != serving {
+            log.info(
+                "turn.model_fallback",
+                json!({"turn": spec.turn_id, "model": model, "served_by": resp.fallback.as_deref().unwrap_or(&model)}),
+            );
+            serving = resp.fallback.clone();
+        }
         usage_total.input_tokens += resp.usage.input_tokens;
         usage_total.output_tokens += resp.usage.output_tokens;
         if let Some(rs) = run_span.as_mut() {
             rs.record_chat(
-                &model,
+                resp.fallback.as_deref().unwrap_or(&model),
                 resp.usage.input_tokens,
                 resp.usage.output_tokens,
                 true,
@@ -723,6 +751,11 @@ mod tests {
 
     /// Start the in-process mock LLM with a playbook file; returns the client.
     fn mock_intel(playbook: &Value) -> IntelClient {
+        IntelClient::from_parts(&mock_uri(playbook), None).unwrap()
+    }
+
+    /// Start the in-process mock LLM with a playbook file; returns its URI.
+    fn mock_uri(playbook: &Value) -> String {
         let dir = std::env::temp_dir();
         // pid + a process-wide counter: tests run in parallel threads, and a
         // clock-derived suffix COLLIDED under load — two tests sharing one
@@ -744,7 +777,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let addr = std::fs::read_to_string(&addr_file).unwrap();
-        IntelClient::from_parts(&format!("http://{}", addr.trim()), None).unwrap()
+        format!("http://{}", addr.trim())
     }
 
     struct FakeBridge {
@@ -768,7 +801,7 @@ mod tests {
                 Some(BudgetReply {
                     ok: true,
                     wait_ms: 0,
-                    model: None,
+                    degrade: None,
                     reason: None,
                 })
             } else {
@@ -991,8 +1024,14 @@ mod tests {
         assert!(
             matches!(&r.messages[1], Msg::Tool { is_error: true, content, .. } if content.as_str().unwrap().contains("transport error"))
         );
-        // Budget: one wait then ok with a degraded model; then a refusal.
+        // Budget: one wait then ok with a degraded model — on its own
+        // connection, which answers the turn; then a refusal.
         let intel = mock_intel(&json!({"turns": [{"content": "ok"}]}));
+        let cheap = crate::subagent::protocol::IntelConfig {
+            uri: mock_uri(&json!({"turns": [{"content": "from the cheap model"}]})),
+            model: Some("cheap".into()),
+            ..Default::default()
+        };
         let mut s = spec(TurnKind::Turn);
         s.budget_admission = true;
         let mut b = FakeBridge {
@@ -1002,13 +1041,13 @@ mod tests {
                 BudgetReply {
                     ok: false,
                     wait_ms: 10,
-                    model: None,
+                    degrade: None,
                     reason: None,
                 },
                 BudgetReply {
                     ok: true,
                     wait_ms: 0,
-                    model: Some("cheap".into()),
+                    degrade: Some(Box::new(cheap)),
                     reason: None,
                 },
             ],
@@ -1016,13 +1055,14 @@ mod tests {
         };
         let r = run_turn(&s, &limits(), &intel, &FakeMcp, &mut b, &log());
         assert_eq!(r.status, "completed");
+        assert_eq!(r.text.as_deref(), Some("from the cheap model"));
         let mut b = FakeBridge {
             calls: vec![],
             answers: BTreeMap::new(),
             budget: vec![BudgetReply {
                 ok: false,
                 wait_ms: 0,
-                model: None,
+                degrade: None,
                 reason: Some("budget refused: window exhausted".into()),
             }],
             cancel: false,

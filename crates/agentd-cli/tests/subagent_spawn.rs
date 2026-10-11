@@ -27,9 +27,7 @@ fn bogus_payload() -> SpawnPayload {
             uri: "http://127.0.0.1:9".into(),
             token: None,
             model: Some("test-model".into()),
-            headers: Vec::new(),
-            aws_auth: None,
-            dialect: None,
+            ..Default::default()
         },
         mcp_servers: Vec::new(),
         a2a_peers: Vec::new(),

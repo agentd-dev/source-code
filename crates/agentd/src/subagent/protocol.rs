@@ -74,37 +74,30 @@ pub enum ControlMsg {
     },
     /// The answer to an [`AgentMsg::BudgetRequest`]. `ok` means proceed now;
     /// otherwise wait `wait_ms` and ask again, or the request is refused with a
-    /// `reason`. A `model` names a cheaper model to degrade to.
+    /// `reason`. A `degrade` is the cheaper model to continue on
+    /// (`budget.degrade.model`), resolved to its connection like any other.
     BudgetGrant {
         id: u64,
         ok: bool,
         #[serde(default)]
         wait_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
+        degrade: Option<Box<IntelConfig>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
 }
 
-/// The intelligence config the child rebuilds its client from on a hot-swap:
-/// the endpoint-list URI, the default endpoint-1 credential, the model, and the
-/// swap policy — exactly the parts [`IntelConfig`] carries plus the policy.
-/// Boxed in [`ControlMsg`] to keep the enum small, as [`SpawnPayload`] is.
+/// What a running child rebuilds its client from when a reload moves its
+/// model: the model resolved again, whole — connection, credential, wire
+/// model, fallbacks — and the swap policy. Boxed in [`ControlMsg`] to keep
+/// the enum small, as [`SpawnPayload`] is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapIntel {
-    /// The new endpoint *list* URI. A list of one is the ordinary single-endpoint
-    /// case; more elements are failover candidates tried in order.
-    pub uri: String,
-    /// Endpoint 1's resolved default credential when its env override is unset
-    /// (the same role as [`IntelConfig::token`]); NEVER logged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// The new model (`None` ⇒ unchanged from the spawn payload's resolved model).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// The model as it now resolves; its credential is NEVER logged.
+    pub intelligence: IntelConfig,
     /// The model-swap policy: `finish-on-old` (default) or `restart-turn`. Only
-    /// matters when `model` actually changed — an endpoint repoint alone never
+    /// matters when the model actually changed — a repoint alone never
     /// restarts a turn.
     #[serde(default)]
     pub policy: SwapPolicy,
@@ -450,7 +443,11 @@ pub struct SeedMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One model as a worker dials it: the connection, the wire model, and the
+/// models to ask when it is unavailable. Built by the runtime from a model
+/// reference ([`crate::runtime::Runtime::intel_config`]), never assembled by
+/// hand, so every caller gets the same provider, credential and chain.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IntelConfig {
     pub uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -472,6 +469,82 @@ pub struct IntelConfig {
     /// means the OpenAI-compatible request shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
+    /// The provider this connection is (`intelligence.providers.<name>`);
+    /// `None` is the top-level connection. Names the credential cache an
+    /// `agentd login` filled: `intelligence:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The ceiling on one model call (`timeout`); `None` is the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// The model REFERENCE this was resolved from — a model name or a
+    /// literal — so a restore resolves it again against the live settings
+    /// instead of replaying a connection that may have moved. `None`: the
+    /// `turn` role's model, whichever that is when it is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// The models asked, in order, when this one is unavailable — each on
+    /// its own connection (`intelligence.models.<n>.fallback`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<IntelConfig>,
+}
+
+impl IntelConfig {
+    /// The credential cache this connection's login filled.
+    fn login_target(&self) -> String {
+        match &self.provider {
+            Some(p) => format!("intelligence:{p}"),
+            None => "intelligence".into(),
+        }
+    }
+
+    /// The client that dials this model and then, when it is unavailable,
+    /// each fallback in order: the one place a model's connection becomes a
+    /// client, for a worker and the runtime's own judges alike.
+    pub fn client(
+        &self,
+    ) -> Result<crate::intel::client::IntelClient, crate::intel::client::IntelError> {
+        let mut client = self.client_alone()?;
+        if let Some((last, rest)) = self.fallbacks.split_last() {
+            // Built tail first: each link holds the rest of the chain.
+            let mut tail = last.client_alone()?;
+            let mut tail_model = last.model.clone().unwrap_or_default();
+            for link in rest.iter().rev() {
+                tail = link.client_alone()?.with_fallback(tail, tail_model);
+                tail_model = link.model.clone().unwrap_or_default();
+            }
+            client = client.with_fallback(tail, tail_model);
+        }
+        Ok(client)
+    }
+
+    /// This link's own client, without its fallbacks.
+    fn client_alone(
+        &self,
+    ) -> Result<crate::intel::client::IntelClient, crate::intel::client::IntelError> {
+        let base = match &self.provider {
+            None => crate::intel::client::IntelClient::from_parts(&self.uri, self.token.clone()),
+            Some(_) => {
+                crate::intel::client::IntelClient::from_provider(&self.uri, self.token.clone())
+            }
+        };
+        #[allow(unused_mut)]
+        let mut c = base?
+            .with_headers(self.headers.clone())
+            .with_dialect(self.dialect.as_deref())
+            .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis));
+        // `auth: {kind: aws}` SigV4-signs the dial, with credentials fetched
+        // at dial time; `source: sso` reads the cache its login filled.
+        #[cfg(feature = "oauth")]
+        if let Some(aws) = &self.aws_auth
+            && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, &self.login_target())
+        {
+            c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
+        }
+        #[cfg(not(feature = "oauth"))]
+        let _ = self.login_target();
+        Ok(c)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,9 +612,7 @@ mod tests {
                 uri: "https://intel.example".into(),
                 token: Some("secret".into()),
                 model: Some("m".into()),
-                headers: Vec::new(),
-                aws_auth: None,
-                dialect: None,
+                ..Default::default()
             },
             mcp_servers: vec![McpServerSpec {
                 name: "fs".into(),
@@ -632,13 +703,22 @@ mod tests {
 
     #[test]
     fn control_swap_intel_roundtrip_and_policy_default() {
-        // The swap frame carries the new endpoint list, model and policy. The
-        // token rides the wire, as Spawn's does, but is never logged — the
-        // resource body and events carry transport and index only.
+        // The swap frame carries the model as it now resolves — connection,
+        // credential, fallbacks — and the policy. The token rides the wire,
+        // as Spawn's does, but is never logged.
         let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
-            uri: "https://gw-a.example,https://gw-b.example".into(),
-            token: Some("rotated-secret".into()),
-            model: Some("claude-haiku-4".into()),
+            intelligence: IntelConfig {
+                uri: "https://gw-a.example,https://gw-b.example".into(),
+                token: Some("rotated-secret".into()),
+                model: Some("claude-haiku-4".into()),
+                provider: Some("second".into()),
+                fallbacks: vec![IntelConfig {
+                    uri: "https://gw-c.example".into(),
+                    model: Some("small".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
             policy: SwapPolicy::RestartTurn,
         }));
         let s = serde_json::to_string(&swap).unwrap();
@@ -647,17 +727,21 @@ mod tests {
         let back: ControlMsg = serde_json::from_str(&s).unwrap();
         match back {
             ControlMsg::SwapIntel(p) => {
-                assert_eq!(p.uri, "https://gw-a.example,https://gw-b.example");
-                assert_eq!(p.model.as_deref(), Some("claude-haiku-4"));
+                assert_eq!(
+                    p.intelligence.uri,
+                    "https://gw-a.example,https://gw-b.example"
+                );
+                assert_eq!(p.intelligence.model.as_deref(), Some("claude-haiku-4"));
+                assert_eq!(p.intelligence.provider.as_deref(), Some("second"));
+                assert_eq!(p.intelligence.fallbacks[0].model.as_deref(), Some("small"));
                 assert_eq!(p.policy, SwapPolicy::RestartTurn);
             }
             other => panic!("expected swap_intel, got {other:?}"),
         }
-        // A frame with no model/token defaults to finish-on-old (an endpoint
-        // repoint with no model change).
-        let minimal: SwapIntel = serde_json::from_str(r#"{"uri":"https://a.example"}"#).unwrap();
+        // A frame with no policy is finish-on-old.
+        let minimal: SwapIntel =
+            serde_json::from_str(r#"{"intelligence": {"uri":"https://a.example"}}"#).unwrap();
         assert_eq!(minimal.policy, SwapPolicy::FinishOnOld);
-        assert!(minimal.model.is_none() && minimal.token.is_none());
     }
 
     #[test]

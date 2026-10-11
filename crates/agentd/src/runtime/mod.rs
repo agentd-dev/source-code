@@ -31,6 +31,7 @@ pub mod human; // human-in-the-loop: ask_human gates + fallbacks
 #[cfg(feature = "a2a")]
 pub mod identities; // the identity registry: principal names that survive restarts
 pub(crate) mod instances; // instance-tier template children (a full daemon each)
+pub(crate) mod intel; // intelligence connections + model resolution (RFC 0046)
 pub mod join; // servers down at boot join when they come up
 #[cfg(feature = "mcp-events")]
 pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
@@ -55,7 +56,7 @@ pub mod worker;
 
 pub use reactor::Runtime;
 
-use crate::config::settings::{Loaded, StoreKind};
+use crate::config::settings::{Loaded, ModelRole, StoreKind};
 use crate::context::memory::Memory;
 use crate::context::{Contexts, skills, tokens};
 use crate::engine::run::StepStatus;
@@ -317,39 +318,16 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         }
     }
 
-    // Intelligence.
-    let intel_uri = settings.intelligence.endpoint_list().unwrap_or_default();
-    let intel_token = match resolve_intel_token(&settings, &envmap) {
-        Ok(t) => t,
+    // Intelligence: every connection's credential, resolved once here (a
+    // header is applied per dial; a token file and a login cache are read at
+    // each one). The models are not: they resolve at each call.
+    let intel = match intel::Conns::build(&settings, &envmap) {
+        Ok(c) => c,
         Err(e) => {
             log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
             return crate::exit::USAGE;
         }
     };
-    // The instance's model, resolved through the tier catalogue: `default`
-    // names a tier, `model` may name a tier or be a literal. Resolving here
-    // means every downstream consumer sees the wire name a provider
-    // understands, and only the config surface deals in tier names.
-    let model = settings
-        .intelligence
-        .default_reference()
-        .map(|r| settings.intelligence.wire_model(&r))
-        .unwrap_or_default();
-    // Resolve `intelligence.headers` once here — they are applied per dial —
-    // plus an optional OAuth credential provider that refreshes its bearer.
-    // A header whose secret cannot be resolved is dropped rather than sent
-    // with an unresolved placeholder in it.
-    let intel_headers: Vec<(String, String)> = settings
-        .intelligence
-        .headers
-        .iter()
-        .filter_map(|(k, v)| {
-            crate::sec::secret::resolve(v, &envmap)
-                .ok()
-                .map(|r| (k.clone(), r))
-        })
-        .collect();
-    let intel_bearer = intel_bearer_provider(&settings);
 
     // MCP servers (contained failures: a down server is logged; tools that need
     // it are unavailable; the store server must be up).
@@ -582,19 +560,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         // A tier that declares its window replaces the guess from the model
         // NAME, which is a substring match and simply wrong for any provider
         // whose naming does not happen to match.
-        .or_else(|| {
-            settings
-                .intelligence
-                .default_reference()
-                .and_then(|r| settings.intelligence.tier(&r).and_then(|t| t.window))
-        })
-        .unwrap_or_else(|| {
-            if model.is_empty() {
-                tokens::DEFAULT_MODEL_WINDOW
-            } else {
-                tokens::window_for_model(&model)
-            }
-        });
+        .or_else(|| settings.intelligence.role_window(ModelRole::Turn))
+        .unwrap_or_else(
+            || match settings.intelligence.role_wire_model(ModelRole::Turn) {
+                Some(m) if !m.is_empty() => tokens::window_for_model(&m),
+                _ => tokens::DEFAULT_MODEL_WINDOW,
+            },
+        );
     // Pressure watches the FILE store's filesystem (a memory/mcp/http store's
     // durability does not live on this disk). `min_free` defaults to 256MB:
     // a checkpoint failure at ENOSPC halts the daemon, so at that point
@@ -682,11 +654,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_started: None,
         drain_reason: String::new(),
         idle_since: None,
-        intel_uri,
-        intel_token,
-        intel_headers,
-        intel_bearer,
-        model,
+        intel,
         trace_id: Some(trace.trace_id.clone()),
         started: Instant::now(),
         seq: 0,
@@ -1365,7 +1333,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
     json!({
         "version": crate::VERSION,
         "agent": {"name": s.instance_name(), "instruction": s.agent.instruction.is_some(), "preflight": format!("{:?}", s.agent.preflight).to_lowercase()},
-        "intelligence": {"model": s.intelligence.model, "endpoints": s.intelligence.endpoints.len()},
+        "intelligence": {"model": s.intelligence.role_wire_model(ModelRole::Turn), "endpoints": s.intelligence.endpoints.len(), "providers": s.intelligence.providers.keys().collect::<Vec<_>>()},
         "mcp_servers": s.mcp.servers.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
         "internal_tools": crate::registry::internal::names(),
         "tools": {"overrides": s.tools.overrides.keys().cloned().collect::<Vec<_>>(), "disabled": s.tools.disabled},
@@ -1438,89 +1406,6 @@ pub fn capabilities(loaded: &Loaded) -> Value {
     })
 }
 
-/// Build the intelligence credential provider: a closure returning the current
-/// bearer, refreshed from the `agentd login intelligence` device-login cache.
-///
-/// Returns `None` when no bearer-style `intelligence.auth` is configured (and
-/// always without `--features oauth`), which leaves the static
-/// `intelligence.token` path untouched.
-fn intel_bearer_provider(
-    settings: &crate::config::settings::Settings,
-) -> Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>> {
-    #[cfg(feature = "oauth")]
-    {
-        let auth = settings.intelligence.auth.as_ref()?;
-        let spec = auth.to_spec();
-        // SigV4 (`kind: aws`) signs each request over its own method, path
-        // and body, so there is no reusable bearer to hand back. That case is
-        // carried separately as an `AuthSpec` (see `Runtime::intel_aws_auth`)
-        // and turned into a per-dial signer at the call site.
-        if spec.kind == "aws" {
-            return None;
-        }
-        // Build the provider's signer once (preserving the oauth2 in-memory
-        // refresh) and extract the bearer per LLM dial. Covers static / oauth2
-        // device-login / spiffe jwt — all bearer-style for intelligence.
-        let signer = crate::auth::device::signer_for(
-            &spec,
-            "intelligence",
-            std::time::Duration::from_secs(30),
-        )
-        .ok()??;
-        Some(std::sync::Arc::new(move || {
-            signer
-                .sign("POST", "", "", &[])
-                .into_iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                .map(|(_, v)| v.strip_prefix("Bearer ").unwrap_or(&v).to_string())
-        }))
-    }
-    #[cfg(not(feature = "oauth"))]
-    {
-        let _ = settings;
-        None
-    }
-}
-
-impl Runtime {
-    /// The current intelligence bearer: the credential provider's refreshing
-    /// token when an `intelligence.auth` oauth2 block is configured, else the
-    /// static `intelligence.token`. Resolved fresh at each subagent spawn so a
-    /// child rides a live token without carrying refresh machinery of its own,
-    /// and so a child spawned late in a long life does not inherit an expired
-    /// one.
-    pub(crate) fn current_intel_bearer(&self) -> Option<String> {
-        let (bearer, err) = bearer_now(
-            self.intel_bearer.as_ref().and_then(|f| f()),
-            self.settings.intelligence.token_file.as_deref(),
-            self.intel_token.as_deref(),
-        );
-        if let Some(e) = err {
-            // Never fatal here: the dial that follows fails with the
-            // provider's own 401, and a rotation caught mid-write should not
-            // take a daemon down.
-            self.log.warn("intel.token_file.error", json!({"err": e}));
-        }
-        bearer
-    }
-
-    /// The AWS SigV4 intelligence-auth spec, when `intelligence.auth` selects
-    /// `kind: aws`. Threaded to subagents (which build the signer themselves)
-    /// and used by the goal judge to sign its own LLM dial, so every path that
-    /// dials intelligence carries the same credential.
-    pub(crate) fn intel_aws_auth(&self) -> Option<crate::config::AuthSpec> {
-        let a = self.settings.intelligence.auth.as_ref()?;
-        (a.kind == crate::config::settings::AuthKind::Aws).then(|| a.to_spec())
-    }
-
-    /// The configured `intelligence.dialect`, threaded into a child's spawn
-    /// payload so the child selects the same wire adapter as its parent.
-    /// `None` means the OpenAI-compatible dialect.
-    pub(crate) fn intel_dialect(&self) -> Option<String> {
-        self.settings.intelligence.dialect.clone()
-    }
-}
-
 /// The bearer for one dial, in precedence order: the credential provider's
 /// refreshing token, then a mounted token FILE read AT THIS INSTANT, then the
 /// static `intelligence.token`. Returns the read error rather than logging, so
@@ -1548,30 +1433,6 @@ pub(crate) fn bearer_now(
         };
     }
     (static_token.map(str::to_string), None)
-}
-
-/// Resolve `intelligence.token` / `token_file` (secret refs, files).
-fn resolve_intel_token(
-    settings: &crate::config::settings::Settings,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<String>, String> {
-    if let Some(t) = &settings.intelligence.token {
-        let resolved = crate::sec::secret::resolve(&t.0, env)
-            .map_err(|e| format!("intelligence.token: {e}"))?;
-        return Ok(Some(resolved));
-    }
-    if let Some(p) = &settings.intelligence.token_file {
-        // Read to PROVE it is readable — a mistyped path is a startup
-        // refusal, as it has always been — and then drop the value:
-        // `current_intel_bearer` re-reads it per dial so a rotated token is
-        // picked up without a reload.
-        crate::sec::secret::read_token_file(p)
-            .map_err(|e| format!("intelligence.token_file: {e}"))?;
-        return Ok(None);
-    }
-    // No token in the configuration: the intel client falls back to its own
-    // environment conventions (`AGENTD_INTELLIGENCE_TOKEN`…).
-    Ok(None)
 }
 
 /// A resource instruction read, verified and folded through one server, not

@@ -373,7 +373,7 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         "agent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 2500ms }\n\
          observability: { log_level: info, log_content: true }\n\
-         intelligence: { model: claude-sonnet-5, default: fast, models: { fast: { model: claude-haiku-4-5 } } }\n\
+         intelligence: { models: { fast: { model: claude-haiku-4-5 } }, roles: { turn: fast } }\n\
          subagents:\n\
         \x20 defaults: { model: gpt-5.1 }\n\
         \x20 templates:\n\
@@ -428,14 +428,14 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         configs[0]
     );
     // The child runs the model its variants were folded for — the spawn
-    // default here — whatever the parent's `default` tier says.
+    // default here — whatever the parent's `roles.turn` says, said once.
     assert_eq!(
         configs[0]["intelligence"]["model"], "gpt-5.1",
         "{}",
         configs[0]
     );
     assert!(
-        configs[0]["intelligence"].get("default").is_none(),
+        configs[0]["intelligence"]["roles"].get("turn").is_none(),
         "{}",
         configs[0]
     );

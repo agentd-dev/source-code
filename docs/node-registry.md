@@ -167,11 +167,15 @@ matches on.
 | `route` | `input` `choices` | `prompt` `skills` `model` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
 | `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. In an instruction document, `to: "@human/<name>"` addresses one of the document's `::!human`s: its principal, or the operators, with its channel announced ([below](#addressed-gates)). `reply_uri` is refused at load — nothing implements it. |
 
-`model` names an `intelligence.models` tier on any kind that makes a model
+`model` names an `intelligence.models` model on any kind that makes a model
 call — the five shaping presets included, since those are the cheap
-high-volume steps a tier catalogue exists for. It resolves to the wire model at
-the edge, so a tier name never reaches a provider, and an unknown one is exit 2
-rather than a run asking for a model nobody serves.
+high-volume steps a model catalogue exists for. It resolves to the wire model,
+on the model's provider, at the edge, so a model's name never reaches a
+provider, and an unknown one is exit 2 rather than a run asking for a model
+nobody serves. Without `model:`, a node runs on its kind's role
+(`intelligence.roles`): `think` on `think`; `classify`, `route` and `judge` on
+`decide`; `agent`, `extract` and `summarize` on `turn`
+([intelligence.md](intelligence.md#providers-models-and-roles)).
 
 ---
 

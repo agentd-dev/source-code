@@ -156,7 +156,10 @@ mod tests {
                 "model": "gpt-5",
                 "token": "sk-inline-from-env",
                 "headers": {"Authorization": "Bearer sk-inline-header", "X-Tenant": "acme"},
-                "auth": {"kind": "static", "token": "sk-inline-auth", "value": "sk-inline-value"}
+                "auth": {"kind": "static", "token": "sk-inline-auth", "value": "sk-inline-value"},
+                "providers": {"second": {"endpoints": "https://p.example", "token": "sk-inline-provider",
+                    "headers": {"X-Api-Key": "k-inline-provider"},
+                    "auth": {"kind": "static", "token": "sk-inline-provider-auth"}}}
             },
             "a2a": {"listen": "https://0.0.0.0:8443", "bearer": "{{secret:A2A_BEARER}}",
                     "peers": [{"name": "p", "endpoint": "https://p", "headers": {"X-Key": "k-inline"}}]},
@@ -174,6 +177,12 @@ mod tests {
         assert_eq!(r["intelligence"]["auth"]["token"], REDACTED);
         assert_eq!(r["intelligence"]["auth"]["value"], REDACTED);
         assert_eq!(r["intelligence"]["headers"]["Authorization"], REDACTED);
+        // A provider is a connection like the top-level one, credentials and all.
+        let second = &r["intelligence"]["providers"]["second"];
+        assert_eq!(second["token"], REDACTED);
+        assert_eq!(second["headers"]["X-Api-Key"], REDACTED);
+        assert_eq!(second["auth"]["token"], REDACTED);
+        assert_eq!(second["endpoints"], "https://p.example");
         assert_eq!(r["a2a"]["peers"][0]["headers"]["X-Key"], REDACTED);
         assert_eq!(r["mcp"]["servers"][0]["oauth"]["client_secret"], REDACTED);
         assert_eq!(r["security"]["aauth"]["enroll_token"], REDACTED);

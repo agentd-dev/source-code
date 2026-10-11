@@ -1,6 +1,6 @@
 # RFC 0046: Kinds of intelligence — chat, reasoning and decision models, by role
 
-**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1–P4 to be built in order
+**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1 implemented 2026-10-11; P2–P4 to be built in order
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-10
 **Depends on:** RFC 0031 (endpoint authentication: every provider is signed and credentialed like `intelligence.endpoints` is today), RFC 0037 (service catalog and egress: every provider endpoint is an egress destination), RFC 0042 (what a served document may configure), RFC 0038 (the prompt template).
@@ -133,7 +133,7 @@ intelligence:
 - A provider's vocabulary is the top-level connection's: `endpoints` (a failover list), `dialect`, `token` / `token_file`, `headers`, `auth`, `timeout`. Nothing else.
 - `dialect: decisions` is new: the endpoint is the **full URL** of the decisions resource, posted as is, because vendors put it at different paths (§3). The chat dialects keep appending their path to a base URL.
 - Every provider endpoint is egress-checked against `services` entries of `kind: intelligence` exactly as `intelligence.endpoints` is (`config/settings/mod.rs:7105`); under `egress: closed` an uncatalogued provider refuses the load.
-- Each provider gets its own client, breakers, failover and credential refresh. `agentd login intelligence` gains a provider argument (`agentd login intelligence openrouter`) for an `oauth2` provider.
+- Each provider gets its own client, breakers, failover and credential refresh. `agentd login` gains a target per provider (`agentd --login intelligence:openrouter`) for an `oauth2` provider, cached under that target.
 - **Operator-only**, as `intelligence.endpoints` is: a served document cannot add a provider, nor declare a model on one (§5.3).
 - Reloadable, as all of `intelligence` is; a changed provider builds a new client at the reload's commit.
 
@@ -330,6 +330,7 @@ Two loop-level uses of a decision model are left for after measurement (§11 Q3)
 Each phase brings a field together with what it does — no key is accepted before it has an effect.
 
 **P1 — providers and roles.** `intelligence.providers`, `provider` on models, `intelligence.roles` (model names), resolution, per-provider clients, every call site through its role (including the goal check and the ask judge, which had none), the three replaced keys removed, the document check. Chat models only; nothing changes for an unchanged config — except three defects one resolver closes, found while designing this (`main` at `180f605f`): a reload set the turn model to the literal `intelligence.model`, ignoring `default` and the tiers, and never rebuilt the headers or the OAuth bearer (`runtime/reload.rs:621`); `budget.degrade.model` reached the worker unresolved, so a tier name was sent to the provider as a model (`runtime/turns.rs:1086`, `runtime/worker.rs:288`); and a tier's `fallback` was validated but never walked — no runtime code read it. P1 resolves every model reference through one function, rebuilds the provider connections at a reload's commit, and hands a worker its model's fallback chain, each entry with its own provider, walked when a model is unavailable (every endpoint failed or its breaker is open).
+*As built:* building P1 found a fourth defect of the same kind — a reload never reached a running subagent: the child honoured a swap frame nothing sent, so `intelligence.swap_policy` did nothing and a warm subagent kept its spawn-time connection. P1 sends each running subagent its model resolved again at a reload's commit. `intelligence.timeout`, accepted and read by nothing, is now a connection's call ceiling.
 **P2 — decide.** `kind` (`chat`, `decision`), `escalate`, the contract, `dialect: decisions`, emulation, `classify`/`route`/`judge` native, the `decide` node and tool, `confidence`/`on_unsure`, kind checks per role and node, the decision mock.
 **P3 — decisions in the loop.** Role bindings with `confidence`; the preflight, goal and approve roles on decision models; §8's untrusted-input rule for every approver.
 **P4 — reasoning.** `kind: reasoning`, `reasoning: {effort, budget}`, `effort` on nodes and `think`, the per-dialect mapping, reasoning parts across tool rounds.

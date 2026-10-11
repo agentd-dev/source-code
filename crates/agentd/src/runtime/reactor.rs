@@ -446,18 +446,10 @@ pub struct Runtime {
     pub(crate) drain_started: Option<Instant>,
     pub(crate) drain_reason: String,
     pub(crate) idle_since: Option<Instant>,
-    pub(crate) intel_uri: String,
-    pub(crate) intel_token: Option<String>,
-    /// Resolved `intelligence.headers`, pushed on every LLM dial and threaded
-    /// to subagents via the spawn payload so a child dials identically.
-    pub(crate) intel_headers: Vec<(String, String)>,
-    /// An optional intelligence credential provider: a closure returning the
-    /// current bearer, refreshed from the device-login cache. Its resolved
-    /// bearer overrides `intel_token`, and is threaded to subagents fresh at
-    /// each spawn so no child carries a stale one. `None` when no
-    /// `intelligence.auth` oauth2 block is configured.
-    pub(crate) intel_bearer: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
-    pub(crate) model: String,
+    /// The intelligence connections — the top-level one and each provider —
+    /// with their credentials resolved. Models are not here: they resolve
+    /// against the live settings at each call ([`Runtime::intel_config`]).
+    pub(crate) intel: super::intel::Conns,
     pub(crate) trace_id: Option<String>,
     pub(crate) started: Instant,
     pub(crate) seq: u64,
@@ -1641,7 +1633,7 @@ impl Runtime {
             "uptime_ms": self.started.elapsed().as_millis() as u64,
             "draining": self.draining,
             "paused": self.paused,
-            "model": self.model,
+            "model": self.turn_model(),
             "version": crate::VERSION,
             "skills": self.skills.names(),
             "skill_prefix": self.skills.prefix,
@@ -1830,7 +1822,7 @@ impl Runtime {
             vis: FeedVis::Operator,
             data: json!({
                 "instance": self.instance,
-                "model": self.model,
+                "model": self.turn_model(),
                 "version": crate::VERSION,
                 "draining": self.draining,
                 "inbox_pending": self.inbox_queue.len(),
@@ -1894,12 +1886,11 @@ impl Runtime {
         if let Some(w) = self
             .settings
             .intelligence
-            .default_reference()
-            .and_then(|r| self.settings.intelligence.tier(&r).and_then(|t| t.window))
+            .role_window(crate::config::settings::ModelRole::Turn)
         {
             return w;
         }
-        tokens::window_for_model(&self.model)
+        tokens::window_for_model(&self.turn_model())
     }
 }
 

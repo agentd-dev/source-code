@@ -1008,11 +1008,15 @@ pub const DOCUMENT_MAY_WRITE: &[&str] = &[
     // it is reached with.
     "intelligence.model",
     "intelligence.models",
-    "intelligence.default",
+    "intelligence.roles.turn",
+    "intelligence.roles.think",
+    "intelligence.roles.decide",
+    "intelligence.roles.preflight",
+    "intelligence.roles.compaction",
+    "intelligence.roles.goal",
     "intelligence.dialect",
     "intelligence.budget",
     "intelligence.timeout",
-    "intelligence.preflight_model",
     "intelligence.structured_output",
     "intelligence.swap_policy",
     // The agent loop's own shape.
@@ -1149,6 +1153,11 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "intelligence.token_file",
     "intelligence.headers",
     "intelligence.auth",
+    // Further destinations for the agent's content, with their credentials
+    // (RFC 0046 §5.2) — and the model that answers asks on the operator's
+    // behalf, which a document must not choose for its own gates.
+    "intelligence.providers",
+    "intelligence.roles.approve",
     // A whole child agent — its own instruction source, grants and identity.
     // A document REFERENCES a template (`:::agent template=…`, the `compose`
     // family); defining one is the operator's.
@@ -1220,7 +1229,68 @@ pub(crate) fn document_wrote_operator_config(fragment: &Map<String, Value>) -> V
     }
     let mut found = Vec::new();
     walk(fragment, "", &mut found);
+    // A document may declare and name models — which model, never where it
+    // lives: one it declares cannot name a connection, or it would point the
+    // agent's content at a provider of its choosing (RFC 0046 §5.3). The
+    // walk stops at `intelligence.models`, so this is said on its own.
+    if let Some(models) = fragment
+        .get("intelligence")
+        .and_then(|i| i.get("models"))
+        .and_then(Value::as_object)
+    {
+        found.extend(
+            models
+                .iter()
+                .filter(|(_, m)| m.get("provider").is_some())
+                .map(|(n, _)| format!("intelligence.models.{n}.provider")),
+        );
+    }
     found
+}
+
+/// The turn model, when the operator names it, is the operator's: a
+/// document's `:::!config` that names it too — in either spelling,
+/// `intelligence.model` or `intelligence.roles.turn` — is dropped, as any
+/// key the operator set is. The two spellings are one setting, so without
+/// this a document's `roles.turn` beside an operator's `--model` refused the
+/// load ("say it once"), and the document's author cannot know which the
+/// operator uses. Returns a warning for each spelling dropped that the
+/// operator did not write (the same spelling is the ordinary merge rule).
+fn drop_document_turn_model(operator: &Value, fragment: &mut Map<String, Value>) -> Vec<String> {
+    let op_model = operator.get("model").is_some_and(|v| !v.is_null());
+    let op_turn = operator
+        .get("roles")
+        .and_then(|r| r.get("turn"))
+        .is_some_and(|v| !v.is_null());
+    if !op_model && !op_turn {
+        return Vec::new();
+    }
+    let Some(intel) = fragment
+        .get_mut("intelligence")
+        .and_then(Value::as_object_mut)
+    else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    let said = |path: &str| {
+        format!(
+            "the instruction's :::!config sets {path}; the operator names the turn model, \
+             which is used"
+        )
+    };
+    if intel.remove("model").is_some() && !op_model {
+        warnings.push(said("intelligence.model"));
+    }
+    if intel
+        .get_mut("roles")
+        .and_then(Value::as_object_mut)
+        .and_then(|r| r.remove("turn"))
+        .is_some()
+        && !op_turn
+    {
+        warnings.push(said("intelligence.roles.turn"));
+    }
+    warnings
 }
 
 /// The instruction document, in the words a refusal names it by.
@@ -1539,45 +1609,188 @@ pub struct Intelligence {
     pub swap_policy: Option<String>,
     pub structured_output: StructuredOutput,
     pub budget: Budget,
+    /// The ceiling on one model call on this connection. Default 120 s; the
+    /// run's deadline is the real bound.
     pub timeout: Option<Dur>,
-    /// Named model TIERS. The model was one instance-global string, so
-    /// choosing a cheap model for a classify step and a frontier one for a
-    /// judgement call meant forking a subagent process just to change it —
-    /// and the breaker was per ENDPOINT, so a frontier and a cheap model
-    /// behind one gateway shared one breaker and one spend pool.
+    /// Further connections, by name — a second vendor, a gateway, a decisions
+    /// endpoint. Each is everything the top-level connection is and nothing
+    /// more: `endpoints`, `dialect`, `token`/`token_file`, `headers`, `auth`,
+    /// `timeout`. A model reaches one by naming it (`models.<n>.provider`);
+    /// nothing else can, so a provider is a destination only the operator
+    /// adds (RFC 0046 §5.2).
+    pub providers: BTreeMap<String, Provider>,
+    /// Named models. The model was one instance-global string, so choosing a
+    /// cheap model for a classify step and a frontier one for a judgement
+    /// call meant forking a subagent process just to change it.
     ///
-    /// A tier is NOT a second service catalog, and its whole vocabulary is
-    /// `model`, `window` and `fallback`: no endpoint, no auth, no tags. That is
-    /// what keeps "make it cheaper" from quietly becoming a different security
-    /// decision — a tier cannot mint a credential or a destination, because it
-    /// has nowhere to write one.
-    ///
-    /// It never inherited tags either: `tags` is `kind: mcp` vocabulary and is
-    /// refused on a `kind: intelligence` entry. A tier names no catalog entry
-    /// either: the client is built from `intelligence.endpoints` and nothing
-    /// else.
+    /// A model's vocabulary is `model`, `window`, `fallback` and `provider`:
+    /// no endpoint, no auth, no tags. It names a connection the operator
+    /// declared and cannot describe one, which is what keeps "make it cheaper"
+    /// from quietly becoming a different security decision.
     pub models: BTreeMap<String, ModelTier>,
-    /// Which tier is used when nothing names one. Falls back to `model`.
-    pub default: Option<String>,
-    /// The tier preflight runs on. Preflight is a recurring fixed cost on
-    /// every inbound message, like compaction — it does not need the model
-    /// that answers.
-    pub preflight_model: Option<String>,
+    /// Which model each job runs on (RFC 0046 §5.4).
+    pub roles: Roles,
+    /// The operator's own `intelligence` section, before a served document's
+    /// `:::!config` merged under it — set only when the document wrote
+    /// `intelligence`. The `approve` role resolves here: the model that
+    /// answers on the operator's behalf is the operator's choice, and a
+    /// document that may declare models and bind `turn` could otherwise
+    /// re-point the judge of its own gates — by declaring a model under the
+    /// name the operator's `roles.approve` gives, adding a `fallback` to it,
+    /// or binding `turn` when `approve` is unset.
+    #[serde(skip)]
+    pub operator: Option<Box<Intelligence>>,
 }
 
-/// One named model tier.
+/// One named intelligence connection (`intelligence.providers.<name>`): the
+/// top-level connection's vocabulary, and only that.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Provider {
+    #[serde(deserialize_with = "string_or_list")]
+    pub endpoints: Vec<String>,
+    pub dialect: Option<String>,
+    pub token: Option<Secret>,
+    pub token_file: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub auth: Option<Auth>,
+    pub timeout: Option<Dur>,
+}
+
+/// One connection as validation, the runtime and `agentd login` read it: the
+/// top-level one (`name: None`) or a named provider. A view, so the two are
+/// checked and dialed by the same code and cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+pub struct Connection<'a> {
+    pub name: Option<&'a str>,
+    pub endpoints: &'a [String],
+    pub dialect: Option<&'a str>,
+    pub token: Option<&'a Secret>,
+    pub token_file: Option<&'a str>,
+    pub headers: &'a BTreeMap<String, String>,
+    pub auth: Option<&'a Auth>,
+    pub timeout: Option<Duration>,
+}
+
+impl Connection<'_> {
+    /// Where this connection's settings live, for a diagnostic.
+    pub fn at(&self) -> String {
+        match self.name {
+            Some(n) => format!("intelligence.providers.{n}"),
+            None => "intelligence".into(),
+        }
+    }
+
+    /// The name its credential is logged into and cached under:
+    /// `intelligence`, or `intelligence:<provider>`.
+    pub fn login_target(&self) -> String {
+        match self.name {
+            Some(n) => format!("intelligence:{n}"),
+            None => "intelligence".into(),
+        }
+    }
+
+    /// The comma-joined endpoint list the intelligence client parses.
+    pub fn endpoint_list(&self) -> Option<String> {
+        (!self.endpoints.is_empty()).then(|| self.endpoints.join(","))
+    }
+}
+
+/// One named model.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ModelTier {
     /// The wire model name sent to the provider. Required.
     pub model: Option<String>,
+    /// The connection it is reached on: a name under `providers`. Absent, the
+    /// top-level connection.
+    pub provider: Option<String>,
     /// This model's context window, so compaction stops guessing from the
     /// model NAME (a substring match that is wrong for every provider whose
     /// naming does not happen to match).
     pub window: Option<u64>,
-    /// The tier to fall back to when this one is unavailable or the budget is
-    /// squeezed — a degradation ladder that walks DOWN instead of failing.
+    /// The model to use when this one is unavailable — every endpoint of its
+    /// connection failed or is broken open: a ladder that walks DOWN, across
+    /// providers, instead of failing. (A squeezed budget moves a turn to
+    /// `budget.degrade.model`, not down this ladder.)
     pub fallback: Option<String>,
+}
+
+/// The model each job runs on. Each names a declared model (or, with no
+/// `models:` at all, a literal one); an unset role runs on `turn`, and `turn`
+/// is `intelligence.model` said another way. No role inherits from another
+/// but `turn`, so binding one moves exactly the jobs it names.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Roles {
+    /// The agent's turns, `agent`, `extract` and `summarize` nodes, and
+    /// subagents that name no model.
+    pub turn: Option<String>,
+    /// The `think` tool and `think` nodes.
+    pub think: Option<String>,
+    /// `classify`, `route` and `judge` nodes.
+    pub decide: Option<String>,
+    /// Triage of an inbound message before its turn.
+    pub preflight: Option<String>,
+    /// Summarising the transcript when it outgrows the window.
+    pub compaction: Option<String>,
+    /// The goal check: achieved? stuck?
+    pub goal: Option<String>,
+    /// Asks answered on the operator's behalf (`approval: auto`). The
+    /// operator's alone: a served document must not pick the judge of its
+    /// own gates.
+    pub approve: Option<String>,
+}
+
+/// A job a model is bound to by [`Roles`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole {
+    Turn,
+    Think,
+    Decide,
+    Preflight,
+    Compaction,
+    Goal,
+    Approve,
+}
+
+impl ModelRole {
+    pub const ALL: [ModelRole; 7] = [
+        ModelRole::Turn,
+        ModelRole::Think,
+        ModelRole::Decide,
+        ModelRole::Preflight,
+        ModelRole::Compaction,
+        ModelRole::Goal,
+        ModelRole::Approve,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelRole::Turn => "turn",
+            ModelRole::Think => "think",
+            ModelRole::Decide => "decide",
+            ModelRole::Preflight => "preflight",
+            ModelRole::Compaction => "compaction",
+            ModelRole::Goal => "goal",
+            ModelRole::Approve => "approve",
+        }
+    }
+}
+
+impl Roles {
+    /// The model `role` names here, if it names one.
+    pub fn get(&self, role: ModelRole) -> Option<&String> {
+        match role {
+            ModelRole::Turn => self.turn.as_ref(),
+            ModelRole::Think => self.think.as_ref(),
+            ModelRole::Decide => self.decide.as_ref(),
+            ModelRole::Preflight => self.preflight.as_ref(),
+            ModelRole::Compaction => self.compaction.as_ref(),
+            ModelRole::Goal => self.goal.as_ref(),
+            ModelRole::Approve => self.approve.as_ref(),
+        }
+    }
 }
 
 impl Intelligence {
@@ -1600,16 +1813,72 @@ impl Intelligence {
         self.models.get(reference)
     }
 
-    /// The model reference used when nothing names one: `default` (a tier),
-    /// else `model` (a literal or a tier name).
-    pub fn default_reference(&self) -> Option<String> {
-        self.default.clone().or_else(|| self.model.clone())
+    /// The model `role` runs on: the role's own binding, else `turn`, else
+    /// `intelligence.model` — a model name or a literal.
+    pub fn reference(&self, role: ModelRole) -> Option<String> {
+        self.roles
+            .get(role)
+            .or(self.roles.turn.as_ref())
+            .or(self.model.as_ref())
+            .cloned()
     }
 
-    /// The model the agent's turns use when nothing names one, as sent to
-    /// the provider: [`Self::default_reference`] through [`Self::wire_model`].
-    pub fn default_wire_model(&self) -> Option<String> {
-        self.default_reference().map(|r| self.wire_model(&r))
+    /// The wire model `role` sends, through [`Self::reference`] and
+    /// [`Self::wire_model`].
+    pub fn role_wire_model(&self, role: ModelRole) -> Option<String> {
+        self.reference(role).map(|r| self.wire_model(&r))
+    }
+
+    /// The context window `role`'s model declares, if it declares one.
+    pub fn role_window(&self, role: ModelRole) -> Option<u64> {
+        self.reference(role)
+            .and_then(|r| self.tier(&r).and_then(|t| t.window))
+    }
+
+    /// The connection a model reference is reached on: its model's
+    /// `provider`, else the top-level connection. A literal reference is a
+    /// model on the top-level connection.
+    pub fn provider_of(&self, reference: &str) -> Option<&str> {
+        self.tier(reference).and_then(|t| t.provider.as_deref())
+    }
+
+    /// A connection by provider name; `None` names the top-level one. An
+    /// undeclared name has none (validation refuses a model that names one).
+    pub fn connection(&self, provider: Option<&str>) -> Option<Connection<'_>> {
+        match provider {
+            None => Some(self.top_connection()),
+            Some(name) => self.providers.get_key_value(name).map(|(n, p)| Connection {
+                name: Some(n.as_str()),
+                endpoints: &p.endpoints,
+                dialect: p.dialect.as_deref(),
+                token: p.token.as_ref(),
+                token_file: p.token_file.as_deref(),
+                headers: &p.headers,
+                auth: p.auth.as_ref(),
+                timeout: p.timeout.map(|d| d.0),
+            }),
+        }
+    }
+
+    /// The top-level connection.
+    pub fn top_connection(&self) -> Connection<'_> {
+        Connection {
+            name: None,
+            endpoints: &self.endpoints,
+            dialect: self.dialect.as_deref(),
+            token: self.token.as_ref(),
+            token_file: self.token_file.as_deref(),
+            headers: &self.headers,
+            auth: self.auth.as_ref(),
+            timeout: self.timeout.map(|d| d.0),
+        }
+    }
+
+    /// Every connection: the top-level one, then each provider by name.
+    pub fn connections(&self) -> impl Iterator<Item = Connection<'_>> {
+        std::iter::once(None)
+            .chain(self.providers.keys().map(|k| Some(k.as_str())))
+            .filter_map(|p| self.connection(p))
     }
 
     /// Walk the fallback chain from `reference`, stopping at the first tier
@@ -1630,18 +1899,6 @@ impl Intelligence {
             cur = next;
         }
         out
-    }
-
-    pub fn timeout(&self) -> Duration {
-        self.timeout.map(|d| d.0).unwrap_or(Duration::from_secs(60))
-    }
-    /// The comma-joined endpoint list URI the v1 intelligence client speaks.
-    pub fn endpoint_list(&self) -> Option<String> {
-        if self.endpoints.is_empty() {
-            None
-        } else {
-            Some(self.endpoints.join(","))
-        }
     }
 }
 
@@ -2715,9 +2972,6 @@ pub struct Summarize {
     /// change — the summary is parsed back into the context, so a prompt that
     /// asks for another shape produces a refusal, not a nicer summary.
     pub prompt: Option<String>,
-    /// Summarize on this model instead of the instance's. Compaction is a
-    /// recurring fixed cost that rarely needs the frontier model.
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -4342,11 +4596,12 @@ impl Settings {
         let instruction_facts = crate::config::idoc::instruction_facts(
             doc.get("intelligence")
                 .and_then(|v| serde_json::from_value::<Intelligence>(v.clone()).ok())
-                .and_then(|i| i.default_wire_model())
+                .and_then(|i| i.role_wire_model(ModelRole::Turn))
                 .as_deref(),
         );
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         let mut gate_channels = crate::config::humans::GateChannels::new();
+        let mut operator_intelligence: Option<Value> = None;
         let mut document_workflows = std::collections::BTreeSet::new();
         let mut document_grants = std::collections::BTreeSet::new();
         if let Some(instr) = doc
@@ -4449,7 +4704,14 @@ impl Settings {
                         return Err(format!("{source}: {}", refused.join("\n  ")));
                     }
                     document_grants = granted.clone();
+                    let mut fragment = ex.config.clone();
                     if let Some(o) = doc.as_object_mut() {
+                        if fragment.contains_key("intelligence") {
+                            let operator = o.get("intelligence").cloned().unwrap_or(json!({}));
+                            instruction_warnings
+                                .extend(drop_document_turn_model(&operator, &mut fragment));
+                            operator_intelligence = Some(operator);
+                        }
                         // `merge_missing` puts a fragment's array entries
                         // AHEAD of the operator's, so the `:::!config`
                         // workflows are the first ones — counted before the
@@ -4460,7 +4722,7 @@ impl Settings {
                                 (None | Some(Value::Array(_)), Some(Value::Array(a))) => a.len(),
                                 _ => 0,
                             };
-                        crate::config::idoc::merge_missing(o, ex.config.clone());
+                        crate::config::idoc::merge_missing(o, fragment);
                         document_workflows.extend(0..fragment_workflows);
                         if !ex.workflows.is_empty()
                             && let Some(w) = o
@@ -4582,6 +4844,9 @@ impl Settings {
             }
         }
         settings.agent.document_gate_channels = gate_channels;
+        settings.intelligence.operator = operator_intelligence
+            .and_then(|v| serde_json::from_value::<Intelligence>(v).ok())
+            .map(Box::new);
         settings.agent.document_workflows = document_workflows;
         settings.agent.document_grants = document_grants;
         settings.agent.instruction_facts = instruction_facts;
@@ -5530,8 +5795,9 @@ const DISCOVERY_FORBIDDEN_RELAXATIONS: [(&str, &str); 2] = [
 /// log rather than inferred from behaviour. Pointer + the dotted label to print:
 /// NAMES only, never values — a value may be a `{{secret:…}}` template, and
 /// the log is not the place to widen a credential's blast radius.
-const DISCOVERY_SECURITY_SETTINGS: [(&str, &str); 12] = [
+const DISCOVERY_SECURITY_SETTINGS: [(&str, &str); 13] = [
     ("/intelligence/endpoints", "intelligence.endpoints"),
+    ("/intelligence/providers", "intelligence.providers"),
     ("/intelligence/token", "intelligence.token"),
     ("/intelligence/token_file", "intelligence.token_file"),
     ("/intelligence/headers", "intelligence.headers"),
@@ -6644,21 +6910,29 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
-    // intelligence.models — a tier catalogue whose names are referenced from
-    // several places, so a typo has to be a startup error rather than a
-    // silent fall-through to "a literal model called `smal`".
+    // intelligence.models — names referenced from several places, so a typo
+    // has to be a startup error rather than a silent fall-through to "a
+    // literal model called `smal`".
     for (name, t) in &s.intelligence.models {
         let at = format!("intelligence.models.{name}");
         if t.model.as_deref().unwrap_or("").trim().is_empty() {
             err(&mut d, format!("{at}: `model` is required"));
         }
+        if let Some(p) = &t.provider
+            && !s.intelligence.providers.contains_key(p)
+        {
+            err(
+                &mut d,
+                format!("{at}.provider: no provider named {p:?} under intelligence.providers"),
+            );
+        }
         if let Some(f) = &t.fallback {
             if !s.intelligence.models.contains_key(f) {
-                err(&mut d, format!("{at}.fallback: no model tier named {f:?}"));
+                err(&mut d, format!("{at}.fallback: no model named {f:?}"));
             } else if f == name {
                 err(
                     &mut d,
-                    format!("{at}.fallback: a tier cannot fall back to itself"),
+                    format!("{at}.fallback: a model cannot fall back to itself"),
                 );
             }
         }
@@ -6688,34 +6962,36 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             cur = next;
         }
     }
-    for (field, reference) in [
-        ("intelligence.default", s.intelligence.default.as_ref()),
-        (
-            "intelligence.preflight_model",
-            s.intelligence.preflight_model.as_ref(),
-        ),
-        (
-            "context.summarize.model",
-            s.context.summarize.model.as_ref(),
-        ),
-    ] {
-        // These name a TIER. A literal here would work by accident today and
-        // break the moment a tier of that name is declared, so require the
-        // tier when a catalogue exists at all.
-        if let Some(r) = reference
-            && !s.intelligence.models.is_empty()
-            && !s.intelligence.models.contains_key(r)
+    // intelligence.roles — `turn` and `model` are one setting said two ways;
+    // two answers to one question would leave the reader guessing which won.
+    if let (Some(turn), Some(model)) = (&s.intelligence.roles.turn, &s.intelligence.model) {
+        err(
+            &mut d,
+            format!(
+                "intelligence.roles.turn ({turn:?}) and intelligence.model ({model:?}) both name \
+                 the turn model; say it once"
+            ),
+        );
+    }
+    for role in ModelRole::ALL {
+        // A role names a MODEL. A literal here would work by accident today
+        // and break the moment a model of that name is declared, so require
+        // the declaration when a catalogue exists at all — for `approve`,
+        // the operator's own catalogue, which is where it resolves.
+        let catalogue = match (role, s.intelligence.operator.as_deref()) {
+            (ModelRole::Approve, Some(op)) => &op.models,
+            _ => &s.intelligence.models,
+        };
+        if let Some(r) = s.intelligence.roles.get(role)
+            && !catalogue.is_empty()
+            && !catalogue.contains_key(r)
         {
             err(
                 &mut d,
                 format!(
-                    "{field}: {r:?} is not a declared model tier (known: {})",
-                    s.intelligence
-                        .models
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "intelligence.roles.{}: {r:?} is not a declared model (known: {})",
+                    role.as_str(),
+                    catalogue.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
             );
         }
@@ -6793,12 +7069,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
-    // intelligence
-    for e in &s.intelligence.endpoints {
-        if let Err(e) = super::validate_intelligence_uri(e) {
-            err(&mut d, e.to_string());
-        }
-    }
+    // intelligence: every connection, the top-level one and each provider,
+    // by one set of rules — a provider is the same kind of destination.
     if let Some(p) = &s.intelligence.swap_policy
         && super::SwapPolicy::parse(p).is_none()
     {
@@ -6807,56 +7079,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             format!("intelligence.swap_policy: {p:?} (want finish-on-old|restart-turn)"),
         );
     }
-    if s.intelligence.token.is_some() && s.intelligence.token_file.is_some() {
-        d.warnings.push(
-            "intelligence.token and intelligence.token_file are both set; the inline token wins"
-                .into(),
-        );
-    }
-    if let Some(auth) = &s.intelligence.auth {
-        for e in validate_auth_block(auth, "intelligence") {
-            err(&mut d, e);
-        }
-    }
-    if let Some(dialect) = &s.intelligence.dialect {
-        if crate::intel::client::Provider::from_dialect(Some(dialect)).is_none() {
-            err(
-                &mut d,
-                format!("intelligence.dialect: {dialect:?} (want openai|anthropic|bedrock)"),
-            );
-        }
-        // Native Bedrock authenticates by SigV4 — an `auth: {kind: aws}` is
-        // required (creds come from env/imds/irsa/sso at dial time).
-        if dialect == "bedrock"
-            && !matches!(
-                s.intelligence.auth.as_ref().map(|a| a.kind),
-                Some(AuthKind::Aws)
-            )
-        {
-            err(
-                &mut d,
-                "intelligence.dialect: bedrock requires intelligence.auth.kind = aws (SigV4)"
-                    .into(),
-            );
-        }
+    for c in s.intelligence.connections() {
+        validate_connection(&c, &mut d);
     }
     validate_budget(&s.intelligence.budget, "intelligence.budget", &mut d);
     if let Some(b) = &s.agent.conversation_budget {
         validate_budget(b, "agent.conversation_budget", &mut d);
     }
-    for (name, value) in &s.intelligence.headers {
-        if super::is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
-            err(
-                &mut d,
-                format!(
-                    "intelligence.headers['{name}'] looks like a credential but has an inline value; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}}"
-                ),
-            );
-        } else if let Some(e) = unresolved_secret_ref(value) {
-            err(&mut d, format!("intelligence.headers['{name}']: {e}"));
-        }
-    }
-
     // MCP Events bindings and grants.
     events::validate(s, &mut d);
 
@@ -7097,15 +7326,14 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 );
             }
         }
-        for e in &s.intelligence.endpoints {
+        for c in s.intelligence.connections() {
+            let what = match c.name {
+                Some(n) => format!("intelligence provider '{n}' endpoint"),
+                None => "intelligence endpoint".into(),
+            };
             // `mock:` is the in-process test endpoint — no socket, no egress.
-            if !e.starts_with("mock:") {
-                closed(
-                    &mut d,
-                    ServiceKind::Intelligence,
-                    "intelligence endpoint",
-                    e,
-                );
+            for e in c.endpoints.iter().filter(|e| !e.starts_with("mock:")) {
+                closed(&mut d, ServiceKind::Intelligence, &what, e);
             }
         }
         for p in &s.a2a.peers {
@@ -7517,7 +7745,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     err(
                         &mut d,
                         format!(
-                            "workflow '{name}' step '{sid}': model {m:?} is not a declared tier (known: {})",
+                            "workflow '{name}' step '{sid}': model {m:?} is not a declared model (known: {})",
                             s.intelligence
                                 .models
                                 .keys()
@@ -8325,6 +8553,56 @@ fn validate_budget(b: &Budget, at: &str, d: &mut Diagnostics) {
     }
 }
 
+/// One intelligence connection's own rules, the same for the top-level one
+/// and every provider: dialable endpoints, a known dialect with the
+/// credential it needs, a coherent `auth:` block, and no inline credential in
+/// a header.
+fn validate_connection(c: &Connection<'_>, d: &mut Diagnostics) {
+    let at = c.at();
+    if c.name.is_some() && c.endpoints.is_empty() {
+        d.errors.push(format!("{at}.endpoints: required"));
+    }
+    for e in c.endpoints {
+        if let Err(e) = super::validate_intelligence_uri(e) {
+            d.errors.push(match c.name {
+                Some(_) => format!("{at}.endpoints: {e}"),
+                None => e.to_string(),
+            });
+        }
+    }
+    if c.token.is_some() && c.token_file.is_some() {
+        d.warnings.push(format!(
+            "{at}.token and {at}.token_file are both set; the inline token wins"
+        ));
+    }
+    if let Some(auth) = c.auth {
+        d.errors.extend(validate_auth_block(auth, &at));
+    }
+    if let Some(dialect) = c.dialect {
+        if crate::intel::client::Provider::from_dialect(Some(dialect)).is_none() {
+            d.errors.push(format!(
+                "{at}.dialect: {dialect:?} (want openai|anthropic|bedrock)"
+            ));
+        }
+        // Native Bedrock authenticates by SigV4 — an `auth: {kind: aws}` is
+        // required (creds come from env/imds/irsa/sso at dial time).
+        if dialect == "bedrock" && !matches!(c.auth.map(|a| a.kind), Some(AuthKind::Aws)) {
+            d.errors.push(format!(
+                "{at}.dialect: bedrock requires {at}.auth.kind = aws (SigV4)"
+            ));
+        }
+    }
+    for (name, value) in c.headers {
+        if super::is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
+            d.errors.push(format!(
+                "{at}.headers['{name}'] looks like a credential but has an inline value; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}}"
+            ));
+        } else if let Some(e) = unresolved_secret_ref(value) {
+            d.errors.push(format!("{at}.headers['{name}']: {e}"));
+        }
+    }
+}
+
 /// Secret-bearing paths that must be REFERENCES when they come from a file.
 const FILE_SECRET_PATHS: &[&str] = &[
     "/intelligence/token",
@@ -8343,6 +8621,20 @@ fn secret_violations(file_doc: &Value) -> Vec<String> {
                 "config file: {} carries an inline credential; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}} (or set it from env/flag)",
                 p.trim_start_matches('/').replace('/', ".")
             ));
+        }
+    }
+    if let Some(providers) = file_doc
+        .pointer("/intelligence/providers")
+        .and_then(Value::as_object)
+    {
+        for (name, p) in providers {
+            if let Some(Value::String(v)) = p.get("token")
+                && !crate::sec::secret::has_secret_ref(v)
+            {
+                out.push(format!(
+                    "config file: intelligence.providers.{name}.token carries an inline credential; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}} (or set it from env/flag)"
+                ));
+            }
         }
     }
     if let Some(servers) = file_doc.pointer("/mcp/servers").and_then(Value::as_array) {
@@ -8489,13 +8781,13 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "identity.labels",
     "intelligence.auth",
     "intelligence.budget",
-    "intelligence.default",
     "intelligence.dialect",
     "intelligence.endpoints",
     "intelligence.headers",
     "intelligence.model",
     "intelligence.models",
-    "intelligence.preflight_model",
+    "intelligence.providers",
+    "intelligence.roles",
     "intelligence.structured_output",
     "intelligence.swap_policy",
     "intelligence.timeout",
@@ -8954,6 +9246,9 @@ mod tests {
                 },
                 paths::Kind::Object => match b.path.as_str() {
                     "intelligence.models" => json!({"small": {"model": "m-1"}}),
+                    "intelligence.providers" => {
+                        json!({"second": {"endpoints": "https://p.example/v1"}})
+                    }
                     "tools.overrides" => json!({"memory.get": {"server": "s", "tool": "t"}}),
                     "tools.narrow" => {
                         json!({"a_tool": {"tags": ["sensitive"], "describe": "note"}})
@@ -9485,12 +9780,33 @@ mod tests {
     #[test]
     fn every_config_path_is_classified_for_documents() {
         let paths = schema_paths();
+        let covered = |p: &str| {
+            super::path_covered(p, DOCUMENT_MAY_WRITE) || super::path_covered(p, OPERATOR_ONLY)
+        };
+        // A field the boundary splits — `intelligence.roles`, where `approve`
+        // is the operator's and the rest a document's — is classified when
+        // every one of its own fields is.
+        let schema = schema::schema();
+        let fields_of = |path: &str| -> Vec<String> {
+            let mut node = &schema;
+            for key in path.split('.') {
+                node = &node["properties"][key];
+                if let Some(name) = node["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+                    node = &schema["$defs"][name];
+                }
+            }
+            node["properties"]
+                .as_object()
+                .map(|f| f.keys().cloned().collect())
+                .unwrap_or_default()
+        };
 
         let unclassified: Vec<&String> = paths
             .iter()
             .filter(|p| {
-                !super::path_covered(p, DOCUMENT_MAY_WRITE)
-                    && !super::path_covered(p, OPERATOR_ONLY)
+                let fields = fields_of(p);
+                !covered(p)
+                    && (fields.is_empty() || !fields.iter().all(|f| covered(&format!("{p}.{f}"))))
             })
             .collect();
         assert!(
@@ -9516,7 +9832,13 @@ mod tests {
         ] {
             let stale: Vec<&&str> = list
                 .iter()
-                .filter(|e| !paths.iter().any(|p| super::path_covered(p, &[*e])))
+                .filter(|e| {
+                    !paths.iter().any(|p| {
+                        super::path_covered(p, &[*e])
+                            || e.strip_prefix(&format!("{p}."))
+                                .is_some_and(|f| fields_of(p).iter().any(|x| x == f))
+                    })
+                })
                 .collect();
             assert!(
                 stale.is_empty(),
@@ -13357,6 +13679,200 @@ mod tests {
                 .to_string();
             assert!(e.contains("65 event types, at most 64"), "{e}");
         }
+    }
+
+    /// RFC 0046 P1: a provider is a second connection, a model reaches it
+    /// by name, and each role resolves to its own model — or to `turn`,
+    /// which is `intelligence.model` said another way.
+    #[test]
+    fn a_model_reaches_a_provider_and_each_role_resolves_to_its_model() {
+        let l = load_doc(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    second:\n      endpoints: \"mock:json\"\n      dialect: anthropic\n      timeout: 5s\n  models:\n    big: {model: big-1, fallback: other}\n    other: {model: other-2, provider: second, window: 9000}\n  roles: {turn: big, think: other}\n",
+        )
+        .unwrap();
+        let i = &l.settings.intelligence;
+        assert_eq!(i.reference(ModelRole::Turn).as_deref(), Some("big"));
+        assert_eq!(i.reference(ModelRole::Think).as_deref(), Some("other"));
+        // Unbound roles run on `turn`; none inherits from another.
+        assert_eq!(i.reference(ModelRole::Decide).as_deref(), Some("big"));
+        assert_eq!(
+            i.role_wire_model(ModelRole::Think).as_deref(),
+            Some("other-2")
+        );
+        assert_eq!(i.role_window(ModelRole::Think), Some(9000));
+        assert_eq!(i.provider_of("other"), Some("second"));
+        assert_eq!(i.provider_of("big"), None);
+        assert_eq!(i.provider_of("a-literal"), None);
+        assert_eq!(i.fallback_chain("big"), vec!["other".to_string()]);
+        let names: Vec<_> = i.connections().map(|c| c.login_target()).collect();
+        assert_eq!(names, vec!["intelligence", "intelligence:second"]);
+        let second = i.connection(Some("second")).unwrap();
+        assert_eq!(second.timeout, Some(Duration::from_secs(5)));
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+    }
+
+    #[test]
+    fn the_turn_model_is_said_once() {
+        let l =
+            load_doc("intelligence:\n  endpoints: \"mock:json\"\n  model: a\n  roles: {turn: b}\n");
+        let e = match l {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("intelligence.roles.turn") && e.contains("say it once"),
+            "{e}"
+        );
+    }
+
+    /// Removed, not aliased: an old key is an unknown key.
+    #[test]
+    fn the_replaced_model_keys_are_unknown() {
+        for doc in [
+            "intelligence:\n  endpoints: \"mock:json\"\n  default: x\n",
+            "intelligence:\n  endpoints: \"mock:json\"\n  preflight_model: x\n",
+            "intelligence:\n  endpoints: \"mock:json\"\ncontext:\n  summarize: {model: x}\n",
+        ] {
+            let e = load_doc(doc).unwrap_err().to_string();
+            assert!(e.contains("unknown field"), "{doc}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_provider_is_checked_like_the_top_level_connection() {
+        let errors = |doc: &str| match load_doc(doc) {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  models:\n    x: {model: m, provider: nowhere}\n",
+        );
+        assert!(
+            e.contains("intelligence.models.x.provider: no provider named \"nowhere\""),
+            "{e}"
+        );
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"ftp://nope\"}\n",
+        );
+        assert!(e.contains("intelligence.providers.p.endpoints"), "{e}");
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example\", dialect: bedrock}\n",
+        );
+        assert!(
+            e.contains("intelligence.providers.p.dialect: bedrock requires intelligence.providers.p.auth.kind = aws"),
+            "{e}"
+        );
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p:\n      endpoints: \"https://p.example\"\n      headers: {authorization: sk-inline}\n",
+        );
+        assert!(
+            e.contains("intelligence.providers.p.headers['authorization'] looks like a credential"),
+            "{e}"
+        );
+        // A provider token in a file is a reference, as the top-level one is.
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example\", token: sk-inline}\n",
+        );
+        assert!(
+            e.contains("intelligence.providers.p.token carries an inline credential"),
+            "{e}"
+        );
+        // Under `egress: closed`, a provider is a destination like any other.
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example/v1\"}\nsecurity: {egress: closed}\n",
+        );
+        assert!(
+            e.contains("intelligence provider 'p' endpoint (https://p.example/v1) matches no `kind: intelligence`"),
+            "{e}"
+        );
+        let e = errors(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example/v1\"}\nsecurity: {egress: closed}\nservices:\n  p: {kind: intelligence, endpoint: \"https://p.example/v1\"}\n",
+        );
+        assert!(!e.contains("intelligence provider"), "{e}");
+    }
+
+    /// The judge that answers on the operator's behalf resolves in the
+    /// operator's own section: a document that declares a model under the
+    /// name the operator's `roles.approve` gives does not re-point it.
+    #[test]
+    fn a_document_cannot_re_point_the_approve_judge() {
+        let l = load_doc(
+            "agent:\n  instruction: |\n    :::!config\n    intelligence:\n      models:\n        big-judge: {model: tiny-agreeable}\n        fast: {model: fast-1}\n      roles: {turn: fast}\n    :::\n    Work.\nintelligence:\n  endpoints: \"mock:json\"\n  model: main-wire\n  roles: {approve: big-judge}\n",
+        )
+        .unwrap();
+        let i = &l.settings.intelligence;
+        let op = i
+            .operator
+            .as_deref()
+            .expect("the operator's section is kept");
+        assert_eq!(
+            op.role_wire_model(ModelRole::Approve).as_deref(),
+            Some("big-judge")
+        );
+        // What the merged section alone would have dialed:
+        assert_eq!(
+            i.role_wire_model(ModelRole::Approve).as_deref(),
+            Some("tiny-agreeable")
+        );
+        // The operator's literal approver stands beside the document's models.
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+    }
+
+    /// The turn model the operator names is the operator's, in either
+    /// spelling: a document's `roles.turn` beside the operator's `model` is
+    /// dropped with a warning, not refused as said twice.
+    #[test]
+    fn the_operators_turn_model_wins_over_a_documents() {
+        let instr = ":::!config\nintelligence:\n  models:\n    fast: {model: fast-1}\n  roles: {turn: fast, think: fast}\n:::\nWork.";
+        let s = Settings::from_document(
+            json!({"agent": {"instruction": instr}, "intelligence": {"model": "main-wire"}}),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            s.intelligence.reference(ModelRole::Turn).as_deref(),
+            Some("main-wire")
+        );
+        assert_eq!(
+            s.intelligence.reference(ModelRole::Think).as_deref(),
+            Some("fast")
+        );
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("intelligence.roles.turn")),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+        // Without the operator's model, the document's binding stands.
+        let s = Settings::from_document(json!({"agent": {"instruction": instr}}), "t").unwrap();
+        assert_eq!(
+            s.intelligence.reference(ModelRole::Turn).as_deref(),
+            Some("fast")
+        );
+    }
+
+    /// A document chooses among the models the operator connected: it may
+    /// bind roles and declare models, never a provider, never the approver.
+    #[test]
+    fn a_document_may_name_models_but_not_where_they_live() {
+        let frag: Map<String, Value> = serde_json::from_value(json!({"intelligence": {
+            "models": {"cheap": {"model": "m-1"}, "mine": {"model": "m-2", "provider": "evil"}},
+            "roles": {"turn": "cheap", "think": "cheap", "decide": "cheap", "approve": "cheap"},
+            "providers": {"evil": {"endpoints": "https://evil.example"}}
+        }}))
+        .unwrap();
+        let mut refused = super::document_wrote_operator_config(&frag);
+        refused.sort();
+        assert_eq!(
+            refused,
+            vec![
+                "intelligence.models.mine.provider".to_string(),
+                "intelligence.providers.evil".to_string(),
+                "intelligence.roles.approve".to_string(),
+            ]
+        );
     }
 
     #[test]

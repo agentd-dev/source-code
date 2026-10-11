@@ -391,24 +391,12 @@ impl Runtime {
             output_contract,
             context_seed,
             gated_tools,
-            intelligence: IntelConfig {
-                uri: self.intel_uri.clone(),
-                token: self.current_intel_bearer(),
-                // An explicit `model:` (from the call, the template or the
-                // spawn defaults) overrides the parent's model; otherwise the
-                // child inherits it.
-                // Resolved through the tier catalogue like every other model
-                // reference, so a caller naming a TIER does not leak that name
-                // to the provider as if it were a model.
-                model: args
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(|m| self.settings.intelligence.wire_model(m))
-                    .or_else(|| Some(self.model.clone())),
-                headers: self.intel_headers.clone(),
-                aws_auth: self.intel_aws_auth(),
-                dialect: self.intel_dialect(),
-            },
+            // An explicit `model:` (from the call, the template or the spawn
+            // defaults) overrides the parent's turn model; otherwise the child
+            // runs on it. Resolved like every other model reference — its
+            // provider, its wire name, its fallbacks — so a caller naming a
+            // model does not leak that name to a provider as if it were one.
+            intelligence: self.intel_config(args.get("model").and_then(Value::as_str)),
             mcp_servers: servers.iter().filter_map(|s| self.spawn_spec(s)).collect(),
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
@@ -801,6 +789,48 @@ impl Runtime {
         }
     }
 
+    /// A reload moved the intelligence: hand each running subagent its model
+    /// resolved again — the connection it dials, the credential, the
+    /// fallbacks — to apply at its next turn boundary under
+    /// `intelligence.swap_policy`. A warm subagent otherwise dialed the
+    /// connection it was spawned with for as long as it lived.
+    pub(crate) fn swap_subagent_intelligence(&mut self) {
+        let policy = self
+            .settings
+            .intelligence
+            .swap_policy
+            .as_deref()
+            .and_then(crate::config::SwapPolicy::parse)
+            .unwrap_or_default();
+        let live: Vec<(NodeId, Option<String>)> = self
+            .subagents
+            .values()
+            .filter(|s| !is_terminal_status(&s.status))
+            .filter_map(|s| {
+                let reference = s
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p["intelligence"]["reference"].as_str())
+                    .map(str::to_string);
+                Some((s.node?, reference))
+            })
+            .collect();
+        for (node, reference) in &live {
+            let swap = crate::subagent::protocol::SwapIntel {
+                intelligence: self.intel_config(reference.as_deref()),
+                policy,
+            };
+            self.children
+                .send(*node, &ControlMsg::SwapIntel(Box::new(swap)));
+        }
+        if !live.is_empty() {
+            self.log.info(
+                "intel.swap.sent",
+                json!({"subagents": live.len(), "policy": policy.as_str()}),
+            );
+        }
+    }
+
     /// Restore: re-spawn non-detached, non-terminal subagents (`attempt + 1`).
     pub(crate) fn respawn_restored_subagents(&mut self) {
         let handles: Vec<String> = self
@@ -824,14 +854,10 @@ impl Runtime {
                 }
                 continue;
             };
-            payload.intelligence = IntelConfig {
-                uri: self.intel_uri.clone(),
-                token: self.current_intel_bearer(),
-                model: Some(self.model.clone()),
-                headers: self.intel_headers.clone(),
-                aws_auth: self.intel_aws_auth(),
-                dialect: self.intel_dialect(),
-            };
+            // The model the child was spawned on, resolved again against the
+            // live settings: its connection and credential may have moved
+            // since, and a stored one is never replayed.
+            payload.intelligence = self.intel_config(payload.intelligence.reference.as_deref());
             let deadline = Duration::from_millis(payload.limits.deadline_ms.max(1000));
             match self.children.spawn(
                 &payload,
@@ -911,11 +937,16 @@ fn apply_spawn_defaults(
     }
 }
 
-/// The payload as stored: no credential, because the intelligence token is
-/// re-supplied from the live settings on restore.
+/// The payload as stored: of the intelligence, only the model REFERENCE —
+/// a restore resolves it again ([`Runtime::intel_config`]). The connection
+/// is not stored: its token and its headers, resolved, are credentials.
 fn secret_free_payload(p: &SpawnPayload) -> Value {
     let mut clean = p.clone();
-    clean.intelligence.token = None;
+    clean.intelligence = IntelConfig {
+        model: p.intelligence.model.clone(),
+        reference: p.intelligence.reference.clone(),
+        ..Default::default()
+    };
     let mut v = serde_json::to_value(&clean).unwrap_or(Value::Null);
     // The record keeps surfacing the narrowed grant for audits/`subagent.status`
     // — read back OFF THE PAYLOAD that actually carries it, so the record can

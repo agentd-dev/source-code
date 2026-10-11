@@ -426,9 +426,11 @@ impl Runtime {
                 srv.remove("event_grants");
             }
         }
-        // Intelligence: the parent's section, minus its budget (the child's
-        // budget is the template's grant) and minus any INLINE token (the env
-        // passthrough carries it; a secret REFERENCE rides along fine).
+        // Intelligence: the parent's section — its providers, models and
+        // roles with it — minus its budget (the child's budget is the
+        // template's grant) and minus any INLINE token, the top-level one's
+        // or a provider's (the env passthrough carries it; a secret
+        // REFERENCE rides along fine).
         let mut intel = self
             .settings_doc
             .get("intelligence")
@@ -436,15 +438,17 @@ impl Runtime {
             .unwrap_or(json!({}));
         if let Some(o) = intel.as_object_mut() {
             o.remove("budget");
-            if let Some(tok) = o.get("token").and_then(Value::as_str)
-                && !crate::sec::secret::has_secret_ref(tok)
-            {
-                o.remove("token");
+            drop_inline_token(o);
+            if let Some(providers) = o.get_mut("providers").and_then(Value::as_object_mut) {
+                for p in providers.values_mut().filter_map(Value::as_object_mut) {
+                    drop_inline_token(p);
+                }
             }
         }
         // The model the template's variants were folded for
         // (`templates::template_facts`): its own, else the spawn default.
-        // It is the child's model whatever the parent's `default` tier says.
+        // It is the child's turn model whatever the parent's `roles.turn`
+        // says — and said once, as `model`.
         if let Some(m) = t
             .spec
             .model
@@ -454,7 +458,9 @@ impl Runtime {
             && let Some(o) = intel.as_object_mut()
         {
             o.insert("model".into(), json!(m));
-            o.remove("default");
+            if let Some(roles) = o.get_mut("roles").and_then(Value::as_object_mut) {
+                roles.remove("turn");
+            }
         }
         if let Some(b) = &t.spec.budget {
             intel["budget"] = b.clone();
@@ -1059,7 +1065,14 @@ fn instance_command(
         .stderr(std::process::Stdio::from(log_file));
     for (k, _) in std::env::vars() {
         let alias = k.starts_with(crate::config::paths::ENV_PREFIX);
-        let keep = k.contains("INTELLIGENCE");
+        // The intelligence credentials ride the environment (a composed file
+        // never holds an inline one); which model the child runs is in its
+        // composed file, said once, so the parent's choice of it in the
+        // environment would contradict the template's.
+        let choice = k.ends_with("_INTELLIGENCE_MODEL")
+            || k.contains("_INTELLIGENCE_MODELS_")
+            || k.contains("_INTELLIGENCE_ROLES");
+        let keep = k.contains("INTELLIGENCE") && !choice;
         if alias && !keep {
             cmd.env_remove(&k);
         }
@@ -1328,6 +1341,16 @@ fn inbox_report(ev: &crate::state::InboxEvent) -> Option<Result<(Admitted, Value
     };
     let args = super::a2a_server::command_data(&message).unwrap_or_else(|| json!({}));
     Some(Ok((admitted, args)))
+}
+
+/// Remove a connection's `token` when it is an inline value rather than a
+/// secret reference: a composed child document is a file on disk.
+fn drop_inline_token(conn: &mut serde_json::Map<String, Value>) {
+    if let Some(tok) = conn.get("token").and_then(Value::as_str)
+        && !crate::sec::secret::has_secret_ref(tok)
+    {
+        conn.remove("token");
+    }
 }
 
 #[cfg(test)]

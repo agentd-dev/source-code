@@ -22,7 +22,7 @@ pub enum Reply {
     Budget {
         ok: bool,
         wait_ms: u64,
-        model: Option<String>,
+        degrade: Option<Box<crate::subagent::protocol::IntelConfig>>,
         reason: Option<String>,
     },
 }
@@ -165,7 +165,7 @@ mod tests {
             Reply::Budget {
                 ok: true,
                 wait_ms: 0,
-                model: None,
+                degrade: None,
                 reason: None,
             },
         );

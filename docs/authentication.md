@@ -224,7 +224,9 @@ $ agentd --login mcp:github --config app.yaml
 logged in to mcp:github — token cached in ~/.local/state/agentd/creds
 ```
 
-- `agentd --login <target>` — run the flow for `intelligence` or `mcp:<name>`.
+- `agentd --login <target>` — run the flow for `intelligence`, a named
+  intelligence provider (`intelligence:<provider>`), `mcp:<name>` or
+  `service:<name>`. Each provider's credential is cached under its own target.
 - `agentd --logout <target>` — evict the cached credential (no feature needed).
 
 The token (and its refresh token) is cached in a per-user file (`0600`, under

@@ -390,7 +390,8 @@ tags, and any MCP declaration whose endpoint matches the entry gets those tags
 Under-tagging a catalogued endpoint is therefore impossible rather than undetected.
 `security.egress: closed` extends the catalog from authority to allow-list
 across the outbound surfaces it knows about: MCP dials, intelligence
-endpoints, A2A peers, the `http` step (with per-entry `methods:` ceilings),
+endpoints (the top-level connection's and every `intelligence.providers`
+entry's), A2A peers, the `http` step (with per-entry `methods:` ceilings),
 stream `forward:` targets, the HTTP store, workflow-reference URLs, and
 caller-registered A2A push targets — refused at boot for configured surfaces,
 at execution for templated ones. Entries carry a `kind:` and matching is
@@ -1066,18 +1067,18 @@ An unknown `{{…}}` token is an **error**, not a pass-through, so a typo cannot
 braces onto the wire. Errors name the reference, never the value: a missing variable yields
 `{{secret:NAME}} is not set in the environment`. The `Secret` newtype's `Debug` prints
 `***` (`config/settings/mod.rs::Secret`), so a credential cannot reach a log line, a payload dump,
-or a panic message through formatting. The durable subagent record is written with the
-intelligence token nulled out, re-supplied from live settings on restore
-(`subagents.rs::secret_free_payload`).
+or a panic message through formatting. The durable subagent record keeps only the
+model reference of its intelligence — no token, no resolved headers — and the connection
+is resolved again from live settings on restore (`subagents.rs::secret_free_payload`).
 
-Two checks catch an inline credential in the config **file**. Four paths must be references
-outright — `/intelligence/token`, `/a2a/bearer`, `/security/aauth/enroll_token`, and each
-MCP server's `oauth.client_secret` (`config/settings/mod.rs::secret_violations`, whose first
-three come from `::FILE_SECRET_PATHS`). Separately, any header whose
+Two checks catch an inline credential in the config **file**. These paths must be references
+outright — `/intelligence/token`, each `intelligence.providers.<name>.token`, `/a2a/bearer`,
+`/security/aauth/enroll_token`, and each MCP server's `oauth.client_secret`
+(`config/settings/mod.rs::secret_violations`, with `::FILE_SECRET_PATHS`). Separately, any header whose
 *key* looks credential-shaped — `authorization`, `api-key`, `x-api-key`, `token`,
 `password`, `secret`, or anything ending `-token` / `_token` / `-key` / `_key`
 (`config/mod.rs::is_secret_shaped_key`) — is refused with an inline value, across
-`intelligence.headers`,
+`intelligence.headers` (and each provider's),
 `mcp.servers[].headers` and `a2a.peers[].headers`.
 
 The limit is the key name, not the value: a bearer pasted into `headers.X-Session` passes

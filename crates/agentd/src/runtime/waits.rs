@@ -2058,7 +2058,10 @@ impl Runtime {
                 think_spec.insert(carried.into(), v.clone());
             }
         }
-        self.step_turn_pub(run_id, step_id, &think, &think_spec, data);
+        // The node's own kind picks its model when it names none: a decision
+        // runs on `roles.decide`, shaping text on the turn's model.
+        let role = super::steps::node_role(&step.kind);
+        self.step_turn_pub(run_id, step_id, &think, &think_spec, data, role);
     }
 
     /// Step `cache {key, ttl}`: a memoized output by key (memory `_cache/<hash>`).

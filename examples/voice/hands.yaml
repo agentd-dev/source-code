@@ -35,13 +35,13 @@ agent:
   # and the text withheld (`readback.withheld` in the log). RFC 0045
   # §5.11.3; docs/security.md, "A result read back is withheld".
 
-# Two tiers on one endpoint. The deep tier exists for exactly one step: the
+# Two models on one endpoint. The deep one exists for exactly one step: the
 # open question a person asks out loud, where the agent has tools and has to
-# think. Everything else runs on the fast one.
+# think. Everything else — the turns, preflight — runs on the quick one.
 #
-# A tier carries the wire model name and its context window — it does NOT
-# select an endpoint. Every tier's call goes to `intelligence.endpoints`, which
-# is what the client is built from, so the credential belongs there too.
+# A model carries the wire model name and its context window; it names no
+# `provider:`, so its calls go to `intelligence.endpoints`, with the
+# credential configured there.
 services:
   gateway:
     kind: intelligence
@@ -54,8 +54,7 @@ intelligence:
   models:
     quick: { model: gpt-5.1-mini, window: 128000 }
     deep:  { model: gpt-5.1,      window: 200000, fallback: quick }
-  default: quick
-  preflight_model: quick
+  roles: { turn: quick }
   budget:
     windows: [{ per: day, tokens: 4000000 }]
     on_exhausted: refuse

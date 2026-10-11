@@ -122,6 +122,9 @@ pub struct Response {
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// The fallback model that answered, when the model asked was
+    /// unavailable; `None` when it answered itself.
+    pub fallback: Option<String>,
 }
 
 impl Response {
@@ -168,6 +171,7 @@ mod tests {
             }],
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),
+            fallback: None,
         };
         assert!(r.wants_tools());
     }

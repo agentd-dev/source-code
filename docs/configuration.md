@@ -74,7 +74,7 @@ teleprot` is flagged where you typed it.
 
 Two things the schema deliberately does **not** do. It will not catch
 cross-field rules — `concurrency.scope: key` needing a `key:`, a `fallback`
-cycle, a tier name that is not declared — because those need the whole
+cycle, a model name that is not declared — because those need the whole
 document; `agentd --validate-config` reports all of them at once, and that
 remains the authority. And it does not know your secrets exist: a
 `{{secret:NAME}}` reference is just a string until startup resolves it.
@@ -385,7 +385,7 @@ is why they are two settings and not one.
 | `--cgroup-memory-max <SIZE>` | `security.cgroup.memory_max` | — | *(none)* | Per-child `memory.max`: `max` or a size (`512M`/`2G`/bytes). Needs a parent that can delegate the `memory` controller. |
 | `--cgroup-pids-max <N>` | `security.cgroup.pids_max` | — | *(none)* | Per-child `pids.max`: `max` or a count. **Counts threads** — set it generously. Needs delegation. |
 | `--aauth-provider`, `--aauth-key-file`, `--aauth-enroll-token`, `--aauth-enroll-assertion-file`, `--aauth-person-server` | `security.aauth.*` | — | *(none)* | Agent-identity signing for AAuth-protected servers. Needs `--features aauth`; see [`aauth.md`](aauth.md). |
-| `--login <target>` | — | — | — | Complete an interactive OAuth device login for an endpoint (e.g. `mcp:<name>`) and cache the token; exits. Needs `--features oauth`; see [`authentication.md`](authentication.md). |
+| `--login <target>` | — | — | — | Complete an interactive OAuth device login for an endpoint (`intelligence`, `intelligence:<provider>`, `mcp:<name>`, `service:<name>`) and cache the token; exits. Needs `--features oauth`; see [`authentication.md`](authentication.md). |
 | `--logout <target>` | — | — | — | Evict a cached credential; exits. |
 | `--capabilities` | — | — | — | Print the capabilities manifest (JSON) and exit `0` — the side-effect-free admission probe. |
 | `-h`, `--help` | — | — | — | Print help (including the full `CONFIG PATHS` table) and exit `0`. |
@@ -624,8 +624,8 @@ standing policy still looks like a working agent. A step selects an
 alternate with `context: {template: minimal, seed: [...]}`.
 
 Compaction has the same treatment at its own scale: `context.summarize.prompt`
-replaces the summarizer's guidance and `context.summarize.model` runs it on a
-cheaper model. The summary's JSON schema is **not** overridable — it is parsed
+replaces the summarizer's guidance and `intelligence.roles.compaction` runs it
+on a cheaper model ([intelligence.md](intelligence.md#providers-models-and-roles)). The summary's JSON schema is **not** overridable — it is parsed
 back into the context, so a prompt asking for another shape produces a refusal
 rather than a nicer summary.
 

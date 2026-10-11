@@ -1,6 +1,8 @@
 # Intelligence: the LLM wire
 
-agentd reaches the model over **one logical wire**. The agentic ReAct loop —
+agentd reaches a model over **one logical wire** per connection — the
+top-level one described here, plus any named providers (see
+[Providers, models and roles](#providers-models-and-roles)). The agentic ReAct loop —
 which runs only inside a child process, a turn worker or a subagent — sends it
 messages plus a scoped tool catalogue and gets back text *and* structured tool
 calls. That wire is named in
@@ -8,7 +10,7 @@ calls. That wire is named in
 `AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`). For resilience the wire
 can list **several endpoints** (failover priority by order), each with its own
 credential, and the list + model are **hot-swappable without a restart** — but it
-stays one model-facing channel. That is the whole surface.
+stays one model-facing channel per connection.
 
 This is the **intelligence wire** — the model-facing channel. It is
 **categorically not MCP.** Tools come from MCP servers; this channel only carries
@@ -239,7 +241,9 @@ Example of the redaction (the token is set but never echoed):
 - **Synchronous and blocking** for the subagent's turn — the agentic loop is
   single-threaded per subagent. The supervisor never blocks on the LLM call.
 - **Non-streaming** (`stream:false`). A timeout surfaces as a transient
-  transport error and is retried with bounded backoff.
+  transport error and is retried with bounded backoff. One call's ceiling is
+  its connection's `timeout` (`intelligence.timeout`, or a provider's;
+  default 120 s); the run's deadline is the real bound.
 - **HTTP status taxonomy** — which status is retried and which is fatal:
   - `429` / `5xx` → bounded retry with backoff + jitter.
   - `401` / `403` → fatal auth → **exit 4**.
@@ -249,77 +253,110 @@ Example of the redaction (the token is set but never echoed):
 
 ---
 
-## Model tiers
+## Providers, models and roles
 
-A tier lets each step choose its model: a cheap one for a classify step and a
-frontier one for a judgement call, in the same instance, with no subagent
-process forked to change it. The breaker is per *endpoint* and is not
-operator-tunable — three consecutive failures open it, and the cooldown
-starts at 5s and doubles to a 60s cap — so a frontier and a cheap model
-behind one gateway still share one breaker; what a tier separates is the
-wire model and the context window, not the failure accounting.
-
-`intelligence.models` names each tier once:
+A model is a name for a wire model, on a connection. Each job the agent does
+runs on the model its **role** names, so a cheap model can triage, a frontier
+one can answer, and a second vendor can think — in one instance, with no
+subagent process forked to change a string ([RFC 0046](../rfcs/0046-kinds-of-intelligence.md)).
 
 ```yaml
-services:
-  frontier:
-    kind: intelligence
-    endpoint: https://api.example.com/v1
-    auth: {kind: oauth2, issuer: "https://id.example.com", grant: client_credentials}
-    rate: "60/1m"
+services:                       # under `egress: closed`, every connection is catalogued
+  anthropic: {kind: intelligence, endpoint: "https://api.anthropic.com"}
+  openai:    {kind: intelligence, endpoint: "https://api.openai.com/v1"}
 
 intelligence:
-  models:
-    big:   {model: big-model-1,   window: 200000, fallback: small}
-    small: {model: small-model-3, window: 128000}
-  default: big
-  preflight_model: small
+  # The top-level connection.
+  endpoints: https://api.anthropic.com
+  dialect: anthropic
+  token: "{{secret:ANTHROPIC_API_KEY}}"
 
-context: {summarize: {model: small}}
+  # Further connections, by name — the same vocabulary, nothing more:
+  # endpoints, dialect, token / token_file, headers, auth, timeout.
+  providers:
+    openai:
+      endpoints: https://api.openai.com/v1
+      token: "{{secret:OPENAI_API_KEY}}"
+
+  models:
+    smart: {model: claude-opus-5-5, window: 1000000, fallback: fast}
+    fast:  {model: claude-haiku-4-5, window: 200000}
+    other: {model: gpt-5.1, provider: openai, fallback: smart}
+
+  roles:
+    turn: smart          # the agent's turns, agent/extract/summarize nodes, subagents
+    think: other         # the think tool and think nodes
+    decide: fast         # classify, route and judge nodes
+    preflight: fast      # triage of an inbound message
+    compaction: fast     # summarising the transcript
+    goal: fast           # the goal check
+    approve: smart       # asks answered on the operator's behalf (approval: auto)
 
 workflows:
   - name: triage
     steps:
-      sort:   {kind: classify, model: small, input: "…", classes: [a, b]}
-      decide: {kind: agent,    model: big,   instruction: "…"}
+      sort:   {kind: classify, input: "…", classes: [a, b]}   # roles.decide → fast
+      answer: {kind: agent, model: other, instruction: "…"}   # a node's model: wins
 ```
 
-`model` is accepted on every kind that makes a model call: `think`, `agent`,
-and the five shaping presets — `classify`, `extract`, `summarize`, `judge`,
-`route`. The presets are the point, not an afterthought: they are the cheap
-high-volume steps, and a catalogue that could not reach them left the only
-lever on the whole instance.
+**Models.** `intelligence.models.<name>` is `model` (the wire name, required),
+`provider` (a name under `providers`; absent, the top-level connection),
+`window` and `fallback`. A reference — in a role, on a node, in
+`budget.degrade.model`, on a subagent — is a declared name or, when no model
+of that name is declared, a literal wire model on the top-level connection.
+Every reference resolves to the wire model at the edge, so a model's *name*
+never reaches a provider, and every one is checked at startup: an unknown
+model on a step or a role, or an unknown provider on a model, is exit 2
+rather than a run quietly asking for a model called `smal`.
 
-A tier is **not** a second service catalogue, and it never was: its whole
-vocabulary is `model`, `window` and `fallback`. A tier writes no endpoint, no
-`auth` and no `tags` of its own, so "make it cheaper" cannot quietly mint a new
-endpoint or credential. Trifecta tags are not part of this either — `tags` is
-`kind: mcp` vocabulary, and writing it on a `kind: intelligence` entry is
-exit 2.
+**Roles.** Every role defaults to `turn`, and `turn` defaults to
+`intelligence.model` — they are one setting said two ways, and setting both is
+exit 2 ("say it once"); `--model` / `MODEL` keep working. No role inherits
+from another, so binding `decide` moves the nodes that decide and nothing
+else. A node with no `model:` runs on its kind's role: `agent`, `extract` and
+`summarize` on `turn`, `think` on `think`, `classify`, `route` and `judge` on
+`decide`. The goal check runs on `goal` and the `approval: auto` judge on
+`approve`.
 
-Every tier's call goes to the endpoint list `intelligence.endpoints` names —
-the ordered failover list below — because that list, and nothing else, is what
-the client is built from at startup and rebuilt from on reload; a tier
-contributes the wire model name and, when it declares one, the window. A tier
-selects no endpoint. `security.egress: closed` works the same way from the other side: it walks the four outbound surfaces —
-`mcp.servers`, `intelligence.endpoints`, `a2a.peers`, and the HTTP dials
-(`store.http`, a workflow `url:` reference, a literal `http` step URL) — and
-demands each URL match a catalogue entry of its own kind on scheme, authority
-and a path that extends the entry's on a segment boundary. The endpoint is
-what gets admitted; a tier naming a catalogued entry admits nothing on its
-own.
+**Providers.** Each provider gets its own client, endpoint failover, breakers
+and credential refresh. Every endpoint of a provider dials with the
+provider's own `token` (or `auth:`); the positional `AGENTD_INTELLIGENCE_TOKEN`
+/ `…_<N>` environment overrides belong to the top-level connection and never
+reach a provider. An `oauth2` provider is logged into on its own:
+`agentd --login intelligence:openai` (the top-level connection stays
+`intelligence`). A provider is a destination, so under `security.egress:
+closed` each of its endpoints must match a `kind: intelligence` service entry,
+as `intelligence.endpoints` must; a provider's `token` in a file is a
+`{{secret:…}}` reference, as the top-level one is.
 
-A tier's declared `window` also replaces the compaction threshold's guess from
-the model *name*, which is a substring match and simply wrong for any provider
-whose naming does not happen to match.
-
-References resolve to the wire model at the edges, so a tier name never reaches
-a provider, and every reference is checked at startup: an unknown tier on a
-step, in `default`, in `preflight_model` or in `summarize.model` is exit 2
-rather than a run quietly asking for a model called `smal`. A `fallback` cycle
-is refused too — a degradation ladder that loops is a hang under exactly the
+**Fallback.** When a model is unavailable — every endpoint of its connection
+failed, or every breaker is open — the call is asked of its `fallback`, with
+the fallback's wire model on the fallback's own provider, and so down the
+chain; `turn.model_fallback` says which model served (once per change, not
+every round). The next call tries the model first again: with its breakers
+open that costs no dial, and a breaker that has cooled half-opens, so the
+model is back the moment it answers. An auth failure is not unavailability
+and is never handed down the chain. Readiness follows the chain: `/readyz`
+reports the intelligence down only when no model in it answered. A `fallback` cycle is refused at
+startup — a degradation ladder that loops is a hang under exactly the
 conditions it exists to survive.
+
+**What a served document may set.** An instruction document may declare
+models and bind every role but `approve` — *which* model, never where it
+lives: a model it declares cannot name a `provider`, and `providers` and
+`roles.approve` are the operator's ([`directives.md`](directives.md)). The
+`approve` judge resolves in the operator's own section — the operator's
+`roles.approve`, else the operator's turn model, with the operator's models
+and fallbacks — so a document cannot re-point it by declaring a model under
+that name or binding `turn`; only when the operator names no model at all does
+it run on the agent's. And a turn model the operator names, in either
+spelling, wins over a document's (which is dropped with a warning).
+
+A model's declared `window` also replaces the compaction threshold's guess
+from the model *name*, which is a substring match and simply wrong for any
+provider whose naming does not happen to match. Trifecta tags are not part of
+any of this — `tags` is `kind: mcp` vocabulary, and writing it on a `kind:
+intelligence` entry is exit 2.
 
 `turn.model` puts the resolved model on the log line, because "how much did
 that cost, and on what" now has a per-turn answer.
@@ -438,22 +475,24 @@ open). Per-call outcomes drive `agent_intel_up`, `agent_intel_errors_total{reaso
 
 ## Runtime hot-swap (`--model-swap`)
 
-The intelligence endpoint list and the model are **reloadable** — a hot reload
-(SIGHUP, or a watched config-file change; see
-[Configuration](configuration.md)) that changes `intelligence.endpoints` or
-`intelligence.model` swaps the model **live**, with no restart:
+Everything under `intelligence` is **reloadable** — a hot reload (SIGHUP, or a
+watched config-file change; see [Configuration](configuration.md)) swaps it
+**live**, with no restart:
 
-- **New spawns** use the new config immediately (the spawn template is
-  repointed).
-- **In-flight runs** — turn workers and subagents already running — receive a
-  control frame and apply it at the **next turn boundary**. An in-flight model
-  call (`complete_once`) is **never torn**, and the conversation transcript is
-  continuous (no context reset).
+- **New work** uses the new settings immediately: which model each job runs on
+  is resolved at each call, and a connection that moved — its endpoints,
+  credential, headers, login — is rebuilt at the reload's commit.
+- **Running subagents** are each handed their model resolved again — its
+  connection, credential and fallbacks — on a control frame (`intel.swap.sent`)
+  and apply it at their **next turn boundary**. An in-flight model call is
+  **never torn**, and the conversation transcript is continuous (no context
+  reset). A turn worker is one turn long and is not swapped: the next one is
+  built from the new settings.
 
-A repoint that changes only the *endpoint list* (model unchanged) is always
-invisible — the run rebuilds its client with **fresh breaker state** (so no stale
-breaker carries to a new endpoint) and continues. The endpoint URL and credential
-travel on the control frame like the spawn payload and are **never logged**.
+A swap that leaves the model unchanged is always invisible — the run rebuilds
+its client with **fresh breaker state** (so no stale breaker carries to a new
+endpoint) and continues. The endpoint URL and credential travel on the control
+frame like the spawn payload and are **never logged**.
 
 `--model-swap` (env `AGENTD_MODEL_SWAP`) controls only what happens when a reload
 changes the **model** under an in-flight turn:
@@ -469,11 +508,9 @@ token or URL).
 
 A `ConfigMap`-driven roll is the canonical trigger: mount the config file from a
 ConfigMap, run with `--watch-config` (needs `--config` + `--features
-config-watch`), and a ConfigMap update reloads the endpoint list/model live. The
-intelligence **endpoint identity is reloadable via the config-file schema**
-(`intelligence.endpoints` / `.model` / `.swap_policy`); the credential in that
-file is a `{{secret:…}}` reference, so rolling the ConfigMap never moves a
-literal secret.
+config-watch`), and a ConfigMap update reloads the connections, models and
+roles live. The credentials in that file are `{{secret:…}}` references, so
+rolling the ConfigMap never moves a literal secret.
 
 ---
 

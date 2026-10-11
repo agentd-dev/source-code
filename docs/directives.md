@@ -289,8 +289,8 @@ agentd answers three of the spec's context keys:
 
 - `host` is always `agentd`.
 - `model` is the model the agent's turns use by default, as the provider
-  receives it: `intelligence.default`, else `intelligence.model`, with a tier
-  resolved to its `model`.
+  receives it: `intelligence.roles.turn`, else `intelligence.model`, with a
+  declared model resolved to its `model`.
 - `agent` is that model's family, when its id names one: `claude`, `gpt`
   (`gpt-*` and `o1`/`o3`/`o4-…`), `gemini`, `llama` or `mistral`.
 
@@ -301,7 +301,7 @@ supplied keeps its content. The facts come from the operator's
 it, so a document cannot choose what its own variants are decided by. An
 OCI re-pull and a registry read are decided by the same facts as the agent's
 own instruction. A subagent template is decided by the model its child runs:
-the template's own `model:` (a literal, or a tier resolved to its `model`),
+the template's own `model:` (a literal, or a declared model resolved to its `model`),
 else `subagents.defaults.model`, else the agent's; a model a call site passes
 when it spawns the template does not decide them again, and `host` is
 `agentd` throughout.
@@ -468,7 +468,7 @@ says otherwise.
 | `workflows`, `streams`, `mcp`, `vars` | what the agent DOES — the whole point of `:::!workflow`, `:::!stream` and `:::!mcp` |
 | `a2a.peers` | another agent this one dials — the same class as `mcp.servers`, and covered by the same closed-egress sweep (`:::peer` declares one) |
 | `context`, `goal`, `knowledge`, `search`, `memory`, `limits` | how it thinks, remembers and bounds itself |
-| `intelligence.model(s)`, `.budget`, `.dialect`, `.timeout`, `.default`, `.swap_policy`, `.structured_output`, `.preflight_model` | WHICH model and how much of it |
+| `intelligence.model(s)`, `.roles` (but `approve`), `.budget`, `.dialect`, `.timeout`, `.swap_policy`, `.structured_output` | WHICH model and how much of it — a model the document declares names no `provider` |
 | `agent.name`, `.approval`, `.ask_human_fallback`, `.ask_human_unowned`, `.conversation_budget`, `.max_parallel_turns`, `.on_workflow_finished`, `.preflight`, `.wake_on` | the agent loop's own shape |
 | `tools.narrow`, `tools.disabled` | `narrow` only ADDS trifecta tags and descriptions — more dangerous than the operator said, never less; `disabled` only takes capability AWAY, and is the spec's `deny` form |
 | `skills.max_bytes`, `.max_loaded`, `.reference_prefix` | caps on the skill loader |
@@ -488,7 +488,8 @@ says otherwise.
 | `a2a.listen`, `.url`, `.tls`, `.bearer`, `.principals`, `.device_grant`, `.cors`, `.push`, `.conversation_ttl` | who may talk to THIS agent and as what, over which socket, from which browser origin, with which credential |
 | `a2a.events`, `a2a.introspection` | what the listener shows its clients — the observation feed, and the reads that expose transcripts and internals |
 | `webhooks.*` | inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's. A route is the `interface` family's however the document spells it — a `:::!workflow` or `:::!config` workflow with a `webhook` start or `wait {on: webhook}` needs the grant `:::!endpoint` needs ([security](security.md#inbound-webhooks)) |
-| `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth` | where the conversation goes and the credential it goes with |
+| `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth`, `.providers`, a model's `provider` | where the conversation goes and the credential it goes with |
+| `intelligence.roles.approve` | the model that answers asks on the operator's behalf — not a document's to pick for its own gates |
 | `subagents.*` | a whole child agent — its own source, grants and identity. A document REFERENCES a template (`:::agent template=…`); defining one is the operator's |
 | `store.file`, `.http`, `.mcp`, `.audit`, `.retention` | WHERE state lives — a path on the host, or a remote the deployment must be willing to reach — and the audit record |
 | `lifecycle.drain_timeout`, `.exit_code_map`, `.run_id`, `.watch_config` | the orchestration contract: what an orchestrator sees, and whether the process watches its own config file |

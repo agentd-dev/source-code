@@ -6,13 +6,14 @@
 
 use super::children::ChildKind;
 use super::reactor::{Runtime, TurnJob};
+use crate::config::settings::ModelRole;
 use crate::context::compact::{self, CompactionRequest};
 use crate::context::{ContextState, Msg, ROOT, skills};
 use crate::governor::Admission;
 use crate::registry::{Caller, ToolClass};
 use crate::state::now_ms;
 use crate::subagent::protocol::{
-    ControlMsg, IntelConfig, Limits, Role, SpawnPayload, Telemetry, TurnKind, TurnResult, TurnSpec,
+    ControlMsg, Limits, Role, SpawnPayload, Telemetry, TurnKind, TurnResult, TurnSpec,
 };
 use crate::supervisor::tree::NodeId;
 use serde_json::{Value, json};
@@ -39,9 +40,12 @@ pub(crate) struct TurnLaunch {
     pub max_tokens: u64,
     pub deadline_ms: u64,
     pub agent_path: String,
-    /// A model REFERENCE for this turn — a declared tier name or a literal
-    /// model string. `None` inherits the instance default.
+    /// A model REFERENCE for this turn — a declared model name or a literal
+    /// model string, from a node's `model:`. `None` runs on `role`'s model.
     pub model: Option<String>,
+    /// The job this turn does, which picks its model when `model` is unset
+    /// (`intelligence.roles`, RFC 0046 §5.4).
+    pub role: ModelRole,
 }
 
 impl Runtime {
@@ -458,6 +462,7 @@ impl Runtime {
             deadline_ms: self.settings.limits.run.deadline().as_millis() as u64,
             agent_path: format!("turn/{ctx_id}"),
             model: None,
+            role: ModelRole::Turn,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -602,9 +607,10 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             max_tokens: 0,
             deadline_ms: 60_000,
             agent_path: format!("preflight/{ctx_id}"),
-            // Preflight is a recurring fixed cost like compaction, so it takes
-            // its own tier when one is declared.
-            model: self.settings.intelligence.preflight_model.clone(),
+            // Preflight is a recurring fixed cost like compaction, so it runs
+            // on its own role's model when one is bound.
+            model: None,
+            role: ModelRole::Preflight,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -994,38 +1000,16 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             // anything a policy might touch was left out of `mcp_routes` and
             // put in `internal`, so there is nothing more to name here.
             gated_tools: Vec::new(),
-            intelligence: IntelConfig {
-                uri: self.intel_uri.clone(),
-                token: self.current_intel_bearer(),
-                // A compaction turn runs on `context.summarize.model` when one
-                // is configured: summarising is a recurring fixed cost that
-                // does not need the agent's main model.
-                // The model reference for this turn, resolved to the wire
-                // name a provider understands. An explicit `model:` on the
-                // node wins; then the compaction tier, since summarising is a
-                // recurring fixed cost that does not need the agent's main
-                // model; then the instance default. This used to be a
-                // hardcoded two-arm match with exactly one tier in it.
-                model: Some({
-                    let reference = launch.model.clone().or_else(|| {
-                        match (&launch.kind, &self.settings.context.summarize.model) {
-                            (ChildKind::Think { purpose, .. }, Some(m))
-                                if purpose == "compaction" =>
-                            {
-                                Some(m.clone())
-                            }
-                            _ => None,
-                        }
-                    });
-                    match reference {
-                        Some(r) => self.settings.intelligence.wire_model(&r),
-                        None => self.model.clone(),
-                    }
-                }),
-                headers: self.intel_headers.clone(),
-                aws_auth: self.intel_aws_auth(),
-                dialect: self.intel_dialect(),
-            },
+            // An explicit `model:` on the node wins; then the model the
+            // turn's role is bound to — summarising and triage are recurring
+            // fixed costs that do not need the agent's main model.
+            intelligence: self.intel_config(
+                launch
+                    .model
+                    .clone()
+                    .or_else(|| self.settings.intelligence.reference(launch.role))
+                    .as_deref(),
+            ),
             mcp_servers: servers,
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
@@ -1064,7 +1048,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         // question with a per-turn answer.
         self.log.info(
             "turn.model",
-            json!({"agent_path": launch.agent_path, "model": payload.intelligence.model}),
+            json!({"agent_path": launch.agent_path, "role": launch.role.as_str(), "model": payload.intelligence.model, "provider": payload.intelligence.provider}),
         );
         self.children
             .spawn(
@@ -1092,7 +1076,11 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                     id,
                     ok: true,
                     wait_ms: 0,
-                    model,
+                    // `budget.degrade.model` is a reference like any other: a
+                    // model name reaches the worker as the wire model it names,
+                    // on the provider it names — never as a name the provider
+                    // would be asked to serve.
+                    degrade: model.map(|m| Box::new(self.intel_config(Some(&m)))),
                     reason: None,
                 }
             }
@@ -1105,7 +1093,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                     id,
                     ok: false,
                     wait_ms: until_ms.saturating_sub(now_ms()).clamp(100, 60_000),
-                    model: None,
+                    degrade: None,
                     reason: None,
                 }
             }
@@ -1115,7 +1103,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 id,
                 ok: false,
                 wait_ms: 0,
-                model: None,
+                degrade: None,
                 reason: Some(reason),
             },
         };
@@ -1411,6 +1399,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             deadline_ms: 120_000,
             agent_path: format!("compact/{ctx_id}"),
             model: None,
+            role: ModelRole::Compaction,
         };
         match self.spawn_turn(launch) {
             Ok(node) => self.log.info(

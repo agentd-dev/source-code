@@ -133,19 +133,38 @@ fn top_level_properties(
                 "gate_channels": { "type": "object", "description": "the channel a configured workflow's gate is announced on: workflow name → step path → channel. How a subagent template's ::!human channels reach its instance child; an instruction document's own ::!human declarations stand where both name a step. Operator-only.", "additionalProperties": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } } }
                 }
             }));
+    let endpoints = json!({ "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" });
+    let dialect = json!({ "enum": ["openai", "anthropic", "bedrock"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)" });
+    let role = |what: &str| json!({ "type": "string", "description": format!("the model {what}; default: roles.turn") });
     m.insert("intelligence".to_string(), json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "endpoints": { "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" },
-                    "model": { "type": "string", "description": "the default model — a declared `models:` tier name, or a literal model string" },
-                    "models": { "type": "object", "description": "named model tiers: cost/quality tiering inside one workflow without forking a process. A tier points AT a `services:` entry and may only narrow — it inherits that service's trifecta tags and can never declare its own floor.", "additionalProperties": {
+                    "endpoints": endpoints,
+                    "model": { "type": "string", "description": "the turn model — a declared `models:` name, or a literal model string; the same setting as roles.turn (set one)" },
+                    "providers": { "type": "object", "description": "further connections, by name: a second vendor, a gateway. A model reaches one with `provider:`. Operator-only; egress-checked like intelligence.endpoints", "additionalProperties": {
+                        "type": "object", "additionalProperties": false, "required": ["endpoints"], "properties": {
+                            "endpoints": endpoints,
+                            "dialect": dialect,
+                            "token": secret,
+                            "token_file": { "type": "string" },
+                            "headers": string_map,
+                            "auth": { "$ref": "#/$defs/Auth" },
+                            "timeout": duration } } },
+                    "models": { "type": "object", "description": "named models: cost/quality tiering inside one workflow without forking a process. A model names the connection it is reached on and cannot describe one", "additionalProperties": {
                         "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
                             "model": { "type": "string", "description": "the wire model name sent to the provider" },
+                            "provider": { "type": "string", "description": "the connection: a name under intelligence.providers; default the top-level one. Operator-only" },
                             "window": { "type": "integer", "minimum": 1, "description": "this model's context window, so compaction stops guessing from the model NAME" },
-                            "fallback": { "type": "string", "description": "the tier to degrade to — a ladder that walks down instead of failing" } } } },
-                    "default": { "type": "string", "description": "the tier used when nothing names one" },
-                    "preflight_model": { "type": "string", "description": "the tier preflight runs on — a recurring fixed cost that does not need the answering model" },
-                    "dialect": { "enum": ["openai", "anthropic", "bedrock"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)" },
+                            "fallback": { "type": "string", "description": "the model used when this one is unavailable (every endpoint failed or broken open) — a ladder that walks down, across providers, instead of failing" } } } },
+                    "roles": { "type": "object", "additionalProperties": false, "description": "which model each job runs on; each defaults to turn, and turn to intelligence.model", "properties": {
+                        "turn": { "type": "string", "description": "the model the agent's turns, agent/extract/summarize nodes and subagents run on; the same setting as intelligence.model (set one)" },
+                        "think": role("the think tool and think nodes run on"),
+                        "decide": role("classify, route and judge nodes run on"),
+                        "preflight": role("preflight triage of an inbound message runs on"),
+                        "compaction": role("summarising the transcript runs on"),
+                        "goal": role("the goal check runs on"),
+                        "approve": role("that answers asks on the operator's behalf (approval: auto) runs on. Operator-only") } },
+                    "dialect": dialect,
                     "token": secret,
                     "token_file": { "type": "string" },
                     "headers": string_map,
@@ -216,8 +235,7 @@ fn top_level_properties(
                 "template": { "type": "string", "description": "the system-prompt template; unset = the built-in default, printed by `agentd --context-template`" },
                 "templates": { "type": "object", "additionalProperties": { "type": "string" }, "description": "named alternates a node selects with context: {template: <name>}" },
                 "summarize": { "type": "object", "additionalProperties": false, "description": "compaction's model-facing half", "properties": {
-                    "prompt": { "type": "string", "description": "override the summarizer guidance; the JSON schema it must satisfy is fixed" },
-                    "model": { "type": "string", "description": "summarize on a cheaper model than the instance's" } } } } }));
+                    "prompt": { "type": "string", "description": "override the summarizer guidance; the JSON schema it must satisfy is fixed; the model it runs on is intelligence.roles.compaction" } } } } }));
     m.insert("knowledge".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "server": { "type": "string" },
                 "auto_context": { "type": "object", "additionalProperties": false, "properties": {

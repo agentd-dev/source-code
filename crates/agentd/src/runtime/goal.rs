@@ -19,10 +19,10 @@
 
 use serde_json::{Value, json};
 
-use crate::config::settings::{Goal, GoalAction};
-use crate::intel::client::IntelClient;
+use crate::config::settings::{Goal, GoalAction, ModelRole};
 use crate::runtime::events::Event;
 use crate::state::{Kind, now_ms};
+use crate::subagent::protocol::IntelConfig;
 use crate::wire::intel::{Message, Request};
 
 /// The default check cadence when `goal.check.every` is unset.
@@ -193,12 +193,9 @@ impl crate::runtime::reactor::Runtime {
     /// (`goal.judge`) with `{achieved, stuck, reason}` (+ the counter's `stuck_det`).
     fn spawn_goal_judge(&mut self, g: &Goal, state: &Value, no_progress: u64, stuck_after: u64) {
         self.goal_judge_at = Some(now_ms());
-        let uri = self.intel_uri.clone();
-        let token = self.current_intel_bearer();
-        let headers = self.intel_headers.clone();
-        let aws_auth = self.intel_aws_auth();
-        let dialect = self.intel_dialect();
-        let model = self.model.clone();
+        // The goal check runs on its own role's model (`roles.goal`), on that
+        // model's connection, with its fallbacks.
+        let intel = self.role_config(ModelRole::Goal);
         let tx = self.events_tx.clone();
         let statement = g.statement.clone().unwrap_or_default();
         let stuck_det = no_progress >= stuck_after;
@@ -218,9 +215,7 @@ impl crate::runtime::reactor::Runtime {
         std::thread::Builder::new()
             .name("goal-judge".into())
             .spawn(move || {
-                let mut result = goal_judge_call(
-                    &uri, token, &headers, aws_auth, dialect, &model, &statement, &summary,
-                );
+                let mut result = goal_judge_call(&intel, &statement, &summary);
                 if let Value::Object(m) = &mut result {
                     m.insert("stuck_det".into(), json!(stuck_det));
                 }
@@ -309,37 +304,11 @@ fn goal_every_ms(g: &Goal) -> u64 {
 
 /// The blocking LLM call (on an executor thread): ask the model to judge the goal.
 #[allow(clippy::too_many_arguments)]
-fn goal_judge_call(
-    uri: &str,
-    token: Option<String>,
-    headers: &[(String, String)],
-    aws_auth: Option<crate::config::AuthSpec>,
-    dialect: Option<String>,
-    model: &str,
-    statement: &str,
-    summary: &Value,
-) -> Value {
-    let client = match IntelClient::from_parts(uri, token) {
-        Ok(c) => {
-            #[allow(unused_mut)]
-            let mut c = c
-                .with_headers(headers.to_vec())
-                // The judge dials the same endpoint a turn does, so it must
-                // speak the configured wire dialect and carry the configured
-                // headers — otherwise a working agent has a broken watchdog.
-                .with_dialect(dialect.as_deref());
-            // Sign the judge's dial when the endpoint uses AWS auth, for the
-            // same reason: the credential path cannot differ from a turn's.
-            #[cfg(feature = "oauth")]
-            if let Some(aws) = &aws_auth
-                && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, "intelligence")
-            {
-                c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
-            }
-            #[cfg(not(feature = "oauth"))]
-            let _ = &aws_auth;
-            c
-        }
+fn goal_judge_call(intel: &IntelConfig, statement: &str, summary: &Value) -> Value {
+    // Built as a worker's client is — the dialect, the headers, the signer,
+    // the fallbacks — so a working agent never has a broken watchdog.
+    let client = match intel.client() {
+        Ok(c) => c,
         Err(e) => return json!({"achieved": false, "stuck": false, "error": format!("intel: {e}")}),
     };
     let system = "You are the goal supervisor for an autonomous agent. Given the GOAL and the agent's current STATE, judge whether the goal is achieved and whether the agent is stuck (making no meaningful progress toward it). Reply with ONLY compact JSON: {\"achieved\": <bool>, \"stuck\": <bool>, \"reason\": \"<short>\"}.";
@@ -348,7 +317,7 @@ fn goal_judge_call(
         serde_json::to_string(summary).unwrap_or_default()
     );
     let req = Request {
-        model: model.to_string(),
+        model: intel.model.clone().unwrap_or_default(),
         messages: vec![Message::System(system.to_string()), Message::User(user)],
         tools: vec![],
         max_tokens: 300,

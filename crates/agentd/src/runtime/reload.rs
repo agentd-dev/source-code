@@ -202,16 +202,15 @@ impl Runtime {
         } else {
             None
         };
-        // The intelligence token: a file that cannot be read refuses the
-        // reload, as it refuses a start. Kept as it was, the new endpoint
-        // went live with the old endpoint's credential.
-        let intel_token = if intelligence_moved(old, new) {
+        // The intelligence connections: a token that does not resolve, or a
+        // file that cannot be read, refuses the reload, as it refuses a
+        // start. Rebuilt whole when any connection moved — the endpoints, the
+        // credential, the headers, the login — so nothing about one is a
+        // value copied at startup that a reload leaves behind.
+        let intel = if connections_moved(old, new) {
             let env = self.env.clone();
             let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-            Some(
-                super::resolve_intel_token(new, &envmap)
-                    .map_err(|e| vec![format!("intelligence token: {e}")])?,
-            )
+            Some(super::intel::Conns::build(new, &envmap).map_err(|e| vec![e])?)
         } else {
             None
         };
@@ -227,11 +226,7 @@ impl Runtime {
             Ok(StagedReload { listener, ..rest })
         });
         match staged {
-            Ok(rest) => Ok(StagedReload {
-                intel_token,
-                mcp,
-                ..rest
-            }),
+            Ok(rest) => Ok(StagedReload { intel, mcp, ..rest }),
             Err(errs) => {
                 if let Some(m) = mcp {
                     self.discard_mcp(m);
@@ -583,7 +578,7 @@ impl Runtime {
             None
         };
         Ok(StagedReload {
-            intel_token: None,
+            intel: None,
             mcp: None,
             registry,
             workflows,
@@ -603,7 +598,7 @@ impl Runtime {
     fn commit_reload(&mut self, old: &cfg::Settings, staged: StagedReload) -> Vec<&'static str> {
         let new = self.settings.clone();
         let StagedReload {
-            intel_token,
+            intel,
             mcp,
             registry,
             workflows,
@@ -614,13 +609,23 @@ impl Runtime {
             listener,
         } = staged;
         let mut changed = Vec::new();
+        let intel_moved = intel.is_some();
 
         // Intelligence is hot-swappable: workers in flight keep dialing the
-        // endpoint they were spawned with, the next spawned worker uses this.
-        if let Some(token) = intel_token {
-            self.intel_uri = new.intelligence.endpoint_list().unwrap_or_default();
-            self.model = new.intelligence.model.clone().unwrap_or_default();
-            self.intel_token = token;
+        // connection they were spawned with, the next spawned worker uses
+        // this. Which model each job runs on is not held here at all — it
+        // resolves against the settings at each call — so a reload that only
+        // moves a role or a model takes effect without anything to swap.
+        let models_moved = old.intelligence.model != new.intelligence.model
+            || old.intelligence.models != new.intelligence.models
+            || old.intelligence.roles != new.intelligence.roles;
+        if let Some(conns) = intel {
+            self.intel = conns;
+        }
+        if intel_moved || models_moved {
+            // Running subagents are handed theirs; a turn worker is one turn
+            // long, and the next one is built from the settings as they are.
+            self.swap_subagent_intelligence();
             changed.push("intelligence");
         }
         // Budgets: new windows, counters carried over.
@@ -961,8 +966,8 @@ impl Runtime {
 /// `commit_reload` switches in. A `None` is a section the reload leaves as
 /// it is.
 struct StagedReload {
-    /// The resolved intelligence token, when intelligence changed.
-    intel_token: Option<Option<String>>,
+    /// The intelligence connections, rebuilt when any of them moved.
+    intel: Option<super::intel::Conns>,
     mcp: Option<StagedMcp>,
     /// The registry to switch in, and whether the tools callers see moved
     /// (a rebuild is always reported); `None` keeps the running one.
@@ -1022,11 +1027,18 @@ fn server_timeout(settings: &cfg::Settings, server: &cfg::McpServer) -> Duration
 }
 
 /// Whether the reload moves what a turn worker dials the model with.
-fn intelligence_moved(old: &cfg::Settings, new: &cfg::Settings) -> bool {
-    old.intelligence.endpoints != new.intelligence.endpoints
-        || old.intelligence.model != new.intelligence.model
-        || old.intelligence.token != new.intelligence.token
-        || old.intelligence.token_file != new.intelligence.token_file
+/// Whether any intelligence connection's settings differ: the top-level
+/// one's or any provider's, added, removed or changed.
+fn connections_moved(old: &cfg::Settings, new: &cfg::Settings) -> bool {
+    let (o, n) = (&old.intelligence, &new.intelligence);
+    o.endpoints != n.endpoints
+        || o.dialect != n.dialect
+        || o.token != n.token
+        || o.token_file != n.token_file
+        || o.headers != n.headers
+        || o.auth != n.auth
+        || o.timeout != n.timeout
+        || o.providers != n.providers
 }
 
 /// The workflows that register a tool, by name, with the definition hash the

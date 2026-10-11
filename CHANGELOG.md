@@ -219,6 +219,81 @@ tracks a draft.
 sent one at a time); agentd's answers to a server's requests are bounded at
 5s; an elicitation's `$schema` and property order are kept.
 
+### Kinds of intelligence (RFC 0046 P1)
+
+**Changed (breaking).**
+
+- **Model choice per job is `intelligence.roles`**: `turn`, `think`,
+  `decide`, `preflight`, `compaction`, `goal`, `approve`. Each names a model
+  and defaults to `turn`; `turn` is `intelligence.model` said another way, and
+  setting both is refused ("say it once"). Three keys are removed, not
+  aliased — an old key is an unknown key at load: `intelligence.default` →
+  `roles.turn`, `intelligence.preflight_model` → `roles.preflight`,
+  `context.summarize.model` → `roles.compaction`. `--model`/`MODEL` are
+  unchanged.
+- A workflow node with no `model:` runs on its kind's role: `think` on
+  `think`, `classify`/`route`/`judge` on `decide`, `agent`/`extract`/
+  `summarize` on `turn`. With no role bound, every one runs on `turn`, as
+  before.
+- The goal check runs on `roles.goal` and the `approval: auto` judge on
+  `roles.approve` (both the turn's model until bound). `roles.approve` is
+  operator-only, and resolves in the operator's own section — its models,
+  its fallbacks, its turn model when unbound — so a served document cannot
+  pick the judge of its own gates by declaring a model under its name or
+  binding `turn`.
+- A turn model the operator names wins over a served document's, in either
+  spelling (`intelligence.model`, `roles.turn`); the document's is dropped
+  with a warning rather than refused as said twice.
+- Refusals name a "model" where they said "tier": `… is not a declared
+  model`.
+- `intelligence.timeout` is applied: one call's ceiling on the connection
+  (default 120 s, which every call used — the key was accepted and read by
+  nothing).
+- `intelligence.token` wins over `token_file` when both are set, as the load
+  warning always said (the file won at the dial).
+
+**Added.**
+
+- `intelligence.providers.<name>` — further connections, with the top-level
+  one's vocabulary and nothing more (`endpoints`, `dialect`, `token`/
+  `token_file`, `headers`, `auth`, `timeout`), each with its own client,
+  failover, breakers and credential refresh, checked by the same rules,
+  egress-checked under `egress: closed`, an inline `token` in a file refused,
+  reloadable, and operator-only. Every endpoint of a provider dials with its
+  own credential; the `AGENTD_INTELLIGENCE_TOKEN*` overrides are the top-level
+  connection's alone. A model reaches one by name:
+  `intelligence.models.<n>.provider`; a model a served document declares
+  cannot name one. A discovered config file that adds a provider is warned
+  about, as one that sets `intelligence.endpoints` is.
+- `agentd --login intelligence:<provider>` logs into a provider's `oauth2`
+  (or `aws` SSO) credential, cached under that target.
+- `turn.model` names the `role` and `provider`; `turn.model_fallback` says
+  when a fallback served a call; `intel.swap.sent` when a reload handed
+  running subagents their model again.
+
+**Fixed.**
+
+- A model's `fallback` is walked: when a model is unavailable — every
+  endpoint failed or broken open — the call is asked of its fallback, with
+  the fallback's wire model on its own provider, and down the chain. It was
+  validated and never read.
+- `budget.degrade.model` reaches the worker resolved — a model's wire name,
+  on its provider; a model's NAME was sent to the provider as a model.
+- A reload set the turn model to the literal `intelligence.model`, ignoring
+  `default` and the tiers, and never rebuilt the headers or the OAuth bearer.
+  Nothing about a model is copied at startup now: each call resolves against
+  the live settings, and a reload that moves any connection rebuilds every
+  one.
+- A reload reaches running subagents: each is handed its model resolved again
+  and applies it at its next turn boundary under `intelligence.swap_policy`.
+  The child always honoured the swap frame; nothing sent it, so a warm
+  subagent dialed what it was spawned with for as long as it lived, and
+  `swap_policy` did nothing.
+- A restored subagent resolves its own model again; it was respawned on the
+  parent's turn model, whatever it had been spawned on.
+- A subagent's stored payload no longer carries its resolved intelligence
+  headers, which may hold credentials; only the model reference is kept.
+
 ### Security (breaking)
 
 - **A stream carries the taint of what feeds it, and a workflow that reads

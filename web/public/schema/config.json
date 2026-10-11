@@ -3343,12 +3343,8 @@
           "additionalProperties": false,
           "description": "compaction's model-facing half",
           "properties": {
-            "model": {
-              "description": "summarize on a cheaper model than the instance's",
-              "type": "string"
-            },
             "prompt": {
-              "description": "override the summarizer guidance; the JSON schema it must satisfy is fixed",
+              "description": "override the summarizer guidance; the JSON schema it must satisfy is fixed; the model it runs on is intelligence.roles.compaction",
               "type": "string"
             }
           },
@@ -3518,10 +3514,6 @@
           },
           "type": "object"
         },
-        "default": {
-          "description": "the tier used when nothing names one",
-          "type": "string"
-        },
         "dialect": {
           "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)",
           "enum": [
@@ -3551,7 +3543,7 @@
           "type": "object"
         },
         "model": {
-          "description": "the default model — a declared `models:` tier name, or a literal model string",
+          "description": "the turn model — a declared `models:` name, or a literal model string; the same setting as roles.turn (set one)",
           "type": "string"
         },
         "models": {
@@ -3559,11 +3551,15 @@
             "additionalProperties": false,
             "properties": {
               "fallback": {
-                "description": "the tier to degrade to — a ladder that walks down instead of failing",
+                "description": "the model used when this one is unavailable (every endpoint failed or broken open) — a ladder that walks down, across providers, instead of failing",
                 "type": "string"
               },
               "model": {
                 "description": "the wire model name sent to the provider",
+                "type": "string"
+              },
+              "provider": {
+                "description": "the connection: a name under intelligence.providers; default the top-level one. Operator-only",
                 "type": "string"
               },
               "window": {
@@ -3577,12 +3573,101 @@
             ],
             "type": "object"
           },
-          "description": "named model tiers: cost/quality tiering inside one workflow without forking a process. A tier points AT a `services:` entry and may only narrow — it inherits that service's trifecta tags and can never declare its own floor.",
+          "description": "named models: cost/quality tiering inside one workflow without forking a process. A model names the connection it is reached on and cannot describe one",
           "type": "object"
         },
-        "preflight_model": {
-          "description": "the tier preflight runs on — a recurring fixed cost that does not need the answering model",
-          "type": "string"
+        "providers": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "auth": {
+                "$ref": "#/$defs/Auth"
+              },
+              "dialect": {
+                "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)",
+                "enum": [
+                  "openai",
+                  "anthropic",
+                  "bedrock"
+                ]
+              },
+              "endpoints": {
+                "description": "ordered endpoint list (failover); one comma-separated string is accepted",
+                "oneOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              },
+              "headers": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "timeout": {
+                "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+                "type": [
+                  "string",
+                  "integer"
+                ]
+              },
+              "token": {
+                "description": "a secret — from a file it MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference; env/flag values may be inline",
+                "type": "string"
+              },
+              "token_file": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "endpoints"
+            ],
+            "type": "object"
+          },
+          "description": "further connections, by name: a second vendor, a gateway. A model reaches one with `provider:`. Operator-only; egress-checked like intelligence.endpoints",
+          "type": "object"
+        },
+        "roles": {
+          "additionalProperties": false,
+          "description": "which model each job runs on; each defaults to turn, and turn to intelligence.model",
+          "properties": {
+            "approve": {
+              "description": "the model that answers asks on the operator's behalf (approval: auto) runs on. Operator-only; default: roles.turn",
+              "type": "string"
+            },
+            "compaction": {
+              "description": "the model summarising the transcript runs on; default: roles.turn",
+              "type": "string"
+            },
+            "decide": {
+              "description": "the model classify, route and judge nodes run on; default: roles.turn",
+              "type": "string"
+            },
+            "goal": {
+              "description": "the model the goal check runs on; default: roles.turn",
+              "type": "string"
+            },
+            "preflight": {
+              "description": "the model preflight triage of an inbound message runs on; default: roles.turn",
+              "type": "string"
+            },
+            "think": {
+              "description": "the model the think tool and think nodes run on; default: roles.turn",
+              "type": "string"
+            },
+            "turn": {
+              "description": "the model the agent's turns, agent/extract/summarize nodes and subagents run on; the same setting as intelligence.model (set one)",
+              "type": "string"
+            }
+          },
+          "type": "object"
         },
         "structured_output": {
           "enum": [

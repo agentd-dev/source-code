@@ -222,6 +222,7 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         tool_calls,
         stop_reason,
         usage: usage.unwrap_or_default(),
+        fallback: None,
     })
 }
 

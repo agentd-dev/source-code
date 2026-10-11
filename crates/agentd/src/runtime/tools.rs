@@ -1325,6 +1325,7 @@ impl Runtime {
             deadline_ms: 300_000,
             agent_path: format!("think/{ctx_id}"),
             model: None,
+            role: crate::config::settings::ModelRole::Think,
         };
         self.spawn_turn(launch)
     }

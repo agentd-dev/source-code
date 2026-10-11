@@ -84,6 +84,22 @@ impl EndpointList {
         default_token: Option<String>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<EndpointList, IntelError> {
+        Self::build(uri, &|i| resolve_token(i, default_token.as_deref(), env))
+    }
+
+    /// A named provider's endpoint list (`intelligence.providers.<name>`):
+    /// every endpoint dials with the provider's own `token`, and nothing from
+    /// the environment. The `AGENTD_INTELLIGENCE_TOKEN*` overrides are the
+    /// top-level connection's — read here, they sent its key to every other
+    /// vendor and silently replaced the provider's own.
+    pub fn parse_own(uri: &str, token: Option<String>) -> Result<EndpointList, IntelError> {
+        Self::build(uri, &|_| Ok(token.clone()))
+    }
+
+    fn build(
+        uri: &str,
+        token_of: &dyn Fn(usize) -> Result<Option<String>, IntelError>,
+    ) -> Result<EndpointList, IntelError> {
         let provider = Provider::OpenAiCompatible;
         let parts: Vec<&str> = uri
             .split(',')
@@ -98,7 +114,7 @@ impl EndpointList {
         let mut eps = Vec::with_capacity(parts.len());
         for (i, part) in parts.iter().enumerate() {
             let (transport, http_path, host_header) = resolve(part, provider)?;
-            let token = resolve_token(i, default_token.as_deref(), env)?;
+            let token = token_of(i)?;
             let scheme = scheme_of(part);
             eps.push(Endpoint {
                 transport,
@@ -590,6 +606,19 @@ mod tests {
             .unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("tok-a"));
         assert_eq!(list.ep(1).token.as_deref(), Some("tok-b"));
+    }
+
+    /// A named provider's endpoints all dial with its own token: the
+    /// positional env overrides belong to the top-level connection.
+    #[test]
+    fn a_providers_endpoints_share_its_own_token() {
+        let list = EndpointList::parse_own(
+            "https://a.example,https://b.example",
+            Some("provider-key".into()),
+        )
+        .unwrap();
+        assert_eq!(list.ep(0).token.as_deref(), Some("provider-key"));
+        assert_eq!(list.ep(1).token.as_deref(), Some("provider-key"));
     }
 
     #[test]

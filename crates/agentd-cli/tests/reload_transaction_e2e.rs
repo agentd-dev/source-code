@@ -689,7 +689,7 @@ fn an_unreadable_intelligence_token_refuses_the_reload() {
             .iter()
             .any(|e| e["error"]
                 .as_str()
-                .is_some_and(|m| m.contains("intelligence token"))),
+                .is_some_and(|m| m.contains("intelligence.token_file"))),
         "{log}"
     );
     std::fs::write(&cfg, &original).unwrap();

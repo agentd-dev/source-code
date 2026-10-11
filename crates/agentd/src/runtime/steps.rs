@@ -11,7 +11,7 @@ use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
 use crate::config::fileset::{Dir, expand_dir_ordered};
-use crate::config::settings::substitute_config_vars;
+use crate::config::settings::{ModelRole, substitute_config_vars};
 use crate::context::Msg;
 use crate::engine::model::{OnError, Step, Workflow, parse_workflow};
 use crate::engine::run::{
@@ -78,6 +78,18 @@ pub(crate) struct PreparedWorkflows {
     shadowed: Vec<(String, Value)>,
     /// Warnings about the set, logged once it is live.
     warnings: Vec<(&'static str, Value)>,
+}
+
+/// The role whose model an intelligence node runs on when it names none
+/// (RFC 0046 §6): a `think` node thinks, a `classify`, `route` or `judge`
+/// node decides, and everything that writes for the agent — `agent`,
+/// `extract`, `summarize` — runs on the turn's model.
+pub(crate) fn node_role(kind: &str) -> ModelRole {
+    match kind {
+        "think" => ModelRole::Think,
+        "classify" | "route" | "judge" => ModelRole::Decide,
+        _ => ModelRole::Turn,
+    }
 }
 
 impl Runtime {
@@ -2000,7 +2012,10 @@ impl Runtime {
                     })
                     .ok();
             }
-            "agent" | "think" => self.step_turn(run_id, step_id, &step, &spec, &data),
+            "agent" | "think" => {
+                let role = node_role(&step.kind);
+                self.step_turn(run_id, step_id, &step, &spec, &data, role)
+            }
             "foreach" | "batch" | "iterate" | "parallel" | "race" | "subgraph" => {
                 self.nested_start(run_id, step_id, &step, &spec)
             }
@@ -2319,11 +2334,13 @@ impl Runtime {
         step: &Step,
         spec: &Map<String, Value>,
         data: &template::Data,
+        role: ModelRole,
     ) {
-        self.step_turn(run_id, step_id, step, spec, data)
+        self.step_turn(run_id, step_id, step, spec, data, role)
     }
 
-    /// An `agent`/`think` step → a turn worker (budget-admitted).
+    /// An `agent`/`think` step → a turn worker (budget-admitted), on the
+    /// node's `model:` or else `role`'s.
     fn step_turn(
         &mut self,
         run_id: &str,
@@ -2331,6 +2348,7 @@ impl Runtime {
         step: &Step,
         spec: &Map<String, Value>,
         data: &template::Data,
+        role: ModelRole,
     ) {
         let is_think = step.kind == "think";
         let prompt = if is_think {
@@ -2587,6 +2605,7 @@ impl Runtime {
             deadline_ms,
             agent_path: format!("run/{run_id}/{step_id}"),
             model: node_model,
+            role,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {

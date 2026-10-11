@@ -5,7 +5,8 @@
 //! to the per-user file cache the daemon reads at startup.
 //!
 //! `<target>` is `mcp:<name>` (an MCP server), `service:<name>` (a catalog
-//! entry shared by several servers), or `intelligence`. The flow is
+//! entry shared by several servers), `intelligence`, or
+//! `intelligence:<provider>` (a named intelligence connection). The flow is
 //! fail-closed: a token is cached only on success, and nothing is printed but
 //! the code and URL — never the token itself.
 
@@ -24,14 +25,13 @@ pub struct DevicePrompt<'a> {
 }
 
 /// Find a target's `auth:` block in the settings. `mcp:<name>` → that server;
-/// `intelligence` → the intelligence block.
+/// `intelligence` → the top-level intelligence connection;
+/// `intelligence:<name>` → that provider.
 pub fn resolve_auth<'a>(settings: &'a Settings, target: &str) -> Result<&'a Auth, String> {
-    if target == "intelligence" {
-        return settings
-            .intelligence
+    if let Some(c) = intelligence_connection(settings, target)? {
+        return c
             .auth
-            .as_ref()
-            .ok_or_else(|| "intelligence has no `auth:` block to log in with".to_string());
+            .ok_or_else(|| format!("{} has no `auth:` block to log in with", c.at()));
     }
     if let Some(name) = target.strip_prefix("mcp:") {
         let s = settings
@@ -58,8 +58,34 @@ pub fn resolve_auth<'a>(settings: &'a Settings, target: &str) -> Result<&'a Auth
             .ok_or_else(|| format!("services.{name} has no `auth:` block to log in with"));
     }
     Err(format!(
-        "unknown login target '{target}' (expected `intelligence`, `mcp:<name>` or `service:<name>`)"
+        "unknown login target '{target}' (expected `intelligence`, `intelligence:<provider>`, `mcp:<name>` or `service:<name>`)"
     ))
+}
+
+/// The intelligence connection a target names — `intelligence`, or
+/// `intelligence:<provider>` — or `None` for a target of another kind.
+fn intelligence_connection<'a>(
+    settings: &'a Settings,
+    target: &str,
+) -> Result<Option<crate::config::settings::Connection<'a>>, String> {
+    let provider = match target.strip_prefix("intelligence") {
+        Some("") => None,
+        Some(rest) => match rest.strip_prefix(':') {
+            Some(name) => Some(name),
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    settings
+        .intelligence
+        .connection(provider)
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "no provider named '{}' under intelligence.providers",
+                provider.unwrap_or_default()
+            )
+        })
 }
 
 pub use super::canonical_target;
@@ -211,8 +237,8 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
     }
     // The resource being logged into (RFC 9728 issuer discovery when no issuer
     // is configured): the MCP server's endpoint, or the primary intel endpoint.
-    let resource: Option<String> = if target == "intelligence" {
-        settings.intelligence.endpoints.first().cloned()
+    let resource: Option<String> = if let Some(c) = intelligence_connection(settings, target)? {
+        c.endpoints.first().cloned()
     } else if let Some(name) = target.strip_prefix("mcp:") {
         settings
             .mcp

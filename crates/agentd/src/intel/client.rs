@@ -147,6 +147,18 @@ pub struct IntelClient {
     health_reporter: Option<Box<dyn Fn(IntelHealthReport)>>,
     /// Last all-down state observed by the reporter, so we only fire on a change.
     last_all_down: std::cell::Cell<bool>,
+    /// The model asked when this one is unavailable, on its own connection
+    /// (`intelligence.models.<n>.fallback`, RFC 0046). Asked per call rather
+    /// than switched to for good: the next call tries this client first, and
+    /// with its breakers open that costs no dial, while a breaker that has
+    /// cooled half-opens and the primary is back the moment it answers.
+    fallback: Option<Box<Fallback>>,
+}
+
+/// The next link of a fallback chain: its client and the wire model it sends.
+struct Fallback {
+    client: IntelClient,
+    model: String,
 }
 
 /// The edge-triggered intelligence-reachability report a child emits upward.
@@ -201,8 +213,18 @@ impl IntelClient {
     /// endpoint resolves its own `_<N>`-suffixed token instead of inheriting
     /// this one, so a fallback never dials with the primary's credential.
     pub fn from_parts(uri: &str, default_token: Option<String>) -> Result<IntelClient, IntelError> {
-        let list = EndpointList::parse(uri, default_token)?;
-        Ok(IntelClient {
+        Ok(Self::from_list(EndpointList::parse(uri, default_token)?))
+    }
+
+    /// A named provider's client: every endpoint dials with `token`, the
+    /// provider's own; the environment's token overrides are the top-level
+    /// connection's ([`EndpointList::parse_own`]).
+    pub fn from_provider(uri: &str, token: Option<String>) -> Result<IntelClient, IntelError> {
+        Ok(Self::from_list(EndpointList::parse_own(uri, token)?))
+    }
+
+    fn from_list(list: EndpointList) -> IntelClient {
+        IntelClient {
             list: RefCell::new(list),
             // Generous per-call ceiling; the run deadline is the real bound.
             timeout: Duration::from_secs(120),
@@ -210,7 +232,23 @@ impl IntelClient {
             alldown: None,
             health_reporter: None,
             last_all_down: std::cell::Cell::new(false),
-        })
+            fallback: None,
+        }
+    }
+
+    /// The ceiling on one call; `None` keeps the default (120 s).
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> IntelClient {
+        if let Some(t) = timeout {
+            self.timeout = t;
+        }
+        self
+    }
+
+    /// Ask `model` on `client` when this client's model is unavailable.
+    /// Builder-style; a chain is built tail first.
+    pub fn with_fallback(mut self, client: IntelClient, model: String) -> IntelClient {
+        self.fallback = Some(Box::new(Fallback { client, model }));
+        self
     }
 
     /// Attach the configured `intelligence.headers`, applied to every endpoint
@@ -265,6 +303,9 @@ impl IntelClient {
     /// Stamp the run's trace id so each completion carries a `traceparent`
     /// header and the model call joins the run's distributed trace.
     pub fn set_trace_id(&mut self, trace_id: Option<String>) {
+        if let Some(f) = &mut self.fallback {
+            f.client.set_trace_id(trace_id.clone());
+        }
         self.trace_id = trace_id;
     }
 
@@ -274,8 +315,14 @@ impl IntelClient {
     /// `once`-mode leaves this unset, so a single sweep leads to exit 4. The run
     /// deadline still bounds the total wait — backoff never extends it, so a
     /// daemon cannot outlive its deadline by retrying.
+    ///
+    /// With a fallback, the wait belongs to the last link: an unavailable
+    /// model is handed to its fallback at once rather than retried first.
     pub fn enable_alldown_backoff(&mut self, policy: AllDownPolicy) {
-        self.alldown = Some(policy);
+        match &mut self.fallback {
+            Some(f) => f.client.enable_alldown_backoff(policy),
+            None => self.alldown = Some(policy),
+        }
     }
 
     /// The number of configured endpoints; one means no fallback exists.
@@ -294,7 +341,10 @@ impl IntelClient {
     /// client preserves the daemon's resilience posture across a repoint rather
     /// than silently reverting to one-shot semantics.
     pub fn alldown_enabled(&self) -> bool {
-        self.alldown.is_some()
+        match &self.fallback {
+            Some(f) => f.client.alldown_enabled(),
+            None => self.alldown.is_some(),
+        }
     }
 
     /// One completion round-trip, driven through the failover policy. Every
@@ -308,7 +358,51 @@ impl IntelClient {
     /// failure (401/403) is NEVER backed off: it is a misconfiguration that
     /// retrying cannot repair, and retrying it would only delay the operator's
     /// signal.
+    ///
+    /// A model that is unavailable — every endpoint failed, or every breaker
+    /// is open — is asked of its fallback, with the fallback's model; the
+    /// response names the model that answered ([`Response::fallback`]).
+    ///
+    /// With a fallback, the reachability report covers the whole chain: the
+    /// intelligence is down only when no model in it answered. A model whose
+    /// connection is gone while its fallback serves is not an outage — and,
+    /// reported as one, it held `/readyz` at 503 for as long as the model
+    /// stayed gone, which is the case a fallback exists for.
     pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
+        let Some(f) = &self.fallback else {
+            return self.complete_here(req);
+        };
+        let outcome = match self.complete_here(req) {
+            Err(e) if unavailable(&e) => {
+                let mut next = req.clone();
+                next.model = f.model.clone();
+                f.client.complete(&next).map(|mut resp| {
+                    resp.fallback.get_or_insert_with(|| f.model.clone());
+                    resp
+                })
+            }
+            outcome => outcome,
+        };
+        let all_down = outcome.is_err() && self.list.borrow().all_down();
+        self.report_health(all_down);
+        outcome
+    }
+
+    /// Tell the supervisor of an all-down transition, and only of one, so it
+    /// latches the child's reachability and the steady state pays a bool
+    /// compare. Carries transport and index only — never a URL or secret.
+    fn report_health(&self, all_down: bool) {
+        if let Some(report) = &self.health_reporter
+            && self.last_all_down.replace(all_down) != all_down
+        {
+            let list = self.list.borrow();
+            let active = (!all_down).then(|| list.active_identity());
+            report(IntelHealthReport { all_down, active });
+        }
+    }
+
+    /// One completion on this client's own endpoints.
+    fn complete_here(&self, req: &Request) -> Result<Response, IntelError> {
         // One model call. A no-op when metrics are not enabled.
         crate::obs::metrics::record_intel_call();
 
@@ -325,30 +419,29 @@ impl IntelClient {
                 let all_down = list.all_down();
                 let active_up = list.ep(list.active()).health.is_up();
                 crate::obs::metrics::set_intel_up(active_up && !all_down);
-                // Upward report: fire ONLY on an all-down transition, so the
-                // supervisor latches the child's reachability and the steady
-                // state pays just this bool compare. Carries transport and index
-                // only — never a URL or secret.
-                if let Some(report) = &self.health_reporter
-                    && self.last_all_down.replace(all_down) != all_down
-                {
-                    let active = (!all_down).then(|| list.active_identity());
-                    report(IntelHealthReport { all_down, active });
-                }
+            }
+            // Upward report, per sweep, so a daemon backing off reports the
+            // outage while it waits. With a fallback, the chain reports once
+            // it is done ([`Self::complete`]).
+            if self.fallback.is_none() {
+                let all_down = self.list.borrow().all_down();
+                self.report_health(all_down);
             }
 
             match sweep.outcome {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     crate::obs::metrics::record_intel_error(error_reason(&e));
-                    // Back off and re-arm only when all three hold: the list is
-                    // all-down, a daemon backoff policy is installed, and the
-                    // cause is not an auth failure. Anything else — a fatal
-                    // class, no policy, or an exhausted retry budget — surfaces
-                    // to the caller now.
+                    // Back off and re-arm only when all four hold: the list is
+                    // all-down, a daemon backoff policy is installed, the cause
+                    // is not an auth failure, and there is no fallback model to
+                    // ask instead. Anything else — a fatal class, no policy, an
+                    // exhausted retry budget, a fallback — surfaces to the
+                    // caller now.
                     let backoff = match (&self.alldown, &e) {
                         (Some(p), IntelError::AllEndpointsDown(cause))
-                            if !cause.as_deref().is_some_and(failover::is_auth)
+                            if self.fallback.is_none()
+                                && !cause.as_deref().is_some_and(failover::is_auth)
                                 && attempt < p.max_retries =>
                         {
                             *p
@@ -363,6 +456,18 @@ impl IntelClient {
                 }
             }
         }
+    }
+}
+
+/// Whether `e` says the model cannot be reached at all — every endpoint
+/// failed or is broken open, or the dial itself failed — which is when a
+/// fallback model is asked. An auth failure is not unavailability: it is a
+/// misconfiguration a different model would only hide.
+fn unavailable(e: &IntelError) -> bool {
+    match e {
+        IntelError::AllEndpointsDown(cause) => !cause.as_deref().is_some_and(failover::is_auth),
+        IntelError::Transport(_) => true,
+        _ => false,
     }
 }
 
@@ -593,6 +698,38 @@ mod tests {
             "unreachable"
         );
         assert_eq!(error_reason(&IntelError::Http(401, "x".into())), "auth");
+    }
+
+    /// A model whose connection is gone while its fallback answers is not an
+    /// outage: the chain reports all-down only when no model in it answered.
+    #[test]
+    fn a_fallback_that_answers_keeps_the_chain_reachable() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let backup = IntelClient::from_parts("mock:final", None).unwrap();
+        let mut chain = IntelClient::from_parts("http://127.0.0.1:9", None)
+            .unwrap()
+            .with_fallback(backup, "m-backup".into());
+        let reports: Rc<RefCell<Vec<bool>>> = Rc::default();
+        let seen = Rc::clone(&reports);
+        chain.set_health_reporter(Box::new(move |r| seen.borrow_mut().push(r.all_down)));
+        let req = Request {
+            model: "m-main".into(),
+            messages: vec![crate::wire::intel::Message::User("hi".into())],
+            tools: vec![],
+            max_tokens: 16,
+            temperature: Some(0.0),
+        };
+        // Past the breaker's threshold, so the dead model is broken open.
+        for _ in 0..4 {
+            let resp = chain.complete(&req).unwrap();
+            assert_eq!(resp.fallback.as_deref(), Some("m-backup"));
+        }
+        assert!(
+            chain.list.borrow().all_down(),
+            "the dead model is broken open"
+        );
+        assert!(!reports.borrow().contains(&true), "{:?}", reports.borrow());
     }
 
     #[test]

@@ -214,24 +214,10 @@ pub fn run() -> i32 {
         serde_json::json!({"depth": payload.depth, "warm": payload.warm}),
     );
 
-    let mut intel = match IntelClient::from_parts(
-        &payload.intelligence.uri,
-        payload.intelligence.token.clone(),
-    ) {
-        Ok(c) => {
-            // The resolved `intelligence.headers` ride every dial.
-            #[allow(unused_mut)]
-            let mut c = c
-                .with_headers(payload.intelligence.headers.clone())
-                // Select the wire dialect: `bedrock` speaks Converse.
-                .with_dialect(payload.intelligence.dialect.as_deref());
-            // An `intelligence.auth: {kind: aws}` SigV4-signs the LLM dial.
-            #[cfg(feature = "oauth")]
-            if let Some(aws) = &payload.intelligence.aws_auth
-                && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, "intelligence")
-            {
-                c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
-            }
+    // The model's connection — headers, dialect, signer, timeout — and its
+    // fallback chain, each link on its own connection.
+    let mut intel = match payload.intelligence.client() {
+        Ok(mut c) => {
             // Outbound LLM calls join the run's distributed trace.
             c.set_trace_id(payload.telemetry.trace_id.clone());
             // Bridge this child's intel reachability UP to the supervisor, which
@@ -571,8 +557,9 @@ fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
     log.info("loop.resumed", serde_json::json!({}));
 }
 
-/// Rebuild an [`IntelClient`] from a hot-swap's endpoint list. A repointed
-/// endpoint starts with its breaker CLOSED: a fresh
+/// Rebuild an [`IntelClient`] from a hot-swap's model as it now resolves —
+/// its connection, credential and fallbacks. A repointed endpoint starts
+/// with its breaker CLOSED: a fresh
 /// [`crate::intel::endpoints::EndpointList`] gives every endpoint a brand-new
 /// `HealthRecord`, so failures recorded against the endpoint that was just
 /// replaced cannot condemn the one that replaced it. The run's trace id is
@@ -581,7 +568,7 @@ fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
 /// unparseable; the caller then keeps the existing client, so a malformed swap
 /// never tears down a working run.
 fn rebuild_intel(swap: &SwapIntel, old: &IntelClient, log: &Logger) -> Option<IntelClient> {
-    match IntelClient::from_parts(&swap.uri, swap.token.clone()) {
+    match swap.intelligence.client() {
         Ok(mut c) => {
             c.set_trace_id(old.trace_id().map(str::to_string));
             // A warm, long-lived loop keeps its all-down backoff across a swap:
@@ -648,7 +635,11 @@ fn apply_pending_swap(
         return; // fast path: no swap pending
     };
     let from_model = model.clone();
-    let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
+    let to_model = swap
+        .intelligence
+        .model
+        .clone()
+        .unwrap_or_else(|| from_model.clone());
     let endpoint_change = match rebuild_intel(&swap, intel, log) {
         Some(mut c) => {
             // The rebuilt client has fresh breakers and no reporter, so
@@ -679,7 +670,11 @@ fn apply_pending_swap_warm(
         return; // fast path: no swap pending
     };
     let from_model = session.model().to_string();
-    let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
+    let to_model = swap
+        .intelligence
+        .model
+        .clone()
+        .unwrap_or_else(|| from_model.clone());
     let endpoint_change = match rebuild_intel(&swap, intel, log) {
         Some(mut c) => {
             // The rebuilt client has fresh breakers and no reporter, so
@@ -706,9 +701,11 @@ fn apply_pending_swap_warm(
 fn restart_turn_pending(pending: &PendingSwap, current_model: &str) -> bool {
     let guard = pending.lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_ref() {
-        Some(swap) if swap.policy == SwapPolicy::RestartTurn => {
-            swap.model.as_deref().is_some_and(|m| m != current_model)
-        }
+        Some(swap) if swap.policy == SwapPolicy::RestartTurn => swap
+            .intelligence
+            .model
+            .as_deref()
+            .is_some_and(|m| m != current_model),
         _ => false,
     }
 }
@@ -886,7 +883,7 @@ fn spawn_control_thread(
                         id,
                         ok,
                         wait_ms,
-                        model,
+                        degrade,
                         reason,
                     }) => {
                         replies.deliver(
@@ -894,7 +891,7 @@ fn spawn_control_thread(
                             crate::subagent::replies::Reply::Budget {
                                 ok,
                                 wait_ms,
-                                model,
+                                degrade,
                                 reason,
                             },
                         );
@@ -1050,9 +1047,11 @@ mod tests {
 
     fn swap_to(uri: &str, model: Option<&str>, policy: SwapPolicy) -> SwapIntel {
         SwapIntel {
-            uri: uri.into(),
-            token: None,
-            model: model.map(str::to_string),
+            intelligence: crate::subagent::protocol::IntelConfig {
+                uri: uri.into(),
+                model: model.map(str::to_string),
+                ..Default::default()
+            },
             policy,
         }
     }
@@ -1131,9 +1130,12 @@ mod tests {
         // LABEL, never `{other:?}`, which would Debug-print a plaintext token or
         // an injected instruction to stderr.
         let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
-            uri: "https://secret-host.example/secret-path".into(),
-            token: Some("super-secret-token".into()),
-            model: Some("m".into()),
+            intelligence: crate::subagent::protocol::IntelConfig {
+                uri: "https://secret-host.example/secret-path".into(),
+                token: Some("super-secret-token".into()),
+                model: Some("m".into()),
+                ..Default::default()
+            },
             policy: SwapPolicy::FinishOnOld,
         }));
         let mut buf = Vec::new();

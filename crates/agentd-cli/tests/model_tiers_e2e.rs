@@ -48,7 +48,7 @@ const TIERS: &str = "intelligence:\n  endpoints: \"mock:json\"\n\
     \x20 models:\n\
     \x20   big:   { model: big-model-1, window: 200000, fallback: small }\n\
     \x20   small: { model: small-model-3, window: 128000 }\n\
-    \x20 default: big\n";
+    \x20 roles: { turn: big }\n";
 
 /// A step naming a tier runs on that tier's wire model — cost tiering inside
 /// one workflow, with no second process.
@@ -95,7 +95,7 @@ fn every_shaping_preset_can_name_a_tier() {
         \x20 models:\n\
         \x20   big:   {{ model: big-model-1, window: 200000 }}\n\
         \x20   small: {{ model: small-model-3, window: 128000 }}\n\
-        \x20 default: big\n"
+        \x20 roles: {{ turn: big }}\n"
     );
     let cases = [
         ("classify", "input: hello, classes: [a, b]"),
@@ -138,15 +138,15 @@ fn an_unknown_tier_on_a_shaping_kind_is_refused_at_startup() {
     ));
     assert_eq!(code, Some(2), "{log}");
     assert!(
-        log.contains("is not a declared tier"),
+        log.contains("is not a declared model"),
         "the refusal should name the typo\n{log}"
     );
 }
 
-/// The instance default resolves through the catalogue too, so `default: big`
-/// means the wire name, not the tier name, reaches the provider.
+/// The turn role resolves through the catalogue too, so `roles.turn: big`
+/// means the wire name, not the model's name, reaches the provider.
 #[test]
-fn the_default_tier_resolves_to_its_wire_model() {
+fn the_turn_role_resolves_to_its_wire_model() {
     let (code, log) = run(&format!(
         "{BASE}{TIERS}workflows:\n\
         \x20 - name: w\n    steps:\n\
@@ -173,7 +173,7 @@ fn an_unknown_tier_on_a_step_is_refused_at_startup() {
         \x20     f: {{ kind: finish, depends_on: [t], status: completed }}\n"
     ));
     assert_eq!(code, Some(2), "{log}");
-    assert!(log.contains("is not a declared tier"), "{log}");
+    assert!(log.contains("is not a declared model"), "{log}");
 }
 
 /// A degradation ladder that loops is a hang under exactly the conditions it
@@ -185,7 +185,7 @@ fn a_fallback_cycle_is_refused_at_startup() {
         \x20 models:\n\
         \x20   a: {{ model: m-a, fallback: b }}\n\
         \x20   b: {{ model: m-b, fallback: a }}\n\
-        \x20 default: a\n"
+        \x20 roles: {{ turn: a }}\n"
     ));
     assert_eq!(code, Some(2), "{log}");
     assert!(log.contains("fallback cycle"), "{log}");
@@ -199,7 +199,7 @@ fn a_declared_window_replaces_the_guess_from_the_model_name() {
     let (code, log) = run(&format!(
         "{BASE}intelligence:\n  endpoints: \"mock:json\"\n\
         \x20 models:\n    only: {{ model: entirely-unrecognisable-name, window: 7777 }}\n\
-        \x20 default: only\n"
+        \x20 roles: {{ turn: only }}\n"
     ));
     assert_eq!(code, Some(0), "{log}");
     assert!(
@@ -208,14 +208,17 @@ fn a_declared_window_replaces_the_guess_from_the_model_name() {
     );
 }
 
-/// An unknown tier named by `default` is refused rather than treated as a
-/// literal that happens to look like a tier name.
+/// An unknown model named by a role is refused rather than treated as a
+/// literal that happens to look like a model name.
 #[test]
-fn an_unknown_default_tier_is_refused() {
+fn an_unknown_model_on_a_role_is_refused() {
     let (code, log) = run(&format!(
         "{BASE}intelligence:\n  endpoints: \"mock:json\"\n\
-        \x20 models:\n    small: {{ model: m-1 }}\n  default: enormous\n"
+        \x20 models:\n    small: {{ model: m-1 }}\n  roles: {{ turn: enormous }}\n"
     ));
     assert_eq!(code, Some(2), "{log}");
-    assert!(log.contains("not a declared model tier"), "{log}");
+    assert!(
+        log.contains("intelligence.roles.turn: \"enormous\" is not a declared model"),
+        "{log}"
+    );
 }

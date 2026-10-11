@@ -40,7 +40,6 @@
 
 use super::reactor::{PendingKind, Runtime, Target};
 use crate::config::settings::AskHumanFallback;
-use crate::intel::client::IntelClient;
 use crate::state::now_ms;
 use crate::wire::intel::{Message, Request};
 use serde_json::{Value, json};
@@ -899,12 +898,9 @@ impl Runtime {
     /// Spawn the `auto` judge on a background thread — same shape as the goal
     /// judge: an intel dial folded back through [`super::events::Event::Background`].
     pub(crate) fn spawn_human_judge(&mut self, ask: &str, question: &str) {
-        let uri = self.intel_uri.clone();
-        let token = self.current_intel_bearer();
-        let headers = self.intel_headers.clone();
-        let aws_auth = self.intel_aws_auth();
-        let dialect = self.intel_dialect();
-        let model = self.model.clone();
+        // The operator's stand-in runs on the model the operator bound to
+        // `roles.approve` — a role no served document may set.
+        let intel = self.role_config(crate::config::settings::ModelRole::Approve);
         let tx = self.events_tx.clone();
         let (ask, question) = (ask.to_string(), question.to_string());
         self.log.info(
@@ -914,8 +910,7 @@ impl Runtime {
         std::thread::Builder::new()
             .name("human-judge".into())
             .spawn(move || {
-                let result =
-                    human_judge_call(&uri, token, &headers, aws_auth, dialect, &model, &question);
+                let result = human_judge_call(&intel, &question);
                 let _ = tx.send(super::events::Event::Background {
                     id: format!("human.judge:{ask}"),
                     result,
@@ -1086,31 +1081,9 @@ pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
 }
 
 /// The auto-judge intel dial: answer `question` on the operator's behalf.
-fn human_judge_call(
-    uri: &str,
-    token: Option<String>,
-    headers: &[(String, String)],
-    aws_auth: Option<crate::config::AuthSpec>,
-    dialect: Option<String>,
-    model: &str,
-    question: &str,
-) -> Value {
-    let client = match IntelClient::from_parts(uri, token) {
-        Ok(c) => {
-            #[allow(unused_mut)]
-            let mut c = c
-                .with_headers(headers.to_vec())
-                .with_dialect(dialect.as_deref());
-            #[cfg(feature = "oauth")]
-            if let Some(aws) = &aws_auth
-                && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, "intelligence")
-            {
-                c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
-            }
-            #[cfg(not(feature = "oauth"))]
-            let _ = &aws_auth;
-            c
-        }
+fn human_judge_call(intel: &crate::subagent::protocol::IntelConfig, question: &str) -> Value {
+    let client = match intel.client() {
+        Ok(c) => c,
         Err(e) => return json!({"error": format!("intel: {e}")}),
     };
     let system = "You are answering ON BEHALF OF the unavailable human operator of an \
@@ -1120,7 +1093,7 @@ irreversible actions on the operator's behalf. Reply with ONLY the answer text t
 operator would give — no preamble. If you genuinely cannot decide, reply exactly \
 UNDECIDED.";
     let req = Request {
-        model: model.to_string(),
+        model: intel.model.clone().unwrap_or_default(),
         messages: vec![
             Message::System(system.to_string()),
             Message::User(format!("QUESTION FOR THE OPERATOR:\n{question}")),

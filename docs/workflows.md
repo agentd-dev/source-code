@@ -294,8 +294,8 @@ read at restore, where it decides what happens to a step caught in flight.
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system`, `model` |
-| `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system`, `model` |
+| `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system`, `model`, `effort` |
+| `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system`, `model`, `effort` |
 | `subagent` | **`instruction`** *or* **`template`** (never both), `params` (only with `template`), `mode`, `tools`, `servers`, `limits`, `priority`, `context`, `output_contract`, `output_schema`, `skills`, `durable` |
 | `classify` | **`input`**, **`classes`**, `prompt`, `skills`, `model`, `confidence`, `on_unsure` |
 | `extract` | **`input`**, **`output_schema`**, `prompt`, `skills`, `model` |

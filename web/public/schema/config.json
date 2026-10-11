@@ -1573,7 +1573,8 @@
           "context",
           "skills",
           "system",
-          "model"
+          "model",
+          "effort"
         ],
         "implemented": true,
         "required": [
@@ -2345,7 +2346,8 @@
           "retries",
           "skills",
           "system",
-          "model"
+          "model",
+          "effort"
         ],
         "implemented": true,
         "required": [
@@ -3583,10 +3585,11 @@
                 "type": "string"
               },
               "kind": {
-                "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing",
+                "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing; reasoning generates after thinking, with an effort",
                 "enum": [
                   "chat",
-                  "decision"
+                  "decision",
+                  "reasoning"
                 ]
               },
               "model": {
@@ -3596,6 +3599,25 @@
               "provider": {
                 "description": "the connection: a name under intelligence.providers; default the top-level one. Operator-only",
                 "type": "string"
+              },
+              "reasoning": {
+                "additionalProperties": false,
+                "description": "a reasoning model's defaults; a node's or a think call's effort overrides the effort",
+                "properties": {
+                  "budget": {
+                    "description": "thinking tokens, for the dialects that take a budget (anthropic, bedrock's Anthropic models); default by effort",
+                    "minimum": 1024,
+                    "type": "integer"
+                  },
+                  "effort": {
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  }
+                },
+                "type": "object"
               },
               "window": {
                 "description": "this model's context window, so compaction stops guessing from the model NAME",

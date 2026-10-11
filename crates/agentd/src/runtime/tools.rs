@@ -1338,6 +1338,7 @@ impl Runtime {
             agent_path: format!("decide/{ctx_id}"),
             model: None,
             role: crate::config::settings::ModelRole::Decide,
+            effort: None,
         };
         self.spawn_turn(launch)
     }
@@ -1353,6 +1354,31 @@ impl Runtime {
         if prompt.trim().is_empty() {
             return Err("think: prompt must be non-empty".into());
         }
+        // `effort` asks a reasoning model to think harder or less; a model
+        // that does not reason has nothing to set it on.
+        let effort = match args.get("effort") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let e = v
+                    .as_str()
+                    .and_then(crate::wire::intel::Effort::parse)
+                    .ok_or("think: effort is low, medium or high")?;
+                let reasons = self
+                    .settings
+                    .intelligence
+                    .reference(crate::config::settings::ModelRole::Think)
+                    .is_some_and(|r| {
+                        self.settings.intelligence.kind_of(&r)
+                            == crate::config::settings::ModelKind::Reasoning
+                    });
+                if !reasons {
+                    return Err(
+                        "think: effort needs a reasoning model, and roles.think is not one".into(),
+                    );
+                }
+                Some(e)
+            }
+        };
         let ctx_id = caller.context_id();
         let mut messages = Vec::new();
         // `reads`: memory keys folded into the prompt.
@@ -1413,6 +1439,7 @@ impl Runtime {
             agent_path: format!("think/{ctx_id}"),
             model: None,
             role: crate::config::settings::ModelRole::Think,
+            effort,
         };
         self.spawn_turn(launch)
     }

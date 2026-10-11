@@ -355,6 +355,7 @@ mod tests {
             max_tokens: 16,
             temperature: Some(0.0),
             decision: None,
+            reasoning: None,
         }
     }
 

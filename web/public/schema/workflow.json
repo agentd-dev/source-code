@@ -72,7 +72,8 @@
           "context",
           "skills",
           "system",
-          "model"
+          "model",
+          "effort"
         ],
         "implemented": true,
         "required": [
@@ -844,7 +845,8 @@
           "retries",
           "skills",
           "system",
-          "model"
+          "model",
+          "effort"
         ],
         "implemented": true,
         "required": [

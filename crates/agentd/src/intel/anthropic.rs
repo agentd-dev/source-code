@@ -7,10 +7,12 @@
 //! tool calls and results are content *blocks* rather than message fields, and
 //! tool arguments arrive as a JSON object rather than a stringified one.
 
-use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
+use crate::wire::intel::{Message, ReasoningParts, Request, Response, StopReason, ToolCall, Usage};
 use serde_json::{Map, Value, json};
 
 pub const DEFAULT_PATH: &str = "/v1/messages";
+/// The dialect's name in a reasoning part's origin.
+pub const NAME: &str = "anthropic";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(String, String)>) {
@@ -28,17 +30,44 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
     let messages: Vec<Value> = req
         .messages
         .iter()
-        .filter_map(message_to_anthropic)
+        .filter_map(|m| message_to_anthropic(m, &req.model))
         .collect();
 
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
-    body.insert("max_tokens".into(), json!(req.max_tokens));
     if !system.is_empty() {
         body.insert("system".into(), json!(system));
     }
-    if let Some(t) = req.temperature {
-        body.insert("temperature".into(), json!(t));
+    match &req.reasoning {
+        // Current Claude models think adaptively, at an effort
+        // (`output_config.effort`); a model that names a `budget` is asked
+        // with the older budget form, which only models before adaptive
+        // thinking take. Either way `max_tokens` leaves room for the
+        // thinking above the answer, and no temperature is sent.
+        Some(r) => {
+            match r.budget {
+                Some(budget) => {
+                    body.insert(
+                        "thinking".into(),
+                        json!({"type": "enabled", "budget_tokens": budget}),
+                    );
+                }
+                None => {
+                    body.insert("thinking".into(), json!({"type": "adaptive"}));
+                    body.insert("output_config".into(), json!({"effort": r.effort.as_str()}));
+                }
+            }
+            body.insert(
+                "max_tokens".into(),
+                json!(req.max_tokens as u64 + r.budget_tokens()),
+            );
+        }
+        None => {
+            body.insert("max_tokens".into(), json!(req.max_tokens));
+            if let Some(t) = req.temperature {
+                body.insert("temperature".into(), json!(t));
+            }
+        }
     }
     body.insert("messages".into(), json!(messages));
     if !req.tools.is_empty() {
@@ -64,11 +93,21 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
     (bytes, headers)
 }
 
-fn message_to_anthropic(m: &Message) -> Option<Value> {
+fn message_to_anthropic(m: &Message, model: &str) -> Option<Value> {
     match m {
         Message::System(_) => None, // hoisted into `system`
         Message::User(s) => Some(json!({"role": "user", "content": s})),
-        Message::Assistant { text, tool_calls } => {
+        Message::Assistant {
+            text,
+            tool_calls,
+            reasoning,
+        } => {
+            // This model's own reasoning goes back exactly as it came — every
+            // block, thinking interleaved with tool use, in order: its
+            // signatures bind it to this model and this conversation.
+            if let Some(content) = ReasoningParts::for_model(reasoning, NAME, model) {
+                return Some(json!({"role": "assistant", "content": content}));
+            }
             let mut blocks: Vec<Value> = Vec::new();
             if let Some(t) = text.as_deref().filter(|t| !t.is_empty()) {
                 blocks.push(json!({"type": "text", "text": t}));
@@ -109,9 +148,11 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut thought = false;
     if let Some(blocks) = v.get("content").and_then(Value::as_array) {
         for b in blocks {
             match b.get("type").and_then(Value::as_str) {
+                Some("thinking") | Some("redacted_thinking") => thought = true,
                 Some("text") => {
                     if let Some(t) = b.get("text").and_then(Value::as_str) {
                         text_parts.push(t.to_string());
@@ -161,6 +202,16 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         usage: usage.unwrap_or_default(),
         fallback: None,
         decision: None,
+        // A message that thought is kept whole, in its order, to go back to
+        // this model while the turn goes on; the endpoint stamps its origin.
+        reasoning: thought.then(|| ReasoningParts {
+            origin: String::new(),
+            content: v
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        }),
     })
 }
 
@@ -168,6 +219,71 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
 mod tests {
     use super::*;
     use crate::wire::intel::ToolDef;
+
+    /// Current models think adaptively at an effort; a model naming a
+    /// `budget` is asked with the budget form. `max_tokens` leaves room for
+    /// the thinking, and no temperature is sent. A message that thought is
+    /// kept whole and in order, and goes back verbatim to the model that
+    /// wrote it — to no other.
+    #[test]
+    fn thinking_is_asked_for_kept_and_returned_to_its_own_model() {
+        use crate::wire::intel::{Effort, ReasoningAsk};
+        let ask = |budget: Option<u64>| Request {
+            model: "claude-opus-5-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 1000,
+            temperature: Some(0.0),
+            reasoning: Some(ReasoningAsk {
+                effort: Effort::High,
+                budget,
+            }),
+            ..Default::default()
+        };
+        let body =
+            |r: &Request| -> Value { serde_json::from_slice(&build_request(r, None).0).unwrap() };
+        let adaptive = body(&ask(None));
+        assert_eq!(adaptive["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(adaptive["output_config"]["effort"], "high");
+        assert_eq!(adaptive["max_tokens"], 1000 + 24_576);
+        assert!(adaptive.get("temperature").is_none(), "{adaptive}");
+        let budgeted = body(&ask(Some(4096)));
+        assert_eq!(
+            budgeted["thinking"],
+            json!({"type": "enabled", "budget_tokens": 4096})
+        );
+        assert_eq!(budgeted["max_tokens"], 5096);
+        assert!(budgeted.get("output_config").is_none());
+
+        let answer = json!({"content": [
+            {"type": "thinking", "thinking": "first, the dates", "signature": "sig-1"},
+            {"type": "tool_use", "id": "t1", "name": "lookup", "input": {}},
+            {"type": "thinking", "thinking": "then the totals", "signature": "sig-2"},
+            {"type": "tool_use", "id": "t2", "name": "sum", "input": {}}
+        ], "stop_reason": "tool_use"});
+        let mut r = parse_response(answer.to_string().as_bytes()).unwrap();
+        assert_eq!(r.tool_calls.len(), 2);
+        let parts = r.reasoning.as_mut().unwrap();
+        parts.origin = ReasoningParts::origin(NAME, "claude-opus-5-5");
+        let msg = Message::Assistant {
+            text: None,
+            tool_calls: r.tool_calls.clone(),
+            reasoning: r.reasoning.clone(),
+        };
+        let same = message_to_anthropic(&msg, "claude-opus-5-5").unwrap();
+        assert_eq!(
+            same["content"], answer["content"],
+            "verbatim, interleaved, in order"
+        );
+        let other = message_to_anthropic(&msg, "claude-haiku-4-5").unwrap();
+        assert!(
+            other["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["type"] == "tool_use"),
+            "another model is sent the message without them: {other}"
+        );
+    }
 
     #[test]
     fn build_hoists_system_and_headers() {
@@ -182,6 +298,7 @@ mod tests {
             max_tokens: 100,
             temperature: None,
             decision: None,
+            reasoning: None,
         };
         let (body, headers) = build_request(&req, Some("sk-ant"));
         let v: Value = serde_json::from_slice(&body).unwrap();

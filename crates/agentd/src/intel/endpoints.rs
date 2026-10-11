@@ -426,6 +426,15 @@ impl Endpoint {
             Provider::Decisions => unreachable!("answered above"),
         }
         .map_err(IntelError::Parse)?;
+        // A message that thought is tagged with the model that wrote it: its
+        // parts go back to that model alone (RFC 0046 §5.7).
+        if let Some(r) = parsed.reasoning.as_mut() {
+            let dialect = match self.provider {
+                Provider::Bedrock => bedrock::NAME,
+                _ => anthropic::NAME,
+            };
+            r.origin = crate::wire::intel::ReasoningParts::origin(dialect, &req.model);
+        }
         // Undo the wire sanitization: route by the original (dotted) tool names.
         if !wire_to_orig.is_empty() {
             for tc in &mut parsed.tool_calls {
@@ -461,6 +470,7 @@ impl Endpoint {
                 usage,
                 fallback: None,
                 decision: Some(answers),
+                reasoning: None,
             };
             return Ok((answered, latency));
         }
@@ -469,6 +479,7 @@ impl Endpoint {
             messages: decisions::emulation_messages(d),
             max_tokens: req.max_tokens,
             temperature: Some(0.0),
+            reasoning: req.reasoning,
             ..Default::default()
         };
         let (mut resp, mut latency) = self.complete_once(&chat, timeout, trace_id)?;
@@ -480,10 +491,8 @@ impl Endpoint {
         match decisions::parse_emulated(&text, d) {
             Ok(answers) => resp.decision = Some(answers),
             Err(why) => {
-                chat.messages.push(Message::Assistant {
-                    text: Some(text),
-                    tool_calls: Vec::new(),
-                });
+                chat.messages
+                    .push(Message::assistant(Some(text), Vec::new()));
                 chat.messages.push(Message::User(format!(
                     "That answer cannot be used: {why}. Reply again with ONLY the JSON object, every question answered."
                 )));

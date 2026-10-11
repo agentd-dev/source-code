@@ -219,7 +219,26 @@ tracks a draft.
 sent one at a time); agentd's answers to a server's requests are bounded at
 5s; an elicitation's `$schema` and property order are kept.
 
-### Kinds of intelligence (RFC 0046 P1, P2, P3)
+### Kinds of intelligence (RFC 0046 P1–P4)
+
+**Added (P4 — reasoning).**
+
+- `intelligence.models.<n>.kind: reasoning` — a model that thinks before it
+  writes, usable wherever a chat model is, with defaults `reasoning: {effort,
+  budget}`; `effort:` on `think` and `agent` nodes and on the `think` tool
+  overrides the effort for that call (refused where the model does not
+  reason). Each dialect gets its own form: `reasoning_effort` (OpenAI, and
+  OpenAI open-weight models on Bedrock), adaptive thinking at an effort
+  (Anthropic, and Claude models on Bedrock) or the budget form when the model
+  names a `budget` — with no temperature, and the output cap raised by the
+  thinking's room, which budget admission counts. A Bedrock reasoning model
+  whose id names no family agentd knows is refused at load.
+- A turn that keeps calling tools sends the model's own message back as it
+  came (Anthropic's signed `thinking` blocks, Bedrock's `reasoningContent`,
+  in order) — to that model only: each message that thought records its
+  dialect and model, so a fallback or degrade model gets the text and tool
+  calls alone. Reasoning never enters the transcript and never outlives the
+  turn.
 
 **Added (P3 — decisions in the loop).**
 

@@ -278,8 +278,8 @@ pub fn run_turn(
             finish_with!("exhausted_tokens");
         }
         // Budget admission: the supervisor owns the token budget, so estimate
-        // what this call will cost (prompt + tool schemas + the completion cap)
-        // and ask before spending it.
+        // what this call will cost (prompt + tool schemas + the completion cap
+        // + a reasoning model's thinking room) and ask before spending it.
         if spec.budget_admission {
             let estimate: u64 = messages
                 .iter()
@@ -289,7 +289,8 @@ pub fn run_turn(
                     .iter()
                     .map(|t| tokens::estimate(&t.name) + tokens::estimate_value(&t.input_schema))
                     .sum::<u64>()
-                + max_tokens_per_call as u64;
+                + max_tokens_per_call as u64
+                + degraded.as_ref().unwrap_or(intel).reasoning_budget();
             if let Err((status, error)) = admit(
                 spec,
                 limits,
@@ -366,7 +367,14 @@ pub fn run_turn(
                 last_text = Some(t.clone());
             }
             let assistant = Msg::assistant(resp.text.clone(), resp.tool_calls.clone());
-            messages.push(assistant.to_wire());
+            // The model's reasoning parts go back with this turn's next round,
+            // as it wrote them (RFC 0046 §5.7) — on the wire only: the
+            // transcript the supervisor keeps never holds them.
+            messages.push(Message::Assistant {
+                text: resp.text.clone(),
+                tool_calls: resp.tool_calls.clone(),
+                reasoning: resp.reasoning.clone(),
+            });
             delta.push(assistant);
             let mut finish_seen = None;
             for (i, tc) in resp.tool_calls.iter().enumerate() {
@@ -636,8 +644,10 @@ fn run_decision(
     let mut model = limits.model.clone();
     let mut degraded: Option<IntelClient> = None;
     if spec.budget_admission {
-        let estimate =
-            tokens::estimate_value(&job.decision.state) + 64 * questions as u64 + max_tokens as u64;
+        let estimate = tokens::estimate_value(&job.decision.state)
+            + 64 * questions as u64
+            + max_tokens as u64
+            + intel.reasoning_budget();
         if let Err((status, error)) = admit(
             spec,
             limits,
@@ -786,7 +796,9 @@ fn run_decision(
 fn render_len(m: &Message) -> String {
     match m {
         Message::System(s) | Message::User(s) => s.clone(),
-        Message::Assistant { text, tool_calls } => format!(
+        Message::Assistant {
+            text, tool_calls, ..
+        } => format!(
             "{}{}",
             text.as_deref().unwrap_or(""),
             tool_calls

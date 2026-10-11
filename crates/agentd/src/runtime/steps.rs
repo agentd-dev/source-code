@@ -2571,6 +2571,11 @@ impl Runtime {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // `effort:` on a `think`/`agent` node, for a reasoning model.
+        let node_effort = spec
+            .get("effort")
+            .and_then(Value::as_str)
+            .and_then(crate::wire::intel::Effort::parse);
         let limits = spec.get("limits").cloned().unwrap_or(json!({}));
         let max_steps = limits
             .get("steps")
@@ -2635,6 +2640,7 @@ impl Runtime {
             agent_path: format!("run/{run_id}/{step_id}"),
             model: node_model,
             role,
+            effort: node_effort,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {

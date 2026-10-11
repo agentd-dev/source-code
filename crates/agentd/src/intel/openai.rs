@@ -38,9 +38,24 @@ fn max_tokens_key(model: &str) -> &'static str {
 pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(String, String)>) {
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
-    body.insert(max_tokens_key(&req.model).into(), json!(req.max_tokens));
-    if let Some(t) = req.temperature {
-        body.insert("temperature".into(), json!(t));
+    match &req.reasoning {
+        // A reasoning model takes `reasoning_effort` and no temperature. Its
+        // thinking counts against `max_completion_tokens` — the parameter
+        // every reasoning model takes, whatever its name — so the cap leaves
+        // the effort's room for it above the answer.
+        Some(r) => {
+            body.insert(
+                "max_completion_tokens".into(),
+                json!(req.max_tokens as u64 + r.budget_tokens()),
+            );
+            body.insert("reasoning_effort".into(), json!(r.effort.as_str()));
+        }
+        None => {
+            body.insert(max_tokens_key(&req.model).into(), json!(req.max_tokens));
+            if let Some(t) = req.temperature {
+                body.insert("temperature".into(), json!(t));
+            }
+        }
     }
     body.insert("messages".into(), json!(messages_to_openai(&req.messages)));
     if !req.tools.is_empty() {
@@ -76,7 +91,9 @@ fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         .map(|m| match m {
             Message::System(s) => json!({"role": "system", "content": s}),
             Message::User(s) => json!({"role": "user", "content": s}),
-            Message::Assistant { text, tool_calls } => {
+            Message::Assistant {
+                text, tool_calls, ..
+            } => {
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("assistant"));
                 obj.insert("content".into(), json!(text));
@@ -188,11 +205,38 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         usage: usage.unwrap_or_default(),
         fallback: None,
         decision: None,
+        reasoning: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A reasoning model is asked with `reasoning_effort`, its completion in
+    /// `max_completion_tokens` with room for the thinking, and no
+    /// temperature (RFC 0046 §5.7).
+    #[test]
+    fn a_reasoning_request_carries_its_effort_and_no_temperature() {
+        let req = Request {
+            model: "o-mini".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 500,
+            temperature: Some(0.0),
+            reasoning: Some(crate::wire::intel::ReasoningAsk {
+                effort: crate::wire::intel::Effort::High,
+                budget: None,
+            }),
+            ..Default::default()
+        };
+        let (body, _) = build_request(&req, None);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
+        assert_eq!(v["max_completion_tokens"], 500 + 24576);
+        assert!(
+            v.get("temperature").is_none() && v.get("max_tokens").is_none(),
+            "{v}"
+        );
+    }
     use super::*;
     use crate::wire::intel::ToolDef;
 
@@ -208,6 +252,7 @@ mod tests {
             max_tokens: 256,
             temperature: Some(0.0),
             decision: None,
+            reasoning: None,
         }
     }
 

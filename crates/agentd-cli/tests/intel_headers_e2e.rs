@@ -85,6 +85,7 @@ fn intelligence_headers_and_bearer_reach_the_llm() {
         max_tokens: 16,
         temperature: Some(0.0),
         decision: None,
+        reasoning: None,
     };
     intel.complete(&req).expect("completion succeeds");
 

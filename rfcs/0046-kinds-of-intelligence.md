@@ -1,6 +1,6 @@
 # RFC 0046: Kinds of intelligence — chat, reasoning and decision models, by role
 
-**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1–P3 implemented 2026-10-11; P4 to be built
+**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1–P4 implemented 2026-10-11; per-turn routing and decision guards (Q3) wait on measurement
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-10
 **Depends on:** RFC 0031 (endpoint authentication: every provider is signed and credentialed like `intelligence.endpoints` is today), RFC 0037 (service catalog and egress: every provider endpoint is an egress destination), RFC 0042 (what a served document may configure), RFC 0038 (the prompt template).
@@ -336,6 +336,7 @@ Each phase brings a field together with what it does — no key is accepted befo
 **P3 — decisions in the loop.** Role bindings with `confidence`; the preflight, goal and approve roles on decision models; §8's untrusted-input rule for every approver.
 *As built (P3):* an ask a judge may not answer — outside input, or `UNDECIDED` — fails with its reason under `approval: auto`, where there is no human to hand it back to; under `ask_human_fallback: auto` it is the gate's timeout that fired the judge, so it fails then too. "Outside input" is agentd's existing record of it (`runtime::withhold`): a run's or a subagent's carries, and an A2A agent's conversation; a root conversation's own reads are governed by the trifecta gate, not tracked per conversation. Preflight's skill questions are capped at the decision's 16 (`preflight.skills_capped` says so). The goal check and the ask judge, which run outside every turn, are charged to the instance budget.
 **P4 — reasoning.** `kind: reasoning`, `reasoning: {effort, budget}`, `effort` on nodes and `think`, the per-dialect mapping, reasoning parts across tool rounds.
+*As built (P4):* the effort default is `medium`. Anthropic is asked `thinking: {type: adaptive}` with `output_config: {effort}` — current Claude models refuse `budget_tokens` — and the budget form only when the model names a `budget`. Every dialect raises its output cap by the thinking's room (`budget`, else 2048 / 8192 / 24576 by effort), and budget admission counts it. On Bedrock the family comes from the model id: `anthropic.…` takes the Anthropic fields, `openai.…` `reasoning_effort`, both in `additionalModelRequestFields`; a reasoning model whose id names neither is refused at load. A message that thought is kept whole (`Message::Assistant.reasoning`: its content blocks in order, tagged `dialect:model`) and is re-sent verbatim only to the same dialect and model — a fallback or degrade model gets the text and tool calls rebuilt. It rides the wire only — the worker's in-turn messages and a warm subagent's transcript, cleared when its next turn starts — never the supervisor's context. Reasoning-token counts are not split out of the output tokens (`completion_tokens_details` is not read): the budget counts them as output, which they are.
 
 Decided by the user, 2026-10-10:
 

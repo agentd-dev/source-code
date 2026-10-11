@@ -362,10 +362,40 @@ reports the intelligence down only when no model in it answered. A `fallback` cy
 startup — a degradation ladder that loops is a hang under exactly the
 conditions it exists to survive.
 
-### Kinds of model: chat and decision
+### Kinds of model: chat, reasoning and decision
 
-A model is `kind: chat` (the default) or `kind: decision`. A chat model
-generates — text, tool calls, JSON. A **decision model** answers typed
+A model is `kind: chat` (the default), `kind: reasoning` or `kind: decision`.
+A chat model generates — text, tool calls, JSON.
+
+A **reasoning model** generates too, after thinking — wherever a chat model
+can serve, it can. Its defaults are `reasoning: {effort: low|medium|high,
+budget: <tokens>}` (effort `medium` when unset); `effort:` on a `think` or
+`agent` node, or on a `think` tool call, overrides the effort for that call,
+and is refused where the model does not reason. Each dialect gets its own
+form:
+
+| Dialect | Sent | Also |
+|---|---|---|
+| `openai` | `reasoning_effort` | `max_completion_tokens`; no `temperature` |
+| `anthropic` | `thinking: {type: adaptive}` and `output_config: {effort}`; with a `budget`, `thinking: {type: enabled, budget_tokens}` instead | no `temperature`; while the same turn is still calling tools, the model's own message — its signed `thinking` blocks among the rest, in order — goes back to it unchanged |
+| `bedrock` | a Claude model (`anthropic.…`, optionally region-prefixed): `additionalModelRequestFields` as for `anthropic`; an OpenAI open-weight model (`openai.…`): `additionalModelRequestFields.reasoning_effort` | no `temperature`; `reasoningContent` blocks go back within the turn as for `anthropic` |
+
+Every dialect raises the output cap above the answer's by the thinking's
+room — `budget`, else 2048 / 8192 / 24576 tokens by effort — and budget
+admission counts it. Current Claude models think adaptively and refuse a
+`budget`; set one only for a model that takes the budget form. On Bedrock the
+fields depend on the model's family, so a reasoning model whose id names
+neither (an ARN, an application inference profile) is refused at load.
+
+The reasoning a model returns is carried only within the turn that made it:
+never in the transcript the agent keeps, never on the feed, never logged,
+never across a compaction. It goes back only to the model that wrote it —
+each message that thought records its dialect and model — so a fallback or a
+degrade model is sent the text and tool calls alone. A fallback is asked as
+the model it is — a chat model without the head model's reasoning, a
+reasoning model with its own.
+
+A **decision model** answers typed
 questions about a state and writes nothing: Jev-style models, OpenRouter's
 decisions resource, Strands Decider, OpenAI's Decisions API. It is reached on a
 provider with `dialect: decisions`, whose endpoint is the decisions resource's

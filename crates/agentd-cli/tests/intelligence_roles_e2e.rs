@@ -471,3 +471,46 @@ fn a_provider_dials_with_its_own_token_not_the_top_level_environment() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&top);
 }
+
+/// A reasoning model is asked with its effort — its own, or the one a node
+/// names over it — and a node's model's fallback with none.
+#[test]
+fn a_reasoning_model_is_asked_with_the_effort_its_node_names() {
+    let play = playbook(r#"{"from": "no effort"}"#);
+    // A playbook that answers by the effort the request carries.
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [{"content": "{\"from\": \"no effort\"}"}], "match": [
+            {"when_contains": "\"reasoning_effort\":\"high\"", "content": "{\"from\": \"high\"}"},
+            {"when_contains": "\"reasoning_effort\":\"low\"", "content": "{\"from\": \"low\"}"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = format!(
+        "{BASE}intelligence:\n  endpoints: \"mock:file:{play}\"\n\
+        \x20 models:\n\
+        \x20   smart: {{ model: wire-smart }}\n\
+        \x20   deep: {{ kind: reasoning, model: wire-deep, reasoning: {{ effort: low }} }}\n\
+        \x20 roles: {{ turn: smart, think: deep }}\n\
+        workflows:\n\
+        \x20 - name: w\n    steps:\n\
+        \x20     s: {{ kind: once }}\n\
+        \x20     own: {{ kind: think, prompt: \"x\", depends_on: [s] }}\n\
+        \x20     hard: {{ kind: think, prompt: \"y\", effort: high, depends_on: [s] }}\n\
+        \x20     chat: {{ kind: think, prompt: \"z\", model: smart, depends_on: [s] }}\n\
+        \x20     f: {{ kind: finish, depends_on: [own, hard, chat], status: completed, output: {{ own: \"{{{{steps.own.output.from}}}}\", hard: \"{{{{steps.hard.output.from}}}}\", chat: \"{{{{steps.chat.output.from}}}}\" }} }}\n"
+    );
+    let (code, out, log) = run(&cfg);
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["own"], "low", "the model's own effort: {out}\n{log}");
+    assert_eq!(
+        out["hard"], "high",
+        "the node's effort over it: {out}\n{log}"
+    );
+    assert_eq!(
+        out["chat"], "no effort",
+        "a chat model is asked with none: {out}\n{log}"
+    );
+    let _ = std::fs::remove_file(&play);
+}

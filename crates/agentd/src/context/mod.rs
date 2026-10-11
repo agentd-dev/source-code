@@ -132,10 +132,7 @@ impl Msg {
             Msg::User { text, .. } => Message::User(text.clone()),
             Msg::Assistant {
                 text, tool_calls, ..
-            } => Message::Assistant {
-                text: text.clone(),
-                tool_calls: tool_calls.clone(),
-            },
+            } => Message::assistant(text.clone(), tool_calls.clone()),
             Msg::Tool {
                 id,
                 content,

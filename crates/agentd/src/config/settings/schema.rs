@@ -167,7 +167,10 @@ fn top_level_properties(
                             "timeout": duration } } },
                     "models": { "type": "object", "description": "named models: cost/quality tiering inside one workflow without forking a process. A model names the connection it is reached on and cannot describe one", "additionalProperties": {
                         "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
-                            "kind": { "enum": ["chat", "decision"], "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing" },
+                            "kind": { "enum": ["chat", "decision", "reasoning"], "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing; reasoning generates after thinking, with an effort" },
+                            "reasoning": { "type": "object", "additionalProperties": false, "description": "a reasoning model's defaults; a node's or a think call's effort overrides the effort", "properties": {
+                                "effort": { "enum": ["low", "medium", "high"] },
+                                "budget": { "type": "integer", "minimum": 1024, "description": "thinking tokens, for the dialects that take a budget (anthropic, bedrock's Anthropic models); default by effort" } } },
                             "model": { "type": "string", "description": "the wire model name sent to the provider" },
                             "escalate": { "type": "string", "description": "a decision model's: the model an unsure answer is asked again on, once" },
                             "provider": { "type": "string", "description": "the connection: a name under intelligence.providers; default the top-level one. Operator-only" },

@@ -761,7 +761,7 @@ pub fn contracts() -> Vec<Contract> {
         "intelligence",
         "One structured reasoning call (no tools): give a prompt and optionally an output schema; get the object back.",
         obj(
-            json!({"prompt": s("What to think about"), "output_schema": {"type": "object"}, "reads": arr(json!({"type": "string"})), "skills": arr(json!({"type": "string"}))}),
+            json!({"prompt": s("What to think about"), "output_schema": {"type": "object"}, "reads": arr(json!({"type": "string"})), "skills": arr(json!({"type": "string"})), "effort": {"enum": ["low", "medium", "high"], "description": "How hard a reasoning model thinks (only when the think model reasons)"}}),
             &["prompt"],
         ),
         any(),

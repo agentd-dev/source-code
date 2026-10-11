@@ -79,7 +79,8 @@
       "context",
       "skills",
       "system",
-      "model"
+      "model",
+      "effort"
     ],
     "implemented": true,
     "kind": "agent",
@@ -971,7 +972,8 @@
       "retries",
       "skills",
       "system",
-      "model"
+      "model",
+      "effort"
     ],
     "implemented": true,
     "kind": "think",

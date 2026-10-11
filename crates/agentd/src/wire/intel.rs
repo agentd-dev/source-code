@@ -23,6 +23,11 @@ pub enum Message {
     Assistant {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// The model's reasoning, as its dialect returned it (RFC 0046 §5.7):
+        /// sent back unchanged — to the model that produced it, and no other —
+        /// while the same turn is still calling tools; every other path
+        /// ignores it, and it never outlives the turn.
+        reasoning: Option<ReasoningParts>,
     },
     /// A tool/exec result fed back into the loop. `is_error` carries the MCP
     /// `isError: true` signal: the tool ran and reported a domain failure the
@@ -41,6 +46,14 @@ impl Message {
     }
     pub fn user(s: impl Into<String>) -> Message {
         Message::User(s.into())
+    }
+    /// An assistant message with no reasoning parts.
+    pub fn assistant(text: Option<String>, tool_calls: Vec<ToolCall>) -> Message {
+        Message::Assistant {
+            text,
+            tool_calls,
+            reasoning: None,
+        }
     }
     pub fn tool_result(
         id: impl Into<String>,
@@ -86,6 +99,96 @@ pub struct Request {
     /// §5.5): a `decisions` endpoint answers it natively, a chat endpoint
     /// emulates it. `messages` and `tools` are unused when it is set.
     pub decision: Option<super::decision::Decision>,
+    /// How hard a reasoning model thinks (RFC 0046 §5.7); set by the client
+    /// from the model it dials. `None` for a chat model.
+    pub reasoning: Option<ReasoningAsk>,
+}
+
+/// How much a reasoning model thinks before it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Effort> {
+        match s {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        }
+    }
+
+    /// The thinking budget a dialect that takes one in tokens is given for
+    /// an effort, when the model names no `budget`.
+    pub fn default_budget(self) -> u64 {
+        match self {
+            Effort::Low => 2_048,
+            Effort::Medium => 8_192,
+            Effort::High => 24_576,
+        }
+    }
+}
+
+/// An assistant message's content as a reasoning model returned it — every
+/// block, in order (thinking interleaves with tool use), with the dialect
+/// and model it came from. A thinking block's signature binds it to the
+/// model and the conversation that produced it, so the parts go back to
+/// that model alone: a fallback, a degrade or a swap to another model is
+/// sent the message without them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReasoningParts {
+    /// `<dialect>:<model>` — [`ReasoningParts::origin`].
+    pub origin: String,
+    /// The content blocks, verbatim and in their order.
+    pub content: Vec<Value>,
+}
+
+impl ReasoningParts {
+    /// The origin a dialect and a model give their parts.
+    pub fn origin(dialect: &str, model: &str) -> String {
+        format!("{dialect}:{model}")
+    }
+
+    /// `parts`, when they came from `dialect` and `model`.
+    pub fn for_model<'a>(
+        parts: &'a Option<ReasoningParts>,
+        dialect: &str,
+        model: &str,
+    ) -> Option<&'a [Value]> {
+        parts
+            .as_ref()
+            .filter(|p| p.origin == Self::origin(dialect, model))
+            .map(|p| p.content.as_slice())
+    }
+}
+
+/// A reasoning model's controls for one call: the effort, and a token budget
+/// for the dialects that take one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningAsk {
+    pub effort: Effort,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u64>,
+}
+
+impl ReasoningAsk {
+    /// The budget in tokens: the model's, else the effort's default.
+    pub fn budget_tokens(&self) -> u64 {
+        self.budget.unwrap_or_else(|| self.effort.default_budget())
+    }
 }
 
 /// Why the model stopped — drives the loop's branch (tool-use vs final) and
@@ -131,6 +234,9 @@ pub struct Response {
     pub fallback: Option<String>,
     /// The answers, when the request was a decision.
     pub decision: Option<super::decision::Answers>,
+    /// The model's reasoning ([`Message::Assistant`]); its origin is
+    /// stamped by the endpoint that dialed it.
+    pub reasoning: Option<ReasoningParts>,
 }
 
 impl Response {
@@ -179,6 +285,7 @@ mod tests {
             usage: Usage::default(),
             fallback: None,
             decision: None,
+            reasoning: None,
         };
         assert!(r.wants_tools());
     }

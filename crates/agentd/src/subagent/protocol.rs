@@ -542,6 +542,10 @@ pub struct IntelConfig {
     /// its own connection (`intelligence.models.<n>.fallback`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<IntelConfig>,
+    /// A reasoning model's controls for every call on it (RFC 0046 §5.7):
+    /// its defaults, with a node's or a `think` call's `effort` over them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<crate::wire::intel::ReasoningAsk>,
 }
 
 impl IntelConfig {
@@ -587,7 +591,8 @@ impl IntelConfig {
         let mut c = base?
             .with_headers(self.headers.clone())
             .with_dialect(self.dialect.as_deref())
-            .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis));
+            .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis))
+            .with_reasoning(self.reasoning);
         // `auth: {kind: aws}` SigV4-signs the dial, with credentials fetched
         // at dial time; `source: sso` reads the cache its login filled.
         #[cfg(feature = "oauth")]

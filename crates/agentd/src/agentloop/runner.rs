@@ -292,6 +292,14 @@ impl<'a> Session<'a> {
         budget: &mut Budget,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<(Outcome, Usage), LoopAbort> {
+        // Reasoning parts are sent back within the turn that produced them,
+        // and never outlive it (RFC 0046 §5.7): a warm session's next turn
+        // starts without the last one's.
+        for m in &mut self.messages {
+            if let Message::Assistant { reasoning, .. } = m {
+                *reasoning = None;
+            }
+        }
         let mut last_text: Option<String> = None;
         // otel run trace: the `invoke_agent` span plus a `chat` child per model
         // call and an `execute_tool` child per tool call. No-op without
@@ -390,9 +398,12 @@ impl<'a> Session<'a> {
                     last_text = Some(t.to_string());
                 }
                 let tool_calls = resp.tool_calls.clone();
+                // The reasoning parts ride along while this turn calls tools
+                // (RFC 0046 §5.7); they are dropped when the next turn starts.
                 self.messages.push(Message::Assistant {
                     text: resp.text,
                     tool_calls: tool_calls.clone(),
+                    reasoning: resp.reasoning,
                 });
 
                 for tc in &tool_calls {
@@ -453,10 +464,8 @@ impl<'a> Session<'a> {
             // Record it in the transcript so a warm session's next turn sees its
             // own prior reply (invisible to once-mode, which discards the session).
             let text = resp.text.clone().or(last_text).unwrap_or_default();
-            self.messages.push(Message::Assistant {
-                text: Some(text.clone()),
-                tool_calls: Vec::new(),
-            });
+            self.messages
+                .push(Message::assistant(Some(text.clone()), Vec::new()));
             log.info(
                 "loop.final",
                 json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}),
@@ -623,10 +632,7 @@ fn system_prompt(contract: Option<&str>) -> String {
 fn seed_message(role: &str, content: &str) -> Message {
     match role {
         "system" => Message::system(content),
-        "assistant" => Message::Assistant {
-            text: Some(content.to_string()),
-            tool_calls: Vec::new(),
-        },
+        "assistant" => Message::assistant(Some(content.to_string()), Vec::new()),
         _ => Message::user(content),
     }
 }

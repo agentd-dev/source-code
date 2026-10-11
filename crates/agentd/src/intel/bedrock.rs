@@ -19,13 +19,15 @@
 //!
 //! Auth is SigV4 only (no bearer/api-key), so `token` is ignored here.
 
-use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
+use crate::wire::intel::{Message, ReasoningParts, Request, Response, StopReason, ToolCall, Usage};
 use serde_json::{Map, Value, json};
 
 /// A placeholder default path. Bedrock's real path is computed per-request from
 /// the model id ([`converse_path`]); this is only the host-only resolve-time
 /// fallback and is always overridden before a dial.
 pub const DEFAULT_PATH: &str = "/";
+/// The dialect's name in a reasoning part's origin.
+pub const NAME: &str = "bedrock";
 
 /// The Converse request path for `model`: `/model/{modelId}/converse`. The model
 /// id is a single opaque path parameter, so it is fully percent-encoded
@@ -71,13 +73,58 @@ pub fn build_request(req: &Request, _token: Option<&str>) -> (Vec<u8>, Vec<(Stri
         .collect();
 
     let mut inference = Map::new();
-    inference.insert("maxTokens".into(), json!(req.max_tokens));
-    if let Some(t) = req.temperature {
-        inference.insert("temperature".into(), json!(t));
+    // A reasoning model takes its family's own fields — a Claude model
+    // adaptive thinking at an effort (or the budget form, when the model
+    // names a `budget`), an OpenAI open-weight model `reasoning_effort` —
+    // with `maxTokens` leaving room for the thinking, and no temperature.
+    // Validation admits a reasoning model on Bedrock only from a family it
+    // can tell ([`model_family`]).
+    let mut additional = Map::new();
+    match &req.reasoning {
+        Some(r) => {
+            match model_family(&req.model) {
+                Some(Family::Anthropic) => match r.budget {
+                    Some(budget) => {
+                        additional.insert(
+                            "thinking".into(),
+                            json!({"type": "enabled", "budget_tokens": budget}),
+                        );
+                    }
+                    None => {
+                        additional.insert("thinking".into(), json!({"type": "adaptive"}));
+                        additional
+                            .insert("output_config".into(), json!({"effort": r.effort.as_str()}));
+                    }
+                },
+                Some(Family::OpenAi) => {
+                    additional.insert("reasoning_effort".into(), json!(r.effort.as_str()));
+                }
+                None => {}
+            }
+            inference.insert(
+                "maxTokens".into(),
+                json!(req.max_tokens as u64 + r.budget_tokens()),
+            );
+        }
+        None => {
+            inference.insert("maxTokens".into(), json!(req.max_tokens));
+            if let Some(t) = req.temperature {
+                inference.insert("temperature".into(), json!(t));
+            }
+        }
     }
 
     let mut body = Map::new();
-    body.insert("messages".into(), json!(messages_to_bedrock(&req.messages)));
+    if !additional.is_empty() {
+        body.insert(
+            "additionalModelRequestFields".into(),
+            Value::Object(additional),
+        );
+    }
+    body.insert(
+        "messages".into(),
+        json!(messages_to_bedrock(&req.messages, &req.model)),
+    );
     if !system.is_empty() {
         body.insert("system".into(), json!(system));
     }
@@ -107,12 +154,41 @@ pub fn build_request(req: &Request, _token: Option<&str>) -> (Vec<u8>, Vec<(Stri
     (bytes, headers)
 }
 
+/// The model families agentd tells apart on Bedrock, for the fields each
+/// takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// `anthropic.claude-…` (or a cross-region profile `us.anthropic.…`).
+    Anthropic,
+    /// `openai.gpt-oss-…`.
+    OpenAi,
+}
+
+/// The family a Bedrock model id names, when it names one agentd knows: the
+/// provider segment, after an optional cross-region prefix (`us.`, `eu.`,
+/// `global.`, …), of the id or of the ARN's resource. An application
+/// inference profile names none — the model behind it cannot be told — and
+/// is refused for a reasoning model at load rather than sent a field its
+/// family rejects.
+pub fn model_family(model: &str) -> Option<Family> {
+    let m = model.to_ascii_lowercase();
+    let id = m.rsplit('/').next().unwrap_or(&m);
+    if id.starts_with("arn:") {
+        return None;
+    }
+    id.split('.').take(2).find_map(|part| match part {
+        "anthropic" => Some(Family::Anthropic),
+        "openai" => Some(Family::OpenAi),
+        _ => None,
+    })
+}
+
 /// Translate neutral messages into Converse turns, **merging consecutive
 /// same-role turns** (Bedrock validates strict user/assistant alternation): the
 /// N tool results of one assistant turn collapse into a single user message with
 /// N `toolResult` blocks, and an assistant's text + tool-use blocks share one
 /// message.
-fn messages_to_bedrock(messages: &[Message]) -> Vec<Value> {
+fn messages_to_bedrock(messages: &[Message], model: &str) -> Vec<Value> {
     let mut turns: Vec<(&'static str, Vec<Value>)> = Vec::new();
     let mut push = |role: &'static str, block: Value| match turns.last_mut() {
         Some((r, blocks)) if *r == role => blocks.push(block),
@@ -122,7 +198,19 @@ fn messages_to_bedrock(messages: &[Message]) -> Vec<Value> {
         match m {
             Message::System(_) => {} // hoisted into `system`
             Message::User(s) => push("user", json!({"text": s})),
-            Message::Assistant { text, tool_calls } => {
+            Message::Assistant {
+                text,
+                tool_calls,
+                reasoning,
+            } => {
+                // This model's own message goes back as it wrote it — its
+                // `reasoningContent` blocks among the rest, in order.
+                if let Some(content) = ReasoningParts::for_model(reasoning, NAME, model) {
+                    for block in content {
+                        push("assistant", block.clone());
+                    }
+                    continue;
+                }
                 if let Some(t) = text.as_deref().filter(|t| !t.is_empty()) {
                     push("assistant", json!({"text": t}));
                 }
@@ -175,12 +263,15 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut thought = false;
     if let Some(blocks) = message
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array)
     {
         for b in blocks {
-            if let Some(t) = b.get("text").and_then(Value::as_str) {
+            if b.get("reasoningContent").is_some() {
+                thought = true;
+            } else if let Some(t) = b.get("text").and_then(Value::as_str) {
                 text_parts.push(t.to_string());
             } else if let Some(tu) = b.get("toolUse") {
                 tool_calls.push(ToolCall {
@@ -224,6 +315,16 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         usage: usage.unwrap_or_default(),
         fallback: None,
         decision: None,
+        // A message that thought is kept whole, in order; the endpoint stamps
+        // its origin.
+        reasoning: thought.then(|| ReasoningParts {
+            origin: String::new(),
+            content: message
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        }),
     })
 }
 
@@ -231,6 +332,83 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
 mod tests {
     use super::*;
     use crate::wire::intel::ToolDef;
+
+    /// On Bedrock a reasoning model takes its family's own fields: a Claude
+    /// model adaptive thinking at an effort (or the budget form), an
+    /// OpenAI open-weight model `reasoning_effort` — with `maxTokens` above
+    /// the thinking and no temperature; a message that thought goes back
+    /// whole to its own model alone.
+    #[test]
+    fn reasoning_goes_in_the_familys_own_field() {
+        use crate::wire::intel::{Effort, ReasoningAsk};
+        let ask = |model: &str, budget: Option<u64>| Request {
+            model: model.into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 1000,
+            temperature: Some(0.0),
+            reasoning: Some(ReasoningAsk {
+                effort: Effort::Medium,
+                budget,
+            }),
+            ..Default::default()
+        };
+        let body =
+            |r: &Request| -> Value { serde_json::from_slice(&build_request(r, None).0).unwrap() };
+        let claude = body(&ask("us.anthropic.claude-sonnet-5-v1:0", None));
+        assert_eq!(
+            claude["additionalModelRequestFields"]["thinking"],
+            json!({"type": "adaptive"})
+        );
+        assert_eq!(
+            claude["additionalModelRequestFields"]["output_config"]["effort"],
+            "medium"
+        );
+        assert_eq!(claude["inferenceConfig"]["maxTokens"], 9192);
+        assert!(claude["inferenceConfig"].get("temperature").is_none());
+        let budgeted = body(&ask("anthropic.claude-haiku-4-5-v1:0", Some(2048)));
+        assert_eq!(
+            budgeted["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            2048
+        );
+        let oss = body(&ask("openai.gpt-oss-120b-1:0", None));
+        assert_eq!(
+            oss["additionalModelRequestFields"]["reasoning_effort"],
+            "medium"
+        );
+        assert_eq!(oss["inferenceConfig"]["maxTokens"], 9192);
+        assert_eq!(
+            model_family("arn:aws:bedrock:us-east-1:1:application-inference-profile/x"),
+            None
+        );
+        assert_eq!(model_family("meta.llama3-70b-instruct-v1:0"), None);
+        assert_eq!(
+            model_family(
+                "arn:aws:bedrock:us-gov-west-1:1:inference-profile/us-gov.anthropic.claude-x"
+            ),
+            Some(Family::Anthropic)
+        );
+        assert_eq!(
+            model_family("apac.openai.gpt-oss-20b-1:0"),
+            Some(Family::OpenAi)
+        );
+
+        let answer = json!({"output": {"message": {"role": "assistant", "content": [
+            {"reasoningContent": {"reasoningText": {"text": "step one", "signature": "s"}}},
+            {"toolUse": {"toolUseId": "t1", "name": "a", "input": {}}}
+        ]}}, "stopReason": "tool_use"});
+        let mut r = parse_response(answer.to_string().as_bytes()).unwrap();
+        r.reasoning.as_mut().unwrap().origin = ReasoningParts::origin(NAME, "anthropic.claude-x");
+        let msg = Message::Assistant {
+            text: None,
+            tool_calls: r.tool_calls.clone(),
+            reasoning: r.reasoning.clone(),
+        };
+        let same = messages_to_bedrock(std::slice::from_ref(&msg), "anthropic.claude-x");
+        assert!(same[0]["content"][0].get("reasoningContent").is_some());
+        assert!(same[0]["content"][1].get("toolUse").is_some());
+        let other = messages_to_bedrock(&[msg], "openai.gpt-oss-120b-1:0");
+        assert!(other[0]["content"][0].get("toolUse").is_some(), "{other:?}");
+    }
 
     #[test]
     fn converse_path_encodes_the_model_id() {
@@ -263,6 +441,7 @@ mod tests {
             max_tokens: 256,
             temperature: Some(0.0),
             decision: None,
+            reasoning: None,
         }
     }
 
@@ -328,6 +507,7 @@ mod tests {
                             arguments: json!({}),
                         },
                     ],
+                    reasoning: None,
                 },
                 Message::tool_result("t1", "r1", false),
                 Message::tool_result("t2", "r2", true),
@@ -336,6 +516,7 @@ mod tests {
             max_tokens: 8,
             temperature: None,
             decision: None,
+            reasoning: None,
         };
         let v: Value = serde_json::from_slice(&build_request(&r, None).0).unwrap();
         let msgs = v["messages"].as_array().unwrap();

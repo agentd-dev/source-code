@@ -1720,6 +1720,18 @@ pub struct ModelTier {
     /// A decision model's: the model an unsure answer is asked again on
     /// (RFC 0046 §5.6), once; its answer is final.
     pub escalate: Option<String>,
+    /// A reasoning model's defaults (RFC 0046 §5.7): how hard it thinks, and
+    /// a token budget for the dialects that take one. A node's or a `think`
+    /// call's `effort` overrides the effort for that call.
+    pub reasoning: Option<ReasoningDefaults>,
+}
+
+/// `intelligence.models.<n>.reasoning`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReasoningDefaults {
+    pub effort: Option<crate::wire::intel::Effort>,
+    pub budget: Option<u64>,
 }
 
 /// A model's kind (RFC 0046 §5.1).
@@ -1733,6 +1745,9 @@ pub enum ModelKind {
     /// Answers decisions natively, on a `dialect: decisions` provider; writes
     /// nothing.
     Decision,
+    /// Generates like a chat model, thinking first — with an effort and,
+    /// where the dialect takes one, a token budget (RFC 0046 §5.7).
+    Reasoning,
 }
 
 impl ModelKind {
@@ -1740,6 +1755,7 @@ impl ModelKind {
         match self {
             ModelKind::Chat => "chat",
             ModelKind::Decision => "decision",
+            ModelKind::Reasoning => "reasoning",
         }
     }
 }
@@ -7033,15 +7049,31 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     &mut d,
                     format!("{at}.fallback: a model cannot fall back to itself"),
                 );
-            } else if t.kind == ModelKind::Chat && s.intelligence.kind_of(f) == ModelKind::Decision
+            } else if t.kind != ModelKind::Decision
+                && s.intelligence.kind_of(f) == ModelKind::Decision
             {
-                // A chat model is asked to write; a decision model cannot. A
-                // decision model's fallback may be chat, which emulates.
+                // A chat or reasoning model is asked to write; a decision
+                // model cannot. A decision model's fallback may write, which
+                // emulates.
                 err(
                     &mut d,
                     format!(
-                        "{at}.fallback: {f:?} is a decision model, and a chat model's fallback must write too"
+                        "{at}.fallback: {f:?} is a decision model, and a {} model's fallback must write too",
+                        t.kind.as_str()
                     ),
+                );
+            }
+        }
+        if let Some(r) = &t.reasoning {
+            if t.kind != ModelKind::Reasoning {
+                err(
+                    &mut d,
+                    format!("{at}.reasoning: the defaults of a `kind: reasoning` model"),
+                );
+            } else if r.budget.is_some_and(|b| b < 1024) {
+                err(
+                    &mut d,
+                    format!("{at}.reasoning.budget: at least 1024 tokens"),
                 );
             }
         }
@@ -7079,7 +7111,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     _ => {}
                 }
             }
-            ModelKind::Chat => {
+            ModelKind::Chat | ModelKind::Reasoning => {
                 if decisions_dialect {
                     err(
                         &mut d,
@@ -7093,6 +7125,27 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                         &mut d,
                         format!(
                             "{at}.escalate: escalation re-asks an unsure decision; it is a decision model's"
+                        ),
+                    );
+                }
+                // Bedrock carries each family's reasoning fields as they are:
+                // a model id that names no family agentd knows (an ARN, an
+                // application inference profile) would be sent fields it
+                // rejects, or none at all.
+                let bedrock = s
+                    .intelligence
+                    .connection(t.provider.as_deref())
+                    .and_then(|c| c.dialect)
+                    == Some("bedrock");
+                if t.kind == ModelKind::Reasoning
+                    && bedrock
+                    && let Some(id) = &t.model
+                    && crate::intel::bedrock::model_family(id).is_none()
+                {
+                    err(
+                        &mut d,
+                        format!(
+                            "{at}.model: a reasoning model on Bedrock names its family in the model id (anthropic.… or openai.…, optionally region-prefixed); {id:?} names neither"
                         ),
                     );
                 }
@@ -8829,6 +8882,25 @@ pub(crate) fn step_model_refusals(
         return out;
     }
     let deciding = DECIDING_KINDS.contains(&kind);
+    // `effort` is a reasoning model's control: the node's model — its own,
+    // else its role's — must reason.
+    if spec.get("effort").is_some() {
+        let role = if kind == "think" {
+            ModelRole::Think
+        } else {
+            ModelRole::Turn
+        };
+        let reference = named.map(str::to_string).or_else(|| intel.reference(role));
+        if !reference
+            .as_deref()
+            .is_some_and(|r| intel.kind_of(r) == ModelKind::Reasoning)
+        {
+            out.push(format!(
+                "effort: its model ({}) is not a reasoning model",
+                reference.as_deref().unwrap_or("none")
+            ));
+        }
+    }
     if let Some(m) = named
         && intel.kind_of(m) == ModelKind::Decision
         && !deciding
@@ -14223,6 +14295,60 @@ mod tests {
             let e = errors(extra);
             assert!(e.contains(why), "{extra}\n→ {e}");
         }
+    }
+
+    /// A reasoning model writes, like a chat model; its defaults and a
+    /// node's `effort` belong to it alone.
+    #[test]
+    fn reasoning_is_a_writing_kind_with_its_own_controls() {
+        const BEDROCK: &str = "    aws: {endpoints: \"https://bedrock-runtime.us-east-1.amazonaws.com\", dialect: bedrock, auth: {kind: aws, service: bedrock, region: us-east-1}}\n";
+        let errors = |extra: &str| -> String {
+            let doc = format!(
+                "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jevp: {{endpoints: \"https://jev.example/v1/decisions\", dialect: decisions}}\n{extra}"
+            );
+            match load_doc(&doc) {
+                Ok(l) => validate(&l).errors.join("; "),
+                Err(e) => e.to_string(),
+            }
+        };
+        let ok = errors(
+            "  models:\n    smart: {model: s-1}\n    deep: {kind: reasoning, model: d-1, reasoning: {effort: high, budget: 4096}, fallback: smart}\n  roles: {turn: smart, think: deep, compaction: deep}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      t: {kind: think, prompt: x, effort: low, depends_on: [s]}\n      f: {kind: finish, depends_on: [t]}\n",
+        );
+        assert!(ok.is_empty(), "{ok}");
+        for (extra, why) in [
+            (
+                "  models:\n    c: {model: c-1, reasoning: {effort: low}}\n",
+                "the defaults of a `kind: reasoning` model",
+            ),
+            (
+                "  models:\n    deep: {kind: reasoning, model: d-1, reasoning: {budget: 100}}\n",
+                "at least 1024",
+            ),
+            (
+                "  models:\n    deep: {kind: reasoning, provider: jevp, model: d-1}\n",
+                "answers decisions only",
+            ),
+            (
+                "  models:\n    deep: {kind: reasoning, model: d-1, fallback: jev}\n    jev: {kind: decision, provider: jevp, model: j-1}\n",
+                "a reasoning model's fallback must write too",
+            ),
+            (
+                "  models:\n    smart: {model: s-1}\n  roles: {turn: smart}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      t: {kind: think, prompt: x, effort: high, depends_on: [s]}\n      f: {kind: finish, depends_on: [t]}\n",
+                "effort: its model (smart) is not a reasoning model",
+            ),
+            (
+                "  models:\n    deep: {kind: reasoning, provider: aws, model: \"arn:aws:bedrock:us-east-1:1:application-inference-profile/x\"}\n",
+                "a reasoning model on Bedrock names its family",
+            ),
+        ] {
+            let e = errors(&format!("{BEDROCK}{extra}"));
+            assert!(e.contains(why), "{extra}\n→ {e}");
+        }
+        // A Bedrock reasoning model whose id names its family loads.
+        let ok = errors(&format!(
+            "{BEDROCK}  models:\n    deep: {{kind: reasoning, provider: aws, model: us.anthropic.claude-sonnet-5-v1:0}}\n    oss: {{kind: reasoning, provider: aws, model: openai.gpt-oss-120b-1:0}}\n"
+        ));
+        assert!(ok.is_empty(), "{ok}");
     }
 
     /// A role is a model's name or `{model, confidence}`; a threshold is for

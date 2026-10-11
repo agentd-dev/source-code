@@ -610,6 +610,7 @@ pub const KINDS: &[KindInfo] = &[
             "skills",
             "system",
             "model",
+            "effort",
         ],
         &["prompt"],
         true,
@@ -704,6 +705,7 @@ pub const KINDS: &[KindInfo] = &[
             "skills",
             "system",
             "model",
+            "effort",
         ],
         &["instruction"],
         true,
@@ -2556,6 +2558,13 @@ fn parse_step(
             }
         }
         "think" | "agent" => {
+            if let Some(e) = spec.get("effort")
+                && !e
+                    .as_str()
+                    .is_some_and(|e| crate::wire::intel::Effort::parse(e).is_some())
+            {
+                errs.push(format!("{at}: effort is low, medium or high"));
+            }
             if let Some(s) = spec.get("output_schema")
                 && let Err(e) = jsonschema::check_schema(s)
             {

@@ -158,6 +158,9 @@ pub struct IntelClient {
     /// with its breakers open that costs no dial, while a breaker that has
     /// cooled half-opens and the primary is back the moment it answers.
     fallback: Option<Box<Fallback>>,
+    /// This model's reasoning controls, when it is a reasoning model: set on
+    /// every request it is asked, and on no other link's.
+    reasoning: Option<crate::wire::intel::ReasoningAsk>,
 }
 
 /// The next link of a fallback chain: its client and the wire model it sends.
@@ -238,7 +241,24 @@ impl IntelClient {
             health_reporter: None,
             last_all_down: std::cell::Cell::new(false),
             fallback: None,
+            reasoning: None,
         }
+    }
+
+    /// Ask every request on this model with these reasoning controls.
+    pub fn with_reasoning(
+        mut self,
+        reasoning: Option<crate::wire::intel::ReasoningAsk>,
+    ) -> IntelClient {
+        self.reasoning = reasoning;
+        self
+    }
+
+    /// The room a call on this model leaves for its thinking — 0 for a model
+    /// that does not reason. The providers raise the output cap by it, so
+    /// budget admission counts it with the completion cap.
+    pub fn reasoning_budget(&self) -> u64 {
+        self.reasoning.map_or(0, |r| r.budget_tokens())
     }
 
     /// The ceiling on one call; `None` keeps the default (120 s).
@@ -381,6 +401,8 @@ impl IntelClient {
             Err(e) if unavailable(&e) => {
                 let mut next = req.clone();
                 next.model = f.model.clone();
+                // The fallback is its own model, with its own controls.
+                next.reasoning = None;
                 f.client.complete(&next).map(|mut resp| {
                     resp.fallback.get_or_insert_with(|| f.model.clone());
                     resp
@@ -408,6 +430,16 @@ impl IntelClient {
 
     /// One completion on this client's own endpoints.
     fn complete_here(&self, req: &Request) -> Result<Response, IntelError> {
+        let owned;
+        let req = match (&self.reasoning, &req.reasoning) {
+            (Some(r), None) => {
+                let mut with = req.clone();
+                with.reasoning = Some(*r);
+                owned = with;
+                &owned
+            }
+            _ => req,
+        };
         // One model call. A no-op when metrics are not enabled.
         crate::obs::metrics::record_intel_call();
 
@@ -725,6 +757,7 @@ mod tests {
             max_tokens: 16,
             temperature: Some(0.0),
             decision: None,
+            reasoning: None,
         };
         // Past the breaker's threshold, so the dead model is broken open.
         for _ in 0..4 {
@@ -736,6 +769,41 @@ mod tests {
             "the dead model is broken open"
         );
         assert!(!reports.borrow().contains(&true), "{:?}", reports.borrow());
+    }
+
+    /// A model's reasoning controls are its own: its fallback is asked
+    /// without them, as the model it is.
+    #[test]
+    fn a_fallback_is_not_asked_with_the_head_models_reasoning() {
+        let play = std::env::temp_dir().join(format!(
+            "agentd-client-reasoning-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &play,
+            r#"{"turns": [{"content": "clean"}], "match": [{"when_contains": "reasoning_effort", "content": "leaked"}]}"#,
+        )
+        .unwrap();
+        let backup =
+            IntelClient::from_parts(&format!("mock:file:{}", play.display()), None).unwrap();
+        let chain = IntelClient::from_parts("http://127.0.0.1:9", None)
+            .unwrap()
+            .with_reasoning(Some(crate::wire::intel::ReasoningAsk {
+                effort: crate::wire::intel::Effort::High,
+                budget: None,
+            }))
+            .with_fallback(backup, "m-backup".into());
+        // Budget admission counts the head's thinking room.
+        assert_eq!(chain.reasoning_budget(), 24576);
+        let req = Request {
+            model: "m-main".into(),
+            messages: vec![crate::wire::intel::Message::User("hi".into())],
+            max_tokens: 16,
+            ..Default::default()
+        };
+        let resp = chain.complete(&req).unwrap();
+        assert_eq!(resp.text.as_deref(), Some("clean"));
+        let _ = std::fs::remove_file(&play);
     }
 
     #[test]

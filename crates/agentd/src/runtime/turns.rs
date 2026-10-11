@@ -46,6 +46,9 @@ pub(crate) struct TurnLaunch {
     /// The job this turn does, which picks its model when `model` is unset
     /// (`intelligence.roles`, RFC 0046 §5.4).
     pub role: ModelRole,
+    /// How hard a reasoning model thinks for this turn — a node's or a
+    /// `think` call's `effort`, over the model's own (RFC 0046 §5.7).
+    pub effort: Option<crate::wire::intel::Effort>,
 }
 
 impl Runtime {
@@ -465,6 +468,7 @@ impl Runtime {
             agent_path: format!("turn/{ctx_id}"),
             model: None,
             role: ModelRole::Turn,
+            effort: None,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -641,6 +645,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             // on its own role's model when one is bound.
             model: None,
             role: ModelRole::Preflight,
+            effort: None,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -1177,13 +1182,28 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             // An explicit `model:` on the node wins; then the model the
             // turn's role is bound to — summarising and triage are recurring
             // fixed costs that do not need the agent's main model.
-            intelligence: self.intel_config(
-                launch
-                    .model
-                    .clone()
-                    .or_else(|| self.settings.intelligence.reference(launch.role))
-                    .as_deref(),
-            ),
+            intelligence: {
+                let mut cfg = self.intel_config(
+                    launch
+                        .model
+                        .clone()
+                        .or_else(|| self.settings.intelligence.reference(launch.role))
+                        .as_deref(),
+                );
+                if let Some(e) = launch.effort {
+                    match cfg.reasoning.as_mut() {
+                        Some(r) => r.effort = e,
+                        // Checked at load and at the call; a reload that moved
+                        // the role to a model that does not reason since is
+                        // said, not hidden.
+                        None => self.log.warn(
+                            "turn.effort_ignored",
+                            json!({"agent_path": launch.agent_path, "effort": e.as_str(), "model": cfg.model}),
+                        ),
+                    }
+                }
+                cfg
+            },
             mcp_servers: servers,
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
@@ -1588,6 +1608,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             agent_path: format!("compact/{ctx_id}"),
             model: None,
             role: ModelRole::Compaction,
+            effort: None,
         };
         match self.spawn_turn(launch) {
             Ok(node) => self.log.info(

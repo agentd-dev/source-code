@@ -240,6 +240,18 @@ impl Runtime {
                 json!({"provider": provider, "err": e}),
             );
         }
+        // A reasoning model's defaults; an effort a node or a call names is
+        // put over them where the call is made.
+        let reasoning = reference
+            .and_then(|r| intel.tier(r))
+            .filter(|t| t.kind == crate::config::settings::ModelKind::Reasoning)
+            .map(|t| {
+                let d = t.reasoning.clone().unwrap_or_default();
+                crate::wire::intel::ReasoningAsk {
+                    effort: d.effort.unwrap_or(crate::wire::intel::Effort::Medium),
+                    budget: d.budget,
+                }
+            });
         IntelConfig {
             uri: conn.uri.clone(),
             token,
@@ -251,6 +263,7 @@ impl Runtime {
             timeout_ms: conn.timeout_ms,
             reference: None,
             fallbacks: Vec::new(),
+            reasoning,
         }
     }
 }

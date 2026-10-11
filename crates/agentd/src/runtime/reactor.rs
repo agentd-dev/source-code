@@ -1286,8 +1286,17 @@ impl Runtime {
             .get(node)
             .map(|c| c.started)
             .unwrap_or_else(Instant::now);
-        if started.elapsed() > Duration::from_secs(1) {
-            self.children.kill(node);
+        if started.elapsed() > Duration::from_secs(1)
+            && let Some(pid) = self.children.kill(node)
+        {
+            // The kill reaps the child itself, so the reaper never reports
+            // the exit. Settled as a reap: otherwise its entry stayed in the
+            // table (idle exit never came, a drain ran out its timeout) and
+            // the unit it owed a result was never failed.
+            let _ = self.events_tx.send(Event::Reaped(Reaped {
+                pid,
+                outcome: crate::supervisor::reap::WaitOutcome::Signaled(libc::SIGKILL),
+            }));
         }
     }
 
@@ -2063,10 +2072,26 @@ impl Runtime {
     }
 }
 
+/// Whether a subagent record's status is final. Every status a child's
+/// result can carry is ([`TerminalStatus`](crate::agentloop::stop::TerminalStatus)),
+/// a budget's end included: a child stopped on its steps, its tokens or its
+/// deadline is finished, and a record left looking live held a breadth slot
+/// for ever, never answered a wait, and was spawned again at the next start.
 pub(crate) fn is_terminal_status(s: &str) -> bool {
     matches!(
         s,
-        "completed" | "failed" | "cancelled" | "refused" | "killed" | "crashed" | "retired"
+        "completed"
+            | "failed"
+            | "cancelled"
+            | "refused"
+            | "killed"
+            | "crashed"
+            | "retired"
+            | "exhausted_steps"
+            | "exhausted_tokens"
+            | "deadline"
+            | "stalled"
+            | "loop_detected"
     )
 }
 
@@ -2129,6 +2154,35 @@ pub fn turn_exit_code(status: &str, error: Option<&str>) -> i32 {
                 None => exit::GENERIC,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    /// Every status a child's result carries ends its record.
+    #[test]
+    fn every_child_outcome_is_terminal() {
+        use crate::agentloop::stop::TerminalStatus::*;
+        for s in [
+            Completed,
+            Refused,
+            ExhaustedSteps,
+            ExhaustedTokens,
+            Deadline,
+            Stalled,
+            LoopDetected,
+            Cancelled,
+            Crashed,
+        ] {
+            assert!(super::is_terminal_status(s.as_str()), "{}", s.as_str());
+        }
+        assert!(!super::is_terminal_status("running"));
+        // An outcome added to the enum belongs in the list above: this match
+        // stops compiling without it.
+        let _every = |s: crate::agentloop::stop::TerminalStatus| match s {
+            Completed | Refused | ExhaustedSteps | ExhaustedTokens | Deadline | Stalled
+            | LoopDetected | Cancelled | Crashed => (),
+        };
     }
 }
 

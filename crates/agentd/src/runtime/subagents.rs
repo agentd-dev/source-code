@@ -705,11 +705,25 @@ impl Runtime {
 
     /// A subagent finished (result or failure).
     pub(crate) fn on_subagent_result(&mut self, node: NodeId, outcome: Result<Outcome, String>) {
-        let Some(ChildKind::Subagent { handle }) = self.children.get(node).map(|c| c.kind.clone())
+        // The child may already be gone: a child that died without a result
+        // reaches here from the reap path AFTER `Children::on_reaped` removed
+        // it, and returning then left its record `running` for ever — no
+        // result, no answer to a waiter. The reaped record says which
+        // subagent it was.
+        let Some(ChildKind::Subagent { handle }) = self
+            .children
+            .get(node)
+            .map(|c| c.kind.clone())
+            .or_else(|| self.children.reaped_kind(node))
         else {
             return;
         };
-        let tokens = self.children.get(node).map(|c| c.tokens).unwrap_or(0);
+        let tokens = self
+            .children
+            .get(node)
+            .map(|c| c.tokens)
+            .or_else(|| self.subagents.get(&handle).map(|s| s.tokens))
+            .unwrap_or(0);
         let (status, result, error) = match &outcome {
             Ok(o) => (
                 o.status.as_str().to_string(),

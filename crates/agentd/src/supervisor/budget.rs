@@ -45,6 +45,10 @@ impl Budget {
     pub fn tokens(&self) -> u64 {
         self.tokens
     }
+    /// The instant the run must end by.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
     pub fn steps(&self) -> u32 {
         self.steps
     }

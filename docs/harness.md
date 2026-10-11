@@ -450,10 +450,6 @@ And these are known gaps, stated here rather than discovered later:
   restored record, and a conversation turn's idempotency key can repeat.
   Workflow runs are unaffected: they use ULIDs and a durable attempt
   counter.
-- **Killing a stuck child leaves a phantom entry.** The kill path reaps the
-  child itself, so no reap event removes its table entry. Idle exit then
-  never fires, a drain runs its full timeout, `child.unhealthy`
-  repeats every tick, and the cgroup leaf stays until the process exits.
 - **A child that dies during setup is found by the reaper**, on the next
   tick, rather than the moment it fails. The reaper does fail its unit:
   a worker reaped while its step is still running fails the step and logs

@@ -387,12 +387,11 @@ way. Notes are withheld from a conversation that holds both sensitive and
 egress tools when the child may carry outside input
 ([Security model](security.md)).
 
-> **Limit.** A child that ends on its budget records `exhausted_steps`,
-> `exhausted_tokens` or `deadline`, and a child killed by a signal stays
-> `running`. Neither counts as finished: `subagent.await` and
-> `wait {on: subagent}` on that handle do not resolve, and the record keeps
-> its `breadth` slot. A `sync` call or a `sync` workflow step receives the
-> result directly and is not affected. Give every `wait` a `timeout`.
+A child that ends on its budget records `exhausted_steps`,
+`exhausted_tokens` or `deadline`, and one that dies without reporting
+(killed by a signal, out of memory, torn down by the supervisor) records
+`failed`. Either way the record is finished: `subagent.await` and
+`wait {on: subagent}` answer, and the child's `breadth` slot is free.
 
 ## Keep a session warm
 

@@ -385,9 +385,14 @@ impl<'a> Session<'a> {
                 json!({"step": budget.steps(), "messages": self.messages.len()}),
             );
             let chat_start = crate::obs::otel::now_unix_nanos();
-            let resp = intel
-                .complete(&req)
-                .map_err(|e| LoopAbort::Intel(e.to_string()))?;
+            // The run's deadline bounds the call in flight too. One it cut
+            // off is no outage of the model: the budget check at the head of
+            // the loop ends the run on its deadline.
+            let resp = match intel.complete_by(&req, budget.deadline()) {
+                Ok(r) => r,
+                Err(_) if Instant::now() >= budget.deadline() => continue,
+                Err(e) => return Err(LoopAbort::Intel(e.to_string())),
+            };
             budget.record_usage(resp.usage);
             budget.record_step();
             tok_in += resp.usage.input_tokens;

@@ -277,10 +277,12 @@ impl Children {
     }
 
     /// Kill a child now (its whole process group).
-    pub fn kill(&mut self, node: NodeId) {
-        if let Some(c) = self.map.get_mut(&node) {
-            c.sub.kill();
-        }
+    /// Kill a child now. Its pid when it was still running: the kill reaps
+    /// it, so the reaper never reports the exit and the caller settles it.
+    pub fn kill(&mut self, node: NodeId) -> Option<i32> {
+        let c = self.map.get_mut(&node)?;
+        let pid = c.sub.pid();
+        c.sub.kill().then_some(pid)
     }
 
     /// Periodic maintenance: pings + liveness. Returns the nodes that must be
@@ -344,7 +346,7 @@ impl Children {
     /// Forget every remaining child (after a forced kill at abandon).
     pub fn abandon(&mut self) {
         for (_, mut c) in self.map.drain() {
-            c.sub.kill();
+            let _ = c.sub.kill();
         }
         self.pid_to_node.clear();
     }

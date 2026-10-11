@@ -210,9 +210,12 @@ tools when the child may carry outside input.
 
 ## Lifecycle
 
-A flat child's record moves through a small set of statuses. Seven of them
-are terminal, the set every waiter tests against: `completed`, `failed`,
-`cancelled`, `refused`, `killed`, `crashed` and `retired`.
+A flat child's record moves through a small set of statuses. All but
+`spawned` and `running` are terminal, the set every waiter tests against:
+`completed`,
+`failed`, `cancelled`, `refused`, `killed`, `crashed`, `retired`,
+`exhausted_steps`, `exhausted_tokens`, `deadline`, `stalled` and
+`loop_detected`.
 
 ```mermaid
 flowchart LR
@@ -225,14 +228,11 @@ flowchart LR
     R -- "steps, tokens or<br/>deadline spent" --> E["exhausted_steps<br/>exhausted_tokens<br/>deadline"]
 ```
 
-> **Limit.** `exhausted_steps`, `exhausted_tokens` and `deadline` are not in
-> the terminal set. A `sync` caller receives the result, but the record keeps
-> counting against `limits.subagents.breadth`, a later `subagent.await` or
-> `wait {on: subagent}` on that handle does not resolve, and a restart
-> spawns the child again. A child that dies without reporting (killed by a
-> signal, out of memory, torn down at its hard deadline) stays `running` in
-> the same way. Prefer `sync` calls and workflow `subagent` steps, which
-> receive the result directly, and give waits a `timeout`.
+Every status a child ends with is final, its budget's included. A child
+that dies without reporting (killed by a signal, out of memory, torn down
+by the supervisor as stuck or past its deadline) ends `failed` with the
+reason "exited without a result". The child's deadline bounds a model call
+in flight, so it ends `deadline` when the deadline passes.
 
 **Liveness is probed, not assumed.** The reactor pings each child, and the
 child's control thread answers separately from its agent loop. A child that

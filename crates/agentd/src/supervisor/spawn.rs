@@ -224,15 +224,19 @@ impl Subagent {
 
     /// Immediate, unconditional teardown of the whole process group. The
     /// graceful ladder (cancel → SIGTERM → SIGKILL over time) is driven by the
-    /// reactor via `kill.rs`; this is the backstop.
-    pub fn kill(&mut self) {
-        if !self.reaped {
-            crate::supervisor::reaper::deregister(self.pid());
-            kill_group(self.pgid);
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.reaped = true;
+    /// reactor via `kill.rs`; this is the backstop. Whether it killed a child
+    /// that was still running: the reaper never sees this exit, so the caller
+    /// settles it.
+    pub fn kill(&mut self) -> bool {
+        if self.reaped {
+            return false;
         }
+        crate::supervisor::reaper::deregister(self.pid());
+        kill_group(self.pgid);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+        true
     }
 }
 

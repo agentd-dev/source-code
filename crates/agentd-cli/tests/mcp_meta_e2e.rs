@@ -109,7 +109,9 @@ fn probe(protocol_version: &str) -> common::MockMcp {
     // `work` step is a turn: the model calls `mock.ops` (and, at 2026-07-28,
     // `mock.regional`, whose argument travels as a header), then delegates;
     // the child — identified by its own system prompt, which the turn's
-    // transcript never contains — calls `search.query`. The rule for the
+    // transcript never contains — calls the server's `search.query`, which it
+    // names `mock.search.query` as the registry does (an agentd contract holds
+    // the bare name). The rule for the
     // child's second round comes first: by then its transcript still carries
     // the first round's marker too.
     let mut first = vec![json!({"name": "mock.ops", "arguments": {}})];
@@ -134,7 +136,7 @@ fn probe(protocol_version: &str) -> common::MockMcp {
         "match": [
             {"when_contains": "Result for zebra-child", "content": "child done"},
             {"when_contains": "You are agentd, an autonomous agent.",
-             "tool_calls": [{"name": "search.query", "arguments": {"query": "zebra-child"}}]}
+             "tool_calls": [{"name": "mock.search.query", "arguments": {"query": "zebra-child"}}]}
         ]
     }));
     let cfg = common::unique_path("agentd-mcp-meta", "yaml");

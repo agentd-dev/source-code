@@ -1409,6 +1409,15 @@ pub fn is_long_lived_start(kind: &str) -> bool {
     KINDS.iter().any(|k| k.start && k.name == kind) && !ONE_SHOT_STARTS.contains(&kind)
 }
 
+/// The events an `event` start fires on — what the runtime raises.
+pub const START_EVENTS: &[&str] = &[
+    "workflow.finished",
+    "workflow.failed",
+    "human.asked",
+    "human.answered",
+    "lifecycle.shutdown",
+];
+
 /// Parse + validate a workflow document. Errors name every problem.
 pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     let mut errs = Vec::new();
@@ -1716,11 +1725,64 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         gate_channels: BTreeMap::new(),
     };
     validate_graph(&wf, &mut errs);
+    check_step_paths(&wf, &mut errs);
     if !errs.is_empty() {
         return Err(errs);
     }
     wf.hash = crate::sha::sha256_hex(canonical(doc).as_bytes());
     Ok(wf)
+}
+
+/// A template path to a step the workflow does not have rendered nothing,
+/// or failed the step reading it, only when that step ran: a misspelt id is
+/// refused here, where it is a typo. A path may name any step at any depth —
+/// a body reads its own steps as well as the run's — so it is checked
+/// against all of them.
+fn check_step_paths(wf: &Workflow, errs: &mut Vec<String>) {
+    fn ids(steps: &BTreeMap<String, Step>, out: &mut BTreeSet<String>) {
+        for (id, s) in steps {
+            out.insert(id.clone());
+            if let Some(b) = &s.body {
+                ids(&b.steps, out);
+            }
+            for b in s.branches.values() {
+                ids(&b.steps, out);
+            }
+        }
+    }
+    fn check(
+        wf: &str,
+        steps: &BTreeMap<String, Step>,
+        known: &BTreeSet<String>,
+        errs: &mut Vec<String>,
+    ) {
+        for (id, s) in steps {
+            // A container's own fields only: its body's steps are checked
+            // as themselves below, not a second time under its id.
+            let mut own = s.spec.clone();
+            own.remove("body");
+            own.remove("branches");
+            for r in super::template::referenced_steps(&Value::Object(own)) {
+                if !known.contains(&r) {
+                    let e = format!(
+                        "workflow {wf:?} step {id:?}: a template names step {r:?}, which the workflow does not have"
+                    );
+                    if !errs.contains(&e) {
+                        errs.push(e);
+                    }
+                }
+            }
+            if let Some(b) = &s.body {
+                check(wf, &b.steps, known, errs);
+            }
+            for b in s.branches.values() {
+                check(wf, &b.steps, known, errs);
+            }
+        }
+    }
+    let mut known = BTreeSet::new();
+    ids(&wf.steps, &mut known);
+    check(&wf.name, &wf.steps, &known, errs);
 }
 
 /// The webhook paths agentd serves for itself: a `wait {on: webhook}`
@@ -2552,6 +2614,18 @@ fn parse_step(
         // the branch is taken. That is a silent trap for whoever writes the
         // config and a confusing one for whoever debugs it, so it is refused
         // here, where the message can say what to write instead.
+        // An `event` start fires on what the runtime raises, by exact name;
+        // any other name would load and never fire.
+        "event" => {
+            if let Some(on) = spec.get("on").and_then(Value::as_str)
+                && !START_EVENTS.contains(&on)
+            {
+                errs.push(format!(
+                    "{at}: on {on:?} is no event the runtime raises (one of: {})",
+                    START_EVENTS.join(", ")
+                ));
+            }
+        }
         "switch" => {
             if let Some(cases) = spec.get("cases").and_then(Value::as_object) {
                 for (case, target) in cases {
@@ -3397,6 +3471,53 @@ mod tests {
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {
         parse_workflow(&doc)
+    }
+
+    /// An `event` start names an event the runtime raises; any other name
+    /// loaded and never fired.
+    #[test]
+    fn an_event_start_names_an_event_the_runtime_raises() {
+        let with = |on: &str| {
+            wf(serde_json::json!({
+                "name": "w",
+                "steps": {
+                    "e": {"kind": "event", "on": on},
+                    "fin": {"kind": "finish", "depends_on": ["e"]}
+                }
+            }))
+        };
+        for on in START_EVENTS {
+            assert!(with(on).is_ok(), "{on}: {:?}", with(on));
+        }
+        let e = with("config.reloaded").unwrap_err().join("; ");
+        assert!(e.contains("is no event the runtime raises"), "{e}");
+    }
+
+    /// A template path names a step the workflow has — at any depth — or the
+    /// workflow is refused, instead of the path rendering nothing at run time.
+    #[test]
+    fn a_template_path_names_a_step_the_workflow_has() {
+        let with = |output: &str| {
+            wf(serde_json::json!({
+                "name": "w",
+                "steps": {
+                    "go": {"kind": "manual"},
+                    "mood": {"kind": "assign", "depends_on": ["go"], "value": "calm"},
+                    "each": {"kind": "foreach", "depends_on": ["mood"], "over": "{{ inputs.xs }}",
+                             "body": {"steps": {"inner": {"kind": "assign", "value": "{{ steps.mood.output }}"}}}},
+                    "fin": {"kind": "finish", "depends_on": ["each"], "output": output}
+                }
+            }))
+        };
+        for ok in [
+            "{{ steps.mood.output }}",
+            "{{ /steps/inner/status }}",
+            "{{ steps.mood.error | ok }}",
+        ] {
+            assert!(with(ok).is_ok(), "{ok}: {:?}", with(ok));
+        }
+        let e = with("{{ steps.moood.output }}").unwrap_err().join("; ");
+        assert!(e.contains("names step \"moood\""), "{e}");
     }
 
     /// `min_success` is a `parallel`'s: how many branches must succeed. A

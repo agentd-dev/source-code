@@ -225,8 +225,9 @@ Three rules decide what you get:
 - A string that starts with `CEL:` is a CEL expression over the same names:
   `"CEL: inputs.amount > 500 ? 'review' : 'auto'"`.
 
-Paths are not checked when the configuration loads. A typo fails the step
-when it runs. The [workflow language reference](workflow-language.md) has
+A path's step is checked when the configuration loads: one naming a step
+the workflow does not have is refused. What follows the step id is read at
+run time, so a typo there fails the step when it runs. The [workflow language reference](workflow-language.md) has
 the full rules, including the JSON-pointer form for ids with dots in them.
 
 ## Branch and guard

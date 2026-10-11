@@ -8971,8 +8971,68 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         for e in events::subscribe_refusals(s, w) {
             err(&mut d, e);
         }
+        for e in undeclared_references(s, w) {
+            err(&mut d, e);
+        }
     }
     d
+}
+
+/// What a workflow's steps name that the configuration does not declare: an
+/// `mcp.tool` or `mcp.resource` step's server, an `emit` or `stream` step's
+/// stream — at any depth. One check for a configured definition at load and
+/// for one the runtime reads, stores or the agent writes, so a validated
+/// configuration is one that starts. A templated name is the run's to
+/// render (a templated `emit` target is any declared stream), not refused.
+pub(crate) fn undeclared_references(
+    s: &Settings,
+    w: &crate::engine::model::Workflow,
+) -> Vec<String> {
+    fn walk(
+        s: &Settings,
+        wf: &str,
+        steps: &BTreeMap<String, crate::engine::model::Step>,
+        out: &mut Vec<String>,
+    ) {
+        for (id, st) in steps {
+            match st.kind.as_str() {
+                "mcp.tool" | "mcp.resource" => {
+                    if let Some(srv) = st.field_str("server")
+                        && !templated(srv)
+                        && !s.mcp.servers.iter().any(|m| m.name == srv)
+                    {
+                        out.push(format!(
+                            "workflow {wf:?} step {id:?}: mcp server {srv:?} is not declared under mcp.servers"
+                        ));
+                    }
+                }
+                "emit" | "stream" => {
+                    if let Some(name) = st.field_str("stream")
+                        && !templated(name)
+                        && !s.streams.contains_key(name)
+                    {
+                        out.push(format!(
+                            "workflow {wf:?} step {id:?}: stream {name:?} is not declared under `streams:`"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            if let Some(b) = &st.body {
+                walk(s, wf, &b.steps, out);
+            }
+            for b in st.branches.values() {
+                walk(s, wf, &b.steps, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(s, &w.name, &w.steps, &mut out);
+    out
+}
+
+fn templated(name: &str) -> bool {
+    crate::engine::template::is_templated(&Value::String(name.to_string()))
 }
 
 /// Start-node kinds that keep an instance alive indefinitely. An instance

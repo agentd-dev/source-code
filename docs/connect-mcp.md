@@ -356,8 +356,8 @@ agentd treats an MCP server as a dependency that may come and go.
 - **Some servers must answer at startup.** The server behind
   `store: {kind: mcp}`, and the server the instruction resource is read from
   (`agent.instruction: {mcp: …}`), are required: without them agentd exits
-  `6`. A server that a configured workflow's `mcp.tool` step names must be
-  connected too, or the start is refused with exit `2`
+  `6`. Any other server may be down at startup: it joins when it comes up,
+  and a workflow step that calls it before then fails when it runs
   (`mcp server "<name>" is not connected`). See
   [CLI, environment and exit codes](cli.md).
 - **Mid-run**, a turn worker or subagent dials the servers its tools route

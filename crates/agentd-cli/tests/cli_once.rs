@@ -154,6 +154,91 @@ fn a_prompt_exits_4_on_unreachable_intel() {
     );
 }
 
+/// What a workflow names that the configuration does not declare — an
+/// `mcp.tool` step's server, a `stream` step's stream — is refused by
+/// `--validate-config`, as startup refuses it; it passed validation and
+/// failed the first start with exit 2.
+#[test]
+fn validate_refuses_an_undeclared_server_or_stream() {
+    for (step, says) in [
+        (
+            "{kind: mcp.tool, depends_on: [s], server: ghost, tool: t}",
+            "mcp server \"ghost\" is not declared under mcp.servers",
+        ),
+        (
+            "{kind: emit, depends_on: [s], stream: ghost, subject: x, data: {}}",
+            "stream \"ghost\" is not declared under `streams:`",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("c.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "agent: {{name: c}}\nstore: {{kind: memory}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nworkflows:\n  - name: w\n    steps:\n      s: {{kind: once}}\n      x: {step}\n      f: {{kind: finish, depends_on: [x]}}\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--validate-config", "--config"])
+            .arg(&cfg)
+            .output()
+            .expect("run agentd");
+        // The refusal is a JSON log line: its quotes arrive escaped.
+        let stderr = String::from_utf8_lossy(&out.stderr).replace("\\\"", "\"");
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+    }
+}
+
+/// A templated `emit` target is the run's to render — any declared stream —
+/// and loads, in a body as at the top level.
+#[test]
+fn validate_accepts_a_templated_emit_target_in_a_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.yaml");
+    std::fs::write(
+        &cfg,
+        "agent: {name: c}\nstore: {kind: memory}\nintelligence: {endpoints: \"mock:final\", model: m}\nstreams: {orders: {}}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      g: {kind: subgraph, depends_on: [s], body: {steps: {e: {kind: emit, stream: \"{{ inputs.target }}\", subject: x, data: {}}}}}\n      f: {kind: finish, depends_on: [g]}\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--validate-config", "--config"])
+        .arg(&cfg)
+        .output()
+        .expect("run agentd");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A declared server that is down at boot does not stop the start: it joins
+/// when it comes up, and a step calling it before then fails when it runs.
+#[test]
+fn a_step_on_a_declared_server_down_at_boot_fails_when_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("c.yaml");
+    std::fs::write(
+        &cfg,
+        "agent: {name: c}\nstore: {kind: memory}\nintelligence: {endpoints: \"mock:final\", model: m}\nmcp:\n  servers:\n    - {name: down, endpoint: \"http://127.0.0.1:9/mcp\"}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      x: {kind: mcp.tool, depends_on: [s], server: down, tool: t}\n      f: {kind: finish, depends_on: [x]}\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config"])
+        .arg(&cfg)
+        .output()
+        .expect("run agentd");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mcp server \\\"down\\\" is not connected"),
+        "the step failed on the server it called:\n{stderr}"
+    );
+}
+
 #[test]
 fn bad_flag_exits_2() {
     let exe = env!("CARGO_BIN_EXE_agentd");

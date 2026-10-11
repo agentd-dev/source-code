@@ -73,8 +73,9 @@ Things to know about the rules:
   fallback does not apply.
 - A render error happens after the attempt counter moved, so it uses up one
   `retry`.
-- Paths are not checked at load. A typo is a step failure when the step
-  runs.
+- A path's step id is checked at load: one naming a step the workflow does
+  not have is refused. What follows it is read at run time, so a typo there
+  is a step failure when the step runs.
 - Secret references resolve only where a node resolves them: an `http`
   step's `headers` and `sign.secret`, and a webhook's `auth`. Anywhere else
   the destination receives the literal text. A credential never lands in
@@ -222,8 +223,10 @@ Some checks need the live registry and run at startup rather than in
 | Message | Cause |
 |---|---|
 | `tool "x" is unknown, disabled or not granted to workflows` | a `tool` step names a tool workflows cannot call |
-| `mcp server "x" is not connected` | an `mcp.tool` step names a server that is not declared, or did not connect at startup |
-| `stream "x" is not declared under \`streams:\`` | a `stream` start on an undeclared stream |
+| `mcp server "x" is not declared under mcp.servers` | an `mcp.tool` or `mcp.resource` step names a server the configuration does not declare |
+| `stream "x" is not declared under \`streams:\`` | a `stream` start or an `emit` names an undeclared stream |
+| `a template names step "x", which the workflow does not have` | a template path to a step id the workflow does not define |
+| `on "x" is no event the runtime raises` | an `event` start on an event agentd never raises |
 
 ## Build features
 

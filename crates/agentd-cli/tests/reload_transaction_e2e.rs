@@ -297,9 +297,9 @@ fn a_config_that_does_not_parse_is_refused_in_the_loaders_words() {
 }
 
 /// A reload that takes away a server a running workflow still calls is
-/// refused the same way — the workflows are checked against the servers the
-/// reload would run on even when the workflow entries did not change — and
-/// the running connection to it stays.
+/// refused — the workflows are checked against the servers the reload would
+/// declare even when the workflow entries did not change — before anything
+/// is dialed, and the running connection to it stays.
 #[test]
 fn removing_a_server_a_workflow_calls_refuses_the_reload_and_its_connection_stays() {
     let a = common::spawn_mock_mcp("mock://a", false);
@@ -317,7 +317,28 @@ fn removing_a_server_a_workflow_calls_refuses_the_reload_and_its_connection_stay
         config("Keep ticking.", &[("b", &b.uri())], &[TICK], ""),
     )
     .unwrap();
-    assert_refused(&d, 0, "mcp server \"a\" is not connected", "b");
+    // Refused at validation, before anything is dialed: the workflow names a
+    // server the new configuration does not declare.
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(
+        outcome["event"], "config.reload.invalid",
+        "the reload was not refused:\n{log}"
+    );
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("mcp server \"a\" is not declared under mcp.servers"))),
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.connect")
+            .iter()
+            .all(|e| e["server"] != "b"),
+        "the refused reload dialed b:\n{log}"
+    );
     assert_nothing_applied(&d, &a, &cfg, &original, 0, "b");
 }
 

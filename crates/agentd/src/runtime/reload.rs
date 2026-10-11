@@ -438,14 +438,13 @@ impl Runtime {
         } else {
             None
         };
-        // The workflows are checked against the registry and the servers
-        // they will run with — the staged ones, not the running ones.
+        // The workflows are checked against the registry they will run with
+        // — the staged one, not the running one — and the servers and
+        // streams the new configuration declares.
         let workflows = match workflows {
-            Some(staged) => Some(self.prepare_workflows(
-                staged,
-                registry.as_ref().unwrap_or(&self.registry),
-                conns,
-            )?),
+            Some(staged) => {
+                Some(self.prepare_workflows(staged, registry.as_ref().unwrap_or(&self.registry))?)
+            }
             None => None,
         };
         // A rebuilt registry carries the workflow tools of the set that will

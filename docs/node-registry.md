@@ -181,8 +181,7 @@ Fires on an internal event.
 
 - An event about a workflow never fires that workflow's own start, so a
   watcher on `workflow.finished` cannot trigger itself.
-- `on` is not checked against this list. Any other name loads and never
-  fires.
+- `on` is one of these; any other name is refused at load.
 - An `inputs` mapping that fails to render refuses to fire
   (`start.inputs.invalid`).
 
@@ -909,8 +908,10 @@ outside world.
 - Every call carries a retry-stable `agent/idempotency_key` in `_meta`, with
   `agent/attempt` beside it. `idempotency: {value}` replaces the key with an
   application key.
-- A server that is not connected at startup exits `2`; at run time it fails
-  the step. A server in the `services:` catalog with a `rate` paces calls.
+- A server the configuration does not declare is refused at load. A
+  declared server that is down when the step runs fails the step; one down
+  at startup joins when it comes up. A server in the `services:` catalog
+  with a `rate` paces calls.
 
 ```yaml
 # fragment: under workflows[].steps

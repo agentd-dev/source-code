@@ -94,7 +94,12 @@ it, `a2a.listen`, `webhooks.listen` and `a2a.peers` (`a2a`),
 A subagent's `tools` grant names tools as the agent's catalogue does: with a
 server's `ns` prefix, and `<server>.<tool>` where the name is taken.
 `min_success` belongs to `parallel`, which reads it, and is refused on a
-`race`, which accepted it and did nothing with it.
+`race`, which accepted it and did nothing with it. `--validate-config` now
+refuses what startup refused or what would never run: a step naming an MCP
+server or a stream the configuration does not declare, an `event` start on
+an event the runtime never raises, and a template path to a step the
+workflow does not have. A declared MCP server that is down at startup no
+longer stops it: a step calling it fails when it runs, until it joins.
 
 **Removed.** Keys that were accepted and read by nothing:
 `observability.report_file` (`--report-file`), `observability.otel.traces`,

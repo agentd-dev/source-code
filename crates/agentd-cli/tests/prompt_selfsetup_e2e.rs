@@ -126,3 +126,48 @@ fn a_prompt_that_sets_up_recurring_work_leaves_a_live_daemon() {
          `auto` must re-read the live workflow set, not just the configured one"
     );
 }
+
+/// A definition the agent writes is held to the load's line: a step in a
+/// body naming a server the configuration does not declare is refused when
+/// the agent defines it, rather than stored and failing when it runs.
+#[test]
+fn an_agent_written_definition_naming_an_undeclared_server_is_refused() {
+    let playbook = json!({"turns": [
+        {"tool_calls": [{"name": "workflow.create", "arguments": {"definition": {
+            "name": "fanout",
+            "steps": {
+                "go": {"kind": "manual"},
+                "each": {"kind": "foreach", "depends_on": ["go"], "over": "{{ inputs.xs }}",
+                         "body": {"steps": {"call": {"kind": "mcp.tool", "server": "ghost", "tool": "t"}}}},
+                "fin": {"kind": "finish", "depends_on": ["each"]}
+            }
+        }}}]},
+        {"content": "ACCEPTED"}
+    ], "match": [
+        // The refusal reaches the model as the tool's result.
+        {"when_contains": "is not declared under mcp.servers", "content": "REFUSED_UNDECLARED"}
+    ]});
+    let llm = spawn_mock_llm(&playbook);
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args([
+            "--prompt",
+            "Set up a fan-out.",
+            "--intelligence",
+            &llm.uri,
+            "--model",
+            "m-1",
+            "--store-kind",
+            "memory",
+            "--agent.preflight",
+            "never",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run agentd");
+    let answer = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        answer.contains("REFUSED_UNDECLARED"),
+        "the definition was not refused: {answer}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

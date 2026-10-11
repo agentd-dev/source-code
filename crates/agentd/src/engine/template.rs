@@ -145,6 +145,49 @@ pub fn lookup(path: &str, data: &Data) -> Option<Value> {
     Some(cur.clone())
 }
 
+/// Every step id a template names by path — `{{ steps.<id>… }}` or
+/// `{{ /steps/<id>/… }}`. An expression is not read, only a path.
+pub fn referenced_steps(template: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                let mut rest = s.as_str();
+                while let Some(start) = rest.find("{{") {
+                    let after = &rest[start + 2..];
+                    let Some(end) = after.find("}}") else { break };
+                    let inner = after[..end].split('|').next().unwrap_or("").trim();
+                    let id = inner
+                        .strip_prefix("steps.")
+                        .and_then(|r| r.split('.').next())
+                        .or_else(|| {
+                            inner
+                                .strip_prefix("/steps/")
+                                .and_then(|r| r.split('/').next())
+                        })
+                        .filter(|id| {
+                            !id.is_empty()
+                                && id
+                                    .chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        });
+                    if let Some(id) = id
+                        && !out.iter().any(|o| o == id)
+                    {
+                        out.push(id.to_string());
+                    }
+                    rest = &after[end + 2..];
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    walk(template, &mut out);
+    out
+}
+
 /// Every `{{path}}` root referenced by a template (`steps`, `vars`, …) — for
 /// validation / dependency hints.
 pub fn referenced_roots(template: &Value) -> Vec<String> {

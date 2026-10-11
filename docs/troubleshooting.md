@@ -76,8 +76,8 @@ the live registry or the network and run when the process starts:
 | At startup | Exit | Meaning |
 |---|---|---|
 | `tool "x" is unknown, disabled or not granted to workflows` | 2 | a `tool` step names a tool workflows cannot call |
-| `mcp server "x" is not connected` | 2 | an `mcp.tool` step names a server that is not declared, or was down when the process started |
-| `stream "x" is not declared under \`streams:\`` | 2 | a `stream` start names an undeclared stream |
+| `mcp server "x" is not declared under mcp.servers` | 2 | an `mcp.tool` or `mcp.resource` step names a server the configuration does not declare |
+| `stream "x" is not declared under \`streams:\`` | 2 | a `stream` start or an `emit` names an undeclared stream |
 | the durable store does not connect | 6 | an MCP or HTTP store is unreachable |
 
 ## Read the exit code
@@ -161,8 +161,9 @@ where nothing was ready and nothing was in flight. The usual causes:
 These behave as designed, and surprise people anyway:
 
 - **Read outputs at `steps.<id>.output`.** `{{ hook.body.id }}` reads
-  nothing; `{{ steps.hook.output.body.id }}` does. Paths are not checked at
-  load, so a typo fails the step when it runs, and uses up a retry.
+  nothing; `{{ steps.hook.output.body.id }}` does. A step id the workflow
+  does not have is refused at load, but what follows it is read at run
+  time, so a typo there fails the step when it runs, and uses up a retry.
 - **A fallback does not cover a pruned step.** A pruned or skipped step has
   `output: null`, which is a value, so `{{ steps.x.output | "none" }}`
   yields null. Test `steps.x.status`.
@@ -202,11 +203,11 @@ These behave as designed, and surprise people anyway:
 
 A server that fails to connect is logged as `mcp.connect.fail`, with the
 server's own refusal, and left out of the tool catalogue; the rest of the
-instance carries on. Two exceptions stop the process: the server backing
-the durable store exits `6`, and a workflow whose `mcp.tool` step names the
-server exits `2` (`mcp server "x" is not connected`). A server that comes
-up later is dialled again (after 1 s, doubling to 60 s) and joins when it
-answers (`mcp.joined`).
+instance carries on. The server backing the durable store is the
+exception: without it the process exits `6`. A workflow step that calls a
+server still down fails when it runs (`mcp server "x" is not connected`). A
+server that comes up later is dialled again (after 1 s, doubling to 60 s)
+and joins when it answers (`mcp.joined`).
 
 | Symptom | Cause and fix |
 |---|---|

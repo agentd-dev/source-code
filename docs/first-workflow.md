@@ -143,9 +143,10 @@ validate again:
 
 The exit code is `2`. Change it back before you go on.
 
-> **Note.** Validation does not check the paths inside templates. A typo
-> such as `{{steps.moood.output.class}}` passes, and the step that renders it
-> fails when the run reaches it.
+> **Note.** Validation checks that a template path names a step the
+> workflow has, so `{{steps.moood.output.class}}` is refused. What follows
+> the step id is read at run time: `{{steps.mood.output.clas}}` passes, and
+> the step that renders it fails when the run reaches it.
 
 ## Step 3: Watch it run
 

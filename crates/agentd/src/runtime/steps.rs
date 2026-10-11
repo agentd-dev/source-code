@@ -146,7 +146,7 @@ impl Runtime {
         let mut staged = StagedWorkflows::default();
         let docs = workflow_documents(&self.settings, &mut staged.errs);
         self.stage_workflows(docs, &self.mcp, &mut staged);
-        let prepared = self.prepare_workflows(staged, &self.registry, &self.mcp)?;
+        let prepared = self.prepare_workflows(staged, &self.registry)?;
         self.install_workflows(prepared);
         Ok(())
     }
@@ -291,16 +291,15 @@ impl Runtime {
     }
 
     /// Check a staged set and compose it with the runtime-created definitions
-    /// from the store, against the tool registry and the connected servers it
-    /// will run with. Changes nothing: the set comes back ready for
-    /// `install_workflows`, which cannot fail, so a reload can check its
-    /// workflows against the registry and servers it has only STAGED and
-    /// refuse with the running ones untouched.
+    /// from the store, against the tool registry it will run with and the
+    /// servers and streams the configuration declares. Changes nothing: the
+    /// set comes back ready for `install_workflows`, which cannot fail, so a
+    /// reload can check its workflows against the registry it has only
+    /// STAGED and refuse with the running ones untouched.
     pub(crate) fn prepare_workflows(
         &self,
         staged: StagedWorkflows,
         registry: &crate::registry::Registry,
-        mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
     ) -> Result<PreparedWorkflows, Vec<String>> {
         let StagedWorkflows {
             defs,
@@ -398,7 +397,7 @@ impl Runtime {
         // both, and a reload that disables a tool a step calls is a mistake to
         // say now, not on the day the step runs.
         for w in workflows.values() {
-            errs.extend(self.reference_errors(w, registry, mcp));
+            errs.extend(self.reference_errors(w, registry));
         }
         // The stream-taint trifecta check over the whole configured set, now
         // that file, URL and directory definitions have resolved: `validate`
@@ -415,7 +414,7 @@ impl Runtime {
         // removes it. It is left out of the set instead, said out loud, and
         // kept in the store: it loads again once what it names is back.
         for w in stored {
-            let mut problems = self.reference_errors(&w, registry, mcp);
+            let mut problems = self.reference_errors(&w, registry);
             // …and the taint check over the set it would join: a stored
             // definition that feeds a configured consumer's stream, or reads
             // one into an agent holding sensitive + egress, stays out.
@@ -525,15 +524,15 @@ impl Runtime {
             .collect()
     }
 
-    /// What `w` names that the registry and servers it would run with do not
-    /// have: a tool, an MCP server, a mapped contract, a declared stream.
+    /// What `w` names that the registry it would run with, or the
+    /// configuration, does not have: a tool, a mapped contract, an MCP server,
+    /// a stream.
     /// One check for a configured definition, a stored one and one the agent
     /// is writing now, so none of them is held to a different line.
     pub(crate) fn reference_errors(
         &self,
         w: &Workflow,
         registry: &crate::registry::Registry,
-        mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
     ) -> Vec<String> {
         let mut errs = Vec::new();
         for s in w.steps.values() {
@@ -557,16 +556,6 @@ impl Runtime {
                         errs.push(format!("workflow {:?} step {:?}: tool {n:?} is unknown, disabled or not granted to workflows", w.name, s.id));
                     }
                 }
-                "mcp.tool" => {
-                    if let Some(srv) = s.field_str("server")
-                        && !mcp.contains_key(srv)
-                    {
-                        errs.push(format!(
-                            "workflow {:?} step {:?}: mcp server {srv:?} is not connected",
-                            w.name, s.id
-                        ));
-                    }
-                }
                 k if (k.starts_with("memory.")
                     || k.starts_with("artifact.")
                     || k.starts_with("knowledge.")
@@ -575,22 +564,18 @@ impl Runtime {
                 {
                     errs.push(format!("workflow {:?} step {:?}: {k} is unavailable (map it with tools.overrides or configure its server)", w.name, s.id));
                 }
-                // Streams are fail-closed at load: an `emit` or `stream` node
-                // naming an undeclared stream is a config error now, not a
-                // step failure later.
-                "emit" | "stream" => {
-                    if let Some(name) = s.field_str("stream")
-                        && !self.settings.streams.contains_key(name)
-                    {
-                        errs.push(format!(
-                            "workflow {:?} step {:?}: stream {name:?} is not declared under `streams:`",
-                            w.name, s.id
-                        ));
-                    }
-                }
                 _ => {}
             }
         }
+        // A server or a stream the configuration does not declare, at any
+        // depth — the load's own check, so a definition the runtime reads,
+        // stores or the agent writes is held to the same line. A declared
+        // server that is down joins when it comes up (`runtime::join`); a
+        // step calling it before then fails when it runs.
+        errs.extend(crate::config::settings::undeclared_references(
+            &self.settings,
+            w,
+        ));
         // A wait that subscribes, at any depth, names an operator grant.
         errs.extend(crate::config::settings::events::subscribe_refusals(
             &self.settings,
@@ -3852,7 +3837,7 @@ impl Runtime {
                         // refused here rather than stored to fail when it
                         // runs.
                         if problems.is_empty() {
-                            problems = self.reference_errors(&w, &self.registry, &self.mcp);
+                            problems = self.reference_errors(&w, &self.registry);
                         }
                         // The taint check, over the running set with this
                         // definition in place of any it replaces — the same

@@ -243,6 +243,47 @@ fn an_unsure_answer_fails_the_node_or_is_marked() {
     }
 }
 
+/// A `decide` (or `think`) request is answered once. The answer used to
+/// leave the request pending, so the worker's exit answered it again with
+/// "think worker exited without a result" — and a requester that read both
+/// replies could take the error (a CI-only failure: it depends on timing).
+/// The double reply itself is not timing-dependent, so it is what this
+/// counts, in the debug log's `tool.reply` lines.
+#[test]
+fn a_decide_request_is_answered_once() {
+    let chat = playbook(json!({"turns": [
+        {"tool_calls": [{"name": "decide", "arguments": {
+            "state": "My card was charged twice.",
+            "questions": {"queue": {"choice": ["billing", "tech"]}}
+        }}]},
+        {"echo_tool_result": true}
+    ]}));
+    let dec = playbook(json!({"decisions": [{"answers": {
+        "queue": {"type": "choice", "choice": "billing", "confidence": 0.93}
+    }}]}));
+    let cfg = format!(
+        "{BASE}{}{}",
+        intelligence(&chat, &dec, "", "{ turn: smart, decide: jev }"),
+        job("kind: agent, instruction: \"triage the ticket\"")
+    )
+    .replace("log_level: info", "log_level: debug");
+    let (code, _out, log) = run(&cfg);
+    assert_eq!(code, Some(0), "{log}");
+    let request = events(&log, "tool.request")
+        .into_iter()
+        .find(|e| e["tool"] == "decide")
+        .expect("the decide request");
+    let replies: Vec<Value> = events(&log, "tool.reply")
+        .into_iter()
+        .filter(|e| e["node"] == request["node"] && e["req"] == request["req"])
+        .collect();
+    assert_eq!(replies.len(), 1, "{replies:?}\n{log}");
+    assert_eq!(replies[0]["is_error"], false, "{log}");
+    for f in [&chat, &dec] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 /// The agent reaches the contract through the `decide` tool, on
 /// `roles.decide`.
 #[test]

@@ -1529,14 +1529,16 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
     // ---- compaction ------------------------------------------------------------
 
     /// Plan + launch a compaction think for `ctx_id`. `reply_to` answers a
-    /// `context.compact` tool request when the compaction finishes.
+    /// `context.compact` tool request when the compaction finishes. Returns
+    /// whether a compaction child will answer later — `false` when the
+    /// request was answered on the spot.
     pub(crate) fn start_compaction(
         &mut self,
         ctx_id: &str,
         keep_last: usize,
         target_tokens: Option<u64>,
         reply_to: Option<(NodeId, u64)>,
-    ) {
+    ) -> bool {
         let req = match self
             .contexts
             .get(ctx_id)
@@ -1550,22 +1552,22 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                         .get(ctx_id)
                         .map(|c| (c.version, c.est_tokens))
                         .unwrap_or((0, 0));
-                    self.reply_tool(node, id, json!({"version": version, "est_tokens": est, "folded": 0, "note": "nothing to compact"}), false);
+                    self.answer_deferred(node, id, json!({"version": version, "est_tokens": est, "folded": 0, "note": "nothing to compact"}), false);
                 }
-                return;
+                return false;
             }
         };
         let already = self.children.iter().any(|(_, c)| matches!(&c.kind, ChildKind::Think { purpose, ctx: Some(cx), .. } if purpose == "compaction" && cx == ctx_id));
         if already {
             if let Some((node, id)) = reply_to {
-                self.reply_tool(
+                self.answer_deferred(
                     node,
                     id,
                     json!({"note": "compaction already in progress"}),
                     false,
                 );
             }
-            return;
+            return false;
         }
         // An operator may replace the summarizer's guidance; the JSON schema it
         // must satisfy stays fixed, so a custom prompt cannot change the shape
@@ -1615,16 +1617,20 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             effort: None,
         };
         match self.spawn_turn(launch) {
-            Ok(node) => self.log.info(
-                "context.compaction.start",
-                json!({"ctx": ctx_id, "node": node.0, "fold": req.fold}),
-            ),
+            Ok(node) => {
+                self.log.info(
+                    "context.compaction.start",
+                    json!({"ctx": ctx_id, "node": node.0, "fold": req.fold}),
+                );
+                true
+            }
             Err(e) => {
                 self.log.warn(
                     "context.compaction.spawn_fail",
                     json!({"ctx": ctx_id, "err": e}),
                 );
                 self.apply_fallback_compaction(ctx_id, &req, reply_to);
+                false
             }
         }
     }
@@ -1644,12 +1650,12 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             Ok(o) => {
                 self.log.info("context.compacted", json!({"ctx": ctx_id, "folded": o.folded, "version": o.version, "before": o.before_tokens, "after": o.after_tokens, "fallback": true}));
                 if let Some((node, id)) = reply_to {
-                    self.reply_tool(node, id, json!({"version": o.version, "est_tokens": o.after_tokens, "folded": o.folded}), false);
+                    self.answer_deferred(node, id, json!({"version": o.version, "est_tokens": o.after_tokens, "folded": o.folded}), false);
                 }
             }
             Err(e) => {
                 if let Some((node, id)) = reply_to {
-                    self.reply_tool(node, id, Value::String(e), true);
+                    self.answer_deferred(node, id, Value::String(e), true);
                 }
             }
         }
@@ -1700,7 +1706,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                                 .collect();
                             self.skills.evict_except(&keep);
                             if let Some((node, id)) = reply_to {
-                                self.reply_tool(node, id, json!({"version": o.version, "est_tokens": o.after_tokens, "folded": o.folded}), false);
+                                self.answer_deferred(node, id, json!({"version": o.version, "est_tokens": o.after_tokens, "folded": o.folded}), false);
                             }
                             return;
                         }
@@ -1728,9 +1734,9 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                             .clone()
                             .or_else(|| turn.text.clone().map(Value::String))
                             .unwrap_or(Value::Null);
-                        self.reply_tool(node, id, v, false);
+                        self.answer_deferred(node, id, v, false);
                     } else {
-                        self.reply_tool(
+                        self.answer_deferred(
                             node,
                             id,
                             Value::String(format!(

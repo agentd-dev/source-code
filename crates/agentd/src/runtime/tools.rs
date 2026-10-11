@@ -168,6 +168,23 @@ impl Runtime {
         }
     }
 
+    /// Answer a request a think child (`think`, `decide`) or a compaction
+    /// was deferred on — and stop waiting on it. Its pending entry goes with
+    /// the answer: left behind, the worker's exit would answer the same
+    /// request again, with an error, and a requester reading both could take
+    /// the error.
+    pub(crate) fn answer_deferred(
+        &mut self,
+        node: NodeId,
+        req: u64,
+        result: Value,
+        is_error: bool,
+    ) {
+        self.pending
+            .retain(|p| p.target != Target::Child(node, req));
+        self.reply_tool(node, req, result, is_error);
+    }
+
     /// Answer a deferred request wherever it came from.
     pub(crate) fn reply(&mut self, target: &Target, result: Value, is_error: bool) {
         match target {
@@ -777,11 +794,22 @@ impl Runtime {
                     .unwrap_or(self.settings.context.keep_last.unwrap_or(12) as usize);
                 let target = args.get("target_tokens").and_then(Value::as_u64);
                 match caller.node {
+                    // Deferred only when a compaction child will answer; one
+                    // answered on the spot (nothing to fold, one already
+                    // running, the fallback) is not waited on.
                     Some(node) => {
-                        self.start_compaction(&ctx_id, keep_last, target, Some((node, caller.req)));
-                        ToolOutcome::Deferred(PendingKind::Think {
-                            child: NodeId(u64::MAX),
-                        })
+                        if self.start_compaction(
+                            &ctx_id,
+                            keep_last,
+                            target,
+                            Some((node, caller.req)),
+                        ) {
+                            ToolOutcome::Deferred(PendingKind::Think {
+                                child: NodeId(u64::MAX),
+                            })
+                        } else {
+                            ToolOutcome::Executing
+                        }
                     }
                     None => err("context.compact needs a calling turn".into()),
                 }

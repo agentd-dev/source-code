@@ -657,6 +657,12 @@ the instance and to the conversation they ran for.
 
 ### Fixed
 
+- **A `think` or `decide` request is answered once.** The answer left the
+  request pending, so the think child's exit answered it again — with "think
+  worker exited without a result" — and an agent that read both replies could
+  act on the error though the answer had arrived (seen in CI as the `decide`
+  tool failing on one feature row). Answering now ends the wait; a
+  `context.compact` answered on the spot is no longer left pending either.
 - **A child's frames are no longer lost when a signal interrupts their
   read.** The supervisor's handlers are installed without `SA_RESTART`, so a
   `SIGCHLD` — any child exiting — could interrupt the thread reading another

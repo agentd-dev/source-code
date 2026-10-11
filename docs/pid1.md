@@ -1,321 +1,315 @@
-# PID 1 — agentd as init
+# Edge and appliances: agentd as PID 1
 
-> **Status.** This is a concept document. Everything described in §1–§3 is
-> shipped behavior you can verify today; §4 onward is a design exploration —
-> boot recipes, robotics architecture, and a brainstorm — clearly marked as
-> such. Nothing here requires a fork of agentd, but some of it deserves one
-> small upstream feature (§4.3), and we say so where it does.
+This case study takes one idea seriously: a custom Linux image — a robot
+controller, an appliance, a kiosk, an edge box — whose init process is the
+agent runtime. It is for architects of devices that run one supervised job
+forever. The first half describes what agentd does as it ships, which you can
+verify; the second half, marked as such, is design exploration.
 
-A running Linux system has exactly one process the kernel starts itself: PID 1,
-the init process. (PID 0 is the kernel's own scheduler — the first thing *you*
-get to run is 1.) Everything else on the machine is its descendant; every
-orphan becomes its child; when it exits, the kernel panics. Init is the one
-program that must supervise, reap, restart, and shut down — forever.
+## The idea
 
-That job description should sound familiar. It is the agentd supervisor's job
-description, minus three mounts and a `reboot(2)`.
+A running Linux system has exactly one process the kernel starts itself:
+PID 1, the init process. Everything else on the machine descends from it,
+every orphan becomes its child, and when it exits the kernel panics. Init is
+the one program that must supervise, reap, restart and shut down, forever.
 
-This page takes the idea seriously: a custom Linux image — a robot controller,
-an appliance, a kiosk, an edge box — whose init **is** the agent runtime.
-No systemd, no service manager, no shell. The kernel boots, agentd starts,
-and the machine's entire userland is one supervised, bounded, durable agent
-tree. For an intelligent machine, the operating system's first process is the
-thing that thinks.
+That is the agentd supervisor's job description, minus three mounts and a
+`reboot(2)`. Picture a machine with no systemd, no service manager and no
+shell: the kernel boots, agentd starts, and the machine's whole userland is one
+supervised, budgeted, durable agent tree. For an intelligent machine, the first
+process is the thing that thinks.
 
----
+## Why it fits: init's duties are the supervisor's
 
-## 1. Why this is less crazy than it sounds
+Init has five duties. agentd performs four of them as its day job.
 
-Init has five duties. agentd already performs four of them as its day job, not
-as an adaptation:
-
-| init duty | what agentd already does |
+| Init duty | What agentd already does |
 |---|---|
-| **Reap orphans.** PID 1 must `waitpid` every child the kernel reparents to it, or the process table fills with zombies. | The supervisor's reaper is process-global by construction: one thread owns `waitpid(-1, WNOHANG)` behind a lock and routes every reaped pid to its owner — an *unowned* pid (exactly what a reparented orphan is) is reaped and its status discarded, because nothing here owns it — the zombie is collected either way. This is the hard init duty, and it is not an add-on: it is how agentd's own subagent tree works. |
-| **Supervise and restart.** Services crash; init's descendants must be restarted with backoff, not in a hot loop. | The restart governor (exponential backoff + a circuit breaker), the dead/stuck detectors, and the SIGTERM→SIGKILL ladder are the supervisor's core. A wedged child is killed by its process group; `PR_SET_PDEATHSIG` means nothing outlives its parent silently. |
-| **Handle signals.** PID 1 is special: signals it has no handler for are *ignored*, not defaulted — an init that installs no handlers cannot even be shut down. | agentd installs real handlers on day one: SIGTERM drains (finish in-flight work, refuse new), SIGHUP hot-reloads config, SIGCHLD wakes the reaper. The drain semantics — stop admitting, let running work finish, exit cleanly — are precisely what a power-button press should mean on a robot. |
-| **Own system state.** Init decides what runs, in what order, with what limits. | The workflow engine is a dependency graph with durable state; `lifecycle.run_until` is a boot target; per-child rlimits (`limits: {memory, cpu}`), niceness by `priority`, and cgroup confinement are resource control; the pressure system (shed under low disk/memory, drain in-flight) is graceful degradation a service manager would envy. |
-| **Bring up the world.** Mount `/proc`, `/sys`, `/dev`; set the hostname; raise loopback; then start userland. | The one duty agentd does **not** do — deliberately. It is ~20 lines of pre-init shim (§4.2), or one small upstream flag (§4.3). |
+| Reap orphans | One thread owns `waitpid(-1, WNOHANG)` for the whole process, and the supervisor sets `PR_SET_CHILD_SUBREAPER`. A reparented orphan is reaped and its status discarded, so zombies never pile up. |
+| Supervise and restart | A restart governor with backoff and a circuit breaker, dead and stuck detectors, and a kill ladder: cancel, `SIGTERM` to the process group, then `SIGKILL`. Every child dies with its parent. |
+| Handle signals | Real handlers from the first instruction: `SIGTERM` drains (finish in-flight work, refuse new work, exit), `SIGHUP` reloads the configuration, `SIGCHLD` wakes the reaper. |
+| Own system state | Workflows are a dependency graph over durable state. Per-child resource limits, niceness by priority and cgroups are resource control; pressure shedding under low memory or disk is graceful degradation. |
+| Bring up the world | **Not done, deliberately.** Mounting `/proc`, `/sys` and `/dev`, setting the hostname and raising loopback is a twenty-line shim that runs first (see [Boot](#boot-from-power-button-to-first-turn)). |
 
 Two properties make the fit unusually clean:
 
-- **The binary is a static musl ELF.** No dynamic linker, no libc on disk, no
-  `/usr`. The shipped container already runs it on `scratch` as a non-root
-  user; an initramfs containing *only* `/agentd`, a config file, and CA roots
-  is a bootable userland in single-digit megabytes.
-- **The supervisor never reasons.** The process that holds PID 1 — the one
-  that must not crash, must not block, must not be talked into anything — is
-  the loop with **no model in it**. The LLM lives in killable child processes
-  with budgets. A jailbroken model on this machine can be SIGKILLed by its
-  parent; the parent cannot be prompted. That is the correct trust topology
-  for a machine that can move.
+- **The binary is a static musl executable.** No dynamic linker, no libc on
+  disk, no `/usr`. The shipped container already runs it `FROM scratch` as a
+  non-root user, and as the container's PID 1. An initramfs holding only
+  `/agentd`, a configuration and CA roots is a complete bootable userland;
+  [Engineering choices](why-rust.md#the-numbers) has the binary's size.
+- **The supervisor runs no agent loop.** The process that holds PID 1 — the
+  one that must not crash, must not block and must not be talked into
+  anything — holds the state and the credentials, and no conversation reaches
+  it. Its only model calls are the opt-in goal check and approval judge, each
+  one structured question with no tools. The agent loops run in killable
+  child processes with budgets. A manipulated model on this machine can be
+  killed by its parent, and it cannot instruct the parent. That is the right
+  trust topology for a machine that can move.
 
-### What PID 1 changes, honestly
+### What PID 1 changes
 
-- **You cannot be killed.** SIGKILL and SIGSTOP do not apply to PID 1, and a
-  crash is a kernel panic (`panic: Attempted to kill init!`). The restart
-  governor that supervises everyone else does not supervise *you*. The honest
-  mitigations are the kernel's: a hardware **watchdog**, and `panic=<seconds>`
-  over a known-good A/B rootfs (both sketched in §5), so a dead brain becomes
-  a reboot into the previous image rather than a frozen robot.
+- **Nothing can kill you, and you cannot crash.** `SIGKILL` and `SIGSTOP` do
+  not apply to PID 1, and a crash is a kernel panic. The restart governor that
+  supervises everyone else does not supervise agentd itself. The mitigations
+  are the kernel's: a hardware watchdog, and `panic=<seconds>` over a
+  known-good A/B root filesystem, so a dead supervisor becomes a reboot into
+  the previous image rather than a frozen robot.
 - **Exit means reboot.** When init exits the kernel panics, so agentd's exit
-  codes — its API on a server — become reboot policy on an appliance: the
-  shim (§4.2) catches the exit status and calls `reboot(2)` or powers off.
-  `lifecycle.exit_code_map` already lets you shape which outcome is which.
-- **You inherit everyone.** Every daemon your MCP driver servers spawn, every
-  orphan, reparents to you. agentd's global reaper handles this today; what
-  it does not do (and should not silently) is *restart* things it never
-  started. Anything that must be supervised should be a declared child —
-  which on this architecture means: a workflow step, a subagent, or a driver
-  the shim started before exec'ing agentd.
+  codes — an API on a server — become reboot policy on an appliance: the shim
+  catches the exit status and calls `reboot(2)` or powers off.
+  `lifecycle.exit_code_map` can remap the partial and budget codes.
+- **You inherit everyone.** Every daemon a driver spawns, and every orphan,
+  reparents to agentd, and the reaper collects them. What agentd does not do,
+  and should not do silently, is restart processes it never started. Anything
+  that must be supervised should be declared: a workflow step, a subagent, or
+  a driver the shim started before handing over.
 
----
+## The shape: a robot's userland as one configuration
 
-## 2. The shape: a robot's userland as one config file
-
-The frame for the rest of this page — a mobile manipulator, one board, one
-config. Every capability is something wired on, which is exactly the property
-you want on a machine with motors:
+The frame for the rest of this page is a mobile manipulator: one board, one
+configuration. Every capability is something the configuration wires on, which
+is exactly the property you want on a machine with motors.
 
 ```mermaid
 flowchart TB
-  kernel["Linux kernel<br/>devicetree · watchdog · cgroups"] --> shim["pre-init shim<br/>mounts /proc /sys /dev · execs init"]
-  shim --> sup["agentd — PID 1<br/>supervisor · no LLM · owns lifecycle"]
-  subgraph agents["subagent processes — budgeted, killable"]
-    plan["mission agent<br/>priority: normal"]
-    percept["perception agent<br/>priority: high · memory: 512MB"]
-    talk["operator dialogue<br/>priority: low"]
-  end
-  sup --> plan
-  sup --> percept
-  sup --> talk
-  subgraph drivers["hardware drivers = MCP servers (loopback)"]
-    motor[("motor-ctl<br/>tags: actuate")]
-    sens[("sensors<br/>IMU · lidar · camera")]
-    fw[("firmware bridge<br/>CAN / EtherCAT")]
-  end
-  plan -->|"tools · MCP"| motor
-  percept -->|"subscribe + window"| sens
-  plan --> fw
-  llm[["intelligence<br/>on-device llama.cpp,<br/>failover to edge box"]]
-  plan --> llm
-  percept --> llm
-  store[("file store — /var<br/>flight recorder")]
-  sup <--> store
-  peer["fleet / operator<br/>A2A over mTLS · TUI attach"] <--> sup
-
-  classDef accent stroke:#22c55e,stroke-width:1.5px;
-  class sup,store accent;
+  KERNEL["Linux kernel<br/>watchdog · cgroups"] -->|"execs /init"| SHIM["pre-init shim<br/>mounts /proc /sys /dev"]
+  SHIM -->|"exec"| SUP["agentd as PID 1<br/>supervisor · no agent loop"]
+  SUP -->|"spawn · budget · kill"| AGENTS["agents in child processes<br/>mission · perception · dialogue"]
+  AGENTS -->|"tools over MCP"| MOTOR[("motor driver<br/>tags: egress")]
+  AGENTS -->|"subscribe with a window"| SENS[("sensor driver<br/>IMU · lidar · camera")]
+  AGENTS -->|"chat completions"| LLM["model<br/>on-device, edge box fallback"]
+  SUP <-->|"checkpoints"| STORE[("file store on /var<br/>flight recorder")]
+  FLEET["fleet and operators<br/>A2A · TUI"] <-->|"authenticated A2A"| SUP
 ```
 
-Read it as three trust rings. The **kernel and PID 1** never reason. The
-**agents** reason but are budgeted, rlimited, and killable. The **drivers**
-touch hardware but expose only the tools they declare — an agent can call
-`motor.move`, it cannot open `/dev/ttyCAN0`, because there is no filesystem
-tool and no shell. The lethal-trifecta gate applies verbatim with
-one word changed: on a robot, *actuation is egress*. An agent that holds
-untrusted input (a voice command, a QR code in the camera frame) + sensitive
-context + actuator access is the configuration agentd refuses at startup
-unless you explicitly say otherwise.
+Read it as three trust rings. The kernel and PID 1 run no agent loop. The
+agents reason, but are budgeted, resource-limited and killable. The drivers
+touch hardware but expose only the tools they declare: an agent can call
+`motor.move`; it cannot open `/dev/ttyCAN0`, because there is no file tool and
+no shell. The Rule of Two applies with one word changed — on a robot,
+**actuation is egress**. An agent holding untrusted input (a voice command, a
+QR code in a camera frame), sensitive context and actuator access is the
+configuration agentd refuses to start.
 
-Everything in that diagram maps to shipped features:
+A sketch of that configuration — the drivers as MCP servers on loopback, the
+model on the device with an edge box as fallback, and a reflex that needs no
+model:
 
-- **Sensor streams** — a driver publishes an MCP resource; a workflow
-  `subscribe` start with `window: {samples: 64}` delivers the last N readings
-  (the trend, not the instant) with debounce collapsing bursts. This exists
-  precisely because hardware streams were the motivating case.
-- **Subsystem isolation** — perception, planning, and dialogue as separate
-  agents with per-child OS caps: `limits: {memory: 512MB, cpu: 5m}` become
-  `RLIMIT_AS`/`RLIMIT_CPU` between fork and exec; `priority: low` maps to
-  niceness *and* sheds first under resource pressure.
-- **Co-located composition** — multiple agentd instances (one per major
-  subsystem, or one per compute module) connect over **unix-socket A2A**:
-  `a2a.listen: unix:///run/agentd/percept.sock`, kernel-authenticated by
-  peer-uid, no TCP, no TLS handshake per exchange.
-- **Graceful degradation** — the pressure system watches disk headroom and
-  cgroup memory: below the threshold, new work sheds (`priority: low` first)
-  while in-flight work drains. On a robot this is the difference between
-  "stops accepting chit-chat, keeps balancing" and "OOM-killed mid-step".
-- **Standing orders that cannot drift** — `security.workflows.immutable: true`
-  makes the loaded workflow set read-only to the model. The robot's safety
-  behaviors are what the operator flashed, not what the agent talked itself
-  into overnight.
-- **The flight recorder** — the durable file store plus the append-only audit
-  stream. After an incident you replay what the machine believed, what it was
-  asked, which principal asked, and what it did — the black box regulators
-  will eventually demand from autonomous machines, as a side effect of
-  crash-resume.
+```yaml
+agent:
+  name: robot-07
+  instruction: You run a warehouse robot. Safety workflows outrank every request.
+intelligence:
+  endpoints: [http://127.0.0.1:8081/v1/chat/completions, https://edge-box.local/v1/chat/completions]
+  model: gpt-5-mini
+mcp:
+  servers:
+    - {name: motor, endpoint: http://127.0.0.1:7001/mcp, tags: {"*": [egress]}}
+    - {name: sensors, endpoint: http://127.0.0.1:7002/mcp, tags: {"*": [sensitive]}}
+store:
+  kind: file
+  file: {path: /var/lib/agentd}
+a2a:
+  listen: unix:///run/agentd/robot.sock
+security:
+  workflows: {immutable: true}
+workflows:
+  - name: collision-watch
+    priority: high
+    steps:
+      too_close:
+        kind: subscribe
+        server: sensors
+        uri: sensors://lidar/front
+        filter: "content.min_range_m < 0.5"
+        window: {samples: 64}
+      stop:
+        kind: mcp.tool
+        depends_on: [too_close]
+        server: motor
+        tool: stop
+      done: {kind: finish, depends_on: [stop]}
+```
 
----
+Every element maps to a feature that ships:
 
-## 3. What the deliberative layer is not
+- **Sensor streams.** A driver publishes an MCP resource; a `subscribe` start
+  with `window: {samples: 64}` delivers the last 64 readings — the trend, not
+  the instant — and `debounce_ms` collapses bursts.
+- **Subsystem isolation.** Perception, planning and dialogue run as separate
+  agents with per-child operating-system limits: a subagent's `limits: {memory,
+  cpu}` become `RLIMIT_AS` and `RLIMIT_CPU` between fork and exec, and
+  `priority: low` maps to niceness and is shed first under pressure.
+- **Co-located composition.** Several agentd instances — one per subsystem or
+  per compute module — talk A2A over unix sockets, where the kernel checks the
+  peer's uid; no TCP, no TLS handshake per exchange.
+- **Graceful degradation.** Under low disk headroom or cgroup memory pressure,
+  new work is shed (low priority first) while in-flight work drains. On a
+  robot that is the difference between "stops accepting small talk, keeps
+  balancing" and "killed by the OOM killer mid-step".
+- **Standing orders that cannot drift.** `security.workflows.immutable: true`
+  makes the loaded workflows read-only at runtime, to the model and to
+  operators alike. The robot's safety behaviour is what was flashed, not what
+  an agent talked itself into overnight.
+- **The flight recorder.** The durable file store, plus the audit trail once
+  `observability.audit` names a sink. After an incident you can replay what
+  the machine was asked, which principal asked it, and what it did.
 
-Being honest about the boundary makes the rest credible:
+## What the deliberative layer is not
+
+Being honest about the boundary makes the rest credible.
 
 - **agentd is the cortex, not the spinal cord.** Motor control loops, balance,
-  current limiting, e-stop — anything with a deadline measured in
-  microseconds-to-milliseconds — belongs in firmware or an RTOS/microcontroller
-  below the Linux board, exactly as it does on every serious robot today. The
-  reactor is a blocking single-writer loop with a 200 ms park ceiling and
-  event-driven wakeups; it is *fast* for a deliberative layer (a delegation
-  round trip measures ~18 ms) and it is not, and will never claim to be,
-  hard-real-time. The driver MCP server for the motor controller should
-  expose *goals* ("walk to the dock"), not torque values.
+  current limiting and the emergency stop — anything with a deadline in
+  microseconds to milliseconds — belong in firmware or a real-time
+  microcontroller below the Linux board, as on every serious robot today. The
+  supervisor is a blocking, event-driven loop whose idle wait is capped at
+  200 ms. It is fast for a deliberative layer and it is not, and will not
+  claim to be, hard real-time. The motor driver should expose goals ("drive to
+  the dock"), not torque values.
 - **ROS 2 is a colleague, not a competitor.** If the platform already runs
-  ROS, agentd sits above it as the mission layer: one small MCP server
-  bridging topics/actions into tools and resources. ROS moves the joints;
-  agentd decides, supervises, remembers, and answers to the fleet.
-- **A model needs somewhere to run.** On-device (llama.cpp / a vendor NPU
-  runtime speaking the OpenAI dialect), an edge box over the local network,
-  or a cloud endpoint — agentd's `intelligence.endpoints` failover chain
-  handles the handoff, and budgets keep an offline-degraded robot from
-  burning its token allowance retrying. A robot with no reachable endpoint
-  still runs: workflows whose steps are data and tool calls (`subscribe` →
-  `switch` → `mcp.tool`) execute with no model at all — your reflex and
-  housekeeping layer keeps working when the cortex is unreachable.
+  ROS, agentd sits above it as the mission layer, with one small MCP server
+  bridging topics and actions into tools and resources. ROS moves the joints;
+  agentd decides, supervises, remembers and answers to the fleet.
+- **A model needs somewhere to run.** On the device (llama.cpp or a vendor NPU
+  runtime that speaks the OpenAI-compatible wire), on an edge box on the local
+  network, or in the cloud; an ordered endpoint list fails over between them,
+  and budgets keep an offline robot from burning its allowance on retries. A
+  robot with no reachable model still runs: workflows made of data steps and
+  tool calls, like the collision watch above, need no model at all.
 
----
+## Exploration: boot and beyond
 
-## 4. Boot: from power button to first turn (design exploration)
+> **Note.** Everything from here on is design exploration. Nothing below ships
+> as a feature, and the `--init` mode it proposes does not exist.
 
-### 4.1 The minimal image
+### Boot: from power button to first turn
 
-An initramfs (or a squashfs rootfs) containing:
+A minimal image is an initramfs or squashfs root holding:
 
+```text
+/init                     the shim, about 20 lines
+/agentd                   the static binary
+/etc/agentd/robot.yaml    the machine's whole userland, declared
+/etc/agentd/workflows/    standing orders, immutable at runtime
+/etc/ssl/certs/           CA roots, if any endpoint leaves the machine
+/drivers/*                the MCP driver servers, static binaries too
+/var                      writable: the file store, logs (tmpfs or a partition)
 ```
-/init                     ← the shim, ~20 lines (§4.2)
-/agentd                   ← the static binary, ~8.5 MiB
-/etc/agentd/robot.yaml    ← the machine's entire userland, declared
-/etc/agentd/workflows/    ← standing orders (immutable at runtime)
-/etc/ssl/certs/           ← CA roots, if any endpoint leaves the machine
-/drivers/*                ← the MCP driver servers (static binaries too)
-/var                      ← writable: the file store, logs   (tmpfs or a real partition)
-```
 
-Kernel config essentials: `DEVTMPFS`, `CGROUPS` (+v2), `UNIX`, `INET` (for
-loopback even if the machine is offline), the watchdog driver for your board,
-and `PANIC_TIMEOUT=5`. No modules is simplest: build the drivers you need in.
+The kernel needs `DEVTMPFS`, cgroups v2, `UNIX`, `INET` (loopback, even
+offline), the board's watchdog driver and a panic timeout. Building the
+drivers in, with no modules, is simplest. Two gotchas cost real debugging time
+on embedded boards:
 
-Two gotchas that cost real debugging time on embedded boards:
+- **Time.** TLS certificate validation needs a plausible clock. A board with no
+  real-time clock boots in 1970, and every HTTPS dial fails until NTP runs.
+  Give the shim a clock step, run offline-first, or pin trust in a way that
+  does not depend on wall-clock validity.
+- **Entropy.** Early-boot TLS on a quiet board can block on the random number
+  generator. A hardware RNG, or a kernel that trusts the CPU's, removes the
+  problem; decide it at kernel configuration time, not in the field.
 
-- **Time.** TLS certificate validation needs a plausible clock. A board with
-  no RTC boots in 1970 and every HTTPS dial fails until NTP runs. Either give
-  the shim a `hwclock`/NTP step, run offline-first, or pin trust in a way
-  that does not depend on wall-clock validity.
-- **Entropy.** Early-boot TLS on a quiet board can block on the RNG; modern
-  kernels with `RANDOM_TRUST_CPU` (or a hardware RNG) make this a non-issue,
-  but decide it at kernel config time, not in the field.
-
-### 4.2 The shim
-
-PID 1 must mount the API filesystems before anything else can work. Keep the
-part that runs before agentd small enough to review at a glance:
+PID 1 must mount the API filesystems before anything else works. Keep what runs
+before agentd small enough to review at a glance:
 
 ```sh
 #!/bin/sh
-# /init — runs as PID 1, then hands the pid to agentd.
-mount -t proc  proc  /proc
+# /init: runs as PID 1, then hands the pid to agentd.
+mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
 hostname robot-07
 ip link set lo up
-/drivers/motor-ctl  --listen 127.0.0.1:7001 &
-/drivers/sensors    --listen 127.0.0.1:7002 &
+/drivers/motor-ctl --listen 127.0.0.1:7001 &
+/drivers/sensors --listen 127.0.0.1:7002 &
 exec /agentd -c /etc/agentd/robot.yaml --env /etc/agentd/fleet.env
 ```
 
-`exec` is the important word: agentd *becomes* PID 1 rather than being its
-child, so the global reaper, the signal handlers, and the drain semantics are
-init's. The drivers started before the exec are inherited children — reaped
-if they die (and, because they are also declared MCP servers, their death is
-*visible*: the connection drops and the telemetry says which capability just
-left the machine).
+`exec` is the important word: agentd becomes PID 1 instead of its child, so
+the reaper, the signal handlers and the drain semantics are init's. The drivers
+started before the `exec` are inherited children — reaped if they die, and,
+because they are also declared MCP servers, their death is visible: the
+connection drops and the telemetry says which capability has left the
+machine. If you would rather not ship a shell at all, the shim is a few dozen
+lines of statically linked Rust.
 
-If you would rather not trust even a shell: the shim is fifty lines of Rust
-with `nix`, statically linked, and `/bin/sh` never ships.
-
-### 4.3 The one feature this deserves upstream (proposed, not shipped)
+### A proposed `--init` mode
 
 Everything above works with agentd as it ships. The ergonomic gap is that the
 shim owns mounts and reboot while agentd owns everything else. A small
 `--init` mode — mount the API filesystems if absent, translate the final exit
-code through `reboot(2)` (`RB_AUTOBOOT` on failure-mapped codes,
-`RB_POWER_OFF` on clean completion), and optionally pet `/dev/watchdog` from
-the existing health tick — would collapse the shim to `exec /agentd --init`.
-It is deliberately *not* a service manager: anything that needs supervision
-should already be a workflow step, a subagent, or an MCP server the config
-declares.
+code through `reboot(2)` (reboot on failure codes, power off on clean
+completion), and optionally pet `/dev/watchdog` from the existing health tick —
+would collapse the shim to `exec /agentd --init`. It would deliberately not be
+a service manager: anything that needs supervision should already be a
+workflow step, a subagent or a declared MCP server.
 
----
+### What an init-native agent could unlock
 
-## 5. Brainstorm: what an init-native agent unlocks (ideas)
+Ideas worth prototyping; none is a promise.
 
-Ideas worth prototyping, none of which are promises:
-
-1. **Reflex/deliberation split as priority tiers.** `priority: high` for the
-   collision-monitor workflow (subscribe → CEL condition → `motor.stop`),
-   `low` for conversation. Under pressure the robot literally stops making
-   small talk before it stops watching where it is going — degradation order
-   as configuration.
-2. **The watchdog pet as a health *judgment*.** Petting `/dev/watchdog` from
-   the health tick means "the reactor is alive". A stricter robot pets only
-   when the safety workflow's last N runs succeeded — turning the hardware
-   watchdog into a dead-man switch for the *behavior*, not just the process.
-3. **A/B roots + `--fresh` generations as OTA.** Flash B, reboot into it;
-   the file store's generation counter and `store.config_changed` warning
-   already distinguish "same brain, new body" from "start over". A failed
+1. **Reflex and deliberation as priority tiers.** `priority: high` for the
+   collision watch, `low` for conversation. Under pressure the robot stops
+   making small talk before it stops watching where it is going: degradation
+   order as configuration.
+2. **The watchdog as a judgment of behaviour.** Petting `/dev/watchdog` from
+   the health tick means "the supervisor is alive". A stricter robot pets only
+   when the safety workflow's last runs succeeded, turning the hardware
+   watchdog into a dead-man switch for behaviour, not only the process.
+3. **A/B roots and fresh generations as OTA.** Flash B and reboot into it. The
+   file store already distinguishes "same brain, new body" (a
+   `store.config_changed` warning) from "start over" (`--fresh`). A failed
    boot panics into the watchdog, which reboots A. Fleet OTA becomes an A2A
    command a fleet agent sends.
-4. **Per-limb subagents.** One subagent per manipulator with
-   `limits: {memory, cpu}` sized to its planner, spawned `warm` so context
-   survives between grasps, killed by the supervisor the moment its budget or
-   its deadline trips. The kill ladder as a safety feature: no planner death
-   spiral can hold a joint.
-5. **Interlocks as principals.** The e-stop chain publishes an MCP resource;
-   safety workflows `subscribe` to it; the A2A principal model gives the
-   teach pendant `operator` and the cloud dashboard `observer` — a read-only
-   fleet by construction, because roles are enforced at the listener, not by
-   politeness.
-6. **The kiosk/appliance degenerate case.** Nothing here is robot-specific:
-   a point-of-sale box, a lab instrument, a set-top device — any machine
-   whose entire job is "run this one supervised thing forever" — gets the
-   same deal: a userland with no shell to compromise, one auditable config,
-   and an agent as the only interface.
-7. **Voice-only field debugging.** The TUI attaches over the A2A listener; on
-   a robot the same surface is reachable over the maintenance port — or the
-   dialogue agent *is* the debug interface, with the operator's role gating
-   what it may do. `agentd-tui --endpoint https://robot-07:8443 --login` on a
-   laptop in the field is the whole story.
-8. **Simulation parity.** The same config boots as PID 1 on the robot and as
-   an ordinary process against simulated driver servers in CI — because the
-   userland *is* the config, "test what you ship" is one file diff:
+4. **One subagent per limb.** Each manipulator's planner as a warm subagent
+   with memory and CPU limits sized to it, killed the moment its budget or
+   deadline trips. The kill ladder as a safety feature: no planner death spiral
+   can hold a joint.
+5. **Interlocks as principals.** The emergency-stop chain publishes an MCP
+   resource, and safety workflows subscribe to it. The A2A principal model
+   gives the teach pendant the `operator` role and the cloud dashboard the
+   `user` role: it can start conversations and see what it started, and no
+   operator control answers to it. A `security.policies` rule matching
+   `principal: "user:*"` and `tags: [egress]` can deny it every actuator tool
+   outright. Roles are enforced at the listener, not by politeness.
+6. **The kiosk and appliance case.** Nothing here is robot-specific. A
+   point-of-sale box, a lab instrument or a set-top device — any machine whose
+   whole job is "run this one supervised thing forever" — gets the same deal: a
+   userland with no shell to compromise, one auditable configuration, and an
+   agent as the only interface.
+7. **Field debugging from a laptop.** The terminal UI attaches over the A2A
+   listener, so `agentd-tui --endpoint https://robot-07:8443 --login` on a
+   laptop at the maintenance port, approved by an operator, is the whole
+   story — or the dialogue agent is the debug interface, with the caller's
+   role gating what it may do.
+8. **Simulation parity.** The same configuration boots as PID 1 on the robot
+   and as an ordinary process against simulated drivers in CI. Because the
+   userland is the configuration, "test what you ship" is a one-line diff:
    the drivers' endpoints.
 
----
+## Where to start
 
-## 6. Where to start
+Prototype without touching a bootloader. Run the configuration above as an
+ordinary process against mock driver servers: the subscribe window,
+priorities, resource limits, unix-socket A2A and immutable workflows behave
+the same. Then move it into a container, where the shipped image already runs
+agentd as the container's PID 1. The initramfs is the last step, not the
+first, and by then it is a packaging exercise.
 
-Prototype the architecture without touching a bootloader: run the §2 config
-as an ordinary process against mock driver servers (the `subscribe window`,
-priorities, rlimits, unix-socket A2A, and immutable workflows all behave
-identically). Then move it into a container with `--init`-style pid 1
-semantics (`docker run --init` inverted: run agentd *as* the container's
-PID 1 — the shipped image already does). The initramfs is the last step, not
-the first, and by then it is a packaging exercise.
+agentd's premise is that an agent is something you run with the same
+discipline as any other long-lived process. PID 1 takes that premise to its
+end: the machine does not have an agent; from its first userland instruction,
+it is one.
 
-The premise of agentd is that an agent is something you *run*, with the same
-discipline as any other long-lived process. PID 1 is that premise taken to
-its logical end: the machine does not have an agent — the machine, from the
-first userland instruction, **is** one.
+## Next steps
 
-## See also
-
-- [Architecture](architecture.md) — the two-loop split this page leans on.
-- [The harness](harness.md) — reaper, kill ladder, restart governor, budgets.
-- [Scaling & operations](scaling.md), [Deployment](deployment.md) — the
-  server-side siblings of these patterns.
-- [Security](security.md) — the trifecta rule; read "actuation as egress"
+- [Supervision and containment](harness.md) — the reaper, the kill ladder, the
+  restart governor and budgets.
+- [Security model](security.md) — the Rule of Two; read "actuation is egress"
   against it.
-- [Operations](operations.md) — the admin surface a fleet control plane drives
-  each unit through.
+- [Deploy](deployment.md) — the server-side siblings of these patterns.
+- [Operate a running daemon](operations.md) — the controls a fleet drives each
+  unit through.

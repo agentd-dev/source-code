@@ -1,600 +1,368 @@
-# Architecture: one binary, two loops, two protocols we did not write
+# Architecture
 
-You are about to run something that holds your API keys, spawns processes, talks
-to a language model, and stays up for weeks. Before you do, you want three
-answers without reading the source: what happens when the model wedges mid-turn,
-what survives when the process dies, and what third-party code you have just
-agreed to trust.
-
-One idea shapes all three: **hand-write the small, stable protocol layers, and
-make the unit of concurrency an OS process rather than an async task.** Every
-other decision below is downstream of that.
-
----
+agentd is one binary that runs as a supervisor process and a set of
+short-lived child processes. The supervisor holds the state and the
+credentials and runs no agent loop; the agent loop runs in the children,
+which the supervisor can kill at any moment. This page is for evaluators,
+security reviewers and integrators who need to predict where a piece of work
+runs, what survives a crash and which network connections a deployment opens.
 
 ## The shape of the system
 
-A running agentd is **one supervisor process** that owns all state, **short-lived
-child processes** that do the reasoning, and **four network edges**, all of them
-HTTP(S).
+A running agentd is **one supervisor** that owns every piece of durable
+state, **child processes** it spawns for each unit of reasoning, and a small
+set of **network edges**: model providers and MCP servers outbound, A2A and
+webhooks inbound, and a store that may be local files or a remote service.
 
 ```mermaid
 flowchart TB
-  OP["operator / A2A peer<br/>TUI · web UI · another agent"]
-
-  subgraph sup["agentd — the supervisor process"]
-    LOOP["single-writer reactor<br/>events → policy → effects → checkpoint"]
-    REG["tool registry<br/>internal &gt; code &gt; MCP"]
-    ADAPT["store adapter<br/>put · get · list · delete"]
-    LISTEN["A2A listener<br/>HTTPS, thread-per-connection"]
+  CL["A2A peers, TUI, web UI"]
+  WC["webhook callers"]
+  subgraph SUP["supervisor process"]
+    LOOP["reactor: the single writer"]
+    LIS["A2A listener"]
+    WH["webhook listener"]
+    ADP["store adapter"]
   end
-
-  subgraph kids["child processes — the same binary, re-exec'd"]
-    TW["turn worker<br/>exactly one LLM turn"]
-    SA["subagent<br/>a nested agent loop"]
+  subgraph KIDS["child processes: the same binary"]
+    TW["turn worker or think child"]
+    SA["subagent"]
+    INST["instance-tier child"]
   end
-
-  STORE[("state store<br/>file · MCP tools · HTTP · memory")]
+  STORE[("state store")]
   MCPS["MCP servers"]
-  LLM["intelligence endpoint"]
-
-  OP <-->|"A2A JSON-RPC over HTTPS"| LISTEN
-  LISTEN --> LOOP
-  LOOP --> REG
-  LOOP --> ADAPT
-  ADAPT <-->|"put · get · list · delete"| STORE
-  LOOP -->|"spawn: setpgid in pre_exec"| TW
-  LOOP -->|spawn| SA
-  TW -->|"length-prefixed control frames"| LOOP
-  SA -->|"ToolRequest → ToolResult"| LOOP
-  TW -->|HTTPS| LLM
-  TW -->|HTTPS| MCPS
-  LOOP -->|HTTPS| MCPS
-
-  classDef accent stroke:#22c55e,stroke-width:1.5px
-  class LOOP accent
+  LLM["model providers"]
+  CL -->|"A2A JSON-RPC"| LIS
+  WC -->|"signed HTTP POST"| WH
+  LIS -->|"event on the loop channel"| LOOP
+  WH -->|"event on the loop channel"| LOOP
+  LOOP -->|"put, get, list, delete"| ADP
+  ADP -->|"files, MCP tools or HTTP"| STORE
+  LOOP -->|"fork and exec"| TW
+  LOOP -->|"fork and exec"| SA
+  LOOP -->|"spawn, then A2A over a unix socket"| INST
+  TW -->|"framed pipe: internal tools, usage"| LOOP
+  TW -->|"model calls"| LLM
+  TW -->|"tool calls"| MCPS
+  LOOP -->|"mapped tools, subscriptions"| MCPS
+  LOOP -->|"goal and approval judges"| LLM
 ```
 
-The supervisor **runs no agent loop**. It decides *when* things run, executes
-effects, and records every transition; reasoning happens inside children it can
-kill outright. (Two opt-in watchdogs — the `goal` judge and the `ask_human`
-auto-answer — do call the model, but on an executor thread, never on the loop.)
-That is the "two loops": a deterministic supervisor loop, and an agentic
-think-act-observe loop that lives in a child.
+Three ideas shape every part of it:
 
-Children are **flat** — every turn worker and subagent is a direct child of the
-supervisor, however deep the *logical* agent tree goes. Depth and `agent_path`
-are bookkeeping the supervisor mints, never values a child asserts about itself.
-A child creates children only by calling back into the supervisor-owned
-`subagent` tool, the single chokepoint where depth, breadth and spawn-rate caps
-are enforced. A fork bomb comes back as a refused tool result, not a crash; the
-limiter is a lazy-refill token bucket sized by `limits.subagents.rate`, which
-defaults to `8/2s` — a burst of 8, refilling four tokens a second.
+- **The unit of concurrency is an OS process, not an async task.** A model
+  call that wedges is ended by killing a process group, which needs no
+  cooperation from the code being stopped.
+- **One thread writes state.** Listeners, readers and executor threads only
+  post events; the reactor decides and records every transition.
+- **The protocols that talk to other people's software come from their
+  official SDKs.** MCP is `rmcp` and A2A is the A2A project's `a2a-rs`, both
+  running over agentd's own transport. The small, stable layers (HTTP/1.1,
+  cron, a YAML subset) are written by hand.
+  [Engineering choices](why-rust.md) explains why.
 
-| Component | Lives in | Owns |
+The code ships as five crates — `agentd-net`, `agentd-mcp`,
+`agentd-instruction`, `agentd-core` and the `agentd-cli` binary — described
+with their cargo features in [Build features and crates](features.md).
+
+## Two loops
+
+The "agent" is split across two loops that never share a thread.
+
+| | Supervisor loop | Agentic loop |
 |---|---|---|
-| Reactor | `runtime/reactor.rs` | the event loop; the only writer of durable state |
-| Workflow engine | `engine/`, `runtime/steps.rs` | the durable DAG: runs, steps, nested bodies |
-| Tool registry | `registry/` | tool definitions, grants, precedence `internal > code > MCP` |
-| Durable state | `state/mod.rs` | entity kinds, manifest, inbox, timers, checkpoint policy |
-| Store adapters | `store/{file,mcp,http,memory}.rs` | the four-operation contract |
-| Supervisor tree | `supervisor/*.rs` | spawn, process groups, reaping, kill ladder, stuck detection |
-| Turn worker, subagent | `runtime/worker.rs`, `subagent/` | one LLM turn; the nested agentic loop |
-| A2A listener | `runtime/a2a_server/` | conversations, durable tasks, the display-client feed |
-| MCP client | `crates/mcp/src/client.rs` | tool calls, resource reads, notifications |
-| Intelligence client | `intel/` | endpoint list, failover, three in-binary dialects |
-| Observability | `obs/*.rs` | NDJSON logs, Prometheus text, OTLP export, probes |
+| Lives in | the main process, one thread | a child process per unit of work |
+| Calls the model | not for agent work | always: it is the reasoning |
+| Owns | lifecycle, config, triggers, the inbox, durable state, budgets, the process tree, liveness | think, call a tool, observe, repeat |
+| Shape | a reactor blocking on one channel | a straight-line loop over a snapshot |
+| Stopped by | a signal, then its own drain | `killpg` from the supervisor |
 
----
+The supervisor decides *when* work runs and *that* it stays inside its
+limits; it never decides what the work should be. Two supervisor-side model
+calls are the exception, and both are narrow: the goal watchdog's check runs
+on `intelligence.roles.goal`, and the judge that answers an ask on the
+operator's behalf runs on `intelligence.roles.approve`. Each runs on a
+detached thread, returns a verdict as an event, cannot call a tool and
+cannot change state. Their tokens are charged to the instance budget.
 
-## The crate split
+## The process tree
 
-Five publishable crates, and a conformance suite that deliberately links none of
-them.
+Every child is a **direct child of the supervisor**, however deep the
+logical agent tree goes. The tree is flat: one table keyed by node id. A
+child is the same binary re-executed, and it receives its whole
+configuration in the first frame on its stdin, so one artifact ships with no
+second code path. The children come in four kinds:
 
-| Crate | Library | Size | Owns |
-|---|---|---|---|
-| `agentd-net` | `net` | 2,310 lines | HTTP/1.1 + SSE client, TLS, SSRF classifier, X.509 extraction |
-| `agentd-mcp` | `mcp` | 6,567 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
-| `agentd-instruction` | `instruction_core` | 15,252 lines | the Instruction Specification reference implementation (version 1, registry revision 1.1): parser, validator, §3.5 delivery, the §7.4 resolution manifest, Appendix C advisories, §7 verification |
-| `agentd-core` | `agentd` | ~89,000 lines | the engine: loop, supervisor, workflows, registry, config, state |
-| `agentd-cli` | bin `agentd` | 749 lines | argv dispatch and exit codes, nothing else |
-| `agentd-conformance` | — | — | black-box checks that drive the real binary |
+| Child | Runs | Lifetime |
+|---|---|---|
+| Turn worker | one turn of a conversation, or one `agent`, `think` or deciding workflow step | until the turn ends |
+| Think child | preflight, compaction, the `think` and `decide` tools: a worker with no tools | one call, a few rounds at most |
+| Subagent | a nested agent loop started by `subagent.run` | until its objective ends or it is retired |
+| Instance-tier child | a whole agentd daemon composed from a subagent template | until its `ttl`, `until` signal or retirement; drains like any daemon |
 
-Sizes are `wc -l` over each crate's `src/`, so the inline `#[cfg(test)]` modules
-count and the integration tests in `tests/` do not. The engine's is rounded
-because it moves with every commit; the leaves are stable enough to state exactly.
+A child creates children only by calling the supervisor-owned `subagent`
+tool, which is where depth, breadth, lifetime total and spawn rate are
+enforced. Depth and `agent_path` are minted by the supervisor from its own
+records, never read from a request, so a child cannot claim to be shallower
+than it is. A burst of spawns comes back as a refused tool result, not a
+crash: the limiter is a token bucket sized by `limits.subagents.rate`
+(default `8/2s`).
 
-The name mismatch is not aesthetic: `agentd` on crates.io belongs to an unrelated
-project, so the package is `agentd-core` with `[lib] name = "agentd"`, and
-dependents rename it back so embedders still write `use agentd::…`.
-`agentd-instruction` carries the same package-vs-lib split for a different
-reason — the specification is instruction.md's, not ours, so a release must not
-stake a claim on the `instruction-*` namespace — and from 0.2.0 it is the one
-crate here under `MIT OR Apache-2.0` rather than the AGPL, because a reference
-implementation the other implementations cannot link is a reference nobody uses.
-
-**Third-party surface sits in the leaves, and is optional above them.** `net`
-holds one heavy end of the default build — `rustls` and `webpki-roots`
-behind its `tls` feature — and `mcp`
-carries the other: the official `rmcp` SDK and the async runtime it needs
-(`tokio`, `futures`, `sse-stream`, `tokio-stream`, `thiserror`, `http`). Beyond
-its own three (`serde`, `serde_json`, `libc`), the engine names fourteen further
-external crates, every one optional and every one off by default: `ring` for
-`aauth`, `sign` and `oci`, `cel-interpreter` for `cel`, and the A2A stack behind
-`a2a` — the official A2A SDK's `a2a-lf`, `a2a-pb` and `a2a-server-lf`, with
-`chrono`, `tokio`, `axum`, `tokio-rustls`, `hyper`, `hyper-util`, `tower`,
-`async-trait`, `tokio-stream` and `futures-util`. `instruction` names `ring` unconditionally, for the §7.2
-digests its resolution manifest is made of, so `ring` is in every build of
-the engine. `net`, `mcp` and `instruction` also contain **zero** `unsafe`;
-in the engine every `unsafe` block outside `#[cfg(test)]` is libc FFI: thirty
-blocks across thirteen files, almost all of them signal handling, spawn, reaping,
-kill and cgroup work, plus the inotify watch and the termios juggling in
-`config/prompt.rs`.
-(The test-only ones are `std::env::set_var` calls, which edition 2024 made
-unsafe.)
-
-**The CLI is a shell**, and that is enforced by the mechanism that makes
-embedding work: subagents are the **same binary re-exec'd** via `current_exe()`,
-so an embedder building its own CLI must install the subagent re-exec dispatch as
-the *first* thing in `main`. Skip it and a spawn re-runs the embedder's CLI as a
-confused supervisor. Code tools register *before* that dispatch, because
-registration is how a tool exists in every re-exec'd process.
-
----
+The kernel enforces the boundary at three points. Each child gets its own
+process group, so one `killpg` ends a subtree. Each child asks the kernel to
+kill it when the supervisor dies (`PR_SET_PDEATHSIG`: `SIGKILL` for workers
+and subagents, `SIGTERM` for an instance-tier daemon so it drains). And the
+supervisor marks itself a subreaper, so orphaned grandchildren reparent to
+agentd rather than to the host's init.
+[Supervision and containment](harness.md) covers spawning, liveness, the kill
+ladder and recovery in depth.
 
 ## The single-writer loop
 
-`Runtime::run_loop` is genuinely single-threaded. Each iteration drains every
-source, decides, checkpoints, and then blocks on exactly one wait.
+The reactor is one thread that drains every source, decides, checkpoints and
+then blocks on exactly one wait. Each iteration runs the same phases in the
+same order:
 
-```mermaid
-flowchart TD
-  START(["run_loop"]) --> H["health tick — the heartbeat /healthz reads"]
-  H --> C2["2 · reap SIGCHLD, dispatch exits<br/>(each reap re-queued once, behind its child's frames)"]
-  C2 --> C3["3 · drain events: child frames + executor results"]
-  C3 --> C4["4 · fire due durable timers"]
-  C4 --> C5["5 · process the durable inbox"]
-  C5 --> C6["6 · poll start nodes, waits, scheduled runs<br/>(re-scheduled to a fixpoint while inline steps finish)"]
-  C6 --> C7["7 · dispatch turns, up to max_parallel_turns"]
-  C7 --> C8["8 · poll pending waits + MCP notifications"]
-  C8 --> C9["9 · child liveness tick"]
-  C9 --> C10["10 · checkpoint + set gauges"]
-  C10 --> C11["11 · signals + lifecycle"]
-  C11 -->|terminal| EXIT(["shutdown, return exit code"])
-  C11 -->|continue| WAIT["12 · recv_timeout, bounded by<br/>min of next armed deadline and TICK = 200 ms"]
-  WAIT --> START
+1. Stamp the health heartbeat that `/healthz` reads; log a change in
+   resource pressure.
+2. Reap exited children. A reap is requeued once behind its child's
+   already-written frames, so "exited without a result" cannot be a race.
+3. Drain events: child frames, executor results, listener requests.
+4. Retire workflows whose drain deadline passed; sweep expired webhook
+   idempotency markers.
+5. Fire due durable timers.
+6. Turn the daemon's own runtime events into stream appends, so this pass's
+   consumers see them.
+7. Process the durable inbox.
+8. Poll start nodes, stream and correlate consumers, and suspended waits;
+   schedule runs. Scheduling repeats to a fixpoint while inline data steps
+   complete, and again for streams appended in this pass.
+9. Dispatch queued turns.
+10. Poll pending tool waits, MCP notifications, MCP Events and joins.
+11. Ping children, classify their liveness and tear down the unhealthy;
+    tick instance-tier children.
+12. Checkpoint dirty state; publish gauges and the display clients' feed.
+13. Handle signals and run the lifecycle step, which may exit.
+14. Wait on the event channel until the nearest deadline, at most 200 ms.
 
-  subgraph off["off-loop threads — never write durable state"]
-    RT["one reader thread per child"]
-    EX["executor threads for blocking MCP and HTTP"]
-    CONN["one thread per served connection"]
-  end
-  RT -. "tagged event" .-> C3
-  EX -. "tagged event" .-> C3
-  CONN -. "tagged event" .-> C3
+The order is the contract. Reaping precedes the inbox, so a child's exit is
+visible before its work is reconsidered. Timers fire before start nodes, so
+a durable sleep resolves in the pass that could re-arm it. Checkpointing
+precedes the lifecycle step, so nothing exits with unflushed state.
+
+The wait is bounded by the nearest armed deadline — a timer, a schedule, a
+wait's timeout — with a 5 ms floor and a 50 ms ceiling while work is pending.
+A timer due in 3 ms fires in about 3 ms; the 200 ms tick caps how long an
+idle loop sleeps, it is not a scheduling granularity. Child frames ride the
+same channel the loop waits on, so a worker's tool request wakes the loop
+instead of waiting out the tick. The scheduling fixpoint means a pipeline of
+inline data steps (`assign`, `map`, `template`, `switch`) advances at
+execution speed rather than one step per tick.
+
+**Single writer does not mean single thread.** These threads exist beside
+the reactor, and none of them mutates durable state — each posts events onto
+the channel the reactor drains:
+
+- one reader thread per child, for its frames;
+- executor threads for the blocking MCP and HTTP calls the supervisor makes,
+  and for the goal and approval judges;
+- the A2A listener: axum on its own two-worker tokio runtime;
+- each MCP connection: a one-worker tokio runtime that the official SDK runs
+  on, in the supervisor and in every worker that dials MCP;
+- the webhook listener: a blocking thread per connection;
+- four MCP Events poll threads, the metrics server and the OTLP log exporter,
+  when those are configured.
+
+An idle daemon with no MCP server and no listener runs on one thread; the
+numbers are in [Engineering choices](why-rust.md#the-numbers).
+
+The async runtimes sit at the protocol edges because the SDKs need them.
+The reactor never awaits, for a correctness reason: the thing that must be
+cancelled when a turn goes wrong is a child process, and dropping a future
+cannot end a process. The reactor also never blocks on an untrusted source.
+It reaches every pipe through the channel it waits on, and it unblocks a
+parked reader only by making the producer go away — closing its pipe,
+killing its group. Pipes carry no read timeout; the deadline lives in one
+place.
+
+## Where state lives
+
+When an instance has a store, every unit of progress is written to it before
+it counts: an accepted message, a fired trigger, a workflow step, a
+conversation's transcript, a subagent record, a memory write, a timer, a
+stream event, an audit record, a cached credential. The store is a
+key-value service behind one small contract:
+
+```text
+put(key, seq, envelope)  -> Ok | Conflict{latest_seq} | Err
+get(key[, seq])          -> Some(envelope) | None | Err
+list(prefix)             -> [{key, seq}] | Unsupported | Err
+delete(key)              -> Ok | Unsupported | Err
 ```
 
-"No async runtime" does not mean single-threaded overall — it means the *writer*
-is single-threaded. Reader threads, executor threads, the MCP notification pump
-and per-connection handlers all exist. The invariant is that none of them mutate
-durable state; they post events onto the `std::sync::mpsc` channels the loop
-drains.
+Keys are `<prefix>/<instance>/<kind>/<id>` across thirteen entity kinds:
+`manifest`, `inbox`, `context`, `run`, `subagent`, `task`, `memory`,
+`artifact`, `timer`, `event`, `audit`, `cred` and `identity`. Values are
+versioned envelopes that carry a sequence number, a timestamp, the writing
+instance and, for a run, the hash of the definition it started under.
 
-The wait at phase 12 is `next_wake().min(TICK)`, not `TICK`. A timer due in 3 ms
-fires in 3 ms; the 200 ms tick is a ceiling on how long the loop sleeps with
-nothing armed, not a scheduling granularity. Two details make that claim true
-rather than aspirational. Child frames ride the SAME channel the loop parks on,
-so a subagent's answer *wakes* the loop instead of waiting out the tick: a
-delegation round-trip measures ~18 ms, where parking until the next tick would
-add most of a 200 ms tick to every one. Each reap is re-queued once behind its
-child's already-flushed frames, so "exited without a result" cannot be a race.
-And after the scheduling pass, the loop re-schedules to a fixpoint while inline
-data steps (`assign`, `map`, `template`, `switch`…) keep completing
-synchronously, so a pure data pipeline advances at execution speed — a 200-step
-chain finishes in ~2.3 s in a debug build, against the ~42 s one step per tick
-would cost. A daemon built with the shipped
-feature set, idling on a schedule workflow, reports `Threads: 1`, `VmRSS`
-around 5.5 MiB, and one accumulated CPU jiffy per ~6 s.
+**`put` is a compare-and-set on the sequence number, and a conflict on a key
+this instance owns is fatal.** A second writer exists, and the instance
+stops rather than interleave with it. That is the split-brain guard that
+makes several replicas over one namespace safe.
 
-### Why not an async runtime
+**Accept means durable.** An inbound message or a fired trigger is written to
+the inbox before it is acted on, and an A2A `SendMessage` is acknowledged
+only after that write. On restart, undone inbox records are re-delivered
+with their original event id. You get exactly-once state transitions and
+at-least-once effects. agentd cannot make a remote tool call idempotent for
+you; it sends an idempotency key in every MCP call's `_meta` so a server can
+collapse a replay.
 
-The argument against tokio is about correctness, not taste. The thing that needs
-cancelling when a turn goes wrong is a **child process**, and the only thing that
-reliably stops it is `killpg(SIGKILL)`. Future-drop cannot do that. A shared
-work-stealing pool also reintroduces the failure mode this design exists to
-avoid — one stuck thing starving everything — and costs scores of crates.
+agentd links no database client. Four adapters implement the contract:
 
-The kernel enforces cancellation at three points. Each child gets its own process
-group via `setpgid(0, 0)` in `pre_exec`, so the ladder can target a whole
-subtree. Each child sets `PR_SET_PDEATHSIG(SIGKILL)` in its own `main` (it is
-cleared across `execve`), so a supervisor crash collapses the tree leaf-up. The
-supervisor sets `PR_SET_CHILD_SUBREAPER`, so orphaned grandchildren reparent to
-agentd rather than host init. The ladder is bounded and deepest-first: graceful
-cancel, `killpg(SIGTERM)` after a 5 s grace, `killpg(SIGKILL)` after a further
-2 s, then `waitpid`.
+| Adapter | Where state goes | Default for |
+|---|---|---|
+| `file` | one file per key under a local directory it locks | a long-lived instance that names no store |
+| `mcp` | any MCP server's tools, through argument and result mappings | — |
+| `http` | a plain HTTP key-value endpoint | — |
+| `memory` | this process only | tests |
 
-### Abandon, don't interrupt
+A one-shot job that names no store keeps none (`none`): a crash re-runs it.
+No adapter keeps a local write-ahead log. One envelope per key is the whole
+record, which is why a remote store is the right choice the moment the
+process is disposable: a container's filesystem is not a durability
+boundary. Restore reads the manifest, fetches every indexed entity,
+reconciles against `list`, re-arms timers from absolute deadlines and
+re-delivers undone inbox events; [Supervision and
+containment](harness.md#checkpoints-and-crash-recovery) has the full
+sequence.
 
-The load-bearing invariant of thread-per-fd is that **the supervisor never blocks
-on an untrusted source.** It reaches every pipe only through the channel it
-`recv_timeout`s, and it unblocks a parked reader only by making the producer go
-away — closing its stdout, killing its process group — never by interrupting the
-read. So pipes have no read timeout, and adding one would be a bug: the deadline
-lives at the reactor's `recv_timeout`, and a second, racing notion of "stuck" is
-what you least want.
+## The edges
 
-The scale envelope is bounded on purpose: roughly 8 MCP readers, up to 50
-subagent readers, one intelligence connection and one signal reader — about 60 to
-65 threads and 130 file descriptors, three orders of magnitude inside default
-Linux limits. You scale by running more instances.
-
-Signals fit the same discipline. Handlers flip an `AtomicBool` and write one byte
-to a self-pipe made with raw `libc::pipe`. `SA_RESTART` is off, so blocked
-syscalls return `EINTR`; `SIGPIPE` is ignored, so writing to a dead child is an
-`EPIPE` you handle rather than a process death.
-
----
-
-## Where state lives, and when the store should be remote
-
-agentd's durable state is a key-value store behind one small contract, and
-where that store lives is a deployment choice. A long-lived instance that names
-no `store.kind` gets the local **file** store — one file per key under a
-directory it holds an exclusive lock on — because an agent on a laptop or a VM
-should survive a restart without an external service standing by; a one-shot job
-may keep no state at all. Point `store` at a **remote** adapter the moment the
-process is disposable, which in a container it always is. Either way the same
-things are written: every unit of progress — an accepted message, a fired
-trigger, a workflow step, a turn, a subagent result, a memory write, a timer —
-goes to the store. The contract is four operations:
-
-```
-put(key, seq, envelope)  → Ok | Conflict{latest_seq} | Err(io)
-get(key[, seq])          → Some(envelope) | None | Err(io)
-list(prefix)             → [{key, seq}] | Unsupported | Err(io)
-delete(key)              → Ok | Unsupported | Err(io)
-```
-
-Keys are `<prefix>/<instance>/<kind>/<id>` across twelve entity kinds —
-`manifest`, `inbox`, `context`, `run`, `subagent`, `task`, `memory`, `artifact`,
-`timer`, `event`, `audit`, `cred`. Values are versioned envelopes carrying
-`seq`, `ts`, the writing `instance`, and an optional `hash` binding a run to its
-definition.
-
-**`put` is a compare-and-set on `seq`, and a conflict is fatal.** If another
-writer owns a key, the instance stops accepting work rather than racing. That is
-the split-brain guard, and what makes several replicas on one namespace safe.
-
-**Accept means durable.** An inbound message or fired trigger is written to the
-inbox *before* it is acted on, and a `SendMessage` is acknowledged only after
-that write. On restore, undone inbox records are re-delivered with their original
-event id. You get exactly-once *state transitions* and at-least-once *effects* —
-the honest pairing, since agentd cannot make a remote tool call idempotent for
-you. It carries the key (`_meta["agent/idempotency_key"]`) so a well-behaved
-server can collapse the replay.
-
-**agentd links no database client** and defines no schema beyond the envelope.
-Four adapters implement the contract. `file` writes one file per key under a
-locked local directory, and is the default for a long-lived instance; `mcp` maps
-the operations onto any MCP server's tools through JSON or CEL templates; `http`
-onto plain HTTP; `memory` in-process for tests. Even the file store keeps no
-local write-ahead log — one envelope per key, never a journal — which is what
-makes the remote answer the right one as soon as the box is disposable: a
-container's filesystem is not a durability boundary, and an evicted pod takes
-its disk with it. Making the store an outbound HTTP call to something that
-already has an operational story means agentd inherits that story instead of
-inventing a worse one.
-
-Restore is explicit: read the manifest, `get` each indexed entity, verify
-definition hashes, rebuild registries, re-arm timers from absolute deadlines,
-re-open in-flight tasks, re-spawn subagents whose parent step is pending,
-re-deliver undone inbox events. Entities newer than the manifest win, because
-entities are written first; listed-but-missing entities are marked lost and
-audited rather than silently skipped. On a store error, `store.on_error` chooses
-`halt` — refuse intake, keep serving status, drain — or `degrade`, which retries
-with backoff and reports `durability: degraded`.
-
----
-
-## The four network edges
+Every edge is HTTP(S) or a unix socket, and every one goes through agentd's
+own transport, so the credentials only agentd knows — AAuth signatures,
+SigV4, mTLS identities, refreshed OAuth tokens — apply under both SDKs.
 
 | Edge | Direction | Wire |
 |---|---|---|
-| Intelligence | outbound | HTTPS; OpenAI-compatible `/chat/completions`, plus Anthropic and Bedrock Converse dialects in-binary |
-| MCP servers | outbound | HTTPS Streamable HTTP: one POST per request, plus a lazily-opened GET SSE stream |
-| State store | outbound | HTTPS, via the `mcp` or `http` adapter |
-| A2A / operator | inbound | HTTPS JSON-RPC — peers, TUI, web UI and operator admin all arrive here |
+| Model providers | out | HTTPS: OpenAI-compatible chat completions, Anthropic Messages, Bedrock Converse, or a decisions resource (`dialect: decisions`). Each provider is its own connection with ordered endpoint failover and breakers |
+| MCP servers | out | Streamable HTTP through `rmcp`. A connection starts with `server/discover` (revision 2026-07-28) and falls back to the 2025-11-25 `initialize` handshake; it holds a `subscriptions/listen` stream and allows up to 16 requests in flight. The supervisor and every worker dial their own |
+| MCP Events | out, or in | occurrences polled on four threads, or POSTed by the server to the webhook listener under `/hooks/_mcp/`. A draft extension |
+| State store | out | an MCP server's tools or HTTP; or local files with no network at all |
+| A2A, inbound | in | JSON-RPC over `https://`, loopback `http://`, or `unix://`. Peers, the TUI, the web UI and operator commands all arrive here |
+| A2A, outbound | out | to declared peers over `https://` or `unix://` |
+| Webhooks | in | HTTPS (loopback `http://`), one route per `webhook` start or wait, authenticated per route |
+| Probes | in | `/metrics`, `/healthz`, `/readyz` on `observability.metrics_addr`; read-only and off by default |
+| OTLP | out | HTTP/JSON spans, and logs under `observability.otel.logs`, to `observability.otel.endpoint` (else `OTEL_EXPORTER_OTLP_ENDPOINT`); each worker exports its own spans |
 
-There is no database protocol, no message-bus client, no local socket. The
-operator edge is the *same* listener as the peer edge: the TUI and web UI are
-thin display clients holding no truth of their own, subscribing to a feed and
-forwarding your intent back. Auth is the listener's — on a loopback listener
-(http or https) with no credential configured a local non-browser client is the operator with zero setup; a
-remote client presents a bearer token or an mTLS identity and sees only what its
-role allows. The probe surface (`/metrics`, `/healthz`, `/readyz`, on a separate
-port when you set `--metrics-addr`) is read-only and off by default. A workflow
-with a `webhook` start node serves that same inbound edge on a port of its own —
-signed request in, durable run out.
+There is no database protocol and no message-bus client. The operator edge
+is the same listener as the peer edge: the TUI and web UI are thin display
+clients that hold no truth of their own, subscribe to a feed and send your
+intent back. What a caller may see and do is decided by the principal its
+credential maps to — see [The A2A channel](a2a.md).
 
-Because every edge is the same wire, there is one transport abstraction:
+TLS is `rustls` with bundled root certificates, so a `scratch` container has
+trust anchors without a system CA bundle. The inbound TLS listeners re-read
+their certificate files when they change, checked at most once a second,
+and keep serving the last good identity if a reload fails. Under mutual TLS
+agentd reads the subject and subject alternative names from the verified
+client certificate, so a SPIFFE ID reaches principal matching. Outbound dials
+whose target a caller can influence — `http` steps, push-notification URLs —
+pass an SSRF classifier that refuses private addresses unless the operator
+allows them.
 
-```rust
-pub trait Stream: Read + Write {}
+## Where each intelligence role runs
+
+Every job that needs a model runs on the model its **role** names, and each
+role defaults to the turn's model. The role decides the model; the job
+decides the process.
+
+| Role | The job | Runs in |
+|---|---|---|
+| `turn` | conversation turns; `agent`, `extract` and `summarize` steps | a turn worker |
+| `think` | the `think` tool and `think` steps | a think child, or the step's worker |
+| `decide` | the `decide` tool; `decide`, `classify`, `route` and `judge` steps; decision guards on a step's `when` | a worker, as a decision call |
+| `preflight` | triage of an incoming message, and the choice of route | a think child, before the turn |
+| `compaction` | summarising a transcript that outgrew its window | a think child, after the turn |
+| `goal` | the goal watchdog's check | a judge thread in the supervisor |
+| `approve` | answering an ask on the operator's behalf | a judge thread in the supervisor |
+
+A role names a declared model of one of three kinds — chat, reasoning or
+decision — on a named provider. A decision model serves only the roles and
+steps that decide. [Models, providers and roles](intelligence.md) explains
+the kinds, resolution and fallback.
+
+## A message, end to end
+
+This is the path of one A2A message that becomes a conversation turn.
+
+```mermaid
+sequenceDiagram
+  participant C as A2A client
+  participant L as A2A listener
+  participant R as reactor
+  participant S as store
+  participant P as preflight child
+  participant W as turn worker
+  participant M as model provider
+  C->>L: SendMessage
+  L->>R: request on the loop channel
+  R->>S: put the inbox record first
+  R-->>L: task created, state working
+  R->>P: spawn, when preflight is wanted
+  P->>M: triage the message
+  P-->>R: verdict: intent, plan, route
+  R->>W: spawn with the turn's snapshot
+  W->>M: model call
+  W->>R: ToolRequest for an internal tool
+  R->>S: durable write
+  R-->>W: ToolResult
+  W-->>R: usage and the transcript delta
+  R->>S: checkpoint the context, mark the inbox record done
+  R-->>L: task completed with the reply
+  L-->>C: the task and its reply
 ```
 
-`rustls::StreamOwned` is `Read + Write`, so TLS is not a branch in the HTTP code
-— it is a different value flowing through the same path. Client roots are the
-bundled `webpki-roots`, so a `scratch` container has trust anchors with no system
-CA bundle; extra anchors are process-wide and must be installed before the first
-outbound dial, because the default client config is built once and cached.
+A blocking `SendMessage` waits up to 25 seconds for the task to settle and
+otherwise answers with the task as it stands, still `working`, to follow by
+its id; a streaming send or one with `returnImmediately` sees each transition
+as an update.
 
-The inbound acceptor re-stats its PEM files at most once per second on accept and
-hot-swaps the config, so a cert rotation is picked up with no restart and no
-dropped listener; a failed reload keeps serving the last-good identity. Under
-mTLS a hand-rolled DER walk lifts subject CN and SANs from the verified leaf, so
-a SPIFFE `spiffe://` URI SAN reaches principal matching.
-
----
-
-## What is hand-rolled, and why
-
-Everything in this table is small, frozen, and only partly needed — which is the
-whole rule. A protocol with a living specification is none of those, which is why
-MCP and A2A are not in it.
-
-| Layer | Where | Instead of |
-|---|---|---|
-| HTTP/1.1 client + SSE reader | `net/http.rs`, 690 lines | `ureq` + `url` → IDNA → ICU |
-| YAML subset reader | `instruction/yaml.rs`, 1,307 lines (re-exported as `config::yaml`) | `serde_yaml`, itself unmaintained |
-| JSON Schema subset | `jsonschema.rs`, 803 lines | a schema crate and a regex engine |
-| Cron | `triggers/timer.rs` | `croner` |
-| Prometheus text | `obs/metrics.rs` | `prometheus` / `metrics` |
-| OTLP export | `obs/otel.rs` | `opentelemetry` + protobuf + gRPC |
-| inotify config watch | `config/watch.rs` | `notify` / `inotify` |
-| NDJSON logging | `obs/log.rs`, 807 lines | `tracing` |
-| SHA-256, HMAC, ULID, base64, SigV4, DER walk, token bucket, FNV-1a | various | six or seven crates |
-
-The reasoning is per-row but rhymes. Cron is five UTC fields as `u64` bitsets,
-whose `next_after` steps one minute at a time bounded at four years so Feb-29
-expressions terminate. OTLP goes over HTTP/JSON rather than gRPC because tonic
-would add a protobuf codegen and a gRPC stack on top of the tokio the MCP SDK
-already brings, for an export path the existing HTTP client already covers.
-`tracing` is declined because implicit async span context is moot in a
-processes-plus-threads design and the process tree already supplies
-correlation.
-
-Two are worth more than a table row.
-
-**Prometheus exposition has structurally bounded cardinality.** Label-bearing
-series are fixed-domain atomic arrays whose label set is known at compile time.
-An unbounded label — `run_id`, `agent_id`, `agent_path` — is impossible by
-construction, not by code review.
-
-**The ConfigMap watch watches the parent directory, not the file.** A kubelet
-update writes a new timestamped directory and atomically renames the `..data`
-symlink; the file inode is never written, so a watch on the file sees nothing.
-The watcher re-arms on `IN_IGNORED` — the subtle bit that makes a *second* update
-fire — and sets the same latch SIGHUP sets, so there is one reload code path.
-
-### The dependency ledger, stated honestly
-
-Two things in agentd are emphatically *not* hand-rolled, and they are the two
-that talk to other people's software:
-
-| | Implementation | Why not ours |
-|---|---|---|
-| MCP | [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) — the official Rust SDK | a live specification, and a misreading fails in the *peer* |
-| A2A | [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs) — the A2A project's official Rust SDK, its wire generated from the spec's protobufs | same, and demonstrable: checking agentd's output against an independent reading of the spec turns up faults that are valid JSON |
-
-Both plug into agentd's own HTTP transport, so the credentials only agentd knows
-about — AAuth signatures, SigV4, mTLS identities, refreshed OAuth tokens — and
-the SSRF guard all still apply. The SDKs own the protocol; agentd owns the socket.
-
-The resolved graph is wide, and it is counted in exactly one place:
-[why-rust.md](why-rust.md#what-that-costs-and-what-it-does-not) carries the
-per-build totals together with the `cargo tree` invocation that produces them
-and the convention for what is and is not counted. Those numbers are
-deliberately not repeated here — three counts written down in two files drift
-apart on the next dependency bump, and a reader is then holding two answers with
-no way to tell which one is stale.
-
-A graph of that width is not one you can hold in your head, so agentd does not
-claim you can. What CI enforces instead is a property of the thing a user
-actually receives: the release binary must be a statically linked musl artifact
-that runs on `scratch` — about 8.5 MiB for the shipped feature set, with no
-shell, no libc and no package manager.
-
-The build stays pure Rust. A crate that pulls `rustls` with its default
-features selects the C/assembly `aws-lc-rs` provider; because feature
-unification is additive, that one default would impose `cmake` and a C++
-compiler on every build, however carefully our own manifests ask for `ring`.
-The A2A server's TLS features are off — agentd terminates TLS itself — and CI
-asserts `aws-lc` stays out of the graph.
-
-Two gates remain: the feature matrix compiles, clippies and tests 18 combinations
-including every shipped feature solo, because `--all-features` unification hides
-broken solo builds; and `deny.toml` bans wildcard versions, denies yanked crates,
-and carries a hand-maintained permissive-only licence allow-list.
-
----
-
-## Feature flags are the capability surface
-
-Capability is decided at compile time. Of the sixteen features besides
-`default`, eight are literally empty arrays — they gate hand-rolled code, not
-dependencies.
-
-| Feature | Adds crates | Gates |
-|---|---|---|
-| `tls` *(default)* | rustls, ring, webpki-roots, … | HTTPS in and out |
-| `a2a` | the official A2A SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`), axum, tokio, … | the inbound A2A / interface listener |
-| `cron` | none | the five-field UTC parser |
-| `oauth` | none | OAuth 2.1 device, PKCE and client-credentials tokens |
-| `metrics` | none | the atomic registry and Prometheus text |
-| `otel` | none | OTLP-over-HTTP/JSON export |
-| `hot-reload` | none | SIGHUP validate-first quiesce-and-reapply |
-| `config-watch` | none — chains `hot-reload` | the inotify directory watch |
-| `workflow` | none | nothing live — the durable DAG engine is unconditional |
-| `exec` | none | the guarded local command runner |
-| `aauth` | none new — reuses `ring` | Ed25519 identity + RFC 9421 signing |
-| `sign` | none new — reuses `ring` | §7 instruction signature verification |
-| `oci` | none new — reuses `ring` | `oci://` instruction pulls, cosign verification |
-| `decrypt` | none | age v1 and JWE instruction envelopes |
-| `mcp-events` | none | MCP Events bindings and grants, polled into declared streams (RFC 0045; the extension is a draft, SEP-3415) |
-| `cel` | **+22** | CEL predicates and expressions |
-| `internal-mocks` | none | the mock LLM and MCP servers the tests drive |
-
-Read that table twice, because the naive model — "features control dependency
-cost" — mispredicts five of its rows.
-
-`aauth` adds Ed25519 signing with **zero new crates**, reusing the `ring` that
-rustls already resolved — a capability that costs nothing to carry, and the same
-is true of the `sign`, `oci` and `decrypt` that ride on it. `cel` is the
-opposite trade and is carried anyway: 22 extra crates — an ANTLR runtime and a
-regex engine among them, a quarter again on top of the default tree — in
-exchange for expressions being available to every `when`, `until` and `filter`
-in a shipped binary.
-
-`exec` costs **nothing** in dependencies and is still absent from every shipped
-binary. It is gated on *posture*: agentd's default position is that it runs no
-local code. Turning it on takes both the cargo feature and
-`security.exec.enabled` at run time, and even then the runner never uses a shell,
-enforces an argv[0] allow-list, confines the working directory, caps output and
-wall-clock, and passes a minimal environment.
-
-Two mechanics follow from treating features as capability rather than cost.
-**Call sites stay unconditional** — there are no `#[cfg]` gates around `record_*`
-or span calls; the feature empties the function body, so the loop wires
-observability once. And **CEL is fail-closed**: the module is always compiled,
-only its internals gated, so a build without the feature rejects a graph using
-CEL at define time with a named error rather than mis-evaluating later.
-
----
-
-## The deployment shapes that fall out
-
-Nothing above chooses a deployment shape. The daemon and the one-shot job are the
-same engine differing only in exit predicate: a workflow's **start node** decides
-when a run begins, `lifecycle.run_until` decides when the process stops.
-
-```console
-$ agentd \
-    --instruction "Summarize the open TODOs under /work and write SUMMARY.md" \
-    --intelligence https://gw.example/v1 \
-    --mcp fs=https://mcp-fs.internal/mcp \
-    --max-steps 40 --deadline 600s
-```
-
-The same binary, woken by an MCP resource and keeping state across restarts:
-
-```yaml
-agent:
-  name: triage
-  instruction: You triage incoming issues and write a one-paragraph summary.
-
-intelligence:
-  endpoints: https://api.openai.com/v1/chat/completions
-  model: gpt-5.1
-  token: "{{secret:OPENAI_API_KEY}}"
-
-mcp:
-  servers:
-    - name: issues
-      endpoint: https://mcp-issues.internal/mcp
-    - name: state
-      endpoint: https://mcp-state.internal/mcp
-
-store:
-  kind: mcp
-  mcp:
-    server: state
-
-workflows:
-  - name: triage
-    steps:
-      start:
-        kind: subscribe
-        server: issues
-        uri: issues://open
-        debounce_ms: 2000
-      summarize:
-        kind: agent
-        depends_on: [start]
-        instruction: Read the open issues and summarize what changed.
-        servers: [issues]
-      done:
-        kind: finish
-        depends_on: [summarize]
-        output: "{{steps.summarize.output}}"
-
-lifecycle:
-  run_until: drained
-```
-
-`agentd --validate-config -c triage.yaml` loads, substitutes, types and validates
-the whole document and exits 0 or 2 — before any side effect. Precedence is
-built-in default, then files, then environment, then flags.
-
-The exit-code table is a public API, meant to be read by a `podFailurePolicy`:
-
-| Code | Meaning |
-|---|---|
-| 0 | success — one-shot completed, or a clean SIGTERM drain |
-| 1 | generic failure (retriable) |
-| 2 | config or usage error (non-retriable) |
-| 3 | partial result |
-| 4 | intelligence unreachable or auth failure after retries (retriable) |
-| 5 | semantic refusal — the task cannot be done (non-retriable) |
-| 6 | a required MCP server failed to connect or handshake (retriable) |
-| 7 | budget exceeded — steps, tokens, deadline, tree |
-| 124 | hard wall-clock deadline |
-| 137 / 143 | killed by SIGKILL / SIGTERM, set by the OS |
-
-Note 0 for a clean drain, not 143 — visible in the log as `drain.start`,
-`drain.done`, `proc.exit` with `code: 0`. The drain budget must be **less** than
-the pod's `terminationGracePeriodSeconds` — a number agentd cannot see, so
-nothing validates it for you, and it is the most common way to get this wrong.
-Liveness is the reactor heartbeat, deliberately: a wedged reactor reads
-unhealthy, while a healthy tree with one stuck subagent keeps reading healthy —
-the reactor is the thing detecting and killing that child, so it is still
-ticking.
-
-The resulting footprint, on a stripped x86_64 glibc release build of 1.16.0
-(`opt-level = "z"`, LTO, `panic = "abort"`, one codegen unit): 5,376,480 B
-(5.13 MiB) with `--no-default-features`, 6,365,288 B (6.07 MiB) with default
-`tls`, 10,235,536 B (9.76 MiB) with the shipped
-set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events`. Release
-artifacts are cross-compiled static-musl for `x86_64` and `aarch64`, plus a
-multi-arch, cosign-signed OCI image with an SPDX SBOM.
-
-`panic = "abort"` is a design statement, not a size optimisation: a panicking
-supervisor should die loudly and let `PR_SET_PDEATHSIG` collapse its tree rather
-than limp on with corrupt state. The consequence is worth saying plainly — every
-`unwrap` on the supervisor path is a tree-wide availability decision, which is
-why mutex locks there recover from poisoning rather than aborting on it.
-
----
+MCP tool calls do not appear: the worker makes them itself, on its own
+connections, with an idempotency key per call. Only internal tools — memory,
+plans, artifacts, workflows, subagents — round-trip to the supervisor,
+because they change state the supervisor owns. [How a turn
+runs](agent-loop.md) follows the turn itself.
 
 ## What this design will not do
 
-- **Scale one instance to thousands of connections.** The model targets roughly
-  60 threads. You scale out, not up.
-- **Give you exactly-once effects.** It gives exactly-once state transitions and
-  carries an idempotency key; collapsing the replay is the remote server's job.
-- **Survive a restart without a store.** `memory` is for tests; there is no local
-  write-ahead log.
+These limits follow from the design. They are stated so you can decide
+whether agentd fits before you deploy it.
+
+- **Scale one instance to thousands of connections.** One instance is a
+  supervisor plus tens of children and threads. You scale out by running
+  more instances, partitioning work at its source ([Scale out](scaling.md)).
+- **Run work measured in milliseconds.** Every turn is a fork and exec of the
+  binary. That is the cost of a cancel that always works.
+- **Give you exactly-once effects.** It gives exactly-once state transitions
+  and an idempotency key; collapsing a replayed call is the remote server's
+  job.
+- **Survive a restart without a store.** The `memory` adapter is for tests,
+  and nothing keeps a local log behind your back.
 - **Sandbox anything.** The container, VM or enclave around agentd is the
-  sandbox. Capability scoping is the granted tool subset, narrowing monotonically
-  down the agent tree.
-- **Run a local command in a shipped binary.** The `exec` runner requires
-  building from source, and then enabling `security.exec.enabled` as well.
+  sandbox. Capability scoping is the granted tool set, which narrows down the
+  agent tree and never widens ([Security model](security.md)).
+- **Run a local command from a shipped binary.** The `exec` runner exists
+  only in a build with the `exec` feature, and even then only with
+  `security.exec.enabled`.
 
----
+## Next steps
 
-## Where to go next
-
-- [`harness.md`](harness.md) — the reactor, supervision, stuck detection and recovery
-- [`agent-loop.md`](agent-loop.md) — what the child loop does on each turn
-- [`configuration.md`](configuration.md) — durable state and the store adapters
-- [`workflows.md`](workflows.md) · [`deployment.md`](deployment.md) · [`security.md`](security.md) · [`embedding.md`](embedding.md)
+- [Supervision and containment](harness.md) — spawning, liveness, the kill
+  ladder, cgroups and crash recovery.
+- [How a turn runs](agent-loop.md) — what a worker does between a message and
+  its reply.
+- [Engineering choices](why-rust.md) — the language, the dependency
+  discipline and the measured footprint.
+- [Build features and crates](features.md) — what each cargo feature adds.

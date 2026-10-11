@@ -1,246 +1,1289 @@
-# The node registry
+# Workflow node reference
 
-Every workflow node agentd implements, what it needs, and what it does. The
-required-field columns follow the binary's own registry, which
-`agentd --workflow-schema` prints, and which is what the parser enforces.
+This page lists every workflow node kind agentd implements: the fields it
+takes, what it outputs, and a short sample. There are 74 kinds: 11 start
+nodes and 63 steps. It is for builders looking up a field;
+[Author workflows](author-workflows.md) shows how the kinds fit together.
 
-**73 kinds — 11 start nodes and 62 steps. All are implemented.** If this page and
-the binary ever disagree, the binary is right; check against
-`agentd --workflow-schema`.
+## How to read this page
 
----
+- **Fields** lists the kind's own fields. A **bold** field is required.
+  Every step also takes the
+  [fields every step accepts](#fields-every-step-accepts).
+- **Output** is what later steps read at `steps.<id>.output`.
+- Samples are fragments of a workflow's `steps:` map. They name an MCP
+  server `github`, a stream `orders` and an A2A peer `reviewer`, which a
+  complete configuration declares.
+- The parser refuses an unknown field and names the allowed set, so a typo
+  is a load error, never a silently ignored setting.
+- `agentd --workflow-schema` prints the same registry as JSON Schema, from
+  the binary you run. When this page and the binary disagree, the binary is
+  right.
 
-## Before the tables: six things that are easy to get wrong
+```sh
+agentd --workflow-schema | jq '.["$defs"].kinds | keys | length'
+```
 
-These are the traps, in the order people hit them.
+```
+74
+```
 
-**1. References are `steps.<id>.output.<path>`.** A step's result is not at its
-bare name. Writing `{{ hook.body.id }}` reads nothing; you want
-`{{ steps.hook.output.body.id }}`. The namespaces are:
+## Fields every step accepts
 
-| Namespace | Holds |
+| Field | Effect |
 |---|---|
-| `steps.<id>.output` | what a completed step returned |
-| `vars.<key>` | what `assign`/`transform` wrote (`writes:` names the key) |
-| `inputs` | the run's inputs, from the start node's `inputs` mapping |
-| `env` | instance, run id, instruction — plus, per step: `env.step`, `env.attempt`, and `env.idempotency_key` (stable across retries of the step; `env.ts` is NOT) |
-| `memory.<key>` | durable memory, read through for keys the definition names |
-| `signals` | recently delivered signals |
+| `kind` | the node kind; required |
+| `depends_on` | the steps this one waits for. A non-start step with none is refused as an unreachable root, except a wait's `on_timeout` target |
+| `when` | a CEL guard, or a [decision guard](#decision-guards). When it does not hold, the step is pruned, and so is everything that depends only on it. Inside a nested body it is skipped instead |
+| `retry` | `{max, backoff}`: retries after a failure or a timeout. `max` is capped at 20; the backoff doubles per attempt with ±20% jitter, on a durable timer |
+| `timeout` | a duration bounding the step. A model step, an `mcp.tool` call and a wait use it; unset, a model step and an `mcp.tool` call get `limits.step_timeout` (600 s) |
+| `on_error` | `fail` (default) fails the run; `continue` marks the step done with `error` set and output `{"error": …}`; `"goto:<step>"` runs that step instead, even though its dependencies have not finished |
+| `on_replay` | what restore does with a step a crash caught running: `retry` (default), `skip`, or `fail` |
+| `output_schema` | a JSON Schema the step's output must match, or the step fails. On a model step it also shapes the answer |
+| `cache` | `{key?, ttl?}`: reuse an earlier output. The key is a template (default: the rendered fields), shared across runs of the workflow; no `ttl` keeps it forever. Never written for a step that suspends or nests |
+| `budget` | a token allowance for this step's model calls |
+| `skills` | skills loaded into a model step's prompt |
+| `description` | free text |
+| `idempotent`, `otel` | accepted, and read by nothing. Use `on_replay` to control a replay |
 
-**Templates are resolved at RUN time, not validated at author time.** A typo in a
-path is not a config error — it is a step failure at the moment the step runs.
-`--validate-config` will not catch it.
+Two more fields are accepted only on some kinds; on any other kind they are
+an unknown field:
 
-**2. `switch` cases name ONE step, as a string.** `cases: {select: prepare}`,
-not `cases: {select: [prepare]}`. A case value is compared against a step id, so
-a list can never match anything; the loader refuses it outright, with a message
-saying what to write instead of leaving a branch that is silently unreachable.
+| Field | Kinds | Effect |
+|---|---|---|
+| `breaker` | `http`, `mcp.tool`, `a2a.send`, `a2a.delegate` | `{failures, cooldown}`: after N consecutive failures, every run fails fast for the cooldown, then one probe is let through. Durable, per instance, keyed by the step's unscoped id |
+| `rate` | the four above, plus `batch`, `stream` and `webhook` (`foreach` takes it inside its `batch` field) | `"<burst>/<per>"`, such as `"10/1s"` or `"1/1d"`. On a remote call, the step waits for a token without using an attempt; on a fan-out it paces element starts; on a start node it paces intake |
 
-**3. A step's status can be `pruned`.** A branch nobody chose is `pruned`, not
-`skipped`, and the difference is load-bearing: a *skipped* step satisfies its
-dependents (that is how several start nodes work, and how uneven joins proceed),
-while a *pruned* one does not. A step is pruned only when EVERY inbound path is
-pruned — one live parent keeps it alive.
+## Start nodes
 
-**4. Signals are edge-triggered.** `workflow.signal` wakes waiters that are
-ALREADY suspended. A signal sent before the waiter parks is missed — there is no
-buffering. Two sibling steps in one run, one signalling and one waiting, is a
-race with no ordering primitive to fix it; signal across runs, or from a tool or
-an operator, where the waiter is demonstrably parked first.
+A start node is a trigger. It does not run inside a run: its output is the
+trigger payload, read by later steps at `steps.<start-id>.output`. When a
+workflow has several start nodes, a run fires one and marks the others
+`skipped`. Every start node takes `inputs`, a mapping rendered against
+`{payload, env}` that becomes the run's `inputs` namespace; `once` passes it
+through unrendered and `manual` takes the inputs its caller supplies.
 
-**5. CEL is a build feature.** A CEL `when`, `until`, `filter` and the `expr` of
-`map`/`filter`/`reduce` need it. The release binaries ship with it enabled; a
-binary built without it **exits 2** on a config that uses those fields rather
-than ignoring the expression and running the step anyway.
+### `once`
 
-**6. Nested steps are scoped.** A step inside a `foreach`/`parallel`/`race`/
-`subgraph` gets a compound id — `each[0].work`, `par{branch}.work`,
-`sub.work` — which is what you will see in the logs and what cancellation
-matches on.
+Fires once, when the workflow is armed at startup or restore.
 
----
-
-### Start nodes — what creates a run
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `once` | — | `policy` `inputs` | Fires when armed at boot/restore, or on `workflow.run`. `policy: ensure` skips if a run is already live. |
-| `manual` | — | `inputs` | Fires only on `workflow.run` (a tool call or an A2A command). Nothing arms it. |
-| `loop` | — | `interval` `delay` `until` `max_iterations` `backoff` `inputs` | Fires again each time the previous run finishes. `interval`/`delay` pace it, `until` and `max_iterations` stop it, `backoff` slows it after failures. |
-| `schedule` | — | `cron` `every` `at` `inputs` | Fires on a 5-field UTC cron or an `every` interval. `at` is a one-shot delay that consumes itself; beside a `cron` it is the first occurrence. A missed occurrence is always skipped, never replayed. One that could never fire — no clock, a value that does not parse, `cron` on a build without the feature, `every` beside another clock — is refused at load. |
-| `subscribe` | `server` `uri` | `debounce_ms` `filter` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms` collapses bursts (the newest payload wins inside the window); `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. |
-| `signal` | `name` | `filter` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
-| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. `human.asked`'s payload is `{task, question, deadline_ms, channel}`, `channel` being where an instruction document's `::!human` said the gate is announced (`null` otherwise) — what an escalation workflow routes on. |
-| `stream` | `stream` | `subject` `filter` `from` `rate` `batch` `inputs` | Fires once per event on a declared stream — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits; `rate: "<burst>/<per>"` paces consumption (events queue durably — `rate: "1/1d"` turns a stream into a worked-off daily queue). `batch: {size: 2..=1000, window?: <dur>}` makes one run per GROUP instead of per event — for anything that amortises, like a bulk write or one LLM call over a page — and the payload becomes `…output.events[]` / `…output.count` / `…output.full` (`full: false` means the window elapsed before the batch filled). `batch` and `rate` are mutually exclusive: both pace consumption and compose confusingly. Output is otherwise the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
-| `correlate` | `stream` `on` | `by` `window` `on_incomplete` `filter` `max_pending` `inputs` | Fires when a SET of events sharing one correlation value has arrived. `depends_on` joins steps; this joins events. `on` lists two or more subject patterns; `by` is a dot path into the event, defaulting to the envelope's own `correlation` (which `emit` sets). Half-collected sets live in durable start-state, so a restart resumes a join — which is why `window` is **required**: it bounds how long one is kept. `on_incomplete: fire_partial` fires the partial set when the window expires ("paid but never shipped" *is* the event); the default `discard` drops it. Output: `…output.events[]` in `on` order, `…output.correlation`, `…output.complete`, `…output.missing[]` — check `complete` before treating a partial firing as a finished join. `max_pending` (default 1000) caps the durable pending map; past it, new correlation values are refused and logged rather than growing without limit. |
-| `a2a` | — | `command` `roles` `schema` `into` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts — the **built-in ops are reserved**, so a name like `status` or `admin.drain` is refused at validation rather than shadowing the operation it collides with; `schema` is the payload CONTRACT — a non-conforming command is refused at the listener, synchronously, naming the mismatch. `roles` narrows who may fire it. Output: `…output.args.*` (the typed payload), plus `parts`/`text`/`principal`. **`into: {stream, subject}`** appends the message to a stream instead of firing a run, after the principal and any `roles` filter have been applied — the peer-facing half of the same binding. |
-| `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `rate` `idempotency` `respond` `filter` `signal` `into` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. `rate: "<burst>/<per>s"` throttles arrivals (429 + Retry-After past it). `signal: "name/{{ body.field }}"` also fires that signal with the payload — the webhook→signal relay as one field. **`into: {stream, subject}`** appends the request to a durable stream instead of firing a run (RFC 0035 §5) — verification, filtering and rate limiting still run first, so it is a different destination for an accepted request, not a way past the gate. That is what gives a webhook replay-after-downtime: a run fired at request time is lost if nothing was ready for it, while an appended event waits for a consumer that may not exist yet. Answers `202 {"status":"appended"}`, or `503` if the append is refused — never a 202 over a dropped event. Incompatible with `respond: sync`, which has no run to wait for. |
-
-### Control flow
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `switch` | `on` `cases` | `default` `on_no_match` | Routes to ONE named step per case. Case values and `default` are step-id STRINGS, not lists. The chosen branch runs even if its deps are not terminal; the others are skipped. No case and no default is a FAILURE unless `on_no_match: skip` — then the switch completes and every branch is pruned. |
-| `parallel` | `branches` | `on_error` | Runs every branch concurrently. `on_error` decides whether one failure fails the step. |
-| `foreach` | `over` `body` | `batch` `collect` `on_error` `as` | Runs `body` once per element of `over`. `batch {size, parallel, rate}` paces it; `collect` gathers outputs; `as` names the element. |
-| `batch` | `over` `body` | `by` `size` `parallel` `rate` `collect` `on_error` | Like `foreach` but the body sees a GROUP of elements — `size`/`by` form the groups. |
-| `iterate` | `body` | `while` `until` `max_iterations` `collect` | Repeats `body` while/until a condition, bounded by `max_iterations`. The loop primitive when there is no list to walk. |
-| `race` | `branches` | `timeout` `min_success` | Runs branches concurrently and takes the first to finish. `min_success` requires more than one; losers are cancelled. |
-| `join` | `handles` | `timeout` `min` `partials` | Awaits async `handles` (from `workflow {mode: async}` or `subagent`). `min` and `partials` decide what "enough" means. |
-| `subgraph` | `body` | — | An inline nested graph. Scopes ids, so the same step names can repeat in different subgraphs. |
-| `workflow` | `name` | `inputs` `mode` `start` `version` `cascade` | Starts another workflow as a child run. `mode: sync` blocks, `async` returns a handle for `join`, `detached` forgets it. `cascade` propagates cancellation. |
-| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `from` `webhook` `stream` `subject` `match` `timeout` `on_timeout` | Suspends until `on` resolves: `resource \| condition \| signal \| run \| subagent \| message \| event \| webhook`. Durable — a restart resumes the wait; a `webhook` wait's callback route is served again, its auth rebuilt from the references its record keeps (never a resolved secret), or the step fails saying why it cannot be. `on: message` waits on a `conversation` (as `a2a.wait` takes it) and takes an optional **`from`**, in the same addressee syntax; without it only the run's own principal, an operator or the runtime wakes the wait. `from` on any other `on` is a load error. `on_timeout: <step>` makes the deadline an EXPECTED branch: the named step runs (forced), the wait's dependents stay unfired, the run continues. A signal wait's output is `{signal, payload, from}`. `on: event` parks on a declared `stream`, anchored where the log stood when it armed: `subject` globs, and the CEL `match` sees `event`, `inputs` and `vars` together — which is how a run waits for the reply about *its own* order rather than the first one to arrive. There is no `from: earliest`: resolving on an event that predates the run would break at-least-once for everything downstream. Its output is the event. |
-| `sleep` | `duration` | — | Suspends for `duration`. Durable: the timer survives a restart. |
-| `assert` | `condition` | `message` | Fails the run unless `condition` holds. A guard you want loud. |
-| `fail` | — | `message` `code` | Ends the run as failed with `message`/`code`. |
-| `noop` | — | — | Does nothing. A join point, a switch target, or a placeholder. |
-| `checkpoint` | — | `name` | Forces a durable checkpoint here rather than at the next natural boundary. |
-| `finish` | — | `status` `output` `reason` | Ends the run with `status` (`completed\|failed\|refused\|cancelled`) and an optional `output`. |
-
-### Data shaping (deterministic, no model, no network)
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `assign` | `value` | `writes` `mode` | Writes `value` into the run vars at `writes` (default: the step id). `mode: overwrite\|append\|merge\|union`. |
-| `transform` | `value` | `writes` `mode` | Identical to `assign`; the name reads better when the value is computed from other data. |
-| `map` | `over` `expr` | `as` | Applies `expr` to every element of `over`. `as` names the element (default `item`). Needs CEL. |
-| `filter` | `over` `expr` | `as` | Keeps elements of `over` whose `expr` is true. Needs CEL. |
-| `reduce` | `over` `expr` | `initial` `as` `acc` | Folds `over` with `expr` from `initial`; `acc` names the accumulator. Needs CEL. |
-| `sort` | `over` | `by` `order` | Orders `over`, optionally `by` a field and `order: asc\|desc`. |
-| `dedupe` | `over` | `by` | Removes duplicates from `over`, optionally `by` a key. |
-| `chunk` | `value` `size` | `by` `overlap` | Splits `value` into pieces of `size`, with optional `overlap`. |
-| `template` | — | `text` `value` | Renders `text` (or `value`) against the run data. The general-purpose string builder. |
-| `parse` | `text` | `format` | Parses `text` into data — `format: json\|yaml\|…`. |
-| `validate` | `value` `schema` | — | Checks `value` against a JSON `schema`; fails the step if it does not conform. |
-
-### Durable state
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `memory.set` | `key` `value` | `ttl` | Writes a durable key/value, with optional `ttl`. |
-| `memory.push` | `key` `value` | — | Appends to the ARRAY at `key` (created if absent) — the durable queue primitive. |
-| `memory.shift` / `memory.pop` | `key` | — | Removes and returns the first / last element (`{found: false}` on empty — a drain loop just stops). |
-| `memory.get` | `key` | — | Reads a durable key. The result is `{found, value}`. |
-| `memory.list` | — | `prefix` `limit` | Lists keys under `prefix`, bounded by `limit`. |
-| `memory.delete` | `key` | — | Removes a durable key. |
-| `artifact.create` | `name` | `mime` `content` `from_step` `sensitive` | Stores a durable blob — `name`, `mime`, `content` or `from_step`. `sensitive` keeps it out of transcripts. |
-| `artifact.get` | `id` | — | Reads an artifact by `id`. |
-| `artifact.delete` | `id` | — | Removes an artifact by `id`. |
-
-### Knowledge and search
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `knowledge.search` | `query` | `top_k` `filters` | Searches a configured knowledge source — `query`, `top_k`, `filters`. |
-| `knowledge.get` | — | `id` `uri` | Fetches one knowledge document by `id`/`uri`. |
-| `search.query` | `query` | `kind` `limit` `freshness` | Queries a configured search source — `query`, `limit`, `freshness`. |
-| `search.fetch` | `url` | `max_bytes` | Fetches one `url` through the search source, bounded by `max_bytes`. |
-
-### Integration — reaching outside
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `mcp.tool` | `server` `tool` | `args` `idempotency` `breaker` `rate` | Calls `tool` on a declared MCP `server` with `args`. The main way a workflow reaches the outside world. Always attaches a retry-stable `agent/idempotency_key` in `_meta`; `idempotency: {value: …}` substitutes an application key. |
-| `mcp.resource` | `server` `op` | `uri` `name` `arguments` `reference` `argument` | Reads MCP resources — `op: read\|list\|prompt\|complete`. |
-| `tool` | `name` | `args` | Calls a tool by registry name, wherever it lives (internal, code-registered, or MCP). |
-| `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` `idempotency` `breaker` `rate` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. `idempotency: {header: NAME}` (or `{query: NAME}`) sends a retry-stable derived key; `value:` overrides it with an application key. |
-| `a2a.send` | `to` | `parts` `command` `args` `context` `timeout` `idempotency` `breaker` `rate` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. `command` + `args` send the TYPED DataPart the peer's `a2a` start matches on — deterministic dispatch, not prose the peer's model interprets. |
-| `a2a.delegate` | `peer` | `objective` `command` `args` `output_contract` `timeout` `idempotency` `breaker` `rate` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. With `command` + `args` the payload is TYPED (and checked against the command's declared `schema` at the peer); the delegate blocks until the command's run finishes and returns its output. `idempotency: true` pins the `messageId` across retries. |
-| `a2a.wait` | `from` | `conversation` `timeout` | Suspends until a message from `from` arrives on a `conversation`. The reply half of `a2a.send`. **`from`** is who the reply must come from, in the addressee syntax a `human` gate's `to` uses (`agent:peer`, `user:*`, `{role: agent, labels: {team: ops}}`): a conversation id is the sender's to choose, so without it anyone who names the conversation could answer, and no default can name a peer. A malformed `from` is a load error. `conversation` is a runtime key, the `contextId` the sender used, or `"*"` for any; left out, the run's own conversation, and a run with none fails the step. Like `wait {on: message}`, its output is `{conversation, contextId, message, principal}`: `conversation` is the runtime's key, which a `message {to:}` in the same run takes to answer in that conversation; `contextId` is the name the sender used, which a reply over A2A carries. |
-| `message` | `to` | `text` `parts` `wait` `timeout` `on_timeout` | Delivers into one of THIS instance's own conversations, so a run can hand work to the agent rather than only the reverse. `to` is a context id, `root`, or `new` (a fresh conversation). The delivery takes the same readers, durability and per-context lock as an inbound A2A message. `wait: reply` parks on the answer; without it the step completes once the delivery is durable and the turn happens on its own schedule. Chained deliveries are capped by `limits.max_message_depth` (default 8) — see [Loops](#message-loops). |
-| `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
-| `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |
-| `workflow.cancel` | `run` | `reason` | Cancels another `run` with a `reason`. |
-| `emit` | — | `stream` `subject` `data` `correlation` `forward` `note` `audit` `value` | With `stream`/`subject` (they travel together, or a load error): publishes an event to a declared stream that any workflow's `stream` start can consume — durable, replayable, exactly-once downstream (the event id is the step's idempotency key, so a crash-replayed emit lands under the same id and consumers drop the copy). Without them: writes `note` to the root transcript, logs `audit` as an audit record, and returns `value` as the step output. **`forward: {webhook: <url>, allow_private?}`** or **`forward: {peer: <name>}`** pushes the event outward as it appends (RFC 0035 §5): the durable copy is the source of truth and the push is only the notification, so a failed forward is logged and does not fail the step. A peer receives it as a `stream.forwarded` command, which its own `a2a` start can bind back onto a stream with `into:` — one instance's `emit` becoming another's stream event. Outbound dials go through the same SSRF/egress guard as the `http` node; reaching a private address is a per-node `allow_private` opt-in. One destination, not both. |
-
-### Intelligence — the steps that cost tokens
-
-| Kind | Required | Other fields | What it does |
-|---|---|---|---|
-| `think` | `prompt` | `output_schema` `reads` `check` `retries` `skills` `system` `model` `effort` | One model call. `output_schema` shapes the answer; `check`/`retries` re-ask until it conforms. `effort: low\|medium\|high` on a reasoning model. |
-| `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` `model` `effort` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. `context` is a seed-message array, or the object form `{template: <name>, seed: […]}` — `template` names an entry in `context.templates` to render this step's system prompt with, in place of the instance default. |
-| `subagent` | `instruction` *or* `template` | `params` `mode` `tools` `servers` `limits` `priority` `context` `output_contract` `output_schema` `skills` `durable` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. `template` instantiates a `subagents.templates` entry — `params` fill its declared holes (schema-checked), `tools`/`servers` are refused (the template defines the grant), and an instance-tier template spawns a full child daemon whose handle is an A2A peer name. `limits` adds OS caps — `memory` (RLIMIT_AS), `cpu` (RLIMIT_CPU) — beside `steps`/`tokens`/`deadline`; `priority: low\|normal\|high` maps to niceness and sheds low first under pressure. |
-| `classify` | `input` `classes` | `prompt` `skills` `model` `confidence` `on_unsure` | Puts `input` into one of `classes` — a list, or a map of class → what it covers. Output `{class, confidence, …}`; on a decision model also `probabilities`, `calibrated: true`. |
-| `extract` | `input` `output_schema` | `prompt` `skills` `model` | Pulls `input` into the shape of `output_schema`. No tools — the safest way to read untrusted text. |
-| `summarize` | `input` | `length` `prompt` `skills` `model` | Shortens `input` to `length`. |
-| `judge` | `input` `rubric` | `levels` `prompt` `skills` `model` `confidence` `on_unsure` | Judges `input` against a `rubric`: `{verdict: pass\|fail, score, confidence, …}`. On a decision model the verdict is a noul (`probability`), and `levels` adds a `score` and `level` on that scale; `reasons` come only from a chat model. |
-| `route` | `input` `choices` | `prompt` `skills` `model` `confidence` `on_unsure` | Picks one of `choices` for `input`: `{choice, confidence, …}`. The model-driven alternative to `switch`. |
-| `decide` | `state` `questions` | `model` `confidence` `on_unsure` | Several typed questions about one `state`, one call ([below](#decisions)). |
-| `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. In an instruction document, `to: "@human/<name>"` addresses one of the document's `::!human`s: its principal, or the operators, with its channel announced ([below](#addressed-gates)). `reply_uri` is refused at load — nothing implements it. |
-
-`model` names an `intelligence.models` model on any kind that makes a model
-call — the five shaping presets included, since those are the cheap
-high-volume steps a model catalogue exists for. It resolves to the wire model,
-on the model's provider, at the edge, so a model's name never reaches a
-provider, and an unknown one is exit 2 rather than a run asking for a model
-nobody serves. Without `model:`, a node runs on its kind's role
-(`intelligence.roles`): `think` on `think`; `classify`, `route` and `judge` on
-`decide`; `agent`, `extract` and `summarize` on `turn`
-([intelligence.md](intelligence.md#providers-models-and-roles)). A decision
-model (`kind: decision`) serves only the kinds that decide — `decide`,
-`classify`, `route`, `judge` — and a node that writes refuses one at load.
-
-### Decisions
-
-`decide` asks named typed questions about one `state` — text, a list of
-texts, or a JSON object — and answers each:
+- **Fields:** `policy`, `inputs`.
+- **Output:** `{fired_at}`, in milliseconds since the epoch.
+- `policy: ensure` (default) does not fire if a run is live, a run ever
+  started at this node, or its start event is still queued.
+  `policy: always` fires on every arm.
 
 ```yaml
+# fragment: under workflows[].steps
+start: {kind: once, inputs: {region: eu-west-1}}
+```
+
+### `manual`
+
+Fires only when asked: the `workflow.run` tool, a `workflow` step, a
+workflow tool call, or the `workflow.run` A2A command.
+
+- **Fields:** `inputs` (ignored; the caller supplies inputs).
+- **Output:** `{requested_by}`: who asked for the run.
+
+```yaml
+# fragment: under workflows[].steps
+start: {kind: manual}
+```
+
+### `loop`
+
+Fires as soon as it is armed, then again each time the previous run
+finishes.
+
+- **Fields:** `interval`, `delay`, `until`, `max_iterations`, `backoff`,
+  `inputs`.
+- **Output:** `{iteration}`.
+- `until` is CEL over `outcome` (`{ok, output}`) and `last` (the last
+  output); when true, the loop stops. After a failed run it waits
+  `backoff.initial` instead of `interval`. `delay` holds the first firing.
+
+```yaml
+# fragment: under workflows[].steps
+poll: {kind: loop, interval: 5m, until: "outcome.ok && last.done == true", backoff: {initial: 15m}}
+```
+
+### `schedule`
+
+Fires on a clock.
+
+- **Fields:** `cron`, `every`, `at`, `inputs`.
+- **Output:** `{scheduled_for}`, in milliseconds since the epoch.
+- `cron` is five fields, read in UTC. `every` is a fixed interval. `at` is
+  a delay before the first firing; beside `cron` it is the first
+  occurrence, and the cron takes over after it.
+- The next occurrence is computed from the current time, so a missed one is
+  skipped, never replayed.
+- Refused at load: no clock at all, an `every` or `at` that is not a
+  duration, a `cron` that does not parse, and `every` beside another clock.
+
+```yaml
+# fragment: under workflows[].steps
+tick: {kind: schedule, cron: "0 7 * * 1-5"}
+```
+
+### `subscribe`
+
+Fires when an MCP resource changes. On a notification agentd reads the
+resource again and applies the filter to what it read.
+
+- **Fields:** **`server`**, **`uri`**, `debounce_ms`, `filter`, `window`,
+  `inputs`.
+- **Output:** `{server, uri, content}`, plus `window` when set.
+- `filter` is CEL over `content`. `debounce_ms` keeps the newest read and
+  fires when the window closes.
+- `window: {samples: N}` (1 to 256) keeps a durable ring of the last N reads
+  and delivers it as `window`, oldest first. Debouncing drops firings; the
+  window keeps every sample.
+- A server that does not advertise resource subscriptions is a loud failure
+  (`start.subscribe.unsupported`), not a watch that never fires.
+
+```yaml
+# fragment: under workflows[].steps
+changed: {kind: subscribe, server: github, uri: "repo://example/app/releases", debounce_ms: 2000}
+```
+
+### `signal`
+
+Fires on a named signal.
+
+- **Fields:** **`name`**, `filter`, `inputs`.
+- **Output:** `{signal, payload}`, and `principal` when a principal sent it.
+- `filter` is CEL over `payload`. A signal also wakes waits suspended on it;
+  see [`wait`](#wait).
+
+```yaml
+# fragment: under workflows[].steps
+go: {kind: signal, name: deploy-approved, filter: "payload.env == 'prod'"}
+```
+
+### `event`
+
+Fires on an internal event.
+
+- **Fields:** **`on`**, `filter`, `inputs`.
+- **Output:** `{event, payload}`. Downstream steps read
+  `steps.<id>.output.payload.*`; the `filter` sees `payload` directly.
+- Events that fire it:
+
+| `on` | Payload |
+|---|---|
+| `workflow.finished` | `{run, workflow, status}` for a completed run |
+| `workflow.failed` | the same, for a run that failed, stalled, was cancelled or was refused |
+| `human.asked` | `{task, question, deadline_ms, channel}`; `channel` is the one an instruction document declared for the gate, else `null` |
+| `human.answered` | `{task, via}` |
+| `lifecycle.shutdown` | `{reason}`; a drain waits for the runs it starts |
+
+- An event about a workflow never fires that workflow's own start, so a
+  watcher on `workflow.finished` cannot trigger itself.
+- `on` is not checked against this list. Any other name loads and never
+  fires.
+- An `inputs` mapping that fails to render refuses to fire
+  (`start.inputs.invalid`).
+
+```yaml
+# fragment: under workflows[].steps
+failed: {kind: event, on: workflow.failed, filter: 'payload.workflow == "nightly"'}
+```
+
+### `stream`
+
+Fires once per event on a declared stream, including events another
+workflow emitted.
+
+- **Fields:** **`stream`**, `subject`, `filter`, `from`, `rate`, `batch`,
+  `inputs`.
+- **Output:** the event: `subject`, `data`, `correlation`. With `batch`:
+  `{events, count, full}`.
+- `subject` matches exactly or by a `prefix.*` glob. The offset is durable,
+  so a restart resumes where it left off; a recently seen event id is
+  dropped, so a replayed emit is not consumed twice.
+- `from: new` (default) starts at the next event; `from: earliest` replays
+  the retained history once, when the consumer first arms.
+- `rate` paces consumption; events queue durably, so `"1/1d"` works a
+  stream off as a daily queue.
+- `batch: {size: 2..1000, window?}` makes one run per group. `full: false`
+  means the window elapsed first. `batch` and `rate` together are refused.
+- A workflow never fires on its own emits.
+
+```yaml
+# fragment: under workflows[].steps
+order: {kind: stream, stream: orders, subject: "order.*", batch: {size: 50, window: 30s}}
+```
+
+### `correlate`
+
+Fires when a set of events sharing one correlation value has arrived. It
+joins events the way `depends_on` joins steps.
+
+- **Fields:** **`stream`**, **`on`**, **`window`**, `by`, `on_incomplete`,
+  `filter`, `max_pending`, `inputs`. (The schema marks `window` optional;
+  the load refuses a correlate without one.)
+- **Output:** `{events, correlation, complete, missing}`, with `events` in
+  `on` order.
+- `on` lists two or more subject patterns. `by` is a dot path into the
+  event; the default is the event's own `correlation`, which `emit` sets.
+- Half-collected sets live in durable start state for at most `window`.
+  `on_incomplete: fire_partial` fires what arrived when the window expires;
+  `discard` (default) drops it. Check `complete` before treating a firing
+  as a finished join.
+- `max_pending` (default 1000, at most 100 000) caps open sets; past it,
+  new correlation values are refused and logged.
+- It reads the stream from its earliest retained event when it first arms,
+  because half of a pair may already be there.
+
+```yaml
+# fragment: under workflows[].steps
+paid_and_shipped:
+  kind: correlate
+  stream: orders
+  on: ["order.paid", "order.shipped"]
+  window: 48h
+  on_incomplete: fire_partial
+```
+
+### `a2a`
+
+Fires when a principal sends a message carrying a declared command.
+
+- **Fields:** `command`, `roles`, `schema`, `into`, `inputs`.
+- **Output:** `{command, args, text, parts, principal, role, conversation,
+  task, message_id}`; `args` is the typed payload without its `op`.
+- Declaring `command` registers it on the listener, and the extended agent
+  card lists it for callers who may fire it. A built-in op name is refused.
+  With no `command`, the start takes any plain message the listener
+  receives.
+- `schema` is the payload's contract: a non-conforming command is refused
+  at the listener, naming the mismatch. `roles` narrows who may fire it.
+- `into: {stream, subject}` appends the message to a stream instead of
+  starting a run, after the principal and roles checks.
+
+```yaml
+# fragment: under workflows[].steps
+review:
+  kind: a2a
+  command: review.start
+  roles: [agent]
+  schema: {type: object, required: [pr], properties: {pr: {type: integer}}}
+  inputs: {pr: "{{ payload.args.pr }}"}
+```
+
+### `webhook`
+
+Fires on an inbound HTTP request.
+
+- **Fields:** **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`,
+  `rate`, `idempotency`, `respond`, `filter`, `signal`, `into`, `inputs`.
+- **Output:** `{method, path, headers, body, raw_body}`; `body` is parsed
+  JSON when it parses.
+- Needs `webhooks.listen`. A non-loopback listener must authenticate every
+  route: `auth` is `{hmac: {secret, header?, prefix?}}`, `{bearer}`,
+  `{header: {name, equals}}`, or `{none: true}` on loopback only;
+  `webhooks.default_auth` applies when a route sets none.
+- The `Idempotency-Key` header deduplicates by default: a repeat is answered
+  `200` as a duplicate and starts nothing. `idempotency: false` turns it off;
+  a string names another header.
+- `respond: ack` (default) answers `202` once the run is queued;
+  `respond: sync` holds the response until the run ends.
+- `rate` answers `429` with `Retry-After` past the burst. `parallelism`
+  bounds concurrent runs; past it `on_overflow` decides: reject with `503`
+  (default), `queue` or `drop`.
+- `signal: "name"` also fires that signal with the payload.
+- `into: {stream, subject}` appends the request to a durable stream instead
+  of starting a run, after verification, filtering and rate limiting;
+  it answers `202 {"status":"appended"}`, or `503` when the append is
+  refused. It cannot be combined with `respond: sync`.
+
+```yaml
+# fragment: under workflows[].steps
+hook:
+  kind: webhook
+  path: /hooks/ci
+  methods: [POST]
+  auth: {hmac: {secret: "{{secret:HOOK_SECRET}}", prefix: "sha256="}}
+  rate: "20/1s"
+```
+
+## Control flow
+
+### `switch`
+
+Routes to one step by value.
+
+- **Fields:** **`on`**, **`cases`**, `default`, `on_no_match`.
+- **Output:** `{case, goto, skipped}`; `skipped` lists the steps it pruned.
+- `on` is rendered and compared, as a string, with the case keys. Each case
+  value names one step id as a string; a list is refused at load.
+- The chosen step runs even if its dependencies have not finished. Every
+  other case target and `default` is pruned, with its whole tail.
+- No match and no `default` fails the step, unless `on_no_match: skip`,
+  which prunes every target and completes.
+
+```yaml
+# fragment: under workflows[].steps
+route:
+  kind: switch
+  depends_on: [triage]
+  on: "{{ steps.triage.output.class }}"
+  cases: {billing: billing, tech: tech}
+  default: human_review
+```
+
+### `parallel`
+
+Runs named branches at once and keeps every result.
+
+- **Fields:** **`branches`**, `on_error`.
+- **Output:** an object keyed by branch name, each branch's result, plus
+  `_errors` when a branch failed.
+- A branch failure fails the step only when `on_error` is `fail` (default).
+
+```yaml
+# fragment: under workflows[].steps
+gather:
+  kind: parallel
+  depends_on: [start]
+  on_error: continue
+  branches:
+    issues: {steps: {list: {kind: mcp.tool, server: github, tool: list_issues, args: {state: open}}}}
+    prs:    {steps: {list: {kind: mcp.tool, server: github, tool: list_pull_requests, args: {state: open}}}}
+```
+
+### `race`
+
+Runs named branches at once and keeps the first to finish.
+
+- **Fields:** **`branches`**, `timeout`, `min_success`.
+- **Output:** `{winner, output}`. The other branches are cancelled.
+- If every branch fails, the step fails; if `timeout` passes first, it ends
+  `timeout`.
+
+> **Limit.** `min_success` is accepted but has no effect: a race always
+> completes with its first finished branch.
+
+```yaml
+# fragment: under workflows[].steps
+fastest:
+  kind: race
+  depends_on: [start]
+  timeout: 30s
+  branches:
+    primary:  {steps: {get: {kind: http, url: "https://api.example.com/rates"}}}
+    fallback: {steps: {get: {kind: http, url: "https://backup.example.com/rates"}}}
+```
+
+### `foreach`
+
+Runs a body once per element of a list.
+
+- **Fields:** **`over`**, **`body`**, `batch`, `collect`, `on_error`, `as`.
+- **Output:** an array as long as the input, in input order. A failed
+  element under `on_error: continue` fills its slot with `{index, error}`.
+- `over` is an array; an object becomes `[{key, value}]` and null an empty
+  list. `as` names the element (`item` and `index` are always set).
+- `batch: {size, parallel, rate}`: `size` defaults to 1, `parallel` to 4.
+  Asking for more than `limits.workflow.fan_out` (8 when unset) is refused
+  at load for a definition written inline; anything else is clamped to it.
+- `collect: {into, mode}` also writes the output to a run variable.
+
+```yaml
+# fragment: under workflows[].steps
+each:
+  kind: foreach
+  depends_on: [list]
+  over: "{{ steps.list.output.json }}"
+  as: repo
+  batch: {parallel: 3}
+  on_error: continue
+  body:
+    steps:
+      check: {kind: judge, input: "{{ repo }}", rubric: "The repository has a licence file."}
+```
+
+### `batch`
+
+Like `foreach`, but the body sees a group of elements.
+
+- **Fields:** **`over`**, **`body`**, `by`, `size`, `parallel`, `rate`,
+  `collect`, `on_error`.
+- **Output:** an array with one entry per group.
+- `size` (default 10) groups consecutive elements; `by` groups by a dotted
+  key, in order of first appearance. Inside the body, `item` is the group's
+  array, not one record.
+
+```yaml
+# fragment: under workflows[].steps
+per_owner:
+  kind: batch
+  depends_on: [list]
+  over: "{{ steps.list.output.json }}"
+  by: owner.login
+  body:
+    steps:
+      sum: {kind: summarize, input: "{{ item }}"}
+```
+
+### `iterate`
+
+Repeats a body while or until a condition holds.
+
+- **Fields:** **`body`**, `while`, `until`, `max_iterations`, `collect`.
+- **Output:** the last iteration's result; with `collect`, the array of
+  every result.
+- `while` is evaluated before each iteration and `until` after it, as CEL
+  over the run's data plus `iteration`, `last` and `results`.
+  `max_iterations` defaults to and is capped at 10 000.
+
+```yaml
+# fragment: under workflows[].steps
+refine:
+  kind: iterate
+  depends_on: [draft]
+  until: "last.verdict == 'pass'"
+  max_iterations: 3
+  body:
+    steps:
+      rewrite: {kind: agent, instruction: "Tighten this draft: {{ steps.draft.output }}"}
+      score:   {kind: judge, depends_on: [rewrite], input: "{{ steps.rewrite.output }}", rubric: "Under 200 words and accurate."}
+```
+
+### `subgraph`
+
+An inline nested graph, so step ids can repeat in different subgraphs.
+
+- **Fields:** **`body`**.
+- **Output:** the body's sinks: one sink's output directly, several as an
+  object keyed by sink id.
+- A decision guard on a `subgraph` whose body has a step named `when` is
+  refused, because both would be `<id>.when`.
+
+```yaml
+# fragment: under workflows[].steps
+prepare:
+  kind: subgraph
+  depends_on: [start]
+  body:
+    steps:
+      fetch: {kind: http, url: "https://api.example.com/config"}
+      parse: {kind: parse, depends_on: [fetch], text: "{{ steps.fetch.output.body }}", format: yaml}
+```
+
+### `join`
+
+Waits for async handles: child runs or subagents.
+
+- **Fields:** **`handles`**, `timeout`, `min`, `partials`.
+- **Output:** an object keyed by handle: `{kind, status, output, error}` for
+  a run, `{kind, status, result, error}` for a subagent. With `partials` and
+  a timeout, `{partial: true, results}`.
+- `min` defaults to every handle. A handle that names no run or subagent
+  counts as finished with `{"error": "unknown handle"}`, so a typo does not
+  block the join.
+
+```yaml
+# fragment: under workflows[].steps
+gather:
+  kind: join
+  depends_on: [fan]
+  handles: ["{{ steps.fan.output.run }}"]
+  timeout: 1h
+  partials: true
+```
+
+### `workflow`
+
+Starts another workflow as a child run.
+
+- **Fields:** **`name`**, `inputs`, `mode`, `start`, `version`, `cascade`.
+- **Output:** with `mode: sync` (default), `{run, status, output, error}`
+  when the child ends; with `async` or `detached`, `{run, workflow, mode}`
+  at once.
+- `start` picks the child's start node (default: its `manual`, else the
+  first). `version` is a definition hash prefix the child must match.
+  `cascade` (default `true`) cancels the child with the parent.
+- A durable parent waiting on a non-durable child is warned about at load:
+  after a restart the child is gone and the wait fails.
+
+```yaml
+# fragment: under workflows[].steps
+charge:
+  kind: workflow
+  depends_on: [start]
+  name: charge-order
+  inputs: {order_id: "{{ inputs.order_id }}", amount_cents: 1200}
+```
+
+### `finish`
+
+Ends the run.
+
+- **Fields:** `status`, `output`, `reason`.
+- **Output:** `output`, which becomes the run's output.
+- `status` is `completed` (default), `refused` or `cancelled`; any other
+  value fails the run. A completing run's output is checked against the
+  workflow's `outputs.schema`, and a mismatch fails the step instead.
+- Every step still running or pending is cancelled. Every workflow needs at
+  least one `finish`, including one that a `loop` or `schedule` restarts.
+
+```yaml
+# fragment: under workflows[].steps
+done: {kind: finish, depends_on: [report], output: "{{ steps.report.output }}"}
+```
+
+### `fail`
+
+Fails the step with a message, which fails the run unless `on_error` routes
+it.
+
+- **Fields:** `message`, `code`.
+- **Output:** `code`. The error is `message` (default
+  `deliberate failure`).
+
+```yaml
+# fragment: under workflows[].steps
+stop: {kind: fail, depends_on: [check], message: "no owner on record", code: NO_OWNER}
+```
+
+### `assert`
+
+Fails unless a CEL condition holds.
+
+- **Fields:** **`condition`**, `message`.
+- **Output:** `true`. On failure, the error is `message` or
+  `assertion failed: <condition>`.
+
+```yaml
+# fragment: under workflows[].steps
+sane: {kind: assert, depends_on: [fetch], condition: "steps.fetch.output.status == 200"}
+```
+
+### `noop`
+
+Does nothing: a join point, a switch target or a placeholder.
+
+- **Fields:** none.
+- **Output:** `null`.
+
+```yaml
+# fragment: under workflows[].steps
+joined: {kind: noop, depends_on: [a, b]}
+```
+
+### `checkpoint`
+
+Forces a durable write of the run here.
+
+- **Fields:** `name`.
+- **Output:** `null`.
+
+```yaml
+# fragment: under workflows[].steps
+saved: {kind: checkpoint, depends_on: [transform], name: after-transform}
+```
+
+## Wait and coordinate
+
+### `wait`
+
+Suspends until something happens. The wait is durable: a restart resumes it
+with its deadline intact.
+
+- **Fields:** **`on`**, `server`, `uri`, `condition`, `signal`, `run`,
+  `subagent`, `conversation`, `from`, `webhook`, `stream`, `subject`,
+  `subscribe`, `match`, `timeout`, `on_timeout`.
+- `on` is written out, never templated: what a wait listens on decides what
+  it opens, which load checks.
+- `timeout` ends the wait with status `timeout`. `on_timeout: <step>` makes
+  that an expected branch: the named step runs, and the wait's dependents do
+  not. The target has no `depends_on`; give it its own path to a `finish`.
+
+| `on` | Also takes | Resolves when | Output |
+|---|---|---|---|
+| `signal` | `signal` | that signal is sent while the wait is suspended | `{signal, payload, from}` |
+| `event` | `stream`, `subject`, `match` | a matching event is appended after the wait armed | the event |
+| `event` | `subscribe`, `match` | an occurrence of the wait's own MCP Events subscription arrives | the event |
+| `resource` | `server`, `uri` | the MCP resource changes | `{server, uri, content}`; `content` is null if the re-read failed |
+| `condition` | `condition` | the CEL condition is true | `{satisfied: true}` |
+| `run` | `run` | that run ends | `{run, status, output, error}` |
+| `subagent` | `subagent` | that subagent ends | `{handle, status, result, error}` |
+| `message` | `conversation`, `from` | a message arrives on the conversation | `{conversation, contextId, message, principal}` |
+| `webhook` | `webhook: {path?, auth?, emit_url_to?}` | the callback route it opens is called | `{signal, payload, from}`; `payload` is the request |
+| `deadline` | `timeout` | the timeout passes; this ends `done`, not `timeout` | `{waited_ms}` |
+
+Notes per form:
+
+- **`event`**: `match` is CEL over `event`, `inputs` and `vars`, so a run
+  can wait for the event about its own order. The wait is anchored where
+  the stream stood when it armed; there is no `from: earliest`.
+- **`event` with `subscribe`** (`{server, event, arguments}`): makes its own
+  MCP Events subscription inside an operator's `event_grants` entry, and
+  lets it go when the step leaves the wait. A `subscribe` no grant covers is
+  refused at load. Occurrences arrive up to a poll interval late, so read
+  the current state first and wait only for what comes after. See
+  [React to changes and events](react-to-events.md).
+- **`condition`**: the CEL sees only `runs`, `subagents`, `now_ms` and
+  `signals` (recent signals by name), not the run's own data. A condition
+  that reads `vars` fails the step when it is evaluated.
+- **`message`**: `conversation` is a runtime key, the `contextId` the sender
+  used, or `"*"` for any; unset, the run's own. `from` names whose message
+  counts, in the addressee syntax of a `human` gate's `to`; unset, only the
+  run's principal, an operator or the runtime wakes it. `from` with any
+  other `on` is a load error.
+- **`webhook`**: opens a one-shot callback route on the webhook listener,
+  at a fixed `path` or a generated one. The URL is built on `webhooks.url`
+  (else the listener's bind), and `emit_url_to` writes it to a run variable
+  so another step can hand it out. The route and its `auth` references are
+  in the durable wait record, so a restart serves it again. Needs the `a2a`
+  build feature.
+
+```yaml
+# fragment: under workflows[].steps
+shipped:
+  kind: wait
+  depends_on: [ship]
+  on: event
+  stream: orders
+  subject: order.shipped
+  match: "event.data.id == inputs.order_id"
+  timeout: 24h
+  on_timeout: chase
+```
+
+### `sleep`
+
+Suspends for a fixed time, on a durable timer.
+
+- **Fields:** **`duration`**.
+- **Output:** `{slept_ms}`.
+
+```yaml
+# fragment: under workflows[].steps
+cool_off: {kind: sleep, depends_on: [deploy], duration: 10m}
+```
+
+### `human`
+
+Asks a person a question and suspends until they answer, across restarts.
+[Human in the loop](human-in-the-loop.md) covers who is asked and how they
+answer.
+
+- **Fields:** **`question`**, `schema`, `to`, `timeout`.
+- **Output:** the answer as the text the person sent.
+- `schema` is enforced: a reply that does not match re-asks with the
+  reason. The step's output is still the reply text, not a parsed object;
+  branch on it with a `switch` over an `enum` schema.
+- `to` names who must answer: `{role: operator}`, optionally narrowed by
+  `labels`, or the id `operator`. A `to` that names anyone else is refused
+  at load. In an instruction document, `to: "@human/<name>"` addresses one of
+  the document's `::!human` declarations.
+- `timeout` defaults to 24 hours. A gate that times out fails the step;
+  route that with `on_error`.
+- A gate in a run that no A2A caller owns, such as one a schedule started,
+  needs `agent.ask_human_unowned: gate`; otherwise
+  `agent.ask_human_fallback` (default `fail`) decides.
+- `reply_uri` is refused at load: nothing implements it.
+
+```yaml
+# fragment: under workflows[].steps
+approve:
+  kind: human
+  depends_on: [draft]
+  question: "Publish these notes?"
+  schema: {type: string, enum: [publish, drop]}
+  to: {role: operator, labels: {team: release}}
+  timeout: 4h
+```
+
+### `message`
+
+Delivers a message into one of this instance's own conversations, so a run
+can hand work to the agent.
+
+- **Fields:** **`to`**, `text`, `parts`, `wait`, `timeout`, `on_timeout`.
+- **Output:** `{delivered, conversation, depth}`; with `wait: reply`, the
+  reply.
+- `to` is a context id, `root`, or `new` (a fresh conversation). One of
+  `text` or `parts` is required.
+- The delivery takes the same readers, durability and per-conversation lock
+  as an inbound A2A message. Without `wait`, the step completes once the
+  delivery is durable.
+- **The loop guard.** A message can start a turn, and a turn can start a
+  run that sends a message. Each delivery adds one to a hop depth the run
+  inherits from whatever caused it, and a delivery past
+  `limits.max_message_depth` (default 8) is refused before it is written,
+  failing the step with the limit named. `message.send` also refuses to
+  deliver into the conversation its own caller is running in.
+
+```yaml
+# fragment: under workflows[].steps
+hand_off: {kind: message, depends_on: [summary], to: root, text: "Nightly summary: {{ steps.summary.output.summary }}"}
+```
+
+### `workflow.signal`
+
+Sends a named signal at once.
+
+- **Fields:** **`name`**, `payload`, `run`.
+- **Output:** `{delivered}`, the number of waits it resolved.
+- Without `run`, it reaches every live run; it also fires matching `signal`
+  start nodes. Signals are edge-triggered: a wait that is not yet suspended
+  misses it. Two sibling steps in one run, one signalling and one waiting,
+  race; signal across runs instead.
+
+```yaml
+# fragment: under workflows[].steps
+open: {kind: workflow.signal, depends_on: [ready], name: warehouse-open, payload: {site: dub1}}
+```
+
+### `workflow.wait`
+
+Waits for another run to end.
+
+- **Fields:** **`run`**, `timeout`.
+- **Output:** `{run, status, output, error}`.
+
+```yaml
+# fragment: under workflows[].steps
+child_done: {kind: workflow.wait, depends_on: [fan], run: "{{ steps.fan.output.run }}", timeout: 2h}
+```
+
+### `workflow.cancel`
+
+Cancels another run.
+
+- **Fields:** **`run`**, `reason`.
+- **Output:** `{ok: true, run}`. An unknown run fails the step.
+
+```yaml
+# fragment: under workflows[].steps
+stop_child: {kind: workflow.cancel, depends_on: [late], run: "{{ steps.fan.output.run }}", reason: "superseded"}
+```
+
+### `a2a.wait`
+
+Waits for a message from a named peer: the reply half of `a2a.send`.
+
+- **Fields:** **`from`**, `conversation`, `timeout`.
+- **Output:** `{conversation, contextId, message, principal}`.
+  `conversation` is the runtime's key, which a `message` step can answer
+  in; `contextId` is the name the sender used.
+- `from` is required because a conversation id is the sender's to choose:
+  without it, anyone who names the conversation could answer. It uses the
+  addressee syntax (`agent:reviewer`, `user:*`,
+  `{role: agent, labels: {team: ops}}`); a malformed one is a load error.
+- `conversation` as in `wait {on: message}`; a run with none of its own and
+  no `conversation` fails the step.
+
+```yaml
+# fragment: under workflows[].steps
+answer: {kind: a2a.wait, depends_on: [ask], from: "agent:reviewer", conversation: "*", timeout: 1h}
+```
+
+## Data shaping
+
+These steps are deterministic: no model, no network. Except for `transform`
+and `template`, they are pure data steps that ride the run's checkpoint
+instead of writing their own.
+
+| Kind | Fields | Output |
+|---|---|---|
+| `assign` | **`value`**, `writes`, `mode` | `value`, also written to run variable `writes` (default: the step id) |
+| `transform` | **`value`**, `writes`, `mode` | the same as `assign` |
+| `map` | **`over`**, **`expr`**, `as` | an array: `expr` applied to each element |
+| `filter` | **`over`**, **`expr`**, `as` | the elements for which `expr` is true |
+| `reduce` | **`over`**, **`expr`**, `initial`, `as`, `acc` | the folded value |
+| `sort` | **`over`**, `by`, `order` | the sorted array |
+| `dedupe` | **`over`**, `by` | the array without duplicates, first kept |
+| `chunk` | **`value`**, **`size`**, `by`, `overlap` | an array of pieces |
+| `template` | `text`, `value` | the rendered `text`, or `value` |
+| `parse` | **`text`**, `format` | the parsed data |
+| `validate` | **`value`**, **`schema`** | `value`, or a failure naming the mismatch |
+
+- `assign` `mode`: `overwrite` (default), `append`, `merge` or `union`. A
+  declared `state` schema for the variable is checked first.
+- `map`, `filter` and `reduce`: `expr` is CEL (a `CEL:` prefix is optional),
+  or a `{{…}}` template. The element is `item` and the `as` alias, with
+  `index`; `reduce`'s accumulator is `acc` and the `acc` alias, starting at
+  `initial`. `filter`'s `expr` must yield a boolean.
+- `sort`: `by` is a dotted path; `order` is `asc` (default) or `desc`.
+- `chunk`: an array is split into slices of `size` elements; a string by
+  `by`: `chars` (default), `lines`, `words` or `tokens` (about 1.3 tokens per
+  word). `overlap` repeats that many items between pieces.
+- `parse` `format`: `json`, `yaml`, `csv` (first row is the header; output
+  is an array of objects), `lines`, or `auto` (default: JSON, then YAML,
+  then lines).
+- `validate`: `schema` is taken as written, not rendered.
+
+```yaml
+# fragment: under workflows[].steps
+rows:   {kind: parse, depends_on: [fetch], text: "{{ steps.fetch.output.body }}", format: csv}
+open:   {kind: filter, depends_on: [rows], over: "{{ steps.rows.output }}", expr: "item.status == 'open'"}
+ids:    {kind: map, depends_on: [open], over: "{{ steps.open.output }}", expr: "item.id"}
+total:  {kind: reduce, depends_on: [open], over: "{{ steps.open.output }}", initial: 0, expr: "acc + int(item.amount)"}
+oldest: {kind: sort, depends_on: [open], over: "{{ steps.open.output }}", by: created, order: asc}
+owners: {kind: dedupe, depends_on: [open], over: "{{ steps.open.output }}", by: owner}
+pages:  {kind: chunk, depends_on: [fetch], value: "{{ steps.fetch.output.body }}", size: 400, by: words, overlap: 40}
+count:  {kind: assign, depends_on: [ids], writes: open_count, value: "CEL: size(steps.ids.output)"}
+same:   {kind: transform, depends_on: [ids], writes: open_ids, value: "{{ steps.ids.output }}"}
+line:   {kind: template, depends_on: [total], text: "{{ vars.open_count }} open, {{ steps.total.output }} owed"}
+shape:  {kind: validate, depends_on: [rows], value: "{{ steps.rows.output }}", schema: {type: array, maxItems: 10000}}
+```
+
+## Durable state
+
+These call the instance's durable store, through the same contracts as the
+agent's `memory.*` and `artifact.*` tools.
+
+| Kind | Fields | Output |
+|---|---|---|
+| `memory.get` | **`key`** | `{found, key, value, meta}` |
+| `memory.set` | **`key`**, **`value`**, `ttl` | `{ok, key, meta}` |
+| `memory.push` | **`key`**, **`value`** | `{ok, key, length}`; appends to the array at `key`, creating it |
+| `memory.shift` | **`key`** | `{found, value, remaining}`; removes the first element |
+| `memory.pop` | **`key`** | `{found, value, remaining}`; removes the last element |
+| `memory.list` | `prefix`, `limit` | `{keys, truncated}` |
+| `memory.delete` | **`key`** | `{ok, key}` |
+| `artifact.create` | **`name`**, `mime`, `content`, `from_step`, `sensitive` | `{id, name, size, sha256}` |
+| `artifact.get` | **`id`** | `{id, name, mime, content, size, sha256}` |
+| `artifact.delete` | **`id`** | `{ok}` |
+
+`memory.push` with `memory.shift` is a durable queue; on an empty queue
+`shift` returns `{found: false}`, so a drain loop stops. `artifact.create`
+takes its content from `content` or from another step's output by id with
+`from_step`; `sensitive` keeps it out of transcripts.
+
+```yaml
+# fragment: under workflows[].steps
+enqueue: {kind: memory.push, depends_on: [start], key: queue/emails, value: "{{ inputs.email }}"}
+next:    {kind: memory.shift, depends_on: [enqueue], key: queue/emails}
+seen:    {kind: memory.set, depends_on: [next], key: "seen/{{ inputs.email }}", value: true, ttl: 30d}
+check:   {kind: memory.get, depends_on: [seen], key: "seen/{{ inputs.email }}"}
+recent:  {kind: memory.list, depends_on: [check], prefix: seen/, limit: 50}
+last:    {kind: memory.pop, depends_on: [recent], key: queue/emails}
+forget:  {kind: memory.delete, depends_on: [last], key: "seen/{{ inputs.email }}"}
+report:  {kind: artifact.create, depends_on: [recent], name: seen.json, mime: application/json, from_step: recent}
+read:    {kind: artifact.get, depends_on: [report], id: "{{ steps.report.output.id }}"}
+drop:    {kind: artifact.delete, depends_on: [read], id: "{{ steps.report.output.id }}"}
+```
+
+## Knowledge and search
+
+These call the knowledge and search sources the instance configures
+(`knowledge.server`, `search.server`).
+
+| Kind | Fields | Output |
+|---|---|---|
+| `knowledge.search` | **`query`**, `top_k`, `filters` | `{hits: [{id, uri, title, score, snippet, metadata}]}` |
+| `knowledge.get` | `id`, `uri` | `{content, mime, metadata}` |
+| `search.query` | **`query`**, `limit`, `freshness` | `{results: [{title, url, snippet, source, published}]}` |
+| `search.fetch` | **`url`**, `max_bytes` | `{content, mime, final_url}` |
+
+`freshness` is a hint such as `day` or `week`. The registry also lists
+`kind` for `search.query` (the search tool's `web`, `docs` or `code`), but a
+step cannot set it: `kind` is the step's own node kind.
+
+```yaml
+# fragment: under workflows[].steps
+lookup: {kind: knowledge.search, depends_on: [start], query: "{{ inputs.question }}", top_k: 5}
+doc:    {kind: knowledge.get, depends_on: [lookup], id: "{{ steps.lookup.output.hits.0.id }}"}
+web:    {kind: search.query, depends_on: [start], query: "{{ inputs.question }}", limit: 5, freshness: week}
+page:   {kind: search.fetch, depends_on: [web], url: "{{ steps.web.output.results.0.url }}", max_bytes: 200000}
+```
+
+## Integration
+
+### `mcp.tool`
+
+Calls a tool on a declared MCP server: the main way a workflow reaches the
+outside world.
+
+- **Fields:** **`server`**, **`tool`**, `args`, `idempotency`, `breaker`,
+  `rate`.
+- **Output:** the tool's result. A result the server marks as an error
+  fails the step.
+- Every call carries a retry-stable `agent/idempotency_key` in `_meta`, with
+  `agent/attempt` beside it. `idempotency: {value}` replaces the key with an
+  application key.
+- A server that is not connected at startup exits `2`; at run time it fails
+  the step. A server in the `services:` catalog with a `rate` paces calls.
+
+```yaml
+# fragment: under workflows[].steps
+label:
+  kind: mcp.tool
+  depends_on: [triage]
+  server: github
+  tool: add_labels
+  args: {issue: "{{ inputs.issue }}", labels: ["{{ steps.triage.output.class }}"]}
+  retry: {max: 3, backoff: 2s}
+```
+
+### `mcp.resource`
+
+Reads MCP resources and prompts.
+
+- **Fields:** **`server`**, **`op`**, `uri`, `name`, `arguments`,
+  `reference`, `argument`.
+- **Output** by `op`:
+
+| `op` | Uses | Output |
+|---|---|---|
+| `read` | `uri` | `{uri, text, json, contents}`; `json` is `text` parsed, or null |
+| `list` | | `{resources}` |
+| `templates` | | `{templates}` |
+| `prompt` | `name`, `arguments` | `{description, messages, text}` |
+| `complete` | `reference`, `argument` | the completion result |
+
+```yaml
+# fragment: under workflows[].steps
+readme: {kind: mcp.resource, depends_on: [start], server: github, op: read, uri: "repo://example/app/README.md"}
+```
+
+### `tool`
+
+Calls any tool by its registry name: built-in, code-registered or MCP.
+
+- **Fields:** **`name`**, `args`.
+- **Output:** the tool's result.
+- The tool must be granted to workflows. One that is unknown, disabled or
+  not granted exits `2` at startup.
+
+```yaml
+# fragment: under workflows[].steps
+plan: {kind: tool, depends_on: [start], name: plan.get, args: {}}
+```
+
+### `http`
+
+One outbound HTTP request.
+
+- **Fields:** **`url`**, `method`, `headers`, `query`, `body`, `json`,
+  `timeout`, `expect`, `allow_private`, `sign`, `idempotency`, `breaker`,
+  `rate`.
+- **Output:** `{status, ok, headers, body, json}`; `json` is the body parsed,
+  or null.
+- `method` defaults to `GET`. Success is a status from 200 to 399 unless
+  `expect` lists codes; any other status fails the step with the output
+  still recorded. `timeout` defaults to 30 s.
+- `json` is serialised with `Content-Type: application/json` and wins over
+  `body`. `query` values are percent-encoded.
+- The target is resolved once and dialled by the vetted address; private,
+  loopback and link-local addresses are refused unless the step sets
+  `allow_private: true`. Under `security.egress: closed` the URL must match
+  a `kind: http` service, whose `methods` list is also a ceiling.
+- `headers` and `sign.secret` resolve `{{secret:NAME}}` references; nothing
+  else in the step does.
+- `sign: {secret, header?, prefix?}` adds an HMAC-SHA256 of the body,
+  default header `X-Signature`, prefix `sha256=`.
+- `idempotency: {header}` or `{query}` sends the step's key there;
+  `value` replaces the derived key.
+
+```yaml
+# fragment: under workflows[].steps
+notify:
+  kind: http
+  depends_on: [summary]
+  method: POST
+  url: https://hooks.example.com/agentd
+  json: {text: "{{ steps.summary.output.summary }}"}
+  sign: {secret: "{{secret:NOTIFY_SECRET}}"}
+  expect: [200, 202]
+```
+
+### `a2a.send`
+
+Sends a message to a peer and continues: a notification.
+
+- **Fields:** **`to`**, `parts`, `command`, `args`, `context`, `timeout`,
+  `idempotency`, `breaker`, `rate`.
+- **Output:** the peer's answer to the send.
+- `to` names an `a2a.peers` entry. `command` with `args` sends the typed
+  payload a peer's `a2a` start matches. `idempotency: true` pins the message
+  id across retries so the peer can deduplicate. `timeout` defaults to 30 s.
+- Needs the `a2a` build feature.
+
+```yaml
+# fragment: under workflows[].steps
+ask: {kind: a2a.send, depends_on: [start], to: reviewer, parts: [{text: "Review PR {{ inputs.pr }}"}], idempotency: true}
+```
+
+### `a2a.delegate`
+
+Delegates an objective to a peer and waits for the result: request and
+response.
+
+- **Fields:** **`peer`**, `objective`, `command`, `args`, `output_contract`,
+  `timeout`, `idempotency`, `breaker`, `rate`.
+- **Output:** the peer's result, parsed as JSON when it parses.
+- With `command` and `args`, the payload is typed and checked against the
+  command's schema at the peer, and the step returns that command's run
+  output. `timeout` defaults to 120 s.
+- Needs the `a2a` build feature.
+
+```yaml
+# fragment: under workflows[].steps
+review:
+  kind: a2a.delegate
+  depends_on: [start]
+  peer: reviewer
+  command: review.start
+  args: {pr: "{{ inputs.pr }}"}
+  timeout: 30m
+```
+
+### `emit`
+
+Publishes an event to a stream, or writes a note or an audit record.
+
+- **Fields:** `stream`, `subject`, `data`, `correlation`, `forward`,
+  `note`, `audit`, `value`.
+- **Output:** with `stream`, `{id, seq, stream, subject}`; without, `value`.
+- `stream` and `subject` go together. The event id is the step's idempotency
+  key, so a replayed emit lands under the same id and consumers drop the
+  copy. The stream must be declared under `streams:`.
+- `forward: {webhook: <url>, allow_private?}` or `forward: {peer: <name>}`
+  pushes the event out as it is appended. The durable copy is the source of
+  truth, so a failed forward is logged and does not fail the step. A peer
+  receives it as a `stream.forwarded` command. One destination, not both.
+- Without `stream`: `note` writes to the root conversation's transcript,
+  `audit` logs an `audit.emit` record, and `value` becomes the output.
+
+```yaml
+# fragment: under workflows[].steps
+shipped: {kind: emit, depends_on: [ship], stream: orders, subject: order.shipped, correlation: "{{ inputs.order_id }}", data: {id: "{{ inputs.order_id }}"}}
+```
+
+## Intelligence
+
+Model steps run on the model their `model:` field names, an
+`intelligence.models` entry or a wire model name. Without `model:`, a step
+runs on its kind's role: `think` on `roles.think`; `decide`, `classify`,
+`route` and `judge` on `roles.decide`; everything else on `roles.turn`. A
+decision model serves only the deciding kinds; any other model step refuses
+one at load. An unknown model is exit `2`. See
+[Models, providers and roles](intelligence.md).
+
+### `agent`
+
+A full agentic turn with tools: think, call, observe, repeat.
+
+- **Fields:** **`instruction`**, `output_contract`, `output_schema`,
+  `tools`, `servers`, `limits`, `context`, `skills`, `system`, `model`,
+  `effort`.
+- **Output:** the final answer text, or a JSON value with `output_schema`.
+- `tools` and `servers` narrow what it may reach. `context` is a list of seed
+  messages, or `{template, seed}` where `template` names a
+  `context.templates` entry for this step's system prompt. `effort` sets a
+  reasoning model's effort for this step.
+- An `agent` step takes `instruction`; `prompt` belongs to `think`, and the
+  wrong one is a load error.
+
+```yaml
+# fragment: under workflows[].steps
+draft:
+  kind: agent
+  depends_on: [start]
+  instruction: "Draft release notes for {{ inputs.tag }}."
+  servers: [github]
+  model: smart
+```
+
+### `think`
+
+A tool-free model call, at most three rounds.
+
+- **Fields:** **`prompt`**, `output_schema`, `reads`, `check`, `retries`,
+  `skills`, `system`, `model`, `effort`.
+- **Output:** a JSON value. An answer that is not JSON, or does not match
+  `output_schema`, is asked again twice and then fails the step.
+- `reads` lists paths of run data to put in front of the prompt.
+- `check` and `retries` are accepted and read by nothing.
+
+```yaml
+# fragment: under workflows[].steps
+risk:
+  kind: think
+  depends_on: [draft]
+  prompt: "Rate the rollout risk of this change."
+  reads: [steps.draft.output]
+  output_schema: {type: object, required: [risk], properties: {risk: {enum: [low, medium, high]}}}
+```
+
+### `subagent`
+
+A child process running its own loop with narrowed tools. The supervisor
+can always kill it.
+
+- **Fields:** **`instruction`** or **`template`** (never both), `params`,
+  `mode`, `tools`, `servers`, `limits`, `priority`, `context`,
+  `output_contract`, `output_schema`, `skills`, `durable`.
+- **Output:** with `mode: sync` (default), `{handle, status, result, error}`
+  when the child ends; with `async`, `detached` or `warm`, the handle record.
+- `template` instantiates a `subagents.templates` entry; `params` fill its
+  declared holes and are schema-checked, and `tools`/`servers` are refused
+  because the template defines the grant.
+- `limits` takes `steps`, `tokens` and `deadline`, plus OS caps `memory`
+  (such as `512MB`) and `cpu` (a duration). `priority` is `low`, `normal` or
+  `high`, mapped to niceness; low sheds first under pressure.
+
+```yaml
+# fragment: under workflows[].steps
+research:
+  kind: subagent
+  depends_on: [start]
+  instruction: "Find the three most-cited papers on {{ inputs.topic }}."
+  servers: [github]
+  limits: {steps: 30, deadline: 10m, memory: 512MB}
+```
+
+### `classify`
+
+Puts an input into one of a set of classes.
+
+- **Fields:** **`input`**, **`classes`**, `prompt`, `skills`, `model`,
+  `confidence`, `on_unsure`.
+- **Output:** `{class, confidence, reason}` on a chat model; on a decision
+  model `{class, confidence, probabilities, calibrated: true}`, with no
+  `reason`.
+- `classes` is a list, or a map of class to what it covers.
+
+```yaml
+# fragment: under workflows[].steps
+triage: {kind: classify, depends_on: [start], input: "{{ inputs.ticket }}", classes: {billing: "payment problems", tech: "bugs and outages"}}
+```
+
+### `extract`
+
+Pulls structured data out of text. It has no tools, so it is the safe way to
+read untrusted text.
+
+- **Fields:** **`input`**, **`output_schema`**, `prompt`, `skills`, `model`.
+- **Output:** an object matching `output_schema`.
+
+```yaml
+# fragment: under workflows[].steps
+fields:
+  kind: extract
+  depends_on: [hook]
+  input: "{{ steps.hook.output.body }}"
+  output_schema: {type: object, required: [email], properties: {email: {type: string}, plan: {type: string}}}
+```
+
+### `summarize`
+
+Shortens text.
+
+- **Fields:** **`input`**, `length`, `prompt`, `skills`, `model`.
+- **Output:** `{summary}`.
+- `length` is free text, such as `three sentences` (default
+  `a short paragraph`). Facts, names, numbers and identifiers are kept
+  verbatim.
+
+```yaml
+# fragment: under workflows[].steps
+brief: {kind: summarize, depends_on: [fetch], input: "{{ steps.fetch.output.body }}", length: five bullet points}
+```
+
+### `judge`
+
+Judges an input against a rubric.
+
+- **Fields:** **`input`**, **`rubric`**, `levels`, `prompt`, `skills`,
+  `model`, `confidence`, `on_unsure`.
+- **Output:** on a chat model, `{verdict, score, confidence, reasons}`,
+  plus `level` with `levels`. On a decision model the verdict is a
+  statement's probability: `score` is that probability on a 0 to 10 scale,
+  or with `levels` the position on them plus `level`; there are no
+  `reasons`.
+- `verdict` is `pass` or `fail`.
+
+```yaml
+# fragment: under workflows[].steps
+check: {kind: judge, depends_on: [draft], input: "{{ steps.draft.output }}", rubric: "Accurate, under 200 words, no marketing language.", levels: [poor, fair, good]}
+```
+
+### `route`
+
+Picks one of a set of choices for an input: the model-driven alternative to
+`switch`.
+
+- **Fields:** **`input`**, **`choices`**, `prompt`, `skills`, `model`,
+  `confidence`, `on_unsure`.
+- **Output:** `{choice, confidence, reason}` on a chat model; on a decision
+  model, `{choice, confidence, probabilities, calibrated: true}`.
+
+```yaml
+# fragment: under workflows[].steps
+where: {kind: route, depends_on: [start], input: "{{ inputs.ticket }}", choices: [sales, support, security]}
+```
+
+### `decide`
+
+Asks several typed questions about one state in one call.
+
+- **Fields:** **`state`**, **`questions`**, `model`, `confidence`,
+  `on_unsure`.
+- **Output:** one entry per question, plus `model` (what answered) and
+  `escalated`.
+- `state` is text, a list of texts, or a JSON object. At most 16 questions,
+  each with 2 to 32 options or levels.
+
+| Question | Asks | Answer entry |
+|---|---|---|
+| `{choice: [a, b]}` or `{choice: {a: "criterion", …}}` | which option applies | `{choice, probabilities?, confidence, calibrated}` |
+| `{noul: "<statement>"}` | how likely the statement is true | `{noul, confidence, calibrated}`; `noul` is the probability |
+| `{score: [low, …, high]}` | where on the scale, lowest first | `{score, level, probabilities?, confidence, calibrated}` |
+
+Each question may add `instructions`: guidance for that question (for a
+`choice`, the question text itself, which defaults to the question's id).
+
+```yaml
+# fragment: under workflows[].steps
 triage:
   kind: decide
-  model: jev                                   # default: roles.decide
+  depends_on: [start]
+  model: jev
   state: "{{ inputs.ticket }}"
   questions:
-    queue:  { choice: { billing: "payment problems", tech: "bugs and outages" } }
-    urgent: { noul: "The customer cannot work at all." }
-    mood:   { score: [calm, annoyed, angry, furious] }
-    refund: { noul: "The customer asks for money back.", instructions: "Only an explicit request counts." }
+    queue:  {choice: {billing: "payment problems", tech: "bugs and outages"}}
+    urgent: {noul: "The customer cannot work at all."}
+    mood:   {score: [calm, annoyed, angry, furious]}
+    refund: {noul: "The customer asks for money back.", instructions: "Only an explicit request counts."}
   confidence: 0.75
   on_unsure: escalate
 ```
 
-A `choice` names its options (a list, or option → criterion); a `noul` is a
-statement, answered with the probability it is true; a `score` lists levels,
-lowest first, answered with a position on the scale. At most 16 questions,
-2 to 32 options or levels each. The output has one entry per question —
-`{choice, probabilities?, confidence}`, `{noul, confidence}`, `{score, level,
-probabilities?, confidence}`, each with `calibrated` — plus `model` (what
-answered) and `escalated`.
+### Confidence and escalation
 
-On a decision model the decision is answered natively (`calibrated: true`);
-on a chat model it is one structured call with every question in it, and its
-`confidence` is a self-report (`calibrated: false`). `classify`, `route` and
-`judge` are the same one-question decision on a decision model and the
-presets they always were on a chat model. On a decision model they keep
-their outputs' keys but write no prose: `judge` has no `reasons`, and its
-`score` is the verdict's probability on its 0..10 scale (with `levels:`, the
-position on those levels, and `level`); `classify` and `route` have no
-`reason`, and `skills` do not apply (a `prompt` becomes the question's
-guidance). A `confidence` outside 0..1 counts as none.
+The deciding kinds share two fields:
 
-**`confidence`** is the least sureness an answer is acted on with — a
-choice's or score's `confidence`; for a noul its distance from a coin flip,
-doubled (`|p − 0.5| × 2`). **`on_unsure`** says what an answer under it does:
-`escalate` asks the same decision once more on the model's `escalate` model
-and takes that answer as final (`escalated: true`); `fail` fails the node;
-`continue` hands the answer on with `unsure: true`. The default is `escalate`
-where the model names an `escalate` model, else `fail` — a threshold you set
-is never quietly ignored. On a chat model's preset, `confidence` is held to
-the answer's own self-reported `confidence`, and there is nothing to escalate
-to. `on_unsure: escalate` on a node whose model names no `escalate` model is
-refused at load.
+- **`confidence`** is the least sureness an answer is acted on with: a
+  choice's or score's confidence, or for a `noul` its distance from a coin
+  flip, doubled (`|p − 0.5| × 2`). Unset, `roles.decide`'s confidence
+  applies, if it has one. A value outside 0 to 1 counts as none.
+- **`on_unsure`** says what an answer under it does: `escalate` asks once
+  more on the model's `escalate` model and takes that answer as final
+  (`escalated: true`); `fail` fails the step; `continue` passes the answer
+  on with `unsure: true`. The default is `escalate` when the model names an
+  `escalate` model, else `fail`. `escalate` on a model with none is refused
+  at load.
 
-The agent reaches the same contract with the **`decide` tool** — `{state,
-questions, confidence?}` on `roles.decide` — where an unsure answer is
-escalated when it can be and otherwise handed back marked `unsure`, for the
-agent to weigh.
+On a decision model, answers are native and `calibrated: true`. On a chat
+model, `decide` is one structured call with every question in it, and the
+presets compare `confidence` with the answer's own self-reported confidence
+(`calibrated: false`); there is nothing to escalate to.
 
-#### Decision guards
+### Decision guards
 
-A step's `when:` may be a decision instead of CEL
-([RFC 0046 §7](../rfcs/0046-kinds-of-intelligence.md)):
+A step's `when:` may be a decision instead of CEL:
 
 ```yaml
+# fragment: under workflows[].steps
 refund:
   kind: agent
   depends_on: [triage]
@@ -248,206 +1291,31 @@ refund:
   when:
     noul: "The customer explicitly asks for their money back."
     state: "{{ inputs.ticket }}"   # default: the outputs of depends_on, by step id
-    confidence: 0.8                # optional; default roles.decide's
-    model: jev                     # optional; default roles.decide
+    confidence: 0.8                # default: roles.decide's
+    model: jev                     # default: roles.decide
 ```
 
-At load the guard becomes a `decide` step of its own, **`refund.when`**, with
-the guarded step's `depends_on` and one question, `holds: {noul: …}`; the
-guarded step then depends on it alone (its own dependencies stay upstream,
-through the guard). It runs only when the statement holds (`noul` ≥ 0.5)
-and the answer is sure; otherwise it is pruned exactly as a false CEL guard
-prunes it — in a nested body, skipped. The guard's decision is an ordinary
-step: in the run (`steps["refund.when"]`, or the template path
-`{{ /steps/refund.when/output }}`), charged to its budget, and durable across a
-restart.
-
-Without `state`, the guard decides about its step's dependencies' outputs
-keyed by step id; a step with none decides about the run's inputs, or, in a
-`foreach`/`batch` body, about its element. It runs on a decision model
-natively, or on a chat model through structured generation — so with no
-decision model configured, the turn model answers it. Under a `confidence`
-an unsure answer is asked once more on the model's `escalate` model when it
-names one, whose answer is final; otherwise the unsure answer prunes the
-step. A guard never fails the run for doubt: escalate-else-`continue`, as for
-the `decide` tool. A guard that cannot be honoured is refused at load: an
-unknown field, an empty `noul`, a `confidence` outside 0..1, a model the
-deciding kinds refuse, a guard on a start node, or on a `subgraph` whose
-body has a step named `when` (both would be `<id>.when` in the run). A step a
-`switch` case, `on_error: goto` or `on_timeout` routes to may carry one: the
-edge asks the guard first and the step waits on its answer; a case not
-chosen has its guard pruned unasked, and a timeout branch's guard waits for
-the timeout as the branch does. Event matches (`filter`, a wait's `match`) stay
-CEL: a decision about an event is a guarded first step.
-
----
-
-## Cross-cutting fields
-
-Every step accepts these regardless of kind:
-
-| Field | Effect |
-|---|---|
-| `depends_on` | the DAG edge. A non-start step with no dependency is refused as an unreachable root |
-| `when` | a CEL guard (needs `cel`), or a [decision guard](#decision-guards) `{noul, state?, confidence?, model?}`; the step is **pruned** when it does not hold, so anything that depends only on it is pruned too |
-| `retry` | `{max, backoff}` — retry on failure: exponential doubling with deterministic ±20% jitter, durable timer between attempts |
-| `timeout` | bound the step; a suspended step resumes as timed out |
-| `on_error` | `fail` (default) · `continue` · `goto:<step>` |
-| `output_schema` | validate the step's output; also SHAPES the answer for model kinds |
-| `cache` | `{key, ttl}` — reuse a previous result |
-| `budget` | a per-step token/step allowance |
-| `skills` | skills to load for a model step |
-| `on_replay` | what restore does with a step caught in flight by a crash: `retry` (default), `skip`, or `fail` |
-| `idempotent` | parsed and validated, but nothing reads it — use `on_replay` to control a replay |
-| `description`, `otel` | documentation and trace attributes |
-
-### `breaker` and `rate` are not among them
-
-Both are kind-specific, declared only on the kinds below, so a `breaker:` or a
-`rate:` on anything else is refused as an unknown field:
-
-| Field | Kinds that accept it | Effect |
-|---|---|---|
-| `breaker` | `mcp.tool`, `http`, `a2a.send`, `a2a.delegate` | `{failures, cooldown}` — cross-run circuit breaker: opens after N consecutive failures, fails fast, one probe per cooldown; durable per `workflow/step` |
-| `rate` | those four remote-effect kinds, plus `stream`, `webhook` and `batch` | `"<burst>/<per>s"` — on a remote-effect step, an outbound throttle: the step WAITS (durable timer, no attempt consumed) for a token, so fan-outs drain at the declared pace instead of bursting. On `stream`, `webhook` and `batch` it paces intake or the fan-out instead — see those rows above |
-
-## Durability, and what a restart does
-
-Every effectful step checkpoints before its effect (pure data steps replay
-deterministically from the last checkpoint instead of writing one each). On
-restore:
-
-- A step that was **Running** is replayed (`on_replay` decides: retry, skip, fail).
-- A step that was **Suspended** — `wait`, `sleep`, `human`, `a2a.wait` — resumes
-  waiting, with its deadline intact. A human gate opened before a restart can
-  still be answered after it.
-- A **timer** whose durable record went missing is repaired at restore rather
-  than leaving the step unreachable.
-
-Effects can therefore run twice. Give a step whose effect must not repeat
-`on_replay: fail` (or `skip`), or make the underlying tool idempotent — every
-remote-effect step already carries a retry-stable idempotency key for that.
-
-## Addressed gates
-
-A `human` gate — and `ask_human` — is answered by whoever may see its task:
-the task's owner, or an operator. `to` narrows that to an operator:
-
-```yaml
-approve:
-  kind: human
-  question: "Refund {{ inputs.order_id }} for {{ inputs.amount }}?"
-  schema: {type: object, required: [approved], properties: {approved: {type: boolean}}}
-  to: {role: operator, labels: {team: finance}}   # an operator from finance
-  # or any operator: to: {role: operator}
-  timeout: 24h
-  on_error: continue                           # a lapsed gate is a "no", not a crash
-```
-
-`on_timeout` is a `wait` field, not a `human` one — a gate has no
-expected-branch routing, so a deadline that passes **fails the step**. Route it
-with `on_error` (`continue`, or `goto:<step>`) and branch on the answer with a
-rendered default rather than a CEL `when`: an unevaluatable guard is fail-closed
-and fails the whole run, so `{{ steps.approve.output.approved | false }}` into a
-`switch` is the construction that behaves the same whether the gate was
-answered, refused, or timed out.
-
-A reply from anyone else is **refused with an explanation** and the gate stays
-open, rather than the answer vanishing into the conversation. Conditions are
-ANDed, so adding one always narrows — an operator tightening a gate never
-widens it by accident. Labels are the durable form (people change, teams do
-not) and come from `a2a.principals[].labels`.
-
-**An addressee must be able to see the task**, and a task is visible only to
-its owner and to operators. So `to` is either absent — the task's owner may
-answer — or names an operator: `{role: operator}` with any labels, or the id
-`operator`. A `to` that could name anyone else (another principal's id, a glob
-starting with `*`, `role: user`, labels with no role) is refused at load and at
-`workflow.create`/`workflow.update`, naming the principal and saying it could
-never see the task; `ask_human` refuses such a `to` when it is called, which
-covers a model's call and a `to` rendered from a template. A `to` with a
-`{{…}}` placeholder or a `CEL:` expression anywhere in it is only known when
-the step runs, so the load leaves it to that check. Every operator is
-addressed as `operator`, whichever `a2a.principals` rule admitted it: a rule's
-own id names no principal and is refused like any other, and its labels are
-how a gate narrows to it. A channel (`#ops`, `@channel/ops`) names no
-principal either, and a `to` written in config, in `workflow.create` or by a
-model is principal syntax only, so it is refused too, saying so.
-
-**An instruction document's `@human/<name>`.** A document declares the people
-it involves with `::!human` — a name, and a `principal` and/or a `channel` —
-and its `:::!workflow` addresses a `human` step to one with
-`to: "@human/<name>"` — at the top level, or inside an `iterate` or
-`subgraph` body (a body that runs copies at once holds no gate at all). The
-loader reads both attributes from the document:
-
-- a human that names a **`principal`** addresses the gate to it, held to the
-  rule above unchanged — `principal=operator` loads, `principal=user:alice` is
-  refused with the usual reason;
-- a human that names **no principal** — only a `channel`, or neither — is
-  answered by the operators, exactly as `to: operator`;
-- the human's **`channel`** is carried on the gate: `human.asked` (as
-  `payload.channel`) and the task's `askChannel`
-  [annotation](ext/task-annotations.md) say where the question is announced,
-  so a workflow or a bridge can route it to Slack, a pager or mail. It never
-  changes who may answer.
-
-The channel stays out of the definition — `workflow.get` shows `to:
-operator` — and is bound to the definition the document loaded, looked up for
-the step when the gate opens. A definition `workflow.create` or
-`workflow.update` writes carries none, and neither can write under the
-document's workflow name — a configured name is refused to both — so nothing
-but the document's own declaration can put one on a gate. A reference to a
-human the document does not declare is refused at load.
-
-A subagent template's instruction is a document too, and its gates are
-addressed the same way, so its child loads them. Its channels are not
-announced: the child's configuration cannot carry one, and the parent's boot
-warns, naming each gate and its channel.
-
-Three more declarations are load errors rather than accepted-and-ignored,
-because each produces a gate that *looks* routed and is not: one that names
-nobody (`to: {}`), one that names `role: anonymous` — precisely the identity
-nothing vouches for — and any typo in a field or role name.
-
-An addressed gate is **never auto-answered**, whatever `agent.approval` says. A
-model judge standing in for the finance lead makes the record a lie, and an
-operator who set `approval: auto` was making a statement about the agent's own
-asks, not about a gate that names someone.
-
-**Any operator can still answer**, and this is deliberate. Refusing one whose
-labels do not match would be theatre — an operator can already rewrite the
-config, the store or the definition — so what matters instead is that it is
-*visible*: the answer is recorded as `operator_override` rather than `human`,
-logged, and audited. What the record holds is the answering principal's id
-(`operator`, for every operator), how it answered, and the session id when it
-signed in with one — so "the finance lead approved this refund" is a record
-when the gate named `{role: operator, labels: {team: finance}}` and the answer
-is not an override, and a claim otherwise.
-
-Both the addressee and the answer schema live in the run's **durable wait
-record**, so a restart rebuilds the gate exactly as declared. That matters more
-than it sounds: a gate whose enforcement lived only in memory would quietly
-weaken on restart, accepting anyone and anything.
-
-## Message loops
-
-`message` closes a cycle the runtime did not previously have: a run can start a
-turn, and a turn can start a run. Left alone that re-arms forever —
-message → turn → `workflow.run` → finish → message — and it is not something
-pressure shedding can hold, because shedding queues new turns while the chain
-keeps adding more.
-
-The guard is **hop depth**, not volume. Twenty unrelated workflows greeting the
-operator are not a loop; one workflow greeting itself is. A run inherits the
-depth of the work that caused it, each delivery adds one, and a delivery past
-`limits.max_message_depth` (default 8) is refused **before it becomes durable**.
-The step fails and names the limit, so a chain that would have spun silently is
-a visibly broken workflow instead.
-
-Two refusals fall out of the same rule: `message.send` will not deliver into the
-conversation its own caller is running in, and `on_workflow_finished: think`
-continues the run's chain rather than starting a fresh one.
+- At load the guard becomes a `decide` step of its own, `refund.when`, with
+  the guarded step's dependencies and one question, `holds`. The guarded
+  step then depends on it alone. Read its answer at
+  `{{ /steps/refund.when/output }}` (the JSON-pointer form, because the id
+  has a dot).
+- The step runs only when `noul` is at least 0.5 and the answer is sure.
+  Otherwise it is pruned exactly as a false CEL guard prunes it; in a nested
+  body, it is skipped.
+- Without `state`, the guard decides about the dependencies' outputs keyed by
+  step id; with no dependencies, the run's inputs; in a `foreach` or `batch`
+  body, the element.
+- An unsure answer is escalated when the model names an `escalate` model,
+  and otherwise prunes the step. A guard never fails the run for doubt.
+- A step that a `switch` case, `on_error: goto` or `on_timeout` routes to may
+  carry a guard: the edge asks it first. A case not chosen has its guard
+  pruned unasked.
+- Refused at load: an unknown field, an empty `noul`, a `confidence`
+  outside 0 to 1, a model the deciding kinds refuse, a guard on a start
+  node, and a guard on a `subgraph` whose body has a step named `when`.
+- Event matches (`filter`, a wait's `match`) stay CEL. To decide about an
+  event, guard the first step after it.
 
 ## Choosing between near-neighbours
 
@@ -455,24 +1323,23 @@ continues the run's chain rather than starting a fresh one.
 |---|---|---|
 | a peer to do something, and you need the answer | `a2a.delegate` | `a2a.send` |
 | a peer to know something, and you carry on | `a2a.send` | `a2a.delegate` |
-| to branch on data you already have | `switch` | `route` (a model call) |
-| to branch on meaning, not a value | `route` / `classify` | `switch` |
-| to read untrusted text safely | `extract` (no tools) | `agent` (has tools) |
-| a child that can be killed | `subagent` (a process) | `agent` (in-process loop) |
+| to branch on data you already have | `switch` | `route` |
+| to branch on meaning, not a value | `route` or `classify` | `switch` |
+| to skip a step on a judgement about text | a decision guard | `route` and a `switch` |
+| to read untrusted text safely | `extract` | `agent` |
+| a child that can be killed | `subagent` | `agent` |
 | to walk a list | `foreach` | `iterate` |
 | to repeat until a condition | `iterate` | `foreach` |
 | to run branches and take the first | `race` | `parallel` |
-| to run branches and need them all | `parallel` | `race` |
+| to run branches and keep them all | `parallel` | `race` |
+| to wait for an event about this run | `wait {on: event}` with `match` | a second workflow |
+| to join several events that never had a run | `correlate` | `wait` |
 
-## Regenerating this page
+## Next steps
 
-```sh
-agentd --workflow-schema | jq '.["$defs"].kinds'
-```
-
-The same schema is published at `https://agentd.dev/schema/workflow.json` for
-editor autocomplete — see
-[Editor autocomplete](workflows.md#editor-autocomplete).
-
-Each entry carries `fields`, `required`, `start` and `implemented`. That is the
-authority; this page is prose around it.
+- [Author workflows](author-workflows.md): the kinds put together, with
+  complete samples.
+- [Workflow language reference](workflow-language.md): templates, CEL,
+  statuses, limits and the workflow tools.
+- [Workflows: how runs work](workflows.md): the scheduler, durability and
+  retirement.

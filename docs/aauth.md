@@ -1,153 +1,247 @@
-# AAuth [DRAFT] — agent identity for AAuth-protected MCP servers
+# AAuth agent identity
 
-> **The spec is a draft; the support is real.** AAuth is an evolving
-> specification, and agentd implements the **agent (client) side** of it. The
-> `aauth` feature is in the release binary and the published container image —
-> its crypto (`ring`) is already linked by the default `tls` (rustls) transport,
-> so enabling it costs **zero** marginal dependency. It is a compile-time
-> feature, so a `--no-default-features` / trimmed build can omit it.
+AAuth gives an agent its own signed identity, so a server can tell exactly
+which agent is calling without a shared API key and without a person on each
+request. This guide explains what AAuth is, when to use it, how to turn it on
+in agentd, what agentd signs and checks, and the limits of the support. It is
+for operators connecting agentd to MCP servers, gateways or peers that ask
+for AAuth.
 
-Some MCP servers replace the shared API key with **AAuth**: your agent holds an
-**Ed25519 key**, gets a short-lived **agent token** from an **Agent Provider**,
-and **signs every MCP request** (RFC 9421). The server verifies the signature
-and knows exactly which agent is calling — no shared secret, and no human on
-each request.
+## What AAuth is
+
+AAuth is a draft IETF protocol, described in
+[draft-hardt-oauth-aauth-protocol](https://datatracker.ietf.org/doc/draft-hardt-oauth-aauth-protocol/)
+and
+[draft-hardt-aauth-bootstrap](https://datatracker.ietf.org/doc/draft-hardt-aauth-bootstrap/).
+agentd implements the agent (client) side. Four parties take part:
+
+| Party | Role |
+|---|---|
+| the agent | holds an Ed25519 key and signs its requests with it (RFC 9421 HTTP Message Signatures) |
+| the Agent Provider | enrolls the agent's public key and issues short-lived *agent tokens* bound to that key |
+| the resource | an MCP server, gateway or peer that verifies the signature and the token |
+| the Person Server | where a person approves when a resource wants that person's authority |
+
+A resource asks for one of three levels of access:
+
+- **Case A, identity-based.** The resource wants to know which agent is
+  calling. agentd signs every request; this is the common case.
+- **Case B, resource-managed.** The resource returns its own access token
+  (`AAuth-Access`). agentd adopts it and presents `Authorization: AAuth <token>`
+  on the retry and later calls to that resource.
+- **Case C, user-scoped.** The resource wants a person's authority and answers
+  `401` with `requirement=auth-token` and a resource token. agentd exchanges
+  the resource token at the Person Server, where the person consents, and
+  presents the user-scoped token on the retry.
+
+## When to use it
+
+Use AAuth when a server asks for it, or when you want a server or gateway to
+attribute each request to an individual agent by signature rather than by a
+shared key or a source address. For an ordinary API key, OAuth or cloud
+identity, use an `auth:` block instead
+([Outbound credentials](authentication.md)). The two are not combined on one
+MCP server: a server with `auth:` or `oauth:` is not AAuth-signed.
 
 ## Turn it on
 
-The release binary and the container image carry the feature, so just pass the
+AAuth is configured under `security.aauth`. Setting `provider` turns it on.
+
+```yaml
+agent:
+  instruction: "Answer questions from the secure knowledge base."
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+
+mcp:
+  servers:
+    # AAuth-protected: no auth block, so the daemon signs its requests.
+    - name: kb
+      endpoint: https://mcp.kb.example.com/mcp
+      tags: { "*": [sensitive] }
+    # Public docs: no identity needed, so do not present one.
+    - name: docs
+      endpoint: https://mcp.docs.example.com/mcp
+      aauth: false
+
+security:
+  aauth:
+    provider: https://apd.example.com
+    key_file: /var/lib/agentd/aauth-key
+    enroll_token: "{{secret:AAUTH_ENROLL_TOKEN}}"
+```
+
+With `OPENAI_API_KEY` and `AAUTH_ENROLL_TOKEN` set, check it with
+`agentd --validate-config --config agentd.yaml`. The same settings work as
 flags:
 
-```console
-$ agentd \
-    --instruction "…" --intelligence https://gw.example/v1 \
-    --mcp secure=https://mcp.secure.example/mcp \
-    --aauth-provider https://apd.example \
-    --aauth-key-file /var/lib/agentd/agent.key \
-    --aauth-enroll-token '{{secret:AAUTH_ENROLL}}'
+```sh
+agentd --instruction "Answer questions from the knowledge base." --intelligence https://api.openai.com/v1/chat/completions --model gpt-5.1 --intelligence-token '{{secret:OPENAI_API_KEY}}' --mcp kb=https://mcp.kb.example.com/mcp --aauth-provider https://apd.example.com --aauth-key-file /var/lib/agentd/aauth-key --aauth-enroll-token '{{secret:AAUTH_ENROLL_TOKEN}}'
 ```
 
-(A trimmed build that dropped the feature rebuilds it with
-`cargo build -p agentd-cli --release --features aauth`.)
-
-At startup agentd loads (or creates) the Ed25519 key and installs the identity
-process-wide; enrollment and the first agent-token fetch happen on the first
-signed request. From then on **every** MCP request — and, when configured, the
-**intelligence dial** — is signed; a non-AAuth server simply ignores the extra
-headers.
-
-Each flag is also a config path under `security.aauth` (so `--aauth-provider` is
-`security.aauth.provider`), and the env column names the variable that path
-derives.
-
-| Flag | Env | Meaning |
+| Setting | Flag | Meaning |
 |---|---|---|
-| `--aauth-provider <url>` | `AGENTD_SECURITY_AAUTH_PROVIDER` | The Agent Provider — this turns AAuth on. |
-| `--aauth-key-file <path>` | `AGENTD_SECURITY_AAUTH_KEY_FILE` | Durable Ed25519 key (created 0600 if absent; default `/var/lib/agentd/aauth-key`). Put it on shared storage so subagents resolve the same identity. |
-| `--aauth-enroll-token <T>` | `AGENTD_SECURITY_AAUTH_ENROLL_TOKEN` | One-time enrollment token (a `{{secret:…}}` reference), if the provider is in `token` mode. |
-| `--aauth-enroll-assertion-file <path>` | `AGENTD_SECURITY_AAUTH_ENROLL_ASSERTION_FILE` | **Federated** enrollment: a file holding an enrollment assertion — e.g. a Kubernetes projected ServiceAccount token whose audience is the provider. Re-read fresh on every enroll (so a rotated token is always current); the assertion never touches config or logs. |
-| `--aauth-person-server <url>` | `AGENTD_SECURITY_AAUTH_PERSON_SERVER` | Person Server for user-scoped identity (Case C — the resource-token → user auth-token exchange). |
+| `security.aauth.provider` | `--aauth-provider` | the Agent Provider's URL; required, and setting it turns AAuth on |
+| `security.aauth.key_file` | `--aauth-key-file` | the durable Ed25519 key, created with mode `0600` when absent; default `/var/lib/agentd/aauth-key` |
+| `security.aauth.enroll_token` | `--aauth-enroll-token` | a one-time enrollment token for a provider in token mode; in a config file it must be a secret reference |
+| `security.aauth.enroll_assertion_file` | `--aauth-enroll-assertion-file` | a file holding an enrollment assertion, such as a Kubernetes projected service-account token whose audience is the provider |
+| `security.aauth.person_server` | `--aauth-person-server` | the Person Server for user-scoped access (Case C) |
+| `mcp.servers[].aauth` | — | `false` stops signing requests to that server |
 
-A binary built without `--features aauth` accepts the settings and ignores them —
-nothing is signed. With the feature, a key file that cannot be read or created,
-or an enrollment-token reference that cannot be resolved, exits `2` at startup,
-before any network I/O.
+Each setting is also an environment variable: `AGENTD_SECURITY_AAUTH_PROVIDER`
+and so on.
 
-**Enrollment modes.** `open` (nothing), `token` (`--aauth-enroll-token`, a
-one-time secret), and `federated` (`--aauth-enroll-assertion-file`, a
-platform-issued assertion). Federated is the secret-free fleet path: each pod
-presents its own projected identity token, so there is no shared enrollment
-secret and no operator-custodied key — the provider verifies the assertion and
-binds it to the agent's public key.
+At startup agentd loads the key, or creates it, and installs the identity in
+the daemon process. A key file that cannot be read or created, or an
+enrollment-token reference that does not resolve, exits 2 before any network
+call. Enrollment and the first agent token happen on the first signed request.
 
-## What agentd does on the wire
+The release binaries and the container image include the `aauth` feature. A
+binary built without it accepts `security.aauth` and signs nothing, with no
+warning.
 
-Each MCP `POST` carries three RFC 9421 headers:
+## Choose an enrollment mode
+
+The Agent Provider decides how a new key is admitted.
+
+| Mode | Configure | Use when |
+|---|---|---|
+| open | nothing beyond `provider` | a self-hosted provider that admits any key |
+| token | `enroll_token`, a one-time secret an operator hands over | a provider that admits keys an operator vouched for |
+| federated | `enroll_assertion_file`, a platform-issued assertion | a fleet: each pod presents its own projected identity token, so there is no shared enrollment secret |
+
+An assertion file is read again on every enrollment, so a rotated projected
+token is always current, and the assertion never enters configuration or
+logs. Put the key file on storage that survives restarts, or each restart
+enrolls a new identity.
+
+## What agentd signs
+
+The identity is installed in the daemon process, and agentd signs the
+requests that process makes:
+
+| Request | Signed |
+|---|---|
+| MCP requests the daemon makes: connecting, listing tools, resource reads and subscriptions, workflow `mcp.tool` steps, tools a `security.policies` rule may match | yes, unless the server has `auth:`, `oauth:` or `aauth: false` |
+| outbound A2A peer requests | yes, always, beside any peer credential |
+| model calls the daemon makes itself: the approval judge and the goal check | yes, beside the connection's own credential |
+| the agent's turns: model calls and MCP tool calls from turn worker processes | **no** |
+| subagents and instance children | **no** |
+
+> **Limit.** The agent's turns run in turn worker processes and subagents in
+> their own processes, and neither inherits the identity. Their model calls
+> and their own MCP tool calls go out unsigned, so an AAuth-protected server
+> that a model calls during a turn refuses the call. A tool the daemon serves
+> itself is signed: a workflow `mcp.tool` step, or a tool that a
+> `security.policies` rule matches, which the turn hands to the daemon to run.
+
+## On the wire
+
+Each signed request carries three RFC 9421 headers:
 
 ```text
-Signature-Input: sig=("@method" "@authority" "@path" "signature-key");created=<now>
-Signature: sig=:<base64 ed25519 over the signature base>:
-Signature-Key: sig=jwt;jwt="<your agent token>"
+Signature-Input: sig=("@method" "@authority" "@path" "signature-key");created=<unix time>
+Signature: sig=:<base64 Ed25519 signature over the signature base>:
+Signature-Key: sig=jwt;jwt="<agent token>"
 ```
 
-The agent token is fetched and cached automatically, refreshed shortly before it
-expires. There is nothing to rotate by hand — losing a token just fetches a new
-one. The whole agent process tree (root + every subagent) signs under **one**
-identity, inherited via the spawn payload like `--tls-ca`.
+When a server's discovery document (`/.well-known/aauth-resource.json`,
+fetched when agentd connects) says it requires body integrity, the signature
+also covers a `Content-Digest` of the body. The agent token is fetched and
+cached, and refreshed a minute before it expires, by its own `exp` claim when
+it carries one. There is nothing to rotate by hand.
 
-**The intelligence dial is signed too.** When an identity is installed, agentd
-signs its requests to the `--intelligence` endpoint with the same RFC 9421
-headers. This lets a model gateway attest the *individual agent* by signature
-instead of source IP. A plain LLM endpoint ignores the headers, and the
-endpoint's bearer token (if any) rides alongside — signing is additive.
+```mermaid
+sequenceDiagram
+  participant A as agentd daemon
+  participant AP as Agent Provider
+  participant R as MCP server
+  participant PS as Person Server
+  A->>AP: enroll the public key, signed with the key
+  AP-->>A: agent identity
+  A->>AP: request an agent token, signed with the key
+  AP-->>A: agent token bound to the key
+  A->>R: request signed with the key, agent token attached
+  R-->>A: result (Case A)
+  R-->>A: AAuth-Access token (Case B)
+  A->>R: retry with Authorization: AAuth token
+  R-->>A: 401 requirement=auth-token (Case C)
+  A->>PS: exchange the resource token, with a justification
+  PS-->>A: user-scoped token, once the person approves
+  A->>R: retry presenting the user-scoped token
+```
 
-**Signing is outbound only.** agentd is the AAuth *agent*: it signs the
-requests it makes and verifies no AAuth signature on the requests it receives.
-Its A2A listener names a caller from a bearer, a signed-in session, a client
-certificate or the connection itself ([a2a.md](a2a.md#who-is-calling)); no
-`a2a.principals` rule matches an AAuth identity.
+A Case B or Case C reaction is one retry inside the same request, bounded so
+a requirement agentd cannot satisfy surfaces as the server's `401` instead of
+a loop. A second `auth-token` requirement from a resource agentd already holds
+a user-scoped token for is a real refusal.
 
-**agentd reacts to what a server asks for.** If, at connect, discovery
-(`/.well-known/aauth-resource.json`) says the server requires body integrity,
-the signature additionally covers a `Content-Digest` (SHA-256 of the body). If a
-response carries an `AAuth-Access` token (Case B, resource-managed), agentd
-adopts it and presents `Authorization: AAuth …` on the retry and later calls. If
-a response is `401 requirement=auth-token` (Case C, user-scoped), agentd runs the
-Person-Server exchange and presents the resulting user auth-token — all inside
-the same request, bounded so a mis-satisfied requirement can't spin.
+## What agentd checks
 
-**agentd validates its provider and its token.** It fetches the Agent-Provider
-metadata document (`/.well-known/aauth-agent.json`) and enforces the AAuth
-protocol's anti-host-poisoning rule: a document whose `issuer` isn't the
-configured provider aborts enrollment. A provider that publishes no document
-still works (best-effort). The agent token itself is then acted on, not treated
-as opaque: agentd refreshes against the token's own `exp`, and fails fast if the
-token's `iss` isn't the configured provider, its `ps` isn't the configured
-Person Server, or its `cnf.jwk` isn't the signing key — each a misconfiguration
-that would otherwise surface as a silent wall of downstream `401`s.
+agentd acts on the agent token rather than treating it as opaque. Each time
+it fetches a token that is a JWT, it checks that its `iss` is the configured
+provider, its `ps` is the configured Person Server, and its `cnf.jwk` is
+agentd's own signing key, for each of those claims the token carries. A
+mismatch fails the token fetch, so a misconfigured provider shows up as that
+error rather than as a wall of `401`s from every server.
 
-## Where the human sits
+The Person Server dial is protected against server-side request forgery: the
+URL the Person Server returns is vetted before agentd connects to it. The
+configured `person_server` URL is dialled by name, so a loopback Person
+Server works in development.
 
-You (or your operator) act **at setup only** for the common case (identity-based
-servers, "Case A"): enable the agent and, if the provider requires it, hand over
-a one-time enrollment token. After that the agent operates autonomously — it
-signs every call; no per-request consent.
+> **Limit.** The daemon does not fetch the Agent Provider's metadata document
+> (`/.well-known/aauth-agent.json`) or compare its `issuer` with the
+> configured provider before enrolling. That check exists in the client API
+> (`AAuthClient::prime`), which an embedder can call, and the `iss` check on
+> every agent token still applies.
 
-Servers that want the *human's* identity (user-scoped, "Case C") route through a
-**Person Server** where the user approves new authority. On a
-`401 requirement=auth-token`, agentd exchanges the server's resource token at the
-configured `--aauth-person-server` (carrying a justification the human sees),
-receives the user-scoped auth-token, and presents it on the retry — the human
-consents *at their PS*, not in agentd. agentd never renders a consent screen and
-never caches a decision on the human's behalf: the approval lives with the
-Person Server, and agentd only carries the token it hands back.
+## Where the person sits
+
+For identity-based servers (Case A) a person acts once, at setup: enabling the
+agent and, if the provider needs one, handing over an enrollment token. After
+that the agent signs its calls with no per-request consent.
+
+For user-scoped servers (Case C) the person approves at their Person Server,
+which shows them the justification agentd sends ("agent … requests access to
+…"). agentd never renders a consent screen and never caches a decision on a
+person's behalf; it carries the token the Person Server hands back.
+
+## Limits
+
+- **Child processes do not sign**, as described in
+  [What agentd signs](#what-agentd-signs).
+- **The agent token goes to every signed destination.** `Signature-Key`
+  carries the agent token to every MCP server the daemon signs for, every A2A
+  peer, and the model endpoint the daemon's own model calls use. A2A peers and
+  model calls have no per-destination opt-out; MCP servers have
+  `aauth: false`. Set it on servers that do not need the identity.
+- **Outbound only.** agentd signs what it sends and verifies no AAuth
+  signature on what it receives. Its A2A listener names callers by bearer,
+  session, client certificate or connection
+  ([The A2A channel](a2a.md)); no principal rule matches an AAuth identity.
+- **Two parts of the draft are not implemented**: a server's
+  `202 requirement=interaction` (asking the person mid-request) and AAuth
+  events (`/inbox`) for asynchronous results. A server that needs either does
+  not work with agentd.
 
 ## Embedding
 
-An embedder building on `agentd-core` can drive AAuth directly:
-`agentd::aauth::{AgentKey, ApdConfig, AAuthClient}` — construct a client, install
-it (`agentd::aauth::install`), and every MCP connection agentd makes signs. The
-signer is the `agentd::aauth::RequestSigner` trait; `verify_ed25519` is exposed
-for the server side of a test. See [embedding.md](embedding.md).
+An embedder building on the `agentd-core` crate with its `aauth` feature can
+drive AAuth directly through `agentd::aauth`: build an `AgentKey` and an
+`ApdConfig`, construct an `AAuthClient`, optionally call `prime()` to enroll,
+validate the provider's metadata and fetch the first token up front, and
+`install` it. Every MCP connection the process makes then signs. The signer
+is the `RequestSigner` trait, and `verify_ed25519` is exposed for the server
+side of a test. [Embed agentd in Rust](embedding.md) covers the crates.
 
-## What's covered (and what isn't)
+## Next steps
 
-All three access modes run end to end:
-
-- **Case A** (identity-based) — sign every request; the common case.
-- **Case B** (resource-managed) — adopt a returned `AAuth-Access` token and
-  present it on the retry + later calls.
-- **Case C** (user-scoped) — run the Person-Server exchange on
-  `401 requirement=auth-token` and present the user auth-token.
-
-Plus **resource discovery** (`/.well-known/aauth-resource.json`) and
-**provider discovery + issuer validation** (`/.well-known/aauth-agent.json`),
-**agent-token claim validation** (refresh off the token's `exp`; fail fast on an
-`iss` / `ps` / `cnf` mismatch), **content-digest** covering when a server
-requires body integrity, **per-server opt-out** (`aauth: false` on an
-`mcp.servers[]` entry), **federated enrollment**
-(`--aauth-enroll-assertion-file`), and **signing the intelligence dial**.
-
-Two parts of the draft are not implemented: a server's own
-`202 requirement=interaction` (HITL elicitation) and AAuth Events (`/inbox`) for
-async results. A server that needs either will not work with agentd today.
+- [Outbound credentials](authentication.md): static, OAuth, AWS and SPIFFE
+  credentials for the same endpoints.
+- [Connect MCP servers](connect-mcp.md): declare the servers you sign for.
+- [Security model](security.md): where signing sits among agentd's other
+  controls.

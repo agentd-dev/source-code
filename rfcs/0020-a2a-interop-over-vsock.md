@@ -11,7 +11,7 @@
 > terminal task → `UnsupportedOperationError`, and no non-spec `final` flag
 > (termination is terminal-state + stream close). The AUTHORITATIVE description is
 > the `crates/agentd/src/mcp/a2a.rs` module doc; this RFC's method-naming/streaming
-> prose is historical. See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+> prose is historical. See ../docs/design/00-target-vision-pivot.md.
 
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok

@@ -42,7 +42,7 @@ Intelligence and the instruction are supplied per run.
 ```sh
 docker run --rm \
   -e AGENTD_INSTRUCTION="Summarize /data/report.txt and write the summary via the fs MCP server." \
-  -e AGENTD_INTELLIGENCE="https://api.example/v1" \
+  -e AGENTD_INTELLIGENCE="https://api.example/v1/chat/completions" \
   -e AGENTD_INTELLIGENCE_TOKEN="$TOKEN" \
   -e AGENTD_MODEL="claude-sonnet-4-5" \
   agentd:tls
@@ -60,7 +60,7 @@ The default image (no `FEATURES`) already keeps TLS out — point it at a
 ```sh
 docker run --rm \
   -e AGENTD_INSTRUCTION="…" \
-  -e AGENTD_INTELLIGENCE="http://127.0.0.1:4000/v1" \
+  -e AGENTD_INTELLIGENCE="http://127.0.0.1:4000/v1/chat/completions" \
   agentd:no-tls
 ```
 

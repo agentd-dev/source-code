@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { GROUPS, docsInGroup } from "../../lib/docs";
+import { GROUPS, docsInGroup, sectionsOf } from "../../lib/docs";
 
 export const metadata = {
   title: "Documentation — agentd",
@@ -63,22 +63,32 @@ export default function DocsIndex() {
 
       {groups.map((g) => (
         <section key={g.id} className="mt-14">
-          <h2 className="mb-4 text-sm font-semibold uppercase tracking-[0.12em] text-[var(--green)]">
+          <h2 className="mb-1 text-sm font-semibold uppercase tracking-[0.12em] text-[var(--green)]">
             {g.title}
           </h2>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {docsInGroup(g.id).map((d) => (
-              <Link key={d.slug} href={`/docs/${d.slug}/`} className="panel lift block p-4">
-                <div className="flex items-baseline justify-between gap-2">
-                  <h3 className="font-semibold text-[var(--fg-strong)]">{d.title}</h3>
-                  <Tag tag={d.tag} />
-                </div>
-                {d.blurb && (
-                  <p className="mt-1.5 text-sm leading-relaxed text-[var(--dim)]">{d.blurb}</p>
-                )}
-              </Link>
-            ))}
-          </div>
+          {g.blurb && <p className="mb-4 max-w-2xl text-sm text-[var(--dim)]">{g.blurb}</p>}
+          {sectionsOf(g.id).map((s) => (
+            <div key={s.id ?? "_"} className="mt-5">
+              {s.title && (
+                <h3 className="mb-3 text-xs font-semibold uppercase tracking-[0.1em] text-[var(--dim)]">
+                  {s.title}
+                </h3>
+              )}
+              <div className="grid gap-3 sm:grid-cols-2">
+                {s.docs.map((d) => (
+                  <Link key={d.slug} href={d.href ?? `/docs/${d.slug}/`} className="panel lift block p-4">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <h4 className="font-semibold text-[var(--fg-strong)]">{d.title}</h4>
+                      <Tag tag={d.tag} />
+                    </div>
+                    {d.blurb && (
+                      <p className="mt-1.5 text-sm leading-relaxed text-[var(--dim)]">{d.blurb}</p>
+                    )}
+                  </Link>
+                ))}
+              </div>
+            </div>
+          ))}
         </section>
       ))}
 

@@ -1,286 +1,343 @@
-# A2A extensions — everything agentd speaks beyond the core protocol
+# A2A extensions
 
 A2A 1.0 defines eleven JSON-RPC methods and a message model. Anything an agent
-speaks beyond them goes through the specification's own mechanism,
+speaks beyond them goes through the protocol's own mechanism,
 [extensions](https://github.com/a2aproject/A2A/blob/main/docs/topics/extensions.md):
-a URI, declared on the agent card, that a client activates per request.
+a URI, declared on the Agent Card, that a client activates per request. This
+page lists the three extensions and one protocol binding agentd declares, the
+activation rules, what the extended card adds, and the errors the extensions
+introduce. It is for integrators building a client or a peer; each URI is
+also the address of its normative specification.
 
-agentd answers the eleven core methods, the one method its events extension
-declares, and nothing else. Its public card is a document, not a method: a
-`GET` on `/.well-known/agent-card.json`, served without a credential. That
-is what makes an agentd instance callable by a peer that has never heard of
-agentd — and this page is the overview of what agentd adds on top: three
-extensions and one protocol binding. Each URI is its own normative
-specification, served at that address; the pages in [`ext/`](ext/) are their
-sources. The core protocol itself — the pipeline, identity, sign-in, tasks — is
-[a2a.md](a2a.md).
+## What agentd declares
 
----
+| URI | Kind | Declared | Applies to | Adds |
+|---|---|---|---|---|
+| [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command) | profile | always | `SendMessage`, `SendStreamingMessage` | command ops: structured operations sent as one DataPart |
+| [`https://agentd.dev/a2a/ext/events`](https://agentd.dev/a2a/ext/events) | method | while `a2a.events.enabled` is on | `agentd.events/SubscribeToEvents` | the instance-wide observation feed |
+| [`https://agentd.dev/a2a/ext/task-annotations`](https://agentd.dev/a2a/ext/task-annotations) | profile | always | every answer that carries a Task | agentd's facts about a task, in `Task.metadata` |
 
-## 1. What agentd declares
-
-| URI | Kind | Declared | Adds |
-|---|---|---|---|
-| [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command) | profile | always | the **command ops**: structured operations sent as one DataPart on `SendMessage` / `SendStreamingMessage` |
-| [`https://agentd.dev/a2a/ext/events`](https://agentd.dev/a2a/ext/events) | method | while `a2a.events.enabled` | `agentd.events/SubscribeToEvents`, the instance-wide observation feed |
-| [`https://agentd.dev/a2a/ext/task-annotations`](https://agentd.dev/a2a/ext/task-annotations) | profile | always | agentd's facts about a task, in `Task.metadata` under the URI |
-
-and one custom protocol binding, named by an interface on the card rather than
+One custom protocol binding is named by an interface on the card rather than
 activated:
 
 | URI | Kind | Used |
 |---|---|---|
-| [`https://agentd.dev/a2a/binding/jsonrpc-unix`](https://agentd.dev/a2a/binding/jsonrpc-unix) | protocol binding | the JSON-RPC binding carried over a unix domain socket, on the card of a listener at `unix:///<path>` |
+| [`https://agentd.dev/a2a/binding/jsonrpc-unix`](https://agentd.dev/a2a/binding/jsonrpc-unix) | protocol binding | the JSON-RPC binding over a unix domain socket, on the card of a listener at `unix:///<path>` |
 
-The specification groups extensions into four kinds: **data-only**
-(information on the card), **profile** (structure or narrower values on core
-messages), **method** (new RPC methods) and **state machine** (new task
-states). agentd's are profile and method extensions. None changes a core
-structure: custom data rides in a `DataPart` or under a URI in a `metadata`
-map, which is what those fields exist for.
+A2A groups extensions into four kinds: data-only (information on the card),
+profile (structure or narrower values on core messages), method (new RPC
+methods) and state machine (new task states). agentd's are profile and method
+extensions. None changes a core structure: custom data rides in a DataPart or
+under a URI in a `metadata` map, which is what those fields exist for.
 
-**None is `required`.** A client that sends no `A2A-Extensions` header at all
-gets the whole core protocol: it can converse, read, list and cancel tasks,
-subscribe to them and, where `a2a.push.enabled` is on, register webhooks. The
-extensions add reach, never a precondition.
+**None is required.** A client that sends no `A2A-Extensions` header gets the
+whole core protocol: it converses, reads, lists and cancels its tasks,
+subscribes to them and, where push is enabled, registers webhooks. The
+extensions add reach and are never a precondition. `-32008` (a required
+extension not activated) is part of the negotiation but agentd never sends it.
 
-**The URIs carry no version.** A2A 1.0.1 §4.6.3 makes a version in an
-extension URI a SHOULD, not a MUST; what §4.6.3 and §5.8 make a MUST is that a
-URI's meaning never changes under a peer that already speaks it. A version in
-an identifier agentd owns would be a second name for the same thing, so an
-incompatible change takes a new URI with a new name, never a `/vN` suffix. The
-same holds for the binding and for the launch grant type.
+## Identifiers
 
-Each URI is both an identifier and an address. A peer matches it exactly —
-neither case nor a trailing slash is forgiven — and can fetch it: agentd.dev
-serves the specification at the URI, the schema bundle at `<uri>/schema.json`
-and golden examples under `<uri>/examples/`. `agentd --extension-schema
-<name>` prints a bundle from the binary, and `agentd --extensions` the
-registry.
+Each URI is both an identifier and an address.
 
-See what an instance declares:
+- **Matched exactly.** A peer compares the URI byte for byte: neither case nor
+  a trailing slash is forgiven.
+- **Served at its address.** agentd.dev serves the specification at the URI,
+  the JSON Schema bundle at `<uri>/schema.json` and golden examples beside it.
+  The binding carries the JSON-RPC binding's own messages and has no schema
+  bundle.
+- **Never versioned.** A URI's meaning never changes under a peer that already
+  speaks it. An incompatible change takes a new URI with a new name, never a
+  version suffix. The same holds for the binding and the launch grant type.
 
-```console
-$ curl -s http://127.0.0.1:8080/.well-known/agent-card.json \
-  | jq -r '.capabilities.extensions[].uri'
+| Schema bundle | Validates |
+|---|---|
+| [`https://agentd.dev/a2a/ext/command/schema.json`](https://agentd.dev/a2a/ext/command/schema.json) | the `data` of a command DataPart, each op's arguments and result |
+| [`https://agentd.dev/a2a/ext/events/schema.json`](https://agentd.dev/a2a/ext/events/schema.json) | the method's params, each frame, each event kind's `data` |
+| [`https://agentd.dev/a2a/ext/task-annotations/schema.json`](https://agentd.dev/a2a/ext/task-annotations/schema.json) | the object under `metadata[<URI>]` |
+
+The binary prints the same registry and bundles, with no configuration and
+no network:
+
+```sh
+agentd --extensions
+agentd --extension-schema command
+```
+
+`--extension-schema` takes the last segment of a URI: `command`, `events` or
+`task-annotations`.
+
+To see what a running instance declares, read its card:
+
+```sh
+curl -s http://127.0.0.1:8420/.well-known/agent-card.json | jq -r '.capabilities.extensions[].uri'
+```
+
+```text
 https://agentd.dev/a2a/ext/command
 https://agentd.dev/a2a/ext/events
 https://agentd.dev/a2a/ext/task-annotations
 ```
 
----
+## Activation and the echo
 
-## 2. Activation and the echo
+A client names the extensions it uses in the `A2A-Extensions` request header,
+comma-separated. The header may repeat, and every line is read. An extension
+is activated for a request when it is all three of:
 
-A client names the extensions it uses in the **`A2A-Extensions`** request
-header, comma-separated (the header may repeat; every line is read). The
-response echoes, in the same header, exactly the extensions that request
-activated. An extension is activated when it is:
-
-- **requested** — named in the header, matched exactly;
-- **declared** — on this instance's card; and
-- **applicable** — meaningful on the method called: the command extension on
-  the two sends, the events extension on its own method, the task-annotations
-  extension on every answer that carries a `Task` (the sends, `GetTask`,
+- **requested:** named in the header, matched exactly;
+- **declared:** on this instance's card;
+- **applicable:** meaningful on the method called. The command extension
+  applies to the two sends, the events extension to its own method, and
+  task-annotations to every answer that carries a Task (the sends, `GetTask`,
   `ListTasks`, `CancelTask`, `SubscribeToTask` and the feed's `task` events).
 
-Three consequences to rely on:
+The response echoes, in the same header, exactly the extensions the request
+activated. Three consequences follow:
 
-- **An unknown URI is dropped, not refused.** Send three, get back the ones
-  that exist here. A client that talks to several agents does not have to
-  branch per agent before it can make a request.
+- **An unknown URI is dropped, not refused.** A client that talks to many
+  agents can send the same header to all of them.
 - **Nothing activated means no header.** The absence of the echo is the
   answer.
-- **The echo never claims what the answer did not do.** An extension named on
-  a method it does not apply to is not echoed.
+- **The echo never claims what the answer did not do.** An extension named
+  on a method it does not apply to is not echoed, and a refused request
+  echoes nothing.
 
-```console
-$ curl -si http://127.0.0.1:8080/ \
-    -H 'content-type: application/json' \
-    -H 'A2A-Version: 1.0' \
-    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command, https://example.com/not-ours' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
-          "role":"ROLE_USER","messageId":"m-1",
-          "extensions":["https://agentd.dev/a2a/ext/command"],
-          "parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+**A command is activated twice.** A DataPart under the `agentd` key is a
+command only when the header names the command URI *and* the message lists it
+in `message.extensions`. Without both it is refused and never run, so no
+client sends a command by accident.
+
+**A method is part of its extension.** `agentd.events/SubscribeToEvents` is
+answered only when the instance declares the events extension and the request
+activates it.
+
+This request sends the `status` command and names one URI agentd does not
+implement:
+
+```sh
+curl -si http://127.0.0.1:8420/ \
+  -H 'content-type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command, https://example.com/not-ours' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"m-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+```
+
+```text
 HTTP/1.1 200 OK
 content-type: application/json
 a2a-extensions: https://agentd.dev/a2a/ext/command
 
-{"id":1,"jsonrpc":"2.0","result":{"message":{…,"parts":[{"data":{"instance":"demo",…}}]}}}
+{"id":1,"jsonrpc":"2.0","result":{"message":{"extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"instance":"reviewer","draining":false,…}}],…}}}
 ```
 
 That example runs against a loopback listener with no credential configured,
-where the caller is the implicit operator; anywhere else, add
-`-H "Authorization: Bearer $TOKEN"`. A browser can read the echo: a real
-response to a listed origin carries `Access-Control-Expose-Headers:
-a2a-extensions, retry-after, www-authenticate`, and the preflight allows the
-request header.
+where a local caller is the operator. Anywhere else, add
+`-H "Authorization: Bearer $TOKEN"`.
 
-**A command is activated twice.** A DataPart under `agentd` is a command only
-when the header names the command URI *and* the message lists it in
-`message.extensions`; without both it is refused and never run, so no client
-sends a command by accident. **A method is part of its extension.**
-`agentd.events/SubscribeToEvents` is answered only when the instance declares
-the events extension and the request activates it.
+> **Note.** A browser can read the echo. A response to a listed origin
+> exposes `a2a-extensions`, `retry-after` and `www-authenticate`, and the
+> preflight allows the `A2A-Extensions` request header.
 
----
+## The extended card
 
-## 3. The three extensions
+The public card is the same for every caller. It declares each extension with
+the params that do not depend on who asks: the command extension's public
+`ops` list is the vocabulary agentd can answer, identical on every instance,
+whatever it has switched on.
 
-### command — calling an operation
+`GetExtendedAgentCard` narrows each declaration to this instance and this
+caller:
+
+| Extension | The extended card adds |
+|---|---|
+| command | `ops`: the ops this instance serves and the caller may run. `commands`: the workflow-declared commands the caller may send, each with its workflow and argument schema. `settable`: the paths `admin.set` accepts, for a caller that may run it |
+| events | `ring`: how many events the feed keeps for a reconnecting subscriber. `kinds`: the event kinds this caller's feed can carry |
+
+It also adds a `workflow:<name>` skill for each workflow the caller may run.
+
+The extended card is an authenticated read, so it exists only where
+authentication means something:
+
+- A listener that **declares a scheme** (a bearer, the device grant or mutual
+  TLS) sets `capabilities.extendedAgentCard: true`. It answers the method
+  only to a caller named by a declared scheme: a bearer, a session or a
+  certificate. Anyone else gets `401`.
+- A listener that **declares none** (a loopback listener with nothing
+  configured, or a unix socket) sets it `false` and answers `-32004`.
+
+For example, a peer whose principal has role `agent` and a grant for one
+workflow-declared command sees this command declaration:
+
+```json
+{
+  "uri": "https://agentd.dev/a2a/ext/command",
+  "params": {
+    "dataPartKey": "agentd",
+    "schema": "https://agentd.dev/a2a/ext/command/schema.json",
+    "ops": [
+      {"op": "status", "reply": "message"},
+      {"op": "workflow.run", "reply": "task"},
+      {"op": "workflow.status", "reply": "message"}
+    ],
+    "commands": [
+      {
+        "op": "review.change",
+        "workflow": "review",
+        "schema": {
+          "type": "object",
+          "required": ["change"],
+          "properties": {"change": {"type": "string"}}
+        }
+      }
+    ]
+  }
+}
+```
+
+## The command extension
 
 A2A has no tool-call primitive, and a method per operation would put agentd's
-surface out of reach of a stock client. The protocol's own answer is a message
-carrying structured input, so every operation is an ordinary `SendMessage`
-whose one DataPart holds `{"agentd": {"op": "…", …arguments}}`. The arguments
-are validated against the op's published schema; one the op does not take is
-refused, never ignored.
+surface out of reach of a stock client. So every operation is an ordinary
+`SendMessage` whose single DataPart holds the command:
+`{"agentd": {"op": "…", …arguments}}`. The arguments are validated against
+the op's published schema, and an argument the op does not take is refused,
+never ignored.
 
 An op answers in one of two ways, published per op as `params.ops[].reply`:
 
-- a **read** (`status`, `config`, `workflow.status`, `plan.get`,
-  `auth.sessions`, …) answers with a **Message** whose DataPart is the result
-  document. No task is created, so a client that polls leaves nothing behind;
-- **work** (`workflow.run`, `admin.drain`, `auth.device.approve`, …) answers
-  with a **Task**, and a result it produces arrives as the task's
-  `<taskId>.result` artifact.
+- **A read** (`message`) answers with a Message whose DataPart is the result
+  document. No task is created, so a client that polls leaves nothing behind.
+- **Work** (`task`) answers with a Task. A result it produces arrives as the
+  task's `<taskId>.result` artifact.
 
-The families: `status` and `config`; `workflow.*`, `subagent.*` and
-`plan.get`; the introspection reads (`conversation.get`, `run.get`,
-`subagent.get`, `debug.events`), served while `a2a.introspection.enabled` is
-on; `admin.*` (drain, pause, resume, cancel, and `admin.set` for the
-runtime-settable paths); and the sign-in ops:
-
-| Op | Reply | Does |
+| Family | Ops | Served |
 |---|---|---|
-| `auth.device.pending` | message | the device sign-ins waiting for a decision |
-| `auth.device.approve` | task | approve one: `{user_code, as, scope?}`. **`as` is required** — the name the device signs in as; every session approved as one name is one principal, `user:<name>`, so what it owns survives a re-login |
-| `auth.device.deny` | task | refuse one `{user_code}`, or every pending one `{all: true}` |
-| `auth.sessions` | message | the signed-in sessions: kind, name, principal, expiry |
-| `auth.sessions.revoke` | task | end one session `{sid}`, every session of a name `{name}`, or all `{all: true}` |
+| Status and configuration | `status`, `config` | always |
+| Workflows | `workflow.run`, `workflow.status`, `workflow.cancel`, `workflow.signal` | always |
+| Subagents and plans | `subagent.send`, `subagent.kill`, `subagent.status`, `plan.get` | always |
+| Introspection | `conversation.get`, `run.get`, `subagent.get`, `debug.events` | while `a2a.introspection.enabled` is on |
+| Operator controls | `admin.drain`, `admin.pause`, `admin.resume`, `admin.cancel`, `admin.set` | always |
+| Sign-in | `auth.device.pending`, `auth.device.approve`, `auth.device.deny` | while `a2a.device_grant.enabled` is on |
+| Sessions | `auth.sessions`, `auth.sessions.revoke` | on a TCP listener |
 
-The `auth.device.*` ops are served while `a2a.device_grant.enabled` is on,
-`auth.sessions*` on any TCP listener; all five are operator-only. The full op
-table — who may call each, what serves it, its arguments and result — is the
-[command extension's specification](ext/command.md#ops).
+Who may call each op, its arguments and its result are in the
+[command ops table](a2a-reference.md#command-ops). The `admin.*` and `auth.*`
+ops, `config` and `debug.events` are operator-only, and no grant reaches
+them.
 
-**The floor is the role's, not a grant's.** `admin.*`, `auth.*`, `config` and
-`debug.events` are operator-only, and no `grants:` entry reaches them — not
-even `grants: ["*"]`. A peer that could drain the instance it delegates to
-would be an operator, and a peer is not one. A rule whose role is not
-`operator` may not name one of them in `grants:` at all: a grant that can
-never apply is a load error, not a control that silently grants nothing.
+**Workflow-declared commands.** A workflow whose start step is `kind: a2a`
+with a `command:` declares one more op: sending that command starts the
+workflow, and its arguments are held to the start step's `schema`. A caller
+may send it when its grants name the op (an operator always may) and the
+start's `roles:` admit its role. The built-in op names are reserved: a
+workflow that declares one is refused at validation, so a workflow can never
+shadow an operator control.
 
-**The built-in ops are reserved names.** A workflow's `kind: a2a` start step
-may declare a `command:`, which becomes one more op. Its name may not collide
-with a built-in: a declared command takes the workflow path, where the
-built-in's own authorization would not run, so a workflow claiming
-`admin.drain` would shadow the operator's control. The collision is refused
-at validation — at config load and at `workflow.create` alike — and the
-listener dispatches a built-in to its own handler regardless.
+The normative specification, with the envelope, every op and the reserved
+names, is at
+[`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command).
 
-### events — the observation feed
+## The events extension
 
-A2A streams one task at a time (`SubscribeToTask`). A display client needs the
-whole instance, so the events extension declares one method,
-`agentd.events/SubscribeToEvents`, namespaced under the extension so a method
-the specification defines later can never collide with it.
+A2A streams one task at a time. A display client needs the whole instance, so
+the events extension declares one method, `agentd.events/SubscribeToEvents`,
+namespaced under the extension so a method the specification defines later
+can never collide with it.
 
-```console
-$ curl -sN http://127.0.0.1:8080/ \
-    -H 'content-type: application/json' \
-    -H 'A2A-Version: 1.0' \
-    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/events' \
-    -d '{"jsonrpc":"2.0","id":7,"method":"agentd.events/SubscribeToEvents","params":{"fromSeq":0}}'
-data: {"id":7,"jsonrpc":"2.0","result":{"hello":{"introspection":false,"resume":0,"resync":false,"seq":7,"version":"…"}}}
+```sh
+curl -sN http://127.0.0.1:8420/ \
+  -H 'content-type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/events' \
+  -d '{"jsonrpc":"2.0","id":7,"method":"agentd.events/SubscribeToEvents","params":{"fromSeq":0}}'
+```
+
+```text
+data: {"id":7,"jsonrpc":"2.0","result":{"hello":{"introspection":false,"resume":0,"resync":false,"seq":7,"version":"1.18.0"}}}
 
 data: {"id":7,"jsonrpc":"2.0","result":{"event":{"kind":"step","seq":1,"ts":…,"data":{…}}}}
 ```
 
-The stream opens with a `hello` frame, replays the events past `fromSeq`, then
-follows live `event` frames, each `{seq, ts, kind, data}`; a reconnect resumes
-from the last `seq` it read. The kinds are a closed vocabulary with a schema
-each — including **`auth`**: a device sign-in pending, approved or denied, a
-session revoked, a launch — and a subscriber is sent only the events its
-principal may see. The stream ends with a **`goodbye`** frame carrying the
-cursor to resume from and its reason: `deadline` when the listener's stream
-deadline elapsed, **`revoked`** when the caller's session was revoked, within
-one tick and with nothing past the revocation. The frames, the kinds and who
-receives each are the [events extension's specification](ext/events.md).
+The answer is a server-sent event stream of three frame types:
 
-### task-annotations — what agentd knows about a task
+| Frame | When | Members |
+|---|---|---|
+| `hello` | first | `seq` (newest in the feed), `resume` (the cursor asked for), `resync`, `introspection`, `version` (the agentd build) |
+| `event` | replayed past the cursor, then live | `seq`, `ts` (epoch milliseconds), `kind`, `data` |
+| `goodbye` | last | `seq` (the cursor to resume from), `reason`: `deadline` or `revoked` |
 
-agentd knows more about a task than the `Task` has fields for: what it tracks
-(a workflow run, a subagent, a conversation turn), who started it, when each
-state change happened, the answer schema of a gate waiting on a person, the
-command that started it. An extension may not add fields to a core structure,
-so these facts travel as one object in `Task.metadata` under the extension's
-URI — only in an answer to a request that activated it. A webhook body never
-carries them. The members are the
-[task-annotations specification](ext/task-annotations.md).
+- **Reconnecting** resumes from the last `seq` read, passed as `fromSeq`.
+- **`resync: true`** means the cursor cannot be honoured: events past it
+  left the ring, or the daemon restarted, since the feed lives in memory.
+  The client re-reads its state (the `status` command and `ListTasks`) rather
+  than applying the replay on top.
+- **Visibility is per event.** An operator receives every event; any other
+  caller receives the events its principal owns and those addressed to every
+  subscriber, so the `seq` values it reads have gaps.
+- **The stream ends** with `goodbye` when the listener's stream deadline
+  passes (`deadline`), or within one tick when the caller's session is
+  revoked (`revoked`), with nothing past the revocation.
 
----
+The kinds are a closed vocabulary with a schema each: `task`, `run`, `step`,
+`conversation`, `subagent`, `child`, `activity` and their `.removed`
+departures, `status`, `lifecycle`, `config`, `audit` (while introspection is
+on) and `auth` (device sign-ins, revocations, launches). Who receives each
+kind is in the specification at
+[`https://agentd.dev/a2a/ext/events`](https://agentd.dev/a2a/ext/events).
 
-## 4. The unix binding
+## The task-annotations extension
 
-Two instances on one host, or in one pod, can skip TCP and TLS: one listens on
-a socket (`a2a.listen: unix:///run/agentd/a.sock`), the other names that
-socket as a peer endpoint. The protocol is the JSON-RPC binding unchanged,
-carried as HTTP/1.1 over the socket — but no `https://` URL can name a socket
-path, and a stock client picks an interface by its binding before it sends
-anything. So the card's interface declares the binding URI above instead of
-`JSONRPC`, and a client that cannot dial a socket never selects it.
+agentd knows more about a task than the Task has fields for. An extension may
+not add fields to a core structure, so these facts travel as one object in
+`Task.metadata` under the extension's URI, only in an answer to a request
+that activated it:
 
-The kernel is the authenticator: the socket is `0600`, the peer's uid is read
-with `SO_PEERCRED`, only the daemon's own uid or root is served, and every
-connection that passes is the operator. A unix listener declares no
-authentication scheme, so it has no extended card. The details are the
-[binding's specification](ext/binding-jsonrpc-unix.md).
+| Member | Always | Meaning |
+|---|---|---|
+| `link` | yes | what the task tracks: `{kind, id}`, `kind` being `run`, `subagent` or `turn` |
+| `created` | yes | when the task was created |
+| `statusHistory` | yes | every state the task has been in, oldest first, each `{state, ts}` |
+| `principal` | no | who started the task |
+| `askSchema` | no | the JSON Schema of the answer an `input-required` gate asks for |
+| `askChannel` | no | where the gate is also announced, from the instruction document's `::!human` |
+| `command` | no | the command op that started the task |
 
----
+A webhook body never carries the annotations. The normative specification is
+at
+[`https://agentd.dev/a2a/ext/task-annotations`](https://agentd.dev/a2a/ext/task-annotations).
 
-## 5. The extended card
+## The unix socket binding
 
-The public card is the same for every caller: it declares each extension with
-the params that do not depend on who asks. The command extension's public
-`params.ops` is the **vocabulary agentd can answer** — identical on every
-instance, whatever it has switched on — so it says nothing about whether
-introspection is on or who may drain.
+Two instances on one host can skip TCP and TLS: one listens on a socket
+(`a2a.listen: unix:///run/agentd/a.sock`), the other names that socket as a
+peer endpoint. The protocol is the JSON-RPC binding unchanged, carried as
+HTTP/1.1 over the socket: the same methods, headers, errors and streams. No
+`https://` URL can name a socket path, and a stock client picks an interface
+by its binding before it sends anything, so the card's interface declares the
+binding URI instead of `JSONRPC`. A client that cannot dial a socket never
+selects it.
 
-`GetExtendedAgentCard` narrows each declaration to this instance and **this
-caller**:
+The kernel is the authenticator. The socket is mode `0600`, only the daemon's
+own uid or root is served, and every connection that passes is the operator.
+A unix listener declares no authentication scheme, so it has no extended
+card, and it serves no session ops. The normative specification is at
+[`https://agentd.dev/a2a/binding/jsonrpc-unix`](https://agentd.dev/a2a/binding/jsonrpc-unix).
 
-| Extension | The extended card adds |
-|---|---|
-| command | `ops`: the ops this instance serves and the caller may run; `commands`: the workflow-declared commands the caller may fire, each with its workflow and argument schema; `settable`: the paths `admin.set` accepts, for a caller that may run it |
-| events | `ring`: how far behind a reconnecting subscriber may be; `kinds`: the kinds this caller's feed can carry |
+## Errors the extensions add
 
-and a `workflow:<name>` skill for each workflow the caller may run.
-
-It is an authenticated read, so it exists only where authentication means
-something. A listener that declares a scheme (a bearer, the device grant, mTLS)
-sets `capabilities.extendedAgentCard: true` and answers the method only to a
-caller named by a declared scheme — a bearer, a session or a certificate;
-anyone else gets `401`. A listener that declares none (a no-auth loopback, a
-unix socket) sets it `false` and answers `-32004`.
-
----
-
-## 6. Errors
-
-The refusals the extensions add, beside the core table in
-[a2a.md](a2a.md#errors). Each carries a `google.rpc.ErrorInfo` in
-`error.data` whose `reason` names the case — under `domain` `agentd.dev`,
-except `CONTENT_TYPE_NOT_SUPPORTED`, which is the specification's own reason
-and carries `a2a-protocol.org` — and a malformed command also a
-`google.rpc.BadRequest` naming the field. Nothing
+These refusals sit beside the core error table in the
+[A2A API reference](a2a-reference.md#errors). Each carries a
+`google.rpc.ErrorInfo` in `error.data` whose `reason` names the case, under
+`domain` `agentd.dev`, except `CONTENT_TYPE_NOT_SUPPORTED`, which is the
+specification's own reason and carries `a2a-protocol.org`. A malformed
+command also carries a `google.rpc.BadRequest` naming each field. Nothing
 refused is run, and no task is created.
 
 | Code | Reason | When |
 |---|---|---|
 | `-32601` | `EXTENSION_NOT_DECLARED` | `agentd.events/SubscribeToEvents` on an instance that does not declare the events extension |
-| `-32601` | `EXTENSION_NOT_ACTIVATED` | the method, and the request's `A2A-Extensions` does not name the events URI |
+| `-32601` | `EXTENSION_NOT_ACTIVATED` | that method, and `A2A-Extensions` does not name the events URI |
 | `-32602` | `EXTENSION_NOT_ACTIVATED` | a DataPart under `agentd`, and the header does not name the command URI |
 | `-32602` | `EXTENSION_NOT_MARKED` | a command, and `message.extensions` does not list the command URI |
 | `-32602` | `COMMAND_ENVELOPE_AMBIGUOUS` | more than one part carries a command |
@@ -291,79 +348,52 @@ refused is run, and no task is created.
 | `-32004` | `INTROSPECTION_DISABLED` | an introspection op while `a2a.introspection.enabled` is off |
 | `-31403` | `PERMISSION_DENIED` | the caller's role and grants do not reach the op (HTTP 403) |
 
-`-32008` — a required extension not activated — is part of the negotiation
-but never sent, because none of agentd's extensions is required.
+## Clients
 
----
+The display clients, `agentd-tui` and `agentd-ui` in the npm package
+`@agentd-dev/cli`, are ordinary A2A clients. They read the card, send
+`A2A-Version` on every call and activate only extensions the card declares.
+Against an agent that declares none of agentd's, they fall back to the core
+methods alone. [Use the terminal and web UI](interface.md) covers them, and
+[Build a client](build-a-client.md) covers writing your own.
 
-## 7. Clients
-
-The display clients — `agentd-tui` and `agentd-ui`, both in the npm package
-`@agentd-dev/cli` — are ordinary A2A clients: they discover the card, send
-`A2A-Version` on every call, and activate only extensions the card declares.
-Against an instance that declares none of agentd's, or a peer that is not
-agentd, they fall back to the core methods alone. How they sign in, and what
-they render from the feed, is [interface.md](interface.md).
-
-agentd's own outbound client, the one the `a2a.send` and `a2a.delegate`
-workflow nodes use, activates the command extension when it sends a command
+agentd's own outbound client, which the `a2a.send` and `a2a.delegate`
+workflow steps use, activates the command extension when it sends a command,
 and dials a peer's unix socket through the binding.
 
----
+## How conformance is checked
 
-## 8. How this is kept honest
+Each claim on this page is held by a check that fails when it stops being
+true:
 
-A compliance claim nobody checks decays, so each one here is a test that fails
-when it stops being true:
-
-- **The method table is the SDK's.** `spec_methods_are_exactly_the_sdks`
-  (`runtime/surface/methods.rs`) holds the eleven core names to the constants
-  of the A2A project's official SDK, which the listener is built on, in both
-  directions; and `route_table_is_exact` routes those and the declared
-  extension methods, and nothing else. The SDK is the same library the
-  listener uses, so this checks agentd against its own dependency, not against
-  an independent reading.
-- **Negotiation is an intersection.**
-  `negotiation_intersects_requested_declared_and_applicable`
-  (`runtime/surface/ext.rs`) runs every method against every subset of the
-  registry, feed on and off, plus a URI agentd does not implement.
-- **The wire does what the table says.** `a2a_extensions_e2e.rs` against a
-  running daemon: the echo is exactly what was activated; the feed needs its
-  extension declared and activated; annotations follow activation; a command
-  without activation is refused and not run; an argument the op does not take
-  is refused.
+- **The method table is the SDK's.** agentd's eleven core method names are
+  held to the constants of the A2A project's official SDK, which the listener
+  is built on, and the route table serves those and the declared extension
+  methods, nothing else.
+- **Negotiation is an intersection.** Every method is tested against every
+  subset of the registry, with the feed on and off, plus a URI agentd does not
+  implement.
 - **What agentd.dev publishes is what the binary speaks.** The registry,
   schema bundles and golden examples are generated from the values the
-  listener validates against (`scripts/gen-schemas.sh`), and CI fails on a
-  difference. `contract_e2e.rs` validates a running daemon's frames, replies,
-  results and annotations against the *committed* files a peer downloads, and
-  the client's `test/contract.test.mjs` validates the golden examples with a
-  validator that is not agentd's (ajv).
-- **The feed pushes only declared kinds.** `feed_kinds_guard.rs` scans every
-  push site, and debug builds assert every push against its kind's schema.
-- **The conformance suite** (`agentd-conformance`, [CONFORMANCE.md](../CONFORMANCE.md))
-  checks the `extensions` and `events` families against a daemon the way a
-  spec-only peer would.
-- **Someone else's reading of the spec.** In CI's contract job, the official
-  Python SDK, a2a-sdk 1.1.5, runs as a *client* of a real agentd
-  (`interface/test/stock/sdk_client.py`): it resolves the card, parses every
-  answer strictly into the protocol's own types, and sends a command the way
-  any client activates an extension. The TypeScript client runs against the
-  SDK's official sample server (`test/stock.e2e.mjs`), and agentd's outbound
-  client calls it too (`test/stock/peer.e2e.mjs`).
-- **The pages name only what is served.** `docs_surface_guard.rs` holds every
-  JSON-RPC method and every agentd URI named in the docs, READMEs, the Agent
-  Skill and the site to the tables above; `unversioned_guard.rs` refuses a
-  version in any identifier agentd owns.
+  listener validates against, and CI fails on a difference. A running daemon's
+  frames, replies and annotations are validated against the published files,
+  and the golden examples against a validator that is not agentd's.
+- **The feed pushes only declared kinds.** Every push site is scanned, and
+  debug builds check every push against its kind's schema.
+- **Someone else's reading of the specification.** In CI, the official Python
+  SDK runs as a client of a real agentd and parses every answer strictly into
+  the protocol's own types. The TypeScript client runs against the SDK's
+  sample server, and agentd's outbound client calls it too. The conformance
+  suite, `agentd-conformance`, checks the extensions from the outside, the
+  way a specification-only peer would.
+- **The pages name only what is served.** Every JSON-RPC method and every
+  agentd URI the docs name is held to the tables the listener is built from.
 
----
+## Next steps
 
-## See also
-
-- [a2a.md](a2a.md) — the channel itself: the pipeline, principals, sign-in, tasks, the card
-- [ext/command.md](ext/command.md), [ext/events.md](ext/events.md),
-  [ext/task-annotations.md](ext/task-annotations.md),
-  [ext/binding-jsonrpc-unix.md](ext/binding-jsonrpc-unix.md) — the normative specifications
-- [operations.md](operations.md) — the admin ops in an operational context
-- [interface.md](interface.md) — the display clients that use the feed
-- [The A2A extensions specification](https://github.com/a2aproject/A2A/blob/main/docs/topics/extensions.md)
+- [A2A API reference](a2a-reference.md): the core methods, the pipeline,
+  errors and the full command ops table.
+- [The A2A channel](a2a.md): how identity, ownership and delegation work.
+- [Build a client](build-a-client.md): a client that uses the feed and the
+  commands.
+- [Use the terminal and web UI](interface.md): the shipped clients.

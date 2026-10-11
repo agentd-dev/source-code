@@ -1,331 +1,382 @@
-# Getting started with agentd
+# Quickstart
 
-`agentd` is a small, dependency-light Rust binary that runs **one agent**. You
-give it an instruction and a way to reach an LLM, and it runs an agentic loop —
-think, call tools, observe, repeat — until the job is done or a new event wakes
-it. Every task tool it can call comes from an **MCP server**; agentd ships none of its
-own and runs no local code. It reaches exactly **one** LLM endpoint, the
-*intelligence*. And it reacts to the world through **MCP resource
-subscriptions** — a resource changing upstream is what triggers a run.
+In about ten minutes you run a first agent against a real model, give it a
+tool from a public MCP server, read its result and exit code, and then run
+the same instruction as a long-lived daemon you talk to from a terminal UI.
+This tutorial is for developers trying agentd for the first time. You need
+agentd installed and an API key for OpenAI or Anthropic.
 
-This page gets you from a checkout to a first end-to-end run, then shows the same
-instruction as a recurring **loop** and a **reactive** daemon. For the full knob list see
-[configuration.md](configuration.md); for how triggers and modes work in depth
-see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
-[architecture.md](architecture.md).
+## Before you start
 
-## Install / build
+- **agentd 1.18 or later** on your `PATH`. [Install](install.md) covers the
+  options; `agentd --version` checks it.
+- **An API key** for OpenAI or for Anthropic.
+- **For the last step**, Node.js 20 or newer and the display clients:
+  `npm install -g @agentd-dev/cli`.
+- **Optionally**, [`jq`](https://jqlang.org) to read the JSON log.
 
-The fastest path is the installer — it picks the right architecture, verifies
-the release `SHA256SUMS`, and installs to `/usr/local/bin` (or `~/.local/bin`
-when that is not writable). It never invokes sudo for you:
+Work in an empty directory; the daemon in step 5 keeps its state there.
 
-```console
-$ curl -fsSL https://agentd.dev/install.sh | sh
-$ agentd --version
+> **Note.** No API key yet? The release binary carries a mock model endpoint
+> that answers with no key and no network. Run
+> `agentd --instruction "Say hello." --intelligence mock:final` to see a
+> one-shot end to end; it prints `mock-llm done` and exits `0`. The rest of
+> this tutorial uses a real model: `mock:final` answers every call at once
+> and never calls a tool.
+
+## Step 1: Give agentd your key
+
+Put the key in your shell's environment:
+
+```bash
+export OPENAI_API_KEY="paste-your-key-here"
 ```
 
-`install.sh --help` covers pinning a version (`--version v2.0.0`) and choosing
-the directory (`--dir ~/bin`). Release binaries are Linux/musl, amd64 and arm64;
-**`exec` is not compiled into them** — it needs the source build below.
-Everything else, including the `cel` expression guards, ships.
+You never hand agentd the key itself. Commands and files name it with a
+reference, `{{secret:OPENAI_API_KEY}}`, which agentd resolves from the
+environment when it starts. The key stays off agentd's command line, and so
+out of `ps`, out of configuration files and out of every log line. A
+reference to a variable that is not set stops agentd before it does
+anything:
 
-Building from source: agentd is a single Cargo crate in a workspace. The build
-is pure Rust — no C toolchain, no `cmake` — and needs Rust 1.96 or newer. What
-it produces is one static binary.
-
-```console
-$ git clone <repo> agent && cd agent
-$ cargo build -p agentd-cli --release
-    Finished `release` profile [optimized] target(s)
-$ ./target/release/agentd --version
-agentd 1.18.0
+```text
+{"event":"config.invalid","msg":"{{secret:OPENAI_API_KEY}} is not set in the environment (referenced at config.intelligence.token)"}
 ```
 
-The result is **one static binary** that starts fast, idles cheaply, and drops
-into a container or a VM. The same binary is also the subagent: when a parent
-spawns a child, it re-execs `argv[0]` in subagent mode — there is no second
-artifact to ship.
+## Step 2: Run a one-shot
 
-### Optional features
+Ask the agent to do one thing, print the answer and exit:
 
-The default build links `tls` (the `https://` transport with bundled roots) — the
-only transport agentd uses. Turn on the rest only when you need them (each is gated
-so it never weighs down a minimal build):
-
-```console
-$ cargo build -p agentd-cli --release                                  # default: tls (https)
-$ cargo build -p agentd-cli --release --features a2a                   # + the A2A listener
-$ cargo build -p agentd-cli --release --features a2a,cron,metrics,otel  # + scheduling, metrics, OTLP traces
+```bash
+agentd \
+  --instruction "Explain in three sentences what the Model Context Protocol is for." \
+  --intelligence https://api.openai.com/v1/chat/completions \
+  --model gpt-5.1 \
+  --intelligence-token '{{secret:OPENAI_API_KEY}}'
 ```
 
-To keep TLS out of the binary entirely, terminate it at a same-host sidecar and
-point agentd at it over a **loopback `http://`** endpoint (`--no-default-features`).
+The agent's answer prints on your terminal: a few sentences from the model,
+and nothing else. The JSON lines that scroll past go to stderr; step 3 reads
+them.
 
-### Minimal container
+The four flags are the whole configuration:
 
-The binary needs nothing but libc (or build fully static for `FROM scratch`).
-A minimal image is just the binary — MCP servers are **remote HTTP endpoints**, so
-they are not bundled into the agentd image:
+| Flag | What it says |
+|---|---|
+| `--instruction` | The task. agentd turns it into a one-step job, runs it to an end, and exits. |
+| `--intelligence` | The model endpoint, written in full. A URL with a path is posted to exactly as written. |
+| `--model` | The model to ask for. agentd has no default, and refuses to start a connection to a real provider that names none. |
+| `--intelligence-token` | The credential, as a reference to the environment. |
 
-```dockerfile
-FROM rust:1-bookworm AS build
-WORKDIR /src
-COPY . .
-RUN cargo build -p agentd-cli --release
+With Anthropic, set `ANTHROPIC_API_KEY` instead and name the dialect, since
+the default dialect is the OpenAI-compatible one:
 
-FROM debian:bookworm-slim
-COPY --from=build /src/target/release/agentd /usr/local/bin/agentd
-ENTRYPOINT ["agentd"]
+```bash
+agentd \
+  --instruction "Explain in three sentences what the Model Context Protocol is for." \
+  --intelligence https://api.anthropic.com \
+  --intelligence-dialect anthropic \
+  --model claude-sonnet-5 \
+  --intelligence-token '{{secret:ANTHROPIC_API_KEY}}'
 ```
 
-All configuration is env-settable (12-factor), so the container takes its
-instruction, intelligence endpoint, and MCP servers entirely from the
-environment — see [configuration.md](configuration.md).
+[Connect model providers](connect-models.md) covers Bedrock, Azure, Vertex
+and local servers.
 
----
+## Step 3: Read the result and the exit code
 
-## The 60-second mental model
+agentd splits its output in two, so it composes with ordinary shell tools:
 
-Two loops, deliberately separated:
+- **stdout** carries the result, and only the result.
+- **stderr** carries telemetry: one JSON object per line.
+- **The exit code** says how the run ended.
+
+Run the one-shot again and keep the log in a file:
+
+```bash
+agentd \
+  --instruction "Explain in three sentences what the Model Context Protocol is for." \
+  --intelligence https://api.openai.com/v1/chat/completions \
+  --model gpt-5.1 \
+  --intelligence-token '{{secret:OPENAI_API_KEY}}' \
+  2> run.log
+echo "exit code: $?"
+```
+
+```text
+exit code: 0
+```
+
+List the events in order, with the step, tool or model each one is about:
+
+```bash
+jq -r '"\(.level) \(.event) \(.step // .tool // .model // "")"' run.log
+```
+
+```text
+info proc.start
+warn config.warning
+warn store.none
+info restore.fresh
+info workflow.loaded
+info inbox.accepted
+info proc.ready
+info run.start
+info step.start work
+info turn.model gpt-5.1
+info step.turn.spawn work
+info loop.start
+info turn.start
+info turn.done
+info turn.done
+info step.done work
+info step.start done
+info run.done
+info child.exit
+info lifecycle.idle_exit
+info proc.exit
+```
+
+The two warnings say that a one-shot keeps no state, which is the point of
+a one-shot. The rest is the job's life: the instruction became a workflow
+with a `work` step, a child process (the turn worker) ran the model turn,
+and the process exited when nothing was left to do. Every line carries the
+same `run_id` and `trace_id`, plus `agent_path`, which says which part of
+the process wrote it: `0` is the supervisor, `run/<run-id>/work` the worker
+that ran the step. The first line, unfolded (`jq . run.log` unfolds them
+all):
+
+```json
+{
+  "agent_id": "sup",
+  "agent_path": "0",
+  "comp": "supervisor",
+  "config_files": [],
+  "event": "proc.start",
+  "instance": "agentd",
+  "level": "info",
+  "pid": 1898125,
+  "run_id": "01M4P4S9DGF68J6J4XN9DF2NBT",
+  "trace_id": "ec8a5ca41008bc6596c89199c65d9b9c",
+  "ts": "2026-10-11T18:49:43.088Z",
+  "version": "1.18.0"
+}
+```
+
+The last line, `proc.exit`, carries the exit code and the tokens the process
+used (`tokens_in`, `tokens_out`). `turn.done` carries the same counts per
+turn. Neither carries the prompt or the answer: the log records lengths and
+counts, not content, unless you turn on `--log-content`.
+
+The exit code maps how the run ended, so a script or a scheduler can branch
+on it without reading the log:
+
+| Code | Meaning |
+|---|---|
+| `0` | The run completed. |
+| `1` | The run failed. |
+| `2` | The configuration or the command line is invalid. Nothing ran. |
+| `3` | A partial result: the run stalled or was flagged partial. |
+| `4` | The model could not be reached, or refused the credential, after retries. |
+| `5` | The task was refused or cannot be done. |
+| `7` | A budget ran out: the run's steps or tokens. |
+| `124` | The run's deadline passed. |
+
+[CLI, environment and exit codes](cli.md#exit-codes) has the full table.
+
+Every run is bounded even if you set nothing: 500 steps, 2,000,000 tokens
+and one hour. Set your own with `--max-steps`, `--max-tokens` and
+`--deadline`; the deadline also cuts off a model call in progress.
+
+## Step 4: Give it a tool
+
+A release binary gives the model no file, shell or web tools of its own.
+Its built-in tools manage the agent itself (memory, plans, workflows,
+subagents, asking a person). Everything else comes from MCP servers that
+agentd connects to over HTTPS.
+
+DeepWiki runs a public MCP server, with no key, that answers questions about
+GitHub repositories. Name it with `--mcp name=endpoint` and ask for
+something only it can provide:
+
+```bash
+agentd \
+  --instruction "Use DeepWiki to list the documentation topics of the modelcontextprotocol/rust-sdk repository, then name the three a newcomer should read first." \
+  --intelligence https://api.openai.com/v1/chat/completions \
+  --model gpt-5.1 \
+  --intelligence-token '{{secret:OPENAI_API_KEY}}' \
+  --mcp deepwiki=https://mcp.deepwiki.com/mcp \
+  2> run.log
+```
+
+The log now shows the connection and the tool calls:
+
+```bash
+jq -r 'select(.event | test("^(mcp|tool)\\.")) | "\(.event) \(.server // .tool) \(.protocol // "")"' run.log
+```
+
+```text
+mcp.connect deepwiki 2025-11-25
+mcp.connect deepwiki 2025-11-25
+tool.call read_wiki_structure
+tool.result read_wiki_structure
+```
+
+The supervisor connects first and lists the server's tools; the turn worker
+holds its own connection for the calls. `2025-11-25` is the MCP revision the
+server speaks: agentd tries MCP 2026-07-28 first and falls back for servers
+that predate it. Your model may call other DeepWiki tools, or more than one.
+
+An MCP server that is down does not stop the run. agentd logs
+`mcp.connect.fail`, runs without that server's tools, and adds them when the
+server comes up. [Connect MCP servers](connect-mcp.md) covers credentials,
+tool filtering and trust tags.
+
+## How the run worked
+
+agentd runs as two kinds of process. The supervisor validates the
+configuration, connects to MCP servers, keeps the durable state and the
+credentials, and enforces the limits; it runs no agent loop. Each model turn
+runs in a child process, the turn worker, which the supervisor can always
+stop.
 
 ```mermaid
-flowchart TB
-  subgraph sup["agentd main process · SUPERVISOR — never talks to the LLM"]
-    direction TB
-    s1["parse + validate config<br/>(exit 2 before any side effect)"]
-    s2["connect MCP servers — the only source of tools"]
-    s3["arm start nodes · subscribe · idle until a trigger fires"]
-    s4["spawn + supervise subagents · reap · kill · restart"]
-    s1 --> s2 --> s3 --> s4
-  end
-  sup -->|"spawn (OS process tree)"| loop
-  subgraph loop["subagent child process · the AGENTIC LOOP — where intelligence lives"]
-    direction LR
-    think["think"] --> tool["call MCP tool"] --> obs["observe"] --> think
-    obs -.->|done| term["terminal status<br/>→ result"]
-  end
-  classDef accent stroke:#22c55e,stroke-width:1.5px,color:#f4f4f5;
-  class loop accent;
+sequenceDiagram
+    participant You
+    participant S as agentd supervisor
+    participant W as turn worker (child)
+    participant M as model provider
+    participant T as MCP server
+    You->>S: flags or a config file
+    S->>S: validate, exit 2 before any call
+    S->>T: connect, list tools
+    S->>W: spawn for the work step
+    W->>M: instruction and tool catalogue
+    M-->>W: tool call
+    W->>T: tools/call
+    T-->>W: tool result
+    W->>M: tool result
+    M-->>W: final answer
+    W-->>S: outcome and token usage
+    S-->>You: answer on stdout, exit code
 ```
 
-Three facts are the whole design:
+[Architecture](architecture.md) explains the split and what it buys.
 
-1. **The supervisor never reasons.** It owns lifecycle, triggers, the process
-   tree, and limits. It has no LLM dependency, so it stays tiny and robust; a
-   runaway or crashing model is always isolated in a child the supervisor can
-   `SIGKILL`.
-2. **MCP is the only tool source.** agentd ships no `fs`/`http`/`shell` tool
-   library and runs no local code. Want a capability? Connect an MCP server with
-   `--mcp`. Its only built-in tools are its self/control primitives (spawn a
-   subagent, subscribe, run a graph).
-3. **One intelligence endpoint.** A single LLM endpoint named by a URI in
-   `--intelligence` — `https://` (or a loopback `http://` for a same-host dev
-   gateway). This is the LLM wire, not MCP; the two are different channels.
+## Step 5: Run the same instruction as a daemon
 
-Output discipline: **stdout carries the agent's result; stderr carries
-JSON-lines telemetry.** This holds for a one-shot run and is the convention every
-example below relies on.
-
----
-
-## A first one-shot run, end to end
-
-The default mode is `once`: run the instruction to a terminal status, print the
-result on stdout, exit. Here we give the agent a filesystem MCP server and ask it
-to do something with a file.
-
-```console
-$ agentd \
-    --instruction "Read /data/report.md and write a 3-bullet summary to /data/summary.md" \
-    --intelligence https://gw.example/v1 \
-    --mcp fs=https://mcp-fs.internal/mcp
-```
-
-Three things are wired here:
-
-- **`--instruction`** — the task: the text itself, a file path, or a URI
-  (`oci://`, `instruction://`, `https://`). (`--instruction.file <path>` reads it
-  from a file, or set the `INSTRUCTION` env var.)
-- **`--intelligence https://gw.example/v1`** — the LLM endpoint. A direct provider
-  is `--intelligence https://api.openai.com/v1/...` with `--intelligence-token`; a
-  same-host gateway sidecar is `--intelligence http://127.0.0.1:4000/v1` (loopback
-  `http://` is the only plaintext allowed). Any other scheme — or a non-loopback
-  `http://` — is rejected at startup with exit 2.
-- **`--mcp fs=https://mcp-fs.internal/mcp`** — declare an MCP server named `fs`. The
-  value is `name=<endpoint>`; agentd connects to that **remote Streamable-HTTP MCP
-  endpoint** (it spawns no process) and discovers its tools via `tools/list`. Repeat
-  `--mcp` for more servers; declare per-server auth headers in the config file.
-
-### Read the telemetry (stderr) and the result (stdout)
-
-On stderr you get one JSON object per line. The run threads a
-`proc.start`, the loop's tool calls, and a terminal `proc.exit` — all stamped
-with the same `run_id`, `agent_id`, `agent_path`, and `comp` correlation tuple:
-
-```jsonc
-{"ts":"2026-06-25T11:18:02.796Z","level":"info","event":"proc.start","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1741188,"version":"1.0.0","mode":"once","mcp_servers":1,"subscribe":0}
-{"ts":"...","level":"info","event":"mcp.connect","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"mcp","server":"fs"}
-{"ts":"...","level":"info","event":"tool.call","run_id":"19efe80512c1a9184","agent_id":"a1","agent_path":"0.1","comp":"agent","server":"fs","tool":"read_file"}
-{"ts":"...","level":"info","event":"tool.call","run_id":"19efe80512c1a9184","agent_id":"a1","agent_path":"0.1","comp":"agent","server":"fs","tool":"write_file"}
-{"ts":"...","level":"info","event":"proc.exit","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","status":"completed","code":0}
-```
-
-`agent_path` is the cheap subtree-query trick: it is the agent's position in the
-process tree (`0` = supervisor, `0.1` = first child), so filtering logs by an
-`agent_path` prefix selects a whole subtree with no backend join. Secrets never
-appear — the intelligence token prints as `***` and is kept out of every log line
-and the model transcript.
-
-On **stdout** you get just the distilled result:
-
-```console
-Wrote /data/summary.md (3 bullets). Source: /data/report.md (1,840 words).
-```
-
-The exit code is the agent's terminal status mapped to a number, so a script or
-an external scheduler can branch on it:
-
-| Terminal status | Exit code |
-|---|---|
-| `completed` | 0 |
-| partial result usable | 3 |
-| intelligence unreachable / auth failed | 4 |
-| `refused` | 5 |
-| a required MCP server is down | 6 |
-| budget hit (`exhausted_steps`/`exhausted_tokens`/`deadline`) | 7 |
-| supervisor hard-kill backstop (a child that won't self-terminate) | 124 |
-| bad config (validation) | 2 |
-
-Every run is bounded by limits you can tune — `--max-steps` (default 500),
-`--max-tokens` (default 2000000), and `--deadline` (default 3600s) — so a confused
-or runaway loop can never burn unbounded cost. See
-[configuration.md](configuration.md) for the full list.
-
-### Status: what runs today
-
-The runtime is fully implemented and runs the command above end to end:
-`--help` and `--version` exit 0; invalid config exits **2** in milliseconds with
-an `agentd: …` message on stderr; valid config parses, logs `proc.start`, runs
-the agentic loop, and exits on the agent's terminal status (see the exit-code
-table above).
-
----
-
-## The same instruction as a `loop`
-
-A **loop** re-runs the agent on a timer — the shape for a polling or
-continuously-working agent. It is a workflow with a **`loop` start node**; the
-run is durable, and the loop's iteration state survives a restart:
+A one-shot exits when its job is done. A daemon stays up, and you work with
+it: send it messages, answer its questions, watch what it does. The same
+settings go in a file. Save this as `quickstart.yaml`:
 
 ```yaml
-# poll.yaml
-intelligence: { endpoints: https://gw.example/v1, model: my-model }
-store: { kind: mcp, mcp: { server: state } }
+agent:
+  instruction: >-
+    Use DeepWiki to list the documentation topics of the
+    modelcontextprotocol/rust-sdk repository, then name the three a
+    newcomer should read first.
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+
 mcp:
   servers:
-    - { name: fs,    endpoint: https://mcp-fs.internal/mcp }
-    - { name: state, endpoint: https://mcp-state.internal/mcp }
-workflows:
-  - name: poll
-    steps:
-      s: { kind: loop, interval: 5m, max_iterations: 288 }   # every 5m; stop after a day
-      w: { kind: agent, depends_on: [s], instruction: "Check /data/inbox; process each file into /data/done." }
-      f: { kind: finish, depends_on: [w] }
-lifecycle: { run_until: drained }
-```
-```console
-$ agentd --config poll.yaml
-```
+    - name: deepwiki
+      endpoint: https://mcp.deepwiki.com/mcp
 
-- **`interval: 5m`** is the cadence; `interval: 0` re-runs immediately on completion
-  (work-until-done). `max_iterations`, `until` (a CEL condition), and `backoff`
-  bound it; a `SIGTERM` drains it. A healthy idle loop backs off rather than
-  spinning hot — a `Deployment`-shaped workload.
+store:
+  kind: file
+  file: { path: ./quickstart-state }
 
----
-
-## The same instruction, reactive — a `subscribe` start node
-
-Instead of polling, an agent can **idle at near-zero CPU and wake when an MCP
-resource it subscribed to changes**. That is a **`subscribe` start node**:
-
-```yaml
-workflows:
-  - name: react
-    steps:
-      s: { kind: subscribe, server: fs, uri: "file:///data/inbox" }
-      w: { kind: agent, depends_on: [s], instruction: "Process the new inbox item into /data/done." }
-      f: { kind: finish, depends_on: [w] }
-```
-
-- The runtime issues MCP `resources/subscribe` for the URI (gated on the server
-  advertising `resources.subscribe`), then idles. On
-  `notifications/resources/updated{uri}` it **re-reads** the resource
-  (notify-then-read — the notification carries only the `{uri}`) and fires a run;
-  bursts are **debounced and coalesced** (newest-wins).
-- Subscribe to **concrete URIs**, not templates — enumerate via `resources/list`
-  and add one `subscribe` node per URI.
-
-> **Scope notes.** The external channel is **A2A** (`a2a.listen`) — an HTTPS
-> listener with mTLS/bearer **principals** and a role matrix. agentd is an MCP
-> *client* only; it serves no MCP surface of its own, so nothing reaches in over
-> MCP. Subagents are flat-tree leaves: the process tree is one generation of
-> children under the supervisor, with no hierarchy to walk.
-> The workflow engine is always compiled in. MCP tasks, sampling and roots are
-> not implemented, and agentd declares no client capability for them — a server
-> request for one is dropped rather than answered.
-
----
-
-## Talk to it instead of driving it
-
-Everything above is agentd as a *job*: config in, result out. To work *with*
-the agent — a conversation, approvals, watching what it does — attach a client:
-
-```console
-$ agentd tui --config agent.yaml       # daemon + terminal UI, one command
-$ agentd ui  --config agent.yaml       # …or the browser
-```
-
-The launcher runs the daemon exactly as `agentd --config agent.yaml` would and
-forces no configuration on it, so `agent.yaml` names the listener itself — on
-loopback, since the launched client redeems its sign-in code only from a
-loopback peer — and turns on the live feed the clients watch:
-
-```yaml
 a2a:
   listen: http://127.0.0.1:8420
-  events: { enabled: true }      # the feed; without it the client runs in core mode
+  events: { enabled: true }
+
+lifecycle:
+  run_until: drained
 ```
 
-It ties the two lifetimes together and signs its client in with a single-use
-launch code minted in the daemon's own process, so no credential of the
-daemon's ever reaches the client. Keep them separate — `agentd --config …` in
-one shell, `agentd-tui --endpoint http://127.0.0.1:8420` in another — and
-quitting the client leaves the agent working, because the **daemon** owns the
-session, not the client. (A TUI started by hand against a loopback listener
-with no credential configured is the local operator; anywhere else it signs in,
-see [interface.md](interface.md#signing-in).) Attach a second surface any time;
-they all render the same live state.
+For Anthropic, replace the `intelligence` block:
 
-The clients live in [`interface/`](../interface) and are not part of the Rust
-build: `npm install -g @agentd-dev/cli` (one package, both binaries), or build
-from source with `cd interface && npm install && npm run build`.
+```yaml
+# fragment: under the top level, replacing intelligence
+intelligence:
+  endpoints: https://api.anthropic.com
+  dialect: anthropic
+  model: claude-sonnet-5
+  token: "{{secret:ANTHROPIC_API_KEY}}"
+```
 
-## Where to go next
+Three blocks are new:
 
-- **[interface.md](interface.md)** — the TUI and web UI: screens, the composer
-  (`/` commands, `@skill`, `#target`, `$value`), approvals, signing in, the
-  debug screen.
-- **[coding-agent.md](coding-agent.md)** — the full recipe for a
-  pair-programming agent on a repository: giving it hands (`exec` vs MCP),
-  approvals, budgets, and the practices that keep it safe.
-- **[configuration.md](configuration.md)** — every flag and env var, precedence
-  (`default < config file < env < flag`), limits, secrets, exit codes.
-- **[modes-and-triggers.md](modes-and-triggers.md)** — the lifecycle
-  (`lifecycle.run_until`) and workflow start-node triggers as exit predicates,
-  reactive routing (exactly-one-owner, spawn-vs-continue, debounce),
-  self-subscribe, and `schedule`/cron.
-- **[architecture.md](architecture.md)** — how the supervisor, the reactor, the
-  child loop and the durable store fit together.
+- **`store`** keeps conversations, tasks and runs in a directory, so a
+  restart resumes them.
+- **`a2a`** opens the listener the clients connect to, on loopback, with the
+  live event feed the clients watch turned on.
+- **`lifecycle.run_until: drained`** keeps the process up until you stop it.
+
+Check the file before you run it:
+
+```bash
+agentd --validate-config --config quickstart.yaml
+```
+
+```text
+{"event":"config.warning","msg":"a2a.listen: no credential is configured, so every local process that presents none is the operator — set a2a.bearer, an a2a.principals rule, a2a.tls.client_ca or a2a.device_grant to require one"}
+{"event":"config.valid","files":["quickstart.yaml"]}
+```
+
+The warning is right for a laptop: on a loopback listener with no
+credential, a local client is the operator. Anything else needs a
+credential; [Use the terminal and web UI](interface.md#signing-in) shows how
+clients sign in.
+
+Start the daemon and the terminal UI together:
+
+```bash
+agentd tui --config quickstart.yaml
+```
+
+```text
+agentd tui: endpoint http://127.0.0.1:8420 · daemon logs → /run/user/1000/agentd-tui-48213.log
+```
+
+The launcher signs the client in with a single-use code and sends the
+daemon's log to the file it names. Type a follow-up, such as "Which of those
+topics covers the Streamable HTTP transport?", and the agent answers in the
+conversation. Type `/quit` to leave; the launcher stops the daemon with the
+client.
+
+Two things happen differently from step 4:
+
+- **The instruction runs once, at the first start.** The file declares no
+  workflow, so agentd makes the instruction a one-step workflow, as it did for
+  the one-shot, and runs it when the daemon first starts. With the file store
+  it never runs again: a restart finds the run already done. After that run,
+  the instruction stays the agent's standing policy for every conversation.
+- **The daemon owns the session, not the client.** To keep the agent working
+  after you close the UI, run the two apart, in two terminals:
+
+```bash
+agentd --config quickstart.yaml
+```
+
+```bash
+agentd-tui --endpoint http://127.0.0.1:8420
+```
+
+Quit the client and the daemon keeps going; attach again, or attach a second
+client, and each shows the same live session. Stop the daemon with `Ctrl-C`:
+it drains and exits `0`.
+
+## Next steps
+
+- [Your first workflow](first-workflow.md): a durable workflow you can kill
+  mid-run and resume.
+- [Build a coding agent](coding-agent.md): a daemon that works on a
+  repository with guarded local commands.
+- [Use the terminal and web UI](interface.md): the screens, commands and
+  approvals.
+- [Connect MCP servers](connect-mcp.md): give the agent the tools it needs.

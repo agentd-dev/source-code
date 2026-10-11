@@ -54,6 +54,9 @@ agent:
     The status page is customers reading during an outage: update it early,
     in plain words, and close it honestly.
   ask_human_fallback: wait
+  # Runs started by a webhook or a schedule are nobody's: their human
+  # gates open as tasks on the A2A listener, for an operator to answer.
+  ask_human_unowned: gate
   # An incident run's text came from an alert webhook, and this root holds
   # `infra` and `statuspage`, the other two legs. It keeps its read-back
   # tools, its plan and its subagents all the same: a run's or a child's

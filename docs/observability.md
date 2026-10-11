@@ -1,837 +1,471 @@
-# Observability
+# Monitor in production
 
-agentd is a *process tree*, not a thread pool, and it is reactive — it spends
-most of its life asleep. That shapes everything below. The contract has three
-jobs:
+This guide shows how to watch a running agentd: read its log stream, probe
+its health, scrape its metrics, export traces, alert on the signals that
+matter and keep an audit trail. It is for operators wiring agentd into an
+existing logging and monitoring stack. Every event and metric it mentions is
+listed in the [Events and metrics reference](telemetry-reference.md).
 
-1. **Reassemble the tree off-box.** The unit of intelligence is a child
-   *process* (the same binary re-exec'd) nesting into a supervised tree. `ps`
-   and `pstree` already show that tree on the box; the logs must reassemble the
-   *same* tree off-box, **with no backend join**.
-2. **Keep two schemas honest.** The supervisor makes no LLM calls and holds no
-   conversation state — its telemetry is lifecycle/control. The subagent's
-   telemetry is reasoning (steps, tool calls, tokens). Same line schema, two
-   `comp` labels.
-3. **Distinguish "healthy and idle" from "hung."** A reactive agentd subscribed
-   to MCP resources idles for hours by design, so **health is never inferred
-   from traffic** — it is measured at the supervisor's own event loop.
+## Where telemetry goes
 
-The default build ships exactly two things: a hand-rolled JSON-lines logger to
-stderr (no `tracing`, no metrics SDK, no OTLP) and a tiny health surface (exit
-code + an optional `--health-file`). Everything heavier is feature-gated.
+agentd writes everything about itself to **stderr**, one JSON object per
+line. **stdout** carries only a job's result, so the two separate with an
+ordinary redirect and never need a parser to tell them apart. Child
+processes (turn workers and subagents) inherit stderr, so one capture holds
+the whole tree.
 
----
+The other channels are opt-in.
 
-## stdout vs stderr
-
-The split is absolute:
-
-- **stdout = the agent's result only.** For a `once` run, the final result body
-  goes to stdout and nothing else does. Pipe it straight into `jq`.
-- **stderr = all telemetry.** One JSON event per line, NDJSON. Every line
-  self-identifies (`run_id`, `agent_path`, `pid`, …), so the container
-  runtime/collector captures stderr and you reassemble the tree later.
-
-In subagent mode stdout is the control channel back to the parent, so telemetry
-still goes to **stderr** — never mixed into the channel.
-
-```sh
-# result on stdout, telemetry on stderr — cleanly separable
-agentd --instruction "summarise /data/report.md" \
-       --intelligence https://gw.example/v1 \
-       --mcp fs=https://mcp-fs.internal/mcp \
-  > result.json 2> telemetry.ndjson
+```mermaid
+flowchart LR
+  S["supervisor"] -->|"JSON lines"| E["stderr"]
+  W["turn workers and subagents"] -->|"JSON lines"| E
+  S -->|"job result"| O["stdout"]
+  E -->|"captured by"| C["container runtime or journald"]
+  S -->|"/metrics /healthz /readyz"| P["Prometheus and the kubelet"]
+  W -->|"OTLP traces"| T["OTLP collector"]
+  S -->|"OTLP logs"| T
+  S -->|"A2A status and event feed"| U["operators and display clients"]
 ```
 
----
-
-## The line schema
-
-One event per line, NDJSON, snake_case keys, stable. Renaming a field is a
-breaking change. The canonical block is written first; event-specific fields are
-merged after it and can never shadow a canonical key.
-
-| Field | Always | Meaning |
+| Channel | Turn it on with | Use it for |
 |---|---|---|
-| `ts` | yes | RFC 3339 UTC, millisecond precision, e.g. `2026-06-25T10:00:00.123Z`. Always UTC — no local time, ever. |
-| `level` | yes | `trace` \| `debug` \| `info` \| `warn` \| `error` |
-| `event` | yes | dotted event type from the closed vocabulary — the primary index key |
-| `run_id` | yes | ULID for the whole invocation (the unit of work), constant across the entire tree |
-| `agent_id` | yes | emitting process id; the supervisor uses the reserved `sup` / `root` |
-| `agent_path` | yes | dotted tree path (`0`, `0.2`, `0.2.1`) — **the cheap superpower:** subtree queries by prefix, no backend join |
-| `comp` | yes | `supervisor` \| `agent` \| `mcp` \| `intel` |
-| `pid` | yes | joins the log tree to the free OS `pstree` |
-| `span_id` / `parent_span_id` | in-span | 8-byte hex |
-| `trace_id` | when propagation on | 16-byte hex, W3C |
-| `dur_ms` | on `*.end` / `*.result` | duration in milliseconds |
-| `err` | on errors | structured `{ "type": "...", "message": "..." }` — never a stringified stack |
-| `msg` | optional | a short human string; never the structured payload |
-| event-specific | | `tool`, `server`, `tokens_in` / `tokens_out`, `resource_uri`, `route`, `call_id`, … |
+| stderr JSON lines | always on | The full record: ship it to your log store |
+| `/healthz`, `/readyz`, `/metrics` | `observability.metrics_addr` | Probes, dashboards, alerts, autoscaling |
+| Health file | `observability.health_file` | Liveness where you cannot open a port |
+| OTLP traces and logs | `observability.otel` | Distributed tracing in your collector |
+| A2A status and event feed | `a2a.listen` | Live state for operators and the UI ([Operate a running daemon](operations.md)) |
+| Audit trail | `observability.audit.sink` | Who did what, on whose authority |
 
-Example — one supervisor line and one agent line:
+agentd does no log rotation or shipping of its own. The container runtime,
+journald or your collector owns capture.
 
-```json
-{"ts":"2026-06-25T10:00:00.012Z","level":"info","event":"subagent.spawn","run_id":"01J8XAMPLE...","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1421,"child_agent_id":"01J8...c","child_path":"0.2","instruction_hash":"b1946ac9","tool_scope":["fs.read"],"depth":1}
-{"ts":"2026-06-25T10:00:01.534Z","level":"info","event":"tool.result","run_id":"01J8XAMPLE...","agent_id":"01J8...c","agent_path":"0.2","comp":"agent","pid":1457,"span_id":"a1b2c3d4e5f60718","parent_span_id":"00f067aa0ba902b7","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","server":"fs","tool":"read_file","call_id":"c-7","ok":true,"dur_ms":42,"result_bytes":2048}
-```
+## See the stream locally
 
-Set verbosity with `--log-level trace|debug|info|warn|error` (default `info`;
-env `AGENTD_LOG_LEVEL`). The level filter is a cheap integer compare *before* any
-allocation — below-level calls cost essentially nothing.
+You can produce a real stream without a model key. The `mock:` model
+endpoint, in the release binaries and the container image, answers from a
+script instead of a provider: `mock:file:<playbook.json>` plays the turns
+the file lists. This script makes the agent call one tool and then finish.
 
----
-
-## The event vocabulary
-
-The `event` string is the backbone — what you filter, count, and alert on. It is
-a dotted, hierarchical set. Adding an event later is cheap; renaming one
-breaks dashboards. The supervisor/lifecycle and agentic-loop events below are
-the core set, not the whole set — the deeper subsystems and the build-gated
-surfaces each add their own — so filter on a prefix, never on this list being
-exhaustive.
-
-### Supervisor / lifecycle (`comp:"supervisor"`)
-
-| Event | Fields beyond canonical |
-|---|---|
-| `proc.start` | `version`, `instance`, `config_files` |
-| `proc.ready` | readiness reached (see [Health](#health-shape-aware)) |
-| `proc.exit` | `code`, `uptime_ms` |
-| `config.invalid` / `config.warning` / `config.reloaded` | `error` / `warning` — one validation or reload finding, never a secret value; `config.reloaded` carries `trigger` and `changed` |
-| `mcp.connect` | `server`, `tools` (count, at boot), `protocol` (the MCP revision the connection negotiated: `2025-11-25` through the handshake, `2026-07-28` through `server/discover`), and `reason` on a reload, a re-dial or a join (`joined`: a server down at boot came up) |
-| `mcp.joined` / `mcp.join.refused` | `server` / `errors` — a server down at boot joined (its connection adopted), or its join was refused, say by a registry its tools would not build into (and is dialed again on the backoff, 1 s → 60 s) |
-| `mcp.connect.fail` | `server`, `err`, and `reason` on a reload or a re-dial |
-| `mcp.tool.dropped` | `server`, `tool`, `reason` — at warn level, once per tool per connection: the server listed a tool the MCP client dropped (an `x-mcp-header` annotation it rejects, at 2026-07-28), so the agent cannot call it |
-| `mcp.disconnect` | `server`, `reason` (`reload`, `reload refused`, or `session_lost`: the server answered `404` to the connection's session, and agentd re-dials it) |
-| `mcp.connect` (`reason: session_lost`) / `mcp.connect.fail` (`reason: session_lost`) | `server` / `err` — the re-dial after a lost session; a failed one is retried on a 1s→30s backoff. A successful one restores the starts, waits and instruction on that server, each said under its own event with `reason: session_lost` |
-| `mcp.listen.ended` / `mcp.listen.resumed` | `server` + `reason`, `retry_ms` — a `subscriptions/listen` stream ended and is opened again after `retry_ms`. At info with `reason: "idle"` (and the cut in `detail`) when it was quiet past its idle bound, at warn otherwise. A URI whose content changed while it was being re-opened gets one `resources/updated`; that is not logged here, the wake it causes is (2026-07-28 connections only) |
-| `mcp.listen.narrowed` | `server`, `dropped` — at warn level: a re-listen was acknowledged without these URIs; they are asked for again (2026-07-28 connections only) |
-| `mcp.listen.unavailable` | `server`, `reason`, `retry_ms` — at warn level, once per run of refusals: the listen carrying the server's `list_changed` notifications failed or got no answer, and is asked for again on the listen backoff without another line (`mcp.listen.resumed` says when it is held) — or the server refused the method or its filter (`-32601`/`-32602`), and it is not asked for again (2026-07-28 connections only) |
-| `mcp.listen.flags_refused` | `server`, `reason` — at warn level: the server refused (`-32601`/`-32602`) a listen that asked for its `list_changed` notifications beside URIs; the URIs are held without them from then on (2026-07-28 connections only) |
-| `start.schedule.armed` / `start.subscribe.armed` | `workflow`, `node` + `next_ms` (schedule) or `server`, `uri` (subscribe), and `reason` (`reload`, `session_lost`, `retry`) when the start is subscribed again rather than armed — a start node armed |
-| `start.subscribe.unsupported` | `workflow`, `node`, `server`, `uri`, `err` — at error level: the server does not advertise `resources.subscribe` (or left the URI out of a listen acknowledgment), so this start can never fire |
-| `start.subscribe.fail` | `workflow`, `node`, `server`, `uri`, `err` — at warn level: a subscribe that may succeed later (a timeout, a `5xx`); it is asked for again on a 1s→30s backoff |
-| `instruction.subscribe.unsupported` / `instruction.subscribe.fail` / `instruction.reread.fail` | `server`, `uri` (+ `err`) — the resource instruction's server offers no `resources.subscribe` (said once, when the instruction is first read from it; the `refresh` re-read alone follows it) / a subscribe to it failed (asked again on a backoff unless the server refused it) / reading it again after a re-dial failed (asked again on a backoff) |
-| `wait.resubscribed` / `wait.resubscribe.fail` | `server`, `uri`, `reason` (+ `err`) — a suspended `wait on: resource` was subscribed again: `reason: boot` for every wait restored from the store, `reload` on a server a reload dialed or dropped, `session_lost` after a re-dial, `retry` when a failed one is asked again. A wait that can never be woken — its server is gone from the config, or does not advertise `resources.subscribe` (or left the URI out of a listen acknowledgment) — is `wait.resubscribe.fail` at error level, with `failed` (how many steps), and those steps fail. A server that is configured but not connected (down at boot, or its reload re-dial failed) is at error level with `parked` (how many steps): the waits stay parked under their timeouts until a reload connects it. Any other failure is at warn level, and is asked again on a 1s→30s backoff |
-| `mcp.unsubscribed` / `mcp.unsubscribe.fail` | `server`, `uri`, `reason: unowned` (+ `err`) — a URI the connection held that no owner wants any more (no armed `subscribe` start, no suspended `wait on: resource`, not the resource instruction: a wait resolved, timed out or was cancelled, its run ended, the instruction moved) was let go of, on the server too; looked at every 5s. A failure is at warn level and is looked at again a minute later; a connection whose session is lost is left to its re-dial |
-| `workflow.unsubscribed` / `workflow.unsubscribe_fail` | `workflow`, `server`, `uri` (+ `err`) — a workflow a reload or `workflow.delete` retired let go of its `subscribe` start's URI, which no other owner wants |
-| `mcp.events.listed` | `server`, `types` — a server's MCP Events listing was read (at a binding's first need, every 15 min, after a reload that dialed the server, and when the server says its list changed) |
-| `mcp.events.armed` | `server`, `event_type`, `mode` (`poll`, `webhook`), `cursor_present`, and for a webhook `truncated` — a binding is polling, or its webhook subscription was made (fresh, from the stored cursor); `cursor_present: false` starts it from now |
-| `mcp.events.refused` | `server`, `event_type`, `reason`, `detail` — at error level, once per refusal: the binding is not polled until a reload, a re-dial or a later listing allows it. `reason` ∈ `revision`, `no_capability`, `method_not_found`, `unknown_event`, `no_common_mode`, `invalid_arguments`, `forbidden`, `not_supported`, `list_too_large` (docs/mcp.md §1.8) |
-| `mcp.events.paused` / `mcp.events.resumed` | `server`, `event_type`, `cause` (`pressure`, `store_degraded`, `rate`, `refusal`) — at warn / info: the binding holds its cursor and is not polled while the cause lasts; a webhook binding paused for `refusal` (a delivery refused for 5 minutes) unsubscribed, and re-arms from its cursor on resuming |
-| `mcp.events.arm.fail` | `server`, `event_type`, `err`, `retry_ms` — a webhook subscribe that may pass on a retry; it backs off with jitter |
-| `mcp.events.callback_failed` | `server`, `event_type`, `reason` (the draft's category: `connection_refused`, `timeout`, `tls_error`, `http_4xx`, `http_5xx`, `challenge_failed`), `url` — at error level: the server could not verify or reach `webhooks.url`; after five in a row the binding moves to its next listed mode |
-| `mcp.events.mode_changed` | `server`, `event_type`, `from`, `to`, `cause` — at warn level: the server would not deliver in the chosen mode, and the binding moved to the next one the operator listed |
-| `mcp.events.delivery_suspended` | `server`, `event_type`, `last_error`, `active` — at warn level: a refresh said deliveries failed (perhaps ones agentd never saw); the binding re-arms from its stored cursor |
-| `mcp.events.throttled` | `server`, `event_type`, `retry_after_ms` — the server says it is delaying deliveries, not failing them |
-| `mcp.events.terminated` | `server`, `event_type`, `code` — at error level: the server ended a webhook subscription (`-32024` refuses the binding; `-32023` or `-32026` lists the server again; anything else re-arms after a backoff) |
-| `mcp.events.hook.denied` | `server`, `event_type`, `reason` (`missing_header`, `bad_timestamp`, `stale`, `bad_signature`, `subscription_mismatch`) — at warn level: a request to a webhook binding's route that did not verify, answered `401` |
-| `mcp.events.hook.unsaved` | `err` — at warn level: a delivery appended but the stream head not saved; answered `503`, so the server retries |
-| `mcp.events.poll.fail` | `server`, `event_type`, `err`, `code` (when the server answered one), `retry_ms` — a poll that may pass on a retry; the binding backs off with jitter and keeps its cursor. At error level for `-32020` (a header the server refused: a defect in agentd's request) |
-| `mcp.events.list.fail` | `server`, `err`, `retry_ms` — a listing that may pass on a retry |
-| `mcp.events.rejected` | `server`, `event_type`, `event_id`, `cause` (`oversize`, `malformed`) — at warn level: an occurrence not appended; the cursor moves past it |
-| `mcp.events.schema_mismatch` | `server`, `event_type`, `event_id` — at warn level: appended with `schema_ok: false`; the type is listed again |
-| `mcp.events.gap` | `server`, `event_type`, `cause` (`truncated`: the server skipped from the cursor; `no_replay`: a type without replay re-armed after downtime, or — with `refused`, a count — webhook deliveries refused and now past recovering; `schema_changed`: the type changed in place, and the cursor minted under the old schema was let go) — at warn level |
-| `mcp.events.list_changed` | `server` — the server said its event types changed (on the standing listen, which asks for `eventsListChanged`); they are listed again now |
-| `mcp.events.subscribed` / `mcp.events.unsubscribed` | `server`, `event_type`, `owner` (`{kind: config\|wait\|tool, …}`), `reason`, `subscription` — a runtime subscription made or let go (a wait that subscribed, an `events.*` call; `reason` on letting go: `wait_left`, `expired`, `run_ended`, `unsubscribed`, `grant_removed`, `grant_narrowed`, `grant_max`, `instance_cap`, `refused`). Each is also an audit entry |
-| `mcp.events.removed` | `server`, `event_type`, `reason` — a reload removed a binding; its records went with it |
-| `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
-| `start.shed` / `start.frozen` / `start.inbox.failed` | `workflow`, `node`, `kind`, plus `cause` (`err` for the inbox) — a firing was refused: resource pressure, a §7.7 freshness freeze, or a failed write of the durable inbox. A `stream` or `correlate` consumer's line also names what it holds — `stream` with `seq` and `event_id` (one event), `from`, `to`, `events`, `seqs` and `event_ids` (a batch) or `correlation`, `events`, `seqs` and `event_ids` (a join) — and that stays unconsumed and is offered again on later passes; a held consumer reads no further until it is admitted. The line is written once when the consumer starts being held, not on every pass |
-| `start.inputs.invalid` | `workflow`, `node`, `kind`, `err`, plus the same stream fields — the start's `inputs` mapping did not render and the firing is cancelled. The same event would fail the same way every time, so a stream consumer moves past it, and this line is its record |
-| `start.too_large` | `workflow`, `node`, `kind`, `err`, plus the same stream fields — the start event is larger than `store.max_value_bytes`, so the durable inbox refused it. Like `start.inputs.invalid`, it would be refused the same way every time: a stream consumer moves past it (a whole batch or join, every event of which the line names), and a webhook answers `413` |
-| `stream.consumer.skipped` | `stream`, `workflow`, `node`, `from`, `to`, `events` — events this consumer had not read yet are gone: retention trimmed them, or their record is missing or (after a `stream.event.corrupt` line) unreadable. The consumer continues from the next event still kept |
-| `stream.read.failed` | `stream`, `seq`, `workflow`, `node`, `err` — the store did not answer a consumer's read of `seq`. The event may well be there, so the consumer holds at it and reads it again on later passes; written once when the hold starts |
-| `stream.event.corrupt` | `stream`, `seq`, `workflow`, `node`, `err` — the record at `seq` is there but does not parse; the consumer reports it with the next `stream.consumer.skipped` line and moves on |
-| `stream.head.recovered` | `stream`, `from`, `to`, `complete` — an append found events already stored past the stream head the manifest recorded (a crash between an append and the head's flush, or a second writer sharing this stream's store identity) and moved the head over them, keeping them. `complete: false`: the gap was longer than one append walks (1024 keys); the head is recorded as far as it got, the append is refused, and the next one carries on |
-| `webhook.idempotency.unrecorded` | `workflow`, `node`, `err` — a kept delivery's idempotency marker could not be written. The delivery stands and was answered `2xx`; a replay of it is processed again (a second run, or a second copy of the event under the same id, which stream consumers drop) |
-| `webhook.idempotency.expired` | `markers` — the sweep deleted that many markers past their seven-day TTL |
-| `webhook.idempotency.sweep.fail` | `err` — a marker sweep pass failed; it is tried again on the next sweep |
-| `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
-| `unsubscribe` | `resource_uri`, `server`, `by` |
-| `subagent.spawn` | `node`, `depth` (the child re-exec'd) |
-| `subagent.result` / `child.exit` | the child's terminal pair: the result frame (`handle`, `status`, `tokens`, `err`), then the reap (`node`, `pid`, `kind`, `outcome`) |
-| `subagent.stuck` | `node` — liveness classification (not a deadline) condemned the child |
-| `child.unhealthy` / `subagent.kill` / `subagent.cancel` / `subagent.respawn` | `node`, `health` / `handle` / `reason` / `handle`, `node` — the child was found unhealthy, stopped, acknowledged its cancel, or was respawned |
-| `drain.start` / `drain.done` / `drain.abandon` | `live`, `drain_ms` — the SIGTERM drain began, completed, or exceeded its budget (the ladder is forced) |
-| `limit.exceeded` | `limit` (`tree_tokens`/…) — a tree budget tripped |
-| (no event) | the lethal-trifecta refusal happens inside `validate()`, **before the logger exists**, so it surfaces as a plain-text refusal message on stderr with exit 2 — as a `config.invalid` diagnostic line under `--validate-config` and `--effective-config` — never as a structured log event; an allowed trifecta (`--allow-trifecta` / `security.allow_trifecta`) emits nothing at all |
-| `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
-| `a2a.conn` / `a2a.send` / `a2a.delegate` | `err` / `run`, `step`, `to` / `run`, `step`, `peer` — a connection could not be served (level `debug`), an A2A message was sent to a peer, or a run was delegated to one (`--features a2a`) |
-| `a2a.denied` | `principal`, `rule`, `method`, `op`, `reason`, `status` — a listener refusal (see the operability table below; the admin ops themselves are audited, not logged) |
-| `turn.refused.not_owner` | `ctx`, `principal`, `reason` — a turn queued for a conversation its principal does not own (a `message.send` its own model aimed at the root or at another caller's key) was refused, and its task failed, rather than run in somebody else's conversation |
-| `lifecycle.until_signal.refused` | `signal`, `principal` — the `lifecycle.until_signal` signal arrived from a sender that may not retire the instance; only the operator or the runtime drains it |
-| `instance.spawn.refused` | `template`, `reason` — an instance-tier subagent was refused before anything was created: the parent's TCP listener requires a credential and the child would carry none, so every report it sent home would be refused (make `a2a.bearer` a `{{secret:…}}` reference, or listen on a unix socket) |
-| `instruction.unavailable` | `uri`, `server`, `err`, `policy`, `trust_pinned` — the instruction source could not be re-read before its deadline; `server` names the MCP server that stopped answering, and `policy` is what `agent.instruction.unavailable` did about it |
-| `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
-| `readback.withheld` | `run` or `subagent` (whose result), `reader` (`conversation`, `run:<id>` or `subagent:<handle>`), `via` (the tool — `workflow.run`, `workflow.status`, `status`, `subagent.await`, … —, the step — `join`, `wait on: run`, `wait on: subagent`, `workflow step` — or the note: `plan.update`, `agent.on_workflow_finished`, `agent.wake_on`, `emit note`), `reason` (the marker that replaced the text) — a result that may carry outside input was read back by a context holding `sensitive` and `egress`, and its output, error and step outputs were withheld ([security](security.md), "A result read back is withheld") |
-| `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
-
-`--validate-config` is the exception to every rule above: it answers with a bare
-`{"event": "config.valid", …}` or `{"event": "config.invalid", …}` line carrying
-none of the canonical envelope fields, because there is no instance to describe —
-nothing has started, and nothing will. Treat it as the tool's verdict, not as a
-log event, and branch on the exit code.
-
-### Agentic loop (`comp:"agent"`; `intel.*` carry `comp:"intel"`)
-
-| Event | Fields beyond canonical |
-|---|---|
-| `loop.start` | `trigger` (`spawn`/`continue`/`resume`), `step` |
-| `loop.step` | `step`, `tokens_in`, `tokens_out` |
-| `loop.final` | `step`, `result_status`, `result_bytes` |
-| `loop.error` | `err`, `step` |
-| `intel.call` | `model`, `tokens_in` (estimated) |
-| `intel.result` | `model`, `tokens_in`, `tokens_out`, `finish_reason`, `dur_ms` |
-| `tool.call` | `tool`, `id`, (`args` only with content capture on) |
-| `tool.result` | `tool`, `is_error`, `bytes` (`content` only with content capture on) |
-
-`comp:"mcp"` is used for transport-level lines folded from MCP
-`notifications/message`; it reuses these event names (e.g. `mcp.disconnect`) and
-introduces **no** new `event` strings.
-
-> **Emission notes (vocabulary vs wire).** A graceful shutdown is
-> `proc.exit{reason:"drain"}` (there is no separate `proc.shutdown`); the
-> restart-governor breaker tripping is `proc.exit{reason:"restart_breaker"}`; the
-> child kill path is `child.unhealthy` → `subagent.kill`/`subagent.cancel` →
-> `child.exit` (no generic `subagent.signal`/`subagent.restart`). Start nodes
-> arm and fire under the `start.*` vocabulary — `start.schedule.armed` /
-> `start.subscribe.armed` / `start.fired` — never a generic
-> `trigger.armed`/`trigger.fired`. Build-gated surfaces also emit `metrics.*` /
-> `cron.unavailable` / `mcp.serve_unavailable` when a flag needs a feature.
-
-### Operability: the listener, hot reload, intelligence swap
-
-These events come from the operability surfaces (the A2A listener, hot reload,
-the intelligence hot-swap). They are emitted only by the builds that serve them
-(`a2a` / `hot-reload` / `config-watch`). The operator/control-plane framing for
-each lives in [`docs/operations.md`](operations.md).
-
-| Event | `comp` | Fields beyond canonical |
-|---|---|---|
-| `a2a.listen` | `supervisor` | `authority`, `bound`, `url`, `tls`, `mtls`, `required`, `implicit_operator`, `device_grant`, `events`, `introspection` — the listener bound, and the posture it enforces |
-| `a2a.conn` | `supervisor` | `err` — a connection could not be served (level `debug`) |
-| `a2a.denied` | `supervisor` | `principal`, `rule`, `method`, `op`, `reason`, `status`, plus `sid` for a signed-in session — a refusal: `reason` is `unauthenticated`, `invalid_credential`, `no_role`, `not_permitted`, `rate_limited` or `auth_failures_limited`; `rule` is the declared id of the principal rule that named the caller. The refusals a stranger can provoke for free are written once per source and reason per minute, with `suppressed` counting what the window left out; a named principal's method or op refusals are written every time, and its rate refusals are bounded like a stranger's |
-| `drain.start` / `drain.done` / `drain.abandon` | `supervisor` | the `admin.drain` op and SIGTERM share this path (see the lifecycle table above) |
-| `agent.paused` / `agent.resumed` | `supervisor` | `reason` — an instance-wide `admin.pause` hold went on or came off |
-| `run.paused` / `run.resumed` | `supervisor` | `run`, `reason` — a single run was held or released |
-| `config.reloaded` | `supervisor` | `trigger` (`sighup`/`watch`), `changed` (the reloadable group labels; a reload with no material change reports `["nothing"]`) — a reload was **applied** |
-| `config.reload.invalid` | `supervisor` | `trigger`, `error` — the candidate did not validate; a clean no-op |
-| `config.reload.restart_required` | `supervisor` | `trigger`, `paths` — the diff touched a restart-only path; a clean no-op |
-| `config.watch.armed` / `config.watch.fired` / `config.watch.error` | `supervisor` | `file`/`err` — the `lifecycle.watch_config` inotify watcher armed, fired on a ConfigMap swap, or hit an I/O error |
-| `intel.swap` | `intel` | `kind` (`model`/`endpoint`), `model_from`, `model_to`, `endpoint_change`, `policy` — a hot-swap was applied at a turn boundary (no URL, no secret) |
-| `intel.swap.reject` | `intel` | a parked swap was refused at the turn boundary |
-
-> The admin ops themselves are recorded in the **audit stream**, not as
-> separate log events: every command DataPart yields an `audit` line whose
-> action is `a2a.<method>:<op>` — `"a2a.SendMessage:admin.drain"`,
-> `"a2a.SendMessage:workflow.run"` — with the principal, role and outcome. See [operations §6](operations.md).
-
-> The intelligence-swap line carries the model *names* (non-secret identifiers),
-> the swap kind, and whether the endpoint list changed — **never** the endpoint
-> URL or credential. Endpoint identity is transport+index only, carried by the
-> `intel.health` / `intel.swap` telemetry, never inline.
-
----
-
-## The runtime as a stream
-
-agentd emits a large dotted event vocabulary and, until now, exposed almost
-none of it to *itself*. "The breaker tripped" was a log line, not something a
-workflow could act on; audit records were written and then unreadable, since
-their kind is deliberately excluded from the manifest index. Remediation,
-paging, SLO accounting and compliance evidence all had to live outside the
-process.
-
-`observability.runtime_events` mirrors selected event families onto a declared
-stream, so they become ordinary `{kind: stream}` start nodes with the
-retention, subject globbing, CEL filters and exactly-once dedup those already
-have:
-
-```yaml
-streams:
-  _runtime:    {retention: {max_events: 5000,   max_age: 24h}}
-  _governance: {retention: {max_events: 200000, max_age: 400d}}
-
-observability:
-  runtime_events:
-    stream: _runtime
-    include: [breaker, intel, store, child]   # taken in full
-    sampled: [pressure]                       # 1-in-16
-  audit: {sink: [log, stream], stream: _governance}
-```
-
-The subject is the event name, so a consumer globs `breaker.*` the way it would
-any other stream. `audit.sink: [stream]` gives the audit trail its first
-supported path off the box — and makes compliance evidence a *scheduled
-workflow* that reads a window and ships it, rather than a subsystem in the
-binary.
-
-Families are a **closed vocabulary**: `include: [pressur]` is a startup error,
-not a filter that silently matches nothing.
-
-Either stream carries what runs produced — `run.done` carries a run's error (and
-its output under `log_content`), an audit record the question an `ask_human`
-put — so the load-time taint check counts it as fed by every run, whatever the
-families: a workflow consuming it is judged with the taint of every run that
-read outside text ([security](security.md), "Streams carry the taint of what
-feeds them").
-
-### Why not the event ring
-
-The obvious implementation would tee the in-memory ring the `debug.events`
-command op drains. That ring is explicitly lossy oldest-evicted and is installed
-only once `a2a.introspection.enabled` is on, so teeing it
-would produce silent gaps in exactly the consumer being sold, and in the default
-deployment would do nothing at all.
-This taps the emission itself, beside the existing ring and OTLP taps.
-
-### Budgeting its own volume
-
-An event system that does not budget itself becomes its own pressure source,
-and the refusals that matter most arrive in storms precisely when the
-constrained resource is what would be written to. Four bounds:
-
-- the queue between ticks is **fixed** and counts what it drops, keeping the
-  oldest — so the start of a storm survives and the count says how big it got;
-- a family may be **sampled** at 1-in-16, so `pressure.shed` need not share a
-  list with a once-a-week `config.reloaded`;
-- appends go through the ordinary admission path, so they **shed under
-  pressure** like everything else;
-- a refused append is dropped, never retried — telemetry queued behind a full
-  disk is a second outage, not a record.
-
-Capture is suspended while draining, because a stream at its retention ceiling
-logs a trim on *every* append: without that, one appended event would produce
-the next one forever, fastest exactly when the stream is already full.
-
-## Tree correlation
-
-This is the whole trick: lineage is encoded *in the values*, so collectors
-rebuild the tree by string prefix and never run a join.
-
-- **`run_id`** → "all telemetry for this unit of work." One ULID, constant from
-  the root supervisor down through every nested subagent.
-- **`agent_path`** → "this subtree." `0` is the root; `0.2` is its third child;
-  `0.2.1` is that child's second child. Querying a subtree is a prefix match:
-
-  ```sh
-  # everything under subagent 0.2 (including its descendants)
-  grep '"agent_path":"0.2' telemetry.ndjson | jq -c '{ts,comp,event}'
-  ```
-
-- **`pid`** → joins the log tree to the OS tree. `subagent.spawn` logs the
-  child's `pid`, so the NDJSON tree and `pstree` are joinable; `subagent.stuck`
-  can cite OS process state (`proc_state`: `D` / `Z` / running) next to
-  `last_event_age_ms`.
-
-Lineage is handed down once at spawn, exactly like environment inheritance. The
-supervisor includes a `telemetry` block in the spawn payload (alongside
-instruction / scope / limits); the child builds its own correlation context from
-it in early `main`, before any side effect, so **every line it emits is
-pre-correlated**:
+Save the script as `playbook.json`:
 
 ```json
 {
-  "telemetry": {
-    "run_id":         "01J8XAMPLE...",
-    "trace_id":       "4bf92f3577b34da6a3ce929d0e0e4736",
-    "parent_span_id": "00f067aa0ba902b7",
-    "agent_path":     "0.2",
-    "agent_id":       "01J8...child",
-    "log_level":      "info",
-    "log_content":    false
-  }
+  "turns": [
+    {"tool_calls": [{"name": "memory.set", "arguments": {"key": "greeting", "value": "hello"}}]},
+    {"content": "Stored the greeting.", "usage": {"prompt_tokens": 120, "completion_tokens": 8}}
+  ]
 }
 ```
 
-**Depth and path are minted by the supervisor, never trusted from the child:**
-`agent_path = parent_path + "." + child_index`. No registry, no service
-discovery, no join-key negotiation.
+Run a one-shot job against it, result to one file and telemetry to another:
 
-### Getting telemetry off-box — two wirings
-
-- **(A) default — each process writes its own stderr.** The container
-  runtime/collector captures it; agentd does no aggregation and never becomes a
-  logging bottleneck. Cleanest for Kubernetes. Reassemble by `run_id` +
-  `agent_path` prefix.
-- **(B) `--aggregate-logs` (roadmap)** — child telemetry is framed up the
-  existing control channel and the supervisor re-emits it on its own stderr, for
-  single-stream environments (deeply nested local runs where only the root's
-  stderr is captured). The supervisor **forwards, never rewrites** the
-  correlation fields. Consumers sort by `ts` + `span_id`, never by arrival order
-  (forwarded lines can arrive out of order).
-
-> The correlation scheme above is identical for sync and async spawns.
-
----
-
-## Content capture (off by default)
-
-The default logs **hashes and lengths only** — never raw content:
-
-- `instruction_hash`, `args_hash`, `result_bytes`, `tokens_in` / `tokens_out`.
-- `*_hash` is the first 8 hex chars of a fast non-cryptographic digest — a
-  stable correlation aid, **not** a security primitive.
-
-`--log-content` (env `AGENTD_LOG_CONTENT`) opts in to capturing
-prompt / tool-arg / result bodies. It is loud, gated, and redaction-aware. It is
-a debug/non-prod switch.
-
-**Secrets never appear, capture on or off.** A field allowlist governs what is
-serialized; values resolved through the secrets path (the intelligence token,
-MCP-server env secrets) are structurally excluded and credential-typed values
-`Debug`-print as `***`. Note the honest limit: a secret a model passes as a
-free-form tool argument is not guaranteed to be redacted under `--log-content`,
-which is exactly why it is non-prod.
-
----
-
-## W3C trace-context propagation (on by default)
-
-Propagation is a few JSON/header fields, so it is free and **on by default**.
-Span *export* is heavy and gated behind the `otel` feature — see
-[Metrics & traces](#metrics--traces). With export off, your logs still carry
-`trace_id` / `span_id`, so you can correlate them to any upstream trace with no
-backend.
-
-**Ingest (mint-or-adopt):**
-
-- If an inbound `traceparent` arrives — on an inbound A2A request to agentd's
-  listener, or via the **`AGENTD_TRACEPARENT`** env var when an orchestrator starts
-  the pod — adopt its `trace_id` and use its `span_id` as the root
-  `parent_span_id`.
-- Otherwise **mint one `trace_id` per `run_id`** (16 random bytes) so the run is
-  self-correlated. A malformed inbound header is ignored and we mint instead — a
-  bad trace header never fails a run.
-
-`traceparent` is parsed per W3C: `00-<32hex trace_id>-<16hex span_id>-<2hex flags>`.
-
-**Propagate outward (all in the default build):**
-
-- **MCP calls:** `_meta.traceparent` (+ `tracestate` / `baggage` when present)
-  on every outbound `tools/call` and `resources/*`, so downstream MCP servers'
-  spans line up.
-- **LLM call:** the standard `traceparent` HTTP header on the intelligence
-  request.
-- **Subagents:** the spawn `telemetry` block carries `{trace_id, parent_span_id}`
-  so the child continues the same trace.
-
----
-
-## Health (shape-aware)
-
-An event-driven agentd is *supposed* to be idle, so **liveness is measured at the
-supervisor's event loop, not at the agent**. What readiness means depends on the
-workflow's start node.
-
-| Start node | Readiness | Liveness | Terminal health |
-|---|---|---|---|
-| `once` / `manual` | implicit (the run *is* the readiness) | n/a — bounded | **exit code** is the entire signal |
-| `loop` / `schedule` | config parsed, MCP connected, first tick armed → `proc.ready` | heartbeat advances each tick | exit code |
-| `subscribe` / `signal` / `event` / `a2a` | MCP connected **and** every declared subscription reconciled (subscribed + read-after-subscribe) → `proc.ready` | supervisor heartbeat; **idle is healthy** | exit code |
-
-**Liveness = the supervisor heartbeat.** The reactor bumps a monotonic
-`last_loop_tick` on *every* wake, including idle timeout expiries. If
-`now - last_loop_tick` exceeds a threshold, the *supervisor* is wedged → fail
-liveness → let the orchestrator restart the pod. **A stuck subagent must NOT
-flip liveness** — the supervisor detects and kills it (emitting `subagent.stuck`)
-while the pod stays live; failing liveness on a stuck child would destroy the
-whole healthy tree.
-
-**Readiness = `proc.ready` reached and subscriptions reconciled.** Before that
-the pod is not "ready", so an orchestrator won't route work to it.
-
-### The health surface — a minimal ladder
-
-1. **Exit code (always, free).** Primary for one-shot, final for daemons. The
-   table is stable — a scheduler may branch on these values:
-
-   | Code | Meaning | Scheduler hint |
-   |---|---|---|
-   | 0 | success (one-shot completed / clean SIGTERM drain) | Complete |
-   | 1 | generic / unspecified failure | retriable |
-   | 2 | config / usage error (validation) | non-retriable |
-   | 3 | partial result | policy |
-   | 4 | intelligence unreachable / auth after retries | retriable |
-   | 5 | semantic — task cannot be done / refused | non-retriable |
-   | 6 | required MCP server failed to connect / handshake / died | retriable |
-   | 7 | budget exceeded (steps / tokens / deadline / tree) | policy |
-   | 124 | hard wall-clock deadline — a run or turn ran past `limits.run.deadline` (mnemonic to `timeout(1)`) | — |
-   | 137 | killed by SIGKILL (128+9, OS-set) — often OOM | raise memory |
-   | 143 | killed by SIGTERM (128+15, OS-set) — ungraceful | — |
-
-   A clean SIGTERM drain returns **0, not 143**. 137/143 are set by the OS when
-   the kernel kills us; agentd never exits those itself.
-
-2. **`--health-file PATH` (default daemon surface).** The supervisor writes the
-   file once a second — **no socket, no port** — via an atomic
-   write-temp-then-`rename`:
-
-   ```json
-   {"ts":"2026-06-25T10:00:00.123Z","run_id":"01J8XAMPLE...","mode":"1",
-    "supervisor_tick_age_ms":34,"alive":true,"draining":false}
-   ```
-
-   `alive` is the heartbeat verdict: the supervisor's last loop tick is fresher
-   than the liveness window (5s — `obs::health::LIVENESS_STALE_AFTER_MS`, the
-   same window `/healthz` judges by) and no drain is under way. Once a drain begins
-   the writer emits one final record with `draining:true` and stops. A Kubernetes
-   `exec` probe reads `alive` (or checks `ts` freshness itself). One
-   dependency-free file write per second:
-
-   ```yaml
-   livenessProbe:
-     exec:
-       command: ["sh","-c","test $(( $(date +%s) - $(date -d \"$(jq -r .ts /run/agent/health)\" +%s) )) -lt 15"]
-     periodSeconds: 5
-   ```
-
-3. **A2A readiness (when `a2a.listen` is on).** An authenticated principal reads
-   the instance status view via the A2A `status` command (and `ListTasks` for the
-   live task/run projection) over the HTTPS listener to learn liveness +
-   readiness — no separate health socket.
-
-4. **HTTP `/healthz` + `/readyz` (opt-in, `--features metrics`).** When an orchestrator
-   wants real HTTP probes, served on `--metrics-addr` by the same hand-rolled blocking HTTP code on
-   one thread — no new dependency. `/healthz` = liveness (heartbeat fresh → 200,
-   stale → 503); `/readyz` = readiness (ready + subs reconciled → 200, else
-   503). Side-effect-free.
-
-**Default = exit code + `--health-file`.** The health file is off for a one-shot
-run — a pure CLI invocation carries zero health machinery. HTTP and socket
-surfaces are opt-in and never on for a one-shot.
-
-> `--health-file`, `--log-level` (plus `AGENTD_LOG_LEVEL`), `--log-content`,
-> `--listen` (the A2A listener), and `--metrics-addr` (behind `metrics`) are the
-> observability flags; see [`config/settings/`](../crates/agentd/src/config/settings/) for the
-> authoritative flag/env list. `--aggregate-logs` and `--health-http` remain
-> roadmap items tracked in
-> [`docs/design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md).
-
----
-
-## Live state reads (the A2A surface)
-
-A control plane reads live state over **A2A** (`a2a.listen`), on the
-same HTTPS listener that carries everything else. Every read resolves to a
-**principal** and is authorized against the role matrix — an anonymous caller is
-refused — so there is no unauthenticated status port. These reads answer "what is
-this instance doing *right now*"; the **metrics** and **OTEL** signals below
-answer the time-series and alerting questions.
-
-| Read | How | Who | Body |
-|---|---|---|---|
-| instance status | `SendMessage` with a `status` command DataPart | any named role, each seeing what it may | instance id, run id, uptime, `draining` / `paused`, the durable store (kind, degraded, generation), armed workflows, live runs, conversations, subagents, OS children, timers, inbox backlog, token budget, tool/skill counts, lifetime counters, instruction source+version, active model, recent activity |
-| effective config | `SendMessage` with a `config` command DataPart | operator | the merged settings document — `{{secret:…}}` **references** only, never resolved values |
-| one task | `GetTask` | the task's owner (operator sees all) | the durable task: state, history, artifacts |
-| all tasks | `ListTasks` | as above | the task/run projection |
-| task updates | `SubscribeToTask` (SSE) | as above | status-update frames until terminal |
-| identity | `GET /.well-known/agent-card.json` | anyone, no credential | name, description, the interface URL and protocol version, capabilities, declared extensions, security schemes |
-| what this caller may run | `GetExtendedAgentCard` | a caller named by a declared scheme | the public card plus the workflows, ops and commands this caller may run |
-| the live event feed | `agentd.events/SubscribeToEvents` (SSE) | any named role; needs `a2a.events.enabled` and the events extension activated | the observation feed ([below](#the-observation-feed)) — per-event visibility |
-| the log ring | `debug.events` command DataPart | operator, needs `a2a.introspection.enabled` | a cursor window of the JSON log lines — see below |
-
-> The redaction discipline is the same as the capabilities manifest and the
-> intel-swap log line: the `status` and `config` reads carry structural names,
-> transport schemes and header *names* only — never a token, an endpoint URL, or
-> a resolved `{{secret:…}}` value.
-
-### `debug.events` — the live log ring
-
-With `a2a.introspection.enabled` on, the same JSON log lines are mirrored into a bounded
-in-memory ring you can tail over A2A — the operator live-tail, without a
-collector round-trip. Its capacity is `observability.events_ring` (flag
-`--events-ring`). A read drains a bounded window with a sequence cursor and
-reports the window bounds plus a **`dropped`** count, so a reader knows when the
-lossy-by-design ring outran it:
-
-```jsonc
-// SendMessage part: {"data":{"agentd":{"op":"debug.events","after":4821,"level":"warn","prefix":"run."}}}
-{ "oldest_seq":4700, "newest_seq":4990, "dropped":0,
-  "events":[ /* the JSON log lines, filtered */ ] }
+```bash
+agentd --instruction "Remember a greeting." --intelligence mock:file:playbook.json > result.txt 2> telemetry.ndjson
 ```
 
-The cursor and filters are command arguments: `after` (advance to the last `seq`
-you saw), `limit` (default 200, capped at 500), `level` (exact level match), and
-`prefix` (a dotted event prefix). The ring never blocks the loop — a slow reader
-loses old lines (reflected in `dropped`), never stalls the daemon. The part is a
-command of the [command extension](https://agentd.dev/a2a/ext/command), so the
-message lists its URI in `message.extensions` and the request names it in the
-`A2A-Extensions` header.
+`result.txt` holds the agent's answer, and the exit code is 0:
 
-### The observation feed
+```text
+Stored the greeting.
+```
 
-`agentd.events/SubscribeToEvents` is the method of agentd's [events
-extension](https://agentd.dev/a2a/ext/events), declared on the card while
-`a2a.events.enabled` is on (restart-only). It is an SSE stream: a `hello` frame,
-then `event` frames `{seq, ts, kind, data}`, then a `goodbye` whose `seq` a
-reconnect resumes from with `fromSeq`. Its kinds are a closed vocabulary:
+`telemetry.ndjson` holds about two dozen lines, from `proc.start` to
+`proc.exit`. The recipes below run against it as written, and against any
+production capture.
 
-| Kinds | What they carry |
+## Read a log line
+
+Every line carries the same envelope: `ts`, `level`, `event`, `run_id`,
+`agent_id`, `agent_path`, `comp`, `pid` and `trace_id`. The event's own
+fields sit beside them. Keys are in alphabetical order, so parse by name.
+
+```json
+{"agent_id":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","agent_path":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","comp":"agent","event":"turn.done","level":"info","pid":1845136,"rounds":1,"run_id":"01M4P4004MMJKM81HAZA0JFGP4","status":"completed","tokens_in":11,"tokens_out":5,"tool_calls":0,"trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.412Z","turn":"main-01M4P4004VPT9M256ZXBGDGV3C/work#1"}
+```
+
+Three fields do the correlation:
+
+- **`run_id`** is constant for the whole process tree: every line of one
+  invocation shares it. Pin it with `--run-id` to make it meaningful across
+  retries.
+- **`agent_path`** says which unit of work wrote the line, as a namespace. The
+  supervisor is `0`; a workflow step's worker is `run/<run>/<step>`; a
+  conversation turn is `turn/<ctx>`; a subagent is `sub/<handle>`. A prefix
+  selects everything under it with no join. The reference lists
+  [every value](telemetry-reference.md#agent_path-values).
+- **`pid`** joins a line to the OS process tree: `ps` and `pstree` show the
+  same processes.
+
+`comp` is `supervisor` for the supervisor's lifecycle and control lines and
+`agent` for the reasoning in turn workers and subagents.
+
+Set the verbosity with `observability.log_level` (`--log-level`): `trace`,
+`debug`, `info` (the default), `warn` or `error`. It reloads without a
+restart. `debug` adds each model round (`turn.round`) and the subagent loop's
+model calls.
+
+## Filter with jq
+
+Every line is one JSON object, so `jq` answers most questions about a run
+without a log backend.
+
+Warnings and errors:
+
+```bash
+jq -c 'select(.level=="error" or .level=="warn") | {ts, event, err}' telemetry.ndjson
+```
+
+The totals a process reports as it exits:
+
+```bash
+jq -c 'select(.event=="proc.exit") | {code, uptime_ms, runs, turns, tool_calls, tokens_in, tokens_out}' telemetry.ndjson
+```
+
+```json
+{"code":0,"uptime_ms":232,"runs":1,"turns":0,"tool_calls":1,"tokens_in":131,"tokens_out":15}
+```
+
+Tokens per turn, from the worker's own line:
+
+```bash
+jq -r 'select(.event=="turn.done" and .comp=="agent") | [.agent_path, .status, .tokens_in, .tokens_out] | @tsv' telemetry.ndjson
+```
+
+Tool calls by tool and outcome, then the slowest calls in milliseconds:
+
+```bash
+jq -r 'select(.event=="tool.result") | "\(.tool)\t\(.is_error)"' telemetry.ndjson | sort | uniq -c
+jq -r 'select(.event=="tool.result") | [.ms, .tool] | @tsv' telemetry.ndjson | sort -rn | head
+```
+
+Runs that did not complete, with their error:
+
+```bash
+jq -c 'select(.event=="run.done" and .status!="completed") | {run, workflow, status, err}' telemetry.ndjson
+```
+
+Everything about one run: the supervisor's lines name it in `run`, its
+workers' lines in `agent_path`.
+
+```bash
+RUN=$(jq -r 'select(.event=="run.start") | .run' telemetry.ndjson | head -1)
+jq -c --arg run "$RUN" 'select(.run==$run or (.agent_path|startswith("run/"+$run+"/"))) | [.ts, .event, .agent_path]' telemetry.ndjson
+```
+
+Reload outcomes on a daemon:
+
+```bash
+jq -c 'select(.event|startswith("config.reload")) | {ts, event, trigger, changed, paths, error}' telemetry.ndjson
+```
+
+## Probe health
+
+Health is measured at the supervisor's event loop, never inferred from
+traffic. An agent waiting for its next trigger is idle by design and stays
+healthy for as long as it waits. A stuck child does not fail liveness either:
+the supervisor is the one that detects and kills it, and it keeps ticking
+while it does.
+
+With `observability.metrics_addr` set (`--metrics-addr`), agentd serves three
+paths over plain HTTP:
+
+| Path | Returns 200 when | Returns 503 when | Use as |
+|---|---|---|---|
+| `/healthz` | the event loop ticked in the last 5 s | the loop is stuck, or a drain is under way | liveness probe |
+| `/readyz` | the runtime is up and accepting work | draining, or a child reported every model endpoint down | readiness probe |
+| `/metrics` | always | | Prometheus scrape |
+
+```bash
+curl -s http://127.0.0.1:9090/healthz
+curl -s http://127.0.0.1:9090/readyz
+```
+
+```text
+ok tick_age_ms=12
+ready
+```
+
+The probe surface binds once startup has finished, so a pod is never routed
+to before `proc.ready`. During a drain `/readyz` turns 503 first, so the pod
+leaves rotation while the drain completes. A model outage turns
+`/readyz` 503 too, so a load balancer stops sending conversations to a pod
+that cannot answer them; it recovers when a model call succeeds.
+
+> **Warning.** The probe surface is unauthenticated. `:9090` binds every IPv4
+> interface and logs `metrics.bound_all_interfaces`; restrict it with a
+> NetworkPolicy or firewall, or bind `127.0.0.1:9090` where only a local
+> agent scrapes it.
+
+Where you cannot open a port, `observability.health_file` (`--health-file`)
+names a file the supervisor rewrites every second:
+
+```json
+{"alive":true,"draining":false,"mode":"1","run_id":"01M4P42Z69EJ2J6XDTWTFHP0GR","supervisor_tick_age_ms":128,"ts":"2026-10-11T18:37:32.731Z"}
+```
+
+`alive` is the same verdict `/healthz` gives. The file stays behind when the
+process exits, so a checker must also confirm that `ts` is recent. Reading it
+needs a shell or a sidecar, which the published `scratch` image does not have:
+on Kubernetes, use the HTTP probes.
+[Deploy](deployment.md#probes-that-work-on-a-scratch-image) has the probe
+manifests.
+
+For a one-shot job, the exit code is the health signal.
+[CLI, environment and exit codes](cli.md#exit-codes) has the table. The
+probe listener and the health file still run for a job when you configure
+them, which is useful for a long batch job under a liveness probe.
+
+## Scrape Prometheus metrics
+
+`/metrics` serves Prometheus text format. A static scrape job:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: agentd
+    static_configs:
+      - targets: ["agent-triage.internal:9090"]
+```
+
+The metrics describe the supervisor process. Model calls happen in child
+processes, so token counts arrive as each child reports them, while the
+per-call model metrics (`agent_intel_*`) count only the few calls the
+supervisor makes itself. Several series are reserved and never move; the
+reference marks each one. The ones worth a dashboard:
+
+| Question | Series |
 |---|---|
-| `task` · `task.removed` | a task changed, or left the store |
-| `run` · `run.removed` · `step` | a workflow run's summary, its departure, a step starting or finishing |
-| `conversation` · `conversation.removed` | a conversation's status, or its departure |
-| `subagent` · `subagent.removed` · `child` · `child.removed` | the subagent tree and the OS children |
-| `activity` · `activity.removed` | live activity of a unit of work: phase, tool, round, tokens |
-| `status` | the instance's slim status |
-| `lifecycle` | draining began, or the instance was paused or resumed as a whole |
-| `config` | settings moved, and whether a reload or `admin.set` moved them |
-| `audit` | the audit mirror, to operators while `a2a.introspection.enabled` |
-| `auth` | a device sign-in pending, approved or denied; a session revoked; a launch |
+| Is it up and taking work? | `agent_up`, `agent_ready`, `agent_paused` |
+| Is it falling behind? | `agent_inbox_pending`, `agent_turns_queued`, `agent_runs_active`, `agent_stream_lag` |
+| How much work is it doing? | `rate(agent_runs_started_total[5m])`, `rate(agent_steps_total[5m])` |
+| How is the work ending? | `agent_runs_completed_total`, `agent_runs_failed_total`, `agent_runs_killed_total` |
+| What does it cost? | `rate(agent_tokens_total[1h])` by `type` |
+| Is the disk safe? | `agent_pressure_level`, `agent_disk_free_bytes` |
+| Is the store healthy? | `agent_store_ops_total` by `result` |
+| Did my change land? | `agent_config_generation`, `agent_config_reload_total` |
+| Are MCP servers reachable? | `agent_mcp_connect_failures_total` by `server` |
 
-Each event is sent only to the subscribers its visibility admits — an operator
-sees every event, a named caller the ones its principal owns and the ones that
-reach everybody — so the `seq` values one subscriber reads have gaps. The
-extension's specification is the authority on each kind's schema and audience;
-the extended card lists the kinds this caller's feed can carry.
+## Alert on what matters
 
----
+A starting rule set, built on series that move:
 
-## Metrics & traces
-
-### Default: derive metrics from logs
-
-The event vocabulary is closed and well-keyed, so every counter is a
-`count by (event)` over the NDJSON stream, and gauges are recoverable from
-`subagent.spawn` / `subagent.exit` deltas. **No in-process registry, zero
-dependencies** — for a minimal unit of work this is genuinely enough, and it is
-the default.
-
-```sh
-# tool calls by server, ok vs error
-jq -r 'select(.event=="tool.result") | "\(.server)\t\(.ok)"' telemetry.ndjson \
-  | sort | uniq -c
-
-# token total for the run
-jq '[ select(.event=="intel.result") | .tokens_out ] | add' telemetry.ndjson
+```yaml
+# agentd-rules.yml, a Prometheus rule file
+groups:
+  - name: agentd
+    rules:
+      - alert: AgentdNotReady
+        expr: agent_ready == 0
+        for: 5m
+        annotations:
+          summary: "{{ $labels.instance }} is draining or every model endpoint is down"
+      - alert: AgentdBacklogGrowing
+        expr: agent_inbox_pending > 100
+        for: 10m
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value }} events waiting"
+      - alert: AgentdUnderPressure
+        expr: agent_pressure_level >= 1
+        for: 2m
+        annotations:
+          summary: "{{ $labels.instance }} is low on disk or memory; level 2 sheds new work"
+      - alert: AgentdStoreConflict
+        expr: increase(agent_store_ops_total{result="conflict"}[5m]) > 0
+        annotations:
+          summary: "two processes share the instance identity of {{ $labels.instance }}"
+      - alert: AgentdStoreErrors
+        expr: increase(agent_store_ops_total{result="error"}[5m]) > 0
+        annotations:
+          summary: "durable store writes are failing on {{ $labels.instance }}"
+      - alert: AgentdRunsFailing
+        expr: increase(agent_runs_failed_total[15m]) > 3
+        annotations:
+          summary: "workflow runs are failing on {{ $labels.instance }}"
+      - alert: AgentdReloadRefused
+        expr: increase(agent_config_reload_total{result="other"}[15m]) > 0
+        annotations:
+          summary: "a configuration reload was refused on {{ $labels.instance }}"
+      - alert: AgentdConsumerLagging
+        expr: agent_stream_lag > 1000
+        for: 10m
+        annotations:
+          summary: "{{ $labels.consumer }} is behind on stream {{ $labels.stream }}"
 ```
 
-The metrics that matter (derivable from logs by default; emitted directly under
-the features below):
+Some conditions are only in the log. Alert on these events in your log
+store:
 
-- **Gauges:** `agent_ready` (0/1) and `agent_up` — plus `agent_active_subagents`,
-  `agent_tree_depth`, `agent_tree_breadth` and the unlabelled
-  `agent_subscriptions_active`, which are **reserved**: rendered, never written in
-  this build, so they sit flat at `0` (see
-  [Reactive-backlog gauges (reserved)](#reactive-backlog-gauges-reserved)). The
-  `kind="event"` series of `agent_subscriptions_active` is written (MCP Events).
-- **Counters:** `agent_loop_steps_total`, `agent_intel_calls_total`,
-  `agent_tokens_total{type=in|out}`, `agent_reactions_total`,
-  `agent_subagents_spawned_total`, `agent_subagents_exited_total{status}`,
-  `agent_subagent_restarts_total{reason}`,
-  `agent_subagent_stuck_kills_total{signal}` (the reliability headline),
-  `agent_limit_exceeded_total{limit}`,
-  `agent_mcp_connect_failures_total{server}`.
+| Event | Means |
+|---|---|
+| `drain.abandon` | A drain overran its budget and children were killed |
+| `budget.lifetime_exhausted` | The instance's lifetime token budget is spent |
+| `instruction.unavailable` | The instruction source stopped answering |
+| `start.subscribe.unsupported` | A `subscribe` start can never fire |
+| `wait.resubscribe.fail` at error | A suspended wait can never be woken |
+| `mcp.events.refused` | An MCP Events binding is not being polled |
+| `stream.consumer.skipped` | A consumer lost events to retention |
+| `human.judge.withheld` | A question failed because no judge may answer outside input |
+| `a2a.denied` with `reason: not_permitted` | A known caller tried something its role does not allow |
 
-> **What the `metrics` build actually renders.** The list above is what an
-> agentctl dashboard counts; under `--features metrics` the **emitted** series are
-> exactly those in [`obs/metrics.rs::render`](../crates/agentd/src/obs/metrics.rs)
-> and the frozen set below. Four frozen names are **reserved**, not emitted in this
-> build (rendered as a `# HELP`/`# TYPE` marker with no sample, the same
-> honest-absence shape as `agent_mcp_up`):
-> `agent_tool_calls_total{server,tool,ok}` (the tool-call boundary runs in the
-> child loop, so a supervisor scrape can't reflect it — derive from `tool.result`
-> log lines), and the three latency **histograms** `agent_run_duration_ms`,
-> `agent_intel_call_duration_ms`, `agent_tool_call_duration_ms` (no histogram
-> exposition machinery in this build — use the `dur_ms` log field). The frozen
-> `model` label on `agent_tokens_total` / `agent_intel_calls_total` is likewise
-> **deferred**: the call sites carry no model identifier, so the label is reserved
-> and intentionally absent (never faked) — per-model splits come from
-> `intel.result.usage` log lines. `agent_loop_steps_total`, `agent_refusals_total`,
-> and the steps/tokens/deadline/depth legs of `agent_limit_exceeded_total` are
-> **process-local** — emitted in the re-exec'd child loop, so the supervisor scrape
-> reflects only its own process (cross-process rollup is a deliberate non-goal);
-> the `tree_tokens` leg is the supervisor's own bound and is emitted.
+## Export traces and logs over OTLP
 
-**Cardinality discipline (binding):** **never** put `run_id`, `agent_id`,
-`agent_path`, `call_id`, or resource URIs into metric labels — they are unbounded
-and live in logs/traces only. Labels use bounded values only: `server`, `tool`,
-`kind`, `route`, `status`, `limit`, `signal`, `reason`, `type`, and the declared
-`stream` and `consumer` names (the `model` label
-is reserved in the frozen schema but never emitted — see the note above).
+The `otel` feature, in the release binaries, exports to an OTLP/HTTP
+collector with JSON bodies. Point it at a collector on the same host or in
+the same pod:
 
-### `metrics` feature — Prometheus text (`--features metrics`)
+```yaml
+# fragment: under observability:
+otel:
+  endpoint: http://127.0.0.1:4318
+  logs: true
+```
 
-A tiny in-process table of atomic counters/gauges feeds a hand-written
-**Prometheus 0.0.4 text exposition** (`# HELP` / `# TYPE` + `name{labels} value`)
-served on the already-opt-in surface (`/metrics`). **No `prometheus` or `metrics`
-crate** — it is plain text, no async, no SDK.
+- **Traces.** Each turn worker sends one batch when its turn ends: an
+  `invoke_agent` span with a `chat` span per model call and an
+  `execute_tool` span per tool call, using the OpenTelemetry GenAI attribute
+  names. Setting the endpoint is enough.
+- **Logs.** `logs: true` mirrors the supervisor's log lines every 5 s.
 
-The metric **names** and label **keys** are a **stable contract** a control
-plane authors scalers and alerts against. Labels carry
-**bounded** values only — out-of-vocabulary values fold into an `other` slot so
-the cardinality is structurally bounded (the closed label set is a compile-time
-array). The same cardinality discipline as the default story applies: **never**
-`run_id` / `agent_id` / `agent_path` / `call_id` / a URI in a label.
+The endpoint must be plain `http://`; an `https://` collector exports
+nothing. Without `endpoint`, agentd reads `OTEL_EXPORTER_OTLP_ENDPOINT`.
+Export is best effort and never slows or fails a turn. The endpoint is
+restart-only.
 
-#### Operability metrics (control plane)
+## Correlate with other services
 
-The A2A/hot-reload surfaces add these to the frozen set:
+Every line carries a W3C `trace_id`. By default agentd derives it from the
+run id, so the same `--run-id` always maps to the same trace. To join an
+upstream trace, pass its `traceparent` when you start the process:
 
-- **`agent_paused`** *(gauge, 0/1)* — `1` while an `admin.pause` hold is in effect;
-  `0` after `admin.resume`. **Pause is not readiness** — `agent_ready` ignores it
-  (it tracks only drain), so a paused instance can still read
-  `agent_ready 1`. The instance-wide `admin.pause` / `admin.resume` handlers set
-  the gauge on both edges, and the A2A `status` command's `paused` field reports
-  the same state; a per-run hold (`admin.pause` with a `run`) moves neither.
-- **`agent_config_reload_total{result}`** *(counter)* — hot reloads by result.
-  The label domain is bounded to `applied` | `rejected` | `other`; a refused
-  reload (invalid candidate, or a restart-only diff) currently lands in `other`,
-  and either way is a clean no-op with the running config unchanged. The precise
-  reason is on the `config.reload.invalid` / `config.reload.restart_required`
-  log line.
-- **`agent_config_generation`** *(gauge)* — the count of successfully-applied
-  reloads, monotonic in practice, so a scraper can detect "this instance has
-  picked up generation N" against the controller's desired generation. The reload
-  path writes it on every applied reload, using the same number it stamps into the
-  durable manifest's `lifecycle.config_generation`; the `config.reloaded` line
-  announces the reload itself (`trigger`, `changed`) and does **not** carry the
-  generation, which is computed only after that line is written — read the number
-  from `/metrics` or the manifest, never by `jq`-ing the reload event.
-- **`agent_drains_total{phase}`** *(counter)* — drain phase transitions; the
-  closed domain is `started` | `completed` | `forced` | `other` (so `completed`
-  vs `forced` distinguishes a clean drain from one that overran its budget).
-- **`agent_runs_total{status}`** *(counter)* — runs by the closed terminal-status
-  vocabulary (`completed`, `refused`, `exhausted_steps`,
-  `exhausted_tokens`, `deadline`, `stalled`, `loop_detected`, `cancelled`,
-  `crashed`, `other`).
-- **`agent_refusals_total{reason}`** *(counter; **process-local**)* — guard trips
-  by reason (`trifecta` | `rate` | `budget` | `depth` | `mcp` | `other`). Refusals
-  trip in the re-exec'd child loop, so this reflects only the scraped process — the
-  headline safety signal is the startup refusal itself: the
-  `agentd: lethal-trifecta refused: …` line on stderr and exit 2.
-- **`agent_intel_up`** *(gauge, 0/1)* and **`agent_intel_errors_total{reason}`**
-  *(counter; `unreachable`|`auth`|`timeout`|`5xx`|`other`)* — intelligence-endpoint
-  reachability + error breakdown.
-- **`agent_intel_all_down`** *(gauge, 0/1)* — `1` while **every** model endpoint
-  is down (the latched last-child-experience truth that also flips `/readyz`
-  NotReady); distinct from `agent_intel_up` (the active endpoint's
-  reachability).
-- **`agent_restarts_total`**, **`agent_reactor_stalls_total`** *(counters;
-  **reserved**)* — supervisor process restarts observed
-  (rebuild+reconcile), and wedged-reactor liveness trips. Both are rendered but
-  **not emitted** in this build: there is no in-process rebuild+reconcile path for
-  the former (a pod restart is a fresh zeroed process the orchestrator counts), and
-  a wedged reactor surfaces as a `/healthz` 503 (a per-scrape heartbeat-age read),
-  not a one-shot in-process event, for the latter.
-- **`agent_tree_breadth`** *(gauge)* — current max siblings at any tree node
-  (alongside the existing `agent_active_subagents` / `agent_tree_depth`).
-- **`agent_memory_max_bytes`** / **`agent_memory_current_bytes`** *(gauges)* —
-  cgroup-v2 `memory.max` / `memory.current`, emitted only for the fields the
-  kernel exposes (absent off-cgroup, keeping `/metrics` clean).
+```bash
+agentd --config /etc/agentd/triage.yaml --traceparent 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
 
-#### Reactive-backlog gauges (reserved)
+agentd then continues that trace id. Outbound, it sends a `traceparent` with
+a fresh span id on every model request (as an HTTP header) and on every MCP
+call (in `_meta`), and child processes inherit the trace id, so downstream
+spans line up under the run. An inbound A2A request's `traceparent` is not
+adopted.
 
-Rendered with their `# HELP` / `# TYPE` lines and flat at `0`: nothing in this
-build writes them, so a scaler that targets one is watching a signal that can
-never move. **Do not target an HPA at them** — [`scaling.md`](scaling.md) §5 has
-the gauges that do move. The same reservation covers `agent_active_subagents`,
-`agent_tree_depth` and `agent_tree_breadth`.
+## Keep an audit trail
 
-- **`agent_pending_events`** — reactive events received but not yet routed.
-- **`agent_inflight_reactions`** — reactions currently executing.
-- **`agent_subscriptions_active`** — reconciled declared subscriptions. Only
-  the unlabelled series is reserved: `agent_subscriptions_active{kind="event",mode}`
-  is written (see [MCP Events metrics](#mcp-events-metrics)).
-- **`agent_reaction_lag_ms`** — age of the oldest un-routed pending event.
+The audit trail records who did what: every A2A call and command, every
+reload, MCP Events subscriptions. Choose one or more sinks:
 
-#### Resource-pressure gauges
+```yaml
+# fragment: under observability:
+audit:
+  sink: [log, store, stream]
+  stream: _governance
+```
 
-- **`agent_pressure_level`** — 0 ok, 1 warn, 2 shedding (admission stopped,
-  in-flight work draining; the levels and gates are in
-  [`operations.md`](operations.md) §7).
-- **`agent_disk_free_bytes`** — free bytes on the file store's filesystem.
-  Deliberately **absent** without a file store: exporting the supervisor's local
-  free space when durability lives elsewhere would invite alerts on the wrong
-  disk.
-- **`agent_runs_active`** — workflow runs in a non-terminal state.
-- **`agent_turns_queued`** — conversation turns waiting for a dispatch slot
-  (parallelism, pause, drain, or shed — the event stream says which).
+| Sink | Writes |
+|---|---|
+| `log` | An `audit` line on stderr, beside the rest of the telemetry |
+| `store` | An append-only record in the durable store, never rewritten |
+| `stream` | An event on the named stream, which a workflow can consume |
 
-#### Stream consumer gauge
+A record carries the principal, its role, the action, the target and the
+outcome. An A2A command's action names the method and the op, so
+`a2a.SendMessage:admin.drain` is a filterable action of its own:
 
-- **`agent_stream_lag{stream,consumer}`** — how many events on `stream` the
-  consumer has not consumed yet, written on every pass of every armed `stream`
-  and `correlate` start; `consumer` is `<workflow>/<node>`. It grows while a
-  consumer is held (pressure, a freshness freeze) or paced (`rate`), and an
-  alert on it fires before retention trims past the consumer — the trim itself
-  is the `stream.consumer.skipped` line. Events a `batch` or `correlate` start
-  has already collected into its durable state count as consumed; a held one
-  reads no further, so its lag grows like any held consumer's. A consumer a
-  reload removed stops being exported. Each start kind exports up to 32
-  consumers by name; the rest fold into one
-  `{stream="other",consumer="other"}` series carrying the largest of their
-  lags. With no consumers the family renders its `# HELP` / `# TYPE` lines and
-  no sample.
+```json
+{"action":"a2a.SendMessage:admin.drain","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"audit","instance":"probe","level":"info","outcome":"ok","pid":1852065,"principal":"operator","request_id":"m-6","role":"operator","run_id":"01M4P42Z69EJ2J6XDTWTFHP0GR","target":{"task":"01a12c41-84e3-7d91-9007-9a171a6601d3"},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","trace_id":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
+```
 
-#### MCP Events metrics
+On an `audit` line, `ts` is the record's own timestamp in milliseconds since
+the epoch, in place of the envelope's text timestamp. A failed audit write is
+logged (`audit.store.fail`) and never fails the action it records. Audit lines
+are metadata, so `log_content` does not change them.
 
-Labelled by binding: `server` and `event` (the event type) come from the
-operator's `mcp.servers[].events` — at most 256 bindings — and the other
-labels from closed domains. A family past 512 series folds the rest into one
-whose labels all read `other`.
+## Feed runtime events back into workflows
 
-- **`agent_mcp_events_total{server,event,mode,outcome}`** — occurrences, by
-  what became of them: `appended`, `schema_mismatch` (appended, flagged),
-  `duplicate` (dropped by the dedup set), `rejected` (oversize or malformed),
-  `refused_pressure` (held at the cursor), and for `mode="webhook"`
-  `unauthenticated` (a request to a binding's route whose signature did not
-  verify).
-- **`agent_mcp_events_requests_total{server,method,outcome}`** — `events/list`,
-  `events/poll`, `events/subscribe` and `events/unsubscribe` requests: `ok`,
-  `refused` (a JSON-RPC error answer), `failed` (no usable answer). An
-  unsubscribe the server answers "no such subscription" counts `ok`.
-- **`agent_mcp_event_gaps_total{server,event,cause}`** — `truncated`,
-  `no_replay`, `schema_changed`.
-- **`agent_mcp_events_dedup_evicted_total{server,event}`** — dedup entries
-  dropped to stay under the 4096 cap; a duplicate older than what the set
-  keeps is appended again (with the same stream-event id).
-- **`agent_mcp_event_lag_ms{server,event}`** — the append time minus the
-  occurrence's `timestamp`, clamped at 0. **Server-reported**: as true as the
-  server's clock.
-- **`agent_subscriptions_active{kind="event",mode}`** — bindings active now, by
-  mode (`poll`, `webhook`).
+`observability.runtime_events` copies chosen event families onto a declared
+stream, so a workflow can react to the runtime itself: page when a breaker
+opens, summarise a day's pressure events, ship audit evidence on a schedule.
+This configuration pages on a breaker through a cheaper model:
 
-(The unlabelled bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
-`agent_reactions_total`, etc. — are emitted alongside the frozen set, so a scrape
-carries both spellings. `agent_mcp_up{server}` is **not** emitted in this build —
-only the connect-failure counter is.)
+```yaml
+agent:
+  name: ops-watch
+  instruction: You keep the incident queue moving.
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  models:
+    smart: { model: gpt-5.1 }
+    fast: { model: gpt-5-mini }
+  roles:
+    turn: smart
+streams:
+  _runtime: { retention: { max_events: 5000, max_age: 24h } }
+  _governance: { retention: { max_events: 200000, max_age: 400d } }
+workflows:
+  - name: page-on-breaker
+    steps:
+      trip:
+        kind: stream
+        stream: _runtime
+        subject: "breaker.*"
+      notify:
+        kind: agent
+        depends_on: [trip]
+        model: fast
+        instruction: "A circuit breaker opened. Summarise which one and why for the on-call channel."
+      done: { kind: finish, depends_on: [notify] }
+lifecycle: { run_until: drained }
+observability:
+  log_level: info
+  metrics_addr: ":9090"
+  health_file: /run/agentd/health.json
+  runtime_events:
+    stream: _runtime
+    include: [breaker, intel, store, child]
+    sampled: [pressure]
+  audit:
+    sink: [log, store, stream]
+    stream: _governance
+  otel:
+    endpoint: http://127.0.0.1:4318
+    logs: true
+```
 
-### `otel` feature — OTLP export + GenAI semconv (`--features otel`)
+- `include` takes a family in full; `sampled` takes 1 event in 16, for
+  families that arrive in storms. The family list is closed: a typo such as
+  `pressur` is refused at load.
+- The event's subject is its name, so a consumer matches `breaker.*`.
+- The capture budgets itself. Its queue is fixed (`queue`, default 512) and
+  counts what it drops; appends shed under pressure; a refused append is
+  dropped, not retried.
 
-The `otel` feature exports spans without adding dependencies — hand-rolled
-OTLP-over-HTTP/JSON over the existing HTTP client + `serde_json` + the run's
-trace ids (no `opentelemetry`/`tracing` crates, no protobuf). It POSTs one batch
-per finished run to `OTEL_EXPORTER_OTLP_ENDPOINT`, mapping the event taxonomy
-onto the OTel GenAI semantic conventions:
+> **Note.** A stream carrying runtime events or audit records holds what runs
+> produced, including text that came from outside. The load-time taint check
+> treats it as fed by every run. See [Security model](security.md).
 
-| agent event/span | `gen_ai.operation.name` | Key attributes |
-|---|---|---|
-| `subagent.spawn` → `loop.final` | `invoke_agent` | `gen_ai.agent.id`, `gen_ai.agent.name`, `gen_ai.conversation.id` |
-| `intel.call` / `intel.result` | `chat` | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons` |
-| `tool.call` / `tool.result` | `execute_tool` | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `mcp.method.name`, `server.address` |
+## Capture content for debugging
 
-agentd instruments the **client side** of each tool call and *propagates*
-context so the MCP server's spans nest underneath — one span tree, no duplicate
-spans. Export is OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`, pushed to a local
-collector / sidecar so agentd stays thin (no batching/retry sophistication).
+By default the log records lengths, counts and names, never conversation
+content. `observability.log_content` (`--log-content`) adds content:
 
-**Token-accounting honesty:** tokens come from the intelligence response
-`usage`. When absent, agentd logs `0` / `null` — never a guess — so
-`agent_tokens_total` stays trustworthy.
+| Event | Gains |
+|---|---|
+| `run.done` | `output`: the run's output |
+| `turn.reply` | `text`: the reply |
+| `tool.request` | `args`: the internal tool's arguments |
+| `tool.call`, `tool.result` in a subagent's loop | `args` and `content`, each capped at 4096 characters |
 
----
+It reloads without a restart and passes to children.
 
-## Non-goals
+> **Warning.** Use `log_content` for debugging, not in production. agentd
+> never logs the model credential or other resolved secrets, but a secret a
+> model passes as a tool argument, or a tool returns, lands in the log with
+> content capture on.
 
-- **No `tracing` in the default build** — only inside the `otel` gate.
-- **No metrics client library, ever** — Prometheus text is hand-written; OTLP
-  metrics ride `otel`.
-- **No span export in the default build** — propagation is on, export is gated.
-- **No MCP `logging` capability** — agentd does not implement or advertise it
-  (the spec deprecates it in favour of stderr + OpenTelemetry).
-- **No log file management / rotation / shipping in-binary** — stderr only; the
-  container runtime / collector owns capture and rotation.
-- **HTTP `/healthz` / `/readyz` / `/metrics` are opt-in**, never on for a
-  one-shot CLI run.
+## Next steps
+
+- [Events and metrics reference](telemetry-reference.md): every event and
+  metric.
+- [Operate a running daemon](operations.md): read live state over A2A.
+- [Deploy](deployment.md): probe manifests for Kubernetes.
+- [Troubleshooting](troubleshooting.md): from a symptom to its cause.

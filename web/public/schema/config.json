@@ -621,34 +621,6 @@
                     "fail"
                   ]
                 },
-                "reserve": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "estimate": {
-                      "enum": [
-                        "context",
-                        "fixed",
-                        "none"
-                      ]
-                    },
-                    "fixed": {
-                      "minimum": 0,
-                      "type": "integer"
-                    }
-                  },
-                  "type": "object"
-                },
-                "scope": {
-                  "items": {
-                    "enum": [
-                      "instance",
-                      "run",
-                      "conversation",
-                      "principal"
-                    ]
-                  },
-                  "type": "array"
-                },
                 "slow": {
                   "additionalProperties": false,
                   "properties": {
@@ -941,34 +913,6 @@
                 "refuse",
                 "fail"
               ]
-            },
-            "reserve": {
-              "additionalProperties": false,
-              "properties": {
-                "estimate": {
-                  "enum": [
-                    "context",
-                    "fixed",
-                    "none"
-                  ]
-                },
-                "fixed": {
-                  "minimum": 0,
-                  "type": "integer"
-                }
-              },
-              "type": "object"
-            },
-            "scope": {
-              "items": {
-                "enum": [
-                  "instance",
-                  "run",
-                  "conversation",
-                  "principal"
-                ]
-              },
-              "type": "array"
             },
             "slow": {
               "additionalProperties": false,
@@ -2675,13 +2619,6 @@
           "description": "a secret — from a file it MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference; env/flag values may be inline",
           "type": "string"
         },
-        "conversation_ttl": {
-          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
-          "type": [
-            "string",
-            "integer"
-          ]
-        },
         "cors": {
           "additionalProperties": false,
           "properties": {
@@ -2873,34 +2810,6 @@
                 "refuse",
                 "fail"
               ]
-            },
-            "reserve": {
-              "additionalProperties": false,
-              "properties": {
-                "estimate": {
-                  "enum": [
-                    "context",
-                    "fixed",
-                    "none"
-                  ]
-                },
-                "fixed": {
-                  "minimum": 0,
-                  "type": "integer"
-                }
-              },
-              "type": "object"
-            },
-            "scope": {
-              "items": {
-                "enum": [
-                  "instance",
-                  "run",
-                  "conversation",
-                  "principal"
-                ]
-              },
-              "type": "array"
             },
             "slow": {
               "additionalProperties": false,
@@ -3523,34 +3432,6 @@
                 "refuse",
                 "fail"
               ]
-            },
-            "reserve": {
-              "additionalProperties": false,
-              "properties": {
-                "estimate": {
-                  "enum": [
-                    "context",
-                    "fixed",
-                    "none"
-                  ]
-                },
-                "fixed": {
-                  "minimum": 0,
-                  "type": "integer"
-                }
-              },
-              "type": "object"
-            },
-            "scope": {
-              "items": {
-                "enum": [
-                  "instance",
-                  "run",
-                  "conversation",
-                  "principal"
-                ]
-              },
-              "type": "array"
             },
             "slow": {
               "additionalProperties": false,
@@ -4201,18 +4082,9 @@
             },
             "logs": {
               "type": "boolean"
-            },
-            "metrics": {
-              "type": "boolean"
-            },
-            "traces": {
-              "type": "boolean"
             }
           },
           "type": "object"
-        },
-        "report_file": {
-          "type": "string"
         },
         "runtime_events": {
           "additionalProperties": false,
@@ -4491,9 +4363,6 @@
     "store": {
       "additionalProperties": false,
       "properties": {
-        "audit": {
-          "type": "boolean"
-        },
         "checkpoint": {
           "additionalProperties": false,
           "properties": {

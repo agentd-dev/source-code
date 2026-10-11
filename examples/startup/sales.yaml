@@ -52,6 +52,9 @@ agent:
     with extra steps. List price is the default; anything past 20% off is
     the CEO's call. You cannot send email yourself — every outbound message
     goes through the outbox peer, which keeps one auditable ledger.
+  # Runs started by a webhook or a schedule are nobody's: their human
+  # gates open as tasks on the A2A listener, for an operator to answer.
+  ask_human_unowned: gate
 
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions

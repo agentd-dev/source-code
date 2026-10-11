@@ -166,17 +166,20 @@ $ agentd-tui --endpoint http://127.0.0.1:8448     # the chief of staff
 > what's happening today?
 ```
 
-**Dry-run the whole company offline** — debug builds carry a mock LLM:
+**Dry-run the whole company offline** — the mock model endpoint answers
+without a provider:
 
 ```console
-$ cargo build --features a2a
-$ AGENTD_INTELLIGENCE=mock:final ./target/debug/agentd \
+$ export ALERT_WEBHOOK_SECRET=dry-run-secret
+$ AGENTD_INTELLIGENCE=mock:final agentd \
     -c examples/startup/services.yaml -c examples/startup/sre.yaml
-$ curl -X POST 127.0.0.1:9444/alerts/firing -d '{"alert_id":"a1","service":"probes","severity":"critical"}'
+$ body='{"alert_id":"a1","service":"probes","severity":"critical"}'
+$ sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$ALERT_WEBHOOK_SECRET" -r | cut -d' ' -f1)
+$ curl -X POST 127.0.0.1:9444/alerts/firing -H "X-Alert-Signature: sha256=$sig" -d "$body"
 ```
 
-No key, no network: `mock:<script>` spawns the intelligence in-process, and
-webhooks are plain HTTP you can curl.
+No key, no network: `mock:<script>` answers in-process. Every webhook is
+signed (`webhooks.default_auth`), so the request carries an HMAC of its body.
 
 Every config validates against the binary:
 

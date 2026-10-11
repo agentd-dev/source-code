@@ -1,0 +1,188 @@
+# Build features and crates
+
+agentd decides most of its capability at compile time: each cargo feature adds
+a protocol, a credential mechanism or an operator surface, and a build without
+it refuses the configuration that needs it. This page lists every feature, what
+the release binaries carry, which configuration needs which feature, and the
+crates the workspace publishes. It is for operators choosing a binary and for
+integrators building from source.
+
+## What the release binaries carry
+
+Every release ships static Linux binaries for `x86_64` and `aarch64` (musl,
+static-PIE on `x86_64`), a `SHA256SUMS` file, and a multi-arch OCI image,
+`ghcr.io/agentd-dev/agentd`, signed with cosign (keyless) and carrying an SPDX
+SBOM attestation. The image is `FROM scratch` plus the binary, run as uid
+65532.
+
+All of them are built with the default feature `tls` plus this list, taken
+from `.github/workflows/release.yml`:
+
+```text
+a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models
+```
+
+`mock-models` is the built-in mock model endpoint: `mock:final` and
+`mock:file:<playbook.json>` answer from a script instead of a provider, so you
+can try an agent or a workflow in the released agentd with no provider
+account.
+
+Two features are never in a release binary:
+
+- `exec`, the local command runner. agentd's default posture is that it runs
+  no local code; you opt in at build time and again at run time.
+- `internal-mocks`, the test scaffolding: the mock MCP servers and crash
+  points the test suites drive. It includes `mock-models`. Debug builds carry
+  it automatically, so `cargo run` and the test suites need no flag.
+
+## Features
+
+| Feature | Default | Release | Adds crates | Enables |
+|---|---|---|---|---|
+| `tls` | yes | yes | `rustls` (with the `ring` provider), `webpki-roots` | Direct `https://` to models, MCP servers and peers; an `https://` listener; mTLS client identities; `security.tls_ca`. The bundled roots mean a `scratch` image trusts public CAs with no system bundle. |
+| `a2a` | no | yes | the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`), `tokio`, `axum`, `hyper`, `hyper-util`, `tokio-rustls`, `tower`, `chrono`, `async-trait`, `tokio-stream`, `futures-util` | The A2A listener and everything served on it, outbound A2A peers, and the webhook listener. Implies `tls`. |
+| `cron` | no | yes | none | Five-field UTC cron expressions on `schedule` start nodes. |
+| `oauth` | no | yes | none | OAuth 2.1 credentials (device, authorization code with PKCE, client credentials, refresh, OIDC discovery) for models, MCP servers and peers; `agentd --login`. |
+| `metrics` | no | yes | none | `/metrics` (Prometheus text), `/healthz` and `/readyz` on `observability.metrics_addr`. |
+| `otel` | no | yes | none | OTLP over HTTP/JSON: run traces with GenAI attributes, and log export. |
+| `hot-reload` | no | yes | none | Reload on `SIGHUP`: validate, stage, apply whole or refuse. |
+| `config-watch` | no | yes | none | An inotify watch that triggers the same reload (`lifecycle.watch_config`). Implies `hot-reload`. |
+| `cel` | no | yes | `cel-interpreter` and its dependencies (22 crates) | CEL expressions: workflow `when`, `until` and `filter`, computed values, `goal.check.condition`, `security.policies[].match.args`, template expressions beyond bare paths. |
+| `aauth` | no | yes | none new (reuses `ring`) | An Ed25519 agent identity that signs outbound MCP requests (RFC 9421). Implies `tls`. |
+| `sign` | no | yes | none new | Signature verification for instruction documents (`agent.instruction.trust`). Implies `aauth`. |
+| `oci` | no | yes | none new (reuses `ring`) | `oci://` instruction sources, including cosign verification. Implies `tls`. |
+| `decrypt` | no | yes | none | Encrypted instruction envelopes: age v1 and JWE compact. Implies `sign`. |
+| `mcp-events` | no | yes | none | MCP Events: bindings, grants, `wait` subscriptions, the `events.*` tools and instruction updates by event. The extension is a draft (SEP-3415). |
+| `exec` | no | **no** | none | The guarded local `exec` tool, also gated by `security.exec.enabled`. |
+| `mock-models` | no | yes | none | The mock model endpoint: `mock:final` and `mock:file:<playbook.json>`, scripted chat and decision answers. |
+| `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers and crash points. Implies `mock-models`. |
+
+Of the seventeen features, fourteen add no crate of their own: they gate code
+written in this repository, or reuse `ring`, which every build already links.
+Beyond the default `tls`, the dependency cost of the release set comes from
+`a2a` and `cel`; see [Crate counts](#crate-counts).
+
+## Configuration that needs a feature
+
+A release binary carries everything in this table except `exec`. In a build
+from source, the right-hand column is what you
+see when the feature is missing.
+
+| Configuration | Feature | Without the feature |
+|---|---|---|
+| an `https://` endpoint, listener or peer; `security.tls_ca` | `tls` | an `https://` model endpoint passes validation and fails at the dial as unsupported |
+| `a2a.listen`, `a2a.peers`, `webhooks.listen`, and so every `webhook` node and A2A start | `a2a` | refused at load: `a2a.listen needs the a2a build feature, which this binary was built without — …` |
+| a `schedule` start with `cron:` | `cron` | refused at load: `cron schedules require the 'cron' build feature` |
+| any CEL expression | `cel` | refused at load: `… uses an expression, which needs the 'cel' build feature (bare paths work without it)` |
+| `auth.kind: oauth2`; any `auth` or `oauth` block on an MCP server; `agentd --login` | `oauth` | an intelligence `auth` the build cannot apply is refused at load; an MCP server's `auth` and `oauth` blocks are not applied |
+| `observability.metrics_addr` | `metrics` | nothing is served on the address |
+| `observability.otel.*` | `otel` | nothing is exported |
+| `SIGHUP` reload | `hot-reload` | `SIGHUP` keeps its default action and ends the process |
+| `lifecycle.watch_config` | `config-watch` | no watch is installed |
+| `security.aauth.*`, `mcp.servers[].aauth` | `aauth` | requests are not signed |
+| `agent.instruction.trust` | `sign` | a pinned instruction refuses startup: `… this build cannot verify signatures — rebuild with --features sign` |
+| an `oci` instruction, prompt or template source | `oci` | refused at load: `… an oci:// source requires building with --features oci` |
+| `agent.instruction.decrypt`, or any encrypted envelope | `decrypt` | the envelope is recognised and refused; ciphertext never reaches the model |
+| `mcp.servers[].events`, `event_grants`, `agent.instruction.mcp.events`, `wait {on: event, subscribe:}` | `mcp-events` | refused at load: `mcp.servers[0]: MCP Events bindings and grants require building with --features mcp-events` |
+| `security.exec.enabled: true` | `exec` | the `exec` tool stays a mapping to an MCP server |
+| `mock:` endpoints | `mock-models` (or a debug build) | refused at load: `mock: intelligence needs a build with --features mock-models` |
+
+Every path and its feature is in the [Configuration reference](configuration.md).
+
+## Building from source
+
+The release build is `agentd-cli` with the release feature list. With a Rust
+toolchain of at least 1.96 (edition 2024):
+
+```bash
+cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
+```
+
+Add `exec` for the local command runner, or `internal-mocks` to keep the test
+scaffolding in a release-profile build. `--no-default-features` drops `tls`;
+such a binary reaches `https://` only through a TLS-terminating sidecar.
+
+The release profile is `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
+`strip = true` and `panic = "abort"`. The build needs a C compiler, because
+`ring`, the TLS crypto provider, compiles C. It needs no CMake: CI fails the
+build if the `aws-lc` provider enters the dependency tree.
+
+## Crates
+
+The workspace publishes five crates to crates.io. A sixth, the conformance
+suite, is not published and links none of the others: it drives the binary
+from outside.
+
+| Crate | Library name | Version (v1.18.0) | Licence | Owns |
+|---|---|---|---|---|
+| `agentd-net` | `net` | 2.0.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
+| `agentd-mcp` | `mcp` | 3.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
+| `agentd-instruction` | `instruction_core` | 0.3.0 | MIT OR Apache-2.0 | The reference implementation of the Instruction Specification: parser, validator, delivery, resolution manifest, signature verification. |
+| `agentd-core` | `agentd` | 1.18.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
+| `agentd-cli` | binary `agentd` | 1.18.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
+| `agentd-conformance` | `agentd_conformance` | 1.7.0 | AGPL-3.0-only | A black-box conformance suite. Not published. |
+
+Each crate's features map onto `agentd-core`'s: `agentd-cli`'s `a2a` turns on
+`agentd-core/a2a`, and so on. `agentd-mcp` and `agentd-net` have one feature
+each, `tls`; `agentd-instruction` has `sign`.
+
+The package and library names differ on purpose. `agentd` on crates.io belongs
+to an unrelated project, so the engine is published as `agentd-core` with
+`[lib] name = "agentd"`, and code still writes `use agentd::…`. The
+instruction crate is `agentd-instruction` because the specification belongs to
+instruction.md, not to agentd; it is the one crate under a permissive licence,
+so other implementations of the specification can link it.
+
+```mermaid
+flowchart LR
+  CLI["agentd-cli<br/>binary agentd"] -->|"depends on"| CORE["agentd-core<br/>lib agentd"]
+  CORE -->|"MCP client"| MCP["agentd-mcp"]
+  CORE -->|"transport"| NET["agentd-net"]
+  CORE -->|"instruction documents"| INS["agentd-instruction"]
+  MCP -->|"transport"| NET
+  MCP -->|"protocol"| RMCP["rmcp<br/>official MCP SDK"]
+  CORE -.->|"feature a2a"| A2A["a2a-lf · a2a-pb · a2a-server-lf<br/>official A2A SDK"]
+  CORE -.->|"feature cel"| CEL["cel-interpreter"]
+  CONF["agentd-conformance"] -.->|"runs the binary"| CLI
+```
+
+Embedding the engine in your own Rust program is
+[Embed agentd in Rust](embedding.md).
+
+## Crate counts
+
+The number of distinct crates in the shipped dependency graph, counted as
+unique package names from `cargo tree -p agentd-cli -e normal --prefix none`
+(build and dev dependencies excluded):
+
+| Build | Crates | Not from this repository |
+|---|---|---|
+| `--no-default-features` | 82 | 77 |
+| default (`tls`) | 89 | 84 |
+| default + `cel` | 111 | 106 |
+| default + `a2a` | 146 | 141 |
+| the release feature set | 163 | 158 |
+
+The right-hand column leaves out the five workspace crates the command lists.
+`a2a` and `cel` overlap in five crates; the other twelve release features add
+none. Measured with cargo 1.98.0 against the committed `Cargo.lock` of the
+v1.18.0 release (`d167aba4`). The same count holds for the
+`x86_64-unknown-linux-musl` target that ships.
+
+## Footprint
+
+The binary size, download size, start-up time and idle memory of the release
+binaries are measured in one place,
+[Engineering choices: the numbers](why-rust.md#the-numbers). Each MCP
+connection and the A2A listener add threads of their own; the
+[Architecture](architecture.md) page explains where they come from.
+
+## Next steps
+
+- [Install](install.md) — download a release binary or the image, and verify
+  it.
+- [Configuration reference](configuration.md) — every path, with the feature
+  it needs.
+- [Embed agentd in Rust](embedding.md) — use `agentd-core` as a library.
+- [Engineering choices](why-rust.md) — why the dependency graph looks like
+  this.

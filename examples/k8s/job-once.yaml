@@ -94,7 +94,7 @@ spec:
             # no-TLS image, point at a loopback sidecar (http://127.0.0.1:PORT)
             # that owns the upstream TLS connection.
             - name: AGENTD_INTELLIGENCE
-              value: https://gw.example/v1
+              value: https://gw.example/v1/chat/completions
             - name: AGENTD_INTELLIGENCE_TOKEN
               valueFrom:
                 secretKeyRef:

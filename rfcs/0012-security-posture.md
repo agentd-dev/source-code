@@ -2,7 +2,7 @@
 
 > **⚠ AMENDED (target-vision pivot, 2026-07-02).** The `exec` self-tool described
 > here was **removed** — agentd runs no local code (no exec/shell tool). Every
-> transport is HTTPS (no unix/vsock). See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+> transport is HTTPS (no unix/vsock). See ../docs/design/00-target-vision-pivot.md.
 
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok

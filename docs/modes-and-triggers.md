@@ -1,170 +1,237 @@
-# Lifecycle & triggers
+# Jobs, daemons and triggers
 
-agentd has **one durable runtime** — a single-writer event loop over durable
-state. There are **no modes** to choose between. When a run happens is
-decided by two independent things:
+agentd has one runtime and no modes. A one-shot job and a long-lived daemon
+run the same loop over the same durable state; they differ only in what
+wakes the agent and when the process exits. This page explains how that
+shape is decided, which start nodes fire runs, how a daemon runs work when
+it starts and stops, and where A2A fits. Read it before you choose between
+running agentd from a scheduler and running it as a service.
 
-- the process **lifecycle shape** — whether the instance is a one-shot *job* or a
-  long-lived *daemon* (`lifecycle.run_until`); or
-- a workflow **start node** — a *trigger* that fires runs (`once`, `manual`,
-  `loop`, `schedule`, `subscribe`, `signal`, `event`, `stream`, `correlate`,
-  `a2a`, `webhook`).
+## One runtime, two shapes
 
-A one-shot job and a long-lived daemon share the same inner loop, the same
-durable state model, the same turn workers, and the same tool registry — they
-differ only in *what wakes the agent* and *when the process exits*.
-
----
-
-## Lifecycle shape — `lifecycle.run_until`
-
-```yaml
-lifecycle:
-  run_until: auto      # auto | idle | drained
-  idle_grace: 5s       # how long `idle`/`auto` waits with no work before exiting
-  drain_timeout: 25s   # SIGTERM → finish in-flight, then exit
-```
-
-| `run_until` | shape | exits when |
+| | Job | Daemon |
 |---|---|---|
-| `idle`    | **job**   | no runs, turns, or pending inbox — after `idle_grace` |
-| `drained` | **daemon** | never on its own; a SIGTERM drains in-flight work then exits 0 |
-| `auto` (default) | job **unless** it has an A2A listener (`a2a.listen`) or a long-lived start node (every start kind except `once` and `manual`: `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`correlate`/`a2a`/`webhook`) — then a daemon | as above, per the shape it resolves to |
+| Exits | when nothing is left to do | only when told to: a signal, a `finish` with `exit: true`, or another stop condition |
+| Exit code | the outcome of its work | 0 after a clean drain |
+| Woken by | its startup work: a `once` start, `--instruction`, `--prompt` | triggers that keep firing, and an A2A listener |
+| Durable state | none unless you set a store: a crash re-runs it | the local `file` store unless you set one |
+
+Both shapes share the reactor, the turn workers, the tool registry and the
+inbox. A job is a daemon that has run out of reasons to stay up.
+
+## How the shape is decided
+
+`lifecycle.run_until` decides when the process stops.
 
 ```mermaid
 flowchart LR
-  cfg["config"] --> ru{"run_until ?"}
-  ru -->|idle| job
-  ru -->|drained| daemon
-  ru -->|"auto (default)"| auto{"a2a.listen or a<br/>long-lived start node?"}
-  auto -->|no| job["JOB<br/>run to terminal status"]
-  auto -->|yes| daemon["DAEMON<br/>stays live · triggers fire runs"]
-  job --> code["exit-code table<br/>(0 / 2 / 4 / 6 / 7 …)"]
-  daemon --> drain["SIGTERM → drain → exit 0"]
-  classDef accent stroke:#22c55e,stroke-width:1.5px,color:#f4f4f5;
-  class daemon accent;
+  CFG["the loaded config"] -->|"read run_until"| RU{"run_until"}
+  RU -->|"idle"| JOB["job: exits when idle"]
+  RU -->|"drained"| DAEMON["daemon: runs until a drain"]
+  RU -->|"auto, the default"| AUTO{"a2a.listen, or a long-lived start node?"}
+  AUTO -->|"no"| JOB
+  AUTO -->|"yes"| DAEMON
+  JOB -->|"exit code from its work"| CODE["0, 3, 4, 7, 124 and so on"]
+  DAEMON -->|"SIGTERM, then drain"| ZERO["exit 0"]
 ```
 
-A job maps its outcome to the exit-code table: `0` completed, `2`
-config/usage, `4` intelligence unavailable, `6` a required MCP server down, `7`
-budget/step exhaustion, etc. A daemon exits `0` on a graceful SIGTERM drain.
+| `run_until` | Shape | Exits when |
+|---|---|---|
+| `auto` (default) | a job, unless the instance has an A2A listener (`a2a.listen`) or a long-lived start node — then a daemon | as for the shape it resolves to |
+| `idle` | a job | nothing is left: no runs, turns, queued or waiting work, timers or children |
+| `drained` | a daemon | never on its own; a drain finishes in-flight work, then exits 0 |
 
-The **quickstart** — `agentd --instruction "…" --intelligence https://…` — is a
-job: the `--instruction` sugar expands to a `once → agent → finish` workflow,
-runs one turn, and exits.
+Every start kind is long-lived except `once` and `manual`. Under `auto` the
+question is asked of the **live** workflow set, not only the configured one:
+a job whose prompt tells the agent to create a schedule (`workflow.create`)
+becomes a daemon, rather than idling out from under the work it was asked to
+set up.
 
----
+A job with no long-lived start exits as soon as it is idle. When an
+instance is forced to `idle` while it still has long-lived starts,
+`lifecycle.idle_grace` (default 5 seconds) is how long it waits with
+nothing to do before it exits.
 
-## Triggers — workflow start nodes
+A job's exit code comes from the outcome of the workflows its `once` starts
+ran; with several, the worst outcome wins, so a partial success is never
+reported as clean. The table of codes is in [CLI, environment and exit
+codes](cli.md).
 
-A workflow is a DAG. Its entry point is a **start node** whose `kind`
-decides *when* a run fires. One workflow may have several.
+A daemon ends with a **drain**. These begin one:
+
+- `SIGTERM` or `SIGINT`; a second signal forces the kill ladder;
+- a `finish` with `exit: true`;
+- the signal named in `lifecycle.until_signal`, when the operator or the
+  runtime sends it (another principal's signal of that name is refused);
+- the goal watchdog's `finish` action, a spent lifetime token budget under
+  `lifetime_exhausted: drain` (or `exit`, which exits 7), or an instruction
+  source that is unavailable under `unavailable: drain`;
+- an operator's drain command over A2A.
+
+A drain stops intake, lets in-flight work finish within
+`lifecycle.drain_timeout` (default 25 seconds), checkpoints and exits: 0
+after a signal or an operator's drain, or the code a `finish` or a failure
+set.
+[Supervision and containment](harness.md#the-kill-ladder) describes how
+children are stopped.
+
+The quickstart is a job. `agentd --instruction "…"` expands to a workflow
+named `main` — a `once` start, one `agent` step, a `finish` — runs one turn
+and exits. `agentd --prompt "…"` instead delivers a message into the root
+conversation, where the agent has its full tool surface.
+
+## Triggers
+
+A workflow's **start node** decides when a run begins. A workflow may have
+several. These are the eleven start kinds; [Workflow node
+reference](node-registry.md) lists every field.
+
+| Start kind | Fires a run |
+|---|---|
+| `once` | at startup. `policy: ensure` (the default) fires unless a run it started is still on record, live or finished; `policy: always` fires on every boot |
+| `manual` | only when asked: the `workflow.run` tool, an A2A `workflow.run` command, or a `workflow` step |
+| `loop` | again after each run ends, paced by `interval`, until a condition or `max_iterations` |
+| `schedule` | on a clock: a five-field UTC `cron`, an `every` interval, or an `at` delay |
+| `subscribe` | when an MCP resource it subscribes to changes; the runtime reads the new contents |
+| `signal` | when a named signal arrives: `workflow.signal`, an A2A command, a webhook's `signal:` |
+| `event` | on a runtime event: `workflow.finished`, `workflow.failed`, `human.asked`, `human.answered`, `lifecycle.shutdown` |
+| `stream` | on each event appended to a declared stream, or on each batch of them |
+| `correlate` | when a set of related stream events has arrived within a window: a join over events |
+| `a2a` | when an A2A message, or a command the start node declares, arrives for it |
+| `webhook` | on an inbound HTTP request to its path on the webhook listener |
+
+> **Limit.** `ensure` looks at the run records the instance holds. A
+> finished run that `store.retention.runs` has evicted does not count, so a
+> `once` start with `ensure` fires again on the next boot. Keep retention
+> off for an instance whose `once` work must happen exactly once, or make
+> that work idempotent.
+
+**Every firing is an inbox event first.** A trigger's firing is written to
+the durable inbox before the run starts, so a crash between the two
+replays the firing rather than losing it. Delivery is at least once — a
+schedule, for one, can fire twice across a crash — so make a run's effects
+idempotent. Start-node state — last fired, next deadline, loop iteration,
+debounce window, stream offset — is durable in the manifest, so a restart
+resumes schedules and loops where they were.
+
+**Schedules collapse missed occurrences.** A schedule that came due while
+the process was down fires once on restart, then arms its next occurrence;
+it does not replay every one it missed. `at: 8h` is a one-shot delay that
+consumes itself when it fires, not a wall-clock time. `cron` needs the
+`cron` build feature, which the release binaries include; `every` needs
+none. For time-driven work across a fleet, an external scheduler firing a
+job per tick is usually the better tool; the built-in schedule is for a
+standalone daemon.
+
+**Under pressure, a firing is refused, not lost.** While the daemon sheds
+work for low disk or memory, a due schedule is skipped (`start.shed`) and
+its next occurrence armed, a webhook answers `429`, and a stream consumer
+holds its offset until the event can be accepted.
+
+A daemon that runs a nightly report:
 
 ```yaml
+agent:
+  name: reporter
+  instruction: You write short operational reports.
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+
 workflows:
   - name: nightly-report
+    concurrency: {max_runs: 1, on_overflow: drop}
     steps:
-      s:  { kind: schedule, cron: "0 2 * * *" }   # ← the trigger
-      gen: { kind: agent, depends_on: [s], instruction: "Summarise yesterday." }
-      f:  { kind: finish, depends_on: [gen] }
+      tick:  {kind: schedule, cron: "0 2 * * *"}    # 02:00 UTC every day
+      write: {kind: agent, depends_on: [tick], instruction: "Summarise yesterday's incidents in five lines."}
+      done:  {kind: finish, depends_on: [write], output: "{{steps.write.output}}"}
+
+lifecycle:
+  run_until: auto       # a schedule start makes this a daemon
+  drain_timeout: 25s
 ```
 
-`cron` is a 5-field UTC expression and needs the `cron` build feature (it is in
-the released binaries; a build without it refuses a `cron` schedule at load).
-`at:` is not a wall-clock time — it is a one-shot
-**delay**, `at: 8h`, that consumes itself when it fires; `every: 24h` paces a
-plain interval with no build feature at all.
+## Concurrency
 
-| start `kind` | fires a run… | key fields |
-|---|---|---|
-| `once`      | once, at startup (unless a live run was restored) | — |
-| `manual`    | only when explicitly triggered (`workflow.run`, or an A2A `workflow.run` command) | — |
-| `loop`      | repeatedly, on an interval, until a condition | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
-| `schedule`  | on a clock | `cron: "0 2 * * *"`, or `every: 1h`, or `at: 30m` (a one-shot **delay**, not a wall-clock time) |
-| `subscribe` | when an MCP **resource** updates | `server`, `uri`, `debounce_ms`, `filter`, `window` |
-| `signal`    | when a named signal arrives | `name` |
-| `event`     | on a runtime event | `on: workflow.finished` \| `workflow.failed` \| `lifecycle.shutdown` |
-| `a2a`       | when an A2A message/command arrives for it | — |
+Each workflow bounds its own live runs with `concurrency`. `max_runs` is the
+cap, and `on_overflow` says what happens to a firing past it: `queue` (the
+default) holds it in the inbox, `drop` discards it, `replace` cancels the
+oldest live run. `scope: key` counts runs per value of the workflow's `key`
+instead of per workflow, which turns the cap into a per-entity lock: one run
+per order, per ticket, per customer. Across all workflows, `limits.max_runs`
+(default 8) caps the live runs of the whole instance, with the same
+overflow handling. [Author workflows](author-workflows.md) has worked
+examples.
 
-Start-node state (last fired, iteration, next deadline, debounce window) is
-**durable** in the manifest, so a restart resumes schedules and loops where they
-left off; the reactor's tick adapts to the nearest deadline so time-based work
-fires promptly.
+## Init and deinit
 
-### Concurrency
+Two start kinds let a daemon run work at the edges of its own life.
 
-Each workflow bounds its own live runs:
-
-```yaml
-    concurrency: { max_runs: 1, on_overflow: queue }   # queue | drop | replace
-```
-
----
-
-## The A2A channel — the daemon's inbox
-
-A daemon's external channel is **A2A**, not a mode. Set `a2a.listen`
-and the runtime binds an HTTPS listener that turns A2A requests into runtime
-work (this alone makes `run_until: auto` a daemon):
+- **Init.** A `once` start with `policy: always` fires on every boot. Use it
+  for self-registration: tell a third party where to reach you as soon as
+  the process can take calls.
+- **Deinit.** An `event` start with `on: lifecycle.shutdown` fires when a
+  drain begins, and the drain **waits** for that run, within
+  `drain_timeout`, before the process exits. Use it to deregister, so the
+  third party stops calling a process that is going away. Its payload says
+  why: `{"reason": "signal"}` or `{"reason": "exit"}`, among others.
 
 ```yaml
-a2a:
-  listen: https://0.0.0.0:8443
-  url:   https://agent.internal:8443   # a wildcard bind names the origin callers dial
-  tls:   { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/ca.pem }
-  principals:
-    - match: { san: "spiffe://team/*" }
-      role:  user
-      grants: [knowledge.*]
-```
+agent:
+  name: orders
+  instruction: You process paid orders.
 
-- A **natural-language** message becomes a durable conversation turn; the answer
-  comes back as the A2A task's artifact.
-- A **command** DataPart (`{"data":{"agentd":{"op":"workflow.run","workflow":"…"}}}`),
-  sent with the [command extension](https://agentd.dev/a2a/ext/command) activated, runs a registry
-  action directly, with no model in the path — deterministic dispatch rather
-  than prose the receiving agent has to interpret.
-- Every call is resolved to a **principal** (mTLS / bearer → `operator | user |
-  agent | anonymous`), authorized against a role matrix, and (optionally)
-  **audited** (`observability.audit`).
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
 
-See [`docs/configuration.md`](configuration.md) for the full `a2a` schema.
+vars:
+  registry: https://hooks.example.com
+  my_hook: https://orders-agent.example.com/hooks/orders
 
-
-
-## Init and deinit — workflows that bracket the process
-
-Two idioms make a daemon's lifecycle itself programmable:
-
-- **Initialization** — a `once {policy: always}` start fires on every boot
-  (before `ensure`-style dedup, it is the "run this when I come up" hook).
-  The canonical use: self-registration — POST your own webhook URL to a
-  third-party service the moment the process is alive to receive calls.
-- **Deinitialization** — an `event {on: lifecycle.shutdown}` start fires when
-  the drain begins (SIGTERM/SIGINT, or a `finish {exit: true}`), and the
-  drain **waits** for that run — bounded by `drain_timeout` like everything
-  else — before the process exits. The mirror of the above: DELETE the
-  webhook registration so the third party stops calling a corpse.
-
-```yaml
 workflows:
   - name: init
     steps:
-      boot:     { kind: once, policy: always }
-      register: { kind: http, depends_on: [boot], method: POST,
-                  url: "{{config.service}}/webhooks", json: { url: "{{config.my_hook}}" } }
-      f:        { kind: finish, depends_on: [register] }
+      boot:     {kind: once, policy: always}       # every boot, not once per state
+      register: {kind: http, depends_on: [boot], method: POST,
+                 url: "{{config.registry}}/webhooks", json: {url: "{{config.my_hook}}"}}
+      done:     {kind: finish, depends_on: [register]}
   - name: deinit
     steps:
-      bye:        { kind: event, on: lifecycle.shutdown }
-      deregister: { kind: http, depends_on: [bye], method: DELETE,
-                    url: "{{config.service}}/webhooks?url={{config.my_hook}}" }
-      f:          { kind: finish, depends_on: [deregister] }
+      bye:        {kind: event, on: lifecycle.shutdown}   # fires when the drain begins
+      deregister: {kind: http, depends_on: [bye], method: DELETE,
+                   url: "{{config.registry}}/webhooks", query: {url: "{{config.my_hook}}"}}
+      done:       {kind: finish, depends_on: [deregister]}
 ```
 
-Keep deinit workflows to fast, model-free steps (`http`, `mcp.tool`, data):
-the drain is simultaneously winding subagent children down, so an `agent`
-step here competes with the shutdown it is part of. Every OTHER queued start
-stays durably in the inbox for the next life — only `lifecycle.shutdown`
-runs are admitted during a drain. The event payload carries the reason:
-`{event: "lifecycle.shutdown", payload: {reason: "signal" | "exit"}}`.
+Keep deinit workflows to fast steps that need no model — `http`,
+`mcp.tool`, data steps. The drain is winding child processes down at the same
+time, so an `agent` step there competes with the shutdown it belongs to.
+Only `lifecycle.shutdown` runs are admitted during a drain; every other
+queued firing stays in the durable inbox for the next start.
+
+## A2A as a trigger
+
+A daemon's external channel is A2A, and it is a trigger like any other. Set
+`a2a.listen` and the instance becomes a daemon under `run_until: auto`. A
+plain message from a caller becomes a durable conversation turn, answered as
+the A2A task's result. A command — a structured data part sent with the
+[command extension](https://agentd.dev/a2a/ext/command) — runs a registered
+action with no model in the path, and an `a2a` start node can declare its
+own command so that a matching message fires a run instead of a turn. Every
+caller is resolved to a principal and held to what that principal may do. [The A2A channel](a2a.md) explains the
+listener and its principals; [Connect agents over A2A](connect-agents.md)
+shows the configuration.
+
+## Next steps
+
+- [Your first workflow](first-workflow.md) — a trigger, a step and a finish,
+  end to end.
+- [Workflows: how runs work](workflows.md) — what happens once a run has
+  started.
+- [React to changes and events](react-to-events.md) — subscriptions,
+  streams, webhooks and MCP Events as triggers.
+- [Deploy](deployment.md) — running a job or a daemon under an orchestrator.

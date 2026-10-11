@@ -22,7 +22,7 @@ agent:
     instructions.
 
 intelligence:
-  endpoints: https://llm.example.com/v1
+  endpoints: https://llm.example.com/v1/chat/completions
   model: gpt-5.1
   token: "{{secret:LLM_TOKEN}}"
 

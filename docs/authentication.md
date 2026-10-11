@@ -1,108 +1,295 @@
-# Authenticating to endpoints
+# Outbound credentials
 
-> Signing callers **in** to agentd's own A2A listener — principals, the device
-> grant, `agentd tui` / `agentd ui` launch codes — is in [a2a.md](a2a.md#signing-in),
-> and its threat model in [security.md](security.md#the-a2a-boundary).
+agentd dials three kinds of endpoint that may need a credential: model
+providers, MCP servers and A2A peers. Each takes one `auth:` block with the
+same shape, so a static token, an OAuth login, AWS SigV4 or a SPIFFE workload
+identity is configured the same way wherever it is used. This guide is for
+operators: it shows how to choose a credential, configure it, log in once
+when a person is needed, and what happens when a credential is missing.
+Signing callers *in* to agentd's own listener is a different task, covered in
+[Connect agents over A2A](connect-agents.md).
 
-agentd talks to three kinds of outbound endpoint that may require credentials:
-**intelligence** (the LLM), **MCP** servers, and **A2A** peers. Each takes an
-optional `auth:` block — one credential provider shared by all three — so you can
-use a static secret, an **interactive OAuth login**, **AWS SigV4**, or a
-**SPIFFE** workload identity, with one consistent shape.
+## Choose a credential
 
-> **The rule that ties it together — fail-closed.** A daemon never blocks waiting
-> for a human. If an interactive credential is missing and can't be refreshed, the
-> process exits telling you to run `agentd --login <target>` rather than hanging.
-> Secrets are always `{{secret:…}}` references — never inline, never logged.
-
-## Two contexts
-
-| Context | Credential | Interactive? |
+| Where agentd runs | Use | Interactive? |
 |---|---|---|
-| **Headless / cloud** | a static secret (env/file), AWS creds, or a SPIFFE SVID | never |
-| **Human at a terminal** | an OAuth login completed once, then a cached, refreshing token | yes, once |
+| anywhere, the endpoint takes an API key | `static`, from a secret reference | never |
+| a server, machine-to-machine OAuth | `oauth2` with `grant: client_credentials` | never |
+| a developer's or operator's machine, a person's OAuth identity | `oauth2` with `grant: device` (or `authorization_code` for a browser) and one `agentd --login` | once |
+| EC2 or EKS, an endpoint behind AWS IAM | `aws` with `source: imds` or `source: irsa` | never |
+| a workstation, AWS IAM Identity Center | `aws` with `source: sso` and one `agentd --login` | once |
+| Kubernetes or a cloud with SPIRE | `spiffe`, a JWT-SVID as a bearer or an X.509-SVID for mutual TLS | never |
 
-## The `auth:` block
+A daemon never stops to wait for a person. Interactive credentials are
+obtained ahead of time with `agentd --login`, cached, and refreshed by the
+daemon.
 
-Every endpoint accepts `auth: { kind: …, … }`. The shortcuts
-(`intelligence.token`, `mcp.servers[].headers`, `a2a.peers[].client_cert`) are
-equivalent to `kind: static`.
+## A complete example
+
+This agent calls a corporate model gateway with a machine credential, reads
+an issue tracker as the operator who logged in, and hands work to a partner
+agent with a static token:
 
 ```yaml
+agent:
+  instruction: "Triage new tracker issues and hand billing questions to the partner desk."
+
 intelligence:
-  endpoints: ["https://llm.corp.example/v1"]
+  endpoints: https://llm.corp.example.com/v1/chat/completions
   model: gpt-5.1
-  auth: { kind: oauth2, grant: device, issuer: "https://sso.corp.example", client_id: agentd, scopes: [llm.invoke] }
+  auth:
+    kind: oauth2
+    grant: client_credentials
+    issuer: https://sso.corp.example.com
+    client_id: agentd-triage
+    client_secret: "{{secret:SSO_CLIENT_SECRET}}"
+    scopes: [llm.invoke]
 
 mcp:
   servers:
-    - name: github
-      endpoint: https://mcp.github.com
-      auth: { kind: oauth2, grant: device, issuer: "https://github.com/login/oauth", client_id: "Iv1.abc", scopes: [repo] }
+    - name: tracker
+      endpoint: https://mcp.tracker.example.com/mcp
+      tags: { "*": [untrusted_input] }
+      auth:
+        kind: oauth2
+        grant: device
+        issuer: https://sso.corp.example.com
+        client_id: agentd-cli
+        scopes: [tracker.read, offline_access]
 
 a2a:
   peers:
     - name: partner
-      endpoint: https://a2a.partner.example
+      endpoint: https://a2a.partner.example.com
       auth: { kind: static, token: "{{secret:PARTNER_TOKEN}}" }
 ```
 
-`agentd --validate-config` checks each block's required fields and rejects an
-inline secret.
+With `SSO_CLIENT_SECRET` and `PARTNER_TOKEN` set, validate it, then log in to
+the tracker once:
 
-## Provider kinds
-
-### `static` — a fixed credential
-
-A bearer token or an arbitrary header, from a `{{secret:…}}` reference:
-
-```yaml
-auth: { kind: static, token: "{{secret:API_TOKEN}}" }              # → Authorization: Bearer …
-auth: { kind: static, header: "X-API-Key", value: "{{secret:KEY}}" }
+```sh
+agentd --validate-config --config agentd.yaml
+agentd --login mcp:tracker --config agentd.yaml
 ```
 
-A `{{secret-file:…}}` reference is re-read per request, so a rotated token file is
-picked up without a restart.
+The client-credentials grant needs no login: the daemon fetches and refreshes
+that token itself.
 
-### `oauth2` — interactive login & machine-to-machine
+## Where a credential goes
+
+| Endpoint | `auth:` block | Other ways to set a credential |
+|---|---|---|
+| the model connection | `intelligence.auth` | `intelligence.token` or `token_file` (a bearer), `intelligence.headers` |
+| a named model provider | `intelligence.providers.<name>.auth` | that provider's `token`, `token_file`, `headers` |
+| an MCP server | `mcp.servers[].auth` | `headers`; `oauth: {token_url, client_id, client_secret, scope}`, a client-credentials shortcut |
+| a service catalog entry | `services.<name>.auth` | `headers` |
+| an A2A peer | `a2a.peers[].auth` | `headers`; `client_cert` and `client_key` for mutual TLS |
+
+On a model connection, a credential from `auth:` takes precedence over
+`token`. The `AGENTD_INTELLIGENCE_TOKEN` and `AGENTD_INTELLIGENCE_TOKEN_FILE`
+environment overrides apply to the top-level connection only, never to a
+named provider.
+On an MCP server, `auth:` wins over `oauth:`, and either one turns off AAuth
+signing for that server; static `headers` are sent alongside.
+
+**One credential for many consumers.** A service catalog entry holds the
+credential every server or peer that references it uses, cached once under
+`service:<name>`:
 
 ```yaml
+agent:
+  instruction: "Answer account questions from the CRM."
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+
+services:
+  crm:
+    endpoint: https://mcp.crm.example.com/mcp
+    tags: { "*": [sensitive] }
+    auth:
+      kind: oauth2
+      grant: device
+      issuer: https://sso.corp.example.com
+      client_id: agentd-cli
+      scopes: [crm.read]
+mcp:
+  servers:
+    - { name: crm, service: crm }
+```
+
+A server that references an entry may not restate its endpoint, `auth` or
+`headers`. `agentd --login mcp:crm` and `agentd --login service:crm` log into
+the same cached credential.
+
+## Static credentials
+
+A fixed bearer token, or a fixed value in a header of your choosing, always
+from a secret reference:
+
+```yaml
+# fragment: under mcp.servers[]:
+auth: { kind: static, token: "{{secret:KB_TOKEN}}" }
+```
+
+```yaml
+# fragment: under mcp.servers[]:
+auth: { kind: static, header: X-API-Key, value: "{{secret:KB_API_KEY}}" }
+```
+
+`token` is sent as `Authorization: Bearer <token>`. A `{{secret-file:PATH}}`
+reference is read again on every request, so a rotated file takes effect
+without a restart.
+
+On a model connection, a `static` block takes `token`; a `header` + `value`
+pair is refused at load there. Use `intelligence.headers` for a custom header
+on a model connection.
+
+## OAuth 2.0
+
+```yaml
+# fragment: under mcp.servers[]:
 auth:
   kind: oauth2
-  issuer: https://sso.corp.example      # or pin token_url / device_authorization_url
-  client_id: agentd
-  client_secret: "{{secret:OIDC_SECRET}}"   # omit for a public client
-  grant: device                         # device | authorization_code | client_credentials
-  scopes: [llm.invoke, offline_access]
+  issuer: https://sso.corp.example.com      # or pin token_url, device_authorization_url
+  client_id: agentd-cli
+  client_secret: "{{secret:SSO_CLIENT_SECRET}}"   # omit for a public client
+  grant: device                             # device | authorization_code | client_credentials
+  scopes: [tracker.read, offline_access]
+  audience: https://tracker.example.com     # sent with the device authorization request
 ```
 
-- **`device`** (the default) — the interactive flow (see [`agentd --login`](#agentd-login)).
-  Works headless / over SSH; no browser or open port. The token endpoints are
-  discovered from `issuer` (RFC 8414 / OIDC) unless pinned.
-- **`client_credentials`** — a headless machine-to-machine grant (needs
-  `client_secret`); refreshes on its own, no login.
-- **`authorization_code`** — a **browser + PKCE** loopback flow. `agentd --login`
-  prints the authorization URL (it never shells out to a browser), captures the
-  redirect on a one-shot `127.0.0.1` listener, verifies `state`, and exchanges the
-  code. Use it when a desktop browser is handier than typing a device code.
+| Grant | When | How the token arrives |
+|---|---|---|
+| `device` (the default) | a person authorizes once, from any terminal, over SSH included | `agentd --login` prints a URL and a short code and polls until the person approves |
+| `authorization_code` | a person with a desktop browser | `agentd --login` prints the authorization URL, catches the redirect on a one-time `127.0.0.1` listener, checks `state`, and exchanges the code with PKCE |
+| `client_credentials` | machine to machine | the daemon fetches the token with `client_secret` and refetches it before it expires; no login |
 
-### `aws` — SigV4-signed requests
+**Endpoints.** With `issuer`, agentd discovers the token, device and
+authorization endpoints from `<issuer>/.well-known/openid-configuration`, or
+`<issuer>/.well-known/oauth-authorization-server`. Pin `token_url`,
+`device_authorization_url` or `authorization_url` to skip discovery. An
+`oauth2` block needs `client_id` and either `issuer` or `token_url`; the
+device grant also needs `issuer` or `device_authorization_url`, and the
+browser grant `issuer` or `authorization_url`. The load checks each of these.
 
-For an endpoint behind AWS IAM (an API-Gateway MCP server, a Bedrock gateway):
+Discovery runs when the connection is built: at startup and at each reload.
+Pin the endpoints if the authorization server may be unreachable then.
+
+**The MCP shortcut.** `mcp.servers[].oauth` is a client-credentials grant
+with a pinned token endpoint, and nothing else:
 
 ```yaml
+# fragment: under mcp.servers[]:
+oauth:
+  token_url: https://sso.corp.example.com/oauth2/token
+  client_id: agentd-search
+  client_secret: "{{secret:SEARCH_CLIENT_SECRET}}"
+  scope: search.read
+```
+
+> **Limit.** agentd reads OAuth responses as JSON, which is what RFC 6749
+> and RFC 8628 specify, and does not send `Accept: application/json`. An
+> authorization server that answers form-encoded unless asked for JSON, such
+> as GitHub's OAuth endpoints, fails with `oauth: bad device-auth response`.
+
+## Log in with agentd --login
+
+When a credential needs a person (an `oauth2` device or authorization-code
+grant, or `aws` with `source: sso`), complete it once with `agentd --login`.
+The release binaries and the container image include the `oauth` feature it
+needs.
+
+```sh
+agentd --login mcp:tracker --config agentd.yaml
+```
+
+```text
+┌─ authorize agentd ──────────────────────────────
+│  target   mcp:tracker
+│  visit    https://sso.corp.example.com/device
+│  code     WDJB-MJHT
+│  waiting… (expires in 900s · Ctrl-C to cancel)
+└──────────────────────────────────────────────────
+logged in to mcp:tracker — token cached in /home/you/.local/state/agentd/creds
+```
+
+The prompt goes to stderr and the one-line result to stdout. The token is
+never printed.
+
+| Target | Logs into |
+|---|---|
+| `intelligence` | the top-level model connection's `auth` |
+| `intelligence:<provider>` | `intelligence.providers.<provider>.auth` |
+| `mcp:<name>` | that MCP server's `auth`; a server that references a service logs into `service:<entry>` |
+| `service:<name>` | a service catalog entry's `auth`, shared by every consumer |
+
+An A2A peer can be logged into only through a service entry: give the peer
+`service: <entry>` with a `kind: peer` catalog entry, and log into
+`service:<entry>`. A peer's own `auth` block caches under a name `--login`
+does not accept.
+
+`agentd --logout <target>` removes a cached credential.
+
+The device grant, from login to the daemon's refresh:
+
+```mermaid
+sequenceDiagram
+  participant P as You
+  participant L as agentd --login
+  participant AS as Authorization server
+  participant C as Credential cache
+  participant D as agentd daemon
+  participant E as Endpoint
+  L->>AS: device authorization request
+  AS-->>L: user code and verification URL
+  L->>P: prints the URL and the code
+  P->>AS: approves in a browser
+  L->>AS: polls the token endpoint
+  AS-->>L: access and refresh tokens
+  L->>C: writes them, mode 0600
+  D->>C: reads them when the connection is built
+  D->>E: request with the bearer token
+  D->>AS: refreshes before the token expires
+```
+
+**The cache** is one file per target, mode `0600`, in `$AGENTD_CRED_DIR`, else
+`$XDG_STATE_HOME/agentd/creds`, else `~/.local/state/agentd/creds`. Log in as
+the user the daemon runs as, or point both at the same `AGENTD_CRED_DIR`. The
+daemon refreshes a token in memory a minute before it expires, using the
+refresh token; a refreshed token is not written back to the cache. A restart
+reads the cache again, so after a restart the daemon refreshes from the
+refresh token the login stored. If your authorization server issues
+single-use refresh tokens, plan on logging in again after a restart.
+
+## AWS SigV4
+
+An endpoint behind AWS IAM, such as an API Gateway in front of an MCP server
+or Amazon Bedrock, takes a `kind: aws` block. Every request is signed over
+its method, path and body; a session token is signed as
+`x-amz-security-token`.
+
+```yaml
+# fragment: under mcp.servers[]:
 auth:
   kind: aws
   region: us-east-1
-  service: execute-api        # or bedrock, …
-  source: env                 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+  service: execute-api
+  source: irsa
 ```
 
-Each request is SigV4-signed (temporary-credential session tokens are handled via
-`x-amz-security-token`). Sources: `env`/`static` (the standard `AWS_*` variables),
-and **`sso`** — the interactive **IAM Identity Center** login:
+| `source` | Credentials | Login |
+|---|---|---|
+| `env` (the default) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, read when the connection is built | none |
+| `static` | the same as `env` | none |
+| `imds` | the EC2 instance role, through IMDSv2, refreshed a minute before expiry | none |
+| `irsa` | the EKS pod's web identity (`AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`) exchanged with STS, refreshed a minute before expiry | none |
+| `sso` | IAM Identity Center; needs `sso_start_url`, `account_id`, `role_name` | `agentd --login`, which caches temporary credentials; the signer re-reads them on every request |
 
 ```yaml
+# fragment: under mcp.servers[]:
 auth:
   kind: aws
   region: us-east-1
@@ -110,157 +297,116 @@ auth:
   source: sso
   sso_start_url: https://my-org.awsapps.com/start
   account_id: "123456789012"
-  role_name: AgentdBedrock
+  role_name: AgentdLedger
 ```
 
-`agentd --login mcp:<name>` runs the SSO device flow and caches **temporary AWS
-credentials**; the signer reloads them per request (a re-login refreshes them with
-no restart).
+For Amazon Bedrock's own API, set `intelligence.dialect: bedrock` with a
+`kind: aws` block and `service: bedrock`; the load refuses the Bedrock
+dialect without one. [Connect model providers](connect-models.md) has
+complete configurations for Bedrock, Azure OpenAI with Microsoft Entra ID, and
+Google Vertex AI.
 
-For **headless** AWS workloads, no login is needed — `source: imds` (an EC2
-instance role, IMDSv2) and `source: irsa` (an EKS pod's web identity → STS
-`AssumeRoleWithWebIdentity`) fetch and auto-refresh temporary credentials at
-runtime:
+## SPIFFE workload identity
 
-```yaml
-auth: { kind: aws, region: us-east-1, service: bedrock, source: irsa }   # EKS/IRSA
-auth: { kind: aws, region: us-east-1, service: bedrock, source: imds }   # EC2 role
-```
-
-### `spiffe` — workload identity (SPIFFE/SPIRE)
-
-Zero-secret identity for k8s/cloud, from SPIRE-written files:
+With SPIRE writing SVIDs to files, an agent needs no stored secret at all.
 
 ```yaml
-# JWT-SVID → a rotating bearer (re-read per request):
+# fragment: under mcp.servers[]:
 auth: { kind: spiffe, svid: jwt, jwt_svid_file: /run/spire/jwt.svid }
-
-# X.509-SVID → mutual TLS (needs a TLS build):
-auth: { kind: spiffe, svid: x509, svid_file: /run/spire/svid.pem, key_file: /run/spire/key.pem }
 ```
-
-## Enterprise LLM providers (Azure, Google, AWS)
-
-The enterprise LLMs authenticate with **standard OAuth** (Azure Entra ID, Google) or
-**AWS SigV4** — all covered by the providers above. Point `intelligence.endpoints` at
-the provider's **OpenAI-compatible** URL and attach the matching `auth:` block.
-
-**Azure OpenAI** — Entra ID (Azure AD) bearer via the device flow:
 
 ```yaml
-intelligence:
-  endpoints: ["https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview"]
-  model: gpt-4o
-  auth:
-    kind: oauth2
-    grant: device
-    issuer: "https://login.microsoftonline.com/<tenant-id>/v2.0"
-    client_id: "<app-registration-client-id>"
-    scopes: ["https://cognitiveservices.azure.com/.default"]
+# fragment: under mcp.servers[]:
+auth: { kind: spiffe, svid: x509, svid_file: /run/spire/svid.pem, key_file: /run/spire/svid.key }
 ```
 
-**Google Vertex AI** — Google OAuth bearer via the device flow, against Vertex's
-OpenAI-compatible endpoint:
+A JWT-SVID is sent as a bearer token and read again on every request, so
+SPIRE's rotation needs nothing from you. An X.509-SVID is a mutual-TLS client
+identity: it works on MCP servers. A model connection cannot use one, and the
+load refuses it there. For an A2A peer, an `x509` block applies nothing; set
+the peer's `client_cert` and `client_key` to the SVID files instead.
+
+## Mutual TLS and private CAs
+
+An A2A peer that requires a client certificate takes `client_cert` and
+`client_key`, PEM files read when the peer is dialled:
 
 ```yaml
-intelligence:
-  endpoints: ["https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>/endpoints/openapi"]
-  model: google/gemini-1.5-pro
-  auth:
-    kind: oauth2
-    grant: device
-    issuer: "https://accounts.google.com"
-    client_id: "<oauth-client-id>"
-    scopes: ["https://www.googleapis.com/auth/cloud-platform"]
+# fragment: under a2a.peers[]:
+name: billing
+endpoint: https://a2a.billing.example.com
+client_cert: /run/spire/svid.pem
+client_key: /run/spire/svid.key
 ```
 
-Complete either once with `agentd --login intelligence`; the daemon refreshes the
-token on its own thereafter.
+To trust an endpoint whose certificate a private CA signed, set
+`security.tls_ca` to a PEM bundle. agentd adds it to the bundled trust roots
+for every outbound TLS dial, in the daemon and its child processes.
 
-**AWS Bedrock (native)** — talk to the Bedrock runtime directly, no gateway. Set
-`intelligence.dialect: bedrock` (agentd speaks the **Bedrock Converse** wire —
-tool-calling and system prompts included) and attach a `kind: aws` auth block;
-agentd SigV4-signs every dial. The model id rides the URL, so `model:` is the
-Bedrock model (or an inference-profile id / ARN):
+## Which kinds each endpoint accepts
 
-```yaml
-intelligence:
-  endpoints: ["https://bedrock-runtime.us-east-1.amazonaws.com"]
-  dialect: bedrock
-  model: anthropic.claude-3-5-sonnet-20241022-v2:0
-  auth:
-    kind: aws
-    region: us-east-1
-    service: bedrock
-    source: sso           # or env / static / imds (EC2) / irsa (EKS)
-    # for source: sso — the IAM Identity Center portal + role:
-    sso_start_url: "https://my-org.awsapps.com/start"
-    account_id: "123456789012"
-    role_name: AgentdBedrock
-```
-
-For `source: sso`, run `agentd --login intelligence` once (the IAM Identity Center
-device flow → temporary credentials); the daemon refreshes them thereafter. On EC2
-(`imds`) or EKS (`irsa`) the credentials are ambient — no login step. The same
-`kind: aws` block also fronts an **AWS-IAM-guarded OpenAI-compatible gateway**
-(leave `dialect` unset, set `service: execute-api`); a bearer-guarded gateway takes
-`oauth2`/`static` instead.
-
-## <a id="agentd-login"></a>`agentd --login` — the interactive flow
-
-When a provider needs a human (an `oauth2` `device`/`authorization_code` grant),
-complete it once with `agentd --login`; the token is cached and the daemon uses
-it. The flag needs a binary built with `--features oauth` (the release binaries
-and the published image have it).
-
-```console
-$ agentd --login mcp:github --config app.yaml
-┌─ authorize agentd ───────────────────────────────
-│  target   mcp:github
-│  visit    https://github.com/login/device
-│  code     WDJB-MJHT
-│  waiting… (expires in 900s · Ctrl-C to cancel)
-└──────────────────────────────────────────────────
-logged in to mcp:github — token cached in ~/.local/state/agentd/creds
-```
-
-- `agentd --login <target>` — run the flow for `intelligence`, a named
-  intelligence provider (`intelligence:<provider>`), `mcp:<name>` or
-  `service:<name>`. Each provider's credential is cached under its own target.
-- `agentd --logout <target>` — evict the cached credential (no feature needed).
-
-The token (and its refresh token) is cached in a per-user file (`0600`, under
-`$AGENTD_CRED_DIR`, else `$XDG_STATE_HOME/agentd/creds`, else
-`~/.local/state/agentd/creds`). The daemon reads it at startup and **refreshes**
-in memory before expiry — so a long-running agent keeps a live credential without
-re-prompting. A restart re-reads the cache; only an expired token with no refresh
-token needs a fresh `agentd --login`.
-
-> **Never printed.** The device prompt shows the URL and short code, never the
-> token. The cache file holds live tokens and is excluded from all logs, audit,
-> and the read surface.
-
-## Where each provider applies
-
-| | static | oauth2 device | oauth2 client-creds | aws (SigV4) | spiffe jwt | spiffe x509 |
+| | `static` token | `static` header | `oauth2` | `aws` | `spiffe` jwt | `spiffe` x509 |
 |---|---|---|---|---|---|---|
-| **MCP server** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (mTLS) |
-| **intelligence** | ✓ | ✓ | ✓ | ✓ (incl. `dialect: bedrock`) | ✓ | — |
-| **A2A peer** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`client_cert`/`key`) |
+| model connection or provider | yes | refused at load | yes | yes | yes | refused at load |
+| MCP server or service | yes | yes | yes | yes | yes | yes (mutual TLS) |
+| A2A peer | yes | yes | yes, login through a service entry | yes | yes | use `client_cert` and `client_key` |
 
-## Security
+## When a credential is missing or refused
 
-- **Fail-closed:** a daemon never blocks on a human; a missing interactive
-  credential is a clean startup error naming the `agentd --login` to run.
-- **Secret-free:** every credential input is a `{{secret:…}}` / `{{secret-file:…}}`
-  reference; the token cache and device codes are never logged.
-- **No ambient authority:** every credential is configured per endpoint; AWS/
-  SPIFFE sources are opt-in.
-- **TLS everywhere:** token and discovery endpoints are HTTPS with certificate
-  verification; a public webhook/`auth` bind must use `https://`.
+The load catches what it can see, and exits 2 before any side effect:
 
-## See also
+- a `{{secret:…}}` or `{{secret-file:…}}` reference that does not resolve;
+- an `auth:` block missing the fields its kind and grant need;
+- an inline `token`, `value` or `client_secret` in any `auth:` block, and an
+  inline `intelligence.token`, provider `token` or `oauth.client_secret` in a
+  config file.
 
-- [Configuration](configuration.md) — every key, precedence, `{{secret:…}}`, `--validate-config`.
-- [Security](security.md) — secret handling, the Rule-of-Two, no local execution.
-- [Intelligence](intelligence.md) — the LLM wire.
+An interactive credential that was never logged in, or has expired with no
+way to refresh, is not caught at load. The request goes out without the
+credential and the endpoint refuses it: an MCP server fails to connect
+(`mcp.connect.fail`), and a model call fails as an authentication error,
+which is not retried and fails the run. In a one-shot job, the run's
+`run.done` line carries the error:
+
+```text
+{…,"err":"step \"work\" failed: turn failed: intel: intelligence HTTP 401: {\"error\":{\"message\":\"unauthorized\"}}","event":"run.done",…,"status":"failed",…}
+```
+
+The job then exits 4. If you see a `401` from an endpoint whose `auth`
+needs a login, run `agentd --login` for its target as the user the daemon
+runs as. The [CLI reference](cli.md) has every exit code.
+
+## Field reference
+
+| Field | Kinds | Meaning |
+|---|---|---|
+| `kind` | all | `static`, `oauth2`, `aws` or `spiffe` (required) |
+| `token` | `static` | bearer token; must be a secret reference |
+| `header`, `value` | `static` | a custom header and its value; `value` must be a secret reference |
+| `issuer` | `oauth2` | authorization server for endpoint discovery |
+| `token_url` | `oauth2` | token endpoint; pins discovery |
+| `device_authorization_url` | `oauth2` | device authorization endpoint |
+| `authorization_url` | `oauth2` | authorization endpoint for `grant: authorization_code` |
+| `client_id` | `oauth2` | client id (required) |
+| `client_secret` | `oauth2` | client secret; must be a secret reference; required for `client_credentials` |
+| `grant` | `oauth2` | `device` (default), `authorization_code` or `client_credentials` |
+| `scopes` | `oauth2` | requested scopes |
+| `audience` | `oauth2` | `audience` parameter sent with the device authorization request, for authorization servers that want one |
+| `region` | `aws` | AWS region (required) |
+| `service` | `aws` | signing service name, such as `bedrock` or `execute-api` (required) |
+| `source` | `aws` | `env` (default), `static`, `imds`, `irsa` or `sso` |
+| `sso_start_url`, `account_id`, `role_name` | `aws` | IAM Identity Center portal, account and permission set; required for `source: sso` |
+| `svid` | `spiffe` | `jwt` (default) or `x509` |
+| `jwt_svid_file` | `spiffe` | JWT-SVID file; required for `svid: jwt` |
+| `svid_file`, `key_file` | `spiffe` | X.509-SVID certificate and key; required for `svid: x509` |
+
+## Next steps
+
+- [Connect model providers](connect-models.md): complete configurations for
+  each provider, credentials included.
+- [Connect MCP servers](connect-mcp.md): declare servers, tags and tool
+  ceilings.
+- [AAuth agent identity](aauth.md): a signed agent identity for servers that
+  ask for one.
+- [Harden a deployment](harden.md): secrets, egress and the rest of the
+  checklist.

@@ -1,596 +1,484 @@
-# Operations
+# Operate a running daemon
 
-`agentd` is one process running one agent, but a fleet of them is a *control
-plane*. This page is for the operator (and the tooling it drives): how to talk
-to a running instance, the commands that steer it without restarting it, how a
-controller discovers what an instance can do, and how to push a config change
-into a live daemon.
+This guide covers the day-to-day control of a long-lived agentd: draining it
+for a rolling update, pausing and resuming work, cancelling a run, changing
+a setting, reading live state, reloading configuration and handling disk
+pressure. Each task comes with a complete request you can copy. It is for
+operators and for the tooling they drive; deploying the daemon in the first
+place is covered in [Deploy](deployment.md).
 
-Almost everything here rides one surface — the **A2A listener** (`a2a.listen`,
-`--features a2a`) — which is off by default. A pure one-shot CLI run carries
-none of it. The exceptions are the three side-effect-free probes
-(`--capabilities`, `--config-schema`, `--validate-config`), which need no
-listener, no network, and no config beyond the files you point them at.
+## The control channel
 
-Every surface here is self-describing: `--capabilities` reports the methods,
-admin family and command ops this instance actually serves, `--config-schema`
-reports the settings document it accepts, and the telemetry event and metric
-names are stable. A controller drives an instance from what the instance
-declares, never from an assumption about the build it is talking to.
+Everything here except reload by signal and the discovery asks travels over
+the instance's A2A listener (`a2a.listen`). The listener is in the release
+binaries and image. An instance without one can still be drained with
+`SIGTERM` and reloaded with `SIGHUP`, but takes no commands.
 
----
+A command is an ordinary A2A `SendMessage` whose message carries a data part
+of the form `{"agentd": {"op": "<name>", …arguments}}`. agentd treats it as a
+command only when the request activates the
+[command extension](https://agentd.dev/a2a/ext/command) twice: the
+`A2A-Extensions` header names its URI, and `message.extensions` lists it.
+A request without the header is refused with `EXTENSION_NOT_ACTIVATED`, and
+one without the mark with `EXTENSION_NOT_MARKED`, so no client sends a
+command by accident.
 
-## 1. The A2A listener
-
-`a2a.listen` (flag `--listen`, env `AGENTD_A2A_LISTEN`) arms an HTTPS listener
-that speaks **A2A JSON-RPC 2.0 over POST**. It is the instance's only external
-channel: peers, display clients and operators all arrive here.
-
-| Form | Meaning | Auth |
-|---|---|---|
-| `https://0.0.0.0:8443` + `a2a.tls.cert`/`.key`/`.client_ca` | TLS with **mutual-TLS** client auth | a verified client cert → matched against `a2a.principals` |
-| `https://0.0.0.0:8443` + `a2a.bearer` | TLS with a **bearer token** | a constant-time-matched `Authorization: Bearer …` → operator; a `bearer_ref` rule → its principal |
-| `http://127.0.0.1:8080` | **loopback only**, no auth (dev) | a local non-browser process that presents nothing → operator, while no credential mechanism and no principal rule is configured |
-
-Trust is never derived from the transport alone. Validation refuses to start if:
-
-- `a2a.listen` is `https://` but `a2a.tls.cert` / `a2a.tls.key` are unset;
-- the bind is **non-loopback** and neither `a2a.tls.client_ca` nor `a2a.bearer`
-  is configured — there is no open control plane;
-- the bind is non-loopback and the scheme is plaintext `http://`;
-- the bind is a wildcard (`0.0.0.0`, `::`) and `a2a.url` is unset — a wildcard
-  is no address a caller can dial, so the card and the OAuth issuer publish
-  `a2a.url` instead.
-
-A signed-in client — a person's terminal or browser, approved by an operator
-under a name — arrives through the listener's OAuth device grant
-(`a2a.device_grant`), never with a copy of the daemon's bearer; see
-[a2a.md](a2a.md#the-device-authorization-grant).
-
-Arming the listener makes the instance a **daemon**, and a daemon must be
-durable: naming no `store` section gets it `kind: file` on the local
-filesystem, while a fleet that shares one backend needs `kind: mcp` or
-`kind: http`. An explicit `store.kind: none` on a long-lived instance is a
-configuration error, not a warning — a long-lived agent that cannot checkpoint
-loses every in-flight run to the next restart.
+This daemon configuration serves the listener with a bearer token for the
+operator:
 
 ```yaml
 # /etc/agentd/ops.yaml
 agent:
-  instruction: reconcile the desired state
+  name: reconciler
+  instruction: Reconcile the desired state of the fleet inventory.
 intelligence:
-  endpoints: https://gw.example/v1
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  models:
+    smart: { model: gpt-5.1 }
+    fast: { model: gpt-5-mini }
+  roles: { turn: smart }
 mcp:
   servers:
-    - name: state
-      endpoint: https://mcp-state.internal/mcp
-store:
-  kind: mcp
-  mcp:
-    server: state
+    - { name: inventory, endpoint: "https://mcp-inventory.internal/mcp" }
 a2a:
   listen: https://0.0.0.0:8443
-  url: https://agent.internal:8443     # what callers dial; required on a wildcard bind
+  url: https://agent.internal:8443
   tls:
     cert: /etc/agentd/tls/server.crt
     key: /etc/agentd/tls/server.key
-    client_ca: /etc/agentd/tls/clients-ca.crt
-  principals:
-    - match: { san: "spiffe://prod/ns/ops/sa/agentctl" }
-      role: operator
+  bearer: "{{secret:A2A_OPERATOR_TOKEN}}"
+  events: { enabled: true }
 lifecycle:
+  run_until: drained
   drain_timeout: 25s
   watch_config: true
 observability:
-  audit:
-    sink: [log, store]
+  metrics_addr: ":9090"
+  audit: { sink: [log, store] }
 ```
 
-**Certificate rotation is live.** The serve identity is read from the
-`a2a.tls.cert` / `.key` / `.client_ca` **paths** and re-stat'ed (throttled) on
-accept: swapping the mounted files in place — a cert-manager renewal rotating a
-Kubernetes Secret mount — is served on the next connection with **no restart, no
-rebind, no dropped listener**. A bad intermediate write degrades to the last-good
-identity (never down); the auth *posture* (whether client certs are required) is
-fixed at startup — only the PEM contents rotate.
+A request bearing `a2a.bearer` is the operator. Mutual TLS, principal rules
+and signed-in sessions are the other ways in; [Harden a deployment](harden.md)
+and [The A2A channel](a2a.md) cover them. The admin operations below are
+the operator's alone: no grant gives them to another role, so a peer agent
+can never drain or pause the instance it talks to.
 
-### 1.1 Principals — the trust gate
+The requests below assume two variables in your shell:
 
-Every request resolves to a **principal**: an identity (mTLS SAN or subject, a
-matched bearer, a signed-in session) plus a **role**. The role decides what the
-caller may do; there is no in-band flag a caller can set.
+```bash
+export DAEMON_URL=https://agent.internal:8443/
+export A2A_OPERATOR_TOKEN=replace-with-the-operator-token
+```
 
-| Role | May do |
+> **Note.** On a development machine, a listener on a loopback address with
+> no credential configured treats every local process that presents nothing
+> as the operator. Drop the `Authorization` header and use
+> `http://127.0.0.1:<port>/`. Declaring any credential or principal rule
+> ends that.
+
+Every command is audited as `a2a.SendMessage:<op>` when an audit sink is on.
+
+## Drain for a rolling update
+
+`admin.drain` begins the same graceful shutdown `SIGTERM` does. agentd stops
+admitting work, turns `/readyz` to 503, cancels its child processes,
+checkpoints, and exits **0**. Runs that are waiting stay in the durable store
+and resume when the instance starts again; a step whose turn is cut off
+mid-call fails with its run.
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"drain-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.drain","reason":"rolling update"}}}]}}}'
+```
+
+The answer is a completed task whose `<task id>.result` artifact carries the
+acknowledgement:
+
+```json
+{"ok":true,"reason":"rolling update","state":"draining"}
+```
+
+What to know:
+
+- The call returns at once; it does not wait for the exit.
+- A second `admin.drain`, or the first `SIGTERM` after it, changes nothing.
+  A second `SIGTERM` or `SIGINT` forces the shutdown and kills the children.
+- `lifecycle.drain_timeout` (default 25 s) bounds the drain. Past it, agentd
+  kills the children that remain; if any survives 3 more seconds, it logs
+  `drain.abandon` and exits anyway. Keep the orchestrator's grace period
+  above that total;
+  [Deploy](deployment.md#keep-the-drain-inside-the-grace-period) shows the
+  arithmetic.
+- Workflows with an `event` start on `lifecycle.shutdown` fire as the drain
+  begins, and the drain waits for them.
+- To let running steps finish first, send `admin.pause`, poll `status`
+  until its `children` list is empty, then send `admin.drain`. A paused
+  instance starts no new step or turn, so nothing is in flight when the drain
+  begins.
+- The log shows `drain.start`, then `drain.done`, then `proc.exit` with
+  code 0.
+
+## Pause and resume
+
+`admin.pause` holds work without leaving. Without a `run`, it holds the whole
+instance: no conversation turn dispatches and no workflow step schedules.
+Intake continues, so the listener answers, the inbox fills and tasks are
+accepted; the work waits until `admin.resume`. Use it to debug a live
+instance, or to hold it still while you swap the model service underneath.
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"pause-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.pause","reason":"debugging"}}}]}}}'
+```
+
+```json
+{"ok":true,"reason":"debugging","state":"paused"}
+```
+
+Resume it:
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":3,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"resume-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.resume"}}}]}}}'
+```
+
+```json
+{"ok":true,"state":"running"}
+```
+
+With a `run` argument, both act on that one run and every other run keeps
+moving:
+
+| Request arguments | Answer | Refused when |
+|---|---|---|
+| `{"op":"admin.pause","run":"<run id>"}` | `{"ok":true,"paused":"<run id>"}` | the run is already terminal (`-32602`); no such run (`-32001`) |
+| `{"op":"admin.resume","run":"<run id>"}` | `{"ok":true,"resumed":"<run id>"}` | the run is not paused (`-32602`); no such run (`-32001`) |
+
+A pause is not a drain. Readiness does not change, the instance stays in
+the fleet, and an instance-wide pause keeps an idle instance from exiting.
+The pause shows as `paused: true` in `status`, as `agent_paused 1` on
+`/metrics`, and as `agent.paused` / `agent.resumed` (or `run.paused` /
+`run.resumed`) in the log. Run ids appear in `status` and in the `run` field
+of `run.start`.
+
+## Cancel one run
+
+`admin.cancel` cancels one workflow run by id and walks its live steps down.
+The instance keeps running.
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":4,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"cancel-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.cancel","run":"reconcile-01M4P42Z6MAKCJSMS0GEMM61CM","reason":"superseded"}}}]}}}'
+```
+
+```json
+{"ok":true,"cancelled":"reconcile-01M4P42Z6MAKCJSMS0GEMM61CM"}
+```
+
+`run` is required: without it the request is refused before anything runs,
+with `-32602` and reason `INVALID_COMMAND_ARGS`. A run id that does not exist
+is acknowledged the same way, so confirm the cancellation with `status` or
+the run's `run.done` line. To cancel a *task*, one
+conversation turn or one delegated unit of work, use the standard A2A
+`CancelTask` method, which any principal may call on its own tasks.
+
+`admin.drain`, `admin.pause` and `admin.cancel` take an optional `reason`
+(default `operator request`) that goes into the log and the audit record.
+An argument an op does not declare is refused, never ignored.
+
+## Change a setting at runtime
+
+`admin.set` changes one of exactly two settings in the running instance,
+without touching the file:
+
+| Path | Values | Use |
+|---|---|---|
+| `agent.approval` | `ask`, `auto`, `accept` | How closely to ask before acting, decided during a session |
+| `a2a.introspection.enabled` | `true`, `false` | Open the content and internals reads (transcripts, run detail, the log ring) while you debug |
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":5,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"set-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.set","path":"a2a.introspection.enabled","value":true}}}]}}}'
+```
+
+```json
+{"path":"a2a.introspection.enabled","value":true}
+```
+
+The value lasts until the next reload puts the file's value back. Any other
+path is refused with the list of settable paths; everything else is the
+configuration file and a reload. Turn introspection back off when you are
+done: it exposes conversation content to operators.
+
+## Read live state
+
+Reads use the same listener and the same request shape. A read answers with
+a message rather than a task, so polling leaves nothing behind in any task
+list.
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":6,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"status-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+```
+
+`status` answers with the instance view: `instance`, `version`, `run_id`,
+`uptime_ms`, `draining`, `paused`, `job_shape`, the `store` (kind, degraded,
+generation), the armed `workflows`, live `runs`, `conversations`,
+`subagents`, OS `children`, `timers`, `inbox_pending`,
+`conversation_bindings`, the token `budget`, the `tools` count, `skills`,
+lifetime `counters`, the `instruction` (source, version, size; never the
+text), the active `model`, operator-published `values`, and recent
+`activity`. Each principal sees the parts it may.
+
+| Read | Request | Who may |
+|---|---|---|
+| Instance status | `{"op":"status"}` | any named principal |
+| Effective configuration | `{"op":"config"}` | operator |
+| One task, all tasks, task updates | `GetTask`, `ListTasks`, `SubscribeToTask` | the task's owner; the operator sees all |
+| Identity | `GET /.well-known/agent-card.json` | anyone |
+| What this caller may run | `GetExtendedAgentCard` | an authenticated caller |
+| The live event feed | `agentd.events/SubscribeToEvents` | any named principal, with `a2a.events.enabled` |
+| Transcripts, run and subagent detail | `conversation.get`, `run.get`, `subagent.get` | the owner or the operator, with `a2a.introspection.enabled` |
+| The log ring | `{"op":"debug.events"}` | operator, with `a2a.introspection.enabled` |
+
+`config` returns the merged configuration with `{{secret:…}}` references as
+written, never the resolved values. Use it to confirm what a reload changed.
+
+`debug.events` tails the last log lines without a collector. It takes
+`after` (the last `seq` you saw), `limit` (default 200, at most 500), `level`
+and `prefix`, and answers with `events`, `oldest_seq`, `newest_seq` and
+`dropped`:
+
+```bash
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":7,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"tail-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"debug.events","level":"warn","limit":50}}}]}}}'
+```
+
+The ring holds `observability.events_ring` lines (default 1024) and exists
+only while introspection is on. It is lossy by design: a slow reader loses old
+lines and sees how many in `dropped`. While introspection is off, the
+introspection reads answer `-32004` with reason `INTROSPECTION_DISABLED`. The
+[A2A API reference](a2a-reference.md) and [A2A extensions](a2a-extensions.md)
+give every method and the feed's event kinds.
+
+## Reload configuration
+
+A reload applies a changed configuration file without a restart and without
+dropping in-flight work. Two triggers run the same routine:
+
+- **`SIGHUP`**, in a build with `hot-reload` (the release builds have it):
+  `kill -HUP <pid>`, or `systemctl reload` for a unit with
+  `ExecReload=/bin/kill -HUP $MAINPID`.
+- **`lifecycle.watch_config: true`** (`--watch-config`), in a build with
+  `config-watch`: agentd watches each configuration file's directory and
+  reloads when the file changes, including the atomic swap a Kubernetes
+  ConfigMap volume makes. It needs a configuration file; watching nothing is
+  exit 2.
+
+Only the files are read again. The environment and the flags are fixed for
+the life of the process, so a flag still overrides the new file.
+
+A reload is validated first and applied whole or not at all:
+
+```mermaid
+flowchart TD
+  T["SIGHUP or file change"] -->|"re-read"| M["merge files, env and flags"]
+  M -->|"same checks as startup"| V{"valid?"}
+  V -->|"no"| X["config.reload.invalid: nothing changes"]
+  V -->|"yes"| D{"restart-only path changed?"}
+  D -->|"yes"| R["config.reload.restart_required: nothing changes"]
+  D -->|"no"| S["stage: dial new MCP servers, build tools, workflows, rules, routes"]
+  S -->|"any piece fails"| X
+  S -->|"all pieces ready"| C["commit in one step: config.reloaded"]
+```
+
+Staging builds every new piece beside the running one. A refused reload
+closes the connections it dialed and leaves the running configuration,
+instruction, servers, tool registry, workflows, principal rules and webhook
+routes exactly as they were.
+
+### What reloads
+
+| Area | Reloads in place |
 |---|---|
-| `operator` | everything: the admin family, every command op, every read, every task |
-| `user` | conversations and their own tasks, plus the command ops the op table opens to `user` |
-| `agent` | conversations and their own tasks, plus `workflow.run` / `workflow.status` |
-| `anonymous` | nothing — a rule with `role: anonymous` names nobody |
+| Models | `intelligence.endpoints`, `token`, `token_file`, `model`, `models`, `providers`, `roles`, `routes`, `dialect`, `headers`, `auth`, `timeout`, `structured_output`, `swap_policy`, `budget` |
+| Agent | `agent.instruction` (all but `trust`), `prompt`, `description`, `preflight`, `wake_on`, `tools`, `max_parallel_turns`, `on_workflow_finished`, `conversation_budget`, `approval`, `ask_human_fallback`, `ask_human_unowned`, `gate_channels` |
+| Tools | `mcp.servers`, `mcp.default_timeout`, `services`, `tools`, `knowledge`, `search`, `skills` |
+| Work | `workflows`, `streams`, `vars`, `limits`, `lifecycle.idle_grace`, `lifecycle.until_signal`, `goal`, `subagents`, `context`, `memory`, `identity` |
+| A2A | `a2a.principals`, `cors`, `introspection`, `push`, `peers`; `webhooks.default_auth` and the webhook routes |
+| Store and telemetry | `store.retention`, `checkpoint`, `durability`, `on_error`, `timeout`; `observability.log_level`, `log_content`, `audit`, `runtime_events`, `status_values` |
 
-`status` is open to every named role. `a2a.principals[].grants` adds explicit
-op-name patterns on top of a role's defaults, and `a2a.principals[].quotas`
-attaches a per-principal rate limit and token budget. Which op each role
-reaches, and which are the operator's alone, is the op table of the
-[command extension](https://agentd.dev/a2a/ext/command).
+How the live parts take a change:
 
-The evidence is read in a fixed order — a unix-socket peer of the daemon's own
-uid, then a session token or bearer, then a verified client certificate, then
-an `any` rule, then the implicit operator —
-and each kind decides only for itself: a bearer that names nobody is a `401`,
-never a fall-through to what else the request carried
-([a2a.md](a2a.md#the-evidence-in-order)). The implicit operator — a local
-process presenting nothing to a loopback-bound listener — exists only while no
-credential mechanism and no principal rule is configured, and never for a
-request carrying `Origin`. Declaring **any** principal ends it, which is what
-you want in production.
+- **Models.** The next turn uses the new values; every turn worker starts
+  from the live settings. A turn already in flight follows
+  `intelligence.swap_policy`: `finish-on-old` (the default) finishes on the
+  old model, `restart-turn` runs it again on the new one. Running subagents
+  receive the change too (`intel.swap.sent`).
+- **MCP servers.** Added and changed servers are dialed into a new
+  connection set; unchanged servers keep their connection; servers the new
+  file leaves out disconnect when the reload commits. A rotated credential
+  counts as a change. A call already in flight on a server that leaves
+  finishes on its connection.
+- **Workflows.** Definitions reload and re-arm. Live runs keep the definition
+  they started with, pinned by its hash.
+- **Principals, CORS, webhook routes.** Rebuilt in the live listener, so a
+  demotion or a rotated secret applies to the next request.
 
-The **admin family is operator-only**. A `user` or `agent` principal that calls
-one is refused; an anonymous caller is refused before dispatch. So a delegating
-peer can never drain or pause the instance it is talking to.
+### What needs a restart
 
----
+A reload whose result differs under any of these paths is refused, naming
+them. Roll a restart instead:
 
-## 2. The operator admin ops
+`agent.name`, `agent.document_capabilities`, `agent.instruction.trust`,
+`store.kind`, `store.prefix`, `store.mcp`, `store.http`, `store.file`,
+`store.max_value_bytes`, `lifecycle.run_until`, `lifecycle.drain_timeout`,
+`lifecycle.run_id`, `lifecycle.exit_code_map`, `lifecycle.watch_config`,
+`a2a.listen`, `a2a.tls`, `a2a.bearer`, `a2a.url`, `a2a.device_grant`,
+`a2a.events`, `webhooks.listen`, `webhooks.tls`, `webhooks.url`,
+`observability.otel`, `observability.metrics_addr`,
+`observability.health_file`, `observability.events_ring`,
+`observability.traceparent`, `security`.
 
-These five operations steer a running instance without restarting it. They
-are **command ops** of agentd's [command
-extension](https://agentd.dev/a2a/ext/command): an ordinary A2A `SendMessage`
-carrying a DataPart, which is how the protocol expresses "do this specific
-thing". A command is a command only when the request activates the extension
-twice — the `A2A-Extensions` header names its URI, and the message lists it in
-`message.extensions` — so a client never sends one by accident.
+These name sockets and identities, not rules. The address a listener binds,
+its TLS identity, the store an instance's keys live in, and the trust a
+document is granted are decided at startup, while the rules on top of them
+reload.
 
-| Op | What it does | Exits the process? |
+### Confirm a reload
+
+| Outcome | Log | Metric |
 |---|---|---|
-| `admin.drain` | Begin a graceful drain (identical to SIGTERM) → exit `0` | yes, eventually |
-| `admin.pause` | Hold the whole instance, or one run, at a safe boundary | no |
-| `admin.resume` | Clear a prior `admin.pause` | no |
-| `admin.cancel` | Cancel one run by id | no |
-| `admin.set` | Set a runtime-settable path (`agent.approval`, `a2a.introspection.enabled`) until the next reload | no |
+| Applied | `config.reloaded` with `trigger` (`sighup` or `watch`) and `changed` | `agent_config_reload_total{result="applied"}`; `agent_config_generation` goes up by one |
+| Invalid | `config.reload.invalid` with `error` | `agent_config_reload_total{result="other"}` |
+| Needs a restart | `config.reload.restart_required` with `paths` | `agent_config_reload_total{result="other"}` |
 
-```console
-$ curl -sS --cert ops.crt --key ops.key --cacert ca.crt https://agent.internal:8443/ \
-    -H 'content-type: application/json' \
-    -H 'A2A-Version: 1.0' \
-    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
-         "role":"ROLE_USER","messageId":"m-1",
-         "extensions":["https://agentd.dev/a2a/ext/command"],
-         "parts":[{"data":{"agentd":{"op":"admin.drain","reason":"rolling update"}}}]}}}'
+`changed` lists what moved, from this set: `intelligence`,
+`intelligence.routes`, `intelligence.budget`, `agent.instruction`,
+`agent.instruction.refresh`, `agent`, `agent.approval`, `mcp`, `mcp.events`,
+`tools`, `skills`, `workflows`, `limits/lifecycle/observability/memory/context`,
+`a2a.principals`, `a2a.introspection.enabled`, `a2a.cors.origins`,
+`webhooks`; or `["nothing"]`. With an audit sink on, every outcome is also
+an audit record with action `config.reload`. A real sequence, editing a
+limit, then a restart-only name, then a broken value (envelope fields left
+out):
+
+```json
+{"changed":["limits/lifecycle/observability/memory/context"],"event":"config.reloaded","level":"info","trigger":"watch"}
+{"event":"config.reload.restart_required","level":"warn","paths":["agent.name"],"trigger":"watch"}
+{"error":"agentd: workflow \"tick\" step \"s\": every must be a duration (e.g. \"1h\")","event":"config.reload.invalid","level":"warn","trigger":"watch"}
 ```
 
-The reply is a completed **Task** whose `<taskId>.result` artifact carries the
-acknowledgement (`{"ok":true,"state":"draining",…}`). `drain`, `pause` and
-`cancel` take an optional `reason` (default `"operator request"`), carried
-into the logs and the audit record; an argument the op's
-schema does not name is refused, never ignored. The shorter snippets below
-show the method and the parts; each is sent with the header and the
-`extensions` marker above.
+Check a candidate before you ship it with the same validation:
+`agentd --validate-config --config <file>` exits 2 on anything a reload
+would refuse as invalid.
 
-**Operator-only, by role alone.** Unlike an ordinary command op, an explicit
-`grants:` entry does not reach these — not even `grants: ["*"]`. A principal
-that could drain the instance it is talking to would be an operator, and a
-delegating peer is not one. The ops appear as skills on
-`GetExtendedAgentCard` only for callers who may actually run them.
+### Rotate the listener's certificate
 
-### 2.1 `admin.drain` — graceful shutdown for a rolling update
+No reload is needed to rotate TLS material. The listener reads
+`a2a.tls.cert`, `a2a.tls.key` and `a2a.tls.client_ca` from their paths and
+checks them again, at most once a second, as connections arrive.
+Replace the files in place (a cert-manager renewal of a mounted Secret does
+this) and the next handshake uses the new identity, with no restart and no
+dropped listener. A half-written or invalid file is ignored and the current
+identity keeps serving. Whether clients must present a certificate is fixed
+at startup; only the contents rotate.
 
-`drain` trips the same one-way latch a `SIGTERM` does: readiness flips to
-NotReady, in-flight work winds down at its boundaries, state is checkpointed,
-then the process exits **`0`** (a clean drain is `0`, never `143`). It returns
-**immediately** with an acknowledgement — it does **not** block until exit.
+## Discover what an instance serves
 
-```jsonc
-// params are the args directly (no nested "arguments")
-{ "jsonrpc":"2.0", "id":1, "method":"SendMessage", "params": { "message": {
-    "extensions": ["https://agentd.dev/a2a/ext/command"], "parts": [
-    { "data": { "agentd": { "op":"admin.drain", "reason":"rolling update" } } } ] } } }
-// result
-{ "ok":true, "state":"draining", "reason":"rolling update" }
+A controller should read what an instance can do rather than assume it.
+These asks need no listener, no network and no model:
+
+```bash
+agentd --capabilities --config /etc/agentd/ops.yaml
+agentd --validate-config --config /etc/agentd/ops.yaml
+agentd --effective-config --config /etc/agentd/ops.yaml
+agentd --extensions
+agentd --config-schema
 ```
 
-The drain budget is `lifecycle.drain_timeout` — a call cannot push the drain past
-it. `drain` is idempotent: a second `drain` (or a later SIGTERM) is a no-op on an
-already-draining instance.
+`--capabilities` prints what this binary and configuration serve (lists
+shortened here):
 
-> **To drain a pod for a rolling update:** call `admin.drain`, then let the
-> orchestrator wait out `terminationGracePeriodSeconds` (keep
-> `lifecycle.drain_timeout` strictly below it — see
-> [configuration §9](configuration.md)). The instance leaves on its own.
-
-### 2.2 `admin.pause` / `admin.resume` — hold work without leaving
-
-With **no** `run` parameter, `pause` holds the **whole instance**: no new
-conversation turns dispatch and no workflow steps schedule. Intake keeps
-running — the listener still answers, the inbox still fills, tasks still
-accept — so nothing is lost; the work simply queues until `resume`. Use it for
-live debugging, or to hold an instance still while you swap the model service
-underneath it.
-
-With a `run` id, it flips just that run between `Paused` and `Running`; the
-scheduler skips paused runs and every other run keeps moving.
-
-```jsonc
-{ "method":"SendMessage", "params": { "message": { "parts": [
-    { "data": { "agentd": { "op":"admin.pause" } } } ] } } }
-{ "ok":true, "state":"paused", "reason":"operator request" }
-
-{ "method":"SendMessage", "params": { "message": { "parts": [
-    { "data": { "agentd": { "op":"admin.pause", "run":"reconcile-01J8…" } } } ] } } }
-{ "ok":true, "paused":"reconcile-01J8…" }
-
-{ "method":"SendMessage", "params": { "message": { "parts": [
-    { "data": { "agentd": { "op":"admin.resume" } } } ] } } }
-{ "ok":true, "state":"running" }
+```json
+{
+  "a2a": {
+    "auth": { "bearer": true, "device": false, "implicit_operator": false, "mtls": false, "required": true },
+    "command_ops": ["status", "config", "workflow.run", "workflow.status", "…"],
+    "cors_origins": 0,
+    "events": true,
+    "extensions": [
+      "https://agentd.dev/a2a/ext/command",
+      "https://agentd.dev/a2a/ext/events",
+      "https://agentd.dev/a2a/ext/task-annotations"
+    ],
+    "introspection": false,
+    "methods": ["SendMessage", "SendStreamingMessage", "GetTask", "…"],
+    "url": "https://agent.internal:8443"
+  },
+  "agent": { "instruction": true, "name": "reconciler", "preflight": "auto" },
+  "document": null,
+  "intelligence": { "endpoints": 1, "model": "gpt-5.1", "providers": [] },
+  "internal_tools": ["instruction.read", "instruction.subscribe", "subagent.run", "…"],
+  "knowledge": { "server": null },
+  "lifecycle": { "daemon": true, "run_until": "drained" },
+  "mcp_servers": ["inventory"],
+  "search": { "server": null },
+  "skills": { "sources": 0 },
+  "store": "file",
+  "store_file": { "defaulted": true, "path": "/root/.local/state/agentd/state" },
+  "tools": { "disabled": [], "overrides": [] },
+  "version": "1.18.0",
+  "webhooks": null,
+  "workflows": []
+}
 ```
 
-Pause is **reversible** and is **not** a drain: readiness is unchanged and the
-instance stays a member of the fleet. `admin.resume` with a `run` releases that
-run alone (`{"ok":true,"resumed":"…"}`). Pausing an already-terminal run is a
-`-32602` invalid-params error; resuming a run that is not paused is too; an
-unknown run id is `-32001`. The instance-wide hold is reported as
-`paused: true` in the `status` view.
-
-### 2.3 `admin.cancel` — kill one run, keep the pod
-
-`cancel` cancels one run **by id**, walking its live steps down — but it leaves
-the pod running (unlike `drain`, which also exits).
-
-```jsonc
-{ "method":"SendMessage", "params": { "message": { "parts": [
-    { "data": { "agentd": { "op":"admin.cancel", "run":"reconcile-01J8…", "reason":"superseded" } } } ] } } }
-{ "ok":true, "cancelled":"reconcile-01J8…" }
-```
-
-Omitting `run` is refused before anything runs: the op's envelope requires it
-(`-32602`, reason `INVALID_COMMAND_ARGS`, naming `run`). To cancel a *task*
-rather than a run — one conversation turn or one delegated unit of work — use
-the standard A2A `CancelTask` method instead, which any named principal may call
-on its own tasks.
-
-### 2.4 `admin.set` — change one setting until the next reload
-
-`admin.set {path, value}` sets one of the runtime-settable paths — today
-`agent.approval` and `a2a.introspection.enabled` — without touching the file.
-The value lasts until the next reload re-reads the file, and the feed's
-`config` event says that `admin.set` moved it. A path outside that list is
-refused by the op's schema; the extended card lists the paths as the command
-extension's `settable` param for a caller who may run the op.
-
----
-
-## 3. Reading live state
-
-The read surface is the same listener, and every read resolves to a principal
-first. There is no unauthenticated status port.
-
-| Read | How | Who |
-|---|---|---|
-| instance status | `SendMessage` with a `status` command DataPart | any named role, each seeing what it may |
-| effective config | `SendMessage` with a `config` command DataPart | operator |
-| one task | `GetTask` | the task's owner (operator sees all) |
-| all tasks | `ListTasks` | as above |
-| task updates | `SubscribeToTask` (SSE) | as above |
-| identity | `GET /.well-known/agent-card.json` | anyone, no credential |
-| what this caller may run | `GetExtendedAgentCard` | a caller named by a declared scheme |
-| the live event feed | `agentd.events/SubscribeToEvents` (SSE) | any named role, with `a2a.events.enabled` and the events extension activated |
-| transcripts, run and subagent detail | `conversation.get` / `run.get` / `subagent.get` command DataParts | a `user` or a grant, on what the caller owns; an operator on anything — with `a2a.introspection.enabled` |
-| the log ring | `debug.events` command DataPart | operator, with `a2a.introspection.enabled` |
-
-A command is a **DataPart** on an ordinary A2A message — `{"data": {"agentd":
-{"op": "<name>", …args}}}` — so one method (`SendMessage`) carries both natural
-language and the machine control surface. A read op answers with a `Message`,
-not a task, so polling it leaves nothing behind in any task list:
-
-```console
-$ curl -sS --cert ops.crt --key ops.key --cacert ca.crt https://agent.internal:8443/ \
-    -H 'content-type: application/json' \
-    -H 'A2A-Version: 1.0' \
-    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
-         "role":"ROLE_USER","messageId":"m1",
-         "extensions":["https://agentd.dev/a2a/ext/command"],
-         "parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
-```
-
-**`status`** answers with the instance view: `instance`, `run_id`, `uptime_ms`,
-`draining`, `paused`, the durable `store` (kind, degraded flag, generation), the
-armed `workflows`, live `runs`, `conversations`, `subagents`, OS `children`,
-`timers`, `inbox_pending`, `conversation_bindings` (how many callers'
-`contextId`s are bound to a conversation), the token `budget`, registered `tools`, loaded
-`skills`, the lifetime `counters`, the current `instruction` (source/version/size,
-never the text), the active `model`, and recent `activity`.
-
-**`config`** answers with the effective merged settings document — the same
-document `--config-schema` describes. It carries `{{secret:…}}` **references**,
-never resolved secret values, which is why it is operator-only. Use it to confirm
-*what* an instance is actually running after a reload, without ever exposing a
-credential.
-
-**`debug.events`** is a cursor read of the live log ring — the operator live-tail,
-without a collector round-trip. It takes `{after?, limit?, level?, prefix?}` and
-returns `{events, oldest_seq, newest_seq, dropped}`; the ring is bounded
-(`observability.events_ring`, 1024 lines by default), lossy by design, and
-never blocks the loop — a slow reader loses old lines and sees it in `dropped`.
-It requires `a2a.introspection.enabled`; turning introspection on — at startup,
-by reload or with `admin.set` — also installs the ring. While it is off, the
-introspection ops answer `-32004` saying so.
-
----
-
-## 4. Discovery — what this binary is and what it serves
-
-A controller does not assume what an instance can do — it **reads** it. A handful
-of flags answer that, all side-effect-free: no socket bind, no MCP connect, no
-LLM call, no discovery probe. They are the admission probes you run against the
-*image* and the *file* before you schedule anything.
-
-### 4.1 `--capabilities`
-
-Prints the capability manifest to stdout and exits `0`. It reflects the
-configuration — what this binary is set up to do — not live state.
-
-```console
-$ agentd --capabilities -c /etc/agentd/ops.yaml
-{ "version":"1.1.0",
-  "agent":{ "name":"agentd", "instruction":true, "preflight":"auto" },
-  "intelligence":{ "model":null, "endpoints":1 },
-  "mcp_servers":["state"], "internal_tools":[…], "tools":{ "overrides":[], "disabled":[] },
-  "workflows":[…], "knowledge":{…}, "search":{…}, "skills":{ "sources":0 },
-  "a2a":{ "methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks",
-                     "CancelTask","SubscribeToTask","…","GetExtendedAgentCard"],
-          "command_ops":["status","config","workflow.run","…",
-                         "admin.drain","admin.pause","admin.resume","admin.cancel",
-                         "admin.set","auth.sessions","auth.sessions.revoke"],
-          "extensions":["https://agentd.dev/a2a/ext/command",
-                        "https://agentd.dev/a2a/ext/task-annotations"],
-          "url":"https://agent.internal:8443",
-          "auth":{ "bearer":false, "mtls":true, "device":false, "required":true,
-                   "implicit_operator":false },
-          "events":false, "introspection":false, "cors_origins":0 },
-  "store":"mcp",
-  "lifecycle":{ "run_until":"auto", "daemon":true } }
-```
-
-The three fields a controller branches on:
-
-- **`a2a`** — `null` when no listener is configured. Its presence is the
-  graceful-degradation contract: `methods`, `command_ops` and `extensions` are
-  exactly what this instance serves — `methods` is the eleven A2A methods plus
-  the method of each declared extension (`agentd.events/SubscribeToEvents` while
-  `events` is on), read from the table the listener routes by; `command_ops`
-  and `extensions` are the lists the agent card publishes — so a controller
-  drives only what is declared. `auth` is the listener's posture, the same value
-  the card's security schemes are derived from, and `url` is `null` until a
-  bind names it (a `:0` port, a unix socket).
-- **`lifecycle.daemon`** — `true` when the instance is long-lived (a listener,
-  or a workflow with a `loop` / `schedule` / `subscribe` / `signal` / `event`
-  start node). A `false` here means a Job, not a Deployment.
-- **`store`** — the durability backing (`mcp` / `http` / `memory` / `none`).
-
-**No secrets, ever.** The manifest carries no token, no resolved `{{secret:NAME}}`
-value, and no endpoint URL (which can embed credentials) — `intelligence` is
-structural: model name plus endpoint *count*. Principal matchers are described,
-never dumped: a `bearer_ref` renders as `***`.
-
-Not every feature is in the released binary. `a2a`, `metrics`, `cron`, `otel`,
-`hot-reload`, `config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci` and
-`decrypt` ship in the published builds; `exec` is the one build-from-source
-opt-in. The manifest reflects the binary you actually have.
-
-### 4.2 `--config-schema` and `--validate-config`
-
-`--config-schema` prints the settings **JSON Schema** (Draft 2020-12) and exits
-`0` — every path, its type, its enum domain. `--workflow-schema` does the same for
-the workflow dialect plus the node registry. Both are how a controller (or an
-editor, or an admission webhook) learns the config surface without parsing docs.
-
-`--validate-config` loads and validates the whole merged configuration, prints
-the verdict as one JSON line, and exits `0` or `2`. It runs the **same** checks
-startup runs, so a bad file fails in CI instead of at rollout:
-
-```console
-$ agentd --validate-config -c /etc/agentd/ops.yaml
-{"event":"config.valid","files":["/etc/agentd/ops.yaml"]}
-
-$ agentd --validate-config -c /etc/agentd/broken.yaml
-{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only included)"}
-```
-
-Both flags are in every build.
-
----
-
-## 5. Hot reload
-
-A `hot-reload` build re-reads its configuration **in place** — no restart, no
-dropped in-flight work — for the *reloadable* subset of settings. The reload is
-**validate-first and all-or-nothing**: a bad or restart-only candidate is a clean
-**no-op** (the running configuration is kept verbatim), never a partial apply.
-
-### 5.1 The two triggers
-
-Both funnel into one identical routine:
-
-- **SIGHUP** (the portable default; `hot-reload` feature). The async-signal-safe
-  handler sets a latch and wakes the loop; the reload runs on the loop thread at
-  a tick boundary. Without the feature, SIGHUP keeps its default disposition
-  (terminate).
-- **`lifecycle.watch_config`** (flag `--watch-config`; the `config-watch`
-  feature). A raw-inotify watch on the config files' directories, so a Kubernetes
-  ConfigMap volume swap reloads in place. It sets the *same* latch SIGHUP does,
-  plus an attribution flag, so the reload is labelled `trigger:"watch"`.
-  `lifecycle.watch_config` **requires** a config file; watching nothing is a
-  usage error (exit `2`).
-
-### 5.2 What is reloadable vs restart-only
-
-Only the **files** are re-read; the env and flag layers are the process's fixed
-inputs, so a flag still overrides the new file. `RESTART_ONLY_PATHS` in
-`config/settings` is the authoritative partition:
-
-| Reloadable (applied in place) | Restart-only (a diff is refused) |
-|---|---|
-| `intelligence` (endpoints, model, token) | `agent.name` |
-| `intelligence.budget` (windows; counters carry over) | `store.kind`, `store.prefix`, `store.mcp`, `store.http`, `store.file` |
-| `agent.instruction` (static text or a resource URI) | `lifecycle.run_until`, `.drain_timeout`, `.run_id`, `.exit_code_map`, `.watch_config` |
-| `agent` (preflight, wake_on, tools, parallelism, budget) | `a2a.listen`, `a2a.url`, `a2a.tls`, `a2a.bearer`, `a2a.device_grant`, `a2a.events` |
-| `mcp` (live re-handshake) | `observability.otel`, `.metrics_addr`, `.health_file`, `.events_ring`, `.traceparent` |
-| `tools`, `knowledge`, `search` (registry rebuild) | `security` |
-| `skills` (sources re-discovered) | `webhooks.listen`, `webhooks.tls` |
-| `a2a.principals`, `a2a.cors`, `a2a.introspection`, `a2a.push`, `a2a.peers` | — |
-| `workflows` (live runs stay pinned to their hash) | |
-| `limits`, `lifecycle.idle_grace`, `observability.log_level` / `.log_content`, `memory`, `context` | |
-
-`mcp` reloads via a live re-handshake: added and edited servers are dialed
-and hand-shaken into a connection set beside the running one, unchanged servers
-keep their live connection (never re-dialed), and removed servers disconnect
-once the reload applies. An added or edited server that will not connect is
-logged (`mcp.connect.fail`) and absent from the new set, as at startup; a
-workflow step that needs it refuses the reload. A call already in flight on a
-removed server finishes on its connection; a step that starts after the reload
-fails with `mcp server "<name>" is not connected`. `intelligence` repoints the
-next unit of work: every turn worker is spawned fresh from the live settings,
-so a new endpoint, model, budget or tool override takes effect at the next
-turn.
-
-A reload whose diff touches **any** restart-only path is refused as a clean
-no-op, naming the paths, so a controller reads them and rolls a restart instead.
-
-### 5.3 Validate-first, all-or-nothing
-
-The routine is, in order:
-
-1. **Re-merge + re-validate** the candidate through the same `load` pipeline
-   startup uses (built-in < files < env < flags) — a candidate that fails
-   validation raises exactly the error startup would, and the running config is
-   kept.
-2. **Restart-only diff** — any changed restart-only path refuses the reload
-   before anything is applied.
-3. **Stage** everything that can fail, beside the running state: the workflow
-   documents (before anything is dialed), the intelligence token, the new MCP
-   servers' connections, then — against those servers — the `uri:` workflow
-   documents, the tool registry, every workflow's tool and server references,
-   the skills catalogue and a resource instruction; last, the listener's
-   principal rules and webhook routes. Any failure refuses the
-   whole reload with `config.reload.invalid`: nothing running changed, and the
-   connections it dialed are closed (`mcp.disconnect`, `reason: "reload
-   refused"`).
-4. **Commit** the staged pieces in one step on the loop thread, with nothing
-   left that can fail: settings, instruction, the MCP connection set, the
-   registry, skills, workflows, principal rules and webhook routes switch
-   together (live runs keep the definition they started with, pinned by
-   hash).
-
-`agentd --validate-config` runs the same validation as an admission gate before
-you ship the file, so a bad candidate fails fast (exit `2`) rather than at reload
-time.
-
-### 5.4 Observing a reload
-
-A successful reload emits `config.reloaded{trigger,changed}` — where `changed`
-is the list of reloadable groups that actually moved (`intelligence`,
-`intelligence.budget`, `agent.instruction`, `agent`, `mcp`, `tools`, `skills`,
-`workflows`, `limits/lifecycle/observability/memory/context`, or `nothing`) —
-bumps the durable manifest's `config_generation`, and records
-`agent_config_reload_total`. A refusal emits `config.reload.invalid{trigger,error}`
-or `config.reload.restart_required{trigger,paths}` and leaves the generation
-unchanged. The file watcher itself emits `config.watch.armed` / `config.watch.fired`
-/ `config.watch.error`. (Metric and event names are detailed in
-[observability](observability.md).)
-
-> **To reload a ConfigMap:** run with `lifecycle.watch_config: true` and a
-> `--config` path on a ConfigMap volume mount; the kubelet's atomic symlink swap
-> fires the inotify watch and the reloadable subset applies in place. A
-> controller confirms the change landed by watching for the `config.reloaded` log
-> line, or by reading the `config` command back. If the change touches a
-> restart-only path, the reload is refused and you roll a restart.
-
----
-
-## 6. The audit stream
-
-`observability.audit.sink` turns on the append-only record of *who did what*:
-every A2A call, every principal-driven command, config reloads, restores, store
-conflicts and kills. Each record is
-`{ts, instance, principal, role, action, target, outcome, request_id, trace}`.
-
-Two sinks, independently selectable:
-
-- **`log`** — one closed-vocabulary `audit` line on stderr, alongside the rest of
-  the telemetry. Never content-suppressed: an audit trail is metadata, not
-  conversation content.
-- **`store`** — a durable, ULID-keyed record in the configured store. It is never
-  compare-and-swapped and never listed, so it cannot be rewritten in place.
-  A failed audit write is logged and never fails the audited action.
-
-An A2A call's `action` is `a2a.<method>` — and `a2a.<method>:<op>` when the
-message carried a command DataPart — so `a2a.SendMessage:workflow.run` and
-`a2a.SendMessage:admin.drain` are both first-class, filterable audit actions.
-This is the answer to "why did the agent do that, and on whose authority?".
-
----
-
-## 7. Resource pressure — shed new work, drain what is in flight
-
-The failure this machinery exists for is disk: the file store writes until
-`ENOSPC`, and a checkpoint failure is a **halting** condition. So the runtime
-watches the store filesystem's headroom (plus the cgroup's `memory.high`, when
-one is armed) and moves through three levels, assessed every ~2 s and logged
-once per **transition**, never per refusal:
-
-| level | event | what changes |
-|---|---|---|
-| ok | `pressure.cleared` | everything admits |
-| warn (< 2× `min_free`) | `pressure.warn` | **`priority: low` work already sheds** (workflows and subagent spawns that declared it); everything else still admits — the operator is told while there is still time to act |
-| shed (< `store.file.min_free`, default 256 MB) | `pressure.shed` | admission stops; in-flight work drains |
-
-"Admission stops" is the same decision at every door, so a pressed daemon is
-consistent rather than lucky:
-
-- **starts** — `loop`/`schedule`/`subscribe`/`signal` firings are skipped with a
-  `start.shed` line naming the cause (a schedule that quietly stopped while the
-  disk filled is a story the log must tell);
-- **webhooks** — `429 Too Many Requests` + `Retry-After: 30`, *after*
-  authentication (an unauthenticated probe learns nothing about load), *before*
-  the durable inbox write the disk may not be able to keep;
-- **conversation turns** — new turns stay **queued**, nothing is dropped;
-  dispatch resumes by itself when the level clears;
-- **subagent spawns** and **`workflow.run`** (the tool and the A2A command) —
-  refused with the cause in the error.
-
-Nothing running is interrupted: an agent that finishes its current job and takes
-no more has degraded; one that dies mid-checkpoint has corrupted its next
-restart's starting point. Tune with `store.file.min_free` (`"0"` disables the
-disk checks; a memory/mcp/http store never enables them — their durability does
-not live on this disk).
-
-On the wire, per-route **arrival throttling** composes with this:
-`rate: "<burst>/<per>s"` on a `webhook` node answers `429` with a computed
-`Retry-After` past its burst — `parallelism` bounds how many requests run at
-once, `rate` bounds how fast they arrive, and pressure sheds regardless of
-either.
-
-With `--features metrics`, the levels are scrapeable:
-`agent_pressure_level` (0/1/2), `agent_disk_free_bytes` (absent without a file
-store), `agent_runs_active`, `agent_turns_queued` — the last two are the
-utilization pair to alert on *before* pressure does it for you.
-
----
-
-## See also
-
-- [Configuration reference](configuration.md) — the settings document, the
-  precedence rules, and the validate-at-startup contract.
-- [Observability & health](observability.md) — the metrics, events, and health
-  surfaces this page emits, plus `/healthz`+`/readyz`+`/metrics`.
-- [Deploying agentd](deployment.md) — the pod/scheduler model the drain and
-  reload primitives plug into.
-- [Intelligence](intelligence.md) — the endpoint list and the runtime hot-swap an
-  `intelligence` reload drives.
-- [MCP: the universal interface](mcp.md) — agentd as an MCP client, and as an A2A
-  endpoint other agents call.
-- [The interface — TUI & web UI](interface.md) — the display clients that ride
-  this same listener.
-- [Horizontal scaling](scaling.md) — partitioning work and the autoscaling signals; drain
-  is the scale-down-safety seam.
+The fields a controller branches on:
+
+- **`a2a`** is `null` without a listener. Its `methods`, `command_ops` and
+  `extensions` are exactly what the listener serves; drive nothing else.
+- **`lifecycle.daemon`** is `true` for an instance that outlives a run. A
+  `false` means it belongs in a Job, not a Deployment.
+- **`store`** is the durability backing: `file`, `mcp`, `http`, `memory` or
+  `none`. `store_file` says where a file store lives and whether the path was
+  defaulted.
+
+The manifest carries no secret and no endpoint URL: `intelligence` gives a
+model name and an endpoint count. [CLI, environment and exit codes](cli.md#asks)
+lists every ask.
+
+## Handle resource pressure
+
+The failure this guards against is a full disk: the file store writes until
+the disk is full, and a failed checkpoint stops the agent. agentd watches the
+free space on the file store's filesystem (and the cgroup's `memory.high`,
+when one is armed) about every 2 seconds and moves between three levels. It
+logs each change of level once.
+
+| Level | When | What changes | Log |
+|---|---|---|---|
+| ok | otherwise | everything is admitted | `pressure.cleared` |
+| warn | free space below twice `store.file.min_free` | work declared `priority: low` sheds; everything else is admitted | `pressure.warn` |
+| shed | free space below `store.file.min_free` (default 256 MB), or memory pressure | admission stops; in-flight work drains | `pressure.shed` |
+
+"Admission stops" means the same thing at every door:
+
+- **Start nodes**: a `loop`, `schedule`, `subscribe` or `signal` firing is
+  skipped and logged as `start.shed`. A `stream` or `correlate` consumer
+  holds its place, logs `start.shed` once, and reads on when the level
+  clears.
+- **Webhooks**: answered `429 Too Many Requests` with `Retry-After: 30`,
+  after authentication and before anything is written.
+- **Conversation turns**: stay queued, and dispatch resumes when the level
+  clears.
+- **Subagent spawns and `workflow.run`**: refused, with the cause in the
+  error.
+
+Nothing running is interrupted. Tune the threshold with `store.file.min_free`
+(a size such as `512MB`; `"0"` turns the disk check off). A `memory`, `mcp`
+or `http` store turns the disk check off, because its durability does not
+live on this disk. Watch `agent_pressure_level` (0, 1, 2) and
+`agent_disk_free_bytes` on `/metrics`, and alert before the shed level does
+the work for you.
+
+## Next steps
+
+- [Deploy](deployment.md): drain timing and ConfigMap reloads on Kubernetes.
+- [Monitor in production](observability.md): probes, metrics and alerts.
+- [A2A API reference](a2a-reference.md): every method and command op.
+- [Scale out](scaling.md): drain as the safe way to scale in.

@@ -3,7 +3,7 @@
 > **⚠ AMENDED (target-vision pivot, 2026-07-02).** The `exec` self-tool here was
 > **removed** (agentd runs no local code), and the self-MCP is served over **HTTPS**
 > with mTLS/bearer auth (loopback `http://` for dev) — not stdio/unix. Operator
-> control is unified into the `a2a.*` method family. See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+> control is unified into the `a2a.*` method family. See ../docs/design/00-target-vision-pivot.md.
 
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok

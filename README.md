@@ -1,536 +1,103 @@
 # agentd
 
-**A minimal, MCP-native, cloud-native AI agent runtime.** One small static Rust
-binary runs **one agent**: hand it an instruction and one LLM endpoint, and it
-runs the agentic loop — think, call a tool, observe, repeat — until the task
-reaches a terminal status or a new event wakes it. Every tool comes from a
-**remote MCP server** over HTTPS (agentd ships none of its own; local execution
-is off unless you compile *and* enable the guarded `exec` runner), it reacts to
-the world through **MCP resource subscriptions**, speaks **A2A** to other
-agents, and can drive **durable DAG workflows**. It is built to be a
-cloud-native unit of work — drop it into a `Job`, a `CronJob`, or a long-lived
-A2A `Deployment` — and when you want to *work with* it, attach a terminal or a
-browser: `agentd tui -c agent.yaml`.
+**Run AI agents the way you run services.** agentd is one small Rust binary
+that runs an agent from a configuration file: a one-shot job that exits with
+a meaningful code, or a daemon that wakes on schedules, webhooks, MCP
+resource changes and upstream events. Its tools come from MCP servers you
+name, people and other agents reach it over A2A, and the reasoning runs in
+child processes a supervisor can budget and kill.
 
-```
-binary 8.5 MiB static (musl, FROM scratch) · 3.6 MiB download · cold start <1 ms
-idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · AGPL-3.0
-```
+[Documentation](https://agentd.dev/docs/) ·
+[Quickstart](https://agentd.dev/docs/getting-started/) ·
+[Why agentd](https://agentd.dev/docs/why-agentd/) ·
+[Releases](https://github.com/agentd-dev/source-code/releases)
 
-- [Why agentd](#why-agentd)
-- [How it works](#how-it-works)
-- [Install](#install)
-- [Quickstart](#quickstart)
-- [Talk to it — TUI & web UI](#talk-to-it--tui--web-ui)
-- [Lifecycle & triggers](#lifecycle--triggers)
-- [Workflows](#workflows)
-- [Embedding — the engine in your app](#embedding--the-engine-in-your-app)
-- [Composition: serving, subagents, A2A](#composition-serving-subagents-a2a)
-- [Security model](#security-model)
-- [Operating it](#operating-it)
-- [Scaling out](#scaling-out)
-- [Build features](#build-features)
-- [Footprint (measured)](#footprint-measured)
-- [Documentation map](#documentation-map)
+## Who it is for
 
-## Why agentd
+Teams that want agents in production with the discipline they already
+apply to services: reviewed configuration, bounded spend, a known blast
+radius, durable work and an audit trail. It fits event-driven back-office
+work, scheduled jobs, served workers other systems call, multi-agent teams,
+a coding agent you host yourself, and edge devices where the agent is the
+only thing the machine runs.
 
-1. **The protocols are not ours to get wrong.** MCP is
-   [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust
-   SDK; A2A is the A2A project's own Rust SDK,
-   [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs), its wire
-   generated from the specification's protocol buffers. Both run over agentd's
-   own socket, so
-   request signing and mTLS survive the adoption. Everything
-   small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
-   export, the inotify watch — is still hand-rolled on `std` + `libc`. What
-   ships is one 8.5 MiB static binary that starts in under a millisecond, idles
-   at 5.5 MiB on one thread, and lands as a single-layer `FROM scratch` image with no shell, no
-   libc, and nothing to CVE-scan but agentd itself.
-2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
-   tool library and, in a release binary, executes nothing locally — the `exec`
-   contract is mapping-only unless it is *both* compiled in and enabled (see
-   [Security model](#security-model)). Every capability is a **remote MCP
-   server** you declare with `--mcp name=https://…` — one protocol out, tools
-   and resources alike. What comes *in* is A2A; see 5.
-3. **Reactivity via resource subscriptions.** Instead of polling, an agentd with
-   a `subscribe` start node **idles at near-zero CPU and wakes when an MCP
-   resource it subscribed to changes** (notify-then-read). An upstream change is
-   the trigger; a workflow can also schedule its own future wakes (`loop`,
-   `schedule`).
-4. **Two loops, strictly separated.** A tiny **supervisor** owns lifecycle,
-   triggers, limits, and the kill ladder — and **never talks to the LLM**. The
-   reasoning lives in **subagent child processes** (the same binary, re-exec'd)
-   the supervisor can always `SIGKILL`. A runaway or crashing model is contained
-   by construction; limits are enforced by a process that cannot be prompted.
-5. **Composability, three ways.** An agentd **serves an A2A endpoint**
-   (`a2a.listen`), so one agent is just another agent a second one
-   sends messages/commands to. It **delegates over A2A** (`a2a.peers`) to remote
-   agents as spec-conformant Tasks. And it **nests subagents** as an OS process tree
-   with narrowed, per-child context and trust. Agents compose like Unix
-   processes.
+It is not a library you write an agent in, and not a hosted service.
 
-## How it works
+## What sets it apart
 
-```
-              triggers: interval · cron · MCP resource change · A2A request
-                                        │
-       ┌────────────────────────────────▼─────────────────────────────────┐
-       │  supervisor (never talks to the LLM)                             │
-       │  config → validate → trifecta gate → mode driver → kill ladder   │
-       │  limits: steps · tokens · deadline · depth · cgroup mem/pids     │
-       └────────────┬─────────────────────────────────────┬───────────────┘
-                    │ spawn (re-exec, narrowed payload)   │ serve (optional)
-       ┌────────────▼────────────────┐       ┌────────────▼───────────────┐
-       │  subagent (agentic loop)    │       │  A2A listener over HTTPS   │
-       │  think → tool → observe …   │       │  Tasks · streaming · card  │
-       │  or: workflow driver        │       │  commands · operator ctl   │
-       └──────┬──────────────┬───────┘       └────────────────────────────┘
-              │ HTTPS        │ HTTPS
-       ┌──────▼──────┐  ┌────▼──────────────┐
-       │ intelligence│  │ MCP servers       │
-       │ (one LLM    │  │ --mcp a=https://… │
-       │  endpoint,  │  │ --mcp b=https://… │
-       │  failover)  │  │  tools+resources  │
-       └─────────────┘  └───────────────────┘
-```
-
-Every network edge is HTTP(S) — the LLM, the MCP servers, the served A2A
-endpoint, A2A peers, and operator control — with mTLS and/or bearer auth
-(plaintext `http://` is loopback-only, for dev). agentd links no vsock or stdio
-transport and spawns no tool processes in a release binary (the `exec` local
-runner is a build-and-config opt-in — see [Security model](#security-model));
-the one non-TCP transport is a unix domain socket for a co-located A2A peer, where the kernel is the authenticator
-— mode `0600` plus an `SO_PEERCRED` uid check instead of TLS (see
-[docs/a2a.md](docs/a2a.md)).
+- **No ambient tools.** Every capability comes from an MCP server you
+  declared, so a run's blast radius is the servers in its configuration.
+- **Reasoning runs where it can be killed.** A supervisor that never talks
+  to a model holds the state and the credentials, enforces budgets and
+  deadlines, and kills a loop that misbehaves.
+- **Durable by default.** Workflows and conversations are checkpointed to a
+  store; a restart resumes work instead of repeating it.
+- **The right model for each job.** Chat, reasoning and decision models,
+  each bound to a role — the agent's turns, deep thinking, typed decisions,
+  triage, approvals — with fallback chains across providers.
+- **Operable.** Configuration is validated before anything runs, the exit
+  code is an API, and every event is a JSON line on stderr.
+- **Open protocols.** MCP for tools and context, A2A for people and agents,
+  OpenAI-compatible, Anthropic and Bedrock model wires, OTLP and Prometheus
+  for telemetry.
 
 ## Install
 
-**Installer** — detects your architecture, verifies the release `SHA256SUMS`,
-installs to `/usr/local/bin` (or `~/.local/bin`), and never invokes sudo:
-
-```console
-$ curl -fsSL https://agentd.dev/install.sh | sh
+```bash
+curl -fsSL https://agentd.dev/install.sh | sh
 ```
 
-**Release binaries** (static musl, amd64 + arm64) if you would rather do it by
-hand — `install.sh --help` lists the pinning and directory options:
-
-```console
-$ TAG=$(curl -fsSL https://api.github.com/repos/agentd-dev/source-code/releases/latest | grep -m1 tag_name | cut -d'"' -f4)
-$ curl -LO https://github.com/agentd-dev/source-code/releases/download/$TAG/agentd-$TAG-x86_64-unknown-linux-musl.tar.gz
-$ tar xzf agentd-$TAG-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
-```
-
-**Container image** (multi-arch, cosign-signed, single layer):
-
-```console
-$ docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
-```
-
-**From source** (Rust stable, 1.96+; no C toolchain — the build is pure Rust and
-the crypto provider is `ring`). Features are compile-time, so `--capabilities`
-tells you what a given binary can actually do:
-
-```console
-$ cargo build -p agentd-cli --release
-$ cargo build -p agentd-cli --release \
-    --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"   # the shipped set
-$ cargo build -p agentd-cli --release --features a2a,exec   # + the local command runner
-```
-
-`exec` is deliberately absent from release binaries — [running local commands
-is opt-in twice over](docs/security.md). `cel` ships: expression guards (`when`,
-`until`, `filter`) are how a workflow branches, and a released binary that
-refuses them at validation was a cliff every non-trivial config fell off. It is
-the one dependency-bearing feature and costs about 1.8 MiB.
+Linux on x86-64 and arm64. The container image is
+`ghcr.io/agentd-dev/agentd`, and the terminal and web clients are
+`npm install -g @agentd-dev/cli`. [Install](https://agentd.dev/docs/install/)
+covers every option, including building from source.
 
 ## Quickstart
 
-```console
-# one-shot: instruction + one LLM endpoint + one MCP server, then exit
-$ agentd \
-    --instruction "Read /data/report.md and write a 3-bullet summary to /data/summary.md" \
-    --intelligence https://gw.example/v1 \
-    --mcp fs=https://mcp-fs.internal/mcp
+```bash
+export OPENAI_API_KEY="paste-your-key-here"
+agentd \
+  --instruction "Explain in three sentences what the Model Context Protocol is for." \
+  --intelligence https://api.openai.com/v1/chat/completions \
+  --model gpt-5.1 \
+  --intelligence-token '{{secret:OPENAI_API_KEY}}'
 ```
 
-stdout carries the result; stderr carries JSON-lines telemetry (one structured
-event per line, trace-correlated); the exit code maps the terminal status. Bad
-config exits `2` in milliseconds, **before** any LLM round-trip — and
-`--validate-config` checks a config without running anything. The intelligence
-endpoint speaks the OpenAI-compatible wire with native tool-calling; a
-comma-list of endpoints is a failover order. See
-[docs/getting-started.md](docs/getting-started.md).
+The answer prints on stdout, telemetry streams to stderr as JSON lines, and
+the exit code says how the run ended. The
+[Quickstart](https://agentd.dev/docs/getting-started/) continues from here:
+a tool from a public MCP server, the same agent as a daemon, and the
+terminal UI attached to it.
 
-## Talk to it — TUI & web UI
+## Where to go next
 
-agentd hosts the state; the clients are thin. One command runs the daemon and a
-terminal UI together:
-
-```console
-$ agentd tui --config agent.yaml     # or: agentd ui -c agent.yaml (browser)
-```
-
-The launcher adds nothing to the configuration: `agent.yaml` names its own
-listener (`a2a.listen`, on loopback — the launched client redeems its sign-in
-code only from a loopback peer) and turns on the live feed the clients watch
-(`a2a.events.enabled`). It signs its client in with a single-use
-launch code minted in the daemon's own process, so no credential of the
-daemon's ever reaches the client.
-
-```
-agentd · prod-agent                              chat  tasks  subagents  debug
-you › Deploy api-gateway to staging
-agent › Deploy checks passed. Rolling out v2.4.1 — 3 pods cycling, ETA 90s.
-⣾ read_file · 3s · 1.2k tok
-● live http://127.0.0.1:8420 · 1 turns · 33/17 tok
-```
-
-Because the daemon owns the session, **several surfaces watch the same one at
-once** — a terminal at your desk, a browser on another screen, a colleague's
-machine signed in with a code an operator approves under their name — and
-quitting a client leaves the agent working. Approvals (`ask_human`) render as
-answerable rows in every attached client and survive a restart; with
-`a2a.introspection.enabled` the debug screen shows transcripts, per-step run
-detail and the log tail. The clients are ordinary A2A 1.0 clients: they read
-the agent card, speak an agentd extension only when the card declares it, and
-fall back to core A2A when it does not.
-
-Both clients ship as one npm package — `npm i -g @agentd-dev/cli`, source under
-[`interface/`](interface) — built on a shared thin-client core that the package
-also exports, so a third client is a small program. See
-**[docs/interface.md](docs/interface.md)**, and
-**[docs/coding-agent.md](docs/coding-agent.md)** to set one up as a
-pair-programming agent for a repository.
-
-## Lifecycle & triggers
-
-agentd has **one durable runtime** — there are no modes to pick between. A run
-is either a one-shot **job** or a long-lived **daemon** (`lifecycle.run_until`),
-and what *triggers* runs is a workflow **start node**.
-
-```console
-# a job (the quickstart): the --instruction sugar expands to a
-# `once → agent → finish` workflow; run one turn, map the outcome to an exit
-# code, then exit.
-$ agentd --instruction "…" --intelligence https://gw.example/v1
-```
-
-Recurring / reactive shapes are **workflow start nodes** in the configuration
-document (see
-[docs/modes-and-triggers.md](docs/modes-and-triggers.md)):
-
-```yaml
-intelligence: { endpoints: https://gw.example/v1, model: gpt-… }
-store: { kind: mcp, mcp: { server: state } }         # a daemon needs a durable store
-a2a:   { listen: https://0.0.0.0:8443,                # the external channel
-         url: https://agent.example.com:8443,        # what callers dial; required on a wildcard bind
-         tls: { cert: …, key: …, client_ca: … } }
-workflows:
-  - name: watch
-    steps:
-      s:  { kind: subscribe, server: queue, uri: "queue://inbox" }  # loop|schedule|subscribe|signal|event
-      do: { kind: agent, depends_on: [s], instruction: "Handle the item." }
-      f:  { kind: finish, depends_on: [do] }
-lifecycle: { run_until: drained }                    # a daemon
-```
-
-A non-loopback `a2a.listen` is **refused at startup** unless the endpoint has
-client auth — `a2a.tls.client_ca` (mTLS, and then *every* caller needs a client
-certificate) or `a2a.bearer` — and a wildcard bind is refused without the
-`a2a.url` callers dial. People sign in through the listener's OAuth device grant
-(`a2a.device_grant`) rather than with a copy of the bearer. `--traceparent`
-continues an upstream W3C trace.
-
-## Workflows
-
-agentd runs **durable DAG workflows** (always compiled — no feature
-flag): a declarative graph of `steps` in the configuration document,
-driven by the same reactor over durable state, so a run survives a restart and
-resumes exactly where it died. Deterministic steps (`assign` / `map` / `filter` /
-`switch` / …) cost **zero model tokens**; `agent` / `think` steps run turn
-workers:
-
-```yaml
-workflows:
-  - name: process
-    steps:
-      s:     { kind: once }
-      fetch: { kind: agent, depends_on: [s], instruction: "fetch the next item",
-               output_schema: { type: object, properties: { id: {type: string}, status: {type: string} } } }
-      route: { kind: switch, depends_on: [fetch], on: "{{steps.fetch.output.status}}",
-               cases: { pending: [work] }, default: [done] }
-      work:  { kind: mcp.tool, depends_on: [route], server: fs, tool: process,
-               args: { id: "{{steps.fetch.output.id}}" } }
-      done:  { kind: finish, depends_on: [work] }
-```
-
-- **A rich node catalogue**: `agent` / `think` (turn workers),
-  `mcp.tool` (direct MCP), data steps (`assign` / `map` / `filter` / `reduce` /
-  `sort` / `parse`), `switch` routing, nested bodies (`foreach` / `batch` with
-  bounded parallelism + `rate` pacing, `iterate`, `parallel`, `race`, `subgraph`),
-  orchestration (`wait` on resource / condition / signal / run / subagent /
-  message / deadline, `join`, child `workflow` runs, `subagent`, `human` gates
-  that project A2A `input-required`, `a2a.delegate`), and `finish`.
-- **Variables + templates** thread data between steps (`writes` /
-  `{{vars.…}}` / `{{steps.x.output}}` / `CEL:` expressions); large step outputs
-  spill to durable artifacts and dereference transparently.
-- **Durable + crash-resumable:** every step checkpoints its progress to the
-  configured store *before* its effect runs — a run restores and resumes exactly
-  where it died (proven by the chaos-matrix e2e), with idempotency keys so at-least-once
-  effects run once. No database is linked — the store is behind MCP tools or HTTP.
-- **Triggers are start nodes** (`once` / `loop` / `schedule` / `subscribe` /
-  `signal` / `event` / `manual` / `a2a`) — the recurring/reactive shapes,
-  durable across restarts.
-- **Bounded by construction:** step / token / deadline budgets, concurrency
-  policies (`queue` / `drop` / `replace`), and per-node caps — each terminal
-  with a distinct `status` / `reason`.
-- **Optional CEL** (`--features cel`): `CEL:` step conditions, computed values,
-  and data-step element expressions; a non-CEL build fails those closed.
-
-See [docs/workflows.md](docs/workflows.md).
-
-## Embedding — the engine in your app
-
-agentd is also **a library**: the binary is a thin shell (`agentd-cli`) over
-the published engine crate (`agentd-core`, lib name `agentd`). Any Rust app can
-run agentic logic as a **function call**, with **native Rust tools** the model
-calls alongside MCP tools:
-
-```rust
-// 1. Register your code as a tool (it joins the model's catalogue — and wins
-//    name collisions with remote servers; first-party is unstealable).
-agentd::tools::register(agentd::tools::CodeTool::new(
-    "word_count", "Count the words in a text.",
-    json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
-    |args| Ok(json!({ "words": args["text"].as_str().unwrap_or("").split_whitespace().count() })),
-))?;
-
-// 2. One agentic run, as a call — Outcome + token Usage back as plain values.
-let intel = IntelClient::from_parts("https://gw.example/v1", token)?;
-let (outcome, usage) = run_loop(&intel, &mcp_servers, &LoopInput {
-    instruction: "Count the words in this review, then summarize it.".into(),
-    output_contract: Some("JSON: {words, summary}".into()),
-    model: "my-model".into(), max_steps: 10, max_tokens: 20_000,
-    deadline: Instant::now() + Duration::from_secs(120),
-    seed: vec![], cancel: None,
-}, &mut NoSelfTools, &log)?;
-```
-
-Workflows embed the same way — author a workflow graph as data, `drive()` it
-with your own executor, and code tools are addressable from `tool` nodes as the
-reserved server **`code`**. A compile-guaranteed example ships in-tree:
-[`embedded-agent.rs`](crates/agentd/examples/embedded-agent.rs) — the loop
-called directly from a host app, with a code-registered tool the model can call
-into mid-reasoning. The **stock CLI registers nothing**
-— its no-local-code posture holds by construction. Reusable on their own:
-`agentd-mcp` (MCP client/server + wire) and `agentd-net` (transports). Recipes,
-the embedder obligations (the re-exec dispatch!), and the API-stability tiers:
-[docs/embedding.md](docs/embedding.md).
-
-## Composition: serving, subagents, A2A
-
-**Serve your agent over A2A** (`--features a2a`) — set `a2a.listen` and
-peers call `SendMessage` (natural language → a conversation turn, or a command
-DataPart → a registry action like `status` / `workflow.run` / `config`),
-`GetTask` / `ListTasks` / `CancelTask`, and `SendStreamingMessage` (SSE) on the
-listener, each resolved to a **principal** (mTLS / bearer → `operator` / `user` /
-`agent` / `anonymous`) and authorized against a role matrix, and (optionally)
-audited:
-
-```yaml
-a2a:
-  listen: https://0.0.0.0:8443
-  tls: { cert: tls.crt, key: tls.key, client_ca: clients.crt }   # and/or a bearer:
-  bearer: "{{secret:A2A_BEARER}}"
-  principals:
-    - match: { san: "spiffe://team/*" }
-      role: user
-      grants: [knowledge.*]
-```
-
-**Delegate over A2A** — a workflow `a2a.delegate` step (or a subagent) calls a
-declared peer as a spec-conformant Task:
-
-```yaml
-a2a:
-  peers:
-    - name: research
-      endpoint: https://research-agent.internal:8443
-```
-
-**Nest subagents** — a parent spawns a child by re-exec'ing the same binary
-with a narrowed spawn payload (subset of servers, tighter limits, its own
-cgroup). The tree is bounded by `--max-depth` and a spawn-rate token bucket;
-every child is one `SIGKILL` from gone.
-
-## Security model
-
-- **No local execution by default.** `exec` ships as a mapping-only contract:
-  a local runner exists only when the binary was built `--features exec` (never
-  a release binary) *and* `security.exec.enabled` is set. Otherwise the attack
-  surface of a tool call is the remote MCP server's, not the host's.
-- **Rule-of-Two trifecta gate.** Tag servers with
-  `--mcp-tags name=untrusted_input,sensitive,egress`; a config that wires all
-  three legs into one agent is **refused at startup** unless you explicitly
-  `--allow-trifecta`.
-- **Authenticated everything.** Outbound: bearer/OAuth 2.1 client-credentials +
-  bundled webpki roots (+ `--tls-ca` for private PKI). Inbound: mTLS client CA
-  and/or constant-time bearer, and sessions from the OAuth device grant an
-  operator approves under a name; **operator verbs (the `admin.*` ops) require
-  the operator role** — granted by a matching `a2a.principals` rule, by a
-  verified `a2a.bearer`, by a client certificate while no rule exists, by a
-  session approved with the `operator` scope or started by the launcher
-  (`agentd tui` / `agentd ui`), or — on a loopback-bound
-  listener with no credential mechanism at all — to a local non-browser caller
-  that presents nothing. No grant lifts another role to an operator verb.
-  Discovery stays public, though: the unauthenticated agent card lists the
-  command extension's whole op vocabulary, `admin.*` included, and only the
-  authenticated `GetExtendedAgentCard` narrows it to the ops that caller may
-  actually run.
-- **Hardened served surface.** A request carrying `Origin` is refused (403)
-  unless its origin is listed in `a2a.cors.origins` — the one exception is the
-  page `agentd ui` itself launched — and a browser is never the implicit
-  operator; plaintext serving is loopback-only.
-- **Secrets discipline.** Tokens come from env or mounted files
-  (`--intelligence-token-file` rotates live) and are never logged; telemetry
-  logs lengths, not contents, unless you opt in with `--log-content`.
-- **Contained blast radius.** Reasoning runs in killable child processes under
-  optional per-run cgroups (`--cgroup`, `--cgroup-memory-max`,
-  `--cgroup-pids-max`) with atomic `cgroup.kill` teardown.
-
-See [docs/security.md](docs/security.md).
-
-### AAuth [draft] — signed agent identity
-
-Calling an MCP server protected by **AAuth**? Build with `--features aauth` and
-agentd gets an **Ed25519 identity**, an agent token from an **Agent Provider**,
-and **signs every MCP request** (RFC 9421) — no shared API key, and the server
-knows exactly which agent is calling:
-
-```console
-$ agentd --instruction "…" --intelligence https://gw.example/v1 \
-    --mcp secure=https://mcp.secure.example/mcp \
-    --aauth-provider https://apd.example --aauth-enroll-token '{{secret:ENROLL}}'
-```
-
-The token is fetched, cached, and refreshed automatically; the whole subagent
-tree signs under one identity. Draft support (Case A end-to-end); ships
-build-from-source, like CEL. See [docs/aauth.md](docs/aauth.md).
-
-## Operating it
-
-**Exit codes are the contract**: `0` completed · `1` crash · `2`
-config/usage (fails in ms, pre-LLM) · `3` stalled/partial · `4` intelligence
-unavailable · `5` refused · `6` required MCP server down · `7` budget/deadline
-exhausted · `124` supervisor hard-kill backstop · `137`/`143` external kills. A
-clean drain is always `0`, never `143`. Policy codes (`3`/`7`) can be remapped with `--budget-exit-code` for
-schedulers that treat nonzero as retry-forever.
-
-**Telemetry:** JSON-lines on stderr (trace-correlated, `--log-level`), a
-`--report-file` path the schema accepts but the runtime does not write — the
-terminal outcome is the `proc.exit` event and the A2A task artifact —
-Prometheus `/metrics` + `/healthz` + `/readyz` via `--metrics-addr`
-(`--features metrics`), OTLP spans with GenAI semconv via `--features otel`, a
-liveness heartbeat file via `--health-file`, and the live log ring tailed with
-the `debug.events` command op (needs `a2a.introspection.enabled`).
-
-**Discovery:** `agentd --capabilities` prints a machine-readable manifest of
-exactly what is compiled and configured in, and exits — feature-detect from
-this, not the version string.
-
-**Control plane:** an operator-role principal drives the served endpoint with
-the `admin.drain` / `admin.pause` / `admin.resume` / `admin.cancel` /
-`admin.set` command ops — each a DataPart on an ordinary A2A `SendMessage`
-under agentd's [command extension](https://agentd.dev/a2a/ext/command),
-not a custom JSON-RPC method. `SIGTERM` starts a graceful drain
-(`--drain-timeout` < pod grace).
-
-**Hot reload** (`--features hot-reload`): `SIGHUP` — or a ConfigMap volume
-swap with `--watch-config` (`--features config-watch`) — revalidates and
-reapplies the reloadable subset (model, limits, log level, subscriptions,
-**live MCP server set**) at a quiesce boundary, restart-free.
-
-See [docs/operations.md](docs/operations.md) and [docs/observability.md](docs/observability.md).
-
-## Scaling out
-
-Scale inside one instance first (`concurrency.max_runs`, `limits.max_runs`,
-`agent.max_parallel_turns`, `parallel` on fan-out steps). For a fleet, agentd has
-**no coordination protocol of its own** — ownership lives where it can actually
-be arbitrated: partition the subscriptions at the source, or use the queue's own
-claim/lease semantics from a workflow step. Prometheus metrics feed the
-autoscaler.
-
-See [docs/scaling.md](docs/scaling.md).
-
-## Build features
-
-The default build is intentionally small; everything else is opt-in at compile
-time. A flag whose feature is absent exits `2` loudly — never a silent no-op.
-
-| Feature | What it adds | Extra deps |
-|---|---|---|
-| `tls` *(default)* | rustls + ring + bundled roots — direct `https://` everywhere | rustls stack |
-| `a2a` | the A2A HTTPS listener + outbound delegation peers | — |
-| `cel` | CEL step conditions / computed values / data-step expressions | `cel-interpreter` (the one exception) |
-| `otel` | hand-rolled OTLP/HTTP trace + log export, GenAI semconv | — |
-| `metrics` | hand-written Prometheus text + health endpoints | — |
-| `aauth` | an Ed25519 agent identity that signs outbound MCP requests | `ring` (already in-tree) |
-| `exec` | the guarded local command runner (never in a release binary) | — |
-| `cron` | 5-field UTC cron scheduling (hand-rolled parser) | — |
-| `oauth` | OAuth 2.1 client-credentials for remote endpoints | — |
-| `hot-reload` / `config-watch` | SIGHUP / inotify restart-free reconfig | — |
-
-Shipped release feature set:
-`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events`.
-
-## Footprint (measured)
-
-Measured on the 1.1.0 release build (x86_64, musl, stripped, the shipped
-feature set):
-
-| Metric | Value |
+| You want to… | Start with |
 |---|---|
-| Binary (static-PIE, runs on `scratch`) | **8.5 MiB** amd64 · 6.3 MiB arm64 |
-| Release download (amd64) | **3.6 MiB** `.tar.gz` → 8.5 MiB binary |
-| Cold start (`--version` / `--capabilities`) | **< 1 ms** |
-| Idle daemon RSS (schedule workflow, file store) | **5.5 MiB**, 1 thread |
-| Idle daemon CPU | **1 jiffy / 6 s** — under 0.2% of a core |
-| Served request overhead (`tools/call`, loopback, fresh conn) | **p50 0.26 ms** |
-| Deterministic workflow steps | **~146k steps/sec** (single lane, 0 model tokens) |
+| decide whether agentd fits | [Why agentd](https://agentd.dev/docs/why-agentd/), [Use cases](https://agentd.dev/docs/use-cases/), [Security at a glance](https://agentd.dev/docs/security-overview/) |
+| build your first agents | [Quickstart](https://agentd.dev/docs/getting-started/), [Your first workflow](https://agentd.dev/docs/first-workflow/), [Build a coding agent](https://agentd.dev/docs/coding-agent/) |
+| connect models and tools | [Connect model providers](https://agentd.dev/docs/connect-models/), [Connect MCP servers](https://agentd.dev/docs/connect-mcp/) |
+| deploy and operate it | [Deploy](https://agentd.dev/docs/deployment/), [Monitor in production](https://agentd.dev/docs/observability/), [Harden a deployment](https://agentd.dev/docs/harden/) |
+| understand how it works | [Architecture](https://agentd.dev/docs/architecture/), [Security model](https://agentd.dev/docs/security/) |
+| look something up | [Configuration reference](https://agentd.dev/docs/configuration/), [CLI and exit codes](https://agentd.dev/docs/cli/), [Workflow node reference](https://agentd.dev/docs/node-registry/) |
+| build on it | [Embed agentd in Rust](https://agentd.dev/docs/embedding/), [Build a client](https://agentd.dev/docs/build-a-client/) |
 
-## Documentation map
+The documentation lives in [`docs/`](docs/) and is published at
+[agentd.dev/docs](https://agentd.dev/docs/). Design decisions are recorded
+in [`rfcs/`](rfcs/).
 
-- **[docs/README.md](docs/README.md)** — the task-oriented guide index:
-  [getting started](docs/getting-started.md) ·
-  [configuration](docs/configuration.md) ·
-  [architecture](docs/architecture.md) · [mcp](docs/mcp.md) ·
-  [modes & triggers](docs/modes-and-triggers.md) ·
-  [interface (TUI/web UI)](docs/interface.md) ·
-  [coding agent](docs/coding-agent.md) ·
-  [workflows](docs/workflows.md) · [subagents](docs/subagents.md) ·
-  [intelligence](docs/intelligence.md) · [security](docs/security.md) ·
-  [observability](docs/observability.md) · [operations](docs/operations.md) ·
-  [deployment](docs/deployment.md) · [scaling](docs/scaling.md) ·
-  [use cases](docs/use-cases.md)
-- **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: a coding
-  agent (`coding-agent.yaml`), Docker Compose, Kubernetes
-  `Job`/`CronJob`/`Deployment` manifests, a systemd unit.
-- **[skills/](skills/README.md)** — an Agent Skill that teaches an AI coding
-  assistant to install, configure and debug agentd (drop it in `~/.claude/skills/`).
-- **[SECURITY.md](SECURITY.md)** — what counts as a vulnerability here, and how
-  to report one privately.
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** — build, test and review expectations.
-- **[CHANGELOG.md](CHANGELOG.md)** — release history.
-- **Website:** [agentd.dev](https://agentd.dev) — the rendered documentation.
+## Crates
+
+| Crate | Responsible for |
+|---|---|
+| `agentd-cli` | The `agentd` binary |
+| `agentd-core` | The engine: supervisor, agent loop, workflows, intelligence, A2A, state |
+| `agentd-mcp` | The MCP client over the official Rust SDK, and a raw HTTP listener |
+| `agentd-net` | Blocking HTTP/1.1 and SSE, unix and TLS connects, the SSRF guard |
+| `agentd-instruction` | The Instruction Specification: parse, validate, deliver, verify |
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE). One crate is deliberately permissive:
-`agentd-instruction` (the Instruction Specification's reference parser,
-`crates/instruction`) is MIT OR Apache-2.0, so other implementations can link
-it. Some files are vendored from the
-Instruction Specification under their own terms (the schema under CC BY 4.0,
-the conformance corpus under Apache-2.0) — see [NOTICE](NOTICE). agentd is fully open source; commercial licensing (for proprietary embedding or AGPL-free use) and commercial support are available — contact agent@agentd.dev.
+AGPL-3.0-only — see [LICENSE](LICENSE). `agentd-instruction` is
+`MIT OR Apache-2.0`, and the conformance corpus under Apache-2.0; see
+[NOTICE](NOTICE). Commercial licensing (for proprietary embedding or
+AGPL-free use) and commercial support are available: agent@agentd.dev.

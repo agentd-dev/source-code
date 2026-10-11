@@ -51,6 +51,9 @@ agent:
     customer in a bad week is still a customer. Writing off revenue is the
     CEO's decision, never yours.
   ask_human_fallback: wait
+  # Runs started by a webhook or a schedule are nobody's: their human
+  # gates open as tasks on the A2A listener, for an operator to answer.
+  ask_human_unowned: gate
 
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions

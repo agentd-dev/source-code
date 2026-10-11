@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useRef } from "react";
+import { DOCS, GROUPS } from "../../lib/docs-registry";
 import ThemeToggle from "./ThemeToggle";
 
 /**
@@ -16,33 +17,20 @@ import ThemeToggle from "./ThemeToggle";
  * only script here closes an open menu on outside-click or Escape, which is
  * the part the platform does not give us.
  */
-const LEARN = [
-  { href: "/docs/overview/", t: "Overview", d: "What agentd is, and the shape of a run" },
-  { href: "/docs/getting-started/", t: "Getting started", d: "Install, configure, first run" },
-  { href: "/docs/coding-agent/", t: "Build a coding agent", d: "A pair-programming daemon you host" },
-  { href: "/docs/use-cases/", t: "Use cases", d: "The shapes people actually deploy" },
-];
-
-const UNDERSTAND = [
-  { href: "/docs/architecture/", t: "Architecture", d: "Two loops, one binary, strict separation" },
-  { href: "/docs/harness/", t: "The harness", d: "The supervisor that never talks to the model" },
-  { href: "/docs/agent-loop/", t: "The agent loop", d: "How a turn is built, run, and ended" },
-  { href: "/docs/workflows/", t: "Workflows", d: "Durable DAGs, triggers, and resume" },
-  { href: "/docs/directives/", t: "Directives", d: "Instructions that carry their machinery" },
-  { href: "/docs/subagents/", t: "Subagents", d: "Delegation as an OS process tree" },
-  { href: "/docs/why-rust/", t: "Why Rust", d: "The dependency moat, and what it buys" },
-  { href: "/docs/pid-1/", t: "PID 1 — agentd as init", d: "Robots and appliances: the runtime as a Linux init" },
-];
-
-const REFERENCE = [
-  { href: "/docs/node-registry/", t: "Node registry", d: "All 67 workflow nodes, and the five traps" },
-  { href: "/docs/configuration/", t: "Configuration", d: "Every key, and how layers resolve" },
-  { href: "/docs/interface/", t: "TUI & web UI", d: "The display clients and their protocol" },
-  { href: "/docs/mcp/", t: "MCP", d: "Where tools and events come from" },
-  { href: "/docs/security/", t: "Security", d: "Capability scoping and the trifecta rule" },
-  { href: "/docs/observability/", t: "Observability", d: "Logs, metrics, traces" },
-  { href: "/docs/", t: "All documentation →", d: null },
-];
+/* The menus come from the docs registry: one per group that names a `menu`
+   label, listing the group's `featured` pages (with their short `hint`), and
+   the docs index last. A hand-kept copy here drifted from the pages it named. */
+const MENUS = GROUPS.filter((g) => g.menu).map((g) => ({
+  label: g.menu,
+  items: [
+    ...DOCS.filter((d) => d.group === g.id && d.featured).map((d) => ({
+      href: `/docs/${d.slug}/`,
+      t: d.title,
+      d: d.hint ?? d.blurb,
+    })),
+    { href: "/docs/", t: "All documentation →", d: null },
+  ],
+}));
 
 function Menu({ label, items }) {
   const ref = useRef(null);
@@ -102,9 +90,9 @@ export default function Nav() {
         </Link>
 
         <div className="hidden items-center gap-0.5 md:flex">
-          <Menu label="Learn" items={LEARN} />
-          <Menu label="Concepts" items={UNDERSTAND} />
-          <Menu label="Reference" items={REFERENCE} />
+          {MENUS.map((m) => (
+            <Menu key={m.label} label={m.label} items={m.items} />
+          ))}
           <Link className="nav-link" href="/editor/">
             Editor
           </Link>

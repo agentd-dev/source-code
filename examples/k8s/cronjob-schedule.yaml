@@ -66,7 +66,7 @@ spec:
                     fs MCP server. If this hour's digest already exists, exit 0
                     without redoing the work.
                 - name: AGENTD_INTELLIGENCE
-                  value: https://gw.example/v1
+                  value: https://gw.example/v1/chat/completions
                 - name: AGENTD_INTELLIGENCE_TOKEN
                   valueFrom:
                     secretKeyRef:

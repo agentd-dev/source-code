@@ -56,7 +56,7 @@ agent:
     use null when no action was taken.
 
 intelligence:
-  endpoints: ["https://gw.example/v1"]
+  endpoints: ["https://gw.example/v1/chat/completions"]
   model: claude-opus-4
 
 mcp:

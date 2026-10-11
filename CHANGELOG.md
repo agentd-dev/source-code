@@ -5,6 +5,44 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+The documentation is rewritten as product documentation, for everyone who
+meets agentd: evaluators, newcomers, workflow authors, operators, security
+reviewers and integrators. It has five parts — Product, Get started,
+Guides, Concepts and Reference — with tutorials, task guides, references
+and use cases, and every complete configuration sample in it is loaded by
+the binary in CI. Writing it against the code found configuration that was
+accepted and did nothing, and a deadline that did not bound the run it
+named; those are fixed below.
+
+**Added.**
+
+- The release binaries and the image carry the mock model endpoint
+  (`mock:final`, `mock:file:<playbook>`, cargo feature `mock-models`), so an
+  agent or a workflow can be tried and tested without a model provider.
+
+**Fixed.**
+
+- `--deadline` bounds the run it names. A one-shot `--instruction` run did
+  not take it at all, and a model call in flight was bounded only by its own
+  timeout; a step's turn now ends when its run's deadline passes, a call in
+  flight included, and the run exits 124.
+- OTLP traces go to `observability.otel.endpoint`; only the logs did, and
+  traces read the environment variable alone.
+
+**Changed (breaking).** These load and did nothing; they are refused at load
+now: a real model connection with no model named; an A2A principal rule
+matching a client certificate (`san`, `sub`) without `a2a.tls.client_ca`;
+`a2a.listen`, `webhooks.listen` or `a2a.peers` in a binary built without the
+`a2a` feature; a model connection's `auth` that sends no bearer (a static
+credential under its own header, an x509 SVID).
+
+**Removed.** Keys that were accepted and read by nothing:
+`observability.report_file` (`--report-file`), `observability.otel.traces`,
+`observability.otel.metrics`, `intelligence.budget.reserve`,
+`a2a.conversation_ttl`, `store.audit`, and `scope` on a budget block.
+
 ## v1.18.0 — MCP 2026-07-28, MCP Events, and kinds of intelligence
 
 Reading the substrate an MCP Events bridge would stand on (RFC 0045) found

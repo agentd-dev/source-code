@@ -68,7 +68,7 @@ mcp:
       headers: { x-mcpg-subject-id: agentd-dev }
 
 intelligence:
-  endpoints: ["http://127.0.0.1:11434/v1"]
+  endpoints: ["http://127.0.0.1:11434/v1/chat/completions"]
   model: qwen3
 
 store: { kind: file }

@@ -662,6 +662,16 @@ details.doc-nav-group > summary::before {
 details.doc-nav-group[open] > summary::before {
   transform: rotate(90deg);
 }
+.doc-nav-section + .doc-nav-section {
+  margin-top: 0.55rem;
+}
+.doc-nav-section-title {
+  color: var(--dimmer);
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin: 0.35rem 0 0.2rem;
+  padding: 0 0.6rem;
+}
 .doc-nav-list {
   list-style: none;
   margin: 0;

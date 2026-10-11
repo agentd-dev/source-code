@@ -27,7 +27,7 @@ export default function sitemap() {
     { url: `${BASE}/docs/`, lastModified: now, changeFrequency: "weekly", priority: 0.9 },
     { url: `${BASE}/editor/`, lastModified: now, changeFrequency: "monthly", priority: 0.5 },
   ];
-  const docs = DOCS.map((d) => ({
+  const docs = DOCS.filter((d) => !d.href).map((d) => ({
     url: `${BASE}/docs/${d.slug}/`,
     lastModified: mtime(d.file),
     changeFrequency: "weekly",

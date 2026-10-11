@@ -1,328 +1,404 @@
-# agentd for software engineering — a coding agent you host
+# Build a coding agent
 
-A recipe for the shape most people want first: **a pair-programming agent you
-talk to in a terminal**, like Claude Code or Codex CLI — except the session
-lives in a daemon you run, not in the CLI. That one difference is what you get
-in exchange for wiring it up yourself: the work survives the client, several
-people (or several of your devices) can watch the same session, and the same
-instance can also run scheduled and event-triggered engineering chores.
+This tutorial sets up a pair-programming agent on one repository: a daemon
+you talk to from a terminal, that reads the code and runs allow-listed
+commands, asks before risky steps, and keeps working when you close the
+client. It is for developers who have done the [Quickstart](getting-started.md).
+At the end you have a running coding agent, you know where its fences are,
+and you can add chores that run on a schedule.
 
-```sh
-agentd tui --config coding.yaml     # daemon + terminal UI, one command
+> **Note.** agentd ships no file-editing tools. It is a runtime you assemble
+> a coding agent on, not a coding agent in a box: you choose its powers, and
+> a configuration that grants none is an agent that can only talk. The
+> assembly is about forty lines of YAML, and step 2 is a complete one.
+
+## Before you start
+
+- **Rust 1.96 or newer** and a C compiler, to build agentd with the command
+  runner. The release binaries leave it out on purpose.
+- **An OpenAI API key** in `OPENAI_API_KEY`.
+- **Node.js 20 or newer** and the clients: `npm install -g @agentd-dev/cli`.
+- **A git repository** to work on.
+
+## What you will build
+
+The daemon owns the session. Clients attach to it over A2A and render it;
+quitting one leaves the agent working. Each model turn runs in a child
+process; the commands it asks for run through agentd's guarded runner,
+inside the repository.
+
+```mermaid
+flowchart LR
+    tui["agentd-tui"] -->|"messages, answers"| daemon["agentd daemon: coder"]
+    web["browser or teammate"] -->|"after signing in"| daemon
+    daemon -->|"spawns per turn"| worker["turn worker"]
+    worker -->|"messages and tools"| model["model provider"]
+    worker -->|"exec requests"| daemon
+    daemon -->|"allow-listed argv, cwd in workdir"| repo["your repository"]
+    worker -.->|"optional, over HTTPS"| mcp["MCP servers"]
+    daemon -->|"conversations, tasks, runs"| store["file store"]
 ```
 
-> **Read this first if you are coming from Claude Code.** agentd ships **no
-> file-editing tools of its own** — see [§2](#2-giving-it-hands). It is a
-> runtime you assemble a coding agent on, not a coding agent in a box. The
-> assembly is about twenty lines of YAML, and §1 is a complete working one.
+## Step 1: Build agentd with the command runner
 
----
+The `exec` feature compiles in the local command runner. This build adds it
+to the A2A listener the clients need, cron schedules, reload on `SIGHUP`,
+and CEL expressions:
 
-## Contents
-
-1. [The 5-minute setup](#1-the-5-minute-setup)
-2. [Giving it hands: `exec` vs MCP](#2-giving-it-hands)
-3. [Approvals — the permission prompt, server-side](#3-approvals)
-4. [Keeping it bounded (cost, context, blast radius)](#4-keeping-it-bounded)
-5. [Working practices](#5-working-practices)
-6. [Beyond chat: chores that run themselves](#6-beyond-chat)
-7. [Honest limits](#7-honest-limits)
-
----
-
-## How this differs from a coding CLI
-
-Neither column is "better" — they are different products. Pick deliberately.
-
-| | Claude Code / Codex CLI | agentd + TUI |
-|---|---|---|
-| Where the session lives | in the CLI process | in the **daemon**; clients are thin projections |
-| Quit the client | session ends | session continues; re-attach and it is still there |
-| A second surface | — | terminal **and** browser **and** another machine, all live at once |
-| Tools | built in, curated | **you wire them**: MCP servers over HTTPS, or the guarded `exec` runner |
-| Approvals | built-in prompts | `ask_human` gates, rendered as answerable rows in *every* attached client |
-| Recurring work | — | workflows on a schedule / webhook / signal, in the same instance |
-| Guardrails | model + prompt | allow-list, workdir confinement, budgets, the Rule-of-Two trifecta check |
-| Setup cost | near zero | ~20 lines of YAML |
-
----
-
-## 1. The 5-minute setup
-
-**Build.** Local command execution is deliberately absent from release
-binaries, so a coding agent is a build-from-source setup:
-
-```sh
-cargo build --release --features a2a,exec
-# a2a  → the listener the TUI/web UI attach to
-# exec → the guarded local command runner (default-OFF even when compiled in)
+```bash
+cargo install agentd-cli --locked --features "a2a,exec,cron,hot-reload,cel"
 ```
 
-**Configure** (`coding.yaml`):
+The binary lands in `~/.cargo/bin/agentd`. If you also installed a release
+binary, make sure this one comes first:
+
+```bash
+command -v agentd
+agentd --version
+```
+
+```text
+/home/you/.cargo/bin/agentd
+agentd 1.18.0
+```
+
+> **Warning.** A release binary accepts the `security.exec` settings below
+> and then offers the agent no command runner, without a warning. Run this
+> tutorial on the binary you built in step 1.
+
+## Step 2: Write the configuration
+
+Save this as `~/coding.yaml`, outside the repository:
 
 ```yaml
 agent:
   name: coder
-  # Your CLAUDE.md equivalent. Keep it about HOW to work, not what the task is.
+  # Standing policy: how to work, not today's task.
   instruction: |
-    You are a careful engineer working in the repository at /work.
+    You are a careful engineer working in one git repository. The exec
+    tool runs commands in it.
 
-    Explore before you edit: read the relevant files, run the tests, and say
-    what you found. Prefer the smallest change that fixes the cause.
+    Explore before you edit: read the relevant files, run the tests, and
+    say what you found. Prefer the smallest change that fixes the cause.
 
-    Ask before you act destructively — anything that rewrites history, force
-    pushes, deletes files, or touches credentials. Use ask_human for that and
-    wait for the answer.
+    Ask before you act destructively: anything that rewrites history,
+    force pushes, deletes files or touches credentials. Use ask_human for
+    that and wait for the answer.
 
     When you finish, state what changed and how you verified it.
-  preflight: never          # skip the intent classifier; you are the intent
-  ask_human_fallback: wait  # a question with nobody to answer it parks, never guesses
+  preflight: never           # your messages go straight to the turn
+  ask_human_unowned: gate    # background work may ask you too
 
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
-  token: "{{secret:OPENAI_API_KEY}}"   # a reference, never the key itself
+  token: "{{secret:OPENAI_API_KEY}}"
   budget:
     windows: [{ per: day, tokens: 2000000 }]
     on_exhausted: refuse
 
 store:
-  kind: memory            # see §4 for making the session durable
+  kind: file
+  file: { path: "${HOME}/.local/state/agentd/coder" }
 
 a2a:
-  listen: http://127.0.0.1:8420   # loopback, no credential ⇒ your terminal is the operator
-  events:
-    enabled: true         # the live feed the TUI/web UI watch (default OFF)
-  introspection:
-    enabled: false        # transcripts, run detail, the log ring — /set it on when you need internals
+  listen: http://127.0.0.1:8420
+  events: { enabled: true }
 
 security:
   exec:
     enabled: true
-    workdir: /work                       # every command is confined here
-    allow: [git, rg, ls, cat, sed, cargo] # argv[0] allow-list; EMPTY denies all
+    workdir: "${REPO}"
+    allow: [git, rg, ls, cat]
     timeout: 120s
     max_output: 262144
-    env: [PATH, HOME, LANG]              # the agent's own env never reaches the child
+    env: [PATH, HOME, LANG]
 
 limits:
   run: { steps: 60, tokens: 400000, deadline: 30m }
 
 lifecycle:
-  run_until: drained      # a daemon: stay up between messages
+  run_until: drained
 ```
 
-**Run:**
+What each block does:
 
-```sh
-export OPENAI_API_KEY=sk-…
-agentd tui --config coding.yaml
+| Block | What it does here |
+|---|---|
+| `agent.instruction` | The standing policy, sent with every turn. Your equivalent of a `CLAUDE.md`: how to work, what to ask about, what "done" means. Today's task goes in your message. |
+| `agent.preflight: never` | Skips the triage step before each turn: you are the intent. |
+| `agent.ask_human_unowned: gate` | Lets work you did not start (subagents, scheduled runs) ask you questions too. |
+| `intelligence` | The model, and a daily token window: once 2,000,000 tokens are spent, new turns are refused until the window resets at 00:00 UTC. |
+| `store` | Keeps conversations, tasks and runs on disk, outside the repository, so a restart resumes them. |
+| `a2a` | The loopback listener the clients attach to, with the live feed they watch. |
+| `security.exec` | The command runner: on, confined to the repository, read-only commands to start. |
+| `limits.run` | Bounds each turn: 60 steps, 400,000 tokens, 30 minutes. |
+| `lifecycle.run_until: drained` | Keeps the daemon up until you stop it. |
+
+`${HOME}` and `${REPO}` are filled in from the environment when agentd
+loads the file; an unset variable stops it with a message naming it.
+
+## Step 3: Start it and talk to it
+
+From the repository, export its path and start the daemon with the terminal
+UI:
+
+```bash
+cd /path/to/your/repository
+export REPO="$PWD"
+agentd tui --config ~/coding.yaml
 ```
 
-That starts the daemon *and* the terminal UI, ties their lifetimes, signs the
-TUI in with a single-use launch code the daemon mints in its own process, and
-puts the daemon's log lines in a file instead of your screen. The launcher
-adds nothing to `coding.yaml`: the feed is on because the file turns it on.
-Prefer them separate?
-Run `agentd --config coding.yaml` in one shell and `agentd-tui --endpoint
-http://127.0.0.1:8420` in another — now quitting the UI leaves the agent
-working. See [interface.md](interface.md) for the client surface in full.
+Ask something that needs the code, such as "What does this repository do,
+and how do I run its tests?" The agent calls `exec` with commands like `ls`,
+`cat` and `git log`, and answers. While it works, the status row shows the
+current phase and tool, the time spent and the tokens used.
 
----
+> **Note.** This configuration declares no workflow, so agentd also runs the
+> instruction once, as a task, the first time the daemon starts: expect one
+> orientation run in the log before your first message. With the file store
+> it never runs again. Adding any workflow, as in
+> [step 7](#step-7-add-a-chore-that-runs-on-its-own), turns it off.
 
-## 2. Giving it hands
+To keep the agent working when you close the UI, run the daemon and the
+client apart, in two terminals:
 
-agentd runs nothing of its own by default. A coding agent gets its abilities
-from exactly two places, and they compose:
+```bash
+agentd --config ~/coding.yaml
+```
 
-### Route A — the `exec` runner (local, guarded)
+```bash
+agentd-tui --endpoint http://127.0.0.1:8420
+```
 
-The pragmatic local choice, and what the config above uses. Every call is
-fenced (details in [The exec runner](security.md#the-exec-runner)):
+## Step 4: Answer its questions
 
-- **argv, never a shell** — no `sh -c`, so no globbing, `$(…)`, pipes, or
-  command injection. Want a shell? Allow-list `bash` and call it explicitly:
-  that is a conscious operator decision, not an accident.
-- **allow-list on `argv[0]`**, empty by default (`enabled: true` alone runs
-  nothing).
-- **workdir confinement** — a requested `cwd` is canonicalized and must resolve
-  inside `workdir`; no `..` or symlink escape.
-- **timeout, output cap, minimal env** — the child never sees your secrets.
+When the agent calls `ask_human`, the task that your message started
+switches to *input-required*, and the question appears in every attached
+client. Reply in the conversation and the agent continues with your answer.
+Typing `#<task-id> your answer` answers a specific task.
 
-Practical allow-lists, in increasing order of trust:
+Two cases behave differently:
+
+- **A restart while a question is open.** The conversation and the task
+  survive in the store, but the turn that asked does not. Your answer
+  arrives as a new message, and the agent continues the conversation from
+  it. A `human` step in a workflow, as in step 7, is rebuilt exactly and
+  waits on.
+- **A question from work nobody started.** Subagents and scheduled runs
+  belong to no conversation. With `ask_human_unowned: gate`, their questions
+  open a task of their own, which you answer from the Tasks screen or with
+  `#<task-id>`. Without it, `agent.ask_human_fallback` decides: `fail`
+  (the default) returns an error to the asker at once, `wait` parks the
+  question until its timeout, and `auto` lets a model judge on
+  `intelligence.roles.approve` answer, marked as automatic. The judge never
+  answers for a run that carries outside input.
+
+[Human in the loop](human-in-the-loop.md) covers addressed gates, timeouts
+and approvals in full.
+
+## Step 5: Widen what it can do
+
+The allow-list matches `argv[0]` exactly; an empty list denies everything.
+Widen it as the agent earns your trust:
+
+| `allow` | The agent can |
+|---|---|
+| `[git, rg, ls, cat]` | Read the repository and its history |
+| `[git, rg, ls, cat, cargo, npm, pytest]` | Also build and run the tests |
+| `[git, rg, ls, cat, sed, tee, cargo]` | Also edit files in place |
+| `[bash]` | Run anything a shell can. A deliberate decision, never a default. |
+
+The runner's guards hold for every call:
+
+- **No shell.** `argv` goes straight to the program, so there is no
+  globbing, `$( … )`, pipe or command injection. To give the agent a shell,
+  allow `bash` and let it call `bash -c` explicitly.
+- **A working directory inside `workdir`.** A requested `cwd` is resolved,
+  symlinks included, and must land inside the repository.
+- **A timeout and an output cap.** `timeout` (30 seconds when unset) kills
+  the command; `max_output` (1 MiB when unset) truncates what comes back.
+- **A minimal environment.** The command sees only the variables in `env`.
+  Your API key and the rest of the agent's environment never reach it.
+
+> **Limit.** `workdir` confines where a command runs, not which paths its
+> arguments name: with `cat` allowed, `cat /etc/hosts` reads `/etc/hosts`.
+> The fences that hold are the allow-list and the operating system. For more
+> than a laptop, run the daemon as a user that can read only the repository,
+> or in a container that mounts only the repository.
+
+The other way to give the agent hands is an MCP server, reached over HTTPS:
+structured edit tools rather than `sed`, or work done in someone else's
+sandbox. agentd has no stdio transport, so a stdio-only server needs a
+bridge you run:
 
 ```yaml
-allow: [git, rg, ls, cat]                       # read-only reconnaissance
-allow: [git, rg, ls, cat, cargo, npm, pytest]   # + run the tests
-allow: [git, rg, ls, cat, sed, tee, cargo]      # + edit files in place
-allow: [bash]                                   # everything; deliberate only
-```
-
-### Route B — MCP servers (structured, off-box)
-
-Tools reached over **HTTPS** (agentd has no stdio transport — see
-[mcp.md](mcp.md)). This is the better route when you want edits to be
-structured rather than `sed`, or the work to happen in someone else's sandbox:
-
-```yaml
+# fragment: under the top level, beside the blocks above
 mcp:
   servers:
     - name: fs
-      endpoint: https://mcp-fs.internal/mcp
+      endpoint: https://mcp-fs.example.com/mcp
       tags: { "*": [sensitive] }
 ```
 
-A useful hybrid: `exec` for reconnaissance and tests, an MCP server for writes.
-You can also keep the *contract* and delegate the implementation — map `exec`
-to an MCP server with `tools.overrides` and the command runs in that server's
-sandbox instead of your machine.
+Tag every server you add beside `exec`. The trifecta check below counts a
+server with no tags as untrusted input, so an untagged server next to
+`exec` stops the daemon from starting.
 
-> **The trifecta check.** `exec` carries `sensitive` + `egress` tags. Add an
-> MCP server tagged `untrusted_input` (a web fetcher, an issue tracker) and
-> agentd **refuses to start** unless you set `--allow-trifecta` — untrusted
-> input plus sensitive powers plus an egress path is the exfiltration shape.
-> That refusal is the feature; think before you override it.
+A useful mix is `exec` for reading and running the tests, and an MCP server
+for writes. You can also keep the `exec` tool and move where it runs:
+`tools.overrides` maps it to a tool on an MCP server, so the command runs in
+that server's sandbox. [Connect MCP servers](connect-mcp.md) covers
+credentials and trust tags.
 
----
-
-## 3. Approvals
-
-The analogue of a coding CLI's permission prompt — but it lives in the daemon,
-so it reaches *every* attached client, and it survives a restart.
-
-When the agent calls `ask_human` (your instruction should tell it when — see
-§1), its task flips to `input-required` and the question renders as an
-answerable row:
-
-```
-agent › Ready to force-push feature/rework over 3 commits. Proceed? [reply to continue]
-› no — open a PR instead
-```
-
-Anything you type answers the newest gate; `#task-… your answer` answers a
-specific one. Workflow `human` steps gate the same way and **survive a daemon
-restart** — the run picks up where it stopped.
-
-What happens when nobody is watching is a policy you set
-(`agent.ask_human_fallback`):
-
-| | behavior | when to use |
-|---|---|---|
-| `wait` | park until the ask times out | interactive sessions — you *will* come back (recommended here) |
-| `fail` (default) | the ask errors; the agent decides what to do | headless/CI, where hanging for a day is worse |
-| `auto` | an LLM judge answers conservatively on your behalf, always marked as auto | unattended runs where progress beats precision |
-
----
-
-## 4. Keeping it bounded
-
-- **Cost.** `intelligence.budget` windows with `on_exhausted: refuse` stop a
-  runaway loop from spending your month. The working row shows spend live
-  (`thinking · 12s · 1.2k tok`), and `/status` gives the totals.
-- **Steps and time.** `limits.run.{steps,tokens,deadline}` bound a single turn.
-- **Context.** Long sessions self-compact (`context.compact_at`); the
-  conversation keeps a structured summary rather than truncating blindly.
-- **Blast radius.** `workdir` + allow-list are the real fence; the model's
-  cooperation is not a control. Start read-only and widen as you trust it.
-- **Durability.** `store.kind: memory` keeps everything in the process — fine
-  to start, but the session dies with the daemon. Set `store.kind: file`, or
-  delete the `store:` block entirely — a long-lived instance defaults to the
-  local file store — and conversations, tasks and workflow runs survive a
-  restart, including a pending approval. Point `store` at an MCP or HTTP store
-  ([configuration.md](configuration.md)) when the box the agent runs on is not
-  the box you trust to keep the state.
-
----
-
-## 5. Working practices
-
-- **One instance per repository.** `workdir` is the fence; two repos in one
-  instance means the fence protects neither.
-- **The instruction is your standing policy** — how to work, what to ask
-  before, what "done" means. Task-specific detail belongs in the message, not
-  the instruction. Reusable playbooks belong in skills (`@skill` in the
-  composer pulls one in).
-- **Start read-only.** `[git, rg, ls, cat]` for a day. Widen when the agent has
-  earned it, not before.
-- **Keep introspection off, and flip it when you need it:**
-  `/set a2a.introspection.enabled true` opens transcripts, per-step run detail
-  and the log tail live, for every attached client at once. Turn it back off
-  after; the next reload of the file does too.
-- **`/pause` before you edit the tree yourself.** It parks dispatch (intake
-  continues), so you and the agent are not writing the same file. `/resume`
-  when you are done — nothing is lost, unlike a cancel.
-- **Watch from a second surface.** Every attached client renders the same
-  session live. A second terminal on this machine is one more
-  `agentd-tui --endpoint http://127.0.0.1:8420`. A browser, or another
-  person, signs in: give the daemon an operator credential (`a2a.bearer`) and
-  the device grant (`a2a.device_grant.enabled`), list the web UI's origin in
-  `a2a.cors.origins`, and the other client shows a code you approve from your
-  TUI with `/approve <code> <name>` — no bearer is copied around
-  ([Signing in](interface.md#signing-in)). With a credential configured your
-  own console still signs in through `agentd tui`'s launch code.
-- **Delegate exploration.** "Check whether this pattern appears elsewhere" is a
-  subagent's job: it runs in its own process with its own context and reports a
-  distillate, so a wide search never floods the conversation you are reading.
-  The Subagents screen shows them working; open one for its instruction and
-  result.
-- **Cancel early.** The working row tells you what it is doing; if it is on the
-  wrong path, `Esc` cancels the task instead of paying for the whole turn.
-- **Let it read its own telemetry.** Point `exec` at your test runner and the
-  agent verifies its own change; the debug screen shows you the same tool calls
-  it made, in order, with timings.
-
----
-
-## 6. Beyond chat
-
-The same instance that answers you in the TUI can run engineering chores on its
-own — this is the part a coding CLI structurally cannot do. Workflows are
-durable DAGs with schedule / webhook / signal triggers
-([workflows.md](workflows.md)):
+`exec` carries the `sensitive` and `egress` tags. Add a server tagged
+`untrusted_input`, such as an issue tracker or a web fetcher:
 
 ```yaml
+# fragment: under the top level, beside the blocks above
+mcp:
+  servers:
+    - name: issues
+      endpoint: https://mcp-issues.example.com/mcp
+      tags: { "*": [untrusted_input] }
+```
+
+and agentd refuses to start:
+
+```text
+{"event":"config.invalid","msg":"lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)"}
+```
+
+Untrusted input, sensitive powers and a way out together are the shape of
+an exfiltration. The refusal is the feature; think before you set
+`--allow-trifecta`. [Security model](security.md) explains the rule.
+
+## Step 6: Keep it bounded
+
+- **Spend.** The `intelligence.budget` window stops a runaway loop from
+  spending the month. `/status` shows the totals. [Control spend with
+  budgets](budgets.md) covers windows, degrading to a cheaper model, and
+  per-conversation allowances.
+- **Each turn.** `limits.run` ends a turn that runs past its steps, tokens
+  or deadline.
+- **Context.** A long session compacts itself: the conversation keeps a
+  summary instead of being cut off blindly. [How a turn runs](agent-loop.md)
+  explains when.
+- **State.** The file store keeps the session through a restart. Point
+  `store` at an MCP or HTTP store when the machine the agent runs on is not
+  the one you trust to keep its state ([Configuration
+  reference](configuration.md)).
+
+## Working practices
+
+- **One instance per repository.** `workdir` and the allow-list are set for
+  one tree; two repositories in one instance share one set of fences.
+- **The instruction is policy, the message is the task.** Reusable
+  playbooks belong in skills; `@` in the composer pulls one in.
+- **Start read-only.** `[git, rg, ls, cat]` for a day. Widen when the agent
+  has earned it.
+- **Open the internals when you need them.** `/set
+  a2a.introspection.enabled true` serves transcripts, per-step run detail
+  and the daemon's log to every attached client. Set it back to `false`
+  after; a reload of the configuration (`SIGHUP`) also restores the file's
+  value.
+- **`/pause` before you edit the tree yourself.** It holds the agent's work
+  at a safe point, so the two of you do not write the same file. `/resume`
+  continues it; nothing is lost.
+- **Cancel early.** If the status row shows the agent on the wrong path,
+  `/cancel` stops the task instead of paying for the whole turn.
+- **Delegate exploration.** "Find every caller of this function" is a
+  subagent's job: it works in its own process and context and reports a
+  summary, so a wide search does not flood your conversation
+  ([Delegate to subagents](delegate-subagents.md)).
+- **Watch from a second surface.** Every attached client shows the same
+  session live. Another terminal on this machine is one more
+  `agentd-tui --endpoint http://127.0.0.1:8420`. A browser or a teammate
+  signs in instead: configure a credential and the device grant, and approve
+  their code from your terminal with `/approve <code> <name>`
+  ([Signing in](interface.md#signing-in)).
+
+## Step 7: Add a chore that runs on its own
+
+The same daemon can run engineering chores without you. A workflow on a
+schedule runs a dependency audit every night and waits for your decision
+before changing anything. Save this as `~/nightly.yaml`:
+
+```yaml
+# fragment: under the top level; load it after coding.yaml
 workflows:
   - name: nightly-audit
     steps:
-      s: { kind: schedule, cron: "0 3 * * *" }
-      audit: { kind: agent, depends_on: [s],
-               instruction: "Run cargo audit and cargo outdated in /work; summarize what needs attention." }
-      gate: { kind: human, question: "Apply the safe upgrades?", depends_on: [audit] }
-      apply: { kind: agent, depends_on: [gate],
-               instruction: "Apply only the upgrades the operator approved: {{steps.gate.output}}" }
-      done:  { kind: finish, depends_on: [apply], status: completed }
+      at_three:
+        kind: schedule
+        cron: "0 3 * * *"
+      audit:
+        kind: agent
+        depends_on: [at_three]
+        instruction: |
+          Run `cargo audit` and `cargo outdated` in the repository and
+          summarize what needs attention.
+      gate:
+        kind: human
+        depends_on: [audit]
+        question: |
+          {{steps.audit.output}}
+
+          Which of these upgrades should I apply? Reply "none" to skip.
+        timeout: 12h
+      apply:
+        kind: agent
+        depends_on: [gate]
+        instruction: |
+          Apply only the upgrades the operator approved, then run the
+          tests. If the answer is "none", change nothing.
+          The answer: {{steps.gate.output}}
+      done:
+        kind: finish
+        depends_on: [apply]
 ```
 
-You wake up to a question in your TUI instead of a stale report — the gate
-waited overnight because the run is durable.
+The agent steps run the commands through the same `exec` runner, so add
+`cargo` to `allow`; the `cargo-audit` and `cargo-outdated` subcommands
+must be installed too. Start the daemon
+with both files:
 
----
+```bash
+agentd tui --config ~/coding.yaml --config ~/nightly.yaml
+```
 
-## 7. Honest limits
+At 03:00 UTC the audit runs, and the `gate` step opens a question in the
+Tasks screen. It waits up to twelve hours, and the wait is durable: a
+restart in the meantime rebuilds the gate exactly. Answer it with
+`#<task-id> apply the patch releases only`, and the run continues. You wake
+up to a question, not a stale report.
 
-- **No token-by-token streaming.** You get live *activity* — phase, current
-  tool, elapsed, spend — and then the finished answer, not a typewriter. This
-  is deliberate: the daemon emits one event per phase change rather than per
-  token, so any number of attached clients costs the same, and the answer that
-  lands is the one the durable store already holds.
-- **No built-in editing tools.** §2 is not a formality: you choose the powers,
-  and a config that grants none is an agent that can only talk.
-- **`exec` is not in release binaries.** Build with `--features exec`, on
-  purpose ([security.md](security.md)).
-- **MCP servers must speak HTTP(S).** There is no stdio transport, so a
-  stdio-only server needs a bridge you run.
-- **Loopback is operator.** On a loopback listener with no credential
-  configured, a local terminal client is fully privileged — correct for your
-  laptop, wrong for a shared host. (A browser never is: a request carrying
-  `Origin` always signs in.) Bind non-loopback and you must configure client
-  auth (mTLS or a bearer), and people then sign in with the device grant.
+Without `ask_human_unowned: gate` in `coding.yaml`, nobody could answer:
+the scheduled run belongs to no conversation, and under the default
+fallback the `gate` step fails at once. [Author workflows](author-workflows.md)
+covers schedules, webhooks and signals.
 
----
+## Limits
 
-## See also
+- **No token streaming.** The clients show live activity (phase, current
+  tool, elapsed time, spend) and then the finished answer. The daemon sends
+  one event per change of phase rather than per token, so any number of
+  attached clients costs the same.
+- **No built-in editing tools.** Step 5 is not a formality.
+- **`exec` is never in a release binary**, and a release binary does not
+  say so when you enable it.
+- **MCP servers must speak HTTP.** A stdio-only server needs a bridge.
+- **Loopback means operator.** With no credential configured, any local
+  process on this machine that presents none is the operator: right for a
+  laptop, wrong for a shared host. A browser never is. Bind anything but
+  loopback and agentd requires client authentication.
 
-- [interface.md](interface.md) — the TUI and web UI in full: screens, the
-  composer's `/ @ # $`, signing in, the debug screen, chrome configuration.
-- [security.md](security.md) — the `exec` fence, the trifecta rule, secrets.
-- [use-cases.md](use-cases.md) — the other shapes (triage, audit, fan-out).
-- [configuration.md](configuration.md) — every key, and precedence.
+## Next steps
+
+- [Use the terminal and web UI](interface.md): screens, commands, approvals
+  and signing in.
+- [Human in the loop](human-in-the-loop.md): gates, addressees, timeouts
+  and automatic answers.
+- [Security model](security.md): the runner's fences and the trifecta rule.
+- [Why agentd](why-agentd.md): how a hosted agent compares with a coding
+  CLI.

@@ -4,7 +4,7 @@
 > transport this RFC specifies is replaced by **HTTPS** (mTLS/bearer auth; loopback
 > `http://` for dev); operator control is unified into the `a2a.*` method family. The
 > contracts (methods/resources/semantics) still hold — only the transport does not.
-> See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+> See ../docs/design/00-target-vision-pivot.md.
 
 **Status:** Superseded by 0029 — A2A is the only external channel; `--serve-mcp` now aliases `a2a.listen`
 **Author:** Andrii Tsok

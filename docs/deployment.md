@@ -1,459 +1,343 @@
-# Deploying agentd
+# Deploy
 
-`agentd` is one binary that runs **one durable agent**. An external scheduler
-starts, stops, replicates, and watches it; the binary owns no control plane of
-its own. This page is a set of deployment recipes:
+This guide shows how to run agentd in production: as a one-shot job, as a
+daemon under systemd, and on Kubernetes as a Job, CronJob, Deployment or
+StatefulSet. It is for operators. agentd is one binary that runs one durable
+agent and owns no control plane: your scheduler starts it, stops it,
+replicates it and watches it, and agentd keeps a contract of signals, exit
+codes and probes that the scheduler can act on.
 
-1. [Standalone CLI — one-shot job](#1-standalone-cli--one-shot)
-2. [Long-lived A2A daemon](#2-long-lived-daemon-a2a--reactive-triggers)
-3. [Container — minimal scratch/distroless image](#3-container--minimal-scratchdistroless-image)
-4. [Scheduled by an external orchestrator (Kubernetes)](#4-scheduled-by-an-external-orchestrator-kubernetes)
+## Choose a shape
 
-The **same durable runtime** backs every shape; they differ only in the
-lifecycle shape (`lifecycle.run_until`) and what triggers runs. A one-shot **job**
-goes empty-and-final and exits, mapping its outcome to the
-[exit-code table](#the-exit-code-contract); a **daemon** idles on its triggers
-(an A2A listener, a `subscribe` / `schedule` / `loop` start node) and exits only
-on a SIGTERM drain.
+What decides the shape is whether the instance outlives one run. A **job**
+runs its work to an end and exits with a code. A **daemon** waits for
+triggers, such as an A2A listener, a webhook listener, or a `schedule`,
+`subscribe`, `loop` or `stream` start node, and exits only when drained.
 
----
+```mermaid
+flowchart TD
+  Q{"Does the instance outlive one run?"} -->|"no"| J{"On a timetable?"}
+  J -->|"no"| K["Kubernetes Job or a plain command"]
+  J -->|"yes"| C["Kubernetes CronJob"]
+  Q -->|"yes"| F{"Several replicas share the work?"}
+  F -->|"no"| D["systemd unit, or a Deployment with one replica"]
+  F -->|"yes"| S["StatefulSet with a shared mcp or http store"]
+```
 
-## The config surface you will actually use
+| Shape | Lifecycle | State | Where |
+|---|---|---|---|
+| One-shot job | ends when its run ends | none by default: every effect goes out through MCP | a shell, a CI step, a Job, a CronJob |
+| Single daemon | drains on `SIGTERM` | a `file` store on a disk that survives restarts | systemd, a Deployment with one replica |
+| Fleet | each replica drains on `SIGTERM` | an `mcp` or `http` store shared by all replicas | a StatefulSet |
 
-Configuration is one document (`--config` / `AGENTD_CONFIG`,
-YAML or JSON, repeatable + merged). **Every path in the schema is also an env var
-and a flag** (`limits.run.steps` ⇒ `AGENTD_LIMITS_RUN_STEPS` /
-`--limits-run-steps`), so a container overrides at deploy time without editing
-the file. Precedence, top wins: **built-in default < config file < env < flag**.
-Secrets are **references** only (`{{secret:NAME}}` / `{{secret-file:PATH}}`),
-resolved from env / mounted files — never inline values.
+`lifecycle.run_until: auto`, the default, picks the shape from the
+configuration: anything long-lived makes a daemon. `agentd --capabilities`
+reports the verdict as `lifecycle.daemon`. [Jobs, daemons and
+triggers](modes-and-triggers.md) explains the rules.
 
-| Concern | Section / path | Short flag |
-|---|---|---|
-| Instruction | `agent.instruction` — text, a file, `oci://`, `mcp://` or `https://` (configuration.md §5a) | `--instruction` / `--instruction.file` / `--instruction.oci` |
-| Intelligence | `intelligence.endpoints` (ordered failover), `.model`, `.token` | `--intelligence` / `--model` / `--intelligence-token` |
-| Token budget | `intelligence.budget.windows` (rate-limit the burn) | — |
-| MCP servers | `mcp.servers: [{name, endpoint}]` | `--mcp name=<endpoint>` |
-| Durable store | `store.kind: file\|mcp\|http\|memory\|none` (defaults: `file` for a long-lived instance, `none` for a one-shot), `store.file.path`, `store.mcp.server` | — |
-| **A2A listener** | `a2a.listen`, `a2a.url` (required on a wildcard bind), `a2a.tls`, `a2a.principals`, `a2a.bearer` | `--listen` |
-| **A2A peers** | `a2a.peers: [{name, endpoint}]` | — |
-| Workflows / triggers | `workflows: [{name, steps}]` (start nodes: once/manual/loop/schedule/subscribe/stream/correlate/signal/event/a2a/webhook) | — |
-| Limits | `limits.max_runs`, `limits.run.{steps,tokens,deadline}`, `limits.subagents.depth` | `--max-steps` / `--deadline` |
-| Lifecycle | `lifecycle.run_until` (auto\|idle\|drained), `lifecycle.drain_timeout` | `--drain-timeout` |
-| Run ID | `lifecycle.run_id` (idempotency key) | `--run-id` |
-| Observability | `observability.log_level`, `.health_file`, `.metrics_addr`, `.audit`, `.otel` | `--log-level` |
-| Security | `security.tls_ca`, `security.aauth`, `security.cgroup.{spec,memory_max,pids_max}` | — |
+## Run a one-shot job
 
-Durations accept `ms`/`s`/`m`/`h` or a bare integer (seconds). Flags take their
-value as the **next argument** (`--drain-timeout 25s`); only `--config` / `-c`
-also accepts the `=` form, so in a container `args:` list write the flag and its
-value as two entries. Each intelligence / MCP endpoint must be `https://…` (or
-loopback `http://` for a same-host dev gateway). Config is validated **before any
-side effect**:
-`agentd --validate-config` (exit 2 on error), `agentd --config-schema` (the
-machine-readable schema), `agentd --capabilities` (the effective surface).
-
-> **Scope.** The external channel is **A2A** (`a2a.listen`): one HTTPS listener
-> carries conversations, operator commands, and durable tasks. On its MCP side
-> agentd is a client only — on the connections a turn's own child process holds
-> it declares one client capability, `elicitation` (a server's mid-call question
-> becomes a human `ask_human` gate); the supervisor's connections, the ones
-> behind `tool:` steps and resource subscriptions, declare none. On neither does
-> it service `roots`, `sampling` or `tasks` requests from a server.
-
----
-
-## 1. Standalone CLI — one-shot
-
-A **job** (the default, `lifecycle.run_until: auto` with no listener). Run an
-instruction to a terminal status, emit the result on **stdout**, write telemetry
-to **stderr**, exit with a code from the
-[exit-code table](#the-exit-code-contract).
+A job runs an instruction to an end, prints the result on stdout, writes its
+telemetry to stderr, and exits with a code from the
+[exit-code table](cli.md#exit-codes).
 
 ```bash
-agentd \
-  --instruction "Summarise today's open incidents and post a digest." \
-  --intelligence https://gw.example/v1 \
-  --model my-model \
-  --mcp incidents=https://mcp-incidents.internal/mcp \
-  --mcp slack=https://mcp-slack.internal/mcp \
-  --deadline 5m \
-  --max-steps 40
+export AGENTD_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
+agentd --instruction.file task.md --intelligence https://api.openai.com/v1/chat/completions --model gpt-5.1 --mcp incidents=https://mcp-incidents.internal/mcp --deadline 15m --max-steps 40
 ```
 
-stdout carries the agent's final result; stderr carries one NDJSON event per
-line. The canonical fields are
-`ts level event run_id agent_id agent_path comp pid …`:
+- `--instruction.file` reads the task from a file; a ConfigMap or Secret
+  projection works well. `--prompt "<text>"` is the other one-shot form: it
+  delivers one message to the agent, which answers with its full tool
+  surface.
+- Pass the model credential in the environment (`AGENTD_INTELLIGENCE_TOKEN`)
+  or a file (`--intelligence-token-file`), never on a shared command line
+  where `ps` shows it. agentd never logs it.
+- `--deadline` bounds the whole run, a model call in flight included, and
+  `--max-steps` bounds its steps. A run past its deadline ends with exit 124;
+  one that runs out of steps or tokens ends with exit 7.
 
-```json
-{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"01M06TKN6W88955NQDJNKCS0SC","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"1.1.0","instance":"agentd","config_files":["/etc/agentd/task.yaml"]}
-```
-
-Because stdout is the result and stderr is telemetry, you compose with ordinary
-shell tooling:
+stdout and stderr separate cleanly, so a job composes with shell tools:
 
 ```bash
-agentd --instruction "$(cat task.md)" --intelligence https://gw.example/v1 \
-  2> >(jq -c 'select(.level=="error")') \
-  | tee result.txt
+agentd --instruction.file task.md --intelligence https://api.openai.com/v1/chat/completions --model gpt-5.1 2> telemetry.ndjson > result.txt
 ```
 
-Read the instruction from a file (handy for ConfigMap/Secret projection) with
-`--instruction.file`, or set `INSTRUCTION` in the environment. The intelligence
-token is **never** logged — pass it via `AGENTD_INTELLIGENCE_TOKEN` or
-`--intelligence-token`, not on a shared command line where it lands in `ps`.
-
-**Idempotent retries.** A bare run mints a random `run_id` per process. For a
-unit of work that a scheduler may retry, pin a **stable** key so backing MCP
-services can dedupe the side effect:
+A job keeps no state of its own (`store.kind: none` is its default), so
+running it again is safe as long as its side effects are. Make retries
+idempotent by pinning the run id to the unit of work:
 
 ```bash
-agentd --run-id "nightly-digest-2026-06-25" \
-  --instruction "$(cat task.md)" --intelligence https://gw.example/v1 --mcp …
+agentd --run-id nightly-digest-2026-10-11 --instruction.file task.md --intelligence https://api.openai.com/v1/chat/completions --model gpt-5.1 --mcp incidents=https://mcp-incidents.internal/mcp
 ```
 
-The key rides in the `_meta` of every outbound MCP `tools/call`; a backing
-service that honours idempotency keys collapses a retried effect to one. A
-one-shot keeps **no** state of its own — it defaults to `store.kind: none`, and
-every effect leaves through MCP — so a re-run is safe by construction. (A
-long-lived instance is the opposite by default: its state is the point, and it
-lands in the configured `store`, on this host's filesystem unless told
-otherwise — §2, §3.)
+The run id rides in the `_meta` of every MCP call as `agent/run_id`, so a
+server that keys on it can collapse a retried job's effects to one. The
+per-call `agent/idempotency_key` beside it stays the same across retries
+inside one process, not across processes. Without `--run-id`, every process
+mints a fresh run id.
 
----
+## Run a daemon
 
-## 2. Long-lived daemon (A2A + reactive triggers)
-
-A **daemon** (`lifecycle.run_until: drained`) idles cheaply and wakes on its
-triggers — an A2A message/command, or a `subscribe` / `schedule` / `loop` start
-node. It exits only on a SIGTERM drain, never on an individual run failing. A
-daemon is **durable** so state survives a restart: name no `store`
-and it gets `kind: file` under the state-directory chain
-([`configuration.md`](configuration.md) §12.3), which is the right answer on a
-laptop or a VM with a real disk. The config below names `kind: mcp` instead
-because it is going to run as more than one pod over its life — see §3 for what
-a file store does and does not survive in a container.
+A daemon idles until a trigger fires. This one wakes when a ticket queue
+resource changes and triages the new ticket:
 
 ```yaml
 # /etc/agentd/triage.yaml
-agent: { instruction: "When a ticket is filed, triage it and assign an owner." }
-intelligence: { endpoints: https://gw.example/v1, model: my-model }
+agent:
+  name: triage
+  instruction: When a ticket is filed, triage it and assign an owner.
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  models:
+    smart: { model: gpt-5.1 }
+    fast: { model: gpt-5-mini }
+  roles:
+    turn: smart
 mcp:
   servers:
-    - { name: tickets, endpoint: https://mcp-tickets.internal/mcp }
-    - { name: state,   endpoint: https://mcp-state.internal/mcp }
-store: { kind: mcp, mcp: { server: state } }
-a2a:
-  listen: https://0.0.0.0:8443
-  url: https://agent-triage.example.com:8443     # a wildcard bind publishes this origin
-  tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/ca.pem }
+    - { name: tickets, endpoint: "https://mcp-tickets.internal/mcp" }
+store:
+  kind: file
+  file: { path: /var/lib/agentd }
 workflows:
   - name: triage
     steps:
-      s: { kind: subscribe, server: tickets, uri: "tickets://queue/inbound" }
-      t: { kind: agent, depends_on: [s], instruction: "Triage the new ticket." }
-      f: { kind: finish, depends_on: [t] }
-lifecycle: { run_until: drained, drain_timeout: 25s }
-observability: { health_file: /run/agent/health }
+      inbound: { kind: subscribe, server: tickets, uri: "tickets://queue/inbound" }
+      work: { kind: agent, depends_on: [inbound], instruction: "Triage the new ticket." }
+      done: { kind: finish, depends_on: [work] }
+lifecycle:
+  run_until: drained
+  drain_timeout: 25s
+  watch_config: true
+observability:
+  metrics_addr: ":9090"
 ```
+
 ```bash
 agentd --config /etc/agentd/triage.yaml
 ```
 
-On restart the daemon **restores its durable state** (runs, timers, artifacts,
-inbox) from the store, re-handshakes its MCP servers, and re-arms every start
-node — a `subscribe` node re-subscribes to its resource. Anything the daemon had
-already *accepted* before it died — an A2A message, a fired trigger — is in the
-durable inbox and replays on restore; a notification that arrives while the
-process is down is not queued for it, so if a missed update matters, back the
-work with a durable queue resource or add a `schedule` / `loop` node that sweeps
-for outstanding items. A `subscribe` trigger is notify-then-read over the MCP
-servers' **Streamable-HTTP** subscriptions: the run sees the resource content
-agentd reads on the notification, not the notification alone.
+Check it before you ship it. Validation resolves `{{secret:…}}` references,
+so set them, with placeholder values in CI:
 
-### Graceful shutdown
+```bash
+OPENAI_API_KEY=placeholder agentd --validate-config --config /etc/agentd/triage.yaml
+```
 
-On `SIGTERM`/`SIGINT` the daemon flips a one-way `DRAINING` latch and runs a
-**bounded drain**:
+A daemon is durable. Naming no store gets it `kind: file` under the state
+directory chain (`AGENTD_STATE_DIR`, then `$XDG_STATE_HOME/agentd/state`,
+then `$HOME/.local/state/agentd/state`); `store.kind: none` on a daemon is
+refused at load. On restart it restores its runs, timers, artifacts and
+pending inbox from the store, connects its MCP servers again and re-arms
+every start node.
 
-1. Disarm triggers — stop routing new resource updates; reject new
-   `subagent.spawn`; flip readiness to not-ready.
-2. Wind down in-flight subagents at turn boundaries (cooperative cancel).
-3. Ladder the stragglers — `SIGTERM` → ~5s grace → `SIGKILL` → reap.
-4. Flush logs and `exit(0)`.
+Anything the daemon had accepted before it stopped is in the durable inbox
+and replays. A notification that arrives while the process is down is not
+queued for it: if a missed update matters, back the work with a durable
+queue, or add a `schedule` start that sweeps for outstanding items.
 
-A **clean drain exits `0`, not `143`** — a rolled `Deployment` looks like a
-clean shutdown in dashboards, not a failure. A **second** `SIGTERM`/`SIGINT`
-forces immediate `SIGKILL` of all process groups.
+### Shut it down cleanly
 
-The whole drain is bounded by `lifecycle.drain_timeout` (`--drain-timeout`,
-`AGENTD_DRAIN_TIMEOUT`; default 25s). **This MUST be smaller than the
-orchestrator's shutdown grace** — see the
-[footgun below](#the-top-footgun-drain-timeout--grace).
+`SIGTERM` or `SIGINT` starts a bounded drain:
 
-### As a systemd unit
+1. Readiness turns off and the triggers stop admitting work. Workflows with
+   an `event` start on `lifecycle.shutdown` fire at this point.
+2. Every child process (turn workers and subagents) is asked to cancel. A
+   child still running 5 seconds later gets `SIGTERM`, and `SIGKILL` 2
+   seconds after that. No new workflow step or conversation turn starts.
+3. The drain waits for the `lifecycle.shutdown` runs, up to
+   `lifecycle.drain_timeout` (default 25 s).
+4. agentd checkpoints its durable state, flushes its log and exits **0**.
+
+What happens to work in flight depends on where it is. A run that is waiting
+(on a timer, a signal, a person, or for its next step) stays in the store and
+resumes when the instance starts again, on the definition it started with. A
+step whose turn worker is cut off mid-call fails, and its run fails with it.
+To let running steps finish before a planned restart, pause the instance
+first, wait until `status` shows no child processes, then drain; see
+[Operate a running daemon](operations.md#drain-for-a-rolling-update).
+
+A clean drain exits 0, not 143, so a rolled pod looks like a clean shutdown.
+A second `SIGTERM` or `SIGINT` forces the shutdown at once. When
+`drain_timeout` passes, agentd kills the children that remain; if any is
+still alive 3 seconds later, it logs `drain.abandon` and exits anyway. The
+worst case is therefore `drain_timeout` plus about 3 seconds.
+
+### Keep the drain inside the grace period
+
+agentd cannot see your orchestrator's grace period, so nothing checks the
+pair for you. If the grace period ends first, the orchestrator's `SIGKILL`
+lands mid-drain: the exit becomes 137, the `lifecycle.shutdown` workflows are
+cut off, the final checkpoint may not be written, and a rolling update
+reports failures.
+
+Keep the grace period above `drain_timeout` plus 3 seconds, with room for
+the final checkpoint:
+
+| `lifecycle.drain_timeout` | Kubernetes `terminationGracePeriodSeconds` | systemd `TimeoutStopSec` |
+|---|---|---|
+| 25s (default) | 35 | 35 |
+| 50s | 60 | 60 |
+
+The Kubernetes default grace period of 30 seconds leaves only 2 seconds of
+margin over the default drain. Set both values explicitly.
+
+### Under systemd
 
 ```ini
 # /etc/systemd/system/agent-triage.service
 [Unit]
-Description=agent ticket triage (daemon)
-After=network.target
+Description=agentd ticket triage
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-EnvironmentFile=/etc/agentd/triage.env       # e.g. AGENTD_INTELLIGENCE_TOKEN=…
-ExecStart=/usr/local/bin/agentd --config /etc/agentd/triage.yaml
-# Give the drain room: must exceed lifecycle.drain_timeout.
-TimeoutStopSec=30
+Type=simple
+DynamicUser=yes
+StateDirectory=agentd
+RuntimeDirectory=agentd
+EnvironmentFile=/etc/agentd/triage.env
+ExecStart=/usr/local/bin/agentd --config /etc/agentd/triage.yaml --health-file /run/agentd/health.json
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
 KillSignal=SIGTERM
+TimeoutStopSec=35
 Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2 5
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-`TimeoutStopSec` is systemd's analogue of `terminationGracePeriodSeconds`: keep
-it **larger** than `--drain-timeout`.
+- `EnvironmentFile` carries the secrets the configuration references, one
+  `OPENAI_API_KEY=…` line per variable. Keep it mode 0600.
+- `StateDirectory=agentd` creates `/var/lib/agentd`, the store path in the
+  configuration, owned by the service's user.
+- `KillMode=mixed` sends `SIGTERM` to agentd alone and lets it wind its
+  children down. The default, `control-group`, signals every child at the
+  same moment and pre-empts the drain.
+- `RestartPreventExitStatus=2 5` stops a restart loop on a configuration
+  error or a refused task, which a restart cannot fix.
+- `systemctl reload agent-triage` sends `SIGHUP`, which reloads the
+  configuration. [Operate a running daemon](operations.md#reload-configuration)
+  says what reloads.
 
----
+## Use the container image
 
-## 3. Container — minimal scratch/distroless image
+The published image is `ghcr.io/agentd-dev/agentd`, tagged by release
+(`1.18.0`, `1.18`, `1`, `latest`) for amd64 and arm64. It holds one static
+musl binary on `scratch`: no shell, no libc, no package manager. It runs as
+uid 65532 with `/agentd` as its entrypoint, and it carries the release
+feature set, including the A2A listener, `/metrics` and the probes, cron,
+OTLP export, hot reload and the `mock:` model endpoint. Pin a version or a
+digest in production.
 
-agentd is statically linkable — one musl artifact with no shell and no libc in
-the image, whatever the build needed to produce it. It runs **no local shell or
-filesystem tools** — every external effect leaves through MCP or A2A — so the
-image stays small (an 8.5 MiB binary on `scratch`). The recommended entrypoint is
-`agentd` itself: it sets
-`PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
-own process tree. You do **not** need an external `tini`.
-
-The published image (`Dockerfile` at the repo root) ships the **cloud-native
-feature set** by default —
-`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"` (the same
-set the release workflow builds). `a2a` brings the A2A SDK and the async stack
-its listener runs on; `cel` is the one dependency-bearing member; `aauth`,
-`sign`, `oci` and `decrypt` are direct edges on `ring`, already in the tree as
-rustls's crypto provider; the rest are hand-rolled and add no dependency. What
-each adds:
-
-| Feature | Adds |
-|---|---|
-| `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`observability.metrics_addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
-| `a2a` | The A2A HTTPS listener (`a2a.listen`) — the external channel + outbound delegation peers. Pulls the TLS stack. |
-| `cron` | UTC 5-field cron scheduling for the `schedule` start node's `cron` field. |
-| `otel` | OTLP-over-HTTP/JSON trace + log export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
-| `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a quiesce boundary. |
-| `config-watch` | The `inotify` file-watch reload trigger (`lifecycle.watch_config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
-| `oauth` | OAuth 2.1 endpoint credentials (device, authorization-code + PKCE, client-credentials, refresh, OIDC discovery) for intelligence / MCP / A2A endpoints — see [`authentication.md`](authentication.md). |
-| `aauth` | AAuth agent identity: an Ed25519 keypair, agent-token enrolment, and RFC 9421 HTTP message signatures on outbound MCP requests. |
-| `cel` | CEL expressions in workflow `when:` / `inputs:` — the one member with a dependency. |
-| `sign` | §7 instruction signature verification: `agent.instruction.trust` pins a publisher, and without this feature a pin is a startup refusal rather than a silent pass. |
-| `oci` | `oci://` instruction pulls over the Distribution API, and the cosign artifact check (`oci: {ref, cosign_key}`). |
-| `decrypt` | Encrypted instruction envelopes — age v1 and JWE (`agent.instruction.decrypt`). |
-| `mcp-events` | MCP Events: `mcp.servers[].events` bindings and `event_grants`, each event type polled into a declared stream (RFC 0045). The extension is a draft (SEP-3415), and a config that declares a binding says so at load. |
-
-Build a narrower (or wider) surface with `--build-arg FEATURES=…`. Other features
-are `exec` (the guarded local-command tool, off at runtime too), `workflow`
-(gates nothing live — the durable DAG engine is unconditional) and
-`internal-mocks` (test scaffolding). `tls` is in the **default** set (it is the
-transport — every network surface is HTTPS); `a2a` rides it.
-`--no-default-features` drops TLS for the loopback-`http://`-to-a-sidecar
-posture.
-
-```dockerfile
-# syntax=docker/dockerfile:1
-# Static musl binary on scratch — the cloud-native feature set.
-FROM rust:1-alpine AS build
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
-RUN apk add --no-cache musl-dev
-WORKDIR /src
-COPY . .
-# Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
-# static; one Dockerfile yields native-static amd64 AND arm64 via buildx.
-RUN if [ -n "$FEATURES" ]; then \
-      cargo build --release --locked -p agentd-cli --features "$FEATURES"; \
-    else \
-      cargo build --release --locked -p agentd-cli; \
-    fi
-
-# scratch: nothing but the binary. (Swap for gcr.io/distroless/static if you
-# want a CA bundle + /etc/passwd without managing them yourself.)
-FROM scratch
-COPY --from=build /src/target/release/agentd /agentd
-# Non-root by uid (scratch has no /etc/passwd; the kernel uses the number).
-USER 65532:65532
-# MCP servers are remote HTTP endpoints (--mcp name=https://…), deployed as their
-# own services — nothing MCP-related is bundled into the agentd image.
-ENTRYPOINT ["/agentd"]
-```
-
-> **Build-arg, not flag.** `FEATURES` selects what the **binary** can do; it is a
-> compile-time choice, not a runtime flag. Config for a feature the image was not
-> built with is either inert or a loud refusal, never a silent downgrade: an
-> `a2a.listen` on a non-`a2a` build never binds and a `cron` field on a
-> non-`cron` build never fires, but anything that is a *control* — a CEL guard
-> in `security.policies[].match.args`, an `agent.instruction.trust` pin — fails
-> validation with exit `2` rather than passing quietly, because a control that
-> silently does nothing turns a deny into an allow. Pin the feature set for your
-> image and keep config and build in step.
-
-### Durable state on a `scratch` image
-
-A long-lived instance is durable by default, and the default adapter is
-`store.kind: file` — one directory on the local filesystem
-([`configuration.md`](configuration.md) §12.3). In a container that default is
-honest but weak: the state directory lands on the **writable layer**, which
-survives a process restart (a crash, a `restartPolicy` bounce — the daemon
-restores its runs, timers and pending inbox) and does **not** survive a
-reschedule. A new pod is a new writable layer, and the previous state is gone
-with the old one. The `scratch` image makes that easy to miss, because there is
-no shell to go looking with.
-
-Two ways to mean it:
-
-- **Mount a volume at the state path** — a PVC (or a hostPath on a single
-  machine), with `store.file.path` pointing inside it. Durability then belongs
-  to the volume, which is where it always belonged. Bind it to a
-  `StatefulSet`'s `volumeClaimTemplates` so a rescheduled ordinal re-attaches
-  its own claim (§4d): identity is `agent.name` / the pod name, and the volume
-  follows the same ordinal.
-- **Use `mcp` or `http`** — the state lives in a service, the pod is
-  disposable, and any number of replicas can be rescheduled anywhere. This is
-  the fleet answer; `file` refuses to be shared (two processes on one directory
-  is a startup error naming the holder's pid), so it is not an option for
-  `replicas: 2` regardless of the volume.
-
-```yaml
-# Deployment/StatefulSet pod spec — a file store that survives a reschedule.
-containers:
-  - name: agent
-    image: ghcr.io/agentd-dev/agentd:1.1.0
-    args: [--config=/etc/agentd/triage.yaml]     # store: { kind: file, file: { path: /var/lib/agentd } }
-    volumeMounts:
-      - { name: state, mountPath: /var/lib/agentd }
-    securityContext:
-      runAsUser: 65532                            # the uid that owns 0700/0600
-      readOnlyRootFilesystem: true                # the state volume is the only writable path
-volumes:
-  - name: state
-    persistentVolumeClaim: { claimName: agent-triage-state }
-```
-
-`readOnlyRootFilesystem: true` composes with this deliberately: the only paths
-agentd writes are ones you named — the state directory, the credential cache if
-an endpoint uses one (`$AGENTD_CRED_DIR`), and `observability.health_file` if it
-is set. Give each a mount (an `emptyDir` is enough for the last two) and the
-filesystem surface is closed. Set the state volume's ownership to the uid the
-container runs as: the adapter creates its directories `0700` and its files
-`0600` and never falls back to anything looser.
-
-### TLS is on by default — or terminate it in a sidecar
-
-The default build links `tls` (rustls + bundled roots), so agentd dials `https://`
-directly. Two postures:
-
-- **Direct HTTPS (default):** `--intelligence https://…` (and `--mcp name=https://…`)
-  reach real endpoints over TLS; agentd holds the trust roots.
-- **Sidecar TLS termination:** build `--no-default-features` and point agentd at a
-  **same-host sidecar over loopback** — `--intelligence http://127.0.0.1:PORT/…` —
-  which terminates TLS + provider auth. A non-loopback `http://` is rejected.
+The image is signed with cosign in the release workflow. Verify it before
+you deploy:
 
 ```bash
-# Direct HTTPS (default build):
-agentd --intelligence https://gw.example/v1 --instruction.file /etc/task.txt \
-  --mcp fs=https://mcp-fs.internal/mcp
+cosign verify ghcr.io/agentd-dev/agentd:1.18.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/agentd-dev/'
 ```
 
-This keeps the default image at scratch-size with no certificate management in
-the agentd process.
+agentd is its own init. It sets itself as the child subreaper and reaps
+orphans, so it runs as PID 1 without `tini`.
 
-### Health surface
+### Build your own image
 
-Two options, both live:
+The `Dockerfile` at the repository root builds the same image. The feature
+set is a build argument:
 
-- **`--metrics-addr host:port`** (`metrics` feature, in the default image) serves
-  `/healthz` + `/readyz` + `/metrics` over HTTP. This is the right choice for the
-  **scratch image**, which has no shell to run an exec probe: point the k8s
-  liveness probe at `/healthz` and readiness at `/readyz`. The bare `:port` form
-  binds all IPv4 interfaces so the kubelet reaches it at the pod IP. (See the K8s
-  probes below.)
-- **`--health-file <PATH>`** — agentd heartbeats it while the reactor is live, so
-  an exec-style probe can `test` its freshness. Useful where you do not want an
-  HTTP listener at all.
+```bash
+docker build -t agentd:local .
+docker build --build-arg FEATURES=a2a,metrics,cron,otel,hot-reload,config-watch -t agentd:narrow .
+docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/agentd:1.18.0 --push .
+```
 
-`/healthz` returns 200 while the **runtime** tick is fresh and 503 once it goes
-stale; `/readyz` flips to not-ready on drain so the pod leaves rotation. An idle
-daemon is healthy — liveness tracks the runtime, not whether work is flowing.
+[examples/docker](../examples/docker/) has a variant on
+`gcr.io/distroless/static-debian12:nonroot` that builds without TLS by
+default, for the loopback-sidecar setup described under [TLS](#tls).
 
-> **External channel.** The way other agents (and operators) reach this one is
-> **A2A** (`a2a.listen`, `--features a2a`) — an HTTPS listener with
-> trust minted per request by mTLS or a bearer token, resolved to a **principal**
-> and authorized against a role matrix. A non-loopback bind must authenticate
-> (`a2a.tls.client_ca` and/or `a2a.bearer`) and must be `https://`, and a
-> wildcard bind (`0.0.0.0`) must name the origin callers dial in `a2a.url`;
-> validation rejects each omission with exit `2`.
+Features are compiled in; no runtime flag adds one. A setting for a feature
+the binary lacks is refused at load rather than ignored: an `a2a.listen`,
+`webhooks.listen` or `a2a.peers` in a build without `a2a`, a CEL guard
+without `cel`, a trust pin without `sign`. Keep your configuration and your
+build in step. [Build features and crates](features.md) lists every feature
+and what it adds.
 
----
+### Where state lives in a container
 
-## 4. Scheduled by an external orchestrator (Kubernetes)
+A `file` store writes to a directory. In a container, choose where that
+directory lives on purpose:
 
-The orchestrator (a K8s operator, Knative, Nomad, a bare-metal supervisor) is
-**not part of this project**. agentd just honours a contract:
-config from env/flags, signal-driven drain, and a public exit-code table a
-`podFailurePolicy` can branch on. Below are the deploy shapes; runnable manifests
-live in [`examples/`](../examples/).
+- **The container's writable layer** survives a process restart in the same
+  pod but not a reschedule: a new pod starts with an empty layer. The
+  `scratch` image makes this easy to miss, since there is no shell to look
+  with.
+- **A mounted volume** at `store.file.path` makes durability the volume's
+  job. Use a PersistentVolumeClaim, and a StatefulSet's
+  `volumeClaimTemplates` when several pods each need their own.
+- **An `mcp` or `http` store** keeps state in a service, so the pod is
+  disposable. This is the only choice for a fleet.
 
-### The exit-code contract
+A file store has a single writer. A second process that opens the same
+directory exits 6 at startup, naming the holder:
 
-This table is a **stable, machine-actionable API** — author `podFailurePolicy`
-against it (the constants live in
-[`crates/agentd/src/exit.rs`](../crates/agentd/src/exit.rs)):
+```text
+store.file: /var/lib/agentd is locked by pid 1921605 — another agentd is using this state directory; give this instance its own agent.name or store.file.path
+```
 
-| Code | Meaning | Scheduler hint |
-|---|---|---|
-| `0` | success — one-shot done / clean bound / **clean SIGTERM drain** | Complete |
-| `1` | generic / unspecified failure | retriable |
-| `2` | config / usage error (validation failed) | **non-retriable** → `FailJob` |
-| `3` | partial result (useful output, some sub-tasks failed) | policy |
-| `4` | intelligence endpoint unreachable / auth after retries | retriable |
-| `5` | agentd ran correctly but the task **cannot** be done / refused | **non-retriable** |
-| `6` | a required MCP server failed to connect / handshake / died | retriable |
-| `7` | budget exceeded (steps / tokens / deadline / tree) | policy |
-| `124` | hard wall-clock deadline — a run past `limits.run.deadline` (mnemonic to `timeout(1)`) | policy |
-| `137` | killed by `SIGKILL` (OOM / kubelet) — OS-set | raise memory limit |
-| `143` | killed by `SIGTERM` **without** clean drain — OS-set | distinguishes ungraceful from `0` |
+agentd creates its directories `0700` and its files `0600`. Give the state
+volume to the uid the container runs as (`fsGroup: 65532` on Kubernetes).
 
-agentd never `exit(137)`/`exit(143)` itself — the kernel sets those when it
-kills the process. A clean drain returns `0`.
+With `readOnlyRootFilesystem: true`, the only paths agentd writes are the
+ones you name: the state directory, the health file if you set one, and the
+OAuth credential cache (`AGENTD_CRED_DIR`) if an endpoint uses
+`--login`. Mount each one; an `emptyDir` is enough for the last two. Set
+`store.file.path` explicitly in a container: the default chain may resolve
+to a path on the read-only root.
 
-### The top footgun: drain timeout < grace
+### TLS
 
-> **`AGENTD_DRAIN_TIMEOUT` (default 25s) MUST be `<`
-> `terminationGracePeriodSeconds` (default 30s).**
+The default build carries TLS with bundled root certificates, so agentd
+dials `https://` model, MCP and A2A endpoints directly. For a private CA, add
+it with `security.tls_ca` (`--tls-ca`); it is trusted beside the bundled
+roots on every outbound connection. A build with `--no-default-features`
+drops TLS and reaches HTTPS only through a TLS-terminating sidecar on a
+loopback `http://` port; any other plain `http://` endpoint is refused.
 
-If your drain budget is `>=` the pod's grace period, the kubelet sends
-`SIGKILL` **before** agentd finishes draining — you lose the clean exit (it
-becomes `137`/`143`), in-flight subagents are not wound down at turn boundaries,
-and a rolled `Deployment` shows failures instead of clean `0`s. Always keep the
-internal budget the **smaller** number, with headroom for the kill-ladder rung
-plus the log flush.
+## Deploy on Kubernetes
 
-agentd cannot see the pod's grace period, so nothing checks the pair for you —
-`lifecycle.drain_timeout` defaults to 25s precisely so the K8s default of 30s
-leaves headroom. Set both explicitly and keep the gap:
+The manifests below use the triage configuration above, mounted from a
+ConfigMap, and take secrets from a Secret as environment variables. The
+repository's [examples/k8s](../examples/k8s/) directory has runnable
+variants.
+
+### Map exit codes to a failure policy
+
+The exit code tells the Job controller whether a retry can help. Codes 2
+(configuration) and 5 (refused) never improve with a retry, so fail the Job
+on them and let everything else count against `backoffLimit`.
+[CLI, environment and exit codes](cli.md#exit-codes) gives the intent of
+every code.
 
 ```yaml
-spec:
-  terminationGracePeriodSeconds: 30   # kubelet grace
-  containers:
-    - name: agent
-      args: ["--drain-timeout", "25s", …]   # < 30s, with headroom
+# fragment: under the Job's spec:
+podFailurePolicy:
+  rules:
+    - action: FailJob
+      onExitCodes:
+        operator: In
+        values: [2, 5]
 ```
 
-### 4a. Job — run once
+A budget stop is exit 7 and a missed deadline exit 124. If either should not
+count as a failure for your Job, `--budget-exit-code 0` remaps 7 (and 3);
+nothing remaps 124.
 
-A **job** — the default lifecycle (`lifecycle.run_until: auto` with no listener
-and no long-lived start node); it runs to a terminal status and exits. Use
-`podFailurePolicy` to turn the exit-code table into retry decisions:
+### Job
 
 ```yaml
 apiVersion: batch/v1
@@ -464,38 +348,61 @@ spec:
   backoffLimit: 3
   podFailurePolicy:
     rules:
-      # Config / usage error and a deterministic refusal are operator bugs —
-      # never retry them.
       - action: FailJob
-        onExitCodes: { operator: In, values: [2, 5] }
+        onExitCodes:
+          operator: In
+          values: [2, 5]
   template:
     spec:
       restartPolicy: Never
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/example/agent:1.0.0
-          args:                          # a bare instruction = a `once` job
+          image: ghcr.io/agentd-dev/agentd:1.18.0
+          args:
             - --instruction.file
-            - /etc/agentd/task.txt
+            - /etc/agentd/task.md
             - --intelligence
-            - https://gw.example/v1
+            - https://api.openai.com/v1/chat/completions
+            - --model
+            - gpt-5.1
+            - --mcp
+            - incidents=https://mcp-incidents.internal/mcp
+            - --deadline
+            - 15m
           env:
-            - { name: AGENTD_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
-            - { name: AGENTD_LIFECYCLE_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
+            - name: AGENTD_INTELLIGENCE_TOKEN
+              valueFrom:
+                secretKeyRef: { name: openai, key: api-key }
+            - name: AGENTD_RUN_ID
+              valueFrom:
+                fieldRef: { fieldPath: "metadata.labels['batch.kubernetes.io/job-name']" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: task, mountPath: /etc/agentd, readOnly: true }
+      volumes:
+        - name: task
+          configMap: { name: agent-digest-task }
 ```
 
-Pin `AGENTD_LIFECYCLE_RUN_ID` (`--run-id` on the command
-line) to a stable per-unit-of-work value — e.g. derived from the
-Job name — so retries dedupe through your MCP backing services.
+`AGENTD_RUN_ID` takes the Job's name from the label Kubernetes puts on every
+Job pod, so every retry of one Job sends the same `agent/run_id` to its MCP
+servers.
+`restartPolicy: Never` is required for `podFailurePolicy`.
 
-### 4b. CronJob — on a schedule
+### CronJob
 
-Prefer an **external** `CronJob` firing a `once` job per tick over an in-agent
-`schedule` start node — it is more robust, more observable, and keeps the
-schedule in the system that already owns schedules. agentd's internal
-`schedule` node is a standalone convenience, not a calendar (no DST/missed-tick
-catch-up; UTC).
+A CronJob that starts a job per tick is the better scheduler for calendar
+work: it is observable, it lives where your other schedules live, and it
+handles missed ticks by policy. agentd's own `schedule` start runs in UTC and
+skips a missed occurrence rather than replaying it.
 
 ```yaml
 apiVersion: batch/v1
@@ -504,29 +411,52 @@ metadata:
   name: agent-nightly
 spec:
   schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
   jobTemplate:
     spec:
       backoffLimit: 2
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              operator: In
+              values: [2, 5]
       template:
         spec:
           restartPolicy: Never
-          terminationGracePeriodSeconds: 30
+          terminationGracePeriodSeconds: 35
           containers:
             - name: agent
-              image: ghcr.io/example/agent:1.0.0
+              image: ghcr.io/agentd-dev/agentd:1.18.0
               args:
                 - --instruction.file
-                - /etc/agentd/nightly.txt
+                - /etc/agentd/task.md
                 - --intelligence
-                - https://gw.example/v1
+                - https://api.openai.com/v1/chat/completions
+                - --model
+                - gpt-5.1
+              env:
+                - name: AGENTD_INTELLIGENCE_TOKEN
+                  valueFrom:
+                    secretKeyRef: { name: openai, key: api-key }
+                - name: AGENTD_RUN_ID
+                  valueFrom:
+                    fieldRef: { fieldPath: "metadata.labels['batch.kubernetes.io/job-name']" }
+              volumeMounts:
+                - { name: task, mountPath: /etc/agentd, readOnly: true }
+          volumes:
+            - name: task
+              configMap: { name: agent-nightly-task }
 ```
 
-### 4c. Deployment — a long-lived daemon
+Each tick creates a Job with a new name, so each tick gets its own run id.
 
-A long-lived Pod (`lifecycle.run_until: drained`) that idles on its triggers (an
-A2A listener, a `subscribe` start node) and survives rolls cleanly because a
-clean drain exits `0`. It mounts a config file (see §2, incl. a durable
-`store`).
+### Deployment
+
+One durable identity is one process, so a daemon with a `file` store runs as
+a single replica with the `Recreate` strategy. A rolling update would start
+the new pod while the outgoing pod still holds the store, and the new pod
+would exit 6.
 
 ```yaml
 apiVersion: apps/v1
@@ -535,222 +465,228 @@ metadata:
   name: agent-triage
 spec:
   replicas: 1
-  selector: { matchLabels: { app: agent-triage } }
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: agent-triage }
   template:
-    metadata: { labels: { app: agent-triage } }
+    metadata:
+      labels: { app: agent-triage }
     spec:
-      terminationGracePeriodSeconds: 30   # > --drain-timeout
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/example/agent:1.0.0
-          args:
-            - --config=/etc/agentd/triage.yaml   # the §2 daemon config (store + subscribe workflow)
-          volumeMounts:
-            # Only needed for store.kind: file — a state directory on the pod's
-            # writable layer would not survive this Deployment rescheduling the
-            # pod (§3). With store.kind: mcp|http, drop the mount and the volume.
-            - { name: state, mountPath: /var/lib/agentd }
+          image: ghcr.io/agentd-dev/agentd:1.18.0
+          args: ["--config", "/etc/agentd/agentd.yaml"]
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: openai, key: api-key }
+          ports:
+            - { name: probes, containerPort: 9090 }
           livenessProbe:
-            # The reactor heartbeats the health file; a wedged reactor goes stale.
-            exec: { command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/agent/health) )) -lt 30"] }
+            httpGet: { path: /healthz, port: probes }
             periodSeconds: 10
-          # If built/served with the HTTP health surface, use instead:
-          #   httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: probes }
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
           resources:
-            limits: { memory: "512Mi" }   # 137 on OOM → raise this
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/agentd, readOnly: true }
+            - { name: state, mountPath: /var/lib/agentd }
       volumes:
+        - name: config
+          configMap: { name: agent-triage-config }
         - name: state
           persistentVolumeClaim: { claimName: agent-triage-state }
 ```
 
-`replicas: 1` is not decoration here: one durable identity is one process. A
-rolling update briefly overlaps the old pod and the new one, so pair a `file`
-store with `strategy: { type: Recreate }` — where the two pods really do share
-one filesystem the adapter's `flock` catches it and the new pod exits at startup
-naming the holder's pid, and where they do not (two nodes, two layers) the new
-pod quietly starts on empty state, which is worse. With `mcp`/`http` the same
-overlap surfaces as the `seq`-CAS `Conflict` described in §4d.
+The ConfigMap `agent-triage-config` holds the triage configuration as
+`agentd.yaml`. Secrets stay out of it: the file carries only
+`{{secret:NAME}}` and `{{secret-file:PATH}}` references, resolved from the
+environment or a mounted Secret at load and at every reload.
 
-Note the liveness probe targets the **supervisor reactor**, not the agentic
-work — a subagent legitimately busy on a long tool call must not flip pod
-liveness. Set `resources.limits.memory` deliberately: aggregate subtree memory
-is a cgroup/pod concern, not enforced in-binary, so an OOM surfaces as `137`
-and means "raise the limit".
+Set `resources.limits.memory` deliberately. The pod's memory covers agentd
+and every child it spawns; an out-of-memory kill is exit 137 and means
+"raise the limit". `security.cgroup` can cap each child separately where the
+node delegates cgroups.
 
-### 4d. StatefulSet — a fleet
+### StatefulSet
 
-One `agentd` process is one durable agent **instance**, and its identity is
-baked into every durable key it writes: `<store.prefix>/<instance>/<kind>/<id>`.
-`instance` comes from `agent.name`, falling back to the downward-API pod name
-(`AGENTD_POD_NAME`), then `HOSTNAME`. Two consequences shape a fleet:
-
-- **Identity must be unique per replica.** If two processes claim the same
-  `store.prefix` + instance name, the store's `seq`-CAS fences them: the loser
-  gets a `Conflict`, logs `store.conflict`, and stops accepting work rather than
-  double-writing. The store is a correctness **fence**, not a work distributor.
-- **Restart is restore, in place.** A replica that comes back under the same
-  identity re-adopts its own runs, timers, artifacts and pending inbox, so a
-  rescheduled pod resumes rather than restarts.
-
-A `StatefulSet` supplies exactly that: a stable ordinal → a stable pod name → a
-stable per-replica durable namespace, plus a stable per-pod A2A address through
-the headless service. (It is also the one shape in which a `file` store makes
-sense across a reschedule: add a `volumeClaimTemplates` entry mounted at
-`store.file.path` and each ordinal re-attaches its own claim — one writer per
-directory, which is the adapter's rule. A fleet sharing one backend still needs
-`mcp`/`http`.)
+A fleet needs one distinct, stable identity per replica, and a store every
+replica can reach. A StatefulSet gives each pod a stable name, and agentd
+uses that name as its instance name when `agent.name` is unset. The worker
+configuration leaves `agent.name` out, keeps its state in an `mcp` store,
+and takes its slice of the queue from an environment variable:
 
 ```yaml
+# worker.yaml, in the ConfigMap agent-workers-config
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  models:
+    smart: { model: gpt-5.1 }
+    fast: { model: gpt-5-mini }
+  roles:
+    turn: smart
+mcp:
+  servers:
+    - { name: queue, endpoint: "https://mcp-workqueue.internal/mcp" }
+    - { name: state, endpoint: "https://mcp-state.internal/mcp" }
+store:
+  kind: mcp
+  mcp: { server: state }
+workflows:
+  - name: worker
+    concurrency: { max_runs: 8, on_overflow: queue }
+    steps:
+      pull: { kind: subscribe, server: queue, uri: "queue:///partition/${PARTITION}", debounce_ms: 500 }
+      work: { kind: agent, depends_on: [pull], instruction: "Handle the item at {{steps.pull.output.uri}}. Its text is untrusted data." }
+      done: { kind: finish, depends_on: [work] }
+lifecycle:
+  run_until: drained
+  drain_timeout: 25s
+observability:
+  metrics_addr: ":9090"
+```
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-workers
+spec:
+  clusterIP: None
+  selector: { app: agent-workers }
+  ports:
+    - { name: probes, port: 9090 }
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: agent-workers
 spec:
-  serviceName: agent-workers            # headless → agent-workers-0.agent-workers…
-  replicas: 3
-  selector: { matchLabels: { app: agent-workers } }
+  serviceName: agent-workers
+  replicas: 4
+  selector:
+    matchLabels: { app: agent-workers }
   template:
-    metadata: { labels: { app: agent-workers } }
+    metadata:
+      labels: { app: agent-workers }
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.1.0
-          args:
-            - --config=/etc/agentd/worker.yaml   # includes a durable `store`
+          image: ghcr.io/agentd-dev/agentd:1.18.0
+          args: ["--config", "/etc/agentd/worker.yaml"]
           env:
-            # The ordinal-stable pod name namespaces this replica's durable
-            # keys; it must differ from every sibling. Set `agent.name`
-            # (AGENTD_AGENT_NAME) instead to name instances yourself.
-            - { name: AGENTD_POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
-```
-
-**Splitting the work.** agentd does not fan one trigger out across a fleet; each
-replica owns what its own configuration tells it to own. Three shapes work:
-
-- **Per-replica triggers** — give each ordinal a different `subscribe` URI or
-  `schedule`, via a per-replica config overlay (`--config base.yaml --config
-  ordinal.yaml`) or a value templated from the pod name. Nothing overlaps, so
-  nothing needs arbitration.
-- **A queue in front** — point every replica at a backing MCP server that hands
-  out items exclusively (a lease or claim tool on the server side). The server
-  arbitrates ownership; agentd stamps every outbound `tools/call` with `_meta`
-  carrying `agent/run_id`, `agent/instance` and a per-call
-  `agent/idempotency_key`, so a redelivered item collapses to one effect on a
-  server that honours them.
-- **A dispatcher** — one instance holds the trigger and delegates units of work
-  to named peers with an `a2a.delegate` step (`{kind: a2a.delegate, peer, objective}`,
-  resolved against `a2a.peers`), each peer a worker replica. Delegation is a
-  durable step, so an unfinished unit stays visible and retriable.
-
-**There is no shard identity.** agentd carries no cluster-coordination surface —
-no shard flag, no claim route, no standby pool. Ownership comes from one of the
-three shapes above, all of which put it in a system that can arbitrate it. See
-[scaling.md §4](scaling.md).
-
-### 4e. Hot reload via a ConfigMap (`hot-reload` / `config-watch` features)
-
-A daemon can apply a new **reloadable** config subset without a restart
-([`configuration.md`](configuration.md) carries the full
-reloadable-vs-restart-only partition). Mount the config file from a ConfigMap and
-either send `SIGHUP` or run `--watch-config`:
-
-- **`--watch-config`** (`config-watch` feature) arms an `inotify` watch on the
-  config file's directory. A `kubectl apply` of the ConfigMap is an atomic
-  volume-symlink swap, which the watch sees — agentd re-reads, **validates**, and
-  applies the reloadable subset in place: the intelligence endpoint list, model,
-  token and budget; the instruction; `agent.*` behaviour; the MCP server set (a
-  live re-handshake — removed servers disconnect, added servers connect and
-  re-subscribe); tool overrides; skills; workflow definitions; and
-  limits / observability / context. An invalid candidate keeps the running
-  config — nothing is half-applied. A diff that touches a **restart-only** path
-  (`agent.name`, the `store.*` binding, `lifecycle.*`,
-  `a2a.listen`/`url`/`tls`/`bearer`/`device_grant`/`events`, the `observability`
-  listeners, `security`) is **refused** with
-  `reason="restart_required"` and logged as `config.reload.restart_required` —
-  roll the pod.
-- **`SIGHUP`** (`hot-reload` feature) is the portable trigger if you would rather
-  signal than watch: `kubectl exec … -- kill -HUP 1`, or an operator that signals
-  after editing the ConfigMap.
-
-```yaml
-spec:
-  template:
-    spec:
-      containers:
-        - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.1.0   # built with config-watch
-          args:
-            - --config=/etc/agentd/config.json      # mounted from the ConfigMap
-            - --watch-config                        # reload on a ConfigMap update
-            - --instruction.file                    # only `--config` takes the `=` form
-            - /etc/agentd/task.txt
-            - --metrics-addr
-            - ":9090"
-            - --drain-timeout
-            - 25s
+            - name: AGENTD_POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: PARTITION
+              valueFrom:
+                fieldRef: { fieldPath: "metadata.labels['apps.kubernetes.io/pod-index']" }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: openai, key: api-key }
+          ports:
+            - { name: probes, containerPort: 9090 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: probes }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: probes }
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: config, mountPath: /etc/agentd, readOnly: true }
       volumes:
         - name: config
-          configMap: { name: agent-config }        # holds config.json (+ task.txt)
+          configMap: { name: agent-workers-config }
 ```
 
-Secrets never live in the ConfigMap: the file carries only structural config and
-`{{secret:NAME}}` / `{{secret-file:PATH}}` references, resolved from env vars or
-mounted Secret files at load/reload ([`configuration.md`](configuration.md)).
+- `AGENTD_POD_NAME` (`agent-workers-0`, `agent-workers-1`, …) becomes the
+  instance name, which namespaces every key the replica writes. A replica
+  that restarts under the same name resumes its own runs.
+- `PARTITION` comes from the pod-index label Kubernetes 1.28 and later put
+  on StatefulSet pods, and `${PARTITION}` in the file expands at load. An
+  unset variable is exit 2, so a missing label fails loudly.
+- Two processes that end up with the same identity are fenced by the store:
+  the loser logs `store.conflict` and stops writing.
 
-### Management over HTTPS
+For a fleet with a `file` store per replica instead, add a
+`volumeClaimTemplates` entry mounted at `store.file.path`; each ordinal
+re-attaches its own claim. [Scale out](scaling.md) covers how to split the
+work so that replicas never process the same item.
 
-The **A2A listener** (`a2a.listen`, `--features a2a`) is also the management
-transport. Over it an operator issues the admin family as command ops — `admin.drain`,
-`admin.pause`, `admin.resume`, `admin.cancel`, `admin.set` — and the read
-commands `status` and `config` (the effective merged document, with secret
-references left unresolved). Workflow control rides the same channel:
-`workflow.run` / `workflow.status` / `workflow.cancel` / `workflow.signal`.
-Each is a `SendMessage` DataPart of agentd's [command
-extension](https://agentd.dev/a2a/ext/command), sent with `A2A-Version: 1.0`,
-the extension's URI in the `A2A-Extensions` header and in
-`message.extensions` ([operations.md](operations.md#2-the-operator-admin-ops)).
+### Reload configuration from a ConfigMap
 
-Trust is minted per request, never by the transport: **mutual TLS**
-(`a2a.tls.cert` / `.key` / `.client_ca`) or a **bearer token** (`a2a.bearer`),
-resolved to a principal (`a2a.principals`) and authorized against a role matrix —
-admin commands are operator-only. A non-loopback bind that configures no client
-auth is a startup error (exit `2`), so there is no open control plane. The
-controller that issues these calls, signals reloads, and reads status is
-**external** and not part of agentd; it presents a client cert or bearer and
-agentd honours the authenticated-identity contract.
+With `lifecycle.watch_config: true`, agentd watches the directory of each
+configuration file. Applying a new ConfigMap swaps the mounted files
+atomically; agentd sees the swap, validates the new file and applies the
+reloadable settings in place. An invalid file changes nothing
+(`config.reload.invalid`), and a change to a restart-only setting is refused
+(`config.reload.restart_required`): roll the pod for those.
+[Operate a running daemon](operations.md#reload-configuration) lists both
+sets.
 
----
+A ConfigMap mounted with `subPath` is not updated by the kubelet; mount the
+whole ConfigMap as a directory. `SIGHUP` reloads too, but the `scratch`
+image has no `kill` binary to send it with from inside the pod, so the file
+watch is the Kubernetes path.
 
-## Runnable manifests
+### Probes that work on a scratch image
 
-See [`examples/k8s/`](../examples/k8s/) for the manifests above as standalone
-files:
+The image has no shell, so `exec` probes cannot run. Serve the HTTP probes
+with `observability.metrics_addr: ":9090"` and point the kubelet at them:
 
-- `examples/k8s/job-once.yaml` — one-shot `Job` with `podFailurePolicy`
-- `examples/k8s/cronjob-schedule.yaml` — scheduled `CronJob`
-- `examples/k8s/deployment-reactive.yaml` — daemon `Deployment` with HTTP probes
-- `Dockerfile` (repo root) — the static-on-scratch image of §3
-- `examples/docker/Dockerfile` — the distroless, `--no-default-features`
-  variant for the TLS-free loopback-sidecar posture
-- `examples/systemd-agentd.service` — daemon systemd unit
+| Probe | Path | Fails when |
+|---|---|---|
+| liveness | `/healthz` | the supervisor's event loop has not ticked for 5 s, or a drain is under way |
+| readiness | `/readyz` | the instance is draining, or every model endpoint is reported down |
 
----
+An idle daemon is healthy: liveness tracks the supervisor, not whether work
+is flowing, and a child stuck on a long tool call never fails it. The health
+file (`--health-file`) is for hosts where a checker can read files; on
+`scratch`, nothing can. [Monitor in production](observability.md#probe-health)
+explains each signal.
 
-## See also
+## Manage it over A2A
 
-- [`docs/configuration.md`](configuration.md): the **complete** path/flag/env
-  reference, the config-file schema, and the reloadable-vs-restart-only
-  partition.
-- [`docs/modes-and-triggers.md`](modes-and-triggers.md): the lifecycle shapes and
-  every start node — which trigger fires runs, and when the process exits.
-- [`docs/operations.md`](operations.md): the A2A control commands, hot reload,
-  and the capabilities manifest from the operator's side.
-- [`docs/scaling.md`](scaling.md): partitioning work across replicas, durable
-  identity per replica, and the metrics an autoscaler reads.
-- [`docs/observability.md`](observability.md): the event schema behind the
-  NDJSON lines above, the metrics surface, and the health endpoints.
-- [`docs/intelligence.md`](intelligence.md): the endpoint list, per-endpoint
-  credentials, failover, and `--model-swap`.
+The A2A listener (`a2a.listen`) is also the management channel: drain,
+pause, resume, cancel, read status and the effective configuration. A
+non-loopback listener must authenticate its callers (mutual TLS, a bearer
+token, or both) and must use `https://`; a wildcard bind must name the
+address callers use in `a2a.url`. Validation refuses each omission with exit
+2, so there is no open control plane. The controller that issues these calls
+is yours; agentd honours the authenticated identity it presents.
+[Operate a running daemon](operations.md) has every request, and
+[Harden a deployment](harden.md) the listener settings.
+
+## Next steps
+
+- [Operate a running daemon](operations.md): drain, pause and reload in
+  practice.
+- [Monitor in production](observability.md): logs, metrics and alerts.
+- [Scale out](scaling.md): split work across replicas.
+- [CLI, environment and exit codes](cli.md): every flag and exit code.

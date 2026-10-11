@@ -58,7 +58,7 @@ endpoint. So every sample needs two things wired:
    config file, and is redacted everywhere agentd logs:
 
    ```bash
-   export AGENTD_INTELLIGENCE=https://gw.example/v1
+   export AGENTD_INTELLIGENCE=https://gw.example/v1/chat/completions
    export AGENTD_INTELLIGENCE_TOKEN=...        # or --intelligence-token
    ```
 
@@ -154,7 +154,7 @@ Run an instruction to a terminal status, then exit. This is the Job / CLI shape:
 result on stdout, telemetry on stderr, no daemon, no served surface.
 
 ```bash
-export AGENTD_INTELLIGENCE=https://gw.example/v1
+export AGENTD_INTELLIGENCE=https://gw.example/v1/chat/completions
 export AGENTD_INTELLIGENCE_TOKEN=...
 ./run-once.sh
 ```
@@ -191,7 +191,7 @@ drain signal (`SIGTERM`) or a fatal/limit class stops it. Deploy it as a
 long-lived Deployment.
 
 ```bash
-export AGENTD_INTELLIGENCE=https://gw.example/v1
+export AGENTD_INTELLIGENCE=https://gw.example/v1/chat/completions
 export AGENTD_INTELLIGENCE_TOKEN=...
 ./run-reactive.sh
 ```
@@ -254,7 +254,7 @@ after which the node re-arms on its backoff. The Job-with-deadline / Deployment
 shape.
 
 ```bash
-export AGENTD_INTELLIGENCE=https://gw.example/v1
+export AGENTD_INTELLIGENCE=https://gw.example/v1/chat/completions
 export AGENTD_INTELLIGENCE_TOKEN=...
 ./run-loop.sh
 ```

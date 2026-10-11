@@ -20,8 +20,8 @@
 //!   that kind.
 //!
 //! The check is positive: it asks whether a name is one agentd serves, never
-//! whether it is on a list of names that went away. History — `CHANGELOG.md`,
-//! `rfcs/`, `docs/design/` — is not scanned; it records what was.
+//! whether it is on a list of names that went away. History — `CHANGELOG.md`
+//! and `rfcs/` — is not scanned; it records what was.
 
 use agentd::engine::model::kind_info;
 use agentd::runtime::surface::launch::{LAUNCH_CONTRACT, LAUNCH_GRANT_TYPE};
@@ -582,7 +582,53 @@ fn node_tables_name_only_fields_the_kind_accepts() {
     let mut rows = 0;
     // The header of the table the previous line belongs to, if any.
     let mut header: Option<(String, Vec<String>)> = None;
+    // The node reference's entry form: a `### `kind`` heading, then a
+    // `- **Fields:** `a`, `b`` bullet (which may wrap onto indented lines).
+    let mut entry: Option<(String, &'static agentd::engine::model::KindInfo)> = None;
+    // Every kind a node entry or a node-table row describes.
+    let mut covered: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut fields: Option<(String, usize, String)> = None;
+    let check_entry = |found: &mut Vec<String>,
+                       kind: &agentd::engine::model::KindInfo,
+                       file: &str,
+                       n: usize,
+                       text: &str| {
+        for f in listed_fields(text) {
+            if !kind.fields.contains(&f.as_str()) {
+                found.push(format!(
+                    "{file}:{n}: `{}` has no field `{f}` (it takes: {})",
+                    kind.name,
+                    kind.fields.join(", ")
+                ));
+            }
+        }
+    };
     for (file, n, line) in scanned_lines() {
+        if let Some((ff, fnum, text)) = fields.take() {
+            if ff == file && line.starts_with("  ") && !line.trim().is_empty() {
+                fields = Some((ff, fnum, format!("{text} {}", line.trim())));
+                continue;
+            }
+            if let Some((ef, kind)) = entry.as_ref().filter(|(ef, _)| *ef == ff) {
+                check_entry(&mut found, kind, ef, fnum, &text);
+                rows += 1;
+                seen.insert(ff.clone());
+                covered.insert(kind.name);
+            }
+        }
+        if let Some(name) = line.strip_prefix("### `").and_then(|r| r.strip_suffix('`')) {
+            entry = kind_info(name).map(|k| (file.clone(), k));
+            continue;
+        }
+        if line.starts_with('#') {
+            entry = None;
+        }
+        if let Some(rest) = line.strip_prefix("- **Fields:**")
+            && entry.as_ref().is_some_and(|(ef, _)| *ef == file)
+        {
+            fields = Some((file.clone(), n, rest.to_string()));
+            continue;
+        }
         let Some(cells) = table_cells(&line) else {
             header = None;
             continue;
@@ -616,6 +662,7 @@ fn node_tables_name_only_fields_the_kind_accepts() {
         }
         rows += 1;
         seen.insert(file.clone());
+        covered.extend(infos.iter().map(|i| i.name));
         let mut takes: Vec<&str> = infos
             .iter()
             .flat_map(|i| i.fields.iter().copied())
@@ -638,15 +685,18 @@ fn node_tables_name_only_fields_the_kind_accepts() {
         }
     }
     // The scan must reach the catalogue's own pages, or it proves nothing.
-    for page in [
-        "docs/node-registry.md",
-        "docs/workflows.md",
-        "docs/configuration.md",
-        "web/public/llms.txt",
-    ] {
+    for page in ["docs/node-registry.md", "web/public/llms.txt"] {
         assert!(seen.contains(page), "no node table read in {page}");
     }
-    assert!(rows > 100, "only {rows} node-table rows read");
+    // …and describe every kind the engine implements.
+    let missing: Vec<&str> = agentd::engine::model::implemented_kinds()
+        .into_iter()
+        .filter(|k| !covered.contains(k))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "kinds no node entry or table describes ({rows} read): {missing:?}"
+    );
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 

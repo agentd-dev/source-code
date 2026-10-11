@@ -1,471 +1,396 @@
-# Subagents: delegation as a process tree
+# Subagents and delegation
 
-The context window is the scarcest resource an agent has. "Which of these 300
-files still call the deprecated auth path?" is answerable, but answering it in
-the parent's window means paying for 300 file reads the parent will never need
-again — and carrying them for the rest of the run.
+A subagent is a separate agentd process that the agent starts to do one
+bounded piece of work and return a short answer. This page explains why
+delegation in agentd is a process tree, what crosses the boundary between
+parent and child, how a child lives, ends and restarts, and how the instance
+tier runs a whole child daemon. It is for reviewers who need the model and
+for builders who want to know what they are configuring; the task guide is
+[Delegate to subagents](delegate-subagents.md).
 
-A subagent buys the answer without the receipts. It is a separate OS process that
-reads the 300 files into its *own* window and hands back a distilled value,
-capped at 8,000 bytes for a string result and 400 characters for the note
-appended to the root context. The search happened; the transcript of it did not.
+## Why delegation is a process
 
-That trade — pay for the exploration once, keep the distillate — is the reason to
-reach for `subagent.run`. Two more wins come with it.
+The context window is the scarcest resource an agent has. "Which of these
+300 files call the auth helper without a timeout?" has an answer, but
+finding it in the agent's own window means paying for 300 file reads the
+agent never needs again, and carrying them for the rest of the run.
 
-**An injection firewall.** No protocol path carries a subagent's transcript
-upward, and no payload field carries the parent's transcript down. Raw untrusted
-bytes never reach a parent holding sensitive or egress-capable tools, and the
-child's grant is checked against the lethal trifecta before it is allowed to
-exist.
+A subagent buys the answer without the receipts. It reads the 300 files into
+its own window and hands back a distilled value: at most 8,000 bytes for a
+string result, and 400 characters for the note the agent's conversation may
+receive. The search happened; its transcript stays in the child. Two more
+properties come with the process boundary.
 
-**Blast radius.** A subagent is a process: its own process group, memory, MCP
-connections, step/token/deadline budget, and where cgroups exist its own cgroup
-leaf. `killpg` on it is instant and total. A wedged child costs you a child, not
-the daemon.
+**An injection firewall.** No protocol path carries a child's transcript up
+to the parent, and nothing hands the parent's transcript down: the child
+starts from what the caller chose to pass. Before a child exists, its
+narrowed set of MCP servers is checked against the lethal trifecta (untrusted
+input, sensitive data and egress in one agent), and a child's result is
+withheld from a reader that holds both sensitive and egress tools when the
+child may carry outside input. [Security model](security.md) explains both
+checks.
 
-## The shape: one flat generation of children
+**A bounded blast radius.** A subagent has its own process group, memory, MCP
+connections and step, token and deadline budget, optional kernel limits, and,
+where cgroups are configured, its own cgroup leaf. Killing its process group
+is instant and total. A wedged child costs you a child, not the daemon.
 
-There is one artifact. `agentd` re-execs itself to make a child, setting
-`AGENTD_SUBAGENT=1`; the re-exec'd process sees that marker and runs the subagent
-entry point instead of the daemon.
+The price is that delegation is lossy by construction, and a child is one
+bounded agent loop, not a durable pipeline. When the parent needs the raw
+material, or the work is a sequence with retries and waits, a subagent is
+the wrong tool; the guide's [when not to delegate](delegate-subagents.md)
+section lists the cases.
 
-The runtime tree is **flat**. Every child — a turn worker, a `think` worker, a
-subagent — is a direct child of the reactor, keyed by a node id in one map. There
-is no nesting between children and no supervision hierarchy to walk.
+## One flat generation of children
+
+agentd ships as one binary. To make a child it re-executes itself with
+`AGENTD_SUBAGENT=1` set, and the new process runs the subagent entry point
+instead of the daemon. The supervisor, called the reactor, owns the
+configuration, the credentials, the durable store and the process table, and
+runs no agent loop. Every agent loop runs in a child: a turn worker for a
+conversation's turn, a think child for preflight, compaction, `think` and
+`decide`, or a subagent. The supervisor's only model calls are the goal check
+and the approval judge, made on threads of its own with no tools.
+
+The tree is flat. Every child is a direct child of the reactor, keyed by a
+node id in one table, so there is no supervision hierarchy to walk.
 
 ```mermaid
 flowchart TB
-    R["agentd reactor<br/>owns config, MCP specs, the durable store,<br/>and the process table — carries no LLM"]
-    R --> W["turn worker<br/>role: Turn"]
-    R --> K["think worker<br/>role: Turn"]
-    R --> A["subagent sub-3<br/>role: Agent, depth 1"]
-    R --> B["subagent sub-4<br/>role: Agent, depth 1"]
-    A --> A1["own process group<br/>PDEATHSIG = SIGKILL<br/>own MCP connections<br/>own steps/tokens/deadline"]
-    B --> B1["own process group<br/>PDEATHSIG = SIGKILL<br/>own MCP connections<br/>own steps/tokens/deadline"]
+    R["agentd reactor<br/>config, store, process table<br/>runs no agent loop"]
+    R -- "runs a turn" --> W["turn worker"]
+    R -- "think, decide" --> K["think child"]
+    W -. "tool call subagent.run" .-> R
+    R -- "spawns, depth 1" --> A["subagent sub-3"]
+    R -- "spawns, depth 1" --> B["subagent sub-4"]
+    A -- "own connections" --> M[("granted MCP servers")]
+    A -- "own connection" --> L[("model provider")]
+    B -- "own connections" --> M
 ```
 
-The reactor never runs a model; all intelligence lives in children. That is why a
-subagent carries a full copy of the intelligence config, and why its stdout is a
-binary control channel rather than logs — stderr is inherited into the daemon's,
-so child telemetry is not captured or re-routed.
+So when a turn worker calls `subagent.run`, it asks the reactor for a
+sibling, not a descendant: the caller does not own the child process. Each
+of these children sets `PR_SET_PDEATHSIG(SIGKILL)` as its first act, and one
+whose parent died during the fork notices (`getppid() == 1`) and exits, so a
+dead daemon takes its children with it. A child's stdout is a binary control
+channel to the reactor, and its stderr is inherited into the daemon's log.
 
-So a `subagent.run` issued *by* a turn worker asks the reactor for a **sibling**,
-not a descendant: the caller does not own the child. A child orphaned mid-fork
-detects it (`getppid() == 1`) and exits, and every child arms
-`PR_SET_PDEATHSIG(SIGKILL)` first thing, so a dead daemon collapses its children.
+## What the child is handed
 
-## The spawn
+The spawn payload is the whole trust boundary. It travels as the first
+control frame on the child's stdin, never in argv (readable by anyone through
+`/proc`) and never in the environment.
 
-`subagent.run` lands in one chokepoint in the reactor and passes an ordered gate
-chain before any process exists. Every gate returns an **error tool result** — a
-value the model reads and adapts to — never an exception, never a crash.
+| The child gets | How it is decided |
+|---|---|
+| Its instruction | The caller's `instruction`, or a template's text with its parameters folded in |
+| A seed transcript | Only the `context` messages the caller passed; empty by default |
+| MCP servers | The `servers` the caller named, from the parent's configured set; every parent server when `servers` is omitted |
+| A tool grant | The `tools` patterns, minted by the supervisor and enforced by the child over its catalogue and its dispatch |
+| An output contract | `output_contract` prose, or `output_schema` folded into that prose as text |
+| A model | The template's `model`, else `subagents.defaults.model`, else the agent's turn model, resolved to a connection with a live credential |
+| Budgets | Steps, tokens and a deadline, plus optional memory and CPU limits and a priority |
 
-| # | Gate | Refused when | Default |
-|---|---|---|---|
-| 1 | `instruction` | empty or whitespace | — |
-| 2 | `mode` | not `sync` / `async` / `detached` / `warm` | `sync` |
-| 3 | breadth | live (non-terminal) subagents ≥ `limits.subagents.breadth` | 8 |
-| 4 | total | records in the registry ≥ `limits.subagents.total` | 64 |
-| 5 | depth | requester depth ≥ `limits.subagents.depth` | 3 |
-| 6 | rate | spawn-rate bucket empty (`limits.subagents.rate`) | `8/2s` |
-| 7 | pressure | resource pressure is shedding (disk headroom below `store.file.min_free`, or cgroup memory) — and at **warn** already, when the spawn declares `priority: low` | — |
-| 8 | trifecta | the narrowed servers carry untrusted-input **and** sensitive **and** egress tags | refuse unless `security.allow_trifecta` |
-| 9 | caps | `limits.memory` / `limits.cpu` / `priority` malformed | — |
+The tool grant can only narrow. A caller cannot forge or widen it through
+`context`, because the supervisor's mint replaces any grant already in the
+seed, and a grant the child cannot parse narrows to nothing rather than to
+everything. An excluded tool is unreachable, not merely unadvertised.
 
-Only then does the reactor mint a handle (`sub-<n>`), build the payload, stage a
-`subagent/<handle>` record at status `spawned`, and fork. The durable write lands
-on the far side of the fork: a successful fork flips the record to `running` and
-persists it straight away, so a restart finds a live child to re-spawn. A crash
-inside the fork window itself leaves nothing behind — there is no record to
-restore, and the half-born child collapses on its own.
+What the child does not get matters as much:
 
-The fork sets `setpgid(0,0)`, registers the pid with the global reaper
-atomically, and retries `EAGAIN` ten times with a rising backoff so a wide
-fan-out under process pressure does not fail spuriously. The payload goes down as
-the **first control frame on the child's stdin** — not argv, which is
-world-readable through `/proc`, and not the environment.
+- **No agentd built-in tools.** The child's catalogue is the tools of its
+  granted MCP servers, any code-registered tools of an embedding build, and
+  `resource.read` when those servers expose resources. It has no
+  `subagent.*`, `workflow.*`, `memory.*` or `a2a.*` tools, so it cannot
+  delegate onward.
+- **No A2A peers and no agent identity.** Both are empty on spawn, so a child
+  cannot reach another agent and does not sign requests under the AAuth
+  identity.
+- **No stored credential.** The durable record keeps the model reference, not
+  the resolved connection; a restore resolves the model again.
 
-### What the child is handed
+> **Limit.** The child connects to its servers itself, and the server
+> description it receives carries the connection but not the parent's
+> per-server tool filters (`mcp.servers[].allow` and `exclude`) or the `ns`
+> prefix. The child sees every tool the server advertises, under the server's
+> own names. Use the spawn's `tools` grant to cut tools a child must not
+> reach, and write its patterns against the names the server advertises.
 
-The payload is the whole trust boundary. Four fields matter most.
+Two calls still come back to the supervisor. With `security.policies` set,
+the supervisor names every tool of the child's servers that a policy rule
+could touch, and the child sends those calls up instead of making them, so
+the rule (and any approval it asks for) applies to the child too. An MCP
+server's elicitation request reaches the operator the same way.
 
-**`context`** is the child's entire transcript seed: `{role, content}` messages
-the parent chose to pass, empty by default. No code path hands a subagent the
-parent's transcript.
+A child acts for whoever spawned it: its records carry the spawning
+principal, and a tool call that names a handle (`subagent.status`,
+`subagent.kill` and the rest) acts only for that handle's owner. Another
+principal's handle reads as unknown.
 
-**`servers`** selects which of the parent's MCP servers the child connects to.
-This is the narrowing that actually bites — but note the default: **omitting
-`servers` inherits every server the parent has.** Narrowing is opt-in. A name
-matching no configured server is silently dropped, so a typo yields a quieter
-subagent rather than an error. A granted server the child cannot reach within
-60 s is fatal for the child.
+## One chokepoint for every spawn
 
-**`tools`** is a per-call allow-list that narrows *within* the granted servers,
-and it can only ever narrow. The supervisor mints it into the payload and the
-child enforces it, filtering both its tool catalogue and its dispatch routing —
-so an excluded tool is unreachable, not merely unadvertised. Patterns are the
-registry's (`*`, an exact name, `prefix*`). A caller-supplied `context` array
-cannot forge or widen a grant, because the supervisor's mint replaces any
-marker already in the seed, and a grant the child cannot parse narrows to
-nothing rather than to everything. Use `servers` to choose which servers the
-child reaches and `tools` to cut individual tools inside them.
+Every `subagent.run`, from the agent's turn or from a workflow step, lands in
+one function in the reactor and passes ordered gates before any process
+exists: a non-empty instruction, a valid mode, live breadth, lifetime total,
+delegation depth, the spawn rate, resource pressure, the trifecta check over
+the narrowed servers, and well-formed memory, CPU and priority values (a
+`priority: low` spawn is shed one pressure level early). Each refusal is a
+tool result the model reads and can adapt to, or a failed step in a
+workflow, never a crash.
+[Supervision and containment](harness.md) describes the gates and the
+pressure signals.
 
-**`output_contract`** is prose appended to the child's brief. Pass
-`output_schema` instead and it is folded textually into that contract ("Reply
-with ONLY one JSON object matching this JSON Schema: …") — it is *not* validated
-for an agent-role subagent. If shape matters, state it in `output_contract` and
-check the result yourself.
+Depth is minted, never claimed. The reactor reads the requester's depth from
+its stored record and gives the child that depth plus one, so a child cannot
+claim to be shallower than it is. In practice depth stops at 1: a child is
+offered no `subagent.*` tool, and the `limits.subagents.depth` cap is the
+backstop behind that.
 
-The child also gets `tls_ca` and a live intelligence bearer token. It does **not**
-get A2A peers or the AAuth identity — both are hardcoded empty on spawn — so it
-cannot delegate onward over A2A and does not sign under the tree identity. It has
-**no internal self-tools at all**: its surface is the tools of its granted MCP
-servers, plus `resource.read` when those servers expose resources.
+Only after the gates does the reactor mint a handle (`sub-<n>`), stage a
+`subagent/<handle>` record, and fork. A successful fork marks the record
+`running` and persists it at once, so a restart finds a child to re-spawn. A
+crash inside the fork window leaves no record, and the half-born child
+collapses on its own.
 
-## Resource allocation — what a parent can cap
+## Four modes
 
-The `limits` a spawn declares are two different kinds of cap, and both are real:
-
-```yaml
-kind: subagent
-instruction: churn through the archive
-priority: low                       # sheds first under pressure; runs at nice +10
-limits:
-  steps: 40                         # protocol budget: the child's loop refuses step 41
-  tokens: 200000                    #   …and counts every model call against this
-  deadline: 10m                     #   …and arms its own wall-clock deadline
-  memory: 512MB                     # OS cap: RLIMIT_AS, set between fork and exec
-  cpu: 5m                           # OS cap: RLIMIT_CPU — SIGXCPU at 5m, SIGKILL 5s later
-```
-
-`steps`/`tokens`/`deadline` are **protocol budgets** — enforced by the child's
-own loop and audited by the supervisor. `memory`/`cpu` are **kernel caps** —
-`setrlimit` between fork and exec, so a child that misbehaves (a runaway
-allocation in a tool, a spin) is stopped by the OS even if its loop never gets
-the chance. `priority` maps to niceness (`low` → +10, `high` → −5 best-effort;
-raising needs `CAP_SYS_NICE` and is skipped silently without it) — so under CPU
-contention the kernel itself favours the important child — and to admission:
-`low` spawns shed one pressure level early (at warn). Verify caps landed with
-`/proc/<pid>/limits`; the `subagent.spawn` event logs the pid and the applied
-values.
-
-## Depth and breadth in practice
-
-Depth is minted, never claimed. The supervisor reads the requester's depth from
-the requester's stored record and checks *that*; the child's payload gets it plus
-one. A root caller is depth 0, so its children are depth 1.
-
-In a default build, **depth beyond 1 is unreachable**, for two independent
-reasons: `subagent.*` is granted to the root context and to workflows but not to
-subagents, and an agent-role child has no self-tools to call it with. The depth
-cap is a backstop for operators who deliberately re-grant `subagent.run`.
-
-Breadth counts *live* subagents and is the one you will meet. Total counts
-**every record in the registry**, finished and restored included — so a
-long-lived daemon eventually refuses on `limits.subagents.total` with nothing
-running. Raise it for daemons.
-
-```yaml
-limits:
-  run:                       # inherited by each subagent unless the call overrides
-    steps: 500
-    tokens: 2000000
-    deadline: 1h
-  subagents:
-    depth: 1
-    breadth: 4
-    total: 500
-    rate: "4/1s"             # burst 4, refilling 4 tokens/sec
-```
-
-The bucket refills lazily from wall clock at admission, so a tight churn loop is
-refused while the absolute counts are still fine. One caveat: `rate` is read once
-at the first spawn of the process lifetime; a config reload does not change it.
-
-## Warm and one-shot
-
-| Mode | Child runs | Caller gets |
+| Mode | The child runs | The caller gets |
 |---|---|---|
-| `sync` | one bounded turn — a whole ReAct loop, up to `steps` — then exits | the result when it lands (the call is parked, not blocking) |
-| `async` | the same single turn | the handle now; `subagent.await` collects |
-| `detached` | the same single turn | the handle now; nobody waits |
-| `warm` | stays alive, one turn per message | the handle now; `subagent.send` steers it |
+| `sync` | One bounded agent loop, up to its step budget, then exits | The result when it lands; the call parks without blocking the reactor |
+| `async` | The same single loop | A handle at once; `subagent.await` or a workflow `wait` collects |
+| `detached` | The same single loop | A handle at once; nobody waits, and a restart does not revive it |
+| `warm` | Stays alive and runs one turn per message | A handle at once; `subagent.send` steers it |
 
-A **warm** subagent prepares its session once, runs its instruction as the first
-turn, then runs one turn per message injected with `subagent.send`. Messages
-arrive on the child's control thread and queue over an in-process channel, so a
-message sent mid-turn is not lost — turns consume them in order. Each turn gets a
-**fresh** step/token/deadline budget, so one expensive reaction cannot starve the
-session. Warm sessions also get the intelligence all-down backoff, riding out a
-transient model outage; a one-shot exits with the intelligence-unavailable code
+A warm subagent prepares its session once, runs its instruction as the first
+turn, then runs one turn per message sent with `subagent.send`. Messages
+queue inside the child, so a message sent mid-turn is not lost. Each turn
+gets a fresh step, token and deadline budget, so one expensive reaction
+cannot starve the session. A warm session also rides out a model outage with
+the all-endpoints-down backoff, where a one-shot child fails at once
 instead.
-
-Two sharp edges:
-
-- **The supervisor's deadline is absolute and armed once**, at spawn, as the
-  child's deadline plus 60 seconds; there is no re-arm path. A warm session meant
-  to live for hours needs `limits.deadline` covering that whole life.
-- **A warm session's terminal result is null.** On close it emits one terminal
-  frame with a null body, and that null overwrites the last turn's distilled
-  result in the record. Read warm output from the per-turn root notes, or poll
-  `subagent.status` while it is alive — never from the record afterwards.
 
 ## How a result comes back
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant W as Turn worker
+    participant W as Turn worker or step
     participant R as Reactor
     participant D as Durable store
     participant S as Subagent process
-    W->>R: tool call subagent.run
-    R->>R: nine admission gates
-    R->>S: fork + exec, then the payload on stdin
-    R->>D: put record, status running
+    W->>R: subagent.run
+    R->>R: admission gates
+    R->>S: fork and exec, then the payload on stdin
+    R->>D: record, status running
     S-->>R: Ready
-    S-->>R: Usage, charged to the governor as it streams
+    S-->>R: Usage, charged to the budget
     S-->>R: Result
-    R->>R: distill, write status/result/tokens
-    R->>W: tool result
-    R->>R: settle plan bindings, append root note
+    R->>R: distil, record status, result, tokens
+    R->>W: handle, status, result, error
+    R->>R: settle plan items, optional root note
 ```
 
 The reactor distils before it stores. A string longer than 8,000 bytes is
-truncated at a character boundary and marked `… [truncated]`; a string that
-parses as JSON is re-parsed so the caller sees an object, not a quoted blob. What
-is *not* capped: an object or array passes through untouched into the record, the
-store and the caller's tool result. Constrain size in `output_contract` rather
-than trusting the cap.
+cut at a character boundary and marked `… [truncated]`; a string that parses
+as JSON is re-parsed, so the caller receives an object rather than a quoted
+blob. An object or array is not capped: it passes untouched into the record,
+the store and the caller's result. A child that ran out of budget still
+returns the last text it wrote.
 
-Where it lands depends on who asked. A tool caller gets
-`{handle, status, result, error}`. A workflow step completes with that value as
-its output. The root context gets a note (`subagent <handle> <status>:` plus a
-400-character distillate) only if `agent.wake_on` includes `subagent_result`,
-which the default does not — and so does each turn of a warm child. A note, like
-any read-back, is withheld from a root holding `sensitive` and `egress` when the
-child may carry outside input (docs/security.md). Any plan item bound to the
-handle advances automatically, in every context.
+Where the result lands depends on who asked. A tool caller gets
+`{handle, status, result, error}`, and so does a workflow step as its output.
+A plan item bound to the handle advances on its own, in every conversation.
+The agent's root conversation receives a note
+(`subagent <handle> <status>: …`, at most 400 characters) only when
+`agent.wake_on` includes `subagent_result`, which the default does not, and a
+warm child notes each finished turn the same way. A note, like every
+read-back, is withheld from a reader that holds both sensitive and egress
+tools when the child may carry outside input.
 
-## Lifecycle, cancellation, and the kill path
+## Lifecycle
+
+A flat child's record moves through a small set of statuses. Seven of them
+are terminal, the set every waiter tests against: `completed`, `failed`,
+`cancelled`, `refused`, `killed`, `crashed` and `retired`.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> spawned: record staged, not yet stored
-    spawned --> running: fork succeeded, durable put
-    spawned --> failed: fork failed (stored at the next checkpoint)
-    running --> running: warm turn — result updated, not terminal
-    running --> completed: terminal Result
-    running --> refused: terminal Result
-    running --> cancelled: subagent.kill (marked immediately)
-    running --> failed: Failed frame, or reaped with no result
-    completed --> [*]
-    refused --> [*]
-    cancelled --> [*]
-    failed --> [*]
+flowchart LR
+    S["spawned"] -- "fork succeeds" --> R["running"]
+    S -- "fork fails" --> F["failed"]
+    R -- "warm turn ends" --> R
+    R -- "final answer" --> C["completed"]
+    R -- "subagent.kill or drain" --> X["cancelled"]
+    R -- "model or MCP server<br/>unreachable" --> F
+    R -- "steps, tokens or<br/>deadline spent" --> E["exhausted_steps<br/>exhausted_tokens<br/>deadline"]
 ```
 
-The seven terminal statuses are `completed`, `failed`, `cancelled`, `refused`,
-`killed`, `crashed` and `retired`; every waiter tests against that set.
+> **Limit.** `exhausted_steps`, `exhausted_tokens` and `deadline` are not in
+> the terminal set. A `sync` caller receives the result, but the record keeps
+> counting against `limits.subagents.breadth`, a later `subagent.await` or
+> `wait {on: subagent}` on that handle does not resolve, and a restart
+> spawns the child again. A child that dies without reporting (killed by a
+> signal, out of memory, torn down at its hard deadline) stays `running` in
+> the same way. Prefer `sync` calls and workflow `subagent` steps, which
+> receive the result directly, and give waits a `timeout`.
 
-**Liveness is probed, not assumed.** The reactor pings each child and classifies
-it on two axes: EOF and the hard deadline dominate; then recent events mean
-healthy; then recent pongs mean *busy*; silence on both means stuck. Pongs are
-answered by the child's control thread, separate from its agentic loop, so a
-child inside a 20-minute model call reads as busy and is left alone. Progress
-timeout 120 s, pong timeout 10 s.
+**Liveness is probed, not assumed.** The reactor pings each child, and the
+child's control thread answers separately from its agent loop. A child that
+reports events is healthy; one that is silent but answers pings is busy (a
+20-minute model call reads as busy and is left alone); one that does neither
+(120 seconds without events, 10 without a pong) is stuck and is torn down.
+Every child also has a hard deadline: its own deadline plus 60 seconds, armed
+once at spawn.
 
-**`subagent.kill` is graceful only.** It marks the record `cancelled` and sends a
-cancel frame; it arms no ladder for that child. A child that ignores cancellation
-keeps running — and keeps spending tokens — until liveness declares it unhealthy,
-at which point the reactor cancels again and hard-kills its process group once it
-is over a second old. So the record reads `cancelled` before the process is gone,
-and it keeps its node pointer: `subagent.send` can still target a dying child.
-
-**Drain is where the ladder lives.** On shutdown every child is cancelled at once
-and one shared ladder escalates: cancel, SIGTERM at 5 s, SIGKILL at 7 s, bounded
-by `lifecycle.drain_timeout` (25 s). A second signal collapses straight to
-SIGKILL; the remainder is force-killed and abandoned. Once a pid is reaped,
-further signalling of that node is suppressed, so a recycled pid is never hit. A
-child that dies without a terminal frame is failed synthetically, so no waiter
-hangs on a crash.
+**`subagent.kill` is graceful.** It marks the record `cancelled` at once and
+sends a cancel frame, which the child's loop reads before its next step. A
+child inside a long call keeps running, and spending, until that call
+returns or liveness declares it unhealthy, at which point the reactor kills
+its process group. Shutdown is where the escalation ladder lives: every
+child is cancelled together, then sent SIGTERM at 5 seconds and SIGKILL at 7,
+inside `lifecycle.drain_timeout`. [Supervision and containment](harness.md)
+covers liveness and the ladder in full.
 
 ## Restart is not resume
 
-At startup the reactor reads back every `subagent/<handle>` record and re-spawns
-the non-terminal ones — except `detached` ones, deliberately abandoned. The
-re-spawn bumps `attempt` and re-supplies a fresh intelligence config, because the
-stored payload is credential-free: the bearer token is stripped before storage.
+At startup the reactor reads every `subagent/<handle>` record and re-spawns
+each one that is not terminal, except `detached` children, which were
+deliberately abandoned. The re-spawn bumps the record's `attempt`, and the
+child's model is resolved again against the live configuration, because the
+stored payload holds no credential. A reload resolves running children's
+models again too, and each applies the new connection at its next turn
+boundary under `intelligence.swap_policy`.
 
-What does not survive: **the conversation** (a restored warm subagent replays its
-original instruction and seed; no transcript is persisted) and **the waiters**
-(in-memory pending entries are gone, so a restored `sync` subagent's completion
-reaches the parent only through plan bindings and the root note — a durable
-workflow step wait does resume). Design delegated work to be idempotent across a
-restart. One further hazard: handle sequence numbers reset to zero on every start
-while restored records keep their `sub-N` handles, so a fresh handle can collide
-with and overwrite a restored record.
+Two things do not survive a restart:
+
+- **The conversation.** A restored warm child replays its original
+  instruction and seed; no transcript is persisted.
+- **In-memory waiters.** A `sync` call from a turn is gone with the process;
+  the result reaches the parent through plan bindings and the root note
+  only. A workflow `subagent` step or `wait {on: subagent}` is a durable step
+  record, and it does resume.
+
+Design delegated work to be idempotent across a restart: a re-spawned child
+does its work again from the start.
+
+> **Limit.** Handle numbers restart at 1 in every process, while restored
+> records keep their handles, so a new spawn can take the handle of a
+> restored record and overwrite it. Treat handles as valid for one process
+> lifetime.
+
+A record with `durable: false` (on the call, the template,
+`subagents.defaults`, or deployment-wide through
+`store.durability.work: ephemeral`) lives in memory only: it is never
+persisted and never restored, which suits throwaway workers.
 
 ## Templates and the instance tier
 
-The `subagents:` config section turns "what a worker here looks like" into an
-operator-declared, reviewable definition the model may *instantiate* but never
-author:
+A template turns "what a worker here looks like" into an operator-declared,
+reviewable definition. The model may instantiate a template but never author
+one, and `subagents.allow_freeform: false` makes templates the only way to
+spawn. The model fills only the template's declared parameters: each value is
+checked against its declared type, enum and `required` flag, then folded into
+the definition as data. A value is never parsed for directives, and a spawn
+whose values would add machinery, an author note or end matter to the text is
+refused.
 
-```yaml
-subagents:
-  allow_freeform: true        # false = templates are the ONLY spawn path
-  defaults: {model: small-fast, priority: low}   # applied when nothing else set
-  templates:
-    researcher:                       # FLAT: no machinery in the instruction
-      instruction: "Research {{params.topic}}; reply with a source-linked brief."
-      params: {topic: {type: string, required: true}}
-      servers: [search]               # narrowing grants from the parent's set
-      mode: sync
-    incident-room:                    # INSTANCE: machinery ⇒ a child daemon
-      instruction: |
-        You are the war room for {{params.id}}.
-        :::workflow
-        name: on-update
-        steps:
-          cmd: {kind: a2a, command: incident.update, roles: [agent, operator]}
-          f:   {kind: finish, depends_on: [cmd], status: completed, output: "..."}
-        :::
-      params: {id: {type: string, required: true}}
-      budget: {windows: [{per: day, tokens: 200000}], on_exhausted: refuse}
-      ttl: 3d                         # graceful retirement triggers
-      until: "closed/{{params.id}}"   # …or this signal delivered IN the child
+A template's tier follows from its text, so it cannot be declared wrongly:
+
+- **Flat.** An instruction with no machinery spawns the flat worker this page
+  has described, through the same chokepoint and caps. The template defines
+  the grant (`servers`, `tools`); its limits, mode, priority and output
+  contract apply where the call site sets none of its own.
+- **Instance.** An instruction that defines machinery, such as a
+  `:::!workflow`, `:::!mcp`, `:::!stream`, `:::!config` or `:::!tools`
+  block, spawns an instance-tier child: a full agentd daemon with its own
+  workflows, streams, waits, timers and store.
+
+An instance child is the same binary started with a configuration file the
+parent composes. The parent writes the template's machinery, the delivered
+prose with its parameters, its own intelligence section (without its budget,
+its routes or any inline token, and with the template's `model` and
+`budget`), its service catalogue, egress posture and TLS trust, a store under
+its own state directory, and an A2A listener on a unix socket. Model
+credentials reach the child through the environment, never the file. The
+child is wired back to the parent as a peer named `parent`, and the parent
+can address the child by its handle (`inst-<n>`) at once.
+
+```mermaid
+flowchart LR
+    P["parent agentd"] -- "composes config,<br/>spawns under the reaper" --> C["child agentd<br/>inst-N"]
+    P -- "subagent.send, a2a.send<br/>over the unix socket" --> C
+    C -- "_instance.result<br/>(mode: sync)" --> P
+    C -- "_instance.emit<br/>(mirror_streams)" --> P
+    C -- "writes token totals" --> M[("child store<br/>manifest")]
+    P -- "reads every 5 s,<br/>charges the delta" --> M
+    P -- "SIGTERM on ttl,<br/>until or retire" --> C
 ```
 
-One resolution rule, two tiers. A template whose instruction carries **no
-config-defining directives** spawns the flat worker described above — same
-chokepoint, same caps, the template's `servers`/`tools`/`limits`/`mode`
-merging under the call site's. A template that defines machinery
-(`:::workflow`, `:::mcp`, `:::stream`, `:::config`, `:::tools`) spawns an
-**instance-tier child**: a full agentd daemon composed by the parent (its own
-workflows, signal parks, streams, schedules, file store under the parent's
-state dir), supervised and reaped like any child, and auto-wired as an **A2A
-peer over a unix socket** — the spawn's `output.peer` is a name `a2a.send` /
-`a2a.delegate` accept immediately, so typed commands to the child work from
-the first tick. `singleton: true` additionally aliases the template name to
-the one live child and refuses a second spawn.
+Four mechanisms ride that wiring:
 
-The spawn call is `subagent.run {template, params}` (or the `subagent` step
-with `template:`/`params:`). Params are the **only** holes the model fills:
-schema-validated at the chokepoint (type/enum/required, defaults applied),
-folded into the definition as *data* — never re-parsed for directives; a
-param value that would introduce a `:::` fence refuses the spawn. Everything
-that can be judged earlier is: extraction runs once at the parent's boot,
-where a template that composes the lethal trifecta, points at an
-uncatalogued endpoint under `security.egress: closed`, declares a
-webhook start, or tries to define `webhooks:`/`a2a:`/`security:`/`store:`
-sections refuses the parent's startup with the template named.
+- **A result.** With `mode: sync` and `result: {workflow: <name>}`, the spawn
+  parks until the named workflow first completes in the child, then resolves
+  with that run's output. agentd composes a small reporter workflow, built
+  from ordinary nodes, that sends the operator-only `_instance.result`
+  command home. The child keeps running afterwards.
+- **Mirrored streams.** `mirror_streams` forwards every event of a child's
+  stream into the parent's stream of the same name, with source
+  `instance:<handle>`, so the parent's consumers see a fleet's events without
+  knowing which child wrote them.
+- **Budget metering.** A durable child's token use is charged against the
+  parent's budget: the parent reads the child's lifetime total from its
+  manifest every five seconds and charges the difference. A `durable: false`
+  child has no manifest, so its use is not metered.
+- **Retirement.** `ttl` elapsing, the `until` signal arriving in the child,
+  `subagent.retire`, or the parent's own shutdown all take one path: the
+  child receives SIGTERM (a parent's death reaches it the same way), stops
+  admitting work, drains its runs, checkpoints and exits. The parent kills
+  it only if it is still running five seconds after the parent's drain
+  timeout. The record closes as `retired`, and the child's directory stays
+  on disk as the audit trail. A child that exits on its own closes as
+  `completed`, `failed` or `crashed`.
 
-Three conveniences ride the same wiring. **`mode: sync`** with
-`result: {workflow: <name>}` parks the spawn until the child's named workflow
-first completes, then resolves it with that run's output — a composed
-reporter workflow inside the child (existing nodes only) dials the parent's
-internal `_instance.result` op; the child keeps running under its own
-lifecycle. **`mirror_streams: [orders]`** forwards every event on the
-child's stream into the parent's same-named stream (source
-`instance:<handle>`), so parent consumers replay a fleet's history without
-knowing which child wrote it. Both need the parent to serve A2A
-(`a2a.listen`) — compile refuses the template otherwise. And a **durable
-child's token usage meters against the parent's budget windows**: the parent
-reads the child's manifest every few seconds and charges the delta — a
-`durable: false` child has no manifest and is invisible to the meter by
-construction.
+Across a parent restart, live instance children are started again from their
+composed configuration. Their state is durable and the handle is their
+identity, so a child picks up where it stopped. A non-durable child runs on a
+memory store and is not restarted.
 
-Instance children retire gracefully — `ttl:` elapsing, the `until:` signal
-arriving in the child, `subagent.retire {handle}`, or the parent's own
-shutdown (a parent death delivers SIGTERM via PDEATHSIG) all take the same
-path: the child stops admitting, drains its runs within its
-`lifecycle.drain_timeout`, checkpoints and exits; SIGKILL only after the
-drain window. The record closes as `retired`, `subagent.await` resolves, and
-the child's store directory remains on disk as the audit trail. Across a
-parent restart, live instance children are respawned from their composed
-config — their state is durable and their identity is the handle. Caps are
-their own family: `limits.subagents.instances.{breadth, total, rate}`
-(defaults 2 live / 8 lifetime / `4/1h`).
+The template's machinery faces the same boundary as any served document: a
+fragment that writes operator-only configuration is refused, and so are a
+child's own `a2a`, `intelligence`, `store` and `lifecycle` sections (the
+parent composes those), MCP Events bindings and grants, and webhook starts or
+waits (a child has no webhook listener). Its MCP servers are checked against
+the parent's service catalogue and egress posture, and must not compose the
+trifecta. These checks run when the parent loads. The child validates the
+composed file again at spawn, and that is where the template's workflow steps
+are checked. [Instruction documents](directives.md) explains the boundary.
 
-## When not to use a subagent
+## What delegation does not do
 
-**When the parent needs the raw material.** Delegation is lossy by construction.
-If the next reasoning step needs the 300 files, read them in the parent.
+- **Delegate onward.** A child has no `subagent.*` tools and no A2A peers.
+- **Detect a spinning loop.** A child's loop has no repeated-call or
+  no-progress detector; its step and token budgets are the bound.
+- **Bound `subagent.await`.** The tool's `timeout` argument is not applied;
+  the child's liveness and hard deadline are the real bound. A workflow
+  `subagent` step or `wait {on: subagent}` honours its `timeout`.
+- **Validate an `output_schema`.** For a subagent the schema is prose in the
+  brief. Check the shape yourself.
+- **Re-read the spawn rate.** `limits.subagents.rate` is read at the first
+  spawn of the process; a reload does not change it.
+- **Pass skills.** A spawn's `skills` list is accepted and not used, and a
+  template's `:::!skill` block is left out of the text the child reads. Put
+  what the child needs in its instruction or `context`.
+- **Count subagents in metrics.** `agent_subagents_spawned_total` and
+  `agent_subagents_exited_total` count every child process, turn and think
+  workers included. Count subagents from the `subagent.*` log events or
+  `subagent.list`.
 
-**When the work is a pipeline.** A fixed sequence with retries, waits and
-branches is a [workflow](workflows.md) — durable and resumable. A subagent is one
-bounded ReAct loop.
+## Next steps
 
-**When you need a bounded wait.** `subagent.await`'s `timeout` is declared in the
-contract and ignored by the implementation; the only real bound is the child's
-liveness deadline. A workflow `subagent` step honours its `timeout`, because that
-wait is a durable step record:
-
-```yaml
-workflows:
-  - name: triage
-    steps:
-      start:
-        kind: once
-      scan:
-        kind: subagent
-        depends_on: [start]
-        mode: sync
-        instruction: "List every call site of legacy_verify under src/auth."
-        servers: [code]
-        output_contract: "A JSON array of {file, line, snippet}. Nothing else."
-        limits: { steps: 80, tokens: 400000, deadline: 9m }
-        timeout: 10m
-      done:
-        kind: finish
-        depends_on: [scan]
-        output: "{{steps.scan.output}}"
-```
-
-**For a long `sync` call from a root turn.** It is bounded by the *calling turn
-worker's* deadline, not the subagent's; if the worker is torn down first the
-reply is dropped. Prefer `async` plus `subagent.await`, or a workflow step.
-
-**When the child must delegate onward or act as the agent's A2A identity.**
-Neither is wired: no self-tools, no inherited peers, no inherited AAuth key.
-
-**When a whole server must disappear rather than a few of its tools.** `tools`
-hides individual tools inside a granted server, but the child still connects to
-that server and pays its handshake and its trifecta tags. Where the server
-itself must be out of reach, leave it out of `servers`.
-
-## Reference
-
-The `subagent.*` tools are granted to the root context and to workflows, not to
-subagents. Over A2A only `send`, `kill` and `status` are exposed (plus a taskless
-status read), each gated by the calling principal's command grants; mutating
-calls are pushed onto the interface feed, so display clients see them.
-
-| Tool | Notes |
-|---|---|
-| `subagent.run` | `instruction` (freeform) or `template` + `params` — one or the other, never both; `mode`, `limits`, `context`, `output_contract`, `output_schema` optional; `servers`/`tools` only without `template` (the template defines the grant). |
-| `subagent.send` | Warm subagents only — except instance-tier children, where the message rides A2A over the child's socket into its conversation surface. |
-| `subagent.retire` | Instance children only: begin graceful retirement (drain → clean exit); SIGKILL only after the drain window. |
-| `subagent.status` | Status, mode, result, error, tokens. Safe to poll. |
-| `subagent.await` | Returns immediately if already terminal; `timeout` ignored. |
-| `subagent.kill` | Graceful cancel; marks the record `cancelled` at once. |
-| `subagent.list` | Handles, modes, statuses; instruction previews cut to 80 chars. |
-
-`durable: false` on a spawn (call site, template, `subagents.defaults`, or the
-deployment-wide `store.durability.work: ephemeral`) makes the record
-memory-only: never persisted, never restore-respawned — the fast path for
-throwaway workers. A non-durable **instance child** additionally runs on a
-memory store and is not respawned after a parent restart.
-
-Per-run defaults inherited by each subagent unless the call overrides them: 500
-steps, 2,000,000 tokens, a 1 h deadline (floor 1 s). `--max-depth` is the CLI
-alias for `limits.subagents.depth`.
-
-Log events: `subagent.spawn` (`handle`, `mode`, `node`, `depth`, `servers`),
-`subagent.turn`, `subagent.result` (`handle`, `status`, `tokens`, `err`),
-`subagent.kill`, `subagent.respawn`, `child.unhealthy` (`node`, `health`). One
-trap: `agent_subagents_spawned_total` and `_exited_total` count **every** child,
-turn and think workers included, because the counters sit in the generic spawn
-and reap paths. Measure subagent volume from the log events or `subagent.list`.
+- [Delegate to subagents](delegate-subagents.md): spawn, narrow, limit and
+  collect, with complete configurations.
+- [Supervision and containment](harness.md): the process tree, liveness, the
+  kill ladder and admission in depth.
+- [Security model](security.md): the trifecta, read-back withholding and
+  policies.
+- [Workflows: how runs work](workflows.md): when the work is a pipeline
+  rather than one bounded loop.

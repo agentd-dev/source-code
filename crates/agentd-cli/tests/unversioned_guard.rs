@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 /// Where agentd's own identifiers live, relative to the workspace root: the
 /// code, and every page and client that names them to a reader.
 ///
-/// History — `CHANGELOG.md`, the RFCs before 0043 and their index,
-/// `docs/design/` — is never scanned: it records what was, versions included.
+/// History — `CHANGELOG.md`, the RFCs before 0043 and their index — is never
+/// scanned: it records what was, versions included.
 const ROOTS: &[&str] = &[
     "crates",
     "examples",
@@ -57,7 +57,6 @@ const SKIP_PATHS: &[&str] = &[
     "target",
     "node_modules",
     "dist",
-    "docs/design",
     "crates/agentd-cli/tests/instruction-spec-corpus",
     "crates/instruction/tests",
     // The vendored specification schema is upstream's to spell: its S22

@@ -2,11 +2,12 @@ import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import tuiFrames from "../../../lib/tui-frames.json";
 import remarkGfm from "remark-gfm";
-import { DOCS, GROUPS, docsInGroup, readDoc, slugForFile } from "../../../lib/docs";
+import { DOCS, GROUPS, readDoc, readingOrder, sectionsOf, slugForFile } from "../../../lib/docs";
 import Mermaid from "../../components/Mermaid";
 
 export function generateStaticParams() {
-  return DOCS.map((d) => ({ slug: d.slug }));
+  // An entry with an `href` lives elsewhere (an extension spec at its URI).
+  return DOCS.filter((d) => !d.href).map((d) => ({ slug: d.slug }));
 }
 
 export async function generateMetadata({ params }) {
@@ -277,29 +278,39 @@ function Tag({ tag }) {
   return <span className={`doc-tag doc-tag-${tag.replace(/\W/g, "")}`}>{tag}</span>;
 }
 
-/** The grouped sidebar. A group holding no docs renders nothing at all. */
+/**
+ * The sidebar: a collapsible group per top-level section, open where the
+ * reader is, with the group's sections labelled inside it. A group holding no
+ * docs renders nothing at all.
+ */
 function NavList({ activeSlug }) {
+  const active = DOCS.find((d) => d.slug === activeSlug);
   return GROUPS.map((g) => {
-    const items = docsInGroup(g.id);
-    if (!items.length) return null;
+    const sections = sectionsOf(g.id);
+    if (!sections.length) return null;
     return (
-      <div key={g.id} className="doc-nav-group">
-        <div className="doc-nav-title">{g.title}</div>
-        <ul className="doc-nav-list">
-          {items.map((d) => (
-            <li key={d.slug}>
-              <Link
-                href={`/docs/${d.slug}/`}
-                aria-current={d.slug === activeSlug ? "page" : undefined}
-                className={d.slug === activeSlug ? "doc-nav-link is-active" : "doc-nav-link"}
-              >
-                <span className="truncate">{d.title}</span>
-                <Tag tag={d.tag} />
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </div>
+      <details key={g.id} className="doc-nav-group" open={!active || active.group === g.id}>
+        <summary className="doc-nav-title">{g.title}</summary>
+        {sections.map((s) => (
+          <div key={s.id ?? "_"} className="doc-nav-section">
+            {s.title && <div className="doc-nav-section-title">{s.title}</div>}
+            <ul className="doc-nav-list">
+              {s.docs.map((d) => (
+                <li key={d.slug}>
+                  <Link
+                    href={d.href ?? `/docs/${d.slug}/`}
+                    aria-current={d.slug === activeSlug ? "page" : undefined}
+                    className={d.slug === activeSlug ? "doc-nav-link is-active" : "doc-nav-link"}
+                  >
+                    <span className="truncate">{d.title}</span>
+                    <Tag tag={d.tag} />
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </details>
     );
   });
 }
@@ -310,11 +321,6 @@ function NavList({ activeSlug }) {
  */
 function stripTitle(raw) {
   return raw.replace(/^\s*#\s+.*\n+/, "");
-}
-
-/** Reading order across groups, for prev/next. */
-function readingOrder() {
-  return GROUPS.flatMap((g) => docsInGroup(g.id));
 }
 
 export default async function DocPage({ params }) {
@@ -332,8 +338,9 @@ export default async function DocPage({ params }) {
   }
 
   const group = GROUPS.find((g) => g.id === doc.group);
+  const section = group?.sections?.find((s) => s.id === doc.section);
   const toc = outline(doc.raw);
-  const order = readingOrder();
+  const order = readingOrder().filter((d) => !d.href);
   const i = order.findIndex((d) => d.slug === slug);
   const prev = i > 0 ? order[i - 1] : null;
   const next = i >= 0 && i < order.length - 1 ? order[i + 1] : null;
@@ -362,7 +369,10 @@ export default async function DocPage({ params }) {
 
       <article className="min-w-0">
         <header className="mb-8">
-          <div className="eyebrow">{group ? group.title : "docs"}</div>
+          <div className="eyebrow">
+            {group ? group.title : "docs"}
+            {section ? ` · ${section.title}` : ""}
+          </div>
           <div className="mt-2 flex items-baseline gap-3">
             <h1 className="text-3xl font-bold tracking-tight text-[var(--fg-strong)]">
               {doc.title}

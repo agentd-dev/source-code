@@ -8,7 +8,7 @@
 > family; and the `exec` self-tool was **removed** (agentd runs no local code). The
 > RFC *contracts* (methods, resources, semantics, exit codes) still hold — only the
 > **transport** and the exec surface changed. The authoritative, verified plan is
-> **[`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md)**;
+> **../docs/design/00-target-vision-pivot.md**;
 > where an RFC and that document diverge on transport/exec, the pivot wins. Affected
 > RFCs carry a banner. Run-graphs (an agent-orchestration feature) are documented in
 > **[`../docs/workflows.md`](../docs/workflows.md)**.
@@ -23,7 +23,7 @@ observe, and manage a *fleet* of agentd instances; RFC **0014** is the umbrella
 and **0015–0020** the concrete contracts (**0020** adds A2A-over-vsock agent-mesh
 interop). All cross-reference one another by number rather than restating detail.
 
-**The binding decision record is [`docs/design/00-architecture-assessment.md`](../docs/design/00-architecture-assessment.md).**
+**The binding decision record is docs/design/00-architecture-assessment.md.**
 Where any RFC and that document diverge, **the assessment wins** and the RFC is
 refined to match. The `docs/design/notes-*.md` files are the supporting research
 and review notes the assessment synthesizes; they are inputs, not normative.
@@ -84,7 +84,7 @@ these rather than redefining them.
 
 ## Supporting research (non-normative)
 
-In [`docs/design/`](../docs/design/): `notes-mine-existing-code.md` (salvage map of
+In docs/design/: `notes-mine-existing-code.md` (salvage map of
 the retired runtime), `notes-research-*.md` (MCP spec depth, modern agent loops,
 minimal Rust ecosystem), and `notes-review-*.md` (reliability, concurrency,
 cloud-native, observability, MCP protocol, agent-loop-modes reviews). These feed

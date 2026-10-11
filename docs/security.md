@@ -1,1375 +1,1094 @@
-# Security: the fence is the configuration
+# Security model
 
-agentd wires a language model to real credentials and real side effects. That is the whole
-product and also the whole problem: everything the model reads may be adversarial, and
-everything it can call is authority it holds. There is no reliable way to tell an injected
-instruction from a legitimate one, so agentd does not try. It ships no policy engine, no
-classifier, and no RBAC DSL. An agent's authority *is* the set of tools its operator
-declared, bounded by one structural rule about which kinds of tool may sit together in one
-process. This page says what is enforced, where in the code, and — in a final section that
-is not an afterthought — what agentd does not defend against at all.
+agentd wires a language model to real credentials and real side effects, so
+everything the model reads may be adversarial and everything it can call is
+authority it holds. This page explains what agentd enforces, where each rule
+runs, and what agentd does not defend against, for security reviewers and
+operators who need the reasoning behind the controls. To apply it, follow
+[Harden a deployment](harden.md).
 
 ## The threat model
 
-**The model is untrusted input holding credentials.** Under a successful prompt injection,
-the agent loop emits attacker-chosen tool calls with the operator's authority. Treat the
-agentd process as potentially compromised and size the surrounding sandbox accordingly.
-
-**Everything an MCP server returns is untrusted** — not only tool *results* but the parts
-the protocol presents as metadata: a tool's name, description, input schema, annotations.
-A malicious server can ship an injection in a description, or mutate one after the first
-connection. agentd passes that metadata to the model as the tool catalogue but never lets
-it make a security decision: capability tags come from operator config only, and
-`readOnlyHint` / `destructiveHint` are hints, never gates.
-
-**Prompt injection is not patchable.** A guardrail that works 95% of the time is a failure
-in security terms. The defenses here are structural — they bound what a compromised loop
-*can reach*, not what it *intends*.
-
-agentd trusts its own binary, the OS, and the operator's configuration. What arrives from
-the network is bounded to a whitelist: the one command op that changes the running
-configuration, `admin.set`, is the operator's alone and reaches two paths
-(`runtime/surface/ops.rs::RUNTIME_SETTABLE`) — `agent.approval`, the human-approval mode,
-deliberately settable mid-session because how closely you want to be asked changes with
-what the agent is doing, and `a2a.introspection.enabled`. Every other path is refused with
-the list of what *is* settable (`runtime/a2a_server/admin.rs`), nothing is written to disk,
-and the next reload puts the file's value back. The model can never register an MCP
-server, edit an endpoint, or name a binary to run.
-
-## Capability scoping
-
-agentd has 53 internal tool contracts (memory, artifacts, plans, subagents, workflows).
-Every *task* capability — reading a repository, sending mail, querying a database —
-arrives from an operator-declared MCP server. Declaring a server is a trust decision
-equivalent to adding a dependency you call at your own privilege.
-
-Narrowing is set membership, not a policy language, and it lands at exactly two surfaces —
-which enforce it at different points, and the difference matters:
-
-- A workflow `agent` step honours its `tools:` list — the plan is filtered by pattern
-  (`*`, an exact name, or `prefix*`) before the child sees the definitions
-  (`runtime/steps.rs::step_turn`, `registry/mod.rs::defs_for`, `::pattern_matches`).
-- `subagent.run`'s `tools:` argument **does** confine the child. The supervisor mints it
-  into the spawn payload as a grant (`runtime/subagents.rs::subagent_run`, through
-  `subagent/protocol.rs::narrow_tools`), and the child filters both its tool catalogue and
-  its dispatch routing map against it (`agentloop/runner.rs::narrow_catalogue`), so an
-  excluded tool is unreachable rather than merely unadvertised. A caller-supplied `context`
-  entry cannot forge or widen that grant — any allow-list already on the seed is dropped
-  before the mint, because `subagent_run` discards every seed message whose role is
-  `subagent/protocol.rs::ALLOWED_TOOLS_ROLE`. `servers:` narrows independently: the payload
-  is built from just those server specs, so the child cannot dial the rest (the same
-  function's read of `args["servers"]`).
-
-An unknown name in `servers:` is filtered out silently, not rejected — that read filters
-on `self.mcp_specs.contains_key`, so a typo yields a less capable child and no diagnostic.
-
-`sec/scope.rs` also defines an intersection type (`scope.rs::Scope`, over
-`scope.rs::ToolScope`) — `parent ∩ requested` over a server whitelist and a tool-name
-whitelist, both dimensions checked independently. It has **no call site outside its own
-tests**; the live exports of that module are `scope.rs::TrifectaTag` and `check_trifecta`.
-The two bullets above are the whole of the narrowing.
-
-Separately, `agent.tools.internal | mcp | code` controls what the model *sees*. That is a
-catalogue filter, not the authorization check; the check is `Registry::allowed`.
-
-## Tool tags and the Rule of Two
-
-The trust budget is three operator-declared tags:
-
-| Tag | Meaning |
-|-----|---------|
-| `untrusted_input` | the tool returns content from an uncontrolled source — web pages, inbound mail, issue text |
-| `sensitive` | the tool reaches private data or privileged systems — secret store, internal database, prod control plane |
-| `egress` | the tool can move data out or change external state — HTTP POST, send mail, open a pull request |
-
-Tags are parsed as snake-case strings from config only; an unrecognized tag is a hard
-config error (`config/settings/mod.rs::McpServer::tag_set`). Nothing the model or a server says
-feeds the gate.
-
-```yaml
-mcp:
-  servers:
-    - { name: web,   endpoint: https://mcp-fetch.internal/mcp, tags: { "*": [untrusted_input] } }
-    - { name: vault, endpoint: https://mcp-vault.internal/mcp, tags: { "*": [sensitive] } }
-security:
-  allow_trifecta: false   # default; adding an `egress` server here refuses startup
-```
-
-The budget is an OR-fold across legs, never a count (`scope.rs::Trifecta::merge`) —
-repeating one leg across twenty tools stays one leg. The Rule of Two is literally
-`legs() < 3` (`scope.rs::evaluate`), so **every pair is allowed**, including `sensitive` +
-`egress`. A tool that reads secrets and can POST is fine as long as nothing in the same
-grant reads untrusted input.
-
-Tags are **per server, not per tool.** The config shape is a map keyed by glob, but
-`McpServer::tag_set()` iterates `self.tags.values()` and discards the keys
-(`config/settings/mod.rs::McpServer::tag_set`); `Registry::build` stamps that union onto every
-tool of the server (`registry/mod.rs::Registry::build`). So
-`tags: {"send_*": ["egress"], "read_*": ["untrusted_input"]}` does not split the server
-into two risk classes — both tools end up `untrusted_input | egress`. The only real split
-is one MCP server per tag profile. An **untagged server counts as `untrusted_input`**
-(`config/settings/mod.rs::validate`, in the fold headed `// trifecta over the root grant`), the
-conservative default.
-
-### Where the gate runs
-
-Two enforcement points over servers, both consulting the same `security.allow_trifecta`
-setting — and a third over what reaches a run through a stream, [below](#streams-carry-the-taint-of-what-feeds-them).
-
-```mermaid
-flowchart TB
-  A["mcp.servers[].tags"] --> B["tag_set() flattens<br/>all glob keys"]
-  B --> C{"empty?"}
-  C -- yes --> D["contributes untrusted_input"]
-  C -- no --> E["contributes declared tags"]
-  D --> F["GATE 1 - validate()<br/>over EVERY declared server"]
-  E --> F
-  F -- "3 legs, no override" --> G["exit 2 - daemon never starts"]
-  F -- "otherwise" --> H["registry built, daemon runs"]
-  H --> I["subagent.run(servers: [...])"]
-  I --> J["intersect with connected servers<br/>unknown names dropped"]
-  J --> K["GATE 2 - over the NARROWED set"]
-  K -- "3 legs, no override" --> L["isError result,<br/>child never spawned"]
-  K -- ok --> M["payload minted, binary re-exec'd"]
-```
-
-Gate 1 lives inside config `validate()` (`config/settings/mod.rs::validate`, where the
-root-grant fold ends in a `check_trifecta` call), the single validation authority that
-both startup and
-`--validate-config` run, so the two can never disagree. A refusal is a config error —
-exit `2`, before any side effect:
-
-```text
-lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress
-into one agent; narrow the tags or set security.allow_trifecta (audited)
-```
-
-Gate 2 is at the `subagent.run` chokepoint (`runtime/subagents.rs::subagent_run`, which
-calls `check_trifecta` itself), over the tags of the *requested* server subset. It returns
-an `isError` tool result the parent's model must adapt to, not a crash.
-
-Because gate 1 folds over **every declared server**, it is a whole-instance budget. An
-instance declaring an untrusted-input reader, a secrets server, and an egress server will
-not start, even if you intend to hand each leg to a different subagent. To run that shape
-you either set `security.allow_trifecta: true` — which relaxes gate 2 as well — or run
-separate agentd instances per risk profile. `security` is a restart-only config path
-(`config/settings/mod.rs::RESTART_ONLY_PATHS`), so a hot reload can never widen the override; a
-reload touching it is refused as `restart_required` and the running config is kept.
-
-Not every leg comes from `mcp.servers`: a binary built with the `exec` feature and
-running with `security.exec.enabled` contributes `sensitive` + `egress` to this same fold,
-pushed by its `#[cfg(feature = "exec")]` arm, so enabling the local runner beside an
-untrusted-input server refuses startup like any other trifecta.
-
-**Two gaps to know.** No warn event is emitted when the override is exercised: a
-`scope.trifecta_grant` event name is reserved but never written, so an allowed trifecta
-proceeds silently and the only trace is the config value. And code-registered (embedder)
-tools sit outside the accounting: they are inserted with `Grant::all()` and an empty tag
-vector — the tool literal that `registry/mod.rs::Registry::build` writes for a code
-tool — so an embedder whose native tool does egress or reads secrets defeats the budget
-silently.
-
-### Streams carry the taint of what feeds them
-
-Gates 1 and 2 judge servers. Neither sees input that reaches a run **through a stream**:
-a webhook `into:` appends whatever its caller posted, an A2A `into:` appends a peer's
-message, and the workflow consuming the stream hands that text to an agent. A config
-whose servers are all tagged — one of them `sensitive` + `egress`, which is two legs —
-passes gate 1, and then feeds a webhook body to the agent holding both.
-
-So every declared stream gets a tag set from every producer the configuration declares
-(`config/taint.rs::propagate`):
-
-- a webhook `into:` and an A2A `into:` add `untrusted_input` — a valid signature says who
-  sent the text, not that it is safe to obey;
-- a subagent template's `mirror_streams` adds `untrusted_input`: the child's own producers
-  are compiled at spawn, into another process, and cannot be judged here. The parent
-  enforces the list: an `_instance.emit` report into any stream the child's template does
-  not mirror is refused (`instance.mirror.fail`);
-- an `emit` from a run that carries taint puts it on its target. Every `emit` target is
-  static — a templated one is taken to be every declared stream — so this is a fixed point
-  over the workflow graph;
-- an MCP Events binding or grant (`mcp.servers[].events`, `event_grants`) adds its server's
-  tags, and `untrusted_input` when the server is untagged: whoever can write into the
-  watched upstream (an email to a monitored inbox, a message in a watched channel) writes
-  into the stream. Bindings and grants are operator-only — a served document or a subagent
-  template declaring either is refused, and a child's composed config carries neither —
-  and the `events.*` tools carry the tags of every server a grant offers them on, since
-  subscribing sends model-chosen arguments to that server.
-
-A run started from a tainted stream (`stream` or `correlate` start) or waiting on one
-(`wait {on: event}`; a templated stream name is any tainted stream) carries its tags, and
-so does a run that such a run starts: a `workflow` step, a workflow tool one of its agents
-can call, or the `workflow.run` / `workflow.signal` tools (a signal reaches every workflow
-with a `signal` start or a `wait {on: signal}`). Each such workflow is then put through
-`check_trifecta` with its tags folded together with every server its model-driven steps can
-reach (`config/taint.rs::Reach`):
-
-- an `agent` step reaches its `servers:`, or every configured server without the list. A
-  templated entry reaches every server. With the list, the step is offered the MCP tools
-  of those servers alone — a tool a policy might gate included, which the supervisor
-  serves over its own connections (`runtime/turns.rs::tool_plan`);
-- a `subagent` step reaches its template's servers, or its own. A flat child is offered
-  no internal tool (`subagent/control.rs::NoSelfTools`) — except one a policy rule might
-  touch, which it routes back up for the supervisor to serve under the subagent grant
-  (`runtime/subagents.rs`, `gated_tools`); such a tool is the child's, judged by the same
-  `could_apply` the runtime asks. Of the MCP tools, only its own servers' are routed back
-  up;
-- a step (or a child) that can call a tool that hands text on reaches what that tool hands
-  it to, by the grant the registry gives the tool (`registry/internal.rs::onward`): `subagent.run`
-  and `subagent.send` whatever a child can be handed — every server, unless
-  `subagents.allow_freeform: false`, and every template's servers; `message.send` the root
-  grant. A `tools:` entry that is templated may name any tool. A deterministic `tool` step
-  naming one of these is the same hand-off;
-- `exec`, when it runs locally or is mapped off-box, is `sensitive` + `egress` on its own;
-  an internal tool mapped onto a server — a `tools.overrides` entry, or `knowledge.*` /
-  `search.*` on `knowledge.server` / `search.server` — reaches that server;
-- a `message` step hands the text to the agent's own conversation, which holds the root
-  grant.
-
-A route's own run is the operator's call. A `webhook` or `a2a` start that fires a run, a
-`wait {on: webhook}`, and a webhook start's `signal:` relay hand a caller's text to a run
-directly; that run, and a run it starts, are not judged on their own reach — the operator
-who opened the route decided what its work may do (`examples/startup/sre.yaml`). What such
-a run puts on a stream is judged like `into:`: its `emit` taints the target, and the
-stream's consumers are checked.
-
-**A result read back is withheld.** A run's result is the text it was handed, worked over
-— and so is the result of a child it spawned or steered. A context that reads one back
-while it holds both `sensitive` and `egress` would complete the trifecta, so the runtime
-answers it with the run's (or the child's) status and the text replaced by a marker that
-says why, and logs `readback.withheld` (`runtime/withhold.rs`, docs/observability.md):
-
-```text
-output withheld: this run carries outside input (it consumes stream "inbox" (fed by webhook
-`into:` at workflow "intake" step "hook")); this conversation holds sensitive and egress tools
-```
-
-What is replaced is the text: `output`, `result` and `error`, the opening of a child's
-`instruction`, and a run's step outputs and variables. The status, the ids and the
-timings stay. Every read-back the code has is answered this way
-(`registry/internal.rs::read_back` classifies the tools, and a test holds every contract
-whose reply can carry a result to it):
-
-- a sync workflow tool's reply, and `workflow.run` with `wait: true`;
-- `workflow.wait`, the `workflow.wait` step and `wait {on: run}`;
-- `workflow.status`, whose runs carry their `output` and `error` (and, by run id, their
-  step outputs and variables), and `status`, whose run list carries every run's;
-- a `workflow` step that is not `detached`, and a `join`, which hands back each handle's
-  output — a run's or a child's;
-- a child read back by handle: `subagent.status`, `subagent.await`, `wait {on: subagent}`,
-  and `subagent.list`, which hands back the opening of each child's instruction;
-- `plan.update` with `bind: {run}` or `bind: {subagent}`: when the bound run or child
-  finishes, its output or error is written into the item's note, which the plan block puts
-  in front of the model on every turn after;
-- the notes a finished run (`agent.on_workflow_finished`) and a child's result
-  (`subagent_result` in `agent.wake_on`, which also notes every turn of a warm child) leave
-  in the root transcript. Both are opt-in: `on_workflow_finished` defaults to `ignore`, and
-  `subagent_result` is not in the default `wake_on`;
-- the note an `emit` step without a `stream:` writes into the root transcript, which is
-  rendered from the run's own data.
-
-Who holds both legs is worked out with the reach the load-time check judges by
-(`config/taint.rs::Withholding`, derived with the registry on every workflow change), and
-each context is judged by what it can hand the text on to, not only by its own servers: a
-conversation by everything the root grant reaches, every run it can start and every child
-one of them can spawn (a `subagent` step spawns one whatever `tools.disabled` says of the
-root's own `subagent.run`); a run by what its model-driven steps reach and what everything
-it hands its text on to reaches — the runs it starts or signals, the runs consuming a stream
-it emits onto; a flat child by its template's servers and tools, or, freeform, every server.
-A child of a template the settings no longer hold, an instance child and a run of a
-workflow the set does not hold are taken to hold both.
-
-What a run or a child carries is recorded on its own durable record (`RunState::carries`,
-the subagent record's `carries`) as text reaches it, and only ever added to:
-
-- a run, when it starts: what its definition can be handed (the taint above), what an A2A
-  peer's own request handed it (`workflow.run` over A2A by an `agent` principal), and what
-  the run, child or peer that started it carried — a `workflow` step, the `workflow.run`
-  tool and a workflow tool alike;
-- a run, when a signal or an A2A message reaches it: what the sender carried — a
-  `workflow.signal` step or tool, a peer's own `workflow.signal`, a peer's message to a
-  `wait {on: message}` — and a `signal` start records the same on the run it starts;
-- a stream event, when a run `emit`s it: what that run carries, on the event's record — and
-  so a run a `stream`, `batch` or `correlate` start fires on it, and a run a
-  `wait {on: event}` resumes on it, carries it too;
-- a run, when it ends: what its definition can be handed by then, before the definition
-  can be released;
-- a child, when it is spawned: what its spawner carried; and when `subagent.send` steers
-  it (the tool, a `tool` step, or the A2A op): what the sender carried;
-- a run or a child that holds a leg less, when it is handed a result whole: what that
-  result carried.
-
-A read is judged by those records, together with what the definition's entry in the table
-says now, which can only add — never by what happens to be installed or on record when the
-result is read. So a definition that is deleted or replaced, a spawner's run that is
-evicted, a restart, and a peer the process has not heard from since all leave a result as
-withheld as it was; a run or a child with no record left is taken to carry text from an
-origin no reader holds. A result is withheld only for text the reader was not handed
-already: each record names where its outside text entered (an outside caller's route, a
-mirrored stream, an A2A peer), so a route's own run reading back a child it started reads
-nothing new. The telemetry taps are not read-backs: a stream the daemon's events are tapped
-onto (`observability.runtime_events`, an audit `sink: [stream]`) is fed by every run, and
-its consumers are judged as any consumer is.
-
-A context that holds a leg less is handed the text whole, as before — and then carries it:
-its own result is withheld in turn from a reader holding both, and what it starts or feeds
-is judged as a run that read a tainted stream would be. So a read-back is never refused at
-load: a reader holding both legs is withheld from, and one holding a leg less can hand the
-text only to what its own reach covers. What a run that only the runtime knows to carry
-outside input — one an A2A peer's request started — puts on a stream with `emit` reaches
-the stream's consumers on the event's record, beyond the taint the static check can see in
-the definitions. An operator reading a run over A2A — the
-`workflow.status` op, the run's task — is no model's context, and reads it whole.
-`security.allow_trifecta` lifts the withholding with every other trifecta gate.
-
-All three legs and no `security.allow_trifecta` is exit `2` — from `--validate-config` for
-the inline definitions and those in local files and folders (`file:`, `dir:`, the adopted
-`workflows/` folder), and at the start and on every reload for the whole set once `url:`
-and `uri:` definitions resolve. A reload that moves anything the check
-reads (`config/taint.rs::inputs_moved`: the servers, the service catalog, the templates,
-the streams, the tools, the policies, the telemetry taps — `observability.runtime_events`,
-`observability.audit`) re-judges the definitions, the stored ones included, and works out
-again what is withheld from whom. A refused
-reload keeps the running configuration. The message names the workflow, the stream, what
-feeds it, and the servers that brought the other two legs:
-
-```text
-workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook
-`into:` at workflow "intake" step "hook"), and its model-driven steps reach mcp server
-"mail" [sensitive, egress]: untrusted input + sensitive + egress in one run. …
-```
-
-A definition the agent writes is held to the same line: `workflow.create`/`update`
-refuses one that would complete the trifecta, and a stored one that a reload makes
-complete it is left out (`workflow.stored.invalid`), not allowed to veto the reload.
-
-A workflow tool's tags include the taint its run carries, and the read-back contracts
-(`registry/internal.rs::read_back`) carry the taint of every run, since any run's output may
-be what they return to a caller holding a leg less (`registry/mod.rs::register_workflow_tools`)
-— so a policy matching
-`untrusted_input` sees both, and the check counts a read-back contract as one such a policy
-routes back up from a flat child. They are re-derived whenever the workflow set changes: at
-startup, on every reload that re-reads the workflows (a workflow-only one included), when
-`workflow.create`/`update` changes it, and when a definition is retired, since a definition
-that is no tool can still taint what a tool's run reads. A retired definition whose runs are
-still live — a `workflow.delete` or a reload drains them — counts until the last of them
-lands, a restart that restores one included: its result can still be read back.
-
-This is coarse and static on purpose — per stream, not per value, and per server, like
-gate 1. It is a grant-level check, not data-flow tracking. What it accepts is what it
-judges: every model-driven step of a run the outside text reaches — the run that reads
-the stream, and any run it starts or feeds — is judged together, so a reader and an actor
-in one run, or an actor in a run the reader starts, are refused alike. A run that has to
-act on what it read does it either with no model-driven step holding both other legs
-(narrow `servers:` and give the step a `tools:` list that leaves out the tools that hand
-text on), or through a deterministic step.
-
-What it does not follow, so an operator knows where the line is:
-
-- **Deterministic steps.** `mcp.tool`, `http`, `a2a.send` and `a2a.delegate` are not
-  counted: their target is fixed in the definition and no model picks it. Their
-  *arguments* are templated, though, and can carry what a model that read the outside
-  text produced — give that model an `output_schema` so what reaches the arguments is
-  constrained.
-- **Shared state.** Text a model writes to memory or an artifact is not traced to whoever
-  reads it.
-
-What a wait listens on is fixed by the definition: a `wait` whose `on` is templated is
-refused at load and by `workflow.create`/`update`, since rendered at dispatch it could open
-a webhook route, or read a stream or a run, that neither the route list nor this check saw.
-
-### The tag floor and closed egress
-
-Tags being config-only leaves one hole: the *author* of a config (or of a
-subagent template) could point a server at the billing system and simply not write
-`sensitive` — the gate then reasons soundly from a false premise. The
-`services:` catalog closes it: an entry binds an endpoint to authoritative
-tags, and any MCP declaration whose endpoint matches the entry gets those tags
-**unioned in before the gate runs** — referencing or inline, unconditionally.
-Under-tagging a catalogued endpoint is therefore impossible rather than undetected.
-`security.egress: closed` extends the catalog from authority to allow-list
-across the outbound surfaces it knows about: MCP dials, intelligence
-endpoints (the top-level connection's and every `intelligence.providers`
-entry's), A2A peers, the `http` step (with per-entry `methods:` ceilings),
-stream `forward:` targets, the HTTP store, workflow-reference URLs, and
-caller-registered A2A push targets — refused at boot for configured surfaces,
-at execution for templated ones. Entries carry a `kind:` and matching is
-kind-filtered. There is deliberately no in-config exception list: the way to
-allow an endpoint is to catalog it, which is exactly the reviewable event it
-should be. What the catalog does **not** bind: where a *compromised MCP
-server* can reach (network egress policy stays complementary — the entry list
-is what makes those rules derivable), `observability.otel.endpoint`
-(telemetry export is operator plumbing; validation says so rather than
-implying coverage), and the instruction fetch itself — an `agent.instruction`
-or subagent-template `url:` / `oci:` source is dialled while the
-configuration is still being assembled, before there is an egress policy to
-consult, so pin it by digest and treat the document host as operator plumbing
-too.
-
-## Policies: a verdict on the call
-
-Grants answer *may this caller reach this tool at all*, and they are name
-patterns. They cannot express "delete anything outside `/tmp`", or "a person
-signs off before any egress-tagged call" — and `agent.approval` only decides
-whether to honour a gate the *model* asked for. `security.policies` is the
-layer in between: an ordered list matched against the call itself, first match
-wins, no match is allow.
-
-```yaml
-security:
-  policies:
-    - match: {tool: "fs.delete*", args: "CEL: !args.path.startsWith('/tmp/')"}
-      action: deny
-    - match: {tags: [egress], caller: [subagent]}
-      action: ask
-      question: "{{caller}} wants {{tool}} with {{args}} — allow?"
-      on_timeout: deny
-    - match: {tool: "billing.*", principal: {role: user}}
-      action: deny
-```
-
-It hooks `execute_tool` — one chokepoint every call passes — deliberately
-*after* argument validation, so a guard judges arguments that already conform
-to the tool's schema rather than whatever the model emitted. It composes with
-the machinery either side rather than duplicating it: `tools.overrides` says
-**where** a call goes, this says **whether**, and `action: ask` suspends on the
-same deferred-human path `ask_human` and the `human` node already use. This is
-also where the trifecta tags finally do work at runtime rather than only
-folding at startup.
-
-**A policy gate holds the call.** `action: ask` does not run the call and
-then ask; it parks the call and puts the question on the asking task, which
-turns `input-required`. The answer is a decision: `approve` runs the held call
-— its grant and its arguments checked again, the policy not re-applied — and
-the asker gets the call's real result (`runtime/tools.rs::policy_settle`);
-`deny` is an error result naming the rule; anything else is refused as an
-answer and the question stays open. A timeout runs the
-call only when the rule's `on_timeout` is `allow`, and refuses it otherwise
-(the default). A workflow step's gate is recorded durably with its question,
-its addressee and the held call, so a restart rebuilds it unweakened.
-
-**A policy gate is addressed**, to the rule's `to:`, and to `{role: operator}`
-when the rule names nobody (`runtime/tools.rs::policy_gate`). The gate usually
-lands on the task of the very caller whose call is being judged, and whoever
-holds a task may answer an unaddressed question on it — so an unaddressed
-policy gate would be approved by the party it exists to check. A policy is the
-operator wanting a say. Who else a `to:` may name is the
-[gate addressee rule](#human-gates-who-may-answer).
-
-An empty list costs one `is_empty` check.
-
-### Every caller, or it is worse than nothing
-
-A policy table that held for root turns but not subagent turns would be worse
-than none, because the operator would believe they were covered. Two different
-bypasses exist and both are closed:
-
-- a **turn worker** dials its MCP tools from its own route map, so any tool a
-  rule might touch is left out of that map and served by the runtime instead;
-- a **subagent** is a separate process that connects to MCP servers itself, so
-  the supervisor names its gated tools in the spawn payload and the child
-  routes exactly those back up the existing tool-request channel.
-
-Gated tools pay one round-trip; everything else keeps the fast path. It is a
-routing decision, not a trust boundary — the parent re-evaluates the policy
-when the request arrives, so a child that ignored the list is still refused.
-
-### Three deliberate refusals
-
-**`shadow` never fabricates a result.** It says plainly that the call was held
-and no result exists. A schema-conformant fake would be reasoned over as real,
-and every later decision built on an observation that never happened — a
-strange thing for a fail-closed runtime to ship, and worse than refusing.
-
-**An `ask` nobody can be asked takes its `on_timeout`, and that defaults to
-deny.** A gate nobody could answer has not been approved, and running the call
-because no client happens to be connected would make the policy a suggestion.
-Nobody can be asked when no A2A listener serves, or when the call belongs to
-work no caller owns — a schedule, a webhook, a subagent (a subagent's gate is
-unowned even under a caller's turn) — and `agent.ask_human_unowned` is not
-`gate`. The question is logged (`tool.policy.unanswerable`) so the operator
-learns what they were not asked. A rule that says `on_timeout: allow` runs the
-call and returns its real result; it never returns a success for a call that
-did not run. A policy `ask` also does *not* route through `agent.approval`,
-whose `auto` mode answers with a model judge — letting the agent approve the
-operator's own security gate: an addressed gate is never judged.
-
-**An argument guard that will not compile is exit 2.** Silently treating it as
-no-match turns a `deny` into an allow at exactly the moment it was meant to
-bite, so a build without the `cel` feature refuses the config rather than
-evaluating the guard to nothing.
-
-## The injection firewall
-
-The defense that does the real work is process isolation plus a distilled return. A
-subagent runs in its own process with its own context, and the parent appends only the
-child's distillate — never its transcript. A string result over `DISTILL_CAP` (8000
-bytes) is truncated back to a UTF-8 boundary (`subagents.rs::DISTILL_CAP`, `::distill`).
+agentd assumes three things about the parties it works with.
+
+**The model is untrusted input holding credentials.** Under a successful
+prompt injection, the agent loop emits tool calls an attacker chose, with the
+operator's authority. Treat an agentd process as potentially compromised and
+size the sandbox around it accordingly.
+
+**Everything an MCP server returns is untrusted.** That covers tool results
+and also what the protocol presents as metadata: a tool's name, description,
+input schema and annotations. A malicious server can put an injection in a
+description. agentd hands that metadata to the model as the tool catalogue and
+never lets it make a security decision: capability tags come from operator
+configuration only, and `readOnlyHint` and `destructiveHint` are hints, never
+gates.
+
+**Prompt injection is not patchable.** A guardrail that works 95% of the time
+is a failure in security terms. The defences here are structural: they bound
+what a compromised loop *can reach*, not what it *intends*. agentd ships no
+injection classifier and asks no model whether a text is safe.
+
+agentd trusts its own binary, the operating system and the operator's
+configuration. What arrives over the network cannot change that
+configuration, with one bounded exception: the operator-only `admin.set`
+command reaches exactly two paths, `agent.approval` (how closely a person is
+asked) and `a2a.introspection.enabled`. Every other path is refused with the
+list of what is settable, nothing is written to disk, and the next reload puts
+the file's value back. The model can never register an MCP server, edit an
+endpoint or name a binary to run.
+
+## Trust boundaries
+
+agentd splits the work across processes so that the process holding the
+operator's control is not the one running the agent's reasoning. The
+supervisor owns state, configuration, credentials, policies and every
+listener, and runs no agent loop. Each of the agent's turns runs in a turn
+worker process, and each subagent in its own process with its own context.
 
 ```mermaid
 flowchart LR
-  U["untrusted source<br/>web / mail / issues"] --> R["READER subagent<br/>untrusted_input<br/>own process"]
-  R -- "distillate, 8000 bytes max" --> P["PARENT<br/>appends the distillate only"]
-  P --> A["ACTOR subagent<br/>sensitive + egress<br/>no untrusted_input"]
-  A --> E["egress"]
-  R -.->|"raw bytes"| X["discarded on exit"]
+  OP["Operator configuration"] -->|"validated before any side effect"| SUP
+  subgraph tree["agentd process tree"]
+    SUP["Supervisor: state, listeners, policies"]
+    TW["Turn worker: one turn"]
+    SA["Subagent: own context"]
+  end
+  SUP -->|"context slice and tool plan"| TW
+  SUP -->|"spawn payload with narrowed grant"| SA
+  SA -->|"distillate, at most 8000 bytes"| SUP
+  TW -->|"prompt"| LLM["Model providers"]
+  TW -->|"tool calls"| MCP["MCP servers"]
+  SUP -->|"gated and workflow tool calls"| MCP
+  A2A["A2A callers"] -->|"principal resolved before the body"| SUP
+  WH["Webhook senders"] -->|"authenticated per route"| SUP
+  SUP -->|"durable records"| ST["Store"]
 ```
 
-Poisoned bytes live only in the reader's context and are gone when that process exits. The
-reader holds no sensitive tool, so it has no secret to encode into its summary. This is a
-trusted-planner / untrusted-data split realized as OS process isolation rather than taint
-tracking. The tree is flat by construction: a subagent is handed no in-child orchestration
-tools (`subagent/control.rs::NoSelfTools`), so it cannot spawn children in-process.
+Apart from the operator's configuration, everything that crosses into the
+tree is untrusted content: model output, tool results, A2A messages and
+webhook bodies. The controls on the rest of this page decide what that content
+can reach once it is inside.
 
-## Caller scopes
+## Capability scoping
 
-Internally there are four caller kinds (`registry::Caller`): root, workflow, subagent and
+An agent's authority is the set of tools its operator declared. agentd has 58
+internal tools (memory, artifacts, plans, subagents, workflows, asks and
+similar), listed by `agentd --capabilities`. Every *task* capability, such as
+reading a repository, sending mail or querying a database, comes from an MCP
+server the operator declared. Declaring a server is a trust decision
+equivalent to adding a dependency you call at your own privilege.
+
+Narrowing is set membership, not a policy language. It applies at two places:
+
+- A workflow `agent` step's `tools:` list filters the tool plan by pattern
+  (`*`, an exact name, or `prefix*`) before the worker sees the definitions.
+  Its `servers:` list is a cap: the step is offered the MCP tools of those
+  servers alone.
+- `subagent.run`'s `tools:` argument confines the child. The supervisor mints
+  it into the spawn payload as a grant, and the child filters both its
+  catalogue and its dispatch routing against it, so an excluded tool is
+  unreachable, not merely unadvertised. A caller-supplied `context` entry
+  cannot forge or widen the grant. Its `servers:` argument builds the payload
+  from those server specs only, so the child cannot dial the rest.
+
+> **Limit.** An unknown name in `subagent.run`'s `servers:` is dropped
+> silently. A typo yields a less capable child and no diagnostic.
+
+`agent.tools.internal`, `agent.tools.mcp` and `agent.tools.code` filter what
+the model *sees*. They are a catalogue filter, not the authorization check.
+Internal tools carry default grants by caller kind (root, workflow,
+subagent); the tiers are in the [reference section](#internal-tool-tiers).
+
+Callers from outside arrive over A2A as principals. A turn that a `user` or
+`agent` principal drives is held to that principal: tools that act on the
+whole instance are refused, and tools that name a run or a subagent act only
+on the principal's own. A principal's `grants` bound the command operations
+it may call; they do not bound what the model does in a conversation the
+principal starts. A natural-language message from a `user` drives a turn with
+the root tool plan, so to restrict which tools that turn may call for a given
+caller, write a [policy](#policies-a-verdict-on-each-call) that matches the
 principal.
-Grants only ever gate **internal** contracts — for MCP and code tools the check
-short-circuits to allowed for root and workflow callers, and for a subagent spawned without
-a `tools:` grant; a subagent that carries one is held to it for every tool class, MCP and
-code included (`registry/mod.rs::allowed`). MCP restriction otherwise happens through
-`agent.tools.mcp` selection and the per-spawn server subset, never through grants.
 
-| Tier | Callers | Examples |
-|------|---------|----------|
-| `ALL` | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `exec` |
-| `ROOT_WF` | root, workflows | `subagent.*`, `code.run`, `workflow.run` / `cancel` / `wait` |
-| `ROOT_ONLY` | root | `instruction.subscribe`, `workflow.create` / `update` / `delete` / `pause` / `resume` |
+## Tool tags and the Rule of Two
 
-`finish` is granted to root and subagents but not to workflows — a workflow terminates
-with the `finish` step kind instead.
+The trust budget is three tags the operator declares on each MCP server:
 
-A root turn is offered its tiers whoever drives it, so a turn that an A2A `user` or
-`agent` principal started — and a workflow step in a run one owns — is held to what that
-principal could do itself (`runtime/tools.rs::execute_tool_as`, `runtime/steps.rs`):
+| Tag | The tool… |
+|---|---|
+| `untrusted_input` | returns content from an uncontrolled source: web pages, inbound mail, issue text |
+| `sensitive` | reaches private data or privileged systems: a secret store, an internal database, a production control plane |
+| `egress` | can move data out or change external state: an HTTP POST, sending mail, opening a pull request |
 
-- a `ROOT_ONLY` tool is the instance's own control and is refused ("acts on the whole
-  instance and is not permitted for …"); only `workflow.pause` / `resume` naming a `run`
-  goes on, to the owner check below;
-- a tool that names a run or a subagent acts only on that principal's own, and anything
-  else is "no such run" / "no such subagent"; `workflow.list` and `workflow.status`
-  show only its own runs, and `subagent.list` only its own subagents;
-- `workflow.run` runs only what its grants and the default start's `roles:` allow, and
-  only from that default start.
+The *lethal trifecta* is all three in one agent: something that reads text an
+attacker wrote, can reach secrets, and can send data out. The **Rule of Two**
+is agentd's response: any two legs may sit together, all three may not. The
+budget is an OR across tools, never a count, so twenty `egress` tools are
+still one leg, and `sensitive` + `egress` together is allowed as long as
+nothing in the same grant reads untrusted input.
 
-The model acts with the principal as the rules name it now. The runtime knows the
-operator and every rule with a declared `id` from startup, and rebuilds that from the new
-rules on every reload of `a2a.principals`, so narrowing or removing a rule narrows work
-already in flight at once. A caller named only by its evidence (a certificate's CN, a
-device session) is known once it has made a request; until then, work it owns acts with
-no role and reaches only what it owns.
+Tags come from configuration only, and an unknown tag is a configuration
+error. Nothing the model or a server says feeds the check. Three properties of
+tags matter when you assign them:
 
-Callers from outside arrive over A2A, and what they are and may do is the
-[next section](#the-a2a-boundary). Two honest limits sit at the seam between the two.
-**A2A command-op limits bound command DataParts, not conversation:** a natural-language
-message from a `user` principal drives a root turn, and a root turn's tool plan is the
-root plan (`runtime/turns.rs::tool_plan`) — every MCP tool and every internal tool that is
-not instance-wide. What holds that turn to its caller is the instance-wide refusal and
-the ownership checks above, not the principal's `grants`: a caller whose grants reach no
-command op may still, in prose, have the model call any MCP tool the root plan holds.
-`security.policies` is the tool for that — a rule can match `principal: {role: user}` and
-deny or ask. And **the
-registry's per-contract role table is not the live one** — `registry/mod.rs::Grant`'s
-`roles` are read only by the `Caller::Principal` arm of `Registry::allowed`, which no
-production path constructs — so editing a contract's `user`/`agent` grant changes nothing
-for A2A.
+- **Tags are per server, not per tool.** The `tags:` map is keyed by glob, but
+  the keys are discarded and the union of every list applies to every tool of
+  the server. `{"send_*": [egress], "read_*": [untrusted_input]}` makes both
+  tools `untrusted_input` and `egress`. The only real split is one MCP server
+  per tag profile.
+- **An untagged server counts as `untrusted_input`**, the conservative
+  default.
+- **`tools.narrow.<tool>.tags` adds tags to one tool**, and can never remove
+  one. Those per-tool tags reach the [policy](#policies-a-verdict-on-each-call)
+  matcher, not the load-time Rule-of-Two check.
+
+### Where the check runs
+
+The check runs at two points over servers, both governed by the one
+`security.allow_trifecta` switch, and at a third over what reaches a run
+through a stream ([below](#outside-input-that-arrives-through-streams)).
+
+```mermaid
+flowchart TB
+  A["mcp.servers tags"] -->|"flattened per server"| B{"Server untagged?"}
+  B -->|"yes"| C["Counts as untrusted_input"]
+  B -->|"no"| D["Counts its declared tags"]
+  C -->|"into the fold"| E["Check 1 at load: every declared server"]
+  D -->|"into the fold"| E
+  E -->|"three legs"| F["Exit 2: the daemon never starts"]
+  E -->|"two or fewer"| G["Daemon runs"]
+  G -->|"subagent.run with servers"| H["Check 2: the requested subset"]
+  H -->|"three legs"| I["Error result; no child spawned"]
+  H -->|"two or fewer"| J["Child spawned"]
+```
+
+Check 1 runs inside configuration validation, the one authority that both
+startup and `agentd --validate-config` use, so the two never disagree. A
+refusal is exit 2, before any side effect:
+
+```text
+lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)
+```
+
+Check 2 runs when `subagent.run` is called, over the tags of the servers the
+child would get. It returns an error result the parent's model must adapt to.
+
+Because check 1 folds over every declared server, it is a whole-instance
+budget. An instance that declares an untrusted-input reader, a secrets server
+and an egress server does not start, even if you intend to hand each leg to a
+different subagent. Run that shape as separate agentd instances per risk
+profile, or set `security.allow_trifecta: true`, which relaxes every trifecta
+check at once. The `security` section is restart-only, so a hot reload can
+never widen the override.
+
+Two sources other than `mcp.servers` matter. A binary built with the `exec`
+feature and running with `security.exec.enabled` contributes `sensitive` and
+`egress` to the same fold. Tools an embedder registers in code sit outside the
+accounting entirely: they carry no tags, so an embedded tool that does egress
+or reads secrets is invisible to the check.
+
+> **Limit.** Using `security.allow_trifecta` emits no event. The refusal text
+> says "audited", but an allowed trifecta proceeds silently and the only trace
+> is the configuration value.
+
+## The service catalog and closed egress
+
+Tags being configuration leaves one hole: the author of a config, or of a
+subagent template, could point a server at the billing system and not write
+`sensitive`. The check would then reason soundly from a false premise. The
+`services:` catalog closes it. An entry binds an endpoint to authoritative
+tags, and any MCP declaration whose endpoint matches the entry gets those tags
+unioned in before the check runs, whether it references the entry or restates
+the endpoint inline. Under-tagging a catalogued endpoint is impossible rather
+than undetected. An entry also carries a tool ceiling (`allow`, `exclude`)
+that a consumer can narrow and never widen, and the one shared credential its
+consumers use.
+
+`security.egress: closed` turns the catalog from an authority into an
+allow-list. Every outbound dial agentd makes from configuration must then
+match an entry of the right `kind`, matched on scheme, host and a path prefix
+that ends on a segment boundary:
+
+| Surface | Entry kind | Checked |
+|---|---|---|
+| MCP servers, a subagent template's servers | `mcp` | at load, and again before each dial |
+| model endpoints, every `intelligence.providers` entry | `intelligence` | at load |
+| A2A peers | `peer` | at load |
+| HTTP store, workflow `url:` references | `http` | at load |
+| the `http` step | `http` | literal URLs at load; every URL again at the dial, where a matching entry's `methods` list is a ceiling |
+| stream `forward` webhook targets | `http` | at the forward; a refusal logs `stream.forward.refused` |
+| A2A push targets a caller registers | `http` | at registration |
+| `agent.instruction` from `url:` or `oci:` | `http` | before the fetch |
+
+An instance child inherits the closed setting. The built-in `mock:` model
+endpoint opens no socket and is exempt. There is deliberately no in-config
+exception list: the way to allow an endpoint is to catalog it, which is the
+reviewable event it should be.
+
+What closed egress does not bind:
+
+- `observability.otel.endpoint`. Telemetry export is operator plumbing, and
+  validation warns that closed egress does not cover it.
+- Credential plumbing: OAuth token and discovery endpoints, the AWS metadata
+  and STS endpoints, the AAuth Agent Provider and Person Server.
+- Anything a compromised MCP server, or a command the `exec` runner starts,
+  reaches on its own. Network policy at the host or cluster stays
+  complementary; the catalog is what makes those rules derivable.
+
+## Outside input that arrives through streams
+
+The two checks above judge servers. Neither sees text that reaches a run
+through a stream: a webhook route with `into:` appends whatever its caller
+posted, an A2A `a2a` start with `into:` appends a peer's message, and the
+workflow consuming the stream hands that text to an agent. A config whose
+servers are all tagged, one of them `sensitive` + `egress`, passes check 1 and
+could then feed a webhook body to the agent holding both. So agentd taints
+streams and judges the runs that read them.
+
+```mermaid
+flowchart LR
+  W["Webhook route with into"] -->|"adds untrusted_input"| S["Stream"]
+  P["A2A start with into"] -->|"adds untrusted_input"| S
+  E["MCP Events binding or grant"] -->|"adds the server's tags"| S
+  S -->|"stream or correlate start, wait on event"| R["Run"]
+  R -->|"workflow step, workflow.run, signal"| R2["Runs it starts or signals"]
+  R -->|"emit"| S2["Streams it feeds"]
+  R -->|"model-driven steps reach"| SV["Servers and tools"]
+  R2 -->|"model-driven steps reach"| SV
+  SV -->|"sensitive and egress too"| X["Refused: exit 2"]
+```
+
+**Producers taint a stream.** A webhook `into:` and an A2A `into:` add
+`untrusted_input`: a valid signature says who sent the text, not that it is
+safe to obey. A subagent template's `mirror_streams` adds `untrusted_input`,
+because the child's producers run in another process. An MCP Events binding
+or grant adds its server's tags, and `untrusted_input` when the server is
+untagged, since whoever can write into the watched upstream writes into the
+stream. An `emit` from a run that carries taint puts it on its target.
+
+**Runs carry what they read.** A run started from a tainted stream, or
+waiting on one, carries its tags. So does every run it starts: a `workflow`
+step, a workflow tool one of its agents calls, `workflow.run`, and
+`workflow.signal` (a signal reaches every workflow with a `signal` start or a
+`wait {on: signal}`).
+
+**The check.** Each such workflow is judged with its tags folded together with
+everything its model-driven steps can reach: an `agent` step's `servers:` (or
+every server without the list), a `subagent` step's template servers, any
+tool that hands text on (`subagent.run`, `subagent.send`, `message.send`,
+`workflow.run`, `workflow.signal`) and what that tool can reach, and `exec`.
+Every model-driven step of a run the outside text reaches is judged together,
+so a reader and an actor in one run, or an actor in a run the reader starts,
+are refused alike. The refusal names the workflow, the stream, what feeds it
+and the servers that brought the other two legs:
+
+```text
+workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook `into:` at workflow "intake" step "hook"); it is run by workflow "triage" step "reply" (through workflow.run), and its model-driven steps reach mcp server "mail" [sensitive, egress]: untrusted input + sensitive + egress in one run. …
+```
+
+A run that has to act on what it read does so with no model-driven step
+holding both other legs: read with a step that has no tools (`extract` is
+built for this), and act with a deterministic step (`mcp.tool`, `http`), whose
+target is fixed in the definition.
+[Harden a deployment](harden.md#keep-outside-input-away-from-the-actors) has
+a worked example.
+
+The check runs at `--validate-config` for inline definitions and those in
+local files and folders, and at startup and on every reload for the whole set
+once `url:` and `uri:` definitions resolve. A reload that moves anything the
+check reads re-judges every definition, the agent's stored ones included; a
+refused reload keeps the running configuration. A definition the agent writes
+is held to the same line: `workflow.create` and `workflow.update` refuse one
+that would complete the trifecta. A `wait` whose `on` is templated is refused
+at load, since rendered at dispatch it could listen on something the check
+never saw.
+
+A route's own run is the operator's call. A `webhook` or `a2a` start that
+fires a run directly, and a `wait {on: webhook}`, hand a caller's text to a run
+the operator opened on purpose; that run is not judged on its own reach. What
+such a run emits onto a stream is judged like `into:`.
+
+What the check does not follow:
+
+- **Deterministic steps.** `mcp.tool`, `http`, `a2a.send` and `a2a.delegate`
+  are not counted, because no model picks their target. Their *arguments* are
+  templated and can carry what a model that read the outside text produced.
+  Give that model an `output_schema` so what reaches the arguments is
+  constrained.
+- **Shared state.** Text a model writes to memory or an artifact is not traced
+  to whoever reads it.
+
+The telemetry taps (`observability.runtime_events` and an audit `stream`
+sink) are fed by every run, and their consumers are judged as any stream's
+consumers are. A workflow tool carries the taint of the run it starts, and
+the tools that read a result back carry the taint of every run, so a policy
+that matches `untrusted_input` sees them too.
+
+The check is coarse and static on purpose: per stream, not per value, and per
+server. It is a grant-level check, not data-flow tracking.
+
+## Results read back are withheld
+
+Taint flows forward into what a run starts. It also flows back, when a context
+reads a run's or a child's result. A context that holds both `sensitive` and
+`egress` and reads back a result carrying outside input would complete the
+trifecta, so the runtime answers it with the run's status and replaces the
+text with a marker that says why. It logs `readback.withheld`.
+
+```text
+output withheld: this run carries outside input (it consumes stream "inbox" (fed by webhook `into:` at workflow "intake" step "hook")); this conversation holds sensitive and egress tools
+```
+
+The output, result and error text are replaced, along with the opening of a
+child's instruction and a run's step outputs and variables. Status, ids and
+timings stay. Every path a result can be read back through is covered; the
+[reference section](#read-back-paths) lists them.
+
+**What a run carries is recorded, and only ever added to.** Each run and each
+child keeps a durable record of the outside input that reached it: from its
+definition's taint, from the run, child or peer that started or signalled it,
+from an A2A peer's own request, and from a stream event's record. A read is
+judged by that record together with the current definitions, which can only
+add. Deleting or replacing a definition, a restart, and a peer that has gone
+quiet all leave a result as withheld as it was; a run with no record left is
+taken to carry text from an origin no reader holds. A result is withheld only
+for text the reader was not already handed, so a route's own run reading back
+a child it started reads nothing new.
+
+**Holding a leg less, a context reads the text whole, and then carries it.**
+Its own result is withheld in turn from a reader holding both legs, and what
+it starts or feeds is judged as a run that read a tainted stream would be. So
+no read-back is refused at load. An operator reading a run over A2A is no
+model's context and reads it whole. `security.allow_trifecta` lifts the
+withholding with every other trifecta check.
+
+## The injection firewall
+
+The defence that does the most work is process isolation plus a distilled
+return. A subagent runs in its own process with its own context, and the
+parent appends only the child's result, never its transcript. A string result
+over 8000 bytes is cut back to a UTF-8 boundary.
+
+```mermaid
+flowchart LR
+  U["Untrusted source: web, mail, issues"] -->|"raw text"| R["Reader subagent: untrusted_input only"]
+  R -->|"distillate, 8000 bytes at most"| P["Parent: appends the distillate"]
+  P -->|"task"| A["Actor subagent: sensitive and egress"]
+  A -->|"call"| E["External system"]
+  R -->|"raw bytes"| X["Discarded when the reader exits"]
+```
+
+Poisoned text lives only in the reader's context and is gone when that
+process exits. The reader holds no sensitive tool, so it has no secret to
+encode into its summary. This is a trusted-planner, untrusted-data split
+realized as process isolation. The tree is flat by construction: a subagent is
+handed no orchestration tools, so it cannot spawn children of its own.
+
+## Policies: a verdict on each call
+
+Grants answer *may this caller reach this tool at all*, and they are name
+patterns. They cannot say "delete nothing outside `/tmp`" or "a person signs
+off before any egress-tagged call". `security.policies` is that layer: an
+ordered list of rules matched against the call itself. The first match wins,
+and no match is allow.
+
+A rule matches on any combination of the tool name (a glob), the tool's tags,
+the caller kind (`root`, `workflow`, `subagent`), the principal id (a glob,
+for calls made on a principal's behalf) and a CEL expression over the
+arguments. Conditions are ANDed, so adding one always narrows a rule. The
+verdict is `allow`, `deny`, `ask` or `shadow`.
+
+Policies run at one chokepoint every call passes, after the arguments are
+validated against the tool's schema, so a guard judges arguments that already
+conform. `tools.overrides` says **where** a call goes; a policy says
+**whether**.
+
+**An `ask` holds the call.** It parks the call and puts a question on a task,
+which turns `input-required`. `approve` runs the held call, its grant and
+arguments checked again, and the asker gets the call's real result. `deny`
+returns an error naming the rule. A timeout runs the call only when the rule's
+`on_timeout` is `allow`, and refuses it otherwise; `deny` is the default. A
+workflow step's gate is recorded durably with its question, its addressee and
+the held call, so a restart rebuilds it unweakened.
+
+**An `ask` is addressed.** It goes to the rule's `to:`, or to the operators
+when the rule names nobody. It never goes to the caller whose call is being
+judged, which would let the party the policy checks approve itself.
+
+**Every caller is covered.** A policy that held for root turns and not for
+subagents would be worse than none. A turn worker dials its own MCP tools, so
+any tool a rule might match is left out of its routing and served by the
+supervisor instead. A subagent connects to servers itself, so the supervisor
+names its gated tools in the spawn payload and the child routes those back up.
+The parent evaluates the policy again when the request arrives, so a child
+that ignored the list is still refused.
+
+Three refusals are deliberate:
+
+- **`shadow` never fabricates a result.** It says the call was held and no
+  result exists. A schema-conforming fake would be reasoned over as real.
+- **An `ask` nobody can answer takes its `on_timeout`**, which defaults to
+  deny. Nobody can be asked when no A2A listener serves, or when the call
+  belongs to work no caller owns (a schedule, a webhook, a subagent) and
+  `agent.ask_human_unowned` is not `gate`. The question is logged as
+  `tool.policy.unanswerable`.
+- **An argument guard that cannot be evaluated never becomes "no match".** A
+  guard that does not compile is exit 2 at load, a build without the `cel`
+  feature included. One that fails at call time refuses the call.
+
+Policies live in the restart-only `security` section.
+
+## Approvals and the judge
+
+`agent.approval` decides what happens to the asks the *agent* makes with
+`ask_human`. With `ask`, the default, a person decides. With `auto`, a model
+judge answers on the operator's behalf, conservatively, and the answer is
+marked as the judge's. With `accept`, the ask's recommended answer is taken,
+and an ask with no recommendation goes to the judge. `ask_human_fallback:
+auto` also hands an unanswerable ask to the judge.
+
+The judge runs on the model `intelligence.roles.approve` names. That role is
+operator-only: a served document cannot pick the judge of its own gates. On a
+decision model, a closed ask (an enum or boolean answer) is answered only
+above the role's `confidence`.
+
+Three rules bound the judge:
+
+- **A gate that names its decider is never judged.** An `ask_human` with
+  `to:`, and every policy `ask`, go to a person whatever `agent.approval`
+  says.
+- **No judge answers over outside input.** When the run, subagent or peer
+  conversation asking carries outside input, the ask fails with that reason
+  and agentd logs `human.judge.withheld`. A judge's answer is no more trusted
+  than what it reads.
+- **`admin.set` can change `agent.approval` at runtime**, and only the
+  operator can call it. The next reload puts the file's value back.
+
+**An addressee must be able to see the task.** A task is visible only to its
+owner and to operators, so a `to:` may name the task's owner (by leaving `to:`
+out) or an operator, narrowed by labels. A `to:` naming any other principal
+is refused at load, wherever it appears. An instruction document's
+`@human/<name>` gate goes to that human's `principal`, or to the operators;
+the human's `channel` is announced to clients and never widens who may answer.
+Work no caller owns gates on the listener only with `agent.ask_human_unowned:
+gate`. [Human in the loop](human-in-the-loop.md) covers the asking side.
 
 ## The A2A boundary
 
-The A2A listener is the one door into a running agentd, and [a2a.md](a2a.md) is the full
-account of what it serves. This section is the model it enforces, and the threat each piece
-answers.
+The A2A listener is the one door into a running agentd.
+[The A2A channel](a2a.md) explains what it serves; this section is the model
+it enforces and the threat each piece answers.
 
-### Who is calling: the evidence, in order
+### Who is calling
 
-Every request resolves to a **principal** — an id, a role and grants — from its headers
-and its connection, before a byte of its body is read
-(`a2a/principals/resolve.rs::Resolver::resolve`). Each kind of evidence decides only for
-itself, in this order:
-
-0. **A unix-socket peer** is the operator: the kernel admits only the daemon's own uid,
-   checked at accept.
-1. **A presented bearer** decides. A session token (`agentd_at_…`) is checked against the
-   listener's sessions and nothing else. Any other bearer, on a listener with a bearer
-   mechanism (`a2a.bearer`, a `bearer_ref` rule, or the device grant), names the operator
-   when it is `a2a.bearer`, and a rule's principal when it is that rule's `bearer_ref`. A
-   bearer that matches nothing is a `401`, never a fallback to what else the request
-   carried: otherwise "present any junk" would be as good as presenting nothing. A bearer
-   sent to a listener with no bearer mechanism at all is ignored.
-2. **A verified client certificate** takes the first `san`/`sub`/`any` rule it matches,
-   in the order written; it is the operator only while no rule exists at all, and nobody
-   (`403`) once one does.
-3. **An `any` rule** names whoever is left.
-4. **The implicit operator** ([below](#the-implicit-operator)).
-5. Anybody else is `401`.
-
-A rule with `role: anonymous` names nobody. Bearer secrets are compared in constant time
-(`sha.rs::ct_eq`). Session tokens, device codes and launch codes are 256 random bits, held
+Every request resolves to a **principal** (an id, a role and grants) from its
+headers and its connection, before any of its body is read. The evidence is
+consulted in a fixed order, and each kind decides only for itself: a
+unix-socket peer of the daemon's own uid is the operator; a presented bearer
+decides next, and one that matches nothing is `401`, never a fallback to what
+else the request carried; then a verified client certificate; then an `any`
+rule; then the implicit operator. Bearer secrets are compared in constant
+time. Session tokens, device codes and launch codes are 256 random bits, held
 only as their SHA-256 digest, in memory.
 
-**Principal ids are what work is owned by.** Every operator is `operator`. A `user` or
-`agent` is `<role>:<id>` when its rule declares `id` — required on `bearer_ref` and `any`
-rules, unique across rules — and otherwise, from its certificate, `<role>:cn=<CN>` or
-`<role>:san=<first SAN>`. The `=` is in neither the declared-id charset nor the approval-name
-charset, so a certificate whose CN equals a declared id or a device name can never inherit
-that principal's work. A device session is `user:<name>` ([below](#named-identities)).
+**Principal ids are what work is owned by.** A `user` or `agent` is
+`<role>:<id>` when its rule declares `id`, and otherwise `<role>:cn=<CN>` or
+`<role>:san=<first SAN>` from its certificate. The `=` is in neither the
+declared-id nor the device-name character set, so a certificate whose CN
+equals a declared id can never inherit that principal's work.
+
+A rule that matches a certificate's subject or SAN needs `a2a.tls.client_ca`:
+without it no certificate is verified, and the load refuses the rule. An
+`any` rule needs no CA.
 
 ### The implicit operator
 
-On a TCP listener **bound to loopback** (`127.0.0.0/8`, `::1`, `localhost`) with no
-`a2a.bearer`, no principals, no `client_ca` and no device grant, a request from a local peer
-that presents nothing **and carries no `Origin`** is the operator
-(`runtime/surface/auth.rs::listener_auth_of` decides the posture; step 4 of the resolver
-applies it). Being on the machine *is* the authorization there, and the load says so with a
-warning. What that means, and where it stops:
+On a TCP listener bound to loopback, with no `a2a.bearer`, no principals, no
+`client_ca` and no device grant, a local request that presents nothing and
+carries no `Origin` is the operator. Being on the machine is the
+authorization there, and the load says so with a warning. Where it stops:
 
-- **Every local account is the operator**, not only yours: plain `curl` from any uid on the
-  host. On a multi-user host use a unix listener, where the kernel checks the uid, or set
-  `a2a.bearer`.
-- **It needs the bind, not merely the peer.** On a wildcard or any other bind, a connection
-  from `127.0.0.1` grants nothing: a same-host reverse proxy relays every remote caller from
-  there.
-- **A browser is never the implicit operator.** A request carrying `Origin` — any value,
-  `Origin: null` included, which is what a `file://` page, a sandboxed iframe or a `data:`
-  URL sends — is refused `401`, with a body saying browser requests must authenticate. Any
-  page on any site can make the operator's browser POST to `127.0.0.1`, so a browser always
-  authenticates: with a session, a bearer or a certificate, even on a no-auth loopback
-  daemon.
-- **An `any` rule applies to browsers too, and can never carry the operator role** — the
-  load refuses `any` with `role: operator` (`config/settings/mod.rs::validate`). A page
-  that reaches an `any`-rule listener is that rule's principal and no more.
+- **Every local account is the operator**, not only yours: plain `curl` from
+  any uid on the host. On a multi-user host use a unix listener, where the
+  kernel checks the uid, or set a credential.
+- **It needs the bind, not merely the peer.** On a wildcard or other bind, a
+  connection from `127.0.0.1` grants nothing: a same-host reverse proxy relays
+  every remote caller from there.
+- **A browser is never the implicit operator.** A request carrying `Origin`,
+  any value, `Origin: null` included, is refused `401` with a body saying
+  browser requests must authenticate. Any page on any site can make the
+  operator's browser POST to `127.0.0.1`.
+- **An `any` rule can never carry the operator role.** The load refuses it.
 
-One caveat follows from the design. **A same-host reverse proxy or sidecar that relays to a
-loopback-bound listener, and strips `Origin`, makes every request it relays the operator**:
-the relayed request is local and presents nothing. Do not front a no-credential loopback
-listener with a proxy. Bind a routable address with credentials instead — the load demands
-them there — or configure a credential on the loopback listener.
+> **Warning.** A same-host reverse proxy or sidecar that relays to a
+> no-credential loopback listener and strips `Origin` makes every request it
+> relays the operator. Do not front such a listener with a proxy. Bind a
+> routable address with credentials, or configure a credential on the
+> loopback listener.
 
-### The posture follows a reload
+Through the implicit operator, anything that reaches the port without a
+browser, including a co-tenant process or an SSRF from another service in the
+same network namespace, is a full operator. That includes flipping
+`agent.approval` to `accept` with `admin.set`, after which the agent's own
+unaddressed asks answer themselves. Addressed gates and policy asks survive
+that flip. Configure a credential on any host you do not fully own.
 
-The rules and the posture they imply are **one value**: `Resolver::build` computes the posture
-from the same `a2a` section and keeps it, and a reload that changes `a2a.principals`
-rebuilds the resolver and swaps it whole (`runtime/reload.rs`). Every request takes one
-snapshot that answers both *who is this* and *what does this listener require*, so a reload
-can never pair new rules with an old posture; the card is built from the current settings on
-every read. A SIGHUP that adds the first rule to a no-auth loopback daemon ends the implicit
-operator, and puts the scheme on the card, at once. A reload whose rebuild fails keeps the old
-rules *and* the old posture. The runtime's view of who the model acts for moves in the same
-step, so narrowing or removing a rule narrows work already in flight. `a2a.bearer`,
-`a2a.listen`, `a2a.tls.*` and `a2a.device_grant` are restart-only.
+### Rules and posture move together
 
-### What a principal may do: the operator floor
+The principal rules and the posture they imply (whether the implicit operator
+applies, which schemes the card declares) are one value. A reload that changes
+`a2a.principals` rebuilds and swaps it whole, so a request is never judged by
+one set of rules under another set's posture. A reload that adds the first
+rule to a no-credential loopback daemon ends the implicit operator at once. A
+reload whose rebuild fails keeps the rules and the posture in force.
+Narrowing or deleting a rule narrows work already in flight. `a2a.bearer`,
+`a2a.listen`, `a2a.tls` and `a2a.device_grant` are restart-only.
 
-Every named role may call every core A2A method, on its own tasks; `anonymous` may call
-nothing. What a role reaches beyond that is a command op, and the op table — who may call
-each op, and which switch serves it — is the command extension's specification, published
-at [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command) from
-`docs/ext/command.md`, which a test holds to the very table the listener enforces. Its
-**floor** is the part that matters here: an `operator` op — `admin.*`, `auth.*`, `config`, `debug.events`
-and the reserved ops — answers to the operator role alone, before any grant is read. A `user`
-holding `grants: ["*"]` reaches none of them, and a rule whose `grants` name an operator-only
-op on a non-operator role is refused at load rather than left looking like a control it
-cannot reach. A name no row serves, and no loaded workflow declares, is `UNKNOWN_OP`.
+### The operator floor
 
-### Ownership, by principal id
+Every named role may call every core A2A method, on its own tasks; `anonymous`
+may call nothing. Beyond that a role reaches command operations, and the op
+table, published as the [command extension](https://agentd.dev/a2a/ext/command)
+specification, is the one the listener enforces. Its floor: an operator
+operation (`admin.*`, `auth.*`, `config`, `debug.events` and the reserved ops)
+answers to the operator role alone, before any grant is read. A `user` with
+`grants: ["*"]` reaches none of them, and a rule that grants an operator-only
+op to another role is refused at load.
 
-What a non-operator starts is its own, and ownership is recorded and compared **by principal
-id** — never by the credential or the session that presented it, so a person who signs in
-again under the same name finds what that name started:
+### Ownership
 
-- **Tasks.** A task is visible to its owner and to operators
-  (`a2a/tasks.rs::Task::is_visible_to`). Anyone else's is `-32001` "task not found", the same answer as a task that does not exist,
-  so ids cannot be probed.
-- **Runs, subagents and conversations on the A2A path.** `workflow.status {run}`,
-  `workflow.cancel`, `workflow.signal {run}`, `subagent.send`, `subagent.kill`,
-  `subagent.status {handle}`, `subagent.get` and `plan.get` act only on the caller's own
-  (`-32001` otherwise). An object nobody owns is the operator's.
-- **The same on the model path.** When a turn runs for a non-operator, the model's own
-  `workflow.cancel`, `workflow.signal` and `subagent.*` tools meet the same checks, and a
-  principal the runtime cannot place fails closed. A caller cannot reach through the model
-  what it cannot reach through the listener.
-- **`contextId` is the caller's own name.** A non-operator's `contextId` is never a key into
-  the runtime: it is bound, per principal, to a fresh key of the runtime's (`ctx-<32 hex>`),
-  so two callers who pick the same id — `root` included — hold two conversations, and neither
-  can join, read or charge the other's. A task always shows its owner the `contextId` the
-  owner used. An operator addresses conversations by the runtime's keys.
-- **Signals are scoped to their sender.** A signal a non-operator sends, over A2A or through
-  the model, wakes only runs that principal owns, starts only workflows it may run (and those
-  runs are its own), and never ends an instance's `lifecycle.until_signal` wait — that
-  attempt is logged `lifecycle.until_signal.refused` instead.
+What a non-operator starts is its own, compared by principal id, never by the
+credential or session that presented it:
 
-**A finished task is kept by one bound across every caller.**
-`store.retention.tasks.keep_last` counts all principals' terminal tasks together, so on a listener several callers share, one
-caller's finished tasks can push out another's, the operator's included. A task that settled
-less than 30 seconds ago and that nobody has read back yet is spared past `keep_last` and
-`ttl`, so a blocking `SendMessage` always gets its own answer; after that, or once it has been
-read, it goes. On a multi-tenant listener bound retention with `ttl` — each task's own age —
-rather than `keep_last` alone.
+- **Tasks** are visible to their owner and to operators. Anyone else's task is
+  `-32001` "task not found", the same answer as a task that does not exist, so
+  ids cannot be probed.
+- **Runs, subagents and conversations** reached over A2A act only for their
+  owner. An object nobody owns is the operator's.
+- **The model path matches the listener.** When a turn runs for a
+  non-operator, the model's own `workflow.cancel`, `workflow.signal` and
+  `subagent.*` tools meet the same ownership checks. A caller cannot reach
+  through the model what it cannot reach through the listener.
+- **`contextId` is the caller's own name.** It is bound, per principal, to a
+  fresh runtime key, so two callers who pick the same id hold two
+  conversations, and neither can read or charge the other's.
+- **Signals are scoped to their sender.** A non-operator's signal wakes only
+  runs it owns, starts only workflows it may run, and never ends an
+  instance's `lifecycle.until_signal` wait.
 
-### A child instance must be able to sign in to its parent
+> **Limit.** `store.retention.tasks.keep_last` counts every principal's
+> finished tasks together, so on a shared listener one caller's tasks can
+> push out another's. A task that settled less than 30 seconds ago and has not
+> been read is kept past the bound, so a blocking `SendMessage` always gets
+> its answer. On a multi-tenant listener bound retention with `ttl`.
 
-An instance-tier subagent reports home over a `parent` peer. When the parent's listener is TCP,
-is not in the implicit-operator posture (read from the current settings at spawn, so a
-principals reload counts), and the `parent` peer entry would carry no authorization header, the
-spawn is refused before anything is created — "the child cannot authenticate to its parent:
-make a2a.bearer a {{secret:…}} reference or use a unix listener" — and logged
-`instance.spawn.refused` (`runtime/instances.rs`). The alternative is a child that runs its
+An instance-tier subagent reports to its parent over a `parent` peer. When the
+parent's listener is TCP and requires a credential (it is not in the
+implicit-operator posture), and the peer entry would carry no authorization
+header, the spawn is refused before anything is created and logged
+`instance.spawn.refused`, with the remedy: make `a2a.bearer` a secret
+reference, or use a unix listener. The alternative is a child that runs its
 work and then has every report refused.
 
 ### Browsers
 
-**CORS admits exact origins.** A request carrying `Origin` — to `POST /` or any `/oauth2/*`
-endpoint — is served only when that origin is listed in `a2a.cors.origins`, compared as a
-parsed origin (scheme, host, port with its default). `Origin: null` and an unparsable value
-never match; `*` is refused at load; a UI served from loopback must be listed like any other.
-A refused origin is `403` with no CORS headers, before the body is read, and never counts
-against the [source limiter](#failed-credentials-the-source-limiter). The one origin admitted
-unlisted is the UI `agentd ui` launched — `http://127.0.0.1:<port>` of the socket the
-launcher bound — for that process only: it is not configuration, and no settings dump shows
-it. **Admission is not trust**: an admitted page still authenticates.
+**CORS admits exact origins.** A request carrying `Origin`, to `POST /` or to
+any `/oauth2/*` endpoint, is served only when that origin is listed in
+`a2a.cors.origins`, compared as scheme, host and port. `Origin: null` never
+matches, `*` is refused at load, and a refused origin is `403` before the body
+is read. The one origin admitted unlisted is the UI that `agentd ui` launched,
+for that process only. **Admission is not trust**: an admitted page still
+authenticates.
 
-**The Agent Card is public.** `GET /.well-known/agent-card.json` answers every origin with
-`Access-Control-Allow-Origin: *` and never with credentials; it holds nothing a stranger may
-not read. The private-network preflight grant goes only to listed origins.
+**The Agent Card is public.** It answers every origin and holds nothing a
+stranger may not read.
 
-**Web credentials live in the tab.** The web UI keeps its session token in `sessionStorage`
-only — this tab, this visit — bound to the endpoint it was issued for, so a page opened
-against another endpoint finds nothing to send; `localStorage` remembers the endpoint and the
-layout and nothing else. The TUI keeps its token in memory. The `agentd-ui` server holds no
-credential and reads none from its environment or a URL; the page takes one thing from its own
-URL, a single-use [launch code](#the-launch-grant-threat-model) in the fragment, and removes it
-before its first request.
+**Web credentials live in the tab.** The web UI keeps its session token in
+`sessionStorage`, bound to the endpoint it was issued for, and the terminal UI
+keeps its token in memory. The `agentd-ui` server holds no credential.
 
 ### Failed credentials: the source limiter
 
-A presented credential that fails — a bearer or session token that names nobody, a
-certificate no rule gives a role — counts against its **source**: an IPv4 address, or an IPv6
-/64, because one host is routinely handed a whole /64 (`a2a/serve/limits.rs`). A source may
-fail 20 times, forgiven one every 3 seconds; 4096 sources are tracked, the least recently seen
-dropped. **The limiter throttles guesses, not callers:**
+A presented credential that fails (a bearer or session token that names
+nobody, a certificate no rule gives a role) counts against its **source**: an
+IPv4 address, or an IPv6 /64. A source may fail 20 times, forgiven one every
+3 seconds. **The limiter throttles guesses, not callers:**
 
-- **Only failures count.** An origin refusal is never counted — it costs nothing and guesses
-  nothing, and counting it would let any web page lock the local console out — and neither is
-  a request that presents nothing, or the refusal of a caller who did authenticate.
-- **Past the limit, a source's bearers are refused `429` before they are checked.** A limiter
-  that still checked each guess would slow nobody down; it would only turn a wrong guess's
-  `401` into a `429` while a right one sailed through at full speed. That refusal is not
-  itself counted.
-- **What presents nothing is never refused by it** — the implicit operator, an `any` rule —
-  and neither is a client certificate, proven in the handshake and not guessable. A unix peer
-  has no source.
-- **A live session token is checked, and served.** The launched console and every signed-in
-  device present one, from `127.0.0.1` for a local console, so refusing it unchecked would let
-  any local process — or a page on an admitted origin — keep the operator's console at `429`
-  with a trickle of junk bearers. A session token is 256 bits agentd minted, not a secret
-  someone chose, so answering it "valid, or `429`" gives a guesser nothing to use; a session
-  token that names nobody is still refused `429` unchecked.
+- **Only failures count.** An origin refusal is never counted (any web page
+  could otherwise lock the local console out), nor is a request that presents
+  nothing.
+- **Past the limit, a source's bearers are refused `429` before they are
+  checked.** A limiter that still checked each guess would only turn a wrong
+  guess's `401` into a `429` while a right one went through.
+- **A live session token is still checked and served.** A session token is 256
+  bits agentd minted, so answering "valid, or `429`" gives a guesser nothing,
+  and a trickle of junk bearers from `127.0.0.1` cannot keep the operator's
+  console out.
 
-The residual is stated plainly. A client presenting a *configured* bearer (`a2a.bearer`, a
-`bearer_ref` rule) that shares a source with a failing one — behind one NAT, on the same host,
-or behind the same reverse proxy, where every caller is the proxy's address — is refused until
-the source drains, at one failure per 3 seconds. And a
-browser sends a bearer only from a page on an origin the listener admits, so only an
-allow-listed origin's page can make a browser spend the local console's budget.
+The residual: a client presenting a *configured* bearer that shares a source
+with a failing one (behind one NAT, on one host, or behind one reverse proxy)
+is refused until the source drains. Refusals a stranger can provoke for free
+are logged once per source and reason per minute, with a count of what the
+window left out.
 
-Refusals a caller can provoke for free — no credential, a bad one, a throttled source, a
-rate refusal, and any refusal of a principal only an `any` rule named — are bounded in the
-log too (`limits.rs::DenialLog`): one `a2a.denied` line per source and reason per minute,
-carrying a `suppressed` count of what the previous window left out, under a global budget of
-20 lines plus one a second. Any other refusal of a principal a credential named — a method or
-an op its role does not reach — is logged every time.
+### The device grant
 
-### The device grant: threat model
+With `a2a.device_grant.enabled`, the listener origin is an OAuth 2.0
+authorization server for the RFC 8628 device flow, and a person signs a
+terminal or browser in without any credential of the daemon's being copied
+into it. Approving needs an operator credential, and the load refuses the
+grant without one, beside `client_ca`, and on a unix listener.
 
-With `a2a.device_grant.enabled`, the listener origin is an OAuth 2.0 authorization server for
-the RFC 8628 device flow, and a person signs a terminal or a browser in without any credential
-of the daemon's being copied into it ([a2a.md](a2a.md#the-device-authorization-grant) has the
-endpoints and the flow). The grant needs an operator credential to approve with — `a2a.bearer`,
-or an operator rule matched by `bearer_ref` — and the load refuses it otherwise; it is refused
-beside `client_ca` and on a unix listener.
+**Brute force.** The device code a client polls with and the session token it
+gets are each 256 random bits. The user code names a request to the approver
+and is never presented by the client, so guessing one buys nothing. Token
+polls are bounded per source, and a guessed session token is a bearer the
+source limiter throttles.
 
-**Brute force.** Nothing a client presents is small enough to guess. The device code a client
-polls with and the session token it gets are each 256 random bits. The user code (eight letters
-from a twenty-consonant alphabet) names a request to the approver and is never presented by the
-client, so guessing one buys nothing. Token polls are bounded per source (30, then one a second),
-a client polling faster than its interval is told `slow_down`, and a guessed session token is a
-bearer, which the source limiter throttles.
+**Remote phishing** (an attacker starts a sign-in and talks an operator into
+approving its code) is the device flow's known weakness, and approval is built
+to make it hard:
 
-**Remote phishing** — an attacker starts a sign-in on its own machine and talks an operator into
-approving its code — is the device flow's known weakness, and approval is built to make it hard:
+- approving is an operator command (`auth.device.approve`), never a page a
+  link can take someone to;
+- `auth.device.pending` shows each waiting request's peer address,
+  `client_id`, scope and age, so an operator approves only a code they watched
+  a client they recognise display;
+- a session is a `user` unless the operator approves `scope: operator` and
+  `a2a.device_grant.scopes` lists it; an approver may narrow a request, never
+  widen it, and `agent` is never grantable;
+- a mistaken approval is ended by its session id, and revoking never deletes
+  what the principal owns.
 
-- approving is an operator act over the command extension (`auth.device.approve`), never a page
-  a link can take someone to — `GET /oauth2/device` is fixed text that approves nothing;
-- `auth.device.pending` shows each waiting request's peer address, `client_id`, scope and when
-  it was asked, so an operator approves only a code they watched a client they recognise
-  display;
-- a session is a `user` unless the operator explicitly approves `scope: operator` *and*
-  `a2a.device_grant.scopes` lists it; an approver may narrow a request, never widen it, and
-  `agent` is never grantable;
-- a mistaken approval is ended by its sid, and revoking never deletes what the principal owns.
+**Per-source limits.** A source may ask for 5 codes, then one every 12
+seconds, and hold 4 waiting; one network holds at most 16 and the whole table
+64. Behind a reverse proxy every caller is one source and shares those
+budgets.
 
-**Per-source limits.** Per source, a client may ask for 5 codes and then one every 12 seconds,
-and may hold 4 waiting; one network (an IPv6 /48; for IPv4, the address itself) may hold 16, and
-the whole table 64. At the global bound a newcomer is still admitted by retiring the oldest code
-of the network holding the most, as long as that network holds at least two more than the
-newcomer's. So 16 IPv4 addresses fill the table without keeping anybody out; a party holding one
-waiting code in each of 64 separate networks does keep newcomers out (`429`) until its codes
-expire at `code_ttl`. Users behind one NAT are one source and share its buckets and caps, and
-**behind a reverse proxy everything is one source**: every caller shares 5 codes, 4 waiting and
-one failure budget.
+**Revocation reaches open work.** A revoked or expired session's streams end
+and its blocking waits answer `401` within a tenth of a second.
 
-**Stream revocation.** A session is checked on every request and while its requests are in
-flight: revoked — by `auth.sessions.revoke`, `POST /oauth2/revoke` or expiry — its open streams
-end, and its blocking waits answer `401` `invalid_token`, within a tenth of a second, and the
-observation feed says goodbye with reason `revoked`. The check is by **sid**, so a sibling
-session of the same name keeps working.
+**Session tokens have their own prefix.** They start with `agentd_at_`, and a
+bearer with that prefix is checked against the sessions and nothing else, so
+a configured `a2a.bearer` or `bearer_ref` secret that starts with it, or that
+equals another configured secret, is refused when the listener builds its
+rules. `a2a.device_grant.rate` bounds requests per signed-in name; operators
+are exempt.
 
-**Session rate, and the reserved prefix.** `a2a.device_grant.rate` admits one token per request
-from a session principal, one bucket per principal id, so every session of one name shares it;
-operators, including operator sessions, are exempt. Session tokens start with `agentd_at_`, and
-a bearer carrying that prefix is checked against the sessions and nothing else, so no configured
-secret may use it: an `a2a.bearer` or `bearer_ref` secret that starts with it — or that equals
-`a2a.bearer` or another rule's secret — is refused when the listener builds its rules, at start
-and at a principals reload. There are no refresh tokens, and a restart revokes every session.
+**Named identities.** An approval names the person (`user:<name>`), and the
+operator vouches for the name. Sessions sharing a name are one principal by
+design, so approving a new person under a name already approved hands them
+its history; the approval answer says `existing: true` in that case. Names
+that spell other parties (`operator`, `anonymous`, `unknown`,
+`launcher`, `runtime`, `system`) are refused. The durable store keeps a
+registry of every declared rule id and approved name, so a device name and a
+`user` rule id never share a principal across restarts and rule removals, for
+as long as the store persists. There are no refresh tokens, and a restart
+revokes every session.
 
-#### Named identities
+### The launch grant
 
-**The operator vouches for the name.** `auth.device.approve` requires `as`, a lowercase name
-(`^[a-z0-9][a-z0-9._-]{0,63}$`), and the session's principal is `user:<name>`; nothing checks the
-name against the person but the operator approving it. **Sessions sharing a name are one
-principal**, by design: they share its tasks, runs, subagents and conversations, one rate bucket
-and one status scope, so a person's history survives signing in again and token expiry. The
-flip side: approving a new person under an old name hands them its history, and the approval
-says so — its answer carries `existing: true` when the name was approved before. Revoking one
-sid ends only that session; `{name}` ends every session of the name. The names `operator`,
-`anonymous`, `unknown`, `launcher`, `runtime` and `system` are refused, because each already
-spells another party in the audit trail.
+`agentd tui` and `agentd ui` run the daemon and one display client as one
+command, and sign the client in without handing it any credential the daemon
+was configured with.
 
-**One namespace across time.** A `user`-role rule id and a device name both spell `user:<x>`,
-and ownership is persisted by principal id, so the durable store keeps an identity registry
-(`runtime/identities.rs`): every declared `user`- or `agent`-role rule id is recorded at listener
-spawn and at every principals reload that applies, and every approved name at approval. An approval of a name
-any rule declares now, or one a `user`-role rule ever declared, is refused; a start (exit `2`) or a reload
-(the old rules stay) that declares a `user`-role id already approved as a device name is refused
-and logged `identity.collision`. So a device name and a rule id never share a principal across
-restarts, token expiry and rule removal — for as long as the store persists; a memory store
-persists no ownership either. There is no command that releases a recorded name.
+- **What the launcher never passes**: not `a2a.bearer` and not a resolved
+  config secret, by argv, environment, file or HTTP. The client's environment
+  is the launcher's minus every variable the config loader reads, every
+  referenced `{{secret:NAME}}`, and `AGENTD_BEARER`.
+- **The code** is minted in the daemon's own process; no operation, route or
+  configuration key mints one. It is 256 random bits, single-use, valid 60
+  seconds, bound to its client and to the launched UI's origin (or to the
+  absence of `Origin` for the terminal UI), and redeemable only from a
+  loopback peer. A presentation from an origin the listener does not admit is
+  `403` and spends nothing; every other wrong presentation burns the code with
+  the same `400`, so a stolen code can at most be spent.
+- **Delivery**: to the terminal UI over an inherited pipe; to the web UI in a
+  `0600` file in a fresh `0700` directory, opened with the desktop's opener,
+  which receives the file path and never the URL. The code travels only in
+  the URL fragment, which a browser never sends over HTTP, and the page strips
+  it before any request. A later browser tab is approved by the person typing
+  a short code at the launcher's terminal.
+- **The session is the operator's**, because the person who ran the launcher
+  started this daemon from their own configuration. A web session lives 8
+  hours at most, a terminal session as long as the launcher.
 
-### The launch grant: threat model
+Any local process can ask for a browser sign-in from the launched UI's
+origin, and at 16 waiting requests the oldest is retired, so a local flood can
+make the real tab ask again. It cannot get a request approved: approval is the
+person at the launcher's terminal typing the code the tab shows.
 
-`agentd tui` and `agentd ui` run the daemon and one display client as one command, and sign the
-client in without handing it any credential the daemon was configured with
-([interface.md](interface.md#launcher) is the user's view; [a2a.md](a2a.md#the-launch-grant) the
-wire).
-
-**What the launcher never passes.** Not `a2a.bearer`, and not a resolved config secret — by argv,
-environment, file or HTTP. The client's environment is the launcher's own minus every variable
-the config loader reads (every spelling of every path it binds), every `{{secret:NAME}}` the
-loaded settings reference, and `AGENTD_BEARER` (`agentd-cli/src/launcher.rs::client_env`).
-
-**The code.** The only credential the launcher hands out is a launch code, minted in the daemon's
-own process — there is no op, route or configuration key that mints one or approves a request.
-It is 256 random bits (`agentd_lc_…`), single-use, valid 60 seconds, bound to its client and to
-the launched UI's origin (`agentd ui`) or to the absence of any `Origin` (`agentd tui`), and
-redeemed at `/oauth2/token` with the grant type
-`https://agentd.dev/oauth/grant-type/launch`, only from a loopback peer. The order at the wire
-matters: the origin gate runs first, so a presentation whose `Origin` is not admitted —
-`Origin: null` included — is `403` and spends nothing. A presentation that reaches the grant
-spends the code whatever its answer: an unknown, spent or expired code, a bind that does not
-match (an admitted origin other than the code's, or any `Origin` on a TUI's code) and a wrong
-`client_id` all get the same `400` `invalid_grant`, so a stolen code can at most be burned.
-
-**Delivery.**
-
-- **`agentd tui`**, always, whatever the listener's posture: over a pipe the TUI inherits as fd 3.
-- **`agentd ui`**: in a 0600 launch file in a fresh 0700 directory under `$HOME`
-  (`agentd-launch-XXXXXX`; `$XDG_RUNTIME_DIR` when `$HOME` is unset), opened with the desktop's
-  opener, which is given the file's path and never the URL — a process's argv is readable by
-  every user. The file is deleted the moment the code is spent, after 60 seconds, and at exit.
-  With `--no-open`, or when the opener fails, the URL is printed on the launcher's terminal
-  instead, never in the daemon log. Either way the code travels **only in the URL fragment**
-  (`#launch=…`), which a browser never sends over HTTP, and the page strips it before it makes
-  any request.
-- **Every later browser sign-in is approved at the launcher's terminal.** A tab asks
-  `POST /oauth2/launch_authorization` — only from the launched origin and a loopback peer — and
-  shows a short code; the person types it at the launcher's terminal, which approves exactly
-  that request. Another web origin cannot start one, and another local process can start one
-  but cannot make the person type its code.
-
-**Descriptor hygiene.** Every descriptor the launcher creates — the pipe, the UI's socket, the
-saved terminal, the daemon log — is close-on-exec, and the one a client is meant to have reaches
-fd 3 only in that client, between fork and exec. So no process the daemon spawns — the `exec`
-tool, an instance, a subagent — inherits the operator's terminal, the pipe or the UI socket.
-A descriptor agentd's own parent left open reaches none of its children either, by two rules.
-At start, before it opens anything, every process of the agentd binary — the launcher, the
-daemon, a subagent or instance re-exec — marks close-on-exec each descriptor it inherited beyond
-its stdio. And every child the daemon spawns — the `exec` tool's command, a subagent, an instance —
-has every descriptor from 3 up marked close-on-exec in the child, between fork and exec, so it
-keeps only its stdio whether agentd runs as its own binary or embedded in another's; the host's
-own descriptors are left as they are. The marking is one `close_range` call on Linux 5.11+.
-Where an older kernel or a seccomp profile refuses it, and off Linux, a process marks what
-`/proc/self/fd` (`/dev/fd` off Linux) lists, and without `/proc` (agentd as PID 1 in a bare
-container) tries each number below its descriptor limit, capped at 65536. A child between fork
-and exec may not read a directory, so it always tries each number below a bound its parent chose
-before the fork: the limit, capped at 65536, or — when the limit is higher — just past the highest
-descriptor `/proc/self/fd` lists. With neither `close_range` nor `/proc` and a limit above the
-cap, higher numbers stay unmarked, and one `process.inherited_fds_unmarked` warning on stderr
-says so: at start in the agentd binary, and at the first such spawn in any process, embedded or
-not.
-
-**The session is the operator's.** It acts for the person who ran the launcher, who started
-this daemon in-process from their own configuration and credentials — and, on a no-auth
-loopback daemon, is already the implicit operator from any non-browser process. A lower role
-would protect nothing from that person and would break the console's operator functions. A
-`ui` session lives 8 hours at most; a `tui` session as long as the launcher. Both end with the
-launcher's process and are revocable like any session: `auth.sessions.revoke {sid}`, or the
-page's `/disconnect`, which revokes its own token.
-
-**Failure limiting throttles failures, not callers.** A launch exchange never draws from the
-device grant's buckets. Only `invalid_grant` answers count, per source (20, forgiven one every 3
-seconds); past the limit only a *failing* presentation is refused `429`, and a live code or an
-approved request is always honoured — so a flood of junk from `127.0.0.1` cannot keep the real
-client out, and the session it buys is served through the listener's own limiter
-([above](#failed-credentials-the-source-limiter)) however far over it the source is.
-
-**Availability against same-host processes.** Any process on the host can ask
-`/oauth2/launch_authorization` from the launched UI's origin; at 16 waiting requests the oldest
-is retired, so a local flood can make the real tab start its request again. It cannot get any
-request approved: approval is the person at the launcher's terminal typing the code the tab
-shows. There is no rate bucket on it, deliberately — every presenter, the real tab included, is
-`127.0.0.1`, so a bucket would lock the tab out exactly as the flood does.
-
-**Why it opens none of the obvious holes.** No credential is served over HTTP: `agentd-ui`
-holds none, and the code reaches the browser only through a 0600 file or the owner's terminal.
-No credential is ever in a query string: the page takes the code from the fragment, exchanges it
-only with the endpoint its own server names, and the session token never appears in a URL. And
-the browser is not an implicit operator: the tab authenticates with a session no other origin
-can obtain — origin binding and CORS, and for a later tab the terminal's approval — while CORS
-admission of the launched origin grants nothing by itself.
-
-**Residual risk, stated plainly.**
-
-- **Other local users** cannot read the launch file, the pipe, the terminal or the pre-bound UI
-  port. But on a no-auth loopback TCP daemon every local uid is already the implicit operator
-  through plain `curl`, so these protections matter on a protected daemon; on a multi-user host
-  use a unix listener or `a2a.bearer`.
-- **Same-uid processes are equivalent to the user** — agentd's own model-driven `exec` and
-  instance children included. Within the 60-second window one could read the launch file, or
-  `/proc/<tui>/fd/3`. Descriptor hygiene, deletion on consumption and loopback-only redemption
-  shrink that window; they do not close it.
-- **Browser history**, and history sync, may record the `#launch=` URL before the page strips it.
-  That is harmless: the code is single-use and spent within seconds.
-- **The environment scrub** covers `a2a.bearer` and resolved config secrets, not credentials
-  that code other than the loader reads (the implicit `AWS_*` chain), and a same-uid child can
-  read `/proc/<ppid>/environ` anyway.
-- **A same-host proxy** that relays to the listener makes remote requests loopback peers, as it
-  does for the [implicit operator](#the-implicit-operator); the launcher refuses a non-loopback
-  endpoint, but it cannot see a proxy in front of a loopback one.
-
-### Human gates: who may answer
-
-When the agent needs a person — `ask_human`, a workflow `human` step, a `security.policies`
-gate — the task turns `input-required`, and whoever may see the task may answer it. An addressee
-narrows that: a gate's `to:` names who must answer, and a gate that names one is never answered
-by the model judge whatever `agent.approval` says.
-
-**An addressee must be able to see the task**, and a task is visible only to its owner and to
-operators. So `to:` may be absent — the question goes to the task's owner, or, for a policy gate,
-to `{role: operator}` — or name an operator. A `to:` that names any other principal is refused
-at load (exit `2`, and a reload is refused), naming the principal and saying it could never see
-the task. The rule holds wherever a question is addressed with `to:`, a workflow's `human` step
-included. An instruction document's `@human/<name>` is held to it too: the gate goes to that
-`::!human`'s `principal`, or to the operators when it names none, and the human's `channel` is only
-announced (`human.asked`, the task's `askChannel`), never consulted, so a channel cannot widen who
-answers. A `to:` anywhere else cannot name a channel at all. The channel is bound to the definition
-the document loaded: `workflow.create` and `workflow.update` cannot write under the document's
-workflow name (a configured name is refused), and a definition they write under any other name
-carries none. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
-with `agent.ask_human_unowned: gate`.
+Residual risks, stated plainly: same-uid processes are equivalent to the user
+and could read the launch file or the pipe inside the 60-second window; the
+environment scrub covers resolved config secrets, not credentials other code
+reads (the implicit `AWS_*` chain); and a same-host proxy in front of a
+loopback listener makes remote requests look local, which the launcher cannot
+see.
 
 ### The remote posture
 
-On a host you do not fully own, or anywhere a listener is reachable off the machine, the posture
-is **TLS plus `a2a.device_grant`, approved by an operator credential**: an `https://` bind with a
-certificate, `a2a.bearer` held by whoever approves — off loopback the listener needs it (or
-`client_ca`), so an operator `bearer_ref` rule alone does not load — and every
-person signed in under a name they are accountable for. The load enforces the edges: a
-non-loopback bind needs `a2a.bearer` or `a2a.tls.client_ca`, plaintext is loopback-only, a
-wildcard bind needs `a2a.url`, and the device grant needs the operator credential. `client_ca`
-instead makes a client certificate mandatory for every caller, bearer-only and browser clients
-included, which is why the device grant refuses to load beside it.
+Anywhere a listener is reachable off the machine, the posture is **TLS plus
+the device grant, approved by an operator credential**: an `https://` bind
+with a certificate, `a2a.bearer` held by whoever approves, and every person
+signed in under a name they are accountable for. The load enforces the edges:
+a non-loopback bind needs `a2a.bearer` or `a2a.tls.client_ca`, plaintext is
+loopback-only, and a wildcard bind needs `a2a.url`. `client_ca` instead makes
+a client certificate mandatory for every caller, bearer-only and browser
+clients included, which is why the device grant refuses to load beside it.
 
 ## The exec runner
 
-agentd runs no local code by default. The `exec` tool exists as a contract, but a local
-runner materializes only when the `exec` cargo feature and `security.exec.enabled` are both
-true (`registry/mod.rs::Registry::build`); otherwise `exec` is `Impl::MappingOnly`, which
-fails `is_available()` and routes nowhere — unavailable for every caller including operator.
-The dispatch arm itself is `#[cfg(feature = "exec")]`, so a default binary answers "no
-built-in implementation". Map the contract onto an MCP server with `tools.overrides` and the
-command runs in that server's sandbox instead.
+agentd runs no local command by default. The `exec` tool exists as a
+contract, but a local runner exists only when the binary is built with the
+`exec` feature **and** `security.exec.enabled` is true. The release binaries
+and the published image do not include the feature. Otherwise `exec` is a
+mapping-only contract: map it onto an MCP server with `tools.overrides` and
+the command runs in that server's sandbox instead.
 
-Watch the tag weight when you do. `Registry::build` stamps `exec` `sensitive` + `egress`,
-and those per-tool tags are what the `security.policies` engine matches on —
-`Registry::tags_of` is read by `runtime/tools.rs::apply_policy`, by the turn-worker routing
-split (`runtime/turns.rs::tool_plan`) and by the subagent `gated_tools` mint
-(`runtime/subagents.rs::subagent_run`) — while an override replaces them wholesale with
-the serving server's tags (`registry/mod.rs::apply_override`). What actually reaches the
-trifecta budget is the config-side contribution above: two legs when the local runner is
-built *and* enabled, and otherwise whatever the MCP server you mapped it onto declares.
-Mapping `exec` onto an untagged server moves the blast radius off-box and files it as
-`untrusted_input`.
+Watch the tags when you do. The built-in runner contributes `sensitive` and
+`egress` to the Rule-of-Two fold. Mapped onto a server, `exec` takes that
+server's tags, and an untagged server files it as `untrusted_input`.
 
-```yaml
-security:
-  exec:
-    enabled: true
-    allow: [git, ls, cat]     # argv[0] allow-list; EMPTY = deny everything
-    workdir: /workspace       # mandatory; a requested cwd must resolve inside it
-    timeout: 30s              # a longer requested timeout is clamped down
-    max_output: 1048576       # 1 MiB cap on captured stdout+stderr
-    env: [PATH, HOME]         # the ONLY variables the child receives
-```
+The runner's guards, each re-checked from live settings on every call, are
+[listed below](#exec-guards): argv without a shell, an exact allow-list on
+`argv[0]` where an empty list runs nothing, a mandatory working directory
+that a requested `cwd` must resolve inside, a timeout a request can shorten
+but never extend, an output cap, and an environment rebuilt from a named list.
+Every run logs `exec.run` with the command, argument count, directory,
+timeout and caller, never the output.
 
-| Guard | Behaviour | Why |
-|-------|-----------|-----|
-| argv, never a shell | `Command::new(cmd).args(argv)` — execve directly (`exec.rs::run_command`) | no metacharacters, globs, `$(…)` or pipes, so no command injection |
-| allow-list | exact equality on `argv[0]`; empty list denies all (`runtime/tools.rs::exec_tool`) | `enabled: true` alone runs nothing |
-| workdir confinement | mandatory; a requested `cwd` is canonicalized then checked with `starts_with(base)` (`exec.rs::resolve_cwd`) | defeats `..` traversal and symlink escape together |
-| timeout | `min(requested, max)`, default 30s; the child is killed and reaped (`exec.rs::run_command`) | a request can shorten but never extend the ceiling |
-| output cap | default 1 MiB; the reader drains past the cap and discards the excess (`exec.rs::read_capped`) | bounded capture, and no deadlock on a full pipe |
-| minimal env | `env_clear()` then rebuild from the named list (`exec.rs::run_command`) | the agent's environment, and its secrets, are never inherited |
-| off the reactor | a named `tool:exec` thread; stdin fed from a further thread | a child that writes before reading cannot stall the daemon. One coupling remains: the spawn holds the reaper's lock until the child's `execve` returns, and the reactor's tick takes that lock, so a command whose `execve` blocks (a binary on a hung network mount) holds the reactor as long — which binaries can run at all is the operator's allow-list |
-| its own exit status | the child's pid is routed to the runner's channel from the fork (`supervisor/reaper.rs::spawn_owned`); the runner takes the status from the daemon's reaper or reaps the pid itself, never both | the reactor reaps every exited child in the process, and a workflow step used to lose its command's exit to it |
-| audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`runtime/tools.rs::exec_tool`) | the confinement is logged, never the output |
-
-Every guard is re-checked at call time even though `Registry::build` already gated the
-route — `runtime/tools.rs::exec_tool` re-derives the allow-list, the workdir and both
-clamps from live settings on every call. Output is
-`{stdout, stderr, exit_code, timed_out}`.
-
-Two things before you enable it. A misconfiguration surfaces as an `isError` result at
-first call, not as a startup failure — the feature, `enabled`, a non-empty `allow`, and a
-`workdir` must all line up. And the guard is *argv-not-shell*, not *no-shell*:
-allow-listing `bash` reinstates the entire injection surface by construction.
+> **Warning.** The guard is *argv, not shell*. Allow-listing `bash`, `sh` or
+> any interpreter reinstates the whole injection surface. A misconfiguration
+> (no `allow`, no `workdir`) surfaces as an error result at the first call,
+> not at startup.
 
 ## Secrets
 
-Secrets have exactly two reference forms, `{{secret:NAME}}` (process environment) and
-`{{secret-file:PATH}}` (a mounted file). Both resolve at the instant of use
-(`sec/secret.rs::resolve`), so a rotated file is picked up without a restart. Exactly one
-trailing newline — or CRLF — is stripped from a file read, because kubelet projects a
-Secret verbatim while editors append one; interior whitespace stays part of the credential.
+A secret appears in configuration only as a reference:
 
-An unknown `{{…}}` token is an **error**, not a pass-through, so a typo cannot smuggle
-braces onto the wire. Errors name the reference, never the value: a missing variable yields
-`{{secret:NAME}} is not set in the environment`. The `Secret` newtype's `Debug` prints
-`***` (`config/settings/mod.rs::Secret`), so a credential cannot reach a log line, a payload dump,
-or a panic message through formatting. The durable subagent record keeps only the
-model reference of its intelligence — no token, no resolved headers — and the connection
-is resolved again from live settings on restore (`subagents.rs::secret_free_payload`).
+- `{{secret:NAME}}` reads the environment variable `NAME`, or the value
+  entered at startup under `--prompt-missing`;
+- `{{secret-file:PATH}}` reads a mounted file, and strips exactly one
+  trailing newline (or CRLF), because kubelet projects a Secret verbatim and
+  editors append one.
 
-Two checks catch an inline credential in the config **file**. These paths must be references
-outright — `/intelligence/token`, each `intelligence.providers.<name>.token`, `/a2a/bearer`,
-`/security/aauth/enroll_token`, and each MCP server's `oauth.client_secret`
-(`config/settings/mod.rs::secret_violations`, with `::FILE_SECRET_PATHS`). Separately, any header whose
-*key* looks credential-shaped — `authorization`, `api-key`, `x-api-key`, `token`,
-`password`, `secret`, or anything ending `-token` / `_token` / `-key` / `_key`
-(`config/mod.rs::is_secret_shaped_key`) — is refused with an inline value, across
-`intelligence.headers` (and each provider's),
-`mcp.servers[].headers` and `a2a.peers[].headers`.
+Both resolve at the instant of use, so a rotated file is picked up without a
+restart. A reference that does not resolve is exit 2 at load, naming the
+reference and never a value. An unknown `{{…}}` token is an error, not a
+pass-through, so a typo cannot put braces on the wire. The type that holds a
+secret prints `***` when formatted, so a credential cannot reach a log line or
+a panic message that way, and `--effective-config` prints `<redacted>` for
+every credential. A subagent's durable record keeps only a model reference,
+never a token, and the connection is resolved again from live settings when
+the subagent is restored.
 
-The limit is the key name, not the value: a bearer pasted into `headers.X-Session` passes
-validation. Use references everywhere; outside those two shapes nothing will catch you.
-Outbound credential providers — OAuth2, AWS SigV4, SPIFFE, `agentd login` — are covered in
-[authentication.md](authentication.md).
+Validation refuses an inline credential in three shapes:
 
-## Transport and identity
+- **Paths that must be references in a config file**: `intelligence.token`,
+  each `intelligence.providers.<name>.token`, `a2a.bearer`,
+  `security.aauth.enroll_token` and each MCP server's `oauth.client_secret`.
+  Set from the environment or a flag, these may be inline.
+- **Every `auth:` block's `token`, `value` and `client_secret`**, on a model
+  connection, a provider, an MCP server, a service entry or an A2A peer.
+- **Header keys that look like credentials** (`authorization`, `api-key`,
+  `x-api-key`, `token`, `password`, `secret`, or a name ending in `-token`,
+  `_token`, `-key` or `_key`) with an inline value, across model connection
+  and provider headers, MCP server and service headers, A2A peer headers, the
+  HTTP store's headers and workflow reference headers.
 
-MCP endpoints are HTTPS-only, with plaintext `http://` permitted for loopback hosts alone;
-anything else exits `2` before any side effect (`config/mod.rs::mcp_endpoint_scheme_ok`).
-The same rule holds for the intelligence endpoint. A non-loopback `a2a.listen` **must**
-configure client auth — `a2a.bearer` or `a2a.tls.client_ca` — or startup fails validation,
-plaintext `http://` on a non-loopback bind is likewise a startup error, and a wildcard bind
-needs `a2a.url` (`config/settings/mod.rs::validate`, the refusals in its `a2a.listen` block).
+> **Limit.** The header check reads the key name, not the value: a bearer
+> pasted into `headers.X-Session` passes. Webhook route secrets
+> (`auth.bearer`, `auth.header.equals`, `auth.hmac.secret`) and a principal's
+> `match.bearer_ref` are not checked at all. Write every credential as a
+> reference; outside the shapes above nothing catches an inline value.
 
-One default deserves emphasis: **the implicit operator.** On a loopback-bound listener with
-no credential mechanism, a local caller that presents nothing and is not a browser resolves
-to the operator with `grants: ["*"]` ([the implicit operator](#the-implicit-operator)).
-Anything that can reach the loopback port without a browser — a co-tenant process, another
-local user, an SSRF from another service in the same network namespace, a same-host proxy
-that strips `Origin` — is a full operator, which includes flipping `agent.approval` to
-`accept` over `admin.set`: the agent's own `ask_human` gates then answer themselves from
-whatever they recommend, and the ones recommending nothing fall to a model judge
-(`runtime/human.rs::ask_human_tool`, `::spawn_human_judge`) — until the next reload puts the
-file's value back. Two kinds of gate survive that flip: one that names its decider with
-`to:`, which is never auto-answered whatever the policy says — the `_ if addressee.is_some()`
-arm of `ask_human_tool` short-circuits ahead of every approval mode — and an
-operator-declared `security.policies` `ask`, which is addressed and deliberately not routed
-through `agent.approval` at all (`runtime/tools.rs::policy_gate`). Configure a credential on
-any host you do not fully own.
+Outbound credential providers (OAuth, AWS SigV4, SPIFFE) are in
+[Outbound credentials](authentication.md).
 
-Apart from the `exec` runner above, and the display client and desktop opener that
-`agentd tui` / `agentd ui` start, the processes agentd launches are re-execs of its own
-binary via `current_exe()` (`runtime/mod.rs::run`); a subagent is marked with the
-`AGENTD_SUBAGENT` environment variable. The child's
-work arrives as a serialized control frame on its stdin — data to a model loop, never argv
-to a shell. Each child gets its own process group so the kill ladder can target the
-subtree, an optional cgroup leaf whose `Drop` writes `cgroup.kill`, and `PR_SET_PDEATHSIG`
-so a supervisor death collapses it.
+## Transport and process isolation
+
+MCP and model endpoints are HTTPS-only; plaintext `http://` is allowed for
+loopback hosts alone, and anything else is exit 2 before any side effect.
+`security.tls_ca` adds a CA to the bundled trust roots for every outbound TLS
+dial, in the daemon and its children. A non-loopback A2A or webhook listener
+must authenticate and serve TLS.
+
+Apart from the `exec` runner, and the display client and desktop opener that
+`agentd tui` and `agentd ui` start, every process agentd launches is a re-exec
+of its own binary. A child's work arrives as a serialized control frame on its
+stdin: data for a model loop, never argv for a shell. Each child gets its own
+process group so the kill ladder can reach the subtree, an optional cgroup
+leaf, and a parent-death signal so a supervisor death takes it down. Every
+descriptor beyond stdio is close-on-exec in a child, so no process the daemon
+spawns inherits the operator's terminal or a listener socket.
+[Supervision and containment](harness.md) covers the process tree.
 
 ## Inbound webhooks
 
-A `webhook` route authenticates per node — HMAC-SHA256 over the raw body, a header match or
-a bearer, compared in constant time — and a non-loopback `webhooks.listen` refuses to start
-with an unauthenticated route
-(`runtime/webhooks.rs::build_verify`, the `webhooks.listen` block of
-`config/settings/mod.rs::validate`). Two further rules protect what the listener does once a
-request is in:
+A `webhook` route authenticates per route, by HMAC-SHA256 over the raw body,
+a header match or a bearer, compared in constant time. A non-loopback
+`webhooks.listen` refuses to start while any route is unauthenticated. Once a
+request is in, more rules hold:
 
-- **Replay markers are agentd's, not the agent's.** A delivery's idempotency key is recorded
-  under `_wh_idem/` in the instance's memory (`runtime/webhooks.rs::idem_marker_id`). The
-  `memory.*` tools refuse every `_`-prefixed key (`context/memory.rs::check_key`), so a model
-  — one steered by an injected payload included — can neither forge a marker, which would
-  answer a real delivery `200 duplicate`, nor delete one, which would let a replay fire
-  twice. A marker is written only after the delivery is kept (its run is in the durable
-  inbox, or its event and the stream head are saved), so a refused delivery is processed when
-  the sender retries; a route's `signal:` waits for the same point, so a retried delivery
-  wakes a waiter once. Under `store.on_error: degrade` a failed write is reported as made,
-  and "kept" is only as true as the store. A marker answers replays for seven days, and a
-  sweep removes it after that (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`) — on a store
-  that cannot `list`, through an index of each period's markers.
-- **A webhook wait outlives a restart without its secret at rest.** Its durable wait record
-  keeps the route's path and its `auth` as written — `{{secret:…}}` references, never a
-  resolved value — and boot serves the callback again, resolving them then
-  (`runtime/webhooks.rs::restore_webhook_callbacks`); one that no longer resolves fails its
-  step.
-- **`/hooks/_` is reserved.** A `wait {on: webhook}` without a fixed path is armed at
-  `/hooks/_cb/<token>`, and configured routes are matched before those callbacks. A route
-  under the prefix could therefore take a suspended run's callback, so a `webhook` start
-  `path` or a `wait` `webhook.path` under `/hooks/_` is refused when the workflow is parsed —
-  at load for a configured workflow, and when an agent-stored one is registered
-  (`engine/model.rs::RESERVED_HOOK_PREFIX`).
-- **MCP Events webhook routes verify the server, and nothing else does.** A webhook
-  binding's deliveries arrive at `/hooks/_mcp/<binding>` under the reserved prefix
-  (`runtime/mcp_events/hook.rs`). Each request is checked against the Standard Webhooks
-  signature before its body is parsed — all four headers, a timestamp within 5 minutes,
-  HMAC-SHA256 over the raw body under the secret minted for that subscription (32 bytes from
-  the kernel CSPRNG, held in memory only, never in the store), compared in constant time, and
-  the subscription id once it is known — and answered `401` otherwise
-  (`sec/stdwebhooks.rs`). `webhooks.default_auth` does not apply there: a server cannot send
-  a bearer. The server's verification challenge is echoed only under a signature that
-  verifies, so the listener is no oracle for a third party subscribing someone else's URL. A
-  body over 256 KiB is answered `413` on its declared length and never buffered. A listener
-  that asks for a client certificate cannot take these deliveries and is refused at load.
-- **A served document opens a route only under the `interface` grant.** `workflows` is a
-  document's to write, but a `webhook` start or a `wait {on: webhook}` in one opens a route on
-  the operator's listener, answering whoever reaches it with the auth the route itself names.
-  `:::!endpoint` — which folds into exactly such a workflow — needs `interface` in
-  `agent.document_capabilities` (capped by what a signature attests), and so does every other
-  spelling of the route: a `:::!workflow` block, a `:::!config` `workflows:` entry, and a
-  `file:`/`url:`/`uri:`/`dir:` entry the document names. Without the grant the load is refused,
-  naming the workflow, the step and the document — inline definitions and local `file:`/`dir:`
-  ones at config load (so `--validate-config` reports them), `url:`/`uri:` references once
-  they resolve at startup or on a reload
-  (`config/settings/mod.rs::document_route_refusals`). The same workflow in the operator's own
-  configuration needs no grant. A subagent template's machinery opens no route at all, through
-  either door into the child's `workflows`: a child has no listener, and the parent's routes
-  reach it as commands or signals (`config/templates.rs::validate_instance_machinery`). What
-  opens a route is one list — a `webhook` start or a `wait {on: webhook}`, at any depth inside
-  a body (`engine/model.rs::inbound_routes`) — and the listener and auth checks read it too. An
-  `a2a` start is not on it: it answers on the A2A listener, whose callers and their roles are
-  the operator's.
-- **A definition the agent stores opens a route only under the same grant.**
-  `workflow.create` and `workflow.update` refuse a definition that opens a route — the same
-  list, nested ones included — unless the operator's `agent.document_capabilities` holds
-  `interface`, naming the workflow, the step and the grant
-  (`config/settings/mod.rs::stored_route_refusals`). The check is in the tool's one handler,
-  so it holds for every caller the tool is granted to. It runs again at every load: the grant
-  is restart-only, as it is for a document (a reload that drops it is refused, and the routes
-  stored under it stay until the restart), and a start without it leaves out a stored
-  definition that opens a route (`workflow.stored.invalid`) — kept in the store, and loaded
-  again once the grant is back. A document whose route loses its grant refuses the start; a
-  stored definition cannot refuse the operator's start, so it is left out, as it is for every
-  other check it fails.
+- **Replay markers are agentd's, not the agent's.** A delivery's idempotency
+  key is recorded under a `_`-prefixed key in the instance's memory, and the
+  `memory.*` tools refuse every `_`-prefixed key, so a model steered by an
+  injected payload can neither forge a marker nor delete one. A marker is
+  written only after the delivery is kept, and answers replays for seven days.
+  Under `store.on_error: degrade` a failed store write is reported as made, so
+  "kept" is only as true as the store.
+- **A webhook wait outlives a restart without its secret at rest.** Its
+  durable record keeps the route's `auth` as written, as references, and boot
+  resolves them again.
+- **`/hooks/_` is reserved** for callbacks agentd arms itself. A configured
+  route under the prefix could take a suspended run's callback, so one is
+  refused when the workflow is parsed.
+- **MCP Events deliveries verify the server.** Each request to a binding's
+  route is checked against the Standard Webhooks signature before its body is
+  parsed: all headers, a timestamp within 5 minutes, HMAC-SHA256 under a
+  secret minted per subscription and held in memory only. The server's
+  verification challenge is echoed only under a signature that verifies, so
+  the listener is no oracle for someone subscribing a URL that is not theirs.
+  A body over 256 KiB is refused on its declared length.
+- **A served document opens a route only under the `interface` grant.** A
+  `webhook` start or a `wait {on: webhook}` in a document's workflows opens a
+  route on the operator's listener, so it needs `interface` in
+  `agent.document_capabilities`, in every spelling, including definitions the
+  document references. `workflow.create` and `workflow.update` refuse a
+  definition that opens a route under the same rule. The grant is
+  restart-only. The same workflow in the operator's own configuration needs no
+  grant. [Instruction documents](directives.md) explains the grant model.
 
-## SSRF defenses
+## SSRF defences
 
-The SSRF classifier guards the outbound surfaces where the URL is not purely operator
-config: the workflow `http` node (`runtime/http_node.rs::do_http`), the one place a URL
-can be model- or graph-derived; caller-registered A2A push targets, vetted at registration
-where the caller is present to be told why and again at delivery because DNS can change its
-mind in between (`a2a/push.rs::check_url`, `::deliver`); and the AAuth Person-Server dial,
-where it is the URL the PS *returns* that is vetted — the operator's configured `ps_url`
-still dials by name, so a loopback PS keeps working in development (`aauth/ps.rs::connect`,
-whose `vetted` argument picks between `ssrf::connect_vetted` and a plain `connect_tcp`).
-Intelligence, MCP, configured A2A peers, and OAuth traffic goes out unguarded by design,
-because those endpoints come from operator config; a model that can influence any of those
-URLs is outside the guard. A configured peer dial in particular is a plain `connect_tcp`
-with no classification at all (`mcp/a2a_client.rs::HttpConn::connect`) — it is only the
-*push targets* a caller registers at runtime that are guarded.
+The SSRF guard covers the outbound surfaces where a URL can come from
+something other than the operator's own endpoint list:
 
-Blocked as non-global: `0.0.0.0/8`, `127/8`, `10/8`, `172.16/12`, `192.168/16`,
-`169.254/16` (the cloud-metadata range), `100.64/10` CGNAT, `240/4` reserved, `224/4`
-multicast, and the broadcast address; for IPv6, `::`, `::1`, `fe80::/10`, `fc00::/7`,
-`ff00::/8`, `2001:db8::/32` (`net/ssrf.rs::is_global_v4` and `::is_global_v6`, which
-`::is_global` dispatches between). IPv6 is classified by first peeling `::ffff:a.b.c.d`
-and `::a.b.c.d` forms back to v4 and re-running the v4 rules —
-the classic bypass, closed. `guard_host` rejects if **any** resolved address is non-global,
-so a hostname answering with both a public and a private address is refused outright.
-Header names and values containing `\r` or `\n` are rejected at request construction in
-both send paths, before any bytes are written (`net/http.rs::send`, `::send_streaming`).
+- the workflow `http` step, the one place a URL can be model- or
+  graph-derived;
+- stream `forward` webhook targets;
+- workflow definitions fetched from a `url:`;
+- A2A push targets a caller registers, vetted at registration and again at
+  delivery, because DNS can change in between;
+- the AAuth Person Server exchange, where the URL the Person Server *returns*
+  is vetted.
 
-**The guard and the dial are one step.** A check that resolves a name, likes the answer and
-then dials the *name* is decorative: the connect resolves a second time, and an attacker
-holding the authoritative DNS answers the check public and the connect `169.254.169.254`.
-So `ssrf::connect_vetted` resolves once, classifies every address it got back, and connects
-to an address it vetted, re-asserting `is_global` immediately before the syscall
-(`net/ssrf.rs::connect_vetted`). TLS/SNI and the `Host` header stay on the hostname —
-connect by IP, verify by name — so certificate validation is unaffected. All three guarded
-dial paths use it (`http_node.rs::do_http`, `push.rs::deliver`, `ps.rs::connect`), which
-closes the rebinding pivot on each. `guard_host` survives for the one question asked where
-there is no socket yet: may this push target be registered at all (`push.rs::check_url`),
-answered while the caller is still there to be told no. Its own doc says it is not
-sufficient at delivery time, which is exactly why delivery guards again.
+Model, MCP, configured A2A peer and OAuth traffic is not classified, because
+those endpoints come from operator configuration. A model that can influence
+any of those URLs is outside the guard.
 
-One limit remains. **`allow_private: true` is an off switch, not a "permit RFC-1918"
-switch.** It does not permit a narrower range; it removes the classifier. `guard_host`
-returns Ok without resolving at all (`net/ssrf.rs::guard_host`), and on the dial path
-`resolve_guarded` still resolves — it has to, to have an address to connect to — but skips
-every address check (`net/ssrf.rs::resolve_guarded_with`), as does the pre-syscall
-re-assertion (`::connect_addrs`). The workflow `http` node exposes it as a plain per-node
-boolean in the graph spec. Review it in graph diffs the way you review a credential.
+**The guard and the dial are one step.** A check that resolves a name, likes
+the answer and then dials the name is decorative: the connect resolves again,
+and an attacker holding the DNS answers public to the check and
+`169.254.169.254` to the connect. agentd resolves once, classifies every
+address it got back, refuses if **any** is non-global, and connects to an
+address it vetted, checking it again immediately before the connect. TLS and
+the `Host` header stay on the hostname, so certificate validation is
+unaffected. IPv4-mapped and IPv4-compatible IPv6 forms are classified as the
+IPv4 address they carry. Header names and values containing CR or LF are
+refused before any byte is written. The blocked ranges are in the
+[reference section](#ssrf-blocked-ranges).
 
-The low-level client follows **no redirects at all** — there is no `3xx`/`Location`
-handling, so a redirect comes back as a plain response and the redirect-chain pivot does not
-exist for the `http` node. Two document-fetch paths layer redirect following on top of it,
-both at config load and both from an operator-named reference: the `url:` instruction
-source, up to three hops (`config/mod.rs::http_get`), and the OCI blob fetch, which has to
-follow a registry's CDN (`oci.rs::get_blob`).
+**`allow_private` is an off switch, not a "permit RFC 1918" switch.** It
+removes the classifier for that surface: per `http` step, per `forward`
+target, per workflow reference, and `a2a.push.allow_private` for push
+targets. Review it in a diff the way you review a credential.
+
+**No redirects.** The HTTP client follows none, so a redirect comes back as a
+plain response and the redirect pivot does not exist for the `http` step. Two
+document fetches, both from an operator-named reference at load, follow
+redirects: the `url:` instruction source, up to three hops, and the OCI blob
+fetch, which follows a registry's CDN.
 
 ## Where the instruction came from
 
 The instruction is the agent's standing policy: whoever controls it controls
-what the agent will do. agentd can check three independent things about it —
-who wrote it, who delivered it to this reader, and who pushed it — and they
-answer different questions.
+what the agent does. agentd can check three independent things about it, and
+they answer different questions.
 
-**Who WROTE it — `agent.instruction.trust`.** The Instruction Specification §7
-author signature travels inside the document, as a front-matter `signature:`
-line. With a publisher pinned, agentd verifies that signature after decryption
-and before anything interprets the bytes — the one point a `file:`, `dir:`,
-`url:`, `oci:` and registry-served document all converge on. An unsigned
-document is refused, as is one signed by another publisher or naming a `doc`
-id no pin covers. On a registry read the pin is chosen by the URI's document
-id, and the signature's `doc` claim must be that id: a document the same
-publisher signed for another id is refused when served under the pinned URI.
-A folder is verified per file, before the documents combine.
-The attested capabilities CAP the grant: effective = grant ∩ ceiling ∩
-attested, so a signature can never widen what the operator gave. A folder is
-capped by the narrowest of its files, since any file's machinery lands in the
-one instruction they combine into. Pins whose `author_keys` are all registry
-JWKS uris cannot verify a file, a folder, a `url:` or an `oci:` source, and
-`agent.instruction.unenforceable` decides what that means for each alike.
-
-The author signature covers end matter. The author digest is the document's
-bytes with only the front-matter `signature:` line left out, so the closing
-`---` record (owners, approvals, review dates) is signed with the text, and
-editing it breaks the signature. agentd's delivery removes an instruction's
-end matter and author notes from every source it delivers: a note is not
-parsed, and end matter is the document's record. A registry read marked
-`md.instruction/resolution: resolved` is the exception, because it is the
-registry's delivery, not agentd's. agentd uses that text as served (see
-[directives](directives.md), *Delivered once*), so removing notes and end
-matter from it is the registry's job. Such a read is unverified unless its
-source pins `publisher` and `reader`; with both pinned, its delivery
-attestation is checked as described below.
-
-**Who DELIVERED it — a pinned `reader`.** A registry can resolve a document
-for one reader and sign that delivery. When a pin sets `reader`, agentd
-verifies the delivery attestation on every registry read, before anything
-interprets the bytes. It checks the audience, the expiry and the delivered
-digest. It checks the delivery's `doc` against the front-matter `id` when the
-delivered text still carries one (delivery strips front matter, so a resolved
-read binds its `doc` through the author check above instead). It checks
-the chain from the embedded resolution manifest's authored digest to the
-author signature the read carries, and the delivery ceiling within the
-author's. The effective set is then grant ∩ ceiling ∩ author ∩ delivery. The
-manifest a delivery embeds is the S7 signed form: the typed §7.4 manifest
-without `authored.version`, whose canonical bytes are RFC 8785 (JCS) JSON.
-The shape is strict. A delivery whose embedded manifest is not the S7
-shape, such as one missing `unresolved` or a `limits` count, is refused, and
-agentd reads no earlier shape. A registry that still embeds one fails
-verification wherever a pin sets `reader`.
-
-A §7 refusal carries its Appendix B code in `agentd-instruction`:
-`signature-typ-mismatch`, `audience-mismatch`, `digest-mismatch`,
-`manifest-dropped-missing`, `unpinned-publisher`,
-`delivery-ceiling-exceeded`, `wire-floor` or `ungranted-family`. A §7
-condition Appendix B has no row for, such as a JWS that does not parse or
-verify or an expired signature, carries `attestation`. The text agentd logs
-is the refusal's message, as before.
-
-**Who PUSHED it — `oci: {ref, cosign_key}`.** For an OCI artifact, the cosign
-signature beside it says which publisher pushed these bytes to this registry.
-agentd fetches it, verifies it against the configured public key, and checks
-that the signed payload names this manifest digest.
+- **Who wrote it: `agent.instruction.trust`.** An author signature travels
+  inside the document, as a front-matter `signature:` line. With a publisher
+  pinned, agentd verifies it after decryption and before anything interprets
+  the bytes, the one point every source converges on. An unsigned document is
+  refused, as is one signed by another publisher or naming a document id no
+  pin covers. A folder is verified per file. The signature covers the
+  document's end matter (owners, approvals, review dates), so editing it
+  breaks the signature.
+- **Who delivered it: a pinned `reader`.** A registry can resolve a document
+  for one reader and sign that delivery. With `reader` set, agentd verifies
+  the delivery attestation on every registry read: the audience, the expiry,
+  the delivered digest, and the chain from the resolution manifest to the
+  author signature.
+- **Who pushed it: `oci: {ref, cosign_key}`.** For an OCI artifact, agentd
+  verifies the cosign signature beside it against the configured key and
+  checks that the signed payload names this manifest digest.
 
 None substitutes for another. A registry compromise can serve a genuinely
-authored document from the wrong place; a stolen push credential can publish an
-artifact nobody authored. For an OCI source, pinning the reference by digest
-(`@sha256:…`), which agentd compares with the manifest it fetches, removes the
-mutable-tag question entirely and costs less than any of the three checks.
+authored document from the wrong place; a stolen push credential can publish
+an artifact nobody authored. For an OCI source, pinning the reference by
+digest (`@sha256:…`) removes the mutable-tag question and costs less than any
+of the three checks.
 
-A build without `--features sign` cannot check an author signature at all, so a
-configured pin is a startup refusal there rather than a silent pass.
+**Signatures cap, never widen.** What a document may activate is the
+operator's grant (`agent.document_capabilities`), intersected with the pin's
+`max_capabilities` and with what the author attested, and with what the
+delivery attested when a reader is pinned. A folder is capped by the narrowest
+of its files.
+
+A build without the `sign` feature cannot check a signature, so a configured
+pin is a startup refusal there rather than a silent pass. The release binaries
+include `sign`. Under `security.egress: closed`, the `url:` and `oci:` fetch
+must match a catalog entry before agentd dials it.
+[Write and ship instruction documents](instruction-documents.md) shows how to
+sign, pin and encrypt documents.
 
 ## What agentd does not protect against
 
-Stated plainly so you size the surrounding environment correctly.
+Stated plainly, so you size the surrounding environment correctly.
 
-- **No in-binary sandboxing.** No seccomp, no namespaces, no chroot. The only OS-level
-  hardening is process-group isolation, an optional cgroup leaf, and `PR_SET_PDEATHSIG`.
-  Confinement, filesystem scope, and aggregate resource limits are the deployment's job.
-- **No egress network policy.** Which hosts the process may reach is a NetworkPolicy or
-  firewall concern; the SSRF guard covers only the surfaces named above.
-- **No content-based injection detection.** No classifier, no "is this injection?" model
-  call. The defense is containment, and containment is not a guarantee.
-- **No per-tool tagging in `mcp.servers[].tags`.** Server tags apply per server; the glob
-  keys are parsed and discarded. Per-tool tags exist only through
-  `tools.narrow.<tool>.tags`, which is append-only — a tag may be added, never removed —
-  and reaches the `security.policies` matcher rather than the startup trifecta fold.
-- **No rug-pull detection.** A server that mutates a tool description after first connect
-  is not detected; the only connect-time log is `mcp.connect{server, tools}` with a count.
-- **No audit event for a trifecta override** — it proceeds silently.
-- **No artifact redaction.** Artifacts carry a `sensitive` flag, but `artifact.get` returns
-  the content regardless (`runtime/artifacts.rs::get_value`).
-- **No defence against the host's own users on a no-credential loopback listener.** Every
-  local uid is the [implicit operator](#the-implicit-operator) there, and a same-uid process
-  is the user in every sense — it can read a launch file or a pipe as easily as the person
-  can.
-- **No per-caller bound on task retention.** `store.retention.tasks.keep_last` is one bound
-  across every principal; use `ttl` on a shared listener.
-- **No policy engine, request signing, or RBAC beyond the principal roles above.**
+- **No in-binary sandboxing.** No seccomp, no namespaces, no chroot. The OS
+  hardening is process groups, an optional cgroup leaf and the parent-death
+  signal. Confinement, filesystem scope and aggregate resource limits are the
+  deployment's job.
+- **No network enforcement.** `security.egress: closed` governs the dials
+  agentd makes from configuration. Which hosts the process, an MCP server or
+  an `exec` command may reach is a firewall or NetworkPolicy concern.
+- **No content-based injection detection.** The defence is containment, and
+  containment is not a guarantee.
+- **No data-flow tracking.** Taint is per stream and per server. Memory and
+  artifacts are not traced, and deterministic step arguments are not counted.
+- **No per-tool tags in `mcp.servers[].tags`.** Server tags apply per server.
+  `tools.narrow` adds per-tool tags for policies only.
+- **No detection of a server that changes its tools.** The catalogue is read
+  at connect and at each reload. A `tools/list_changed` notification is logged
+  as `mcp.tools_changed` and changes nothing until an operator reloads; a
+  description changed under the same name is not flagged.
+- **No event when the trifecta override is used.**
+- **No artifact redaction.** Artifacts carry a `sensitive` flag, but
+  `artifact.get` returns the content regardless.
+- **No defence against the host's own users on a no-credential loopback
+  listener.** Every local uid is the implicit operator there, and a same-uid
+  process is the user in every sense.
+- **No per-caller bound on task retention.** Use `ttl` on a shared listener.
+- **No role model beyond principal roles, grants and policies.**
 
-## Operator checklist
+## Reference
 
-1. Run agentd inside a real sandbox with an egress policy and cgroup limits. That is the
-   security boundary; agentd is not.
-2. Treat every declared MCP server as code you execute at agentd's privilege. Vet it.
-3. Tag every server, one server per tag profile — glob keys do not split a server.
-4. Configure a credential — `a2a.bearer`, a unix listener, or principals — on any host where
-   loopback is not exclusively yours, and never put a proxy in front of a no-credential
-   loopback listener. Off the machine, the posture is TLS plus `a2a.device_grant`, approved
-   by an operator credential, with every person approved under their own name.
-5. Reference every secret; validation covers four config paths plus credential-shaped
-   header keys — a credential under any other key name sails through.
-6. Leave `exec` off. If you enable it, keep `allow` minimal, never allow-list a shell, and
-   never co-locate it with an untrusted-content reader.
-7. Run `agentd --validate-config -c agentd.yaml` in CI — the same authority startup runs,
-   exiting `2` on any diagnostic.
-8. Pin where the instruction comes from: a digest rather than a tag, `trust` for who wrote
-   it, `cosign_key` for who pushed it. A document you did not verify is a policy you did
-   not write.
+### Internal tool tiers
+
+Default grants of the internal tools by caller kind. MCP and code-registered
+tools have no grant: root and workflow callers may call them, and a subagent
+may unless its spawn carried a `tools:` grant, which then holds for every tool
+class.
+
+| Tier | Callers | Tools |
+|---|---|---|
+| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal` |
+| root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
+| root only | root | `instruction.subscribe`, `workflow.create`, `workflow.update`, `workflow.delete`, `workflow.pause`, `workflow.resume` |
+
+`finish` is granted to root and subagents, not to workflows, which end with
+the `finish` step. `status` is granted to every caller. What an A2A `user` or
+`agent` principal may do is set by the command extension's op table, its
+grants and the ownership rules, not by this table.
+
+### Read-back paths
+
+Every way a result can be read back, each answered with the marker when the
+reader holds `sensitive` and `egress` and the result carries outside input it
+was not already handed:
+
+- a synchronous workflow tool's reply, and `workflow.run` with `wait: true`;
+- `workflow.wait`, the `workflow.wait` step and `wait {on: run}`;
+- `workflow.status` (runs, step outputs and variables) and `status`;
+- a `workflow` step that is not `detached`, and a `join`;
+- `subagent.status`, `subagent.await`, `wait {on: subagent}`, and
+  `subagent.list`, which carries the opening of each child's instruction;
+- `plan.update` with `bind: {run}` or `bind: {subagent}`, whose note carries
+  the bound output into every later turn;
+- the notes a finished run (`agent.on_workflow_finished`) and a child's
+  result (`subagent_result` in `agent.wake_on`) leave in the root transcript;
+- the note an `emit` step without a `stream:` writes into the root transcript.
+
+### Exec guards
+
+| Guard | Behaviour | Why |
+|---|---|---|
+| argv, never a shell | the command is executed directly with its arguments | no metacharacters, globs, `$(…)` or pipes |
+| allow-list | exact equality on `argv[0]`; an empty list denies everything | `enabled: true` alone runs nothing |
+| working directory | mandatory; a requested `cwd` is canonicalized and must resolve inside it | defeats `..` traversal and symlink escape |
+| timeout | the lesser of the requested and configured values, default 30 s; the child is killed and reaped | a request can shorten the ceiling, never extend it |
+| output cap | default 1 MiB of stdout and stderr; the excess is drained and discarded | bounded capture, no deadlock on a full pipe |
+| minimal environment | cleared, then rebuilt from `security.exec.env` | the agent's environment and its secrets are never inherited |
+| off the reactor | runs on its own thread; stdin fed from another | a child that writes before reading cannot stall the daemon |
+| audit | `exec.run {cmd, argc, cwd, timeout_ms, caller}` | the confinement is logged, never the output |
+
+The result is `{stdout, stderr, exit_code, timed_out}`. One coupling remains:
+spawning holds the process reaper's lock until the child's `execve` returns,
+so a binary on a hung network mount can stall the daemon as long.
+
+### SSRF blocked ranges
+
+Refused as non-global, unless `allow_private` is set:
+
+| Family | Ranges |
+|---|---|
+| IPv4 | `0.0.0.0/8`, `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` (cloud metadata), `100.64.0.0/10` (CGNAT), `224.0.0.0/4` (multicast), `240.0.0.0/4` (reserved), the broadcast address |
+| IPv6 | `::`, `::1`, `fe80::/10`, `fc00::/7`, `ff00::/8`, `2001:db8::/32`, and `::ffff:a.b.c.d` / `::a.b.c.d` classified as their IPv4 address |
+
+### Instruction provenance refusal codes
+
+A refusal of an author signature or a delivery attestation carries its
+Instruction Specification Appendix B code in the `agentd-instruction` crate's
+refusal type: `signature-typ-mismatch`, `audience-mismatch`,
+`digest-mismatch`, `manifest-dropped-missing`, `unpinned-publisher`,
+`delivery-ceiling-exceeded`, `wire-floor` or `ungranted-family`. A condition
+Appendix B has no row for, such as a JWS that does not parse or verify or an
+expired signature, carries `attestation`. The log line is the refusal's
+message.
+
+### A2A limits
+
+| Limit | Value |
+|---|---|
+| failed-credential budget per source | 20, one forgiven every 3 s; 4096 sources tracked |
+| source | an IPv4 address or an IPv6 /64 |
+| denial log | one `a2a.denied` line per source and reason per minute; 20 lines plus one a second overall |
+| device codes per source | 5, then one every 12 s; 4 waiting |
+| waiting device codes | 16 per network (IPv6 /48, or the IPv4 address), 64 in all |
+| token polls per source | 30, then one a second |
+| device user code | 8 letters from a 20-consonant alphabet |
+| device approval name | `^[a-z0-9][a-z0-9._-]{0,63}$` |
+| launch code | 256 bits, single-use, 60 s |
+| waiting launch requests | 16; the oldest is retired past it |
+| launch failures per source | 20, one forgiven every 3 s |
+| session, device and launch secrets | 256 random bits, held as SHA-256 |
+
+### Descriptor hygiene
+
+Every descriptor the launcher creates (the pipe, the UI's socket, the saved
+terminal, the daemon log) is close-on-exec, and the one a client is meant to
+have reaches fd 3 only in that client. Every process of the agentd binary
+marks close-on-exec, at start and before it opens anything, each descriptor
+it inherited beyond stdio. Every child the daemon spawns (an `exec` command, a
+subagent, an instance) has every descriptor from 3 up marked close-on-exec
+between fork and exec, whether agentd runs as its own binary or embedded in
+another program.
+
+The marking is one `close_range` call on Linux 5.11 and later. Where a kernel
+or a seccomp profile refuses it, and off Linux, a process marks what
+`/proc/self/fd` (`/dev/fd`) lists, and without `/proc` (agentd as PID 1 in a
+bare container) it tries each number below its descriptor limit, capped at
+65536. With neither `close_range` nor `/proc` and a limit above the cap,
+higher numbers stay unmarked, and one `process.inherited_fds_unmarked`
+warning on stderr says so.
+
+## Next steps
+
+- [Harden a deployment](harden.md): the checklist, as configuration that
+  validates.
+- [Outbound credentials](authentication.md): how agentd authenticates to
+  models, MCP servers and peers.
+- [The A2A channel](a2a.md): principals, ownership and sign-in on the wire.
+- [Supervision and containment](harness.md): the process tree these controls
+  run in.

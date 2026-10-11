@@ -50,7 +50,7 @@ agent:
   # "A result read back is withheld".
 
 intelligence:
-  endpoints: https://gateway.internal/v1
+  endpoints: https://gateway.internal/v1/chat/completions
   model: gpt-5.1
   headers:
     authorization: "Bearer {{secret:INTEL_KEY}}"

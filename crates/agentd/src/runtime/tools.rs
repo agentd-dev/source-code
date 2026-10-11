@@ -469,6 +469,7 @@ impl Runtime {
                         "instruction.subscribe: the instruction is static text; give a uri".into(),
                     ),
                     Some(u) => {
+                        #[cfg(feature = "mcp-events")]
                         let was = (
                             self.instruction.server.clone(),
                             self.instruction.uri.clone(),

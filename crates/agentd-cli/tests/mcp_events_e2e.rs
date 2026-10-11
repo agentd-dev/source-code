@@ -1169,3 +1169,52 @@ fn an_event_type_the_server_cannot_honour_is_refused_and_the_instruction_stays()
         assert!(polls(&mock).is_empty(), "{}", mock.log());
     }
 }
+
+/// The model moves the instruction (`instruction.subscribe` to another
+/// resource, from a turn of the root conversation): the event types the
+/// configured one named are let go with it, not polled on its behalf.
+#[cfg(feature = "a2a")]
+#[test]
+fn the_instructions_events_are_let_go_when_the_model_moves_it() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let playbook = common::unique_path("events-moved", "json");
+    std::fs::write(
+        &playbook,
+        json!({"turns": [
+            {"tool_calls": [{"name": "instruction.subscribe", "arguments": {"uri": "mcp://mock/mock://res"}}]},
+            {"content": "moved"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let boot = |port: u16| {
+        Daemon::start(
+            "events-moved",
+            &format!(
+                "agent:\n  name: moves\n  preflight: never\n  instruction:\n    mcp:\n      server: mock\n      resource: \"mock://instruction\"\n      events: [{{name: mock.tick, arguments: {{topic: instruction}}}}]\n    refresh: \"off\"\nintelligence:\n  endpoints: \"mock:file:{playbook}\"\n  model: mock\nstore:\n  kind: memory\na2a:\n  listen: http://127.0.0.1:{port}\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}/mcp\n      tags: {{\"*\": [sensitive]}}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n",
+                mock.uri()
+            ),
+        )
+    };
+    let (daemon, addr) = (0..5)
+        .find_map(|_| {
+            let d = boot(common::free_port());
+            common::try_a2a_bound(&d.err_path, Duration::from_secs(15)).map(|a| (d, a))
+        })
+        .expect("the daemon bound an A2A listener");
+    daemon.wait_for("the instruction's binding armed", |l| armed(l, "mock.tick"));
+    common::SendMessage::text("move to the other resource").result(&addr);
+    daemon.wait_for("the binding let go", |l| {
+        events(l, "mcp.events.removed")
+            .iter()
+            .any(|e| e["event_type"] == "mock.tick" && e["reason"] == "instruction_moved")
+    });
+    let log = daemon.log();
+    let _ = std::fs::remove_file(&playbook);
+    assert!(
+        events(&log, "instruction.loaded")
+            .iter()
+            .any(|e| e["uri"] == "mock://res"),
+        "the model moved the instruction:\n{log}"
+    );
+}

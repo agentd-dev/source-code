@@ -20,10 +20,11 @@
 # binaries are the same release and must have the same capabilities.
 # HTTPS is the primary transport for both intelligence and MCP, so `tls` is ON by
 # DEFAULT: rustls with the `ring` provider + bundled webpki roots, so there is no
-# system CA bundle to mount. MCP and A2A are the official/published protocol
-# implementations (`rmcp`, `a2a-rs`), which bring an async runtime into the BUILD
-# — but no C: the crypto provider is `ring` everywhere, so the build is pure Rust
-# and needs no cmake or C++ compiler (see third_party/connectrpc/PATCH.md). What
+# system CA bundle to mount. MCP and A2A are the official SDKs (`rmcp`, and the
+# A2A project's `a2a-lf`/`a2a-pb`/`a2a-server-lf`), which bring an async runtime
+# into the BUILD — but no C: the crypto provider is `ring` everywhere, and the
+# A2A SDK's protoc is a vendored static binary, so the build is pure Rust and
+# needs no cmake or C++ compiler. What
 # ships is one static musl binary on an empty base, a few MB, no shell, no libc,
 # no package manager. Nothing to attack.
 #

@@ -39,8 +39,6 @@ export interface CallOptions {
    */
   require?: readonly string[];
   signal?: AbortSignal;
-  /** Resume a stream after this SSE id (`Last-Event-ID`). */
-  lastEventId?: string;
 }
 
 function headers(ep: Endpoint, accept: string, o: CallOptions): Record<string, string> {
@@ -48,7 +46,6 @@ function headers(ep: Endpoint, accept: string, o: CallOptions): Record<string, s
   h['a2a-version'] = A2A_VERSION;
   if (ep.bearer) h.authorization = `Bearer ${ep.bearer}`;
   if (o.exts && o.exts.length > 0) h['a2a-extensions'] = o.exts.join(', ');
-  if (o.lastEventId !== undefined) h['last-event-id'] = o.lastEventId;
   return h;
 }
 

@@ -31,8 +31,9 @@ Everything durable is **checkpointed before the effect happens**, so a crash
 resumes rather than repeats-blindly.
 
 Protocols are not hand-rolled: MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)
-(the official Rust SDK) and A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs)
-(generated from the spec's protobufs), both running over agentd's own
+(the official Rust SDK) and A2A is the A2A project's own Rust SDK,
+[`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs) (its wire generated
+from the spec's protobufs), both running over agentd's own
 credentialed transport.
 
 ---

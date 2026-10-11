@@ -792,6 +792,57 @@ mod tests {
     /// one and any version but 1.0 are -32009 at HTTP 200, with the id echoed
     /// and the version this listener does speak — and nothing reaches the
     /// runtime. A 1.0 client with any patch is let through.
+    /// What reaches the SDK is the envelope the pipeline read: a request with
+    /// no `params` — which JSON-RPC allows, and the specification's own
+    /// `GetExtendedAgentCard` example sends — is answered, and a caller's
+    /// integer past ±2^53 reaches the runtime as the double the protocol
+    /// carries it as rather than refusing the request.
+    #[tokio::test]
+    async fn the_sdk_is_handed_the_envelope_the_pipeline_read() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let (router, _) = listener(
+            move |req| {
+                log.lock()
+                    .unwrap()
+                    .push((req.method.clone(), req.params.clone()));
+                match req.method.as_str() {
+                    "ListTasks" => {
+                        json!({"tasks": [], "nextPageToken": "", "pageSize": 50, "totalSize": 0})
+                    }
+                    _ => json!({"task": {"id": req.params["taskId"], "contextId": "c",
+                        "status": {"state": "TASK_STATE_COMPLETED"}}, "_seq": 0}),
+                }
+            },
+            None,
+        );
+        let v = json_of(
+            post(
+                &router,
+                r#"{"jsonrpc":"2.0","id":6,"method":"ListTasks"}"#,
+                &[],
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["result"]["totalSize"], 0, "{v}");
+
+        let send = json!({"jsonrpc": "2.0", "id": 7, "method": "SendMessage", "params": {
+            "message": {"role": "ROLE_USER", "messageId": "m-big",
+                "parts": [{"data": {"cursor": 9_007_199_254_740_993u64}}]},
+            "configuration": {"returnImmediately": true}}});
+        let v = json_of(post(&router, &send.to_string(), &[], &[]).await).await;
+        assert!(v.get("error").is_none(), "{v}");
+        let seen = seen.lock().unwrap().clone();
+        let (_, sent) = seen.iter().find(|(m, _)| m == "SendMessage").expect("sent");
+        assert_eq!(
+            sent["message"]["parts"][0]["data"]["cursor"].as_f64(),
+            Some(9_007_199_254_740_992.0),
+            "{sent}"
+        );
+    }
+
     #[tokio::test]
     async fn version_gate() {
         let (router, reached) = listener(|_| task_not_found(), None);

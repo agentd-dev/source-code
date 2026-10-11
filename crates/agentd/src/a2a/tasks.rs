@@ -342,7 +342,7 @@ impl Task {
     /// spellings are not ours to get wrong; see [`crate::a2a::wire`].
     #[cfg(feature = "a2a")]
     pub fn to_a2a(&self, ann: crate::a2a::wire::Annotations) -> Value {
-        serde_json::to_value(crate::a2a::wire::task(self, ann)).unwrap_or(Value::Null)
+        crate::a2a::wire::to_wire(&crate::a2a::wire::task(self, ann))
     }
 
     /// The projection `ListTasks` returns: the same `Task`, cut to what the
@@ -353,7 +353,7 @@ impl Task {
         view: crate::a2a::wire::ListView,
         ann: crate::a2a::wire::Annotations,
     ) -> Value {
-        serde_json::to_value(crate::a2a::wire::task_listed(self, view, ann)).unwrap_or(Value::Null)
+        crate::a2a::wire::to_wire(&crate::a2a::wire::task_listed(self, view, ann))
     }
 }
 #[cfg(test)]

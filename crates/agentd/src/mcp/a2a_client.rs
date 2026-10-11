@@ -793,8 +793,13 @@ impl HttpConn {
         // Consume the stream: statusUpdate frames carry the lifecycle (a
         // terminal state ends it), a completed run's artifactUpdate frames
         // carry the distillate before that — possibly in chunks, possibly as
-        // several artifacts, which read as one answer in order.
-        let mut events = resp.sse();
+        // several artifacts, which read as one answer in order. The reads
+        // themselves stop at the deadline: a peer's keep-alive comments would
+        // otherwise hold a quiet stream open past it.
+        let mut events = crate::net::http::SseReader::new(std::io::BufReader::new(UntilDeadline {
+            inner: resp.into_reader(),
+            deadline,
+        }));
         let mut task_id: Option<String> = None;
         let mut artifacts: Vec<(String, String)> = Vec::new();
         loop {
@@ -845,6 +850,15 @@ impl HttpConn {
                     .pointer("/status/state")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                // A task waiting on someone keeps its stream open (A2A 1.0
+                // closes a stream only at a terminal state), but nothing will
+                // arrive on it until that someone answers: the wait is the
+                // poll's, up to the deadline.
+                if waits_on_someone(state)
+                    && let Some(tid) = &task_id
+                {
+                    return Ok(StreamOutcome::Recover(tid.clone()));
+                }
                 // Terminate on a terminal task STATE: an A2A stream closes once
                 // the task is terminal. agentd emits no `final` flag of its own,
                 // and a conformant peer signals termination by the state plus
@@ -903,11 +917,49 @@ impl HttpConn {
                 )));
             }
             // A full-Task frame (some peers stream the initial Task) is benign:
-            // capture its id and keep reading.
+            // capture its id and keep reading — unless the task is already
+            // waiting on someone, which the poll waits out.
             else if !a2a::task_id_of(&result).is_empty() {
-                task_id = Some(a2a::task_id_of(&result));
+                let tid = a2a::task_id_of(&result);
+                let state = result
+                    .pointer("/task/status/state")
+                    .or_else(|| result.pointer("/status/state"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if waits_on_someone(state) {
+                    return Ok(StreamOutcome::Recover(tid));
+                }
+                task_id = Some(tid);
             }
         }
+    }
+}
+
+/// Whether a task in `state` (its proto name) is waiting on someone outside it.
+fn waits_on_someone(state: &str) -> bool {
+    matches!(
+        state,
+        "TASK_STATE_INPUT_REQUIRED" | "TASK_STATE_AUTH_REQUIRED"
+    )
+}
+
+/// A reader that will not read past `deadline`: what a quiet stream's
+/// keep-alive comments would otherwise hold open ends when the delegation's
+/// time is up, as a read error the stream's caller recovers from.
+struct UntilDeadline<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+impl<R: std::io::Read> std::io::Read for UntilDeadline<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the delegation's deadline passed",
+            ));
+        }
+        self.inner.read(buf)
     }
 }
 
@@ -1039,6 +1091,10 @@ mod tests {
         /// An SSE stream of such responses, after a keep-alive comment the
         /// client must skip.
         Sse(Vec<Value>),
+        /// The same, held open afterwards — a keep-alive comment every 50 ms
+        /// for the duration — as a peer holds the stream of a task that has
+        /// not ended.
+        SseHeld(Vec<Value>, Duration),
         /// A plain HTTP response.
         Http(u16, Vec<(&'static str, String)>, String),
     }
@@ -1083,6 +1139,27 @@ mod tests {
     }
 
     fn write_answer<S: Write>(s: &mut S, req: &Seen, answer: Answer) {
+        if let Answer::SseHeld(frames, hold) = answer {
+            let mut head = String::from(
+                "HTTP/1.1 200 X\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: keep-alive\n\n",
+            );
+            for f in frames {
+                head.push_str(&format!("data: {}\n\n", envelope(req, f)));
+            }
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.flush();
+            let until = Instant::now() + hold;
+            while Instant::now() < until {
+                thread::sleep(Duration::from_millis(50));
+                if s.write_all(b": keep-alive\n\n")
+                    .and_then(|()| s.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            return;
+        }
         let (status, content_type, extra, body) = match answer {
             Answer::Rpc(r) => (200, "application/json", Vec::new(), envelope(req, r)),
             Answer::Sse(frames) => {
@@ -1093,6 +1170,7 @@ mod tests {
                 (200, "text/event-stream", Vec::new(), body)
             }
             Answer::Http(status, headers, body) => (status, "application/json", headers, body),
+            Answer::SseHeld(..) => unreachable!("written above"),
         };
         let mut head = format!(
             "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -1222,6 +1300,73 @@ mod tests {
             Answer::Rpc(json!({ "result": result }))
         })
         .0
+    }
+
+    /// A peer whose task waits at a gate keeps its stream open (A2A 1.0
+    /// closes one only at a terminal state). The client does not sit on it:
+    /// it recovers over GetTask at once and polls — here straight to the
+    /// answer.
+    #[test]
+    fn a_peer_task_at_a_gate_is_polled_not_waited_on() {
+        let mut first = true;
+        let (url, _) = serve(move |req| {
+            if is_card_get(req) {
+                return no_card();
+            }
+            if std::mem::take(&mut first) {
+                return Answer::SseHeld(
+                    vec![
+                        json!({"result": status_frame("g-1", "TASK_STATE_WORKING", false)}),
+                        json!({"result": status_frame("g-1", "TASK_STATE_INPUT_REQUIRED", false)}),
+                    ],
+                    Duration::from_secs(30),
+                );
+            }
+            Answer::Rpc(
+                json!({"result": task("g-1", TaskState::Completed, Some("after the gate"))}),
+            )
+        });
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(20);
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+            DelegateOutcome::Distillate(s) => assert_eq!(s, "after the gate"),
+            DelegateOutcome::Error(e) => panic!("expected the polled answer: {e}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited on a held stream: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stream kept alive by comments alone still ends at the delegation's
+    /// deadline.
+    #[test]
+    fn a_stream_held_open_by_keep_alives_ends_at_the_deadline() {
+        let mut first = true;
+        let (url, _) = serve(move |req| {
+            if is_card_get(req) {
+                return no_card();
+            }
+            if std::mem::take(&mut first) {
+                return Answer::SseHeld(
+                    vec![json!({"result": status_frame("k-1", "TASK_STATE_WORKING", false)})],
+                    Duration::from_secs(30),
+                );
+            }
+            Answer::Rpc(json!({"result": task("k-1", TaskState::Working, None)}))
+        });
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        let outcome = delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "read past the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(outcome, DelegateOutcome::Error(_)), "unfinished");
     }
 
     fn status_frame(id: &str, state: &str, _is_final: bool) -> Value {

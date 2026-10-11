@@ -95,20 +95,23 @@ impl Outgoing {
     }
 }
 
-/// `v` with every part's document blanked, for reading with the SDK's types.
+/// `v` with every part's document and every `metadata` blanked, for reading
+/// with the SDK's types.
 ///
-/// A DataPart's document is a `google.protobuf.Value`, and the SDK's ProtoJSON
-/// refuses a number no double holds exactly (past ±2^53) — rightly, for a
-/// protobuf reader, but it would make a whole reply unreadable for one
-/// cursor in one document. agentd never needs a document typed: it renders
-/// each from the bytes the peer sent (see the module note). So the reply is
-/// read with its documents emptied, and they are taken from the raw JSON.
+/// A DataPart's document and an object's metadata are protobuf `Value`s and
+/// `Struct`s, and the SDK's ProtoJSON refuses a number no double holds exactly
+/// (past ±2^53) — rightly, for a protobuf reader, but it would make a whole
+/// reply unreadable for one cursor in one document. agentd never needs either
+/// typed: it renders each document from the bytes the peer sent (see the
+/// module note), and reads no peer's metadata. So the reply is read with them
+/// emptied, and documents are taken from the raw JSON.
 fn without_documents(v: &Value) -> Value {
     match v {
         Value::Object(o) => Value::Object(
             o.iter()
                 .map(|(k, val)| {
                     let val = match (k.as_str(), val) {
+                        ("metadata", Value::Object(_)) => json!({}),
                         ("parts", Value::Array(parts)) => Value::Array(
                             parts
                                 .iter()

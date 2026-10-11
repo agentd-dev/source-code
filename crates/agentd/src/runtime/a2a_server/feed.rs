@@ -224,7 +224,7 @@ impl Runtime {
     /// event restating what somebody said. What it is linked to and who owns
     /// it are the task's annotations, not fields of an agentd envelope.
     pub(crate) fn feed_task(&self, t: &crate::a2a::tasks::Task) {
-        let task = serde_json::to_value(crate::a2a::wire::task_for_feed(t)).unwrap_or(Value::Null);
+        let task = crate::a2a::wire::to_wire(&crate::a2a::wire::task_for_feed(t));
         self.feed_push(
             "task",
             FeedVis::Owner(t.principal.clone()),

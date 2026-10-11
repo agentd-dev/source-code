@@ -503,22 +503,16 @@ export class AgentdClient {
   }
 
   /**
-   * Attach to one task's stream (status/artifact frames until it stops).
-   * Rejects on an error — a terminal or unknown task is an answer, not an
-   * empty stream — and locally when the card does not declare streaming.
-   * `lastEventId` resumes after that SSE id.
+   * Attach to one task's stream: the task as it is, then its status and
+   * artifact frames until it ends. Rejects on an error — a terminal or
+   * unknown task is an answer, not an empty stream — and locally when the
+   * card does not declare streaming. A lost stream is followed again by
+   * subscribing again, which opens with the task as it now is.
    */
-  async subscribeTask(
-    id: string,
-    onFrame: (frame: Json, sseId?: string) => void,
-    signal?: AbortSignal,
-    lastEventId?: string,
-  ): Promise<void> {
+  async subscribeTask(id: string, onFrame: (frame: Json) => void, signal?: AbortSignal): Promise<void> {
     if (!this.caps.streaming) {
       throw new ClientError('op-not-offered', 'this agent does not stream (its card leaves capabilities.streaming off)');
     }
-    const o = this.core(signal);
-    if (lastEventId !== undefined) o.lastEventId = lastEventId;
-    await this.a2a.subscribeToTask(id, onFrame, o);
+    await this.a2a.subscribeToTask(id, onFrame, this.core(signal));
   }
 }

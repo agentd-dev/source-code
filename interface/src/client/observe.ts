@@ -131,8 +131,6 @@ export class Observation {
    * An entry lapses at its time, or when the task's state moves on.
    */
   private cooldown = new Map<string, { until: number; state: TaskState }>();
-  /** The last SSE id each task's stream carried, so a new follower resumes after it. */
-  private lastEventIds = new Map<string, string>();
   /** Tasks this client started: followed first, and polled when the agent cannot stream. */
   private own = new Set<string>();
   /** Tasks already asked for their history once. */
@@ -487,10 +485,6 @@ export class Observation {
       const t = tasks.get(id);
       if (!t || t.state !== c.state || now >= c.until) this.cooldown.delete(id);
     }
-    for (const id of this.lastEventIds.keys()) {
-      const t = tasks.get(id);
-      if (!t || TERMINAL_STATES.has(t.state)) this.lastEventIds.delete(id);
-    }
     const live = [...tasks.values()]
       .filter((t) => followable(t) && !this.followers.has(t.id) && !this.cooldown.has(t.id))
       .sort((a, b) => Number(this.own.has(b.id)) - Number(this.own.has(a.id)) || b.updated - a.updated);
@@ -526,14 +520,12 @@ export class Observation {
           try {
             await client.subscribeTask(
               id,
-              (frame, sseId) => {
-                if (sseId !== undefined) this.lastEventIds.set(id, sseId);
+              (frame) => {
                 this.mirror.applyStream(frame);
                 const now = this.mirror.getState().tasks.get(id);
                 if (now && !followable(now)) ac.abort();
               },
               ac.signal,
-              this.lastEventIds.get(id),
             );
           } catch (e) {
             if (ac.signal.aborted) return;

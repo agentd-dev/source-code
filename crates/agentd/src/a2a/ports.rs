@@ -57,8 +57,10 @@ use crate::runtime::surface::Active;
 const SEND_WAIT: Duration = Duration::from_secs(25);
 
 /// The transitions a slow stream may fall behind by before it is handed the
-/// task as it now is instead of the ones it missed.
-const STREAM_BUFFER: usize = 256;
+/// task as it now is instead of the ones it missed. A channel allocates every
+/// slot up front, so this is kept small: falling behind costs a read, not a
+/// transition.
+const STREAM_BUFFER: usize = 64;
 
 /// agentd's answers to the specification's operations, in one value.
 pub struct RuntimePorts {
@@ -157,6 +159,16 @@ fn named_task(req: &SendMessageRequest) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A request's `historyLength`, which must not be negative (A2A 1.0 §3.2.4).
+fn history_of(n: Option<i32>) -> Result<Option<i32>, A2AError> {
+    match n {
+        Some(n) if n < 0 => Err(A2AError::invalid_params(format!(
+            "historyLength must be >= 0, not {n}"
+        ))),
+        other => Ok(other),
+    }
+}
+
 /// Whether a blocking send stops waiting at `state`: a terminal state, or one
 /// that waits on the caller (A2A 1.0 §3.1.1).
 fn settles(state: &TaskState) -> bool {
@@ -181,7 +193,7 @@ impl RequestHandler for RuntimePorts {
         let task_id = named.clone().unwrap_or_else(a2a_types::new_task_id);
         let config = req.configuration.as_ref();
         let immediately = config.and_then(|c| c.return_immediately).unwrap_or(false);
-        let history = config.and_then(|c| c.history_length);
+        let history = history_of(config.and_then(|c| c.history_length))?;
         // Watching starts before the work does: a task that settles while the
         // message is still being processed would otherwise be waited on for a
         // transition that has already happened.
@@ -194,13 +206,23 @@ impl RequestHandler for RuntimePorts {
             return Ok(SendMessageResponse::Task(with_history(task, history)));
         }
         let _ = tokio::time::timeout(SEND_WAIT, async {
+            let mut seq = seq;
             loop {
                 match updates.recv().await {
                     Ok(p) if p.seq <= seq => {}
                     Ok(p) if p.settles => return,
                     Ok(_) => {}
-                    // Behind or gone: what the task now is is read below.
-                    Err(_) => return,
+                    // Behind: the task as it now is decides whether to keep
+                    // waiting.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match self.read_task(&task_id, &who).await {
+                            Ok((t, _)) if settles(&t.status.state) => return,
+                            Ok((_, at)) => seq = at,
+                            Err(_) => return,
+                        }
+                    }
+                    // Gone (retention dropped it): read below.
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         })
@@ -222,7 +244,7 @@ impl RequestHandler for RuntimePorts {
         let who = caller();
         let named = named_task(&req);
         let task_id = named.clone().unwrap_or_else(a2a_types::new_task_id);
-        let history = req.configuration.as_ref().and_then(|c| c.history_length);
+        let history = history_of(req.configuration.as_ref().and_then(|c| c.history_length))?;
         let updates = self.streams.subscribe(&task_id);
         let (answer, seq) = self.send(&req, &task_id, named.is_none(), &who).await?;
         Ok(match answer {
@@ -241,9 +263,10 @@ impl RequestHandler for RuntimePorts {
         req: GetTaskRequest,
     ) -> Result<WireTask, A2AError> {
         let who = caller();
+        let history = history_of(req.history_length)?;
         let v = self.call("GetTask", json!({"id": req.id}), &who).await?;
         let task = same_task(&req.id, task_from(v)?)?;
-        Ok(with_history(task, req.history_length))
+        Ok(with_history(task, history))
     }
 
     /// One page of the tasks the caller may see. The request crosses whole —
@@ -376,7 +399,7 @@ impl RuntimePorts {
         &self,
         task: WireTask,
         seq: u64,
-        updates: broadcast::Receiver<Published>,
+        updates: Subscription,
         who: Principal,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let state = Watch {
@@ -386,6 +409,8 @@ impl RuntimePorts {
             updates,
             bridge: Arc::clone(&self.bridge),
             who,
+            // A re-read projects the task as the opening snapshot did.
+            active: serving().map_or(Active::NONE, |s| s.active),
             done: false,
         };
         Box::pin(stream::unfold(state, |mut w| async move {
@@ -410,7 +435,7 @@ impl RuntimePorts {
                             "GetTask",
                             json!({"id": w.id, "_attach": true}),
                             &w.who,
-                            Active::NONE,
+                            w.active,
                         )
                         .await
                         .and_then(|v| match error_of(&v) {
@@ -443,9 +468,10 @@ struct Watch {
     first: Option<WireTask>,
     /// The last position the reader has seen, by snapshot or by transition.
     seq: u64,
-    updates: broadcast::Receiver<Published>,
+    updates: Subscription,
     bridge: Arc<A2aBridge>,
     who: Principal,
+    active: Active,
     done: bool,
 }
 
@@ -658,9 +684,11 @@ pub struct Published {
 /// The per-task channels the reactor publishes into and streams read from.
 ///
 /// A channel exists while somebody watches its task: one is made when a stream
-/// or a blocking send starts watching, and goes when nobody is left to read it
-/// (seen at the next publish) or retention drops the task. A transition with
-/// nobody watching is published nowhere — there is nobody to tell.
+/// or a blocking send starts watching, and goes when its last watcher lets go
+/// ([`Subscription`]'s drop — a refused subscribe included), when the task
+/// reaches a terminal state (its readers still get what was sent before
+/// that), or when retention drops the task. A transition with nobody watching
+/// is published nowhere — there is nobody to tell.
 #[derive(Default)]
 pub struct Fanout {
     channels: Mutex<HashMap<String, Channel>>,
@@ -672,18 +700,58 @@ struct Channel {
     seq: u64,
 }
 
+/// One watcher of one task's channel. Dropping the last one removes the
+/// channel, so a watch that ends — a stream closed, a send answered, a
+/// subscribe refused — leaves nothing behind.
+pub struct Subscription {
+    fanout: Arc<Fanout>,
+    task: String,
+    rx: Option<broadcast::Receiver<Published>>,
+}
+
+impl Subscription {
+    async fn recv(&mut self) -> Result<Published, broadcast::error::RecvError> {
+        match self.rx.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => Err(broadcast::error::RecvError::Closed),
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut channels = self
+            .fanout
+            .channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        drop(self.rx.take());
+        if channels
+            .get(&self.task)
+            .is_some_and(|c| c.tx.receiver_count() == 0)
+        {
+            channels.remove(&self.task);
+        }
+    }
+}
+
 impl Fanout {
     /// Watch `task`, from now.
-    pub fn subscribe(&self, task: &str) -> broadcast::Receiver<Published> {
+    pub fn subscribe(self: &Arc<Self>, task: &str) -> Subscription {
         let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-        channels
+        let rx = channels
             .entry(task.to_string())
             .or_insert_with(|| Channel {
                 tx: broadcast::channel(STREAM_BUFFER).0,
                 seq: 0,
             })
             .tx
-            .subscribe()
+            .subscribe();
+        Subscription {
+            fanout: Arc::clone(self),
+            task: task.to_string(),
+            rx: Some(rx),
+        }
     }
 
     /// The position of `task`'s last transition (`0` when nobody watches it).
@@ -703,12 +771,17 @@ impl Fanout {
             return;
         }
         ch.seq += 1;
+        let terminal = state.is_some_and(TaskState::is_terminal);
         let _ = ch.tx.send(Published {
             seq: ch.seq,
             response,
-            terminal: state.is_some_and(TaskState::is_terminal),
+            terminal,
             settles: state.is_some_and(settles),
         });
+        // Nothing follows a terminal state; its readers drain what was sent.
+        if terminal {
+            channels.remove(task);
+        }
     }
 
     /// Drop `task`'s channel: its streams end.
@@ -1083,6 +1156,41 @@ mod tests {
         assert_eq!(states, [TaskState::InputRequired, TaskState::Completed]);
     }
 
+    /// A task whose result holds an integer no double holds exactly is still
+    /// readable — the runtime projects it through the SDK's ProtoJSON, which
+    /// carries the protocol's double — and a negative `historyLength` is
+    /// refused as invalid params rather than read as "none".
+    #[tokio::test]
+    async fn every_task_reads_back_and_history_is_never_negative() {
+        let mut t = crate::a2a::tasks::Task::new(
+            "t-big",
+            "c",
+            None,
+            crate::a2a::tasks::Link::Turn { ctx: "c".into() },
+        );
+        t.set_result(json!({"ns": 1_760_140_310_123_456_789u64}));
+        t.transition(crate::a2a::tasks::State::Completed, None);
+        let read = task_from(t.to_a2a(crate::a2a::wire::Annotations::Omit));
+        assert!(read.is_ok_and(|w| w.id == "t-big"));
+
+        let ports = ports_answering(wire_task("t-1", "TASK_STATE_WORKING"));
+        let e = with_request(scope(), async {
+            ports
+                .get_task(
+                    &ServiceParams::new(),
+                    GetTaskRequest {
+                        id: "t-1".into(),
+                        history_length: Some(-1),
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap_err()
+        })
+        .await;
+        assert_eq!(e.code, -32602);
+    }
+
     /// Every way a reply can fail to be the answer it claims is an error, and
     /// every code crosses as the code it is.
     #[tokio::test]
@@ -1113,29 +1221,52 @@ mod tests {
         );
     }
 
-    /// A task retention forgets leaves nothing on the stream side: its channel
-    /// goes, its streams end, and every other task keeps its own; a channel
-    /// nobody reads is dropped at its next publish.
+    /// No watch leaves anything behind: a task retention forgets ends its
+    /// streams and every other task keeps its own; the last watcher letting
+    /// go — a refused subscribe, a closed stream — removes the channel; and a
+    /// terminal transition removes it once sent, its readers still draining
+    /// what came before.
     #[test]
-    fn a_forgotten_task_leaves_no_stream_state() {
-        let streams = Fanout::default();
+    fn no_watch_leaves_a_channel_behind() {
+        let streams = Arc::new(Fanout::default());
+        let held = |id: &str| streams.channels.lock().unwrap().contains_key(id);
         let mut one = streams.subscribe("t-1");
         let _two = streams.subscribe("t-2");
         streams.forget("t-1");
         assert!(matches!(
-            one.try_recv(),
+            one.rx.as_mut().unwrap().try_recv(),
             Err(broadcast::error::TryRecvError::Closed)
         ));
-        assert_eq!(
-            streams.channels.lock().unwrap().len(),
-            1,
-            "t-2 keeps its own"
-        );
+        assert!(held("t-2"), "t-2 keeps its own");
 
-        let reader = streams.subscribe("t-3");
-        drop(reader);
-        let ev = StreamResponse::Message(a2a_types::Message::new(a2a_types::Role::Agent, vec![]));
-        streams.publish("t-3", ev, None);
-        assert!(!streams.channels.lock().unwrap().contains_key("t-3"));
+        let a = streams.subscribe("t-3");
+        let b = streams.subscribe("t-3");
+        drop(a);
+        assert!(held("t-3"), "one watcher left");
+        drop(b);
+        assert!(!held("t-3"), "the last watcher took the channel with it");
+
+        let mut reader = streams.subscribe("t-4");
+        let ended = |state: crate::a2a::tasks::State| {
+            let mut t = crate::a2a::tasks::Task::new(
+                "t-4",
+                "c",
+                None,
+                crate::a2a::tasks::Link::Turn { ctx: "c".into() },
+            );
+            t.transition(state, None);
+            let ev = crate::a2a::wire::status_event(&t);
+            let st = ev.status.state.clone();
+            (StreamResponse::StatusUpdate(ev), st)
+        };
+        let (working, w) = ended(crate::a2a::tasks::State::Working);
+        streams.publish("t-4", working, Some(&w));
+        assert!(held("t-4"));
+        let (done, d) = ended(crate::a2a::tasks::State::Completed);
+        streams.publish("t-4", done, Some(&d));
+        assert!(!held("t-4"), "nothing follows a terminal state");
+        let rx = reader.rx.as_mut().unwrap();
+        assert!(rx.try_recv().is_ok_and(|p| !p.terminal));
+        assert!(rx.try_recv().is_ok_and(|p| p.terminal));
     }
 }

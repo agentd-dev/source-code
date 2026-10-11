@@ -672,8 +672,8 @@ impl Runtime {
     ///
     /// Each goes everywhere at once: from the task map, from the inbox-event
     /// links that would otherwise name it, from the stream fan-out — whose
-    /// replay ring holds its every status and its result, and would otherwise
-    /// outlive it for the daemon's whole life — from the store, so a restart
+    /// channel, while anyone still watches, would otherwise outlive it — from
+    /// the store, so a restart
     /// does not bring it back, and from every display client, which is told
     /// with `task.removed` by the same visibility its `task` events had, so
     /// the owner's view drops it too.
@@ -1112,7 +1112,7 @@ mod tests {
     /// An evicted task takes its stream state with it. What `forget` drops
     /// is pinned in `ports`; that eviction asks for it cannot be shown from a
     /// request — no read of an evicted task gets past "not found" to its
-    /// replay ring — and a runtime cannot be built in a unit test, so this
+    /// channel — and a runtime cannot be built in a unit test, so this
     /// pins the call where every eviction passes.
     #[test]
     fn an_evicted_task_is_forgotten_by_the_stream_side() {
@@ -1124,7 +1124,7 @@ mod tests {
             .expect("evict_terminal_tasks");
         assert!(
             body.contains("sink.forget(&id)"),
-            "eviction must drop the task's replay ring and channel"
+            "eviction must drop the task's stream channel"
         );
         // …and eviction is the one place a removal is announced: a turn or
         // run ending after it must not tell display clients a second time,

@@ -79,10 +79,11 @@ test('against a stock A2A 1.0 agent the client uses only core methods', async (t
     artifacts: [],
   });
   // The follower's first stream ends with the task still working; the
-  // resume carries Last-Event-ID and sees it finish.
-  fake.handle('SubscribeToTask', ({ id }, rec) => {
+  // resume subscribes again and sees it finish.
+  let w1Streams = 0;
+  fake.handle('SubscribeToTask', ({ id }) => {
     if (id !== 'w1') return { stream: [{ task: fake.tasks.get(id) }] };
-    if (rec.headers['last-event-id'] === undefined) return { stream: [{ task: w1 }] };
+    if (w1Streams++ === 0) return { stream: [{ task: w1 }] };
     w1.status = { state: 'TASK_STATE_COMPLETED', timestamp: at(9) };
     w1.artifacts = [{ artifactId: 'w1.out', parts: [{ text: 'job done' }] }];
     return {
@@ -106,8 +107,8 @@ test('against a stock A2A 1.0 agent the client uses only core methods', async (t
   await until(() => mirror.getState().conn === 'polling', 3000, 'core mode');
   await until(() => mirror.getState().transcript.some((e) => e.text === 'job done'), 3000, 'the followed task to finish');
   const subs = fake.rpcCalls('SubscribeToTask').filter((r) => r.params.id === 'w1');
-  assert.equal(subs.length, 2);
-  assert.equal(subs[1].headers['last-event-id'], '1', 'the follower resumed after the last SSE id');
+  assert.equal(subs.length, 2, 'the follower subscribed again');
+  assert.ok(!('last-event-id' in subs[1].headers), 'a resume is a new subscription');
 
   // This client's own send streams; the CRLF-framed frames fold in.
   const a2a = new A2aClient(got.session.ep);
@@ -401,11 +402,9 @@ test('a follower that gave up hands the task to the poll until it moves', async 
   await sleep(400);
   const subs = fake.rpcCalls('SubscribeToTask');
   assert.equal(subs.length, 4, 'the first stream and three resumes, then no fresh follower');
-  assert.deepEqual(subs.slice(1).map((r) => r.headers['last-event-id']), ['1', '1', '1'], 'each resume after the last SSE id');
-  // The task moves on: it is followed again, from where it was.
+  // The task moves on: it is followed again.
   w.status = { state: 'TASK_STATE_SUBMITTED', timestamp: at(5) };
   await until(() => fake.rpcCalls('SubscribeToTask').length > 4, 3000, 'a new follower');
-  assert.equal(fake.rpcCalls('SubscribeToTask')[4].headers['last-event-id'], '1');
   assert.equal(got.terminal.length, 0);
 });
 

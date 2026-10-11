@@ -145,7 +145,7 @@ const CAPS = [
 ];
 
 const SPECS = [
-  ["protocols", "rmcp (official MCP SDK) · a2a-rs (A2A from the spec)"],
+  ["protocols", "official SDKs · rmcp (MCP) · a2aproject/a2a-rs (A2A)"],
   ["transport", "HTTPS everywhere · rustls + ring · bundled roots"],
   ["reactor", "one writer thread · blocking I/O · kernel-enforced cancel"],
   ["binary", "one static musl ELF · 8.5 MiB · stripped · on scratch"],

@@ -208,7 +208,7 @@ export class A2aClient {
     return { result, echo };
   }
 
-  /** SubscribeToTask; `o.lastEventId` resumes after that SSE id. */
+  /** SubscribeToTask: the task as it is, then its transitions until it ends. */
   async subscribeToTask(
     id: string,
     onFrame: (frame: Json, sseId?: string) => void,

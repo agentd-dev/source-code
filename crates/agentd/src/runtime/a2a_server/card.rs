@@ -207,14 +207,27 @@ fn agent_card_of(
     // A conversion failure would mean the card is not an `AgentCard`, which the
     // unit tests make impossible; were it ever to happen, sending the
     // hand-built form beats sending nothing.
-    let Ok(mut typed) = crate::a2a::wire::from_wire::<a2a_types::AgentCard>(card.clone()) else {
-        return card;
-    };
-    if let Some(sec) = security_of(
+    let security = security_of(
         &posture,
         origin_of(advertised_url).as_deref(),
         &settings.a2a.device_grant.scopes,
-    ) {
+    );
+    let Ok(mut typed) = crate::a2a::wire::from_wire::<a2a_types::AgentCard>(card.clone()) else {
+        // Still a card that declares what the listener enforces: a client
+        // MUST authenticate with a scheme the public card names.
+        let mut card = card;
+        if let Some(sec) = security {
+            card["securitySchemes"] = serde_json::to_value(&sec.schemes).unwrap_or(Value::Null);
+            card["securityRequirements"] = json!(
+                sec.requirements
+                    .iter()
+                    .map(|r| json!({"schemes": r.iter().map(|(k, v)| (k.clone(), json!({"list": v}))).collect::<serde_json::Map<_, _>>()}))
+                    .collect::<Vec<_>>()
+            );
+        }
+        return card;
+    };
+    if let Some(sec) = security {
         typed.security_schemes = Some(sec.schemes);
         typed.security_requirements = Some(sec.requirements);
     }

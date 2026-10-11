@@ -228,14 +228,13 @@ test('every request carries a2a-version, tenant and content-type', async (t) => 
     }
   }
 
-  // Extensions and a resume id travel as headers only when asked for.
+  // Extensions travel as a header only when asked for.
   calls.length = 0;
-  await rpcStream(EP, 'SubscribeToTask', { id: 't' }, () => {}, { exts: [X, Y], lastEventId: '42' });
+  await rpcStream(EP, 'SubscribeToTask', { id: 't' }, () => {}, { exts: [X, Y] });
   await rpc(EP, 'GetTask', { id: 't' });
   assert.equal(calls[0].headers['a2a-extensions'], `${X}, ${Y}`);
-  assert.equal(calls[0].headers['last-event-id'], '42');
   assert.ok(!('a2a-extensions' in calls[1].headers));
-  assert.ok(!('last-event-id' in calls[1].headers));
+  assert.ok(!('last-event-id' in calls[0].headers), 'a stream is never resumed by id');
 
   // withTenant overwrites a stray tenant with the declared one and leaves
   // everything else alone.

@@ -210,10 +210,18 @@ async fn dispatch(
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return err(Value::Null, errors::PARSE_ERROR, "invalid JSON");
     };
-    let Envelope { id, method, params } = match envelope(&req) {
+    let Envelope {
+        id,
+        method,
+        mut params,
+    } = match envelope(&req) {
         Ok(e) => e,
         Err(refusal) => return json_response(refusal),
     };
+    // A number the protocol cannot carry exactly is carried as the double it
+    // is on the wire (a DataPart is a `google.protobuf.Value`), so a caller's
+    // over-long integer is read rather than refused.
+    as_protobuf_numbers(&mut params);
 
     // The protocol version the caller speaks, before anything is done on its
     // behalf: a 0.3 client reads the same method names differently, so
@@ -401,7 +409,6 @@ async fn dispatch(
         Admitted {
             id,
             params,
-            body,
             headers,
             principal,
             via,
@@ -418,7 +425,6 @@ async fn dispatch(
 struct Admitted {
     id: Value,
     params: Value,
-    body: Bytes,
     headers: HeaderMap,
     principal: Principal,
     via: Via,
@@ -433,7 +439,6 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
     let Admitted {
         id,
         params,
-        body,
         headers,
         principal,
         via,
@@ -497,11 +502,16 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
 
     // Everything else is the specification's: the SDK's router parses it,
     // dispatches it to agentd's handler with the caller in scope, and frames
-    // the answer.
+    // the answer. It is handed the envelope as the pipeline read it — `params`
+    // an object even where the request left it out, which JSON-RPC allows and
+    // the router would refuse, and its numbers ones the protocol carries.
+    let envelope = json!({"jsonrpc": "2.0", "id": id, "method": route.name(), "params": params});
     let mut request = axum::http::Request::builder()
         .method("POST")
         .uri("/")
-        .body(Body::from(body))
+        .body(Body::from(
+            serde_json::to_vec(&envelope).unwrap_or_default(),
+        ))
         .expect("build request");
     *request.headers_mut() = headers;
     let alive = app.liveness.as_ref().and_then(|l| l(&principal));
@@ -532,6 +542,26 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         empty_result: route == Route::Spec(SpecMethod::DeleteTaskPushNotificationConfig),
     };
     faithful(resp, fidelity, app.request_timeout, alive).await
+}
+
+/// Integers past ±2^53 in `v`, as the doubles a `google.protobuf.Value` holds
+/// them as. The SDK's ProtoJSON refuses an integer no double holds exactly
+/// rather than round it; the protocol's number is a double, so rounding is
+/// what carrying it means.
+fn as_protobuf_numbers(v: &mut Value) {
+    const EXACT: u64 = 1 << 53;
+    match v {
+        Value::Number(n) => {
+            let beyond = n.as_u64().is_some_and(|u| u >= EXACT)
+                || n.as_i64().is_some_and(|i| i.unsigned_abs() >= EXACT);
+            if beyond && let Some(f) = n.as_f64() {
+                *v = json!(f);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(as_protobuf_numbers),
+        Value::Object(o) => o.values_mut().for_each(as_protobuf_numbers),
+        _ => {}
+    }
 }
 
 /// Whether the request says its body is JSON: `application/json`, with any

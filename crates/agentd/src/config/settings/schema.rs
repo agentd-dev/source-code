@@ -135,6 +135,7 @@ fn top_level_properties(
             }));
     let endpoints = json!({ "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" });
     let dialect = json!({ "enum": ["openai", "anthropic", "bedrock", "decisions"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)" });
+    let structured_output = json!({ "enum": ["auto", "prompt"], "description": "how a call whose answer has a JSON Schema is asked on this connection: auto (default) — natively where the dialect and the schema allow (OpenAI response_format, Anthropic output_config.format, a Claude model's on Bedrock), else in the prompt; prompt — in the prompt alone, for a server that refuses a response format. The answer is validated against the schema either way" });
     // A role that writes takes a model; one that decides, a threshold too.
     let writing_role = |what: &str| {
         json!({ "oneOf": [
@@ -164,7 +165,8 @@ fn top_level_properties(
                             "token_file": { "type": "string" },
                             "headers": string_map,
                             "auth": { "$ref": "#/$defs/Auth" },
-                            "timeout": duration } } },
+                            "timeout": duration,
+                            "structured_output": structured_output } } },
                     "models": { "type": "object", "description": "named models: cost/quality tiering inside one workflow without forking a process. A model names the connection it is reached on and cannot describe one", "additionalProperties": {
                         "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
                             "kind": { "enum": ["chat", "decision", "reasoning"], "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing; reasoning generates after thinking, with an effort" },
@@ -187,13 +189,14 @@ fn top_level_properties(
                         "compaction": writing_role("summarising the transcript runs on"),
                         "goal": role("the goal check runs on"),
                         "approve": role("that answers asks on the operator's behalf (approval: auto) runs on. Operator-only") } },
+                    "routes": { "type": "object", "maxProperties": 32, "additionalProperties": { "type": "string", "minLength": 1 }, "description": "the models a turn may run on instead of roles.turn — a declared chat or reasoning model → when to use it. Preflight chooses one per message it looks at (needs agent.preflight auto or always). Operator-only" },
                     "dialect": dialect,
                     "token": secret,
                     "token_file": { "type": "string" },
                     "headers": string_map,
                     "auth": { "$ref": "#/$defs/Auth" },
                     "swap_policy": { "enum": ["finish-on-old", "restart-turn"] },
-                    "structured_output": { "enum": ["auto", "json_schema", "tool", "prompt"] },
+                    "structured_output": structured_output,
                     "budget": budget,
                     "timeout": duration
                 }

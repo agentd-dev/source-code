@@ -93,11 +93,6 @@ pub fn definition_path(id: &str) -> String {
     out
 }
 
-/// The parent scope of a scoped id (`each[3].classify` → `each[3]`).
-pub fn parent_of(id: &str) -> Option<&str> {
-    id.rsplit_once('.').map(|(p, _)| p)
-}
-
 impl Runtime {
     /// Resolve a (possibly scoped) step id against the workflow: the step
     /// definition and its scope (`None` for a top-level step).
@@ -107,9 +102,26 @@ impl Runtime {
         run: &RunState,
         id: &str,
     ) -> Option<(Step, Option<Scope>)> {
+        // A top-level step — a decision guard's `<step>.when` among them, whose
+        // `.` is not a scope.
+        if let Some(s) = wf.step(id) {
+            return Some((s.clone(), None));
+        }
+        // A body step's decision guard sits beside it, in its scope. A guard's
+        // record names its step plainly: `each[0].when` is the body step
+        // `when` of element 0 (and `par{a}.when` of branch `a`), never a guard.
+        if let Some(guarded) = id.strip_suffix(crate::engine::model::GUARD_SUFFIX)
+            && parse_scoped(guarded)
+                .last()
+                .is_some_and(|seg| seg.index.is_none() && seg.branch.is_none())
+            && let Some((step, Some(scope))) = self.resolve_step(wf, run, guarded)
+            && let Some(guard) = step.guard.as_ref().and_then(|g| scope.siblings.get(g))
+        {
+            return Some((guard.clone(), Some(scope)));
+        }
         let segs = parse_scoped(id);
         if segs.len() == 1 && segs[0].index.is_none() && segs[0].branch.is_none() {
-            return wf.step(id).cloned().map(|s| (s, None));
+            return None;
         }
         // Walk the chain: the first segment is a top-level step; each further
         // segment is a body/branch step of the previous.
@@ -524,6 +536,20 @@ impl Runtime {
                             continue;
                         }
                     }
+                }
+                // A decision guard that does not surely hold ends the step as
+                // a false CEL guard does in a body: skipped.
+                if let Some(g) = &step.guard
+                    && !snapshot.get(&scoped_id(scope_id, g)).is_some_and(|s| {
+                        s.status == StepStatus::Done
+                            && crate::engine::run::guard_holds(s.output.as_ref())
+                    })
+                {
+                    if let Some(r) = self.runs.get_mut(run_id) {
+                        r.end_step(&sid, StepStatus::Skipped, None, None);
+                    }
+                    changed = true;
+                    continue;
                 }
                 ready.push(sid);
             }
@@ -1103,13 +1129,12 @@ impl Runtime {
 
     /// A scoped step finished: advance its parent (and, if the parent's own
     /// completion cascades, its grandparent — `nested_advance` recurses through
-    /// `finish_step`).
-    pub(crate) fn on_scoped_step_done(&mut self, run_id: &str, scoped: &str) {
-        if let Some(parent) = parent_of(scoped).map(str::to_string) {
-            // Strip the element/branch suffix to find the parent's own id.
-            let parent_step_id = strip_scope_suffix(&parent);
-            self.nested_advance(run_id, &parent_step_id);
-        }
+    /// `finish_step`). The parent is the step's resolved scope, not a cut of
+    /// its id at the last `.`: a decision guard's id holds one of its own.
+    pub(crate) fn on_scoped_step_done(&mut self, run_id: &str, scope: &Scope) {
+        // Strip the element/branch suffix to find the parent's own id.
+        let parent_step_id = strip_scope_suffix(&scope.parent);
+        self.nested_advance(run_id, &parent_step_id);
     }
 }
 
@@ -1258,7 +1283,6 @@ mod tests {
         assert_eq!(segs[0].branch.as_deref(), Some("a"));
         assert_eq!(segs[1].index, Some(2));
         assert_eq!(scoped_id("each[3]", "classify"), "each[3].classify");
-        assert_eq!(parent_of("each[3].classify"), Some("each[3]"));
         assert_eq!(strip_scope_suffix("each[3]"), "each");
         assert_eq!(strip_scope_suffix("par{a}"), "par");
         assert_eq!(strip_scope_suffix("x[1].y[2]"), "x[1].y");

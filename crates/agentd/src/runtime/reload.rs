@@ -628,6 +628,12 @@ impl Runtime {
             self.swap_subagent_intelligence();
             changed.push("intelligence");
         }
+        // Routes are read as each turn is launched, so a reload that moves
+        // only them has nothing to rebuild — but it changed something, and
+        // says so rather than reporting nothing.
+        if old.intelligence.routes != new.intelligence.routes {
+            changed.push("intelligence.routes");
+        }
         // Budgets: new windows, counters carried over.
         if old.intelligence.budget != new.intelligence.budget {
             let counters = self.governor.to_value();
@@ -1038,6 +1044,7 @@ fn connections_moved(old: &cfg::Settings, new: &cfg::Settings) -> bool {
         || o.headers != n.headers
         || o.auth != n.auth
         || o.timeout != n.timeout
+        || o.structured_output != n.structured_output
         || o.providers != n.providers
 }
 

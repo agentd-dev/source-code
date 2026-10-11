@@ -133,6 +133,7 @@ fn intel_dial_is_aauth_signed_when_identity_installed() {
         temperature: Some(0.0),
         decision: None,
         reasoning: None,
+        output_schema: None,
     };
     intel.complete(&req).expect("completion succeeds");
 

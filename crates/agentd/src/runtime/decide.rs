@@ -96,11 +96,14 @@ pub(crate) fn node_decision(kind: &str, spec: &Map<String, Value>) -> Result<Dec
 /// A deciding node's threshold: its `confidence` — else `roles.decide`'s —
 /// and what an answer under
 /// it does — `on_unsure` as written, else `escalate` where there is a model
-/// to escalate to, else `fail`. A threshold the author set is never quietly
-/// ignored. `None` without `confidence`: nothing is unsure.
+/// to escalate to, else `otherwise`: `fail` for a node, so a threshold the
+/// author set is never quietly ignored, and `continue` for a decision guard,
+/// whose marked answer prunes the step it guards. `None` without
+/// `confidence`: nothing is unsure.
 pub(crate) fn node_sureness(
     spec: &Map<String, Value>,
     can_escalate: bool,
+    otherwise: OnUnsure,
     role_confidence: Option<f64>,
 ) -> Option<Sureness> {
     let confidence = spec
@@ -114,7 +117,7 @@ pub(crate) fn node_sureness(
         .unwrap_or(if can_escalate {
             OnUnsure::Escalate
         } else {
-            OnUnsure::Fail
+            otherwise
         });
     Some(Sureness {
         confidence,
@@ -165,17 +168,25 @@ impl Runtime {
     }
 
     /// The work a deciding node hands its turn: the decision, its shape, the
-    /// escalate model and the threshold.
+    /// escalate model and the threshold. A decision guard (RFC 0046 §7) is
+    /// escalate-else-`continue`, as the `decide` tool is: doubt prunes the
+    /// guarded step rather than failing the run.
     pub(crate) fn decision_work(
         &self,
-        kind: &str,
+        step: &Step,
         spec: &Map<String, Value>,
     ) -> Result<StepWork, String> {
-        let decision = node_decision(kind, spec)?;
+        let decision = node_decision(&step.kind, spec)?;
         let escalate = self.escalate_config(self.deciding_reference(spec).as_deref());
+        let otherwise = if step.guarding.is_some() {
+            OnUnsure::Continue
+        } else {
+            OnUnsure::Fail
+        };
         let sure = node_sureness(
             spec,
             escalate.is_some(),
+            otherwise,
             self.settings
                 .intelligence
                 .role_confidence(ModelRole::Decide),
@@ -183,7 +194,7 @@ impl Runtime {
         Ok(StepWork {
             decision: Some(Box::new(DecisionJob {
                 decision,
-                shape: node_shape(kind),
+                shape: node_shape(&step.kind),
                 escalate,
             })),
             sure,
@@ -229,7 +240,7 @@ impl Runtime {
         spec: &Map<String, Value>,
         data: &Data,
     ) {
-        match self.decision_work(&step.kind, spec) {
+        match self.decision_work(step, spec) {
             Ok(work) => {
                 self.step_turn_pub(run_id, step_id, step, spec, data, ModelRole::Decide, work)
             }
@@ -300,22 +311,31 @@ mod tests {
 
     #[test]
     fn a_threshold_is_never_quietly_ignored() {
-        assert!(node_sureness(&spec(json!({})), true, None).is_none());
-        let s = node_sureness(&spec(json!({"confidence": 0.8})), true, None).unwrap();
+        let fail = OnUnsure::Fail;
+        assert!(node_sureness(&spec(json!({})), true, fail, None).is_none());
+        let s = node_sureness(&spec(json!({"confidence": 0.8})), true, fail, None).unwrap();
         assert_eq!(s.on_unsure, OnUnsure::Escalate);
-        let s = node_sureness(&spec(json!({"confidence": 0.8})), false, None).unwrap();
+        let s = node_sureness(&spec(json!({"confidence": 0.8})), false, fail, None).unwrap();
         assert_eq!(s.on_unsure, OnUnsure::Fail);
         let s = node_sureness(
             &spec(json!({"confidence": 0.8, "on_unsure": "continue"})),
             true,
+            fail,
             None,
         )
         .unwrap();
         assert_eq!(s.on_unsure, OnUnsure::Continue);
         // `roles.decide`'s confidence is the default a node's own replaces.
-        let s = node_sureness(&spec(json!({})), false, Some(0.6)).unwrap();
+        let s = node_sureness(&spec(json!({})), false, fail, Some(0.6)).unwrap();
         assert_eq!(s.confidence, 0.6);
-        let s = node_sureness(&spec(json!({"confidence": 0.9})), false, Some(0.6)).unwrap();
+        let s = node_sureness(&spec(json!({"confidence": 0.9})), false, fail, Some(0.6)).unwrap();
         assert_eq!(s.confidence, 0.9);
+        // A decision guard escalates where it can and is otherwise handed on
+        // marked: its doubt prunes the guarded step.
+        let guard = OnUnsure::Continue;
+        let s = node_sureness(&spec(json!({"confidence": 0.8})), true, guard, None).unwrap();
+        assert_eq!(s.on_unsure, OnUnsure::Escalate);
+        let s = node_sureness(&spec(json!({"confidence": 0.8})), false, guard, None).unwrap();
+        assert_eq!(s.on_unsure, OnUnsure::Continue);
     }
 }

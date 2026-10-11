@@ -118,6 +118,21 @@ pub fn build_request(req: &Request, _token: Option<&str>) -> (Vec<u8>, Vec<(Stri
         }
     }
 
+    // The answer's schema: a Claude model takes Anthropic's own
+    // `output_config.format`, merged with any effort already there. The other
+    // families have no native form agentd sends, so they are asked in the
+    // prompt alone.
+    if model_family(&req.model) == Some(Family::Anthropic)
+        && let Some(format) = super::anthropic::output_format(req)
+    {
+        let config = additional
+            .entry("output_config")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(c) = config {
+            c.insert("format".into(), format);
+        }
+    }
+
     let mut body = Map::new();
     if !additional.is_empty() {
         body.insert(
@@ -414,6 +429,64 @@ mod tests {
         assert!(other[0]["content"][0].get("toolUse").is_some(), "{other:?}");
     }
 
+    /// A Claude model on Bedrock is asked for the answer's schema as on
+    /// Anthropic's own API — `output_config.format`, merged with the
+    /// thinking's effort — inside `additionalModelRequestFields`; another
+    /// family is sent no format.
+    #[test]
+    fn a_claude_model_is_asked_for_the_schema_in_its_own_field() {
+        use crate::wire::intel::{Effort, ReasoningAsk};
+        let ask = |model: &str, reasoning: Option<ReasoningAsk>| Request {
+            model: model.into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            reasoning,
+            output_schema: Some(json!({"type": "object", "properties": {
+                "achieved": {"type": "boolean"}
+            }, "required": ["achieved"]})),
+            ..Default::default()
+        };
+        let body =
+            |r: &Request| -> Value { serde_json::from_slice(&build_request(r, None).0).unwrap() };
+        let claude = body(&ask(
+            "us.anthropic.claude-sonnet-5-v1:0",
+            Some(ReasoningAsk {
+                effort: Effort::High,
+                budget: None,
+            }),
+        ));
+        let config = &claude["additionalModelRequestFields"]["output_config"];
+        assert_eq!(config["effort"], "high", "{claude}");
+        assert_eq!(config["format"]["type"], "json_schema");
+        assert_eq!(config["format"]["schema"]["additionalProperties"], false);
+        let plain = body(&ask("anthropic.claude-haiku-4-5-v1:0", None));
+        assert_eq!(
+            plain["additionalModelRequestFields"]["output_config"]
+                .as_object()
+                .map(|c| c.len()),
+            Some(1),
+            "{plain}"
+        );
+        let llama = body(&ask("meta.llama3-70b-instruct-v1:0", None));
+        assert!(
+            llama.get("additionalModelRequestFields").is_none(),
+            "{llama}"
+        );
+        let oss = body(&ask(
+            "openai.gpt-oss-120b-1:0",
+            Some(ReasoningAsk {
+                effort: Effort::Low,
+                budget: None,
+            }),
+        ));
+        assert!(
+            oss["additionalModelRequestFields"]
+                .get("output_config")
+                .is_none(),
+            "{oss}"
+        );
+    }
+
     #[test]
     fn converse_path_encodes_the_model_id() {
         // A versioned model id: the `:` becomes %3A (both wire + signature).
@@ -446,6 +519,7 @@ mod tests {
             temperature: Some(0.0),
             decision: None,
             reasoning: None,
+            output_schema: None,
         }
     }
 
@@ -526,6 +600,7 @@ mod tests {
             temperature: None,
             decision: None,
             reasoning: None,
+            output_schema: None,
         };
         let v: Value = serde_json::from_slice(&build_request(&r, None).0).unwrap();
         let msgs = v["messages"].as_array().unwrap();

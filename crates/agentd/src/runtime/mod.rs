@@ -59,7 +59,7 @@ pub use reactor::Runtime;
 
 use crate::config::settings::{Loaded, ModelRole, StoreKind};
 use crate::context::memory::Memory;
-use crate::context::{Contexts, skills, tokens};
+use crate::context::{Contexts, skills};
 use crate::engine::run::StepStatus;
 use crate::governor::Governor;
 use crate::mcp::client::McpClient;
@@ -555,19 +555,14 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     let (reap_tx, reap_rx) = std::sync::mpsc::channel();
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agentd"));
 
+    // A tier that declares its window replaces the guess from the model NAME,
+    // which is a substring match and simply wrong for any provider whose
+    // naming does not happen to match; with routes, the smallest window any
+    // turn may run in.
     let model_window = settings
         .context
         .model_window
-        // A tier that declares its window replaces the guess from the model
-        // NAME, which is a substring match and simply wrong for any provider
-        // whose naming does not happen to match.
-        .or_else(|| settings.intelligence.role_window(ModelRole::Turn))
-        .unwrap_or_else(
-            || match settings.intelligence.role_wire_model(ModelRole::Turn) {
-                Some(m) if !m.is_empty() => tokens::window_for_model(&m),
-                _ => tokens::DEFAULT_MODEL_WINDOW,
-            },
-        );
+        .unwrap_or_else(|| settings.intelligence.turn_window());
     // Pressure watches the FILE store's filesystem (a memory/mcp/http store's
     // durability does not live on this disk). `min_free` defaults to 256MB:
     // a checkpoint failure at ENOSPC halts the daemon, so at that point

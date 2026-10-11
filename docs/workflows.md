@@ -289,6 +289,11 @@ Every step also accepts the cross-cutting fields, on any kind:
 `on_replay`, `output_schema`, `cache`, `budget`, `skills`, `otel`, `description`.
 `idempotent` and `otel` parse but no runtime code reads them; `on_replay` is
 read at restore, where it decides what happens to a step caught in flight.
+`when` is a CEL guard, or a decision — `when: {noul: "<statement>", state?,
+confidence?, model?}` — asked as a `decide` step of its own, `<id>.when`, on
+`roles.decide` (the turn model through structured generation when no decision
+model is configured); the step runs only when the statement surely holds. See
+[node-registry.md](node-registry.md#decision-guards).
 
 ### Ask the model something
 
@@ -735,7 +740,7 @@ restart resumes at the next batch").
 ```mermaid
 stateDiagram-v2
     [*] --> Pending
-    Pending --> Pruned: when guard false, or an untaken switch branch
+    Pending --> Pruned: when guard does not hold, or an untaken switch branch
     Pending --> Skipped: a sibling start node fired, or on_replay skip on restore
     Pending --> Running: begin_step, checkpointed before the effect
     Running --> Done: success
@@ -890,11 +895,16 @@ dependency is never waited on, but it does not *satisfy* anything either: a step
 whose every parent is pruned is pruned too, and only a step with another live
 parent still runs.
 
+A decision guard is read the same way: its `<id>.when` step is the guarded
+step's only dependency, and an answer that does not surely hold — the
+statement is false, or the answer is marked unsure — prunes the step exactly
+as a false CEL guard does.
+
 A false `when` guard prunes only in the top-level scheduler. Inside a nested body
-— `foreach`, `batch`, `iterate`, `parallel`, `race`, `subgraph` — a false guard
-still marks the step `skipped`, and a skipped step *satisfies* its dependents:
-the body runs its own smaller scheduler, and the tail behind a guarded-off step
-there runs rather than pruning away. `switch` is the exception: it prunes its
+— `foreach`, `batch`, `iterate`, `parallel`, `race`, `subgraph` — a false guard,
+CEL or decision, still marks the step `skipped`, and a skipped step *satisfies*
+its dependents: the body runs its own smaller scheduler, and the tail behind a
+guarded-off step there runs rather than pruning away. `switch` is the exception: it prunes its
 untaken targets at any depth, body included — and inside a body a pruned step
 satisfies nothing, so anything depending only on it never becomes ready.
 
@@ -911,9 +921,9 @@ flowchart TD
     F -->|"yes"| G["blocked forever, so the run stalls"]
     F -->|"no"| H{"all dependencies Done, Skipped or Pruned?"}
     H -->|"no"| I["not ready yet"]
-    H -->|"yes"| J{"when guard"}
-    J -->|"absent or true"| R
-    J -->|"false"| K
+    H -->|"yes"| J{"when guard: CEL, or the decision's answer"}
+    J -->|"absent, true, or surely holds"| R
+    J -->|"false, does not hold, or unsure"| K
     J -->|"CEL error"| L["the run fails"]
     R --> M{"ready set empty?"}
     M -->|"no"| N["execute the ready steps"]

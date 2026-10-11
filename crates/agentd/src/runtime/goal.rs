@@ -357,6 +357,7 @@ fn goal_judge_call(intel: &IntelConfig, statement: &str, summary: &Value) -> Val
         tools: vec![],
         max_tokens: 300,
         temperature: Some(0.0),
+        output_schema: Some(verdict_schema()),
         ..Default::default()
     };
     match client.complete(&req) {
@@ -478,6 +479,21 @@ pub(crate) fn goal_decision_call(
     })
 }
 
+/// The goal judge's answer, which a connection that allows it holds the
+/// model to (RFC 0046 §5.8); [`parse_verdict`] reads it, and any reply.
+fn verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "achieved": {"type": "boolean"},
+            "stuck": {"type": "boolean"},
+            "reason": {"type": "string"}
+        },
+        "required": ["achieved", "stuck", "reason"],
+        "additionalProperties": false
+    })
+}
+
 /// Extract `{achieved, stuck, reason}` from the model's reply (tolerant of prose
 /// around the JSON object).
 fn parse_verdict(text: &str) -> Value {
@@ -497,4 +513,25 @@ fn extract_json_object(text: &str) -> Option<Value> {
         return None;
     }
     serde_json::from_str(&text[start..=end]).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The goal judge's answer is one a provider can hold the model to —
+    /// strictly on OpenAI — and a reply in that shape is read as given.
+    #[test]
+    fn the_verdict_has_a_strict_schema_and_is_read_from_it() {
+        let schema = verdict_schema();
+        assert_eq!(
+            crate::intel::structured::openai(&schema).map(|(_, strict)| strict),
+            Some(true)
+        );
+        let v =
+            parse_verdict(r#"{"achieved": true, "stuck": false, "reason": "the report is filed"}"#);
+        assert_eq!(v["achieved"], true);
+        assert_eq!(v["reason"], "the report is filed");
+        crate::jsonschema::validate(&schema, &v).unwrap();
+    }
 }

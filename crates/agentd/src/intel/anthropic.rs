@@ -38,6 +38,9 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
     if !system.is_empty() {
         body.insert("system".into(), json!(system));
     }
+    // One `output_config` carries both the thinking's effort and the
+    // answer's format: the API takes one object, so each fills its key.
+    let mut output_config = Map::new();
     match &req.reasoning {
         // Current Claude models think adaptively, at an effort
         // (`output_config.effort`); a model that names a `budget` is asked
@@ -54,7 +57,7 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
                 }
                 None => {
                     body.insert("thinking".into(), json!({"type": "adaptive"}));
-                    body.insert("output_config".into(), json!({"effort": r.effort.as_str()}));
+                    output_config.insert("effort".into(), json!(r.effort.as_str()));
                 }
             }
             body.insert(
@@ -67,6 +70,14 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
         None => {
             body.insert("max_tokens".into(), json!(req.max_tokens));
         }
+    }
+    // The answer's schema, when it has a constrained form; one that has
+    // none (a free-form object, `oneOf`, …) is asked in the prompt alone.
+    if let Some(format) = output_format(req) {
+        output_config.insert("format".into(), format);
+    }
+    if !output_config.is_empty() {
+        body.insert("output_config".into(), Value::Object(output_config));
     }
     body.insert("messages".into(), json!(messages));
     if !req.tools.is_empty() {
@@ -90,6 +101,14 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
         headers.push(("x-api-key".to_string(), tok.to_string()));
     }
     (bytes, headers)
+}
+
+/// The `output_config.format` a request's schema is asked with — on the
+/// Messages API, and for a Claude model on Bedrock — or `None` when it has no
+/// schema or the schema no constrained form.
+pub fn output_format(req: &Request) -> Option<Value> {
+    let schema = super::structured::constrained(req.output_schema.as_ref()?)?;
+    Some(json!({"type": "json_schema", "schema": schema}))
 }
 
 fn message_to_anthropic(m: &Message, model: &str) -> Option<Value> {
@@ -284,6 +303,51 @@ mod tests {
         );
     }
 
+    /// A schema-bearing request asks for the answer in `output_config.format`
+    /// — beside the thinking's effort in the same object — closed and
+    /// stripped; a schema with no constrained form is asked in the prompt.
+    #[test]
+    fn an_output_schema_is_asked_in_output_config_beside_the_effort() {
+        use crate::wire::intel::{Effort, ReasoningAsk};
+        let schema = json!({"type": "object", "properties": {
+            "answer": {"type": "string", "enum": ["approve", "deny", "UNDECIDED"]},
+            "why": {"type": "string", "minLength": 1}
+        }, "required": ["answer"]});
+        let mut req = Request {
+            model: "claude-opus-5-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            reasoning: Some(ReasoningAsk {
+                effort: Effort::Low,
+                budget: None,
+            }),
+            output_schema: Some(schema),
+            ..Default::default()
+        };
+        let body =
+            |r: &Request| -> Value { serde_json::from_slice(&build_request(r, None).0).unwrap() };
+        let v = body(&req);
+        assert_eq!(v["output_config"]["effort"], "low", "{v}");
+        let format = &v["output_config"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["schema"]["additionalProperties"], false);
+        assert_eq!(
+            format["schema"]["properties"]["why"],
+            json!({"type": "string"})
+        );
+
+        // Without reasoning, the format alone.
+        req.reasoning = None;
+        let v = body(&req);
+        assert_eq!(v["output_config"].as_object().unwrap().len(), 1, "{v}");
+        assert!(v["output_config"].get("format").is_some());
+
+        // A free-form answer has no constrained form: no format, and with no
+        // effort either, no output_config at all.
+        req.output_schema = Some(json!({"type": "object"}));
+        assert!(body(&req).get("output_config").is_none());
+    }
+
     /// No temperature reaches a Claude model: current ones refuse it.
     #[test]
     fn a_claude_model_is_sent_no_temperature() {
@@ -313,6 +377,7 @@ mod tests {
             temperature: None,
             decision: None,
             reasoning: None,
+            output_schema: None,
         };
         let (body, headers) = build_request(&req, Some("sk-ant"));
         let v: Value = serde_json::from_slice(&body).unwrap();

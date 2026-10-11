@@ -48,6 +48,11 @@ pub struct Endpoint {
     /// one client, since the credential is a property of the caller and not of
     /// the endpoint it happens to reach.
     pub(super) signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
+    /// `structured_output: prompt` on this endpoint's connection: a
+    /// schema-bearing request is sent without its format and asked in the
+    /// prompt alone — for an OpenAI-compatible server that refuses
+    /// `response_format`.
+    pub(super) structured_prompt: bool,
     /// Live health and circuit-breaker state for this endpoint.
     pub health: HealthRecord,
 }
@@ -125,6 +130,7 @@ impl EndpointList {
                 scheme,
                 extra_headers: Vec::new(),
                 signer: None,
+                structured_prompt: false,
                 health: HealthRecord::new(),
             });
         }
@@ -147,6 +153,14 @@ impl EndpointList {
     pub fn set_signer(&mut self, signer: std::sync::Arc<dyn ::mcp::http::RequestSigner>) {
         for e in &mut self.eps {
             e.signer = Some(signer.clone());
+        }
+    }
+
+    /// Ask every endpoint's schema-bearing requests in the prompt alone,
+    /// with no format on the wire (`structured_output: prompt`).
+    pub fn set_structured_prompt(&mut self, prompt: bool) {
+        for e in &mut self.eps {
+            e.structured_prompt = prompt;
         }
     }
 
@@ -368,7 +382,8 @@ impl Endpoint {
         // the wire — the `tools` definitions AND the prior `tool_calls` in the
         // assistant message history (which get re-sent each turn) — and map the
         // returned `tool_calls` back to the originals so routing is unaffected.
-        // No-op (no clone) when every name is already wire-safe.
+        // No-op (no clone) when every name is already wire-safe and the request
+        // goes out as built.
         use crate::wire::intel::Message;
         let dirty = |n: &str| wire_tool_name(n) != n;
         let must_sanitize = req.tools.iter().any(|t| dirty(&t.name))
@@ -376,10 +391,17 @@ impl Endpoint {
                 matches!(m, Message::Assistant { tool_calls, .. }
                     if tool_calls.iter().any(|tc| dirty(&tc.name)))
             });
+        // A connection that is asked in the prompt alone (`structured_output:
+        // prompt`) is sent no format: the schema stays the caller's, to
+        // validate the answer against, and leaves this request here.
+        let drop_format = self.structured_prompt && req.output_schema.is_some();
         let mut wire_to_orig: HashMap<String, String> = HashMap::new();
         let owned_req;
-        let req: &crate::wire::intel::Request = if must_sanitize {
+        let req: &crate::wire::intel::Request = if must_sanitize || drop_format {
             let mut r = req.clone();
+            if drop_format {
+                r.output_schema = None;
+            }
             for t in &mut r.tools {
                 let w = wire_tool_name(&t.name);
                 if w != t.name {
@@ -474,12 +496,16 @@ impl Endpoint {
             };
             return Ok((answered, latency));
         }
+        // Every question in one call, its answer's shape asked natively where
+        // this connection allows (RFC 0046 §5.8) and in the prompt always, so
+        // a connection asked in the prompt alone answers the same object.
         let mut chat = Request {
             model: req.model.clone(),
             messages: decisions::emulation_messages(d),
             max_tokens: req.max_tokens,
             temperature: Some(0.0),
             reasoning: req.reasoning,
+            output_schema: Some(decisions::emulation_schema(d)),
             ..Default::default()
         };
         let (mut resp, mut latency) = self.complete_once(&chat, timeout, trace_id)?;

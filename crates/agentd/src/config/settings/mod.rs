@@ -1158,6 +1158,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // behalf, which a document must not choose for its own gates.
     "intelligence.providers",
     "intelligence.roles.approve",
+    // The models every turn may be routed to. A document binds the turn model
+    // already; which models preflight may move a turn onto, message by
+    // message, is the operator's choice, as the approver is (RFC 0046 §7).
+    "intelligence.routes",
     // A whole child agent — its own instruction source, grants and identity.
     // A document REFERENCES a template (`:::agent template=…`, the `compose`
     // family); defining one is the operator's.
@@ -1607,6 +1611,8 @@ pub struct Intelligence {
     /// `agentd login intelligence`; the resolved bearer overrides `token`.
     pub auth: Option<Auth>,
     pub swap_policy: Option<String>,
+    /// How the top-level connection asks for an answer that has a schema:
+    /// `auto` (natively where it can) or `prompt` (RFC 0046 §5.8).
     pub structured_output: StructuredOutput,
     pub budget: Budget,
     /// The ceiling on one model call on this connection. Default 120 s; the
@@ -1615,9 +1621,9 @@ pub struct Intelligence {
     /// Further connections, by name — a second vendor, a gateway, a decisions
     /// endpoint. Each is everything the top-level connection is and nothing
     /// more: `endpoints`, `dialect`, `token`/`token_file`, `headers`, `auth`,
-    /// `timeout`. A model reaches one by naming it (`models.<n>.provider`);
-    /// nothing else can, so a provider is a destination only the operator
-    /// adds (RFC 0046 §5.2).
+    /// `timeout`, `structured_output`. A model reaches one by naming it
+    /// (`models.<n>.provider`); nothing else can, so a provider is a
+    /// destination only the operator adds (RFC 0046 §5.2).
     pub providers: BTreeMap<String, Provider>,
     /// Named models. The model was one instance-global string, so choosing a
     /// cheap model for a classify step and a frontier one for a judgement
@@ -1630,6 +1636,12 @@ pub struct Intelligence {
     pub models: BTreeMap<String, ModelTier>,
     /// Which model each job runs on (RFC 0046 §5.4).
     pub roles: Roles,
+    /// The models a turn may run on instead of `roles.turn`, each with when
+    /// to use it: preflight chooses one for each message it looks at, and
+    /// the turn that answers that message runs on it (RFC 0046 §7). Every
+    /// key is a declared chat or reasoning model. Operator-only — it moves
+    /// every turn, as `roles.approve` moves every approval.
+    pub routes: BTreeMap<String, String>,
     /// The operator's own `intelligence` section, before a served document's
     /// `:::!config` merged under it — set only when the document wrote
     /// `intelligence`. The `approve` role resolves here: the model that
@@ -1655,6 +1667,7 @@ pub struct Provider {
     pub headers: BTreeMap<String, String>,
     pub auth: Option<Auth>,
     pub timeout: Option<Dur>,
+    pub structured_output: StructuredOutput,
 }
 
 /// One connection as validation, the runtime and `agentd login` read it: the
@@ -1670,6 +1683,7 @@ pub struct Connection<'a> {
     pub headers: &'a BTreeMap<String, String>,
     pub auth: Option<&'a Auth>,
     pub timeout: Option<Duration>,
+    pub structured_output: StructuredOutput,
 }
 
 impl Connection<'_> {
@@ -1944,6 +1958,25 @@ impl Intelligence {
             .and_then(|r| self.tier(&r).and_then(|t| t.window))
     }
 
+    /// The context window a turn's transcript has to fit: the turn model's,
+    /// and with `routes` the least of it and every route's — any of them may
+    /// answer the next message, so compaction keeps the transcript within
+    /// the smallest (RFC 0046 §7). Each is the model's declared `window`,
+    /// else the guess from its wire model's name.
+    pub fn turn_window(&self) -> u64 {
+        use crate::context::tokens;
+        let window = |reference: &str| {
+            self.tier(reference)
+                .and_then(|t| t.window)
+                .unwrap_or_else(|| tokens::window_for_model(&self.wire_model(reference)))
+        };
+        let turn = self
+            .reference(ModelRole::Turn)
+            .filter(|r| !r.is_empty())
+            .map_or(tokens::DEFAULT_MODEL_WINDOW, |r| window(&r));
+        self.routes.keys().map(|r| window(r)).fold(turn, u64::min)
+    }
+
     /// A reference's kind: its declared model's, else `chat` (a literal is a
     /// chat model on the top-level connection).
     pub fn kind_of(&self, reference: &str) -> ModelKind {
@@ -1971,6 +2004,7 @@ impl Intelligence {
                 headers: &p.headers,
                 auth: p.auth.as_ref(),
                 timeout: p.timeout.map(|d| d.0),
+                structured_output: p.structured_output,
             }),
         }
     }
@@ -1986,6 +2020,7 @@ impl Intelligence {
             headers: &self.headers,
             auth: self.auth.as_ref(),
             timeout: self.timeout.map(|d| d.0),
+            structured_output: self.structured_output,
         }
     }
 
@@ -2017,13 +2052,18 @@ impl Intelligence {
     }
 }
 
+/// How a connection asks for an answer that has a JSON Schema (RFC 0046
+/// §5.8). The caller validates the answer against the schema either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredOutput {
+    /// Natively wherever the dialect and the schema allow — OpenAI's
+    /// `response_format`, Anthropic's `output_config.format` (and a Claude
+    /// model's on Bedrock) — and in the prompt otherwise.
     #[default]
     Auto,
-    JsonSchema,
-    Tool,
+    /// In the prompt alone, never a format on the wire: for an
+    /// OpenAI-compatible server that refuses `response_format`.
     Prompt,
 }
 
@@ -7263,6 +7303,63 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             );
         }
     }
+    // intelligence.routes — preflight chooses among them in one question, and
+    // the turn it chose runs on the route's model (RFC 0046 §7). A route
+    // nothing can choose, or a model a turn cannot run on, would be accepted
+    // and never take effect, so each is refused here.
+    let routes = &s.intelligence.routes;
+    if !routes.is_empty() && s.agent.preflight == Preflight::Never {
+        err(
+            &mut d,
+            "intelligence.routes: agent.preflight is never, so nothing would choose a route — \
+             set preflight to auto or always, or remove the routes"
+                .into(),
+        );
+    }
+    if routes.len() > crate::wire::decision::MAX_OPTIONS {
+        err(
+            &mut d,
+            format!(
+                "intelligence.routes: {} routes, at most {} — preflight chooses among them in one question",
+                routes.len(),
+                crate::wire::decision::MAX_OPTIONS
+            ),
+        );
+    }
+    for (name, when) in routes {
+        let at = format!("intelligence.routes.{name}");
+        match s.intelligence.models.get(name) {
+            None => err(
+                &mut d,
+                format!(
+                    "{at}: {name:?} is not a declared model (known: {})",
+                    if s.intelligence.models.is_empty() {
+                        "none — declare it under intelligence.models".to_string()
+                    } else {
+                        s.intelligence
+                            .models
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ),
+            ),
+            Some(t) if t.kind == ModelKind::Decision => err(
+                &mut d,
+                format!(
+                    "{at}: {name:?} is a decision model; a turn writes, so a route is a chat or reasoning model"
+                ),
+            ),
+            Some(_) => {}
+        }
+        if when.trim().is_empty() {
+            err(
+                &mut d,
+                format!("{at}: say when to use it — preflight chooses a route by its criterion"),
+            );
+        }
+    }
 
     // What qualifies a spawn or a budget names a model that writes: a child
     // and a degraded turn both generate.
@@ -8058,6 +8155,24 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 };
                 for e in step_model_refusals(s, kind, spec) {
                     err(&mut d, format!("workflow '{name}' step '{sid}': {e}"));
+                }
+                // A decision guard is a `decide` step of its own at load
+                // (RFC 0046 §7), and its model is held to the same rules.
+                if let Some(guard) = st.get("when").and_then(Value::as_object) {
+                    let spec: Map<String, Value> = guard
+                        .iter()
+                        .filter(|(k, _)| matches!(k.as_str(), "model" | "confidence"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for e in step_model_refusals(s, "decide", &spec) {
+                        err(
+                            &mut d,
+                            format!(
+                                "workflow '{name}' step '{sid}{}': {e}",
+                                crate::engine::model::GUARD_SUFFIX
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -9025,6 +9140,13 @@ fn validate_connection(c: &Connection<'_>, d: &mut Diagnostics) {
                 "{at}.dialect: decisions — the top-level connection serves the agent's turns; a decision model's endpoint goes under intelligence.providers"
             ));
         }
+        // A decisions endpoint is never sent a schema, so `prompt` there
+        // would be accepted and do nothing.
+        if dialect == "decisions" && c.structured_output == StructuredOutput::Prompt {
+            d.errors.push(format!(
+                "{at}.structured_output: prompt — a decisions endpoint answers decisions natively and is sent no schema; set it on the chat connection that refuses a response format"
+            ));
+        }
         // Native Bedrock authenticates by SigV4 — an `auth: {kind: aws}` is
         // required (creds come from env/imds/irsa/sso at dial time).
         if dialect == "bedrock" && !matches!(c.auth.map(|a| a.kind), Some(AuthKind::Aws)) {
@@ -9229,6 +9351,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "intelligence.models",
     "intelligence.providers",
     "intelligence.roles",
+    // Read when a turn is launched: a route a reload removed leaves the turn
+    // a preflight routed to it on `roles.turn`.
+    "intelligence.routes",
     "intelligence.structured_output",
     "intelligence.swap_policy",
     "intelligence.timeout",
@@ -14179,6 +14304,46 @@ mod tests {
         }
     }
 
+    /// `structured_output` is `auto` or `prompt`, at the top and on each
+    /// provider; the values nothing read are gone, and `prompt` on a
+    /// decisions endpoint — which is sent no schema — is refused, not
+    /// accepted to do nothing.
+    #[test]
+    fn structured_output_is_auto_or_prompt_per_connection() {
+        let l = load_doc(
+            "intelligence:\n  endpoints: \"mock:json\"\n  structured_output: prompt\n  providers:\n    p: {endpoints: \"https://p.example\", structured_output: prompt}\n",
+        )
+        .unwrap();
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+        let intel = &l.settings.intelligence;
+        assert_eq!(intel.structured_output, StructuredOutput::Prompt);
+        assert_eq!(
+            intel.connection(Some("p")).map(|c| c.structured_output),
+            Some(StructuredOutput::Prompt)
+        );
+        assert_eq!(
+            intel.connection(None).map(|c| c.structured_output),
+            Some(StructuredOutput::Prompt)
+        );
+        for gone in ["json_schema", "tool"] {
+            let doc =
+                format!("intelligence:\n  endpoints: \"mock:json\"\n  structured_output: {gone}\n");
+            assert!(load_doc(&doc).is_err(), "{gone}");
+        }
+        let e = match load_doc(
+            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jev: {endpoints: \"https://d.example/v1/decisions\", dialect: decisions, structured_output: prompt}\n",
+        ) {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains(
+                "intelligence.providers.jev.structured_output: prompt — a decisions endpoint"
+            ),
+            "{e}"
+        );
+    }
+
     #[test]
     fn a_provider_is_checked_like_the_top_level_connection() {
         let errors = |doc: &str| match load_doc(doc) {
@@ -14393,6 +14558,71 @@ mod tests {
         }
     }
 
+    /// `intelligence.routes`: each a declared model a turn can run on, with
+    /// a criterion preflight chooses by — and something to choose them.
+    #[test]
+    fn routes_are_declared_writing_models_that_preflight_chooses_among() {
+        let doc = |routes: &str, agent: &str| {
+            format!(
+                "agent: {{name: r{agent}}}\nintelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jevp: {{endpoints: \"https://jev.example/v1/decisions\", dialect: decisions}}\n  models:\n    smart: {{model: s-1}}\n    fast: {{model: f-1, window: 32000}}\n    deep: {{kind: reasoning, model: d-1}}\n    jev: {{kind: decision, provider: jevp, model: j-1}}\n  roles: {{turn: smart, preflight: jev}}\n  routes: {routes}\n"
+            )
+        };
+        let l = load_doc(&doc(
+            "{fast: \"a quick answer\", deep: \"careful multi-step work\"}",
+            "",
+        ))
+        .unwrap();
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+        let i = &l.settings.intelligence;
+        assert_eq!(i.routes["deep"], "careful multi-step work");
+        // Any route may answer the next message, so the transcript fits the
+        // smallest window among them and the turn model.
+        assert_eq!(i.turn_window(), 32000);
+        let errors = |routes: &str, agent: &str| match load_doc(&doc(routes, agent)) {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        let many = (0..33)
+            .map(|i| format!("m{i}: x"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (routes, agent, why) in [
+            (
+                "{nope: \"x\"}",
+                "",
+                "intelligence.routes.nope: \"nope\" is not a declared model",
+            ),
+            (
+                "{jev: \"x\"}",
+                "",
+                "intelligence.routes.jev: \"jev\" is a decision model",
+            ),
+            (
+                "{fast: \"  \"}",
+                "",
+                "intelligence.routes.fast: say when to use it",
+            ),
+            (
+                "{fast: x}",
+                ", preflight: never",
+                "agent.preflight is never, so nothing would choose a route",
+            ),
+            (&format!("{{{many}}}"), "", "33 routes, at most 32"),
+            ("{fast: [x]}", "", "expected a string"),
+        ] {
+            let e = errors(routes, agent);
+            assert!(e.contains(why), "{routes} {agent} → {e}");
+        }
+        // With no models declared at all, a route still names a declared one.
+        let e = match load_doc(
+            "intelligence:\n  endpoints: \"mock:json\"\n  model: smart\n  routes: {deep: x}\n",
+        ) {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("declare it under intelligence.models"), "{e}");
+    }
+
     /// The judge that answers on the operator's behalf resolves in the
     /// operator's own section: a document that declares a model under the
     /// name the operator's `roles.approve` gives does not re-point it.
@@ -14462,7 +14692,8 @@ mod tests {
         let frag: Map<String, Value> = serde_json::from_value(json!({"intelligence": {
             "models": {"cheap": {"model": "m-1"}, "mine": {"model": "m-2", "provider": "evil"}},
             "roles": {"turn": "cheap", "think": "cheap", "decide": "cheap", "approve": "cheap"},
-            "providers": {"evil": {"endpoints": "https://evil.example"}}
+            "providers": {"evil": {"endpoints": "https://evil.example"}},
+            "routes": {"cheap": "every message"}
         }}))
         .unwrap();
         let mut refused = super::document_wrote_operator_config(&frag);
@@ -14473,7 +14704,19 @@ mod tests {
                 "intelligence.models.mine.provider".to_string(),
                 "intelligence.providers.evil".to_string(),
                 "intelligence.roles.approve".to_string(),
+                "intelligence.routes.cheap".to_string(),
             ]
+        );
+        // And through a real `:::!config` block: the load is refused.
+        let e = Settings::from_document(
+            json!({"agent": {"instruction": ":::!config\nintelligence:\n  models:\n    cheap: {model: m-1}\n  routes: {cheap: every message}\n:::\nWork."},
+                   "intelligence": {"endpoints": "mock:json"}}),
+            "t",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("intelligence.routes.cheap") && e.contains("operator configuration"),
+            "{e}"
         );
     }
 

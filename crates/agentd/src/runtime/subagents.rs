@@ -749,9 +749,7 @@ impl Runtime {
     pub(crate) fn note_root(&mut self, text: String) {
         let window = self.model_window();
         let c = self.contexts.root();
-        if c.model_window == 0 {
-            c.model_window = window;
-        }
+        c.model_window = window;
         c.append(Msg::note(text));
     }
 

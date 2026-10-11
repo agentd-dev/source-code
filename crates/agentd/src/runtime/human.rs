@@ -978,7 +978,7 @@ impl Runtime {
                         schema.as_ref(),
                     )
                 } else {
-                    human_judge_call(&intel, &question)
+                    human_judge_call(&intel, &question, schema.as_ref())
                 };
                 let _ = tx.send(super::events::Event::Background {
                     id: format!("human.judge:{ask}"),
@@ -1154,7 +1154,17 @@ pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
 }
 
 /// The auto-judge intel dial: answer `question` on the operator's behalf.
-fn human_judge_call(intel: &crate::subagent::protocol::IntelConfig, question: &str) -> Value {
+///
+/// A closed ask — its answer an `enum` or a boolean ([`closed_answers`]) —
+/// is asked with the answer's shape (RFC 0046 §5.8): `{answer}`, one of its
+/// answers or `UNDECIDED`, held to it natively where the connection allows.
+/// A connection asked in the prompt alone answers in plain text, as the
+/// system prompt says, and that text is the answer.
+fn human_judge_call(
+    intel: &crate::subagent::protocol::IntelConfig,
+    question: &str,
+    schema: Option<&Value>,
+) -> Value {
     let client = match intel.client() {
         Ok(c) => c,
         Err(e) => return json!({"error": format!("intel: {e}")}),
@@ -1165,23 +1175,58 @@ conservatively: prefer the safe, reversible choice; never approve destructive or
 irreversible actions on the operator's behalf. Reply with ONLY the answer text the \
 operator would give — no preamble. If you genuinely cannot decide, reply exactly \
 UNDECIDED.";
+    let closed = closed_answers(schema);
+    let mut user = format!("QUESTION FOR THE OPERATOR:\n{question}");
+    if let Some(options) = &closed {
+        user.push_str(&format!(
+            "\n\nTHE ANSWER IS ONE OF: {} (or UNDECIDED)",
+            options.join(", ")
+        ));
+    }
     let req = Request {
         model: intel.model.clone().unwrap_or_default(),
-        messages: vec![
-            Message::System(system.to_string()),
-            Message::User(format!("QUESTION FOR THE OPERATOR:\n{question}")),
-        ],
+        messages: vec![Message::System(system.to_string()), Message::User(user)],
         tools: vec![],
         max_tokens: 400,
         temperature: Some(0.0),
+        output_schema: closed.as_deref().map(judge_answer_schema),
         ..Default::default()
     };
     match client.complete(&req) {
         Ok(resp) => {
-            json!({"answer": resp.text.unwrap_or_default(), "usage": super::goal::usage_value(resp.usage)})
+            let text = resp.text.unwrap_or_default();
+            let answer = match closed {
+                Some(_) => judged_answer(&text),
+                None => text,
+            };
+            json!({"answer": answer, "usage": super::goal::usage_value(resp.usage)})
         }
         Err(e) => json!({"error": format!("intel: {e}")}),
     }
+}
+
+/// The shape a chat judge answers a closed ask in: one of `options`, or
+/// `UNDECIDED` — so a model held to it can still leave the ask to the
+/// operator.
+fn judge_answer_schema(options: &[String]) -> Value {
+    let mut answers: Vec<&str> = options.iter().map(String::as_str).collect();
+    answers.push(UNDECIDED);
+    json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string", "enum": answers}},
+        "required": ["answer"],
+        "additionalProperties": false
+    })
+}
+
+/// A chat judge's answer to a closed ask: the `answer` of the object it was
+/// held to, or — from a connection asked in the prompt alone — its reply as
+/// written.
+fn judged_answer(text: &str) -> String {
+    crate::runtime::worker::parse_json_answer(text)
+        .ok()
+        .and_then(|v| v.get("answer").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| text.to_string())
 }
 
 /// The answers a closed ask allows: its schema's `enum`, or `true`/`false`
@@ -1227,7 +1272,7 @@ fn human_decision_call(
     let Some(options) = closed_answers(schema) else {
         return match escalate {
             Some((e, true)) => {
-                let mut r = human_judge_call(e, question);
+                let mut r = human_judge_call(e, question, schema);
                 r["escalated"] = json!(true);
                 r
             }
@@ -1340,5 +1385,25 @@ mod decision_tests {
         assert_eq!(closed_answers(Some(&json!({"enum": ["only"]}))), None);
         assert_eq!(closed_answers(Some(&json!({"enum": [1, 2]}))), None);
         assert_eq!(closed_answers(None), None);
+    }
+
+    /// A chat judge answers a closed ask in a shape a provider can hold it to
+    /// — one of the answers or UNDECIDED, strictly on OpenAI — and the answer
+    /// is read from that object, or taken as written from a connection asked
+    /// in the prompt alone.
+    #[test]
+    fn a_chat_judge_answers_a_closed_ask_in_its_shape() {
+        let schema = judge_answer_schema(&["approve".into(), "deny".into()]);
+        assert_eq!(
+            schema["properties"]["answer"]["enum"],
+            json!(["approve", "deny", "UNDECIDED"])
+        );
+        assert_eq!(
+            crate::intel::structured::openai(&schema).map(|(_, strict)| strict),
+            Some(true)
+        );
+        assert_eq!(judged_answer(r#"{"answer": "deny"}"#), "deny");
+        assert_eq!(judged_answer("approve"), "approve");
+        assert_eq!(judged_answer("true"), "true");
     }
 }

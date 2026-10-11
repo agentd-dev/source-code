@@ -428,9 +428,11 @@ impl Runtime {
         }
         // Intelligence: the parent's section — its providers, models and
         // roles with it — minus its budget (the child's budget is the
-        // template's grant) and minus any INLINE token, the top-level one's
-        // or a provider's (the env passthrough carries it; a secret
-        // REFERENCE rides along fine).
+        // template's grant), minus its routes (the parent's per-turn policy;
+        // a child's turn model is its template's choice, and a template that
+        // turns preflight off would compose a child its routes refuse), and
+        // minus any INLINE token, the top-level one's or a provider's (the
+        // env passthrough carries it; a secret REFERENCE rides along fine).
         let mut intel = self
             .settings_doc
             .get("intelligence")
@@ -438,6 +440,7 @@ impl Runtime {
             .unwrap_or(json!({}));
         if let Some(o) = intel.as_object_mut() {
             o.remove("budget");
+            o.remove("routes");
             drop_inline_token(o);
             if let Some(providers) = o.get_mut("providers").and_then(Value::as_object_mut) {
                 for p in providers.values_mut().filter_map(Value::as_object_mut) {

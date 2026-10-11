@@ -19,7 +19,7 @@ use super::events::{Event, kinds};
 use super::timers::Timers;
 use crate::config::settings::{RunUntil, Settings};
 use crate::context::memory::Memory;
-use crate::context::{Contexts, skills, tokens};
+use crate::context::{Contexts, skills};
 use crate::engine::{RunState, RunStatus, Workflow};
 use crate::governor::Governor;
 use crate::mcp::client::McpClient;
@@ -152,6 +152,12 @@ pub struct TurnJob {
     /// a timer acting for nobody — is not held to that: it is the instance
     /// talking to itself.
     pub owner_checked: bool,
+    /// The route preflight chose for this message — a model under
+    /// `intelligence.routes` the turn runs on instead of `roles.turn`
+    /// (RFC 0046 §7). `None` (no preflight, no verdict, no route) runs it on
+    /// `roles.turn`. It belongs to this job alone: the conversation's next
+    /// message is routed by its own preflight.
+    pub route: Option<String>,
 }
 
 impl TurnJob {
@@ -175,6 +181,7 @@ impl TurnJob {
             knowledge: None,
             msg_depth: 0,
             owner_checked: false,
+            route: None,
         }
     }
     /// The same job, carrying a delivered message's hop depth.
@@ -1882,19 +1889,16 @@ impl Runtime {
     /// `context.model_window` wins, then the active tier's declared `window`,
     /// and only then the guess from the model NAME — a substring match that is
     /// simply wrong for any provider whose naming does not happen to match.
-    /// A tier that declares its window replaces the guess with a fact.
+    /// A tier that declares its window replaces the guess with a fact. With
+    /// `intelligence.routes`, the smallest of the turn model's and the
+    /// routes' ([`Intelligence::turn_window`]).
+    ///
+    /// [`Intelligence::turn_window`]: crate::config::settings::Intelligence::turn_window
     pub(crate) fn model_window(&self) -> u64 {
-        if let Some(w) = self.settings.context.model_window {
-            return w;
-        }
-        if let Some(w) = self
-            .settings
-            .intelligence
-            .role_window(crate::config::settings::ModelRole::Turn)
-        {
-            return w;
-        }
-        tokens::window_for_model(&self.turn_model())
+        self.settings
+            .context
+            .model_window
+            .unwrap_or_else(|| self.settings.intelligence.turn_window())
     }
 }
 

@@ -39,6 +39,22 @@ pub const MAX_ID_LEN: usize = 64;
 /// serve — every other intelligence node writes.
 pub const DECIDING_KINDS: &[&str] = &["decide", "classify", "route", "judge"];
 
+/// The suffix of a decision guard's step id (RFC 0046 §7): `when: {noul, …}`
+/// on step `refund` becomes the `decide` step `refund.when`. An author's id
+/// never holds a `.`, so the two cannot collide in one step map.
+pub const GUARD_SUFFIX: &str = ".when";
+
+/// The one question a decision guard asks: does its statement hold?
+pub const GUARD_QUESTION: &str = "holds";
+
+/// A dependency-less step's decision guard decides about the run's inputs
+/// unless it names its own `state` …
+const RUN_INPUTS: &str = "{{ inputs }}";
+/// … and, inside a `foreach` or `batch` body, about the element the body runs
+/// for: the run's inputs are the same for every element, so a guard asking
+/// about them would answer the same for each one.
+const BODY_ITEM: &str = "{{ item | null }}";
+
 /// A step kind's metadata.
 #[derive(Debug, Clone, Copy)]
 pub struct KindInfo {
@@ -902,8 +918,21 @@ pub struct Step {
     pub kind: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// A CEL guard: the step runs only when it is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    /// A decision guard (RFC 0046 §7): the id of the `decide` step,
+    /// `<id>.when`, that asks whether this step should run. The step depends
+    /// on it alone and runs only when its answer holds surely; otherwise it
+    /// is pruned, as a false CEL guard prunes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+    /// On that `decide` step: the step it guards. An unsure answer is
+    /// escalated where the model names an `escalate` model and otherwise
+    /// handed on marked, for the guarded step to be pruned by. Doubt never
+    /// fails the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<Retry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1593,10 +1622,14 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
                 ));
             }
             for (id, sv) in map {
-                if let Some(step) = parse_step(&name, id, sv, 0, &mut errs) {
+                if let Some((step, guard)) = parse_step(&name, id, sv, 0, RUN_INPUTS, &mut errs) {
+                    if let Some(g) = guard {
+                        steps.insert(g.id.clone(), g);
+                    }
                     steps.insert(id.clone(), step);
                 }
             }
+            check_routed_guards(&format!("workflow {name:?}"), &steps, &mut errs);
         }
     }
     if !errs.is_empty() {
@@ -1786,13 +1819,18 @@ pub fn inbound_routes(def: &Value) -> Vec<InboundRoute<'_>> {
     out
 }
 
+/// Parse one step. A decision guard on it comes back as a second step, the
+/// `decide` step that asks it, for the caller to place beside it.
+/// `entry_state` is what that guard decides about when the step has no
+/// dependencies and the guard names no `state`.
 fn parse_step(
     wf: &str,
     id: &str,
     sv: &Value,
     depth: usize,
+    entry_state: &str,
     errs: &mut Vec<String>,
-) -> Option<Step> {
+) -> Option<(Step, Option<Step>)> {
     let at = format!("workflow {wf:?} step {id:?}");
     if !valid_id(id) {
         errs.push(format!(
@@ -1857,6 +1895,11 @@ fn parse_step(
         if depth + 1 > MAX_NESTING {
             errs.push(format!("{at}: nesting exceeds {MAX_NESTING}"));
         }
+        let inner_entry = if matches!(kind.as_str(), "foreach" | "batch") {
+            BODY_ITEM
+        } else {
+            RUN_INPUTS
+        };
         if matches!(kind.as_str(), "parallel" | "race") {
             match spec.get("branches").and_then(Value::as_object) {
                 Some(bm) if !bm.is_empty() => {
@@ -1864,9 +1907,13 @@ fn parse_step(
                         if !valid_id(bname) {
                             errs.push(format!("{at}: branch name {bname:?} must match [a-zA-Z_][a-zA-Z0-9_-]{{0,63}}"));
                         }
-                        if let Some(b) =
-                            parse_body(&format!("{wf}/{id}/{bname}"), bv, depth + 1, errs)
-                        {
+                        if let Some(b) = parse_body(
+                            &format!("{wf}/{id}/{bname}"),
+                            bv,
+                            depth + 1,
+                            inner_entry,
+                            errs,
+                        ) {
                             branches.insert(bname.clone(), b);
                         }
                     }
@@ -1877,7 +1924,9 @@ fn parse_step(
             }
         } else {
             match spec.get("body") {
-                Some(bv) => body = parse_body(&format!("{wf}/{id}"), bv, depth + 1, errs),
+                Some(bv) => {
+                    body = parse_body(&format!("{wf}/{id}"), bv, depth + 1, inner_entry, errs)
+                }
                 None => errs.push(format!("{at}: body is required")),
             }
         }
@@ -1898,13 +1947,58 @@ fn parse_step(
     if info.start && !depends_on.is_empty() {
         errs.push(format!("{at}: a start node cannot depend on other steps"));
     }
-    let when = o.get("when").and_then(Value::as_str).map(str::to_string);
-    if let Some(w) = &when {
-        let expr = w.trim().trim_start_matches("CEL:").trim();
-        if let Err(e) = crate::cel::compile_check(expr) {
-            errs.push(format!("{at}: when: {e}"));
+    // `when` is a CEL expression, or a decision (RFC 0046 §7) that becomes a
+    // `decide` step of its own, which this step then depends on alone — its
+    // own dependencies stay upstream, through the guard. Any other shape is
+    // refused: an object here was once read as no guard at all, and the step
+    // ran unguarded.
+    let mut guard_step: Option<Step> = None;
+    let when = match o.get("when") {
+        None => None,
+        Some(Value::String(w)) => {
+            let expr = w.trim().trim_start_matches("CEL:").trim();
+            if let Err(e) = crate::cel::compile_check(expr) {
+                errs.push(format!("{at}: when: {e}"));
+            }
+            Some(w.clone())
         }
+        // A start node is the trigger: nothing runs before it to ask.
+        Some(Value::Object(_)) if info.start => {
+            errs.push(format!(
+                "{at}: a start node cannot carry a decision guard — it is the trigger; \
+                 guard the step after it"
+            ));
+            None
+        }
+        Some(Value::Object(g)) => {
+            guard_step = parse_guard(&at, id, g, &depends_on, entry_state, errs);
+            None
+        }
+        Some(_) => {
+            errs.push(format!(
+                "{at}: when is a CEL expression, or a decision guard \
+                 {{noul, state?, confidence?, model?}}"
+            ));
+            None
+        }
+    };
+    // A subgraph's body step `s` is `<id>.s` in the run (an element's or a
+    // branch's is `<id>[i].s` or `<id>{b}.s`), so a subgraph's body step named
+    // `when` would share its run record with this step's guard.
+    if guard_step.is_some()
+        && kind == "subgraph"
+        && body.as_ref().is_some_and(|b| b.steps.contains_key("when"))
+    {
+        errs.push(format!(
+            "{at}: a body step named `when` would share the run record `{id}{GUARD_SUFFIX}` \
+             with this step's decision guard — rename it"
+        ));
     }
+    let guard = guard_step.as_ref().map(|g| g.id.clone());
+    let depends_on = match &guard {
+        Some(g) => vec![g.clone()],
+        None => depends_on,
+    };
     let retry = o.get("retry").map(|r| Retry {
         max: r.get("max").and_then(Value::as_u64).unwrap_or(0).min(20) as u32,
         backoff_ms: match r.get("backoff") {
@@ -2596,11 +2690,13 @@ fn parse_step(
             errs.push(format!("{at}: {key}: {e}"));
         }
     }
-    Some(Step {
+    let step = Step {
         id: id.to_string(),
         kind,
         depends_on,
         when,
+        guard,
+        guarding: None,
         retry,
         timeout_ms,
         on_error,
@@ -2629,11 +2725,155 @@ fn parse_step(
         spec,
         body,
         branches,
+    };
+    Some((step, guard_step))
+}
+
+/// A decision guard, `when: {noul, state?, confidence?, model?}` (RFC 0046
+/// §7), as the `decide` step that asks it: `<id>.when`, with the guarded
+/// step's dependencies, its state (by default the dependencies' outputs by
+/// step id, or `entry_state` when there are none) and one question,
+/// [`GUARD_QUESTION`]. Its model goes through the deciding kinds' checks
+/// like any `decide` step's, since that is what it is.
+fn parse_guard(
+    at: &str,
+    id: &str,
+    g: &Map<String, Value>,
+    depends_on: &[String],
+    entry_state: &str,
+    errs: &mut Vec<String>,
+) -> Option<Step> {
+    let before = errs.len();
+    for k in g.keys() {
+        if !matches!(k.as_str(), "noul" | "state" | "confidence" | "model") {
+            errs.push(format!(
+                "{at}: when: unknown field {k:?} (a decision guard takes noul, state, \
+                 confidence, model)"
+            ));
+        }
+    }
+    let statement = g
+        .get("noul")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    if statement.is_none() {
+        errs.push(format!(
+            "{at}: when.noul: the statement the step runs on when it holds (a non-empty string)"
+        ));
+    }
+    if let Some(c) = g.get("confidence")
+        && !c.as_f64().is_some_and(|c| (0.0..=1.0).contains(&c))
+    {
+        errs.push(format!("{at}: when.confidence is a number from 0 to 1"));
+    }
+    if let Some(m) = g.get("model")
+        && !m.as_str().is_some_and(|m| !m.trim().is_empty())
+    {
+        errs.push(format!("{at}: when.model names a declared model"));
+    }
+    if let Some(expr) = g
+        .get("state")
+        .and_then(Value::as_str)
+        .and_then(|s| s.trim().strip_prefix("CEL:"))
+        && let Err(e) = crate::cel::compile_check(expr.trim())
+    {
+        errs.push(format!("{at}: when.state: {e}"));
+    }
+    if errs.len() > before {
+        return None;
+    }
+    // A pruned dependency (an uneven join) has no output; the guard still
+    // decides on what the live ones produced.
+    let state = g.get("state").cloned().unwrap_or_else(|| {
+        if depends_on.is_empty() {
+            Value::String(entry_state.to_string())
+        } else {
+            Value::Object(
+                depends_on
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.clone(),
+                            Value::String(format!("{{{{ steps.{d}.output | null }}}}")),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+    });
+    let mut spec = Map::new();
+    spec.insert("state".into(), state);
+    spec.insert(
+        "questions".into(),
+        json!({ GUARD_QUESTION: { "noul": statement } }),
+    );
+    for k in ["confidence", "model"] {
+        if let Some(v) = g.get(k) {
+            spec.insert(k.into(), v.clone());
+        }
+    }
+    Some(Step {
+        id: format!("{id}{GUARD_SUFFIX}"),
+        kind: "decide".into(),
+        depends_on: depends_on.to_vec(),
+        when: None,
+        guard: None,
+        guarding: Some(id.to_string()),
+        retry: None,
+        timeout_ms: None,
+        on_error: OnError::Fail,
+        idempotent: false,
+        on_replay: OnReplay::default(),
+        output_schema: None,
+        cache: None,
+        budget: None,
+        skills: Vec::new(),
+        description: Some(format!("the decision guard of {id:?}")),
+        spec,
+        body: None,
+        branches: BTreeMap::new(),
     })
 }
 
-/// Parse + validate a nested body `{steps: {…}}`.
-fn parse_body(at: &str, bv: &Value, depth: usize, errs: &mut Vec<String>) -> Option<Body> {
+/// A routing edge — a `switch` case or default, `on_error: goto`, a wait's
+/// `on_timeout` — runs its target whatever the target depends on, so a
+/// decision guard on the target would never be asked. Refused where it is
+/// written: the guard belongs on a step after the target.
+fn check_routed_guards(at: &str, steps: &BTreeMap<String, Step>, errs: &mut Vec<String>) {
+    for s in steps.values() {
+        let mut targets: Vec<&str> = Vec::new();
+        if s.kind == "switch" {
+            if let Some(cases) = s.field("cases").and_then(Value::as_object) {
+                targets.extend(cases.values().filter_map(Value::as_str));
+            }
+            targets.extend(s.field_str("default"));
+        }
+        if let OnError::Goto(t) = &s.on_error {
+            targets.push(t);
+        }
+        targets.extend(s.field_str("on_timeout"));
+        for t in targets {
+            if steps.get(t).is_some_and(|t| t.guard.is_some()) {
+                errs.push(format!(
+                    "{at} step {t:?}: {:?} routes to this step, which runs it past its \
+                     dependencies — its decision guard would never be asked; guard a step \
+                     after it instead",
+                    s.id
+                ));
+            }
+        }
+    }
+}
+
+/// Parse + validate a nested body `{steps: {…}}`. `entry_state` is what a
+/// decision guard on a step with no dependencies decides about.
+fn parse_body(
+    at: &str,
+    bv: &Value,
+    depth: usize,
+    entry_state: &str,
+    errs: &mut Vec<String>,
+) -> Option<Body> {
     let Some(bs) = bv.get("steps").and_then(Value::as_object) else {
         errs.push(format!("{at}: body must be {{steps: {{…}}}}"));
         return None;
@@ -2644,7 +2884,7 @@ fn parse_body(at: &str, bv: &Value, depth: usize, errs: &mut Vec<String>) -> Opt
     }
     let mut steps = BTreeMap::new();
     for (bid, sv) in bs {
-        if let Some(step) = parse_step(at, bid, sv, depth, errs) {
+        if let Some((step, guard)) = parse_step(at, bid, sv, depth, entry_state, errs) {
             if step.is_start() {
                 errs.push(format!(
                     "{at} step {bid:?}: a start node cannot be inside a body"
@@ -2653,9 +2893,13 @@ fn parse_body(at: &str, bv: &Value, depth: usize, errs: &mut Vec<String>) -> Opt
             if step.kind == "finish" {
                 errs.push(format!("{at} step {bid:?}: `finish` cannot be inside a body (a body's sinks are its result)"));
             }
+            if let Some(g) = guard {
+                steps.insert(g.id.clone(), g);
+            }
             steps.insert(bid.clone(), step);
         }
     }
+    check_routed_guards(at, &steps, errs);
     let body = Body { steps };
     for s in body.steps.values() {
         for d in &s.depends_on {
@@ -3092,7 +3336,15 @@ pub fn workflow_schema() -> Value {
                 "properties": {
                     "kind": {"enum": kinds},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
-                    "when": {"type": "string"},
+                    "when": {"anyOf": [
+                        {"type": "string", "description": "a CEL guard: the step runs only when it is true"},
+                        {"type": "object", "additionalProperties": false, "required": ["noul"],
+                         "description": "a decision guard (asked as the decide step `<id>.when`): the step runs only when the statement holds, surely; otherwise it is pruned",
+                         "properties": {
+                            "noul": {"type": "string", "minLength": 1, "description": "the statement the step runs on when it holds"},
+                            "state": {"description": "what is decided about (a value or template); default: the outputs of depends_on by step id, or the inputs (a foreach/batch element in its body)"},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "the least confidence the guard holds at; default roles.decide's"},
+                            "model": {"type": "string", "description": "the model that decides; default roles.decide"}}}]},
                     "retry": {"type": "object", "properties": {"max": {"type": "integer"}, "backoff": {"type": "string"}}},
                     "timeout": {"type": "string"},
                     "on_error": {"type": "string"},
@@ -3305,6 +3557,167 @@ mod tests {
             Vec::<&&str>::new(),
             "the schema declares fields the parser refuses — completion would suggest fields that fail at load"
         );
+    }
+
+    /// A decision guard (RFC 0046 §7) becomes a `decide` step of its own,
+    /// `<id>.when`, with the guarded step's dependencies; the guarded step
+    /// then depends on it alone. An object `when` used to be read as no guard
+    /// at all — the step ran unguarded — so the rewiring is the fix too.
+    #[test]
+    fn a_decision_guard_becomes_a_decide_step_its_step_depends_on() {
+        let w = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "triage": {"kind": "noop", "depends_on": ["s"]},
+            "lookup": {"kind": "noop", "depends_on": ["s"]},
+            "refund": {"kind": "noop", "depends_on": ["triage", "lookup"], "when": {
+                "noul": "The customer asks for money back.", "confidence": 0.8, "model": "jev"}},
+            "quick": {"kind": "noop", "depends_on": ["s"], "when": {
+                "noul": "It is urgent.", "state": "{{ inputs.ticket }}"}},
+            "f": {"kind": "finish", "depends_on": ["refund", "quick"]}
+        }}))
+        .unwrap();
+        let refund = w.step("refund").unwrap();
+        assert_eq!(refund.depends_on, vec!["refund.when"]);
+        assert_eq!(refund.guard.as_deref(), Some("refund.when"));
+        assert!(refund.when.is_none());
+        let g = w.step("refund.when").unwrap();
+        assert_eq!(g.kind, "decide");
+        assert_eq!(g.guarding.as_deref(), Some("refund"));
+        assert_eq!(g.depends_on, vec!["triage", "lookup"]);
+        assert_eq!(
+            g.spec["questions"],
+            json!({"holds": {"noul": "The customer asks for money back."}})
+        );
+        // By default it decides about what its step's dependencies produced.
+        assert_eq!(
+            g.spec["state"],
+            json!({"triage": "{{ steps.triage.output | null }}", "lookup": "{{ steps.lookup.output | null }}"})
+        );
+        assert_eq!(g.spec["confidence"], json!(0.8));
+        assert_eq!(g.spec["model"], "jev");
+        // Its own state when it names one, and no threshold or model it was
+        // not given (those are `roles.decide`'s).
+        let q = w.step("quick.when").unwrap();
+        assert_eq!(q.spec["state"], "{{ inputs.ticket }}");
+        assert!(q.spec.get("confidence").is_none() && q.spec.get("model").is_none());
+        // In a body: a dependency-less step's guard decides about its
+        // element in a `foreach`, the run's inputs elsewhere — and a nested
+        // step's own guard sits beside it, among the steps it runs with.
+        let w = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "each": {"kind": "foreach", "depends_on": ["s"], "over": [1, 2], "body": {"steps": {
+                "x": {"kind": "noop", "when": {"noul": "It is odd."}}}}},
+            "sub": {"kind": "subgraph", "depends_on": ["s"], "when": {"noul": "Worth doing."},
+                    "body": {"steps": {"y": {"kind": "noop", "when": {"noul": "Worth it."}}}}},
+            "f": {"kind": "finish", "depends_on": ["each", "sub"]}
+        }}))
+        .unwrap();
+        let each = w.step("each").unwrap().body.as_ref().unwrap();
+        assert_eq!(each.steps["x"].depends_on, vec!["x.when"]);
+        assert!(each.steps["x.when"].depends_on.is_empty());
+        assert_eq!(each.steps["x.when"].spec["state"], "{{ item | null }}");
+        // The guarded step is still the body's result.
+        assert_eq!(each.sinks(), vec!["x"]);
+        let sub = w.step("sub").unwrap();
+        assert_eq!(sub.depends_on, vec!["sub.when"]);
+        assert_eq!(w.step("sub.when").unwrap().depends_on, vec!["s"]);
+        let body = &sub.body.as_ref().unwrap().steps;
+        assert_eq!(body["y.when"].spec["state"], "{{ inputs }}");
+    }
+
+    /// A guard that cannot be honoured is refused at load, with the step it
+    /// sits on: an unknown field, an empty statement, a threshold outside
+    /// 0..1, a guard on a trigger, on a step a routing edge forces past its
+    /// dependencies, or one whose run record a subgraph's body step `when`
+    /// would share.
+    #[test]
+    fn a_decision_guard_that_cannot_be_honoured_is_refused_at_load() {
+        let refused = |steps: Value| {
+            wf(json!({"name": "w", "steps": steps}))
+                .unwrap_err()
+                .join("\n")
+        };
+        let guarded = |when: Value| {
+            refused(json!({
+                "s": {"kind": "once"},
+                "g": {"kind": "noop", "depends_on": ["s"], "when": when},
+                "f": {"kind": "finish", "depends_on": ["g"]}
+            }))
+        };
+        for (when, why) in [
+            (
+                json!({"noul": "x", "because": "y"}),
+                "when: unknown field \"because\"",
+            ),
+            (json!({"noul": "  "}), "when.noul"),
+            (json!({"state": "{{ inputs }}"}), "when.noul"),
+            (
+                json!({"noul": "x", "confidence": 1.5}),
+                "when.confidence is a number from 0 to 1",
+            ),
+            (
+                json!({"noul": "x", "confidence": "high"}),
+                "when.confidence is a number from 0 to 1",
+            ),
+            (json!({"noul": "x", "model": 3}), "when.model"),
+            (json!(true), "when is a CEL expression, or a decision guard"),
+        ] {
+            let e = guarded(when.clone());
+            assert!(
+                e.contains(&format!("workflow \"w\" step \"g\": {why}")),
+                "{when}: {e}"
+            );
+        }
+        let e = refused(json!({
+            "s": {"kind": "once", "when": {"noul": "x"}},
+            "f": {"kind": "finish", "depends_on": ["s"]}
+        }));
+        assert!(
+            e.contains("a start node cannot carry a decision guard"),
+            "{e}"
+        );
+        for router in [
+            json!({"kind": "switch", "depends_on": ["s"], "on": "a", "cases": {"a": "g"}}),
+            json!({"kind": "switch", "depends_on": ["s"], "on": "a", "cases": {}, "default": "g"}),
+            json!({"kind": "noop", "depends_on": ["s"], "on_error": "goto:g"}),
+        ] {
+            let e = refused(json!({
+                "s": {"kind": "once"},
+                "r": router,
+                "g": {"kind": "noop", "depends_on": ["r"], "when": {"noul": "x"}},
+                "f": {"kind": "finish", "depends_on": ["g"]}
+            }));
+            assert!(
+                e.contains("step \"g\": \"r\" routes to this step")
+                    && e.contains("would never be asked"),
+                "{e}"
+            );
+        }
+        // The same inside a body.
+        let e = refused(json!({
+            "s": {"kind": "once"},
+            "sub": {"kind": "subgraph", "depends_on": ["s"], "body": {"steps": {
+                "r": {"kind": "switch", "on": "a", "cases": {"a": "g"}},
+                "g": {"kind": "noop", "depends_on": ["r"], "when": {"noul": "x"}}}}},
+            "f": {"kind": "finish", "depends_on": ["sub"]}
+        }));
+        assert!(e.contains("\"r\" routes to this step"), "{e}");
+        let e = refused(json!({
+            "s": {"kind": "once"},
+            "sub": {"kind": "subgraph", "depends_on": ["s"], "when": {"noul": "x"},
+                    "body": {"steps": {"when": {"kind": "noop"}}}},
+            "f": {"kind": "finish", "depends_on": ["sub"]}
+        }));
+        assert!(e.contains("would share the run record `sub.when`"), "{e}");
+        // A body step named `when` is fine where nothing shares its record.
+        wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "sub": {"kind": "subgraph", "depends_on": ["s"], "body": {"steps": {"when": {"kind": "noop"}}}},
+            "each": {"kind": "foreach", "depends_on": ["s"], "over": [1], "when": {"noul": "x"},
+                     "body": {"steps": {"when": {"kind": "noop"}}}},
+            "f": {"kind": "finish", "depends_on": ["sub", "each"]}
+        }}))
+        .unwrap();
     }
 
     /// `human.to` names who must answer and is enforced when the reply lands,

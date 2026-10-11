@@ -175,6 +175,56 @@ that lacks it.
 
 ---
 
+## Structured answers
+
+Every call whose answer has a JSON Schema asks the provider to hold the model
+to it, rather than asking for JSON in the prompt and hoping
+([RFC 0046 §5.8](../rfcs/0046-kinds-of-intelligence.md)): `think` and `agent`
+nodes with an `output_schema`, the `think` tool's, `classify`/`route`/`judge`
+and a `decide` node on a chat model (an emulated decision) — a step's
+decision guard (`when: {noul: …}`) among them — preflight, compaction, the
+goal check, and the `approval: auto` judge on a closed ask (an `enum` or
+boolean answer). This is how a deciding role with no decision model bound is
+answered by the turn model.
+
+| Dialect | Sent |
+|---|---|
+| `openai` | `response_format: {type: json_schema, json_schema: {name: answer, schema, strict}}` |
+| `anthropic` | `output_config.format: {type: json_schema, schema}` — beside `output_config.effort` when the model reasons |
+| `bedrock` | a Claude model: the same `output_config.format`, in `additionalModelRequestFields`; any other family: nothing (asked in the prompt) |
+
+The schema on the wire is the answer's, made sendable: each object that lists
+`properties` is closed (`additionalProperties: false` — a narrower answer
+still validates), and the constraints providers refuse (`minimum`/`maximum`,
+`minLength`/`maxLength`, `pattern`, item and property counts, a `format`
+outside `date-time`, `time`, `date`, `duration`, `email`, `hostname`, `uri`,
+`ipv4`, `ipv6`, `uuid`) are left out of the copy. A schema with a part no
+provider constrains — a free-form object (an `object` with no `properties`,
+or `additionalProperties` / `patternProperties` that admit keys of their own
+shape), `oneOf`, `not`, `if`/`then`/`else`, a recursive `$ref`, or a root
+that is not an object — has no `anthropic` form and is asked in the prompt
+there. `openai` takes any object schema: `strict: true` when every object is
+closed and requires all its properties, otherwise the schema as written with
+`strict: false`, as guidance.
+
+**The answer is still validated** against the full schema, and a miss is
+re-asked as before: a provider that ignores the format, a refusal, or an
+answer cut off at `max_tokens` is caught the same way, so nothing depends on
+the format being honoured.
+
+**`structured_output`** sets this per connection — `intelligence.structured_output`
+for the top-level one, `intelligence.providers.<name>.structured_output` for
+each provider, each link of a fallback chain by its own connection's:
+
+- `auto` (the default) — natively wherever the dialect and the schema allow;
+- `prompt` — never a format on the wire: for an OpenAI-compatible server that
+  refuses `response_format`, and for a model that has no structured outputs
+  (Claude models before Haiku 4.5 and Opus 4.1 — on Anthropic's API or on
+  Bedrock), which answers a format with a 400. Refused on a
+  `dialect: decisions` provider, which is sent no schema.
+
+---
+
 ## Credentials
 
 The credential is resolved **per endpoint** and **never logged**. Set it from
@@ -277,7 +327,8 @@ intelligence:
   token: "{{secret:ANTHROPIC_API_KEY}}"
 
   # Further connections, by name — the same vocabulary, nothing more:
-  # endpoints, dialect, token / token_file, headers, auth, timeout.
+  # endpoints, dialect, token / token_file, headers, auth, timeout,
+  # structured_output.
   providers:
     openai:
       endpoints: https://api.openai.com/v1/chat/completions
@@ -291,7 +342,7 @@ intelligence:
   roles:
     turn: smart          # the agent's turns, agent/extract/summarize nodes, subagents
     think: other         # the think tool and think nodes
-    decide: fast         # classify, route and judge nodes
+    decide: fast         # classify, route, judge and decide nodes, decision guards
     preflight: fast      # triage of an inbound message
     compaction: fast     # summarising the transcript
     goal: fast           # the goal check
@@ -330,7 +381,7 @@ write and take no threshold. What a deciding role does on each kind:
 
 | Role | on a chat model | on a decision model |
 |---|---|---|
-| `preflight` | the structured triage it always was | one decision: `intent` (choice), `needs_plan` (noul), `risk` (choice), one noul per catalogued skill (up to 13, the decision's 16 questions; `preflight.skills_capped` says when more are left out); a plan it calls for is the turn's to write, and the turn is told |
+| `preflight` | the structured triage it always was | one decision: `intent` (choice), `needs_plan` (noul), `risk` (choice), with `routes` the `route` (choice), and one noul per catalogued skill (up to 13 of the decision's 16 questions, 12 when a route takes one; `preflight.skills_capped` says when more are left out); a plan it calls for is the turn's to write, and the turn is told |
 | `goal` | the judge it always was | `achieved` and `stuck` as two statements about the status, each true at 0.5 and, with a `confidence`, only when that sure |
 | `approve` | the judge it always was | a closed ask — its answer an `enum` or a boolean, at the top of its schema or as the schema's one property — as a choice; an open one to the `escalate` model when that model writes, else `UNDECIDED`; bound only with a `confidence`, which an escalated answer is held to as well |
 | `decide` | emulated decisions | native decisions; its `confidence` is the threshold of every deciding node and `decide` call that sets none |
@@ -341,6 +392,34 @@ preflight treats the message as a `task` (as a missing verdict always did),
 the goal is neither achieved nor stuck, an approval stays `UNDECIDED`.
 Whatever the model, the `approve` judge never answers an ask whose run carries
 outside input ([experience.md](experience.md#approvals-and-steering)).
+
+**Routing a turn.** `intelligence.routes` names the models a turn may run on,
+each with when to use it:
+
+```yaml
+intelligence:
+  roles: {turn: smart, preflight: jev}
+  routes:
+    fast: "a quick answer, a status question or one simple operation"
+    deep: "multi-step work, analysis, or anything that needs careful reasoning"
+```
+
+Preflight answers one more question for each message it looks at — `route`, a
+choice among the routes, their criteria its options; on a chat model a
+`route` enum in its schema, with the routes and their criteria listed in its
+prompt — and the turn that answers that message runs on the chosen model
+instead of `roles.turn`, logged `turn.routed {ctx, model}`. No verdict, or a
+route under the preflight role's `confidence` (`preflight.route_unsure`; the
+rest of the triage stands), leaves the turn on `roles.turn`, and so does a
+route a reload removed while the message waited (`turn.route_removed`). Only
+that turn moves: the conversation's next message is routed by its own
+preflight, and under `preflight: auto` a message preflight does not look at
+is not routed. Each route is a declared `chat` or `reasoning` model with a
+criterion, 32 at most; `routes` with `agent.preflight: never` is refused at
+load, since nothing would choose one. Any of them may answer the next
+message, so the transcript is compacted to fit the smallest window among the
+turn model and the routes (`context.model_window`, when set, still wins).
+`routes` is operator-only and reloadable.
 
 **Providers.** Each provider gets its own client, endpoint failover, breakers
 and credential refresh. Every endpoint of a provider dials with the
@@ -436,8 +515,8 @@ is content and is not.
 
 **What a served document may set.** An instruction document may declare
 models and bind every role but `approve` — *which* model, never where it
-lives: a model it declares cannot name a `provider`, and `providers` and
-`roles.approve` are the operator's ([`directives.md`](directives.md)). The
+lives: a model it declares cannot name a `provider`, and `providers`,
+`roles.approve` and `routes` are the operator's ([`directives.md`](directives.md)). The
 `approve` judge resolves in the operator's own section — the operator's
 `roles.approve`, else the operator's turn model, with the operator's models
 and fallbacks — so a document cannot re-point it by declaring a model under

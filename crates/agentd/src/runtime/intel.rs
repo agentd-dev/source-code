@@ -16,7 +16,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::Runtime;
-use crate::config::settings::{AuthKind, Connection, Intelligence, ModelRole, Settings};
+use crate::config::settings::{
+    AuthKind, Connection, Intelligence, ModelRole, Settings, StructuredOutput,
+};
 use crate::subagent::protocol::IntelConfig;
 
 /// A refreshing credential: the current bearer, from the login cache.
@@ -41,6 +43,8 @@ pub(crate) struct Conn {
     aws: Option<crate::config::AuthSpec>,
     dialect: Option<String>,
     timeout_ms: Option<u64>,
+    /// `structured_output: prompt`: a schema-bearing call is sent no format.
+    structured_prompt: bool,
 }
 
 /// Every connection: the top-level one and each provider by name.
@@ -118,6 +122,7 @@ impl Conn {
                 .map(|a| a.to_spec()),
             dialect: c.dialect.map(str::to_string),
             timeout_ms: c.timeout.map(|t| t.as_millis() as u64),
+            structured_prompt: c.structured_output == StructuredOutput::Prompt,
         })
     }
 }
@@ -264,6 +269,7 @@ impl Runtime {
             reference: None,
             fallbacks: Vec::new(),
             reasoning,
+            structured_prompt: conn.structured_prompt,
         }
     }
 }

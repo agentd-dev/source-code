@@ -3111,8 +3111,8 @@ impl Runtime {
                 );
                 crate::state::kill_point("step.before_done");
                 self.checkpoint(false);
-                if scope.is_some() {
-                    self.on_scoped_step_done(run_id, step_id);
+                if let Some(sc) = &scope {
+                    self.on_scoped_step_done(run_id, sc);
                 }
                 return;
             }
@@ -3150,7 +3150,7 @@ impl Runtime {
                 if !crate::engine::model::pure_data_kind(&step.kind) {
                     self.checkpoint(false);
                 }
-                self.on_scoped_step_done(run_id, step_id);
+                self.on_scoped_step_done(run_id, sc);
                 return;
             }
             let routed = run::route_failure(
@@ -3210,8 +3210,8 @@ impl Runtime {
         if terminal_now || !crate::engine::model::pure_data_kind(&step.kind) {
             self.checkpoint(false);
         }
-        if scope.is_some() {
-            self.on_scoped_step_done(run_id, step_id);
+        if let Some(sc) = &scope {
+            self.on_scoped_step_done(run_id, sc);
         }
     }
 

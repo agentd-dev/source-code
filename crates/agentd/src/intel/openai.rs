@@ -76,6 +76,19 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
         body.insert("tools".into(), json!(tools));
         body.insert("tool_choice".into(), json!("auto"));
     }
+    // The answer's schema, asked natively: strict where OpenAI's strict mode
+    // takes it, else as guidance. It coexists with `tools` — the model may
+    // still call one, and its final answer takes the format.
+    if let Some((schema, strict)) = req
+        .output_schema
+        .as_ref()
+        .and_then(super::structured::openai)
+    {
+        body.insert(
+            "response_format".into(),
+            json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": schema, "strict": strict}}),
+        );
+    }
 
     let bytes = serde_json::to_vec(&Value::Object(body)).unwrap_or_default();
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
@@ -253,6 +266,7 @@ mod tests {
             temperature: Some(0.0),
             decision: None,
             reasoning: None,
+            output_schema: None,
         }
     }
 
@@ -268,6 +282,48 @@ mod tests {
         let v: Value = serde_json::from_slice(&build_request(&req(), None).0).unwrap();
         assert_eq!(v["max_tokens"], 256);
         assert!(v.get("max_completion_tokens").is_none(), "{v}");
+    }
+
+    /// A schema-bearing request asks for the answer natively — strict when
+    /// every property is required, beside the tools; a schema whose root is
+    /// not an object, and a request with none, send no format.
+    #[test]
+    fn an_output_schema_is_asked_as_a_response_format() {
+        let body =
+            |r: &Request| -> Value { serde_json::from_slice(&build_request(r, None).0).unwrap() };
+        let mut r = req();
+        r.output_schema = Some(json!({"type": "object", "properties": {
+            "achieved": {"type": "boolean"}, "reason": {"type": "string", "maxLength": 80}
+        }, "required": ["achieved", "reason"]}));
+        let v = body(&r);
+        let f = &v["response_format"];
+        assert_eq!(f["type"], "json_schema");
+        assert_eq!(f["json_schema"]["name"], "answer");
+        assert_eq!(f["json_schema"]["strict"], true);
+        assert_eq!(
+            f["json_schema"]["schema"]["additionalProperties"], false,
+            "{v}"
+        );
+        assert!(
+            f["json_schema"]["schema"]["properties"]["reason"]
+                .get("maxLength")
+                .is_none()
+        );
+        assert_eq!(v["tools"][0]["function"]["name"], "read_file");
+
+        r.output_schema = Some(json!({"type": "object", "properties": {"a": {"type": "string"}}}));
+        let v = body(&r);
+        assert_eq!(v["response_format"]["json_schema"]["strict"], false);
+        assert!(
+            v["response_format"]["json_schema"]["schema"]
+                .get("additionalProperties")
+                .is_none(),
+            "guidance is the schema as written: {v}"
+        );
+
+        r.output_schema = Some(json!({"type": "array"}));
+        assert!(body(&r).get("response_format").is_none());
+        assert!(body(&req()).get("response_format").is_none());
     }
 
     #[test]

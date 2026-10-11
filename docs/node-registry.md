@@ -48,7 +48,7 @@ buffering. Two sibling steps in one run, one signalling and one waiting, is a
 race with no ordering primitive to fix it; signal across runs, or from a tool or
 an operator, where the waiter is demonstrably parked first.
 
-**5. CEL is a build feature.** `when`, `until`, `filter` and the `expr` of
+**5. CEL is a build feature.** A CEL `when`, `until`, `filter` and the `expr` of
 `map`/`filter`/`reduce` need it. The release binaries ship with it enabled; a
 binary built without it **exits 2** on a config that uses those fields rather
 than ignoring the expression and running the step anyway.
@@ -235,6 +235,50 @@ questions, confidence?}` on `roles.decide` — where an unsure answer is
 escalated when it can be and otherwise handed back marked `unsure`, for the
 agent to weigh.
 
+#### Decision guards
+
+A step's `when:` may be a decision instead of CEL
+([RFC 0046 §7](../rfcs/0046-kinds-of-intelligence.md)):
+
+```yaml
+refund:
+  kind: agent
+  depends_on: [triage]
+  instruction: "Refund the order."
+  when:
+    noul: "The customer explicitly asks for their money back."
+    state: "{{ inputs.ticket }}"   # default: the outputs of depends_on, by step id
+    confidence: 0.8                # optional; default roles.decide's
+    model: jev                     # optional; default roles.decide
+```
+
+At load the guard becomes a `decide` step of its own, **`refund.when`**, with
+the guarded step's `depends_on` and one question, `holds: {noul: …}`; the
+guarded step then depends on it alone (its own dependencies stay upstream,
+through the guard). It runs only when the statement holds (`noul` ≥ 0.5)
+and the answer is sure; otherwise it is pruned exactly as a false CEL guard
+prunes it — in a nested body, skipped. The guard's decision is an ordinary
+step: in the run (`steps["refund.when"]`, or the template path
+`{{ /steps/refund.when/output }}`), charged to its budget, and durable across a
+restart.
+
+Without `state`, the guard decides about its step's dependencies' outputs
+keyed by step id; a step with none decides about the run's inputs, or, in a
+`foreach`/`batch` body, about its element. It runs on a decision model
+natively, or on a chat model through structured generation — so with no
+decision model configured, the turn model answers it. Under a `confidence`
+an unsure answer is asked once more on the model's `escalate` model when it
+names one, whose answer is final; otherwise the unsure answer prunes the
+step. A guard never fails the run for doubt: escalate-else-`continue`, as for
+the `decide` tool. A guard that cannot be honoured is refused at load: an
+unknown field, an empty `noul`, a `confidence` outside 0..1, a model the
+deciding kinds refuse, a guard on a start node, on a step a `switch` case,
+`on_error: goto` or `on_timeout` routes to (a routing edge runs its target
+past its dependencies, so the guard would never be asked — guard a step
+after it), or on a `subgraph` whose body has a step named `when` (both would
+be `<id>.when` in the run). Event matches (`filter`, a wait's `match`) stay
+CEL: a decision about an event is a guarded first step.
+
 ---
 
 ## Cross-cutting fields
@@ -244,7 +288,7 @@ Every step accepts these regardless of kind:
 | Field | Effect |
 |---|---|
 | `depends_on` | the DAG edge. A non-start step with no dependency is refused as an unreachable root |
-| `when` | a CEL guard; the step is **pruned** when it is false, so anything that depends only on it is pruned too (needs `cel`) |
+| `when` | a CEL guard (needs `cel`), or a [decision guard](#decision-guards) `{noul, state?, confidence?, model?}`; the step is **pruned** when it does not hold, so anything that depends only on it is pruned too |
 | `retry` | `{max, backoff}` — retry on failure: exponential doubling with deterministic ±20% jitter, durable timer between attempts |
 | `timeout` | bound the step; a suspended step resumes as timed out |
 | `on_error` | `fail` (default) · `continue` · `goto:<step>` |

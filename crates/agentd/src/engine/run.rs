@@ -517,8 +517,21 @@ pub enum Next {
     Terminal,
 }
 
-/// Compute the ready steps. `when` guards are evaluated over `data`; a false
-/// guard skips the step (durably) — hence `&mut RunState`.
+/// Whether a decision guard's answer (RFC 0046 §7) lets its step run: the
+/// statement holds (`holds.noul` ≥ 0.5) and the answer is not marked unsure.
+pub fn guard_holds(output: Option<&Value>) -> bool {
+    let Some(a) = output.and_then(|o| o.get(super::model::GUARD_QUESTION)) else {
+        return false;
+    };
+    a.get("unsure") != Some(&Value::Bool(true))
+        && a.get("noul")
+            .and_then(Value::as_f64)
+            .is_some_and(|p| p >= 0.5)
+}
+
+/// Compute the ready steps. `when` guards are evaluated over `data`, and a
+/// decision guard's answer read from its step; a guard that does not hold
+/// prunes the step (durably) — hence `&mut RunState`.
 pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, String> {
     if run.status.is_terminal() {
         return Ok(Next::Terminal);
@@ -617,6 +630,20 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
                     }
                     Err(e) => return Err(format!("step {id:?}: when: {e}")),
                 }
+            }
+            // A decision guard is the step's only dependency, and it has
+            // answered: anything but a sure "holds" — it does not hold, it was
+            // unsure, it was skipped on restore — prunes the step as a false
+            // CEL guard does.
+            if let Some(g) = &step.guard
+                && !run
+                    .steps
+                    .get(g)
+                    .is_some_and(|s| s.status == StepStatus::Done && guard_holds(s.output.as_ref()))
+            {
+                run.end_step(&id, StepStatus::Pruned, None, None);
+                changed = true;
+                continue;
             }
             ready.push(id.clone());
         }
@@ -835,6 +862,58 @@ mod tests {
             ),
             other => panic!("expected work ready, got {other:?}"),
         }
+    }
+
+    /// A decision guard (RFC 0046 §7) is read natively from its step's
+    /// answer: a sure "holds" runs the step; a statement that does not hold,
+    /// or an answer marked unsure, prunes it and the tail that depends on it
+    /// alone — while a branch beside it runs on.
+    #[test]
+    fn a_decision_guard_runs_its_step_only_when_it_surely_holds() {
+        let w = parse_workflow(&json!({
+            "name": "w", "steps": {
+                "s":      {"kind": "once"},
+                "refund": {"kind": "noop", "depends_on": ["s"], "when": {"noul": "They ask for money back."}},
+                "after":  {"kind": "noop", "depends_on": ["refund"]},
+                "other":  {"kind": "noop", "depends_on": ["s"]},
+                "fin":    {"kind": "finish", "depends_on": ["after", "other"], "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let answered = |holds: Value| {
+            let mut run = RunState::new("r", &w, start_at("s"), json!({}));
+            let data = run.data(env_view("i", "r", None, None), json!({}));
+            // The guard is asked first, beside the independent branch.
+            assert_eq!(
+                schedule(&w, &mut run, &data).unwrap(),
+                Next::Ready(vec!["other".to_string(), "refund.when".to_string()])
+            );
+            run.end_step("other", StepStatus::Done, None, None);
+            run.end_step(
+                "refund.when",
+                StepStatus::Done,
+                Some(json!({"holds": holds, "model": "m", "escalated": false})),
+                None,
+            );
+            let next = schedule(&w, &mut run, &data).unwrap();
+            (run, next)
+        };
+        let (_, next) = answered(json!({"noul": 0.8, "confidence": 0.6}));
+        assert_eq!(next, Next::Ready(vec!["refund".to_string()]));
+        for holds in [
+            json!({"noul": 0.2, "confidence": 0.6}),
+            json!({"noul": 0.7, "confidence": 0.4, "unsure": true}),
+        ] {
+            let (run, next) = answered(holds.clone());
+            assert_eq!(run.steps["refund"].status, StepStatus::Pruned, "{holds}");
+            assert_eq!(run.steps["after"].status, StepStatus::Pruned, "{holds}");
+            // `fin` has a live parent (`other`), so the run still finishes.
+            assert_eq!(next, Next::Ready(vec!["fin".to_string()]), "{holds}");
+        }
+        assert!(guard_holds(Some(&json!({"holds": {"noul": 0.5}}))));
+        assert!(!guard_holds(Some(&json!({"holds": {"noul": 0.49}}))));
+        assert!(!guard_holds(Some(&json!({"error": "x"}))));
+        assert!(!guard_holds(None));
     }
 
     fn wf() -> Workflow {

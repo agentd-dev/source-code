@@ -546,6 +546,12 @@ pub struct IntelConfig {
     /// its defaults, with a node's or a `think` call's `effort` over them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::wire::intel::ReasoningAsk>,
+    /// This connection's `structured_output: prompt` (RFC 0046 §5.8): a call
+    /// that carries an answer schema is asked in the prompt alone, with no
+    /// format on the wire. `false` — `auto` — asks natively wherever the
+    /// dialect and the schema allow.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_prompt: bool,
 }
 
 impl IntelConfig {
@@ -592,7 +598,8 @@ impl IntelConfig {
             .with_headers(self.headers.clone())
             .with_dialect(self.dialect.as_deref())
             .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis))
-            .with_reasoning(self.reasoning);
+            .with_reasoning(self.reasoning)
+            .with_structured_prompt(self.structured_prompt);
         // `auth: {kind: aws}` SigV4-signs the dial, with credentials fetched
         // at dial time; `source: sso` reads the cache its login filled.
         #[cfg(feature = "oauth")]

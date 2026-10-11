@@ -278,8 +278,9 @@ pub fn run_turn(
             finish_with!("exhausted_tokens");
         }
         // Budget admission: the supervisor owns the token budget, so estimate
-        // what this call will cost (prompt + tool schemas + the completion cap
-        // + a reasoning model's thinking room) and ask before spending it.
+        // what this call will cost (prompt + tool schemas + the answer's
+        // schema + the completion cap + a reasoning model's thinking room)
+        // and ask before spending it.
         if spec.budget_admission {
             let estimate: u64 = messages
                 .iter()
@@ -289,6 +290,10 @@ pub fn run_turn(
                     .iter()
                     .map(|t| tokens::estimate(&t.name) + tokens::estimate_value(&t.input_schema))
                     .sum::<u64>()
+                + spec
+                    .output_schema
+                    .as_ref()
+                    .map_or(0, tokens::estimate_value)
                 + max_tokens_per_call as u64
                 + degraded.as_ref().unwrap_or(intel).reasoning_budget();
             if let Err((status, error)) = admit(
@@ -314,12 +319,17 @@ pub fn run_turn(
             "turn.think",
             json!({"turn": spec.turn_id, "round": result.rounds + 1}),
         );
+        // A structured turn asks for its schema on every round: a format and
+        // tools coexist, so the model may still call a tool, and the answer
+        // it ends on is constrained where the connection allows. It is
+        // validated below all the same (RFC 0046 §5.8).
         let req = Request {
             model: model.clone(),
             messages: messages.clone(),
             tools: tools.clone(),
             max_tokens: max_tokens_per_call,
             temperature: spec.temperature.or(Some(0.0)),
+            output_schema: spec.output_schema.clone(),
             ..Default::default()
         };
         let chat_start = crate::obs::otel::now_unix_nanos();
@@ -1238,6 +1248,46 @@ mod tests {
         let intel3 = mock_intel(&json!({"turns": [{"content": "not json at all"}]}));
         let r = run_turn(&s, &limits(), &intel3, &FakeMcp, &mut bridge, &log());
         assert_eq!(r.status, "failed");
+        assert_eq!(r.rounds, 1 + SCHEMA_REASKS);
+    }
+
+    /// A structured turn — a think node's, preflight's, compaction's — asks
+    /// for its schema natively (RFC 0046 §5.8), so a model held to it answers
+    /// on the first round; a connection asked in the prompt alone is sent no
+    /// format, and its answer is still parsed, validated and re-asked.
+    #[test]
+    fn a_structured_turn_sends_its_schema_unless_the_connection_is_prompt_only() {
+        // Only a request that carries the format is answered in the shape.
+        let playbook = json!({"turns": [{"content": "it is a task, I think"}], "match": [
+            {"when_contains": "\"response_format\"", "content": "{\"intent\": \"task\", \"needs_plan\": false}"}
+        ]});
+        let mut s = spec(TurnKind::Think);
+        s.output_schema = Some(json!({"type": "object", "properties": {
+            "intent": {"enum": ["chat", "task"]}, "needs_plan": {"type": "boolean"}
+        }, "required": ["intent", "needs_plan"]}));
+        let mut bridge = FakeBridge {
+            calls: vec![],
+            answers: BTreeMap::new(),
+            budget: vec![],
+            cancel: false,
+        };
+        let r = run_turn(
+            &s,
+            &limits(),
+            &mock_intel(&playbook),
+            &FakeMcp,
+            &mut bridge,
+            &log(),
+        );
+        assert_eq!(r.status, "completed", "{:?}", r.error);
+        assert_eq!(r.value.as_ref().unwrap()["intent"], json!("task"));
+        assert_eq!(r.rounds, 1);
+
+        let prompt_only = IntelClient::from_parts(&mock_uri(&playbook), None)
+            .unwrap()
+            .with_structured_prompt(true);
+        let r = run_turn(&s, &limits(), &prompt_only, &FakeMcp, &mut bridge, &log());
+        assert_eq!(r.status, "failed", "no format reached the mock");
         assert_eq!(r.rounds, 1 + SCHEMA_REASKS);
     }
 

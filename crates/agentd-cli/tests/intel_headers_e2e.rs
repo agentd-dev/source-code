@@ -86,6 +86,7 @@ fn intelligence_headers_and_bearer_reach_the_llm() {
         temperature: Some(0.0),
         decision: None,
         reasoning: None,
+        output_schema: None,
     };
     intel.complete(&req).expect("completion succeeds");
 

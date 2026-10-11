@@ -254,6 +254,16 @@ impl IntelClient {
         self
     }
 
+    /// Ask this connection's schema-bearing requests in the prompt alone
+    /// (`structured_output: prompt`): no format reaches its endpoints. A
+    /// fallback keeps its own connection's setting.
+    pub fn with_structured_prompt(self, prompt: bool) -> IntelClient {
+        if prompt {
+            self.list.borrow_mut().set_structured_prompt(true);
+        }
+        self
+    }
+
     /// The room a call on this model leaves for its thinking — 0 for a model
     /// that does not reason. The providers raise the output cap by it, so
     /// budget admission counts it with the completion cap.
@@ -758,6 +768,7 @@ mod tests {
             temperature: Some(0.0),
             decision: None,
             reasoning: None,
+            output_schema: None,
         };
         // Past the breaker's threshold, so the dead model is broken open.
         for _ in 0..4 {

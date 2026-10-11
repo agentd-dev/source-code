@@ -220,6 +220,41 @@ pub fn emulation_messages(d: &Decision) -> Vec<Message> {
     ]
 }
 
+/// The JSON Schema of an emulated answer to `d` — the shape
+/// [`emulation_messages`] describes, one required property per question —
+/// for a chat model that can be held to it (RFC 0046 §5.8). A choice is an
+/// enum of its options; the ranges (a probability's 0..1, a score's levels)
+/// are not expressible to a constraining provider and are checked by
+/// [`parse_emulated`].
+pub fn emulation_schema(d: &Decision) -> Value {
+    let number = || json!({"type": "number"});
+    let object = |props: Value| {
+        let required: Vec<&String> = props
+            .as_object()
+            .map(|p| p.keys().collect())
+            .unwrap_or_default();
+        json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+    };
+    let questions: Map<String, Value> = d
+        .questions
+        .iter()
+        .map(|(id, q)| {
+            let answer = match q {
+                Question::Choice { options, .. } => object(json!({
+                    "choice": {"type": "string", "enum": options.keys().collect::<Vec<_>>()},
+                    "confidence": number(),
+                })),
+                Question::Noul { .. } => object(json!({"noul": number()})),
+                Question::Score { .. } => {
+                    object(json!({"score": number(), "confidence": number()}))
+                }
+            };
+            (id.clone(), answer)
+        })
+        .collect();
+    object(Value::Object(questions))
+}
+
 /// Read a chat model's emulated answer to `d`.
 pub fn parse_emulated(text: &str, d: &Decision) -> Result<Answers, String> {
     let v = crate::runtime::worker::parse_json_answer(text)?;
@@ -319,5 +354,47 @@ mod tests {
         assert_eq!(a["queue"].value, AnswerValue::Choice("tech".into()));
         assert!(a.values().all(|x| !x.calibrated));
         assert!(parse_emulated("{\"queue\": {\"choice\": \"tech\"}}", &decision()).is_err());
+    }
+
+    /// An emulated decision's answer has a schema a provider can hold the
+    /// model to: every question required and closed, a choice an enum of
+    /// its options — strict on OpenAI, constrained on Anthropic. An answer
+    /// that fits it is one `parse_emulated` reads.
+    #[test]
+    fn an_emulated_answer_has_a_closed_schema() {
+        let schema = emulation_schema(&decision());
+        // The order a map keeps is not the point: the names are.
+        let names = |v: &Value| -> std::collections::BTreeSet<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_string())
+                .collect()
+        };
+        let set = |ns: &[&str]| ns.iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            names(&schema["required"]),
+            set(&["queue", "tone", "urgent"])
+        );
+        let queue = &schema["properties"]["queue"];
+        assert_eq!(
+            names(&queue["properties"]["choice"]["enum"]),
+            set(&["billing", "tech"])
+        );
+        assert_eq!(names(&queue["required"]), set(&["choice", "confidence"]));
+        assert_eq!(
+            names(&schema["properties"]["urgent"]["required"]),
+            set(&["noul"])
+        );
+        assert_eq!(
+            names(&schema["properties"]["tone"]["required"]),
+            set(&["score", "confidence"])
+        );
+        let (wire, strict) = crate::intel::structured::openai(&schema).unwrap();
+        assert!(strict, "{wire}");
+        assert!(crate::intel::structured::constrained(&schema).is_some());
+        let answer = json!({"queue": {"choice": "tech", "confidence": 0.6}, "urgent": {"noul": 0.9}, "tone": {"score": 2, "confidence": 0.5}});
+        crate::jsonschema::validate(&schema, &answer).unwrap();
+        assert!(parse_emulated(&answer.to_string(), &decision()).is_ok());
     }
 }

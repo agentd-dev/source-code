@@ -357,3 +357,78 @@ fn a_decision_model_in_a_file_workflow_is_refused_at_load() {
         let _ = std::fs::remove_file(f);
     }
 }
+
+/// RFC 0046 §5.8: a decide node with no decision model configured is
+/// answered by the turn model through structured generation — the answer's
+/// schema rides the request as a native format (`response_format`, strict),
+/// so a model that only answers when held to it answers, and is read.
+#[test]
+fn a_decide_node_with_no_decision_model_is_answered_through_structured_generation() {
+    // Only a request that carries the format gets a usable answer: without
+    // it the model rambles, and the node fails.
+    let chat = playbook(
+        json!({"turns": [{"content": "Probably billing, I would say."}], "match": [{
+            "when_contains": "\"response_format\"",
+            "content": "{\"queue\": {\"choice\": \"billing\", \"confidence\": 0.8}, \"urgent\": {\"noul\": 0.3}}"
+        }]}),
+    );
+    let dec = playbook(native_answers(0.9));
+    let cfg = format!(
+        "{BASE}{}{}",
+        // No `decide` role: the decision runs on the turn's chat model.
+        intelligence(&chat, &dec, "", "{ turn: smart }"),
+        job(&format!("kind: decide, {}", questions()))
+    );
+    let (code, out, log) = run(&cfg);
+    assert_eq!(code, Some(0), "{log}");
+    let d = &out["out"];
+    assert_eq!(d["queue"]["choice"], "billing", "{out}\n{log}");
+    assert_eq!(d["queue"]["calibrated"], false);
+    assert_eq!(d["urgent"]["noul"], 0.3);
+    assert_eq!(d["model"], "wire-smart");
+    for f in [&chat, &dec] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// `structured_output: prompt` sends no format — on the top-level
+/// connection, and on a provider's — for a server that refuses one; the
+/// answer is asked in the prompt and still read.
+#[test]
+fn a_connection_asked_in_the_prompt_alone_is_sent_no_format() {
+    // A request that carries a format gets an answer the node cannot use;
+    // only the prompt-only request is answered.
+    let chat = playbook(json!({"turns": [{"content": "{}"}], "match": [
+        {"when_contains": "\"response_format\"", "content": "a format reached a server that refuses one"},
+        {"when_contains": "QUESTIONS:",
+         "content": "{\"queue\": {\"choice\": \"tech\", \"confidence\": 0.9}, \"urgent\": {\"noul\": 0.6}}"}
+    ]}));
+    let dec = playbook(native_answers(0.9));
+    let top = format!(
+        "{BASE}{}{}",
+        intelligence(&chat, &dec, "", "{ turn: smart }").replacen(
+            "intelligence:\n",
+            "intelligence:\n  structured_output: prompt\n",
+            1
+        ),
+        job(&format!("kind: decide, {}", questions()))
+    );
+    // The turn model on a provider of its own, asked in the prompt alone
+    // while the top-level connection keeps `auto`.
+    let provider = format!(
+        "{BASE}intelligence:\n  endpoints: \"mock:file:{chat}\"\n  providers:\n\
+         \x20   plain: {{ endpoints: \"mock:file:{chat}\", structured_output: prompt }}\n\
+         \x20 models:\n\
+         \x20   smart: {{ model: wire-smart, provider: plain }}\n\
+         \x20 roles: {{ turn: smart }}\n{}",
+        job(&format!("kind: decide, {}", questions()))
+    );
+    for cfg in [top, provider] {
+        let (code, out, log) = run(&cfg);
+        assert_eq!(code, Some(0), "{cfg}\n{log}");
+        assert_eq!(out["out"]["queue"]["choice"], "tech", "{out}\n{log}");
+    }
+    for f in [&chat, &dec] {
+        let _ = std::fs::remove_file(f);
+    }
+}

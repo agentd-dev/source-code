@@ -102,6 +102,12 @@ pub struct Request {
     /// How hard a reasoning model thinks (RFC 0046 §5.7); set by the client
     /// from the model it dials. `None` for a chat model.
     pub reasoning: Option<ReasoningAsk>,
+    /// The JSON Schema the answer must match (RFC 0046 §5.8). Each dialect
+    /// asks for it natively where the connection and the schema allow
+    /// (`intel::structured`); the caller still validates what comes back,
+    /// because a provider that ignores the format, a refusal or a cut-off
+    /// answer reaches it all the same.
+    pub output_schema: Option<Value>,
 }
 
 /// How much a reasoning model thinks before it answers.

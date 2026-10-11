@@ -490,6 +490,7 @@ says otherwise.
 | `webhooks.*` | inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's. A route is the `interface` family's however the document spells it — a `:::!workflow` or `:::!config` workflow with a `webhook` start or `wait {on: webhook}` needs the grant `:::!endpoint` needs ([security](security.md#inbound-webhooks)) |
 | `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth`, `.providers`, a model's `provider` | where the conversation goes and the credential it goes with |
 | `intelligence.roles.approve` | the model that answers asks on the operator's behalf — not a document's to pick for its own gates |
+| `intelligence.routes` | the models preflight may move a turn onto, message by message — it moves every turn, as the approver moves every approval |
 | `subagents.*` | a whole child agent — its own source, grants and identity. A document REFERENCES a template (`:::agent template=…`); defining one is the operator's |
 | `store.file`, `.http`, `.mcp`, `.audit`, `.retention` | WHERE state lives — a path on the host, or a remote the deployment must be willing to reach — and the audit record |
 | `lifecycle.drain_timeout`, `.exit_code_map`, `.run_id`, `.watch_config` | the orchestration contract: what an orchestrator sees, and whether the process watches its own config file |

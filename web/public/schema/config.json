@@ -2621,7 +2621,40 @@
           "type": "string"
         },
         "when": {
-          "type": "string"
+          "anyOf": [
+            {
+              "description": "a CEL guard: the step runs only when it is true",
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "description": "a decision guard (asked as the decide step `<id>.when`): the step runs only when the statement holds, surely; otherwise it is pruned",
+              "properties": {
+                "confidence": {
+                  "description": "the least confidence the guard holds at; default roles.decide's",
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "model": {
+                  "description": "the model that decides; default roles.decide",
+                  "type": "string"
+                },
+                "noul": {
+                  "description": "the statement the step runs on when it holds",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "state": {
+                  "description": "what is decided about (a value or template); default: the outputs of depends_on by step id, or the inputs (a foreach/batch element in its body)"
+                }
+              },
+              "required": [
+                "noul"
+              ],
+              "type": "object"
+            }
+          ]
         }
       },
       "required": [
@@ -3669,6 +3702,13 @@
                 },
                 "type": "object"
               },
+              "structured_output": {
+                "description": "how a call whose answer has a JSON Schema is asked on this connection: auto (default) — natively where the dialect and the schema allow (OpenAI response_format, Anthropic output_config.format, a Claude model's on Bedrock), else in the prompt; prompt — in the prompt alone, for a server that refuses a response format. The answer is validated against the schema either way",
+                "enum": [
+                  "auto",
+                  "prompt"
+                ]
+              },
               "timeout": {
                 "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
                 "type": [
@@ -3863,11 +3903,19 @@
           },
           "type": "object"
         },
+        "routes": {
+          "additionalProperties": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "description": "the models a turn may run on instead of roles.turn — a declared chat or reasoning model → when to use it. Preflight chooses one per message it looks at (needs agent.preflight auto or always). Operator-only",
+          "maxProperties": 32,
+          "type": "object"
+        },
         "structured_output": {
+          "description": "how a call whose answer has a JSON Schema is asked on this connection: auto (default) — natively where the dialect and the schema allow (OpenAI response_format, Anthropic output_config.format, a Claude model's on Bedrock), else in the prompt; prompt — in the prompt alone, for a server that refuses a response format. The answer is validated against the schema either way",
           "enum": [
             "auto",
-            "json_schema",
-            "tool",
             "prompt"
           ]
         },

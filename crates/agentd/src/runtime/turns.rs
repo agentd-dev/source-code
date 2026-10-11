@@ -340,9 +340,10 @@ impl Runtime {
                 self.contexts
                     .conversation(&ctx_id, job.principal.as_deref())
             };
-            if c.model_window == 0 {
-                c.model_window = window;
-            }
+            // The window is derived from the live settings, never chosen
+            // per conversation: a restart or reload that moves the turn
+            // model or adds a smaller route moves a restored one too.
+            c.model_window = window;
             if let Some(m) = job.message.clone() {
                 c.append(m);
             }
@@ -423,6 +424,24 @@ impl Runtime {
             }
         };
         self.governor.waiting.remove(&format!("turn:{ctx_id}"));
+        // The model preflight routed this message to (RFC 0046 §7), while it
+        // is still a route: one a reload removed since leaves the turn on
+        // `roles.turn`, as no route would.
+        let routed = match job.route.take() {
+            Some(r) if self.settings.intelligence.routes.contains_key(&r) => {
+                self.log
+                    .info("turn.routed", json!({"ctx": ctx_id, "model": r}));
+                Some(r)
+            }
+            Some(r) => {
+                self.log.warn(
+                    "turn.route_removed",
+                    json!({"ctx": ctx_id, "model": r, "reason": "no longer under intelligence.routes; the turn runs on roles.turn"}),
+                );
+                None
+            }
+            None => None,
+        };
         // Every turn — the root context and each conversation alike — is served
         // the root tool plan. An instance has one operator, so there is no
         // narrower per-conversation grant to apply; per-principal narrowing
@@ -466,7 +485,7 @@ impl Runtime {
             max_tokens: self.settings.limits.run.tokens(),
             deadline_ms: self.settings.limits.run.deadline().as_millis() as u64,
             agent_path: format!("turn/{ctx_id}"),
-            model: None,
+            model: routed,
             role: ModelRole::Turn,
             effort: None,
         };
@@ -541,8 +560,10 @@ impl Runtime {
 
     /// The schema a preflight verdict must satisfy. `additionalProperties` is
     /// open so a model volunteering extra fields is not rejected outright.
-    pub fn preflight_schema() -> Value {
-        json!({
+    /// With `routes`, the verdict also names one of them — the model the
+    /// message's turn runs on (RFC 0046 §7).
+    pub fn preflight_schema(routes: &BTreeMap<String, String>) -> Value {
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "intent": {"enum": ["chat", "question", "status", "command", "task", "steer", "clarify"]},
@@ -555,7 +576,15 @@ impl Runtime {
             },
             "required": ["intent", "needs_plan", "risk"],
             "additionalProperties": true
-        })
+        });
+        if !routes.is_empty() {
+            schema["properties"]["route"] = json!({"enum": routes.keys().collect::<Vec<_>>()});
+            schema["required"]
+                .as_array_mut()
+                .expect("written above")
+                .push(json!("route"));
+        }
+        schema
     }
 
     /// Launch the preflight think for a staged job.
@@ -569,11 +598,35 @@ impl Runtime {
             .unwrap_or_default();
         let catalogue = self.skills.render_catalogue().unwrap_or_default();
         let workflows: Vec<String> = self.workflows.keys().cloned().collect();
+        let routes = &self.settings.intelligence.routes;
+        // The routes are named with their criteria in the prompt as well as
+        // in the schema's enum: a connection asked in the prompt alone is
+        // sent no schema, and an enum says which, never when.
+        let (last_task, route_block) = if routes.is_empty() {
+            (
+                "and name the skills from the catalogue that apply".to_string(),
+                String::new(),
+            )
+        } else {
+            (
+                "name the skills from the catalogue that apply, and choose the route — the model that \
+answers the message — from the routes below"
+                    .to_string(),
+                format!(
+                    "\n\nRoutes (route: when to use it):\n{}",
+                    routes
+                        .iter()
+                        .map(|(m, when)| format!("- {m}: {when}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            )
+        };
         let system = format!(
             "PREFLIGHT. You triage an incoming message for {} before it is answered. Classify the intent \
 (chat | question | status | command | task | steer | clarify), decide whether a short working plan is needed \
-(needs_plan + plan items), list clarifying questions if the request is ambiguous, rate the risk, and name the \
-skills from the catalogue that apply. Reply with ONLY one JSON object matching the schema.\n\nWorkflows: {}\n{}\n{}",
+(needs_plan + plan items), list clarifying questions if the request is ambiguous, rate the risk, {last_task}. \
+Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: {}\n{}\n{}",
             self.instance,
             workflows.join(", "),
             catalogue,
@@ -611,7 +664,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 tools: Vec::new(),
                 internal: Vec::new(),
                 mcp_routes: BTreeMap::new(),
-                output_schema: Some(Self::preflight_schema()),
+                output_schema: Some(Self::preflight_schema(&self.settings.intelligence.routes)),
                 max_rounds: 3,
                 budget_admission: false,
                 idempotency_prefix: String::new(),
@@ -663,96 +716,27 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         }
     }
 
-    /// Preflight's typed part as one decision about the message: its intent,
-    /// whether it needs a plan, its risk, and — one statement each — which
-    /// catalogued skills it calls for. Returns the decision and the skill
-    /// each `skill_<i>` question asks about. A catalogue too large for one
-    /// decision is asked about in part, and says so.
+    /// Preflight's typed part as one decision about the message
+    /// ([`preflight_questions`]), saying so when the skill catalogue is too
+    /// large to ask about whole.
     fn preflight_decision(&self, text: &str) -> (crate::wire::decision::Decision, Vec<String>) {
-        use crate::wire::decision::{Decision, MAX_QUESTIONS, Question};
-        let options = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        };
-        let mut questions = BTreeMap::from([
-            (
-                "intent".to_string(),
-                Question::Choice {
-                    instructions: "What does the message ask of the agent?".into(),
-                    options: options(&[
-                        ("chat", "a remark or small talk that needs no action"),
-                        ("question", "a question to answer from what is known"),
-                        ("status", "a request for the agent's own status or progress"),
-                        ("command", "an instruction to run one specific operation"),
-                        ("task", "work that takes several steps or tools"),
-                        (
-                            "steer",
-                            "a correction or change of direction for work in progress",
-                        ),
-                        ("clarify", "too ambiguous to act on without asking"),
-                    ]),
-                },
-            ),
-            (
-                "needs_plan".to_string(),
-                Question::Noul {
-                    instructions: "The message calls for a multi-step working plan before acting."
-                        .into(),
-                },
-            ),
-            (
-                "risk".to_string(),
-                Question::Choice {
-                    instructions: "How much harm could acting on it wrongly do?".into(),
-                    options: options(&[
-                        ("low", "little or none, easily undone"),
-                        ("medium", "some, and undoing it takes work"),
-                        ("high", "serious, or it cannot be undone"),
-                    ]),
-                },
-            ),
-        ]);
-        let room = MAX_QUESTIONS - questions.len();
         let metas: Vec<_> = self.skills.metas().collect();
-        if metas.len() > room {
+        let (decision, asked) =
+            preflight_questions(text, &self.settings.intelligence.routes, &metas);
+        if asked.len() < metas.len() {
             self.log.warn(
                 "preflight.skills_capped",
-                json!({"asked": room, "catalogued": metas.len()}),
+                json!({"asked": asked.len(), "catalogued": metas.len()}),
             );
         }
-        let mut asked = Vec::new();
-        for (i, m) in metas.into_iter().take(room).enumerate() {
-            let when = m
-                .when_to_use
-                .as_deref()
-                .map(|w| format!(" Use it when: {w}"))
-                .unwrap_or_default();
-            questions.insert(
-                format!("skill_{i}"),
-                Question::Noul {
-                    instructions: format!(
-                        "The message calls for the skill `{}`: {}.{when}",
-                        m.name, m.description
-                    ),
-                },
-            );
-            asked.push(m.name.clone());
-        }
-        (
-            Decision {
-                state: Value::String(text.to_string()),
-                questions,
-            },
-            asked,
-        )
+        (decision, asked)
     }
 
     /// A decision model's preflight answers as the verdict preflight has
     /// always produced. An answer under the role's confidence on the intent,
     /// the plan or the risk leaves no verdict at all — the message is a
-    /// task, as a missing verdict always made it (RFC 0046 §5.6).
+    /// task, as a missing verdict always made it (RFC 0046 §5.6). An unsure
+    /// route leaves the verdict without one: the turn runs on `roles.turn`.
     fn preflight_verdict(&self, ctx_id: &str, v: &Value, extra: &Value) -> Option<Value> {
         let unsure: Vec<&str> = ["intent", "needs_plan", "risk"]
             .into_iter()
@@ -765,6 +749,17 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             );
             return None;
         }
+        let route = match &v["route"] {
+            Value::Null => Value::Null,
+            r if r["unsure"] == json!(true) => {
+                self.log.info(
+                    "preflight.route_unsure",
+                    json!({"ctx": ctx_id, "choice": r["choice"], "confidence": r["confidence"], "model": v["model"]}),
+                );
+                Value::Null
+            }
+            r => r["choice"].clone(),
+        };
         let skills: Vec<Value> = extra["skills"]
             .as_array()
             .into_iter()
@@ -776,13 +771,17 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             })
             .map(|(_, name)| name.clone())
             .collect();
-        Some(json!({
+        let mut verdict = json!({
             "intent": v["intent"]["choice"],
             "needs_plan": v["needs_plan"]["noul"].as_f64().is_some_and(|p| p >= 0.5),
             "risk": v["risk"]["choice"],
             "skills": skills,
             "model": v["model"],
-        }))
+        });
+        if !route.is_null() {
+            verdict["route"] = route;
+        }
+        Some(verdict)
     }
 
     /// The preflight verdict arrived: record it, apply the short-circuits, seed
@@ -800,7 +799,13 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         };
         match &verdict {
             Some(v) => {
-                self.log.info("preflight.verdict", json!({"ctx": ctx_id, "intent": v["intent"], "needs_plan": v["needs_plan"], "risk": v["risk"], "skills": v["skills"]}));
+                self.log.info("preflight.verdict", json!({"ctx": ctx_id, "intent": v["intent"], "needs_plan": v["needs_plan"], "risk": v["risk"], "route": v["route"], "skills": v["skills"]}));
+                // The route this message's turn runs on — only one of the
+                // routes: a model's answer outside them is no route.
+                job.route = v["route"]
+                    .as_str()
+                    .filter(|r| self.settings.intelligence.routes.contains_key(*r))
+                    .map(str::to_string);
                 let intent = v["intent"].as_str().unwrap_or("task").to_string();
                 let skills: Vec<String> = v["skills"]
                     .as_array()
@@ -1035,9 +1040,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         let c = self
             .contexts
             .conversation_for(&job.ctx, principal, wire.as_deref())?;
-        if c.model_window == 0 {
-            c.model_window = window;
-        }
+        // Derived from the live settings, as for the root turn.
+        c.model_window = window;
         Ok(())
     }
 
@@ -1778,4 +1782,174 @@ pub fn render_knowledge_block(v: &Value, max_bytes: usize) -> Option<String> {
 pub(crate) enum TurnDefer {
     Later(Box<TurnJob>),
     Dropped,
+}
+
+/// Preflight's typed part as one decision about `text` (RFC 0046 §5.4): its
+/// intent, whether it needs a plan, its risk, the route its turn runs on
+/// when there are `routes` (§7) — a choice among them, each with its
+/// criterion — and, one statement each, which of `skills` it calls for.
+/// Returns the decision and the skill each `skill_<i>` question asks about.
+/// A catalogue too large for one decision is asked about in part; the
+/// route's question is never the one left out.
+fn preflight_questions(
+    text: &str,
+    routes: &BTreeMap<String, String>,
+    skills: &[&crate::context::skills::SkillMeta],
+) -> (crate::wire::decision::Decision, Vec<String>) {
+    use crate::wire::decision::{Decision, MAX_QUESTIONS, Question};
+    let options = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let mut questions = BTreeMap::from([
+        (
+            "intent".to_string(),
+            Question::Choice {
+                instructions: "What does the message ask of the agent?".into(),
+                options: options(&[
+                    ("chat", "a remark or small talk that needs no action"),
+                    ("question", "a question to answer from what is known"),
+                    ("status", "a request for the agent's own status or progress"),
+                    ("command", "an instruction to run one specific operation"),
+                    ("task", "work that takes several steps or tools"),
+                    (
+                        "steer",
+                        "a correction or change of direction for work in progress",
+                    ),
+                    ("clarify", "too ambiguous to act on without asking"),
+                ]),
+            },
+        ),
+        (
+            "needs_plan".to_string(),
+            Question::Noul {
+                instructions: "The message calls for a multi-step working plan before acting."
+                    .into(),
+            },
+        ),
+        (
+            "risk".to_string(),
+            Question::Choice {
+                instructions: "How much harm could acting on it wrongly do?".into(),
+                options: options(&[
+                    ("low", "little or none, easily undone"),
+                    ("medium", "some, and undoing it takes work"),
+                    ("high", "serious, or it cannot be undone"),
+                ]),
+            },
+        ),
+    ]);
+    if !routes.is_empty() {
+        questions.insert(
+            "route".to_string(),
+            Question::Choice {
+                instructions: "Which model should answer the message?".into(),
+                options: routes.clone(),
+            },
+        );
+    }
+    // The skills fill what room the fixed questions leave, so taking a
+    // route's question never pushes the decision past its bound.
+    let room = MAX_QUESTIONS - questions.len();
+    let mut asked = Vec::new();
+    for (i, m) in skills.iter().take(room).enumerate() {
+        let when = m
+            .when_to_use
+            .as_deref()
+            .map(|w| format!(" Use it when: {w}"))
+            .unwrap_or_default();
+        questions.insert(
+            format!("skill_{i}"),
+            Question::Noul {
+                instructions: format!(
+                    "The message calls for the skill `{}`: {}.{when}",
+                    m.name, m.description
+                ),
+            },
+        );
+        asked.push(m.name.clone());
+    }
+    (
+        Decision {
+            state: Value::String(text.to_string()),
+            questions,
+        },
+        asked,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::decision::{MAX_QUESTIONS, Question};
+
+    fn routes() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("deep".to_string(), "careful multi-step work".to_string()),
+            ("fast".to_string(), "a quick answer".to_string()),
+        ])
+    }
+
+    /// With routes, a chat preflight's verdict must name one of them; without,
+    /// the schema is the one preflight always had.
+    #[test]
+    fn a_routed_preflight_schema_requires_one_of_the_routes() {
+        let plain = Runtime::preflight_schema(&BTreeMap::new());
+        assert!(plain["properties"].get("route").is_none());
+        assert_eq!(plain["required"], json!(["intent", "needs_plan", "risk"]));
+        let verdict = json!({"intent": "task", "needs_plan": false, "risk": "low"});
+        assert!(crate::jsonschema::validate(&plain, &verdict).is_ok());
+
+        let routed = Runtime::preflight_schema(&routes());
+        assert_eq!(
+            routed["properties"]["route"],
+            json!({"enum": ["deep", "fast"]})
+        );
+        assert!(
+            crate::jsonschema::validate(&routed, &verdict).is_err(),
+            "a verdict with no route is re-asked"
+        );
+        let mut v = verdict.clone();
+        v["route"] = json!("deep");
+        assert!(crate::jsonschema::validate(&routed, &v).is_ok());
+        v["route"] = json!("smart");
+        assert!(
+            crate::jsonschema::validate(&routed, &v).is_err(),
+            "a model that is not a route is re-asked"
+        );
+    }
+
+    /// The route is one choice among the routes, their criteria its options;
+    /// a catalogue too large for the decision loses skills, never the route.
+    #[test]
+    fn the_route_keeps_its_question_ahead_of_the_skills() {
+        let metas: Vec<crate::context::skills::SkillMeta> = (0..MAX_QUESTIONS)
+            .map(|i| {
+                serde_json::from_value(json!({
+                    "name": format!("s{i}"), "description": "d",
+                    "source": {"server": "", "kind": "inline", "ref": format!("s{i}")}
+                }))
+                .unwrap()
+            })
+            .collect();
+        let metas: Vec<&_> = metas.iter().collect();
+
+        let (d, asked) = preflight_questions("hello", &routes(), &metas);
+        assert_eq!(d.questions.len(), MAX_QUESTIONS);
+        assert_eq!(
+            asked.len(),
+            MAX_QUESTIONS - 4,
+            "intent, needs_plan, risk, route"
+        );
+        match &d.questions["route"] {
+            Question::Choice { options, .. } => assert_eq!(options, &routes()),
+            other => panic!("route is a choice: {other:?}"),
+        }
+
+        let (d, asked) = preflight_questions("hello", &BTreeMap::new(), &metas);
+        assert!(!d.questions.contains_key("route"));
+        assert_eq!(asked.len(), MAX_QUESTIONS - 3);
+    }
 }

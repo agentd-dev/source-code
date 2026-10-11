@@ -17,6 +17,9 @@ pub mod endpoints;
 pub mod failover;
 pub mod health;
 pub mod openai;
+// The wire copy of an answer's JSON Schema, which each dialect asks for
+// natively (RFC 0046 §5.8). Pure functions over `serde_json::Value`.
+pub mod structured;
 // Built-in mock LLM (the hidden `--internal-mock-llm` mode) that backs the
 // observe-to-validate and conformance suites. Debug builds always carry it so
 // `cargo test` works with no flag; release ships it only under `internal-mocks`,

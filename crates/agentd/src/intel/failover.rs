@@ -356,6 +356,7 @@ mod tests {
             temperature: Some(0.0),
             decision: None,
             reasoning: None,
+            output_schema: None,
         }
     }
 

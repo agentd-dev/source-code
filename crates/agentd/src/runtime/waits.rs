@@ -2099,6 +2099,7 @@ impl Runtime {
             sure: super::decide::node_sureness(
                 spec,
                 false,
+                crate::subagent::protocol::OnUnsure::Fail,
                 self.settings
                     .intelligence
                     .role_confidence(crate::config::settings::ModelRole::Decide),

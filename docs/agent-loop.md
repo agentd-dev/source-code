@@ -112,7 +112,10 @@ tokens, 60-second deadline. It classifies intent (`chat`, `question`, `status`,
 lists clarifying questions, rates risk, and names skills to preload. `auto` — the
 default — runs it when the message exceeds 280 characters, contains one of 21
 work verbs (`implement`, `fix`, `deploy`, `refactor`, …), or the context has an
-incomplete plan.
+incomplete plan. With `intelligence.routes` it also chooses the model the turn
+that answers this message runs on (`turn.routed`); a message it does not look
+at, or gives no verdict for, runs on `roles.turn`
+([intelligence.md](intelligence.md#providers-models-and-roles)).
 
 Two verdicts short-circuit the turn entirely: `status` is answered
 deterministically, and `clarify` with non-empty questions asks back. Preflight

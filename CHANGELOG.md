@@ -219,7 +219,75 @@ tracks a draft.
 sent one at a time); agentd's answers to a server's requests are bounded at
 5s; an elicitation's `$schema` and property order are kept.
 
-### Kinds of intelligence (RFC 0046 P1–P4)
+### Kinds of intelligence (RFC 0046 P1–P5)
+
+**Added (P5 — structured generation, decision guards, routing).**
+
+- Structured generation: every call whose answer has a JSON Schema asks the
+  provider to hold the model to it — `think` and `agent` nodes with an
+  `output_schema`, the `think` tool's, `classify`/`route`/`judge`, an
+  emulated decision (a `decide` node, `decide` call or deciding role with no
+  decision model bound, answered by the turn model), preflight, compaction,
+  the goal check, and the `approval: auto` judge on a closed ask. OpenAI is
+  sent `response_format` (`strict` when every object requires all its
+  properties, else the schema as guidance), Anthropic
+  `output_config.format` beside a reasoning model's effort, a Claude model
+  on Bedrock the same in `additionalModelRequestFields`. The wire copy
+  closes each object and leaves out the constraints providers refuse; a
+  schema no provider constrains (a free-form object, `oneOf`, `not`, a
+  conditional, recursion) is asked in the prompt on Anthropic. The answer is
+  still validated against the full schema and re-asked on a miss.
+- `intelligence.providers.<n>.structured_output`: each provider says how it
+  is asked, as the top-level connection does; each link of a fallback chain
+  uses its own connection's.
+- Decision guards: a step's `when:` may be a decision, `{noul: "<statement>",
+  state?, confidence?, model?}`, instead of CEL. It is asked as a `decide`
+  step of its own, `<id>.when` — in the run, budgeted and durable like any
+  step — on its `model` or `roles.decide`: a decision model natively, else
+  the turn model through structured generation. The guarded step depends on
+  it alone and runs only when the statement holds (`noul` ≥ 0.5) and the
+  answer is sure; otherwise it is pruned as a false CEL guard prunes it (in a
+  nested body, skipped), with the tail that depends on it alone. Its default
+  state is the step's dependencies' outputs by step id, or the run's inputs
+  (a `foreach`/`batch` element in its body). Under a `confidence` (the
+  guard's, else `roles.decide`'s) an unsure answer is escalated where the
+  model names an `escalate` model and otherwise prunes the step; doubt never
+  fails the run. A guard on a start node, on a step a `switch`, `on_error:
+  goto` or `on_timeout` routes to (which would run it past its guard), or on
+  a `subgraph` with a body step named `when` is refused at load, and the
+  guard's model is held to the deciding kinds' checks.
+- Per-turn routing: `intelligence.routes` maps each model a turn may run on
+  to when to use it (`fast: "a quick answer"`, `deep: "careful multi-step
+  work"`). Preflight chooses one for each message it looks at — on a decision
+  model as one more choice, the routes' criteria its options; on the turn
+  model through structured generation, a `route` enum in its schema and the
+  routes listed in its prompt — and the turn that answers that message runs
+  on it instead of `roles.turn` (`turn.routed {ctx, model}`). No verdict, a
+  route under the preflight role's `confidence` (`preflight.route_unsure`;
+  the rest of the triage stands) or a route a reload removed meanwhile
+  (`turn.route_removed`) leaves the turn on `roles.turn`; the next message
+  is routed by its own preflight. Each route is a declared chat or reasoning
+  model with a criterion, at most 32, and `routes` with `agent.preflight:
+  never` is refused at load. The transcript is compacted to fit the smallest
+  window among the turn model and the routes. Operator-only (a served
+  document that sets it is refused) and reloadable.
+
+**Changed (P5, breaking).** `structured_output` is `auto` (the default:
+natively where the dialect and the schema allow) or `prompt` (never a
+format on the wire, for an OpenAI-compatible server that refuses
+`response_format`). `json_schema` and `tool` are removed and refused at
+load; `prompt` on a `dialect: decisions` provider, which is sent no schema,
+is refused too.
+
+**Fixed (P5).** `intelligence.structured_output` was accepted and read by
+nothing: every schema-bearing call asked for JSON in the prompt whatever it
+said. A step's `when:` written as an object was dropped without a word and
+the step ran unguarded; an object is now a decision guard, and any other
+shape that is not a CEL string is refused at load. A conversation's
+compaction window was fixed when the conversation was created, so a restart
+or reload that moved the turn model to a smaller window left a restored
+conversation compacting against the old one; it now follows the live
+settings at each turn.
 
 **Added (P4 — reasoning).**
 

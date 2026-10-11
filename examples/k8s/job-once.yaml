@@ -47,12 +47,13 @@ spec:
           values: [4, 6]
       # Budget/partial — default retriable; flip to FailJob if your policy is
       # "raise the budget, don't retry" (rfcs/0011 §5 calls this operator-tunable).
-      #   3 = usable partial result   7 = hit max-steps/tokens/deadline budget
+      #   3 = usable partial result   7 = hit max-steps/tokens budget
+      #   124 = the run's deadline passed
       - action: Count
         onExitCodes:
           containerName: agentd
           operator: In
-          values: [3, 7]
+          values: [3, 7, 124]
       # SIGTERM-without-clean-drain (143) — count as a normal retriable failure
       # rather than ignore it; a clean drain returns 0, not 143 (rfcs/0011 §5).
       - action: Count

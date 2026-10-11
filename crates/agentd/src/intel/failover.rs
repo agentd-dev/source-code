@@ -16,7 +16,7 @@
 //! connection, which is what makes a re-dial safe to attempt at all. The only
 //! state kept between calls is the cheap per-endpoint health and breaker record.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::client::IntelError;
 use super::endpoints::EndpointList;
@@ -103,13 +103,57 @@ pub struct SweepResult {
     pub served_by: Option<usize>,
 }
 
+/// The error a call gets once its run's deadline has passed.
+pub(super) fn deadline_passed() -> IntelError {
+    IntelError::Transport(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the run's deadline passed",
+    ))
+}
+
+/// `timeout` cut to what is left before `deadline`, or the deadline's error
+/// once it has passed — so no dial is opened after it.
+pub(super) fn bounded(
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> Result<Duration, IntelError> {
+    match deadline {
+        Some(d) => {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(deadline_passed());
+            }
+            Ok(timeout.min(left))
+        }
+        None => Ok(timeout),
+    }
+}
+
+/// A sweep the run's deadline ended.
+fn ended_by_deadline(
+    failover: Option<(usize, usize)>,
+    breaker_changes: Vec<(usize, BreakerTransition)>,
+) -> SweepResult {
+    SweepResult {
+        outcome: Err(deadline_passed()),
+        failover,
+        breaker_changes,
+        active_change: None,
+        served_by: None,
+    }
+}
+
 /// Drive one bounded failover sweep for a single logical `complete`. The sweep
 /// visits at most `eps.len()` distinct endpoints and each of them at most once,
-/// so one `complete` can never loop over the list.
+/// so one `complete` can never loop over the list. A run's `deadline` bounds
+/// each endpoint's attempt, and the sweep ends when it passes: a dial the
+/// deadline cut short is the run's, not the endpoint's, and does not count
+/// against its breaker.
 pub fn complete_resilient(
     list: &mut EndpointList,
     req: &Request,
     timeout: Duration,
+    deadline: Option<Instant>,
     trace_id: Option<&str>,
 ) -> SweepResult {
     let order = list.attempt_order();
@@ -133,6 +177,9 @@ pub fn complete_resilient(
     }
 
     for idx in order {
+        let Ok(timeout) = bounded(timeout, deadline) else {
+            return ended_by_deadline(failover, breaker_changes);
+        };
         // A second-or-later attempt within one sweep IS a failover advance, and
         // is what the caller reports as such.
         if let Some(prev) = prev_idx
@@ -142,7 +189,11 @@ pub fn complete_resilient(
         }
         prev_idx = Some(idx);
 
-        match list.ep(idx).complete_once(req, timeout, trace_id) {
+        let outcome = list.ep(idx).complete_once(req, timeout, deadline, trace_id);
+        if outcome.is_err() && deadline.is_some_and(|d| Instant::now() >= d) {
+            return ended_by_deadline(failover, breaker_changes);
+        }
+        match outcome {
             Ok((resp, latency)) => {
                 if let Some(t) = list.ep(idx).health.record_success(latency) {
                     breaker_changes.push((idx, t));
@@ -368,7 +419,7 @@ mod tests {
     fn connect_failure_advances_to_next_healthy_endpoint() {
         let good = serve_status(200);
         let mut list = list_of(&[dead_endpoint(), good]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(r.outcome.is_ok(), "sweep failed over to the healthy ep");
         assert_eq!(r.served_by, Some(1));
         // a failover advance was recorded (0 → 1)
@@ -380,7 +431,7 @@ mod tests {
         let bad = serve_status(503);
         let good = serve_status(200);
         let mut list = list_of(&[bad, good]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(r.outcome.is_ok());
         assert_eq!(r.served_by, Some(1));
     }
@@ -390,7 +441,7 @@ mod tests {
         let bad = serve_status(400);
         let good = serve_status(200);
         let mut list = list_of(&[bad, good]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         // a 4xx is fatal — the sweep returns it WITHOUT trying endpoint 1.
         assert!(matches!(r.outcome, Err(IntelError::Http(400, _))));
         assert_eq!(r.served_by, None);
@@ -402,7 +453,7 @@ mod tests {
         let bad = serve_status(401);
         let good = serve_status(200);
         let mut list = list_of(&[bad, good]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(matches!(r.outcome, Err(IntelError::Http(401, _))));
         assert!(is_auth(&r.outcome.unwrap_err()));
     }
@@ -418,7 +469,7 @@ mod tests {
         }
         // the sweep skips the broken endpoint 0 entirely → serves on 1, no
         // failover advance recorded (0 was never dialed).
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(r.outcome.is_ok());
         assert_eq!(r.served_by, Some(1));
         assert_eq!(r.failover, None, "broken ep was skipped, not failed-over");
@@ -430,15 +481,89 @@ mod tests {
         // One sweep over two dead endpoints exhausts the list, since each one
         // failed over, giving the all-down terminal that maps to exit 4 in
         // `once` mode.
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(matches!(r.outcome, Err(IntelError::AllEndpointsDown(_))));
         // After enough sweeps the breakers open and `all_down()` (breaker-state)
         // also reports true — at which point `attempt_order()` is empty.
         for _ in 0..3 {
-            let _ = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+            let _ = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         }
         assert!(list.all_down());
         assert!(list.attempt_order().is_empty());
+    }
+
+    /// Bind `127.0.0.1:0` and accept one connection that is never answered.
+    fn serve_silence() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(5));
+                drop(s);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn the_deadline_ends_the_sweep_and_spares_the_breaker() {
+        // A silent endpoint ahead of a healthy one: the run's deadline cuts the
+        // first dial short, and the sweep ends there rather than dialing the
+        // next endpoint after the deadline — an answer the run could no
+        // longer use. The cut-off dial is the run's, not the endpoint's.
+        let mut list = list_of(&[serve_silence(), serve_status(200)]);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(300);
+        let r = complete_resilient(
+            &mut list,
+            &req(),
+            Duration::from_secs(10),
+            Some(deadline),
+            None,
+        );
+        assert!(
+            matches!(&r.outcome, Err(IntelError::Transport(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "the deadline ended the sweep: {:?}",
+            r.outcome.as_ref().err()
+        );
+        assert_eq!(r.served_by, None);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cut off, not waited out"
+        );
+        assert_eq!(list.ep(0).health.total_fail(), 0, "no failure counted");
+        // A deadline already passed dials nothing at all.
+        let r = complete_resilient(
+            &mut list,
+            &req(),
+            Duration::from_secs(10),
+            Some(start),
+            None,
+        );
+        assert!(r.outcome.is_err());
+        assert_eq!(list.ep(1).health.total_calls(), 0, "nothing dialed");
+    }
+
+    #[test]
+    fn a_transient_retry_does_not_wait_past_the_deadline() {
+        // A 503 then a 200: the 250ms retry would answer after the run's
+        // deadline, so the 503 itself is returned at once — not slept on and
+        // then reported as the deadline.
+        let ep = serve_sequence(vec![503, 200]);
+        let mut list = list_of(&[ep]);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let r = complete_resilient(
+            &mut list,
+            &req(),
+            Duration::from_secs(2),
+            Some(deadline),
+            None,
+        );
+        assert!(
+            matches!(&r.outcome, Err(IntelError::AllEndpointsDown(Some(c))) if matches!(**c, IntelError::Http(503, _))),
+            "the endpoint's own answer, at once: {:?}",
+            r.outcome.as_ref().err()
+        );
     }
 
     #[test]
@@ -450,7 +575,7 @@ mod tests {
         // exit 4.
         let ep = serve_sequence(vec![503, 200]);
         let mut list = list_of(&[ep]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(r.outcome.is_ok(), "same-endpoint retry cleared the 503");
         assert_eq!(r.served_by, Some(0));
         assert_eq!(r.failover, None, "handled in place, not failed over");
@@ -460,7 +585,7 @@ mod tests {
     fn transient_429_is_retried_then_succeeds() {
         let ep = serve_sequence(vec![429, 200]);
         let mut list = list_of(&[ep]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(r.outcome.is_ok(), "429 rate-limit blip was retried");
         assert_eq!(r.served_by, Some(0));
     }
@@ -472,7 +597,7 @@ mod tests {
         // the retry wrongly fired on 4xx, this would spuriously succeed.
         let ep = serve_sequence(vec![400, 200]);
         let mut list = list_of(&[ep]);
-        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None, None);
         assert!(
             matches!(r.outcome, Err(IntelError::Http(400, _))),
             "4xx must surface on the first dial, not be retried"

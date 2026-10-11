@@ -28,7 +28,7 @@ permissions:
 # silently drops the event), which would make every non-trivial config a
 # build-from-source job.
 env:
-  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
+  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

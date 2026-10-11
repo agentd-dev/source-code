@@ -48,6 +48,7 @@ mcp-events = ["agentd/mcp-events"]
 # On-the-fly decryption of encrypted instruction envelopes (RFC 0041).
 decrypt = ["sign", "agentd/decrypt"]
 internal-mocks = ["agentd/internal-mocks"]
+mock-models = ["agentd/mock-models"]
 
 [dependencies]
 # The engine. Dependency-renamed so the binary's code (and every embedder

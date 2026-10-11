@@ -22,6 +22,8 @@ fn validate_config_rejects_non_https_intelligence() {
                 "x",
                 "--intelligence",
                 intel,
+                "--model",
+                "m-1",
             ])
             .output()
             .expect("run agentd --validate-config")
@@ -68,6 +70,8 @@ fn yaml_config_path_env_and_generic_flags_pass_the_validation_gate() {
             "x",
             "--intelligence",
             "https://intel.example",
+            "--model",
+            "m-1",
         ]);
         cmd.args(extra);
         for (k, v) in env {

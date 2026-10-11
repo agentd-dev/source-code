@@ -205,6 +205,44 @@ fn an_unsure_answer_is_escalated_once() {
     }
 }
 
+/// An escalation the run's deadline cuts off ends the run on its deadline,
+/// as the first call would — not as a failure of the escalate model.
+#[test]
+fn an_escalation_cut_off_by_the_deadline_ends_on_the_deadline() {
+    let chat = playbook(json!({"turns": [{"content": "{}"}], "match": [{
+        "when_contains": "QUESTIONS:",
+        "delay_ms": 8000,
+        "content": "{\"queue\": {\"choice\": \"billing\", \"confidence\": 0.9}, \"urgent\": {\"noul\": 0.95}}"
+    }]}));
+    let dec = playbook(native_answers(0.4));
+    let cfg = format!(
+        "{BASE}{}{}",
+        intelligence(
+            &chat,
+            &dec,
+            ", escalate: smart",
+            "{ turn: smart, decide: jev }"
+        ),
+        job(&format!("kind: decide, confidence: 0.8, {}", questions()))
+            .replace("    steps:\n", "    limits: { deadline: 2s }\n    steps:\n")
+    );
+    let started = std::time::Instant::now();
+    let (code, out, log) = run(&cfg);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(7),
+        "the deadline ended the escalation, not its answer: {log}"
+    );
+    assert_eq!(events(&log, "intel.decision.escalate").len(), 1, "{log}");
+    assert!(
+        !log.contains("intel (escalate)"),
+        "a cut-off escalation is the deadline, not the model's failure: {out}\n{log}"
+    );
+    assert_eq!(code, Some(124), "{out}\n{log}");
+    for f in [&chat, &dec] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 /// With no model to escalate to, an unsure answer fails the node — a
 /// threshold the author set is never quietly ignored — and `continue` hands
 /// it on marked instead.

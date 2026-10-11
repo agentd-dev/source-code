@@ -32,13 +32,9 @@ pub fn schema() -> Value {
             "windows": { "type": "array", "items": { "$ref": "#/$defs/BudgetWindow" } },
             "lifetime_tokens": { "type": "integer", "minimum": 0, "description": "hard ceiling; 0 = unbounded" },
             "lifetime_exhausted": { "enum": ["drain", "refuse", "exit"], "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)" },
-            "scope": { "type": "array", "items": { "enum": ["instance", "run", "conversation", "principal"] } },
             "on_exhausted": { "enum": ["wait", "slow", "degrade", "refuse", "fail"] },
             "slow": { "type": "object", "additionalProperties": false, "properties": { "factor": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 } } },
-            "degrade": { "type": "object", "additionalProperties": false, "properties": { "model": { "type": "string" } } },
-            "reserve": { "type": "object", "additionalProperties": false, "properties": {
-                "estimate": { "enum": ["context", "fixed", "none"] },
-                "fixed": { "type": "integer", "minimum": 0 } } }
+            "degrade": { "type": "object", "additionalProperties": false, "properties": { "model": { "type": "string" } } }
         }
     });
     let mut properties = Map::new();
@@ -242,7 +238,6 @@ fn top_level_properties(
                         "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] },
                         "work": { "enum": ["durable", "ephemeral"], "description": "default durability CLASS for runs + subagent records: ephemeral = nothing persists unless a workflow/spawn says durable: true (the fast path); default durable" } } },
                     "on_error": { "enum": ["halt", "degrade"] },
-                    "audit": { "type": "boolean" },
                     "timeout": duration,
                     "max_value_bytes": { "type": "integer", "minimum": 1, "description": "refuse a durable write larger than this; set it when the store's READ limit is lower than its write limit (an MCP store behind a broker often caps a tool RESULT well below its request body), so a checkpoint that could not be read back is refused at write time instead of failing the next restore" }
                 }
@@ -351,7 +346,6 @@ fn top_level_properties(
                 "bearer": secret,
                 "principals": { "type": "array", "items": { "$ref": "#/$defs/Principal" } },
                 "peers": { "type": "array", "items": { "$ref": "#/$defs/A2aPeer" } },
-                "conversation_ttl": duration,
                 "push": { "type": "object", "additionalProperties": false,
                     "description": "push notifications: a caller registers a webhook and agentd POSTs its task's updates there. Default-OFF — the URL comes from a peer, so making the request at all is the operator's decision.",
                     "properties": {
@@ -374,10 +368,9 @@ fn top_level_properties(
                 "log_level": { "enum": ["trace", "debug", "info", "warn", "error"] },
                 "log_content": { "type": "boolean" },
                 "otel": { "type": "object", "additionalProperties": false, "properties": {
-                    "endpoint": { "type": "string" }, "traces": { "type": "boolean" }, "metrics": { "type": "boolean" }, "logs": { "type": "boolean" } } },
+                    "endpoint": { "type": "string" }, "logs": { "type": "boolean" } } },
                 "metrics_addr": { "type": "string" },
                 "health_file": { "type": "string" },
-                "report_file": { "type": "string" },
                 "events_ring": { "type": "integer", "minimum": 1 },
                 "audit": { "type": "object", "additionalProperties": false, "properties": {
                     "sink": { "type": "array", "items": { "enum": ["log", "store", "stream"] } },

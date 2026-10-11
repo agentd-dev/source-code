@@ -605,13 +605,13 @@ fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     }
     // `mock:<script>` — the offline dev endpoint (in-process mock LLM over
     // loopback). Admitted only where the client can actually serve it: debug
-    // builds, or a release built `--features internal-mocks`.
+    // builds, or a release built `--features mock-models`.
     if uri.starts_with("mock:") {
-        #[cfg(any(feature = "internal-mocks", debug_assertions))]
+        #[cfg(any(feature = "mock-models", debug_assertions))]
         return Ok(());
-        #[cfg(not(any(feature = "internal-mocks", debug_assertions)))]
+        #[cfg(not(any(feature = "mock-models", debug_assertions)))]
         return Err(usage(format!(
-            "mock: intelligence needs a build with --features internal-mocks (got: {uri})"
+            "mock: intelligence needs a build with --features mock-models (got: {uri})"
         )));
     }
     if let Some(rest) = uri.strip_prefix("http://") {

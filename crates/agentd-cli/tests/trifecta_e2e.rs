@@ -89,6 +89,7 @@ fn assert_names(err: &str, producer: &str) {
     }
 }
 
+#[cfg(feature = "a2a")]
 #[test]
 fn a_webhook_into_fed_workflow_handing_an_agent_sensitive_and_egress_is_refused() {
     let t = tempfile::tempdir().unwrap();
@@ -116,6 +117,7 @@ fn an_a2a_into_fed_workflow_is_refused_the_same_way() {
     );
 }
 
+#[cfg(feature = "a2a")]
 #[test]
 fn the_explicit_allow_loads_it() {
     let t = tempfile::tempdir().unwrap();
@@ -129,6 +131,7 @@ fn the_explicit_allow_loads_it() {
     assert_eq!(code, 0, "{err}");
 }
 
+#[cfg(feature = "a2a")]
 #[test]
 fn a_stream_nothing_outside_feeds_loads() {
     let t = tempfile::tempdir().unwrap();
@@ -600,6 +603,7 @@ fn a_reload_that_only_retags_a_service_rechecks_the_stored_definitions() {
 /// reader narrowed to `notes` that can call `workflow.run` starts the run
 /// holding `mail`, and one that can call `message.send` hands the text to the
 /// root grant. Both are refused; without them the reader loads.
+#[cfg(feature = "a2a")]
 #[test]
 fn a_reader_holding_a_tool_that_hands_text_on_is_refused() {
     let t = tempfile::tempdir().unwrap();
@@ -636,6 +640,7 @@ const FETCH: &str = "  - name: fetch\n    tool: {name: inbox.next}\n    steps:\n
      f: {kind: finish, depends_on: [a], status: completed}\n";
 
 /// [`FETCH`], handing what it read to a child, whose result is that text.
+#[cfg(feature = "a2a")]
 const FETCH_SPAWNS: &str = "  - name: fetch\n    steps:\n      \
      s: {kind: manual}\n      \
      w: {kind: wait, depends_on: [s], on: event, stream: inbox}\n      \
@@ -644,6 +649,7 @@ const FETCH_SPAWNS: &str = "  - name: fetch\n    steps:\n      \
 
 /// A manually started workflow whose step `r` reads something back before
 /// an agent holding `mail` — both other legs — acts.
+#[cfg(feature = "a2a")]
 fn caller(read: &str) -> String {
     format!(
         "  - name: caller\n    steps:\n      s: {{kind: manual}}\n      \
@@ -657,6 +663,7 @@ fn caller(read: &str) -> String {
 /// legs, loads: the runtime hands that caller the result's status with its
 /// text withheld (`readback_withhold_e2e.rs`), so the read cannot complete
 /// the trifecta, and nothing is refused for it.
+#[cfg(feature = "a2a")]
 #[test]
 fn a_caller_reading_back_a_tainted_result_loads_through_each_path() {
     let t = tempfile::tempdir().unwrap();
@@ -694,6 +701,7 @@ fn a_caller_reading_back_a_tainted_result_loads_through_each_path() {
 /// read-back tools, the plan, the children, and the notes a finished run and
 /// a child's result leave once opted into — and, holding `mail`, loads: what
 /// it reads is withheld from it at runtime, not refused at load.
+#[cfg(feature = "a2a")]
 #[test]
 fn the_root_reading_back_a_tainted_result_loads() {
     let t = tempfile::tempdir().unwrap();

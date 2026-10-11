@@ -2591,13 +2591,19 @@ impl Runtime {
             .budget
             .or_else(|| limits.get("tokens").and_then(Value::as_u64))
             .unwrap_or(self.settings.limits.run.tokens());
-        let deadline_ms = step.timeout_ms.unwrap_or(
+        // The step's own timeout, cut to what is left of the run's deadline:
+        // the turn ends when the run must, model call in flight included.
+        let step_ms = step.timeout_ms.unwrap_or(
             self.settings
                 .limits
                 .step_timeout
                 .map(|d| d.0.as_millis() as u64)
                 .unwrap_or(600_000),
         );
+        let deadline_ms = match self.runs.get(run_id).and_then(|r| r.deadline_ms) {
+            Some(at) => step_ms.min(at.saturating_sub(crate::state::now_ms()).max(1)),
+            None => step_ms,
+        };
         let spec = TurnSpec {
             kind: if deciding {
                 TurnKind::Decide

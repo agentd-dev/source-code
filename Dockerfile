@@ -3,7 +3,7 @@
 # agentd cloud-native appliance image — a fully static musl binary on `scratch`.
 #
 # The image ships the **cloud-native feature set**
-# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events`): the A2A HTTPS listener
+# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models`): the A2A HTTPS listener
 # (RFC 0029, the external channel + delegation peers), the `/healthz`+`/readyz`+
 # `/metrics` HTTP probe surface (so k8s liveness/readiness probes work), UTC-cron
 # scheduling, OTLP trace+log export, SIGHUP + inotify config hot-reload (a
@@ -37,7 +37,7 @@
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.96-alpine AS builder
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one

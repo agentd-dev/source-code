@@ -630,6 +630,7 @@ fn a_resolvable_credential_reference_validates() {
 /// then computed HMAC-SHA256, so every sender signing SHA-512 got a 401 with
 /// nothing explaining why. A silent downgrade in a security field is worse than
 /// either offering the digest or refusing the knob.
+#[cfg(feature = "a2a")]
 #[test]
 fn an_unimplemented_hmac_algo_is_refused_at_validate_time() {
     let (root, home, work) = project("hmacalgo");

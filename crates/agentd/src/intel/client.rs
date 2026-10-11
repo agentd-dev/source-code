@@ -18,9 +18,9 @@
 
 use crate::net::http::{Stream, Url};
 use crate::wire::intel::{Request, Response};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::endpoints::EndpointList;
 use super::{anthropic, bedrock, failover, openai};
@@ -127,6 +127,10 @@ pub struct IntelClient {
     /// `IntelClient` rather than mutating this list in place.
     list: RefCell<EndpointList>,
     timeout: Duration,
+    /// The instant the call in progress must end by — a run's deadline — set
+    /// for the length of [`Self::complete_by`]. Each attempt's timeout is cut
+    /// to what is left of it, and no backoff sleeps past it.
+    deadline: Cell<Option<Instant>>,
     /// The run's trace id; when set, every completion carries a `traceparent`
     /// header so the model call joins the run's distributed trace.
     trace_id: Option<String>,
@@ -236,6 +240,7 @@ impl IntelClient {
             list: RefCell::new(list),
             // Generous per-call ceiling; the run deadline is the real bound.
             timeout: Duration::from_secs(120),
+            deadline: Cell::new(None),
             trace_id: None,
             alldown: None,
             health_reporter: None,
@@ -404,6 +409,27 @@ impl IntelClient {
     /// reported as one, it held `/readyz` at 503 for as long as the model
     /// stayed gone, which is the case a fallback exists for.
     pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
+        self.complete_until(req, self.deadline.get())
+    }
+
+    /// [`Self::complete`], ended by `deadline` (a run's): a call in flight is
+    /// cut off when the deadline passes, as the run is.
+    pub fn complete_by(&self, req: &Request, deadline: Instant) -> Result<Response, IntelError> {
+        self.complete_until(req, Some(deadline))
+    }
+
+    fn complete_until(
+        &self,
+        req: &Request,
+        deadline: Option<Instant>,
+    ) -> Result<Response, IntelError> {
+        let before = self.deadline.replace(deadline);
+        let outcome = self.complete_chain(req);
+        self.deadline.set(before);
+        outcome
+    }
+
+    fn complete_chain(&self, req: &Request) -> Result<Response, IntelError> {
         let Some(f) = &self.fallback else {
             return self.complete_here(req);
         };
@@ -413,10 +439,12 @@ impl IntelClient {
                 next.model = f.model.clone();
                 // The fallback is its own model, with its own controls.
                 next.reasoning = None;
-                f.client.complete(&next).map(|mut resp| {
-                    resp.fallback.get_or_insert_with(|| f.model.clone());
-                    resp
-                })
+                f.client
+                    .complete_until(&next, self.deadline.get())
+                    .map(|mut resp| {
+                        resp.fallback.get_or_insert_with(|| f.model.clone());
+                        resp
+                    })
             }
             outcome => outcome,
         };
@@ -455,9 +483,19 @@ impl IntelClient {
 
         let mut attempt: u32 = 0;
         loop {
+            // A run's deadline bounds every endpoint's attempt; once it has
+            // passed nothing more is dialed.
+            let deadline = self.deadline.get();
+            failover::bounded(self.timeout, deadline)?;
             let sweep = {
                 let mut list = self.list.borrow_mut();
-                failover::complete_resilient(&mut list, req, self.timeout, self.trace_id.as_deref())
+                failover::complete_resilient(
+                    &mut list,
+                    req,
+                    self.timeout,
+                    deadline,
+                    self.trace_id.as_deref(),
+                )
             };
 
             // `set_intel_up` reflects the active endpoint's reachability (in rotation).
@@ -496,6 +534,13 @@ impl IntelClient {
                         _ => return Err(e),
                     };
                     let delay = backoff_delay(&backoff, attempt);
+                    if self
+                        .deadline
+                        .get()
+                        .is_some_and(|d| Instant::now() + delay >= d)
+                    {
+                        return Err(e);
+                    }
                     attempt += 1;
                     std::thread::sleep(delay);
                     // Loop: the next sweep promotes any elapsed-cooldown breaker to
@@ -578,17 +623,17 @@ pub(super) fn resolve(
 ) -> Result<(Transport, String, String), IntelError> {
     // `mock:<script>` — the offline dev endpoint: spawns the built-in mock
     // LLM in-process and dials it over loopback. Debug builds always carry it;
-    // release only under `--features internal-mocks`, so a production binary
+    // release only under `--features mock-models`, so a production binary
     // has no way to be pointed at fake intelligence.
-    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    #[cfg(any(feature = "mock-models", debug_assertions))]
     if let Some(script) = uri.strip_prefix("mock:") {
         let addr = super::mock::inprocess(script).map_err(IntelError::Unsupported)?;
         return resolve(&format!("http://{addr}"), provider);
     }
-    #[cfg(not(any(feature = "internal-mocks", debug_assertions)))]
+    #[cfg(not(any(feature = "mock-models", debug_assertions)))]
     if uri.starts_with("mock:") {
         return Err(IntelError::Unsupported(
-            "mock: intelligence needs a build with --features internal-mocks".into(),
+            "mock: intelligence needs a build with --features mock-models".into(),
         ));
     }
     let url = Url::parse(uri).map_err(|_| {

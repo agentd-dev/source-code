@@ -177,11 +177,9 @@ that arrives without one gets the sugar workflow agentd synthesizes for it —
 `start: {kind: once}`, an `agent` step carrying the instruction, a `finish` — so
 the flags above are the whole configuration for a job that runs once.
 
-The exit code maps the root subagent's terminal status: `completed`→`0`,
-`refused`→`5`, budget/exhausted (steps / tokens / the run's own `deadline`)→`7`
-(RFC 0007/0011). Exit `124` is reserved for the supervisor's hard-kill backstop —
-a child that won't self-terminate — not the deadline terminal status itself.
-Setting an explicit `--run-id` makes retries idempotent.
+The exit code maps the run's terminal status: `completed`→`0`, `refused`→`5`,
+steps or tokens exhausted→`7`, and the run's `deadline` passed→`124`, model call
+in flight included. Setting an explicit `--run-id` makes retries idempotent.
 
 ---
 

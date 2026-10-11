@@ -20,6 +20,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// A document whose machinery opens a route.
+#[cfg(feature = "a2a")]
 const ROUTE_DOC: &str = "You are the desk.\n\n\
      :::!workflow{name=intake}\n\
      steps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n\
@@ -66,6 +67,7 @@ fn validate(cfg: &Path, body: &str) -> (i32, String) {
 
 /// Whether `err` names the workflow, its step and the document it came from,
 /// and says what would open it. `err` may be a JSON-escaped log line.
+#[cfg(feature = "a2a")]
 fn names_the_route(err: &str, doc: &Path) -> bool {
     let err = err.replace("\\\"", "\"");
     err.contains("workflow \"intake\" step \"hook\"")
@@ -73,6 +75,7 @@ fn names_the_route(err: &str, doc: &Path) -> bool {
         && err.contains("`interface` grant")
 }
 
+#[cfg(feature = "a2a")]
 #[test]
 fn a_document_webhook_start_is_refused_at_load() {
     let t = tempfile::tempdir().unwrap();
@@ -94,6 +97,7 @@ fn a_document_webhook_start_is_refused_at_load() {
 
 /// The route the OPERATOR writes is theirs: the same workflow in the config,
 /// beside a document with machinery of its own, loads with no grant.
+#[cfg(feature = "a2a")]
 #[test]
 fn an_operator_configured_webhook_workflow_still_loads() {
     let t = tempfile::tempdir().unwrap();
@@ -144,6 +148,7 @@ fn a_template_document_route_is_refused_at_load() {
 /// A document's `file:` reference is the document's machinery one hop away:
 /// a local file, so `--validate-config` reads it and refuses it as the start
 /// does — under the grant, it loads.
+#[cfg(feature = "a2a")]
 #[test]
 fn a_document_reference_to_a_route_is_refused_at_startup() {
     let t = tempfile::tempdir().unwrap();
@@ -199,6 +204,7 @@ fn a_document_reference_to_a_route_is_refused_at_startup() {
 
 /// Start the daemon on `cfg` until it exits — `(Some(code), log)` — or until
 /// `up` sees what it waits for in the log, when it is stopped: `(None, log)`.
+#[cfg(feature = "a2a")]
 fn start(cfg: &Path, up: impl Fn(&str) -> bool) -> (Option<i32>, String) {
     let log = cfg.with_extension("log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -232,13 +238,13 @@ fn start(cfg: &Path, up: impl Fn(&str) -> bool) -> (Option<i32>, String) {
 }
 
 /// A daemon whose stderr log a test reads, stopped on drop.
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 struct Daemon {
     child: std::process::Child,
     log: std::path::PathBuf,
 }
 
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 impl Daemon {
     fn spawn(cfg: &Path) -> Daemon {
         let log = cfg.with_extension("log");
@@ -277,7 +283,7 @@ impl Daemon {
     }
 }
 
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 impl Drop for Daemon {
     fn drop(&mut self) {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
@@ -294,7 +300,7 @@ impl Drop for Daemon {
 /// A reload that brings a route into the document is refused, naming it; and
 /// restoring the document then reloads to "nothing", so no section of the
 /// refused reload had applied.
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 #[test]
 fn a_reload_introducing_a_document_route_is_refused() {
     let t = tempfile::tempdir().unwrap();

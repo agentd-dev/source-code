@@ -136,6 +136,7 @@ Enterprise: 1 hour.
 :::
 "#;
 
+#[cfg(feature = "a2a")]
 #[test]
 fn a_full_document_loads_every_element() {
     let all = [
@@ -251,6 +252,7 @@ fn human_steps(s: &agentd::config::settings::Settings) -> Vec<(String, String, V
 /// instruction crate's fold, and so the corpus's expected output, is
 /// untouched: agentd reads the principal and the channel from the parsed
 /// document rather than from the one folded string.
+#[cfg(feature = "a2a")]
 #[test]
 fn the_spec_corpus_documents_load_with_their_gates_answered_by_operators() {
     let corpus = concat!(

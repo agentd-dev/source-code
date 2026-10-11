@@ -12,8 +12,8 @@
 //! | 4    | intelligence unreachable / auth after retries       | retriable      |
 //! | 5    | semantic — task cannot be done / refused            | non-retriable  |
 //! | 6    | required MCP server failed to connect/handshake/die | retriable      |
-//! | 7    | budget exceeded (steps/tokens/deadline/tree)        | policy         |
-//! | 124  | hard wall-clock deadline (mnemonic to `timeout(1)`) | —              |
+//! | 7    | budget exceeded (steps/tokens/subagent tree)        | policy         |
+//! | 124  | the run's deadline passed (mnemonic to `timeout(1)`)| policy         |
 //! | 137  | killed by SIGKILL (128+9, OS-set) — often OOM       | raise memory   |
 //! | 143  | killed by SIGTERM (128+15, OS-set) — ungraceful     | —              |
 //!
@@ -55,7 +55,8 @@ pub fn once_exit(status: TerminalStatus, partial: bool) -> i32 {
             }
         }
         Refused => REFUSED,
-        ExhaustedSteps | ExhaustedTokens | Deadline => BUDGET,
+        ExhaustedSteps | ExhaustedTokens => BUDGET,
+        Deadline => DEADLINE,
         Stalled | LoopDetected => PARTIAL,
         Cancelled => GENERIC,
         Crashed => GENERIC,
@@ -155,7 +156,7 @@ mod tests {
         assert_eq!(once_exit(Refused, false), REFUSED);
         assert_eq!(once_exit(ExhaustedSteps, false), BUDGET);
         assert_eq!(once_exit(ExhaustedTokens, false), BUDGET);
-        assert_eq!(once_exit(Deadline, false), BUDGET);
+        assert_eq!(once_exit(Deadline, false), DEADLINE);
         assert_eq!(once_exit(Stalled, false), PARTIAL);
         assert_eq!(once_exit(LoopDetected, false), PARTIAL);
         assert_eq!(once_exit(Cancelled, false), GENERIC);

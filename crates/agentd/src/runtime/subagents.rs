@@ -423,6 +423,7 @@ impl Runtime {
                     .clone()
                     .unwrap_or_else(|| "info".into()),
                 log_content: self.settings.observability.log_content,
+                otel_endpoint: self.settings.observability.otel.endpoint.clone(),
             },
             depth: depth + 1,
             warm: mode == "warm",

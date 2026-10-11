@@ -22,7 +22,7 @@ pub mod openai;
 pub mod structured;
 // Built-in mock LLM (the hidden `--internal-mock-llm` mode) that backs the
 // observe-to-validate and conformance suites. Debug builds always carry it so
-// `cargo test` works with no flag; release ships it only under `internal-mocks`,
+// `cargo test` works with no flag; release ships it only under `mock-models`,
 // keeping the production binary free of test scaffolding.
-#[cfg(any(feature = "internal-mocks", debug_assertions))]
+#[cfg(any(feature = "mock-models", debug_assertions))]
 pub mod mock;

@@ -656,6 +656,10 @@ pub struct Telemetry {
     /// carry sensitive data. Inherited from the parent's `--log-content`.
     #[serde(default)]
     pub log_content: bool,
+    /// Where the child exports its OTLP spans: `observability.otel.endpoint`.
+    /// Absent, it falls back to the inherited `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_endpoint: Option<String>,
 }
 
 #[cfg(test)]
@@ -707,6 +711,7 @@ mod tests {
                 trace_id: None,
                 log_level: "info".into(),
                 log_content: false,
+                otel_endpoint: None,
             },
             depth: 1,
             warm: false,

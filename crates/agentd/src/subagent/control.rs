@@ -141,6 +141,9 @@ pub fn run() -> i32 {
             return crate::exit::USAGE;
         }
     };
+    // Spans go where the operator configured, as the supervisor's own OTLP
+    // logs do; the inherited environment variable is the fallback.
+    crate::obs::otel::set_endpoint(payload.telemetry.otel_endpoint.clone());
 
     // Outbound extra trust anchor (`--tls-ca`), inherited via the payload:
     // install process-wide BEFORE the first dial (the intel/MCP/A2A clients

@@ -75,6 +75,7 @@ fn config(listen: &str, listener_auth: &str, node_auth: &str) -> String {
     )
 }
 
+#[cfg(feature = "a2a")]
 const HMAC: &str = ", auth: {hmac: {secret: \"{{secret:HOOK_SECRET}}\"}}";
 
 /// (a) THE HOLE: a public bind with no auth anywhere — not on the listener, not
@@ -104,6 +105,7 @@ fn a_non_loopback_listener_with_no_auth_anywhere_is_refused_naming_what_to_set()
 /// (b) A listener-wide `webhooks.default_auth` covers every node that declares
 /// none — that is exactly what the runtime falls back to, so it satisfies the
 /// gate.
+#[cfg(feature = "a2a")]
 #[test]
 fn a_listener_default_auth_satisfies_the_gate() {
     let dir = workdir("wh-gate-default");
@@ -116,6 +118,7 @@ fn a_listener_default_auth_satisfies_the_gate() {
 /// (c) Per-node `auth` is the documented shape — auth is declared per node —
 /// and it must be enough on its own: the check is about routes, not about
 /// whether a listener-wide default happens to exist.
+#[cfg(feature = "a2a")]
 #[test]
 fn every_node_carrying_its_own_auth_satisfies_the_gate() {
     let dir = workdir("wh-gate-node");
@@ -127,6 +130,7 @@ fn every_node_carrying_its_own_auth_satisfies_the_gate() {
 /// (d) THE CASE THAT MUST NOT REGRESS: loopback dev keeps working. An
 /// unauthenticated `http://127.0.0.1` webhook is the documented dev shape (it is
 /// what `webhook_e2e` runs), and nothing off-box can reach it.
+#[cfg(feature = "a2a")]
 #[test]
 fn a_loopback_listener_with_no_auth_still_validates() {
     let dir = workdir("wh-gate-loopback");
@@ -164,6 +168,7 @@ fn an_explicit_none_auth_does_not_open_a_public_bind() {
 /// path on the same listener, and its `auth` lives under `webhook.auth`. An
 /// unauthenticated callback on a public bind is the same hole — resuming a
 /// suspended run on a forged callback — so it is refused too.
+#[cfg(feature = "a2a")]
 #[test]
 fn a_wait_on_webhook_callback_is_covered_by_the_gate() {
     let dir = workdir("wh-gate-wait");

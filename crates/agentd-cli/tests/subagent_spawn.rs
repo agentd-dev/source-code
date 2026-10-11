@@ -50,6 +50,7 @@ fn bogus_payload() -> SpawnPayload {
             trace_id: None,
             log_level: "error".into(),
             log_content: false,
+            otel_endpoint: None,
         },
         depth: 0,
         warm: false,

@@ -18,7 +18,7 @@
 //! serialized — that is why no `Serialize` impl may ever be added to a type
 //! holding it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::client::{IntelError, Provider, Transport, resolve};
 use super::health::{BreakerConfig, HealthRecord};
@@ -362,13 +362,14 @@ impl Endpoint {
         &self,
         req: &crate::wire::intel::Request,
         timeout: Duration,
+        deadline: Option<Instant>,
         trace_id: Option<&str>,
     ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
         use super::{anthropic, openai};
         use std::collections::HashMap;
 
         if let Some(d) = &req.decision {
-            return self.decide_once(req, d, timeout, trace_id);
+            return self.decide_once(req, d, timeout, deadline, trace_id);
         }
         if self.provider == Provider::Decisions {
             return Err(IntelError::Unsupported(
@@ -439,7 +440,7 @@ impl Endpoint {
         // signature covers the exact request-target. Recomputing it separately
         // for either use would silently invalidate every signature.
         let path = self.provider.request_path(&self.http_path, req);
-        let (resp, latency) = self.post(&path, body, headers, timeout, trace_id)?;
+        let (resp, latency) = self.post(&path, body, headers, timeout, deadline, trace_id)?;
 
         let mut parsed = match self.provider {
             Provider::OpenAiCompatible => openai::parse_response(&resp.body),
@@ -476,13 +477,15 @@ impl Endpoint {
         req: &crate::wire::intel::Request,
         d: &crate::wire::decision::Decision,
         timeout: Duration,
+        deadline: Option<Instant>,
         trace_id: Option<&str>,
     ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
         use super::decisions;
         use crate::wire::intel::{Message, Request, Response, StopReason};
         if self.provider == Provider::Decisions {
             let (body, headers) = decisions::build_request(&req.model, d, self.token.as_deref());
-            let (resp, latency) = self.post(&self.http_path, body, headers, timeout, trace_id)?;
+            let (resp, latency) =
+                self.post(&self.http_path, body, headers, timeout, deadline, trace_id)?;
             let (answers, usage) =
                 decisions::parse_response(&resp.body, d).map_err(IntelError::Parse)?;
             let answered = Response {
@@ -508,7 +511,7 @@ impl Endpoint {
             output_schema: Some(decisions::emulation_schema(d)),
             ..Default::default()
         };
-        let (mut resp, mut latency) = self.complete_once(&chat, timeout, trace_id)?;
+        let (mut resp, mut latency) = self.complete_once(&chat, timeout, deadline, trace_id)?;
         // A chat model that misses the shape is told why and asked once
         // more. Either way the tokens it spent are on the response: an answer
         // that is still not a decision comes back with `decision: None` and
@@ -523,7 +526,7 @@ impl Endpoint {
                     "That answer cannot be used: {why}. Reply again with ONLY the JSON object, every question answered."
                 )));
                 let first = resp.usage;
-                let (again, l) = self.complete_once(&chat, timeout, trace_id)?;
+                let (again, l) = self.complete_once(&chat, timeout, deadline, trace_id)?;
                 latency += l;
                 resp = again;
                 resp.usage.input_tokens += first.input_tokens;
@@ -538,16 +541,17 @@ impl Endpoint {
     /// POST one request body to this endpoint and read the answer: the trace
     /// header, the configured headers and the signatures added, a transient
     /// status retried a bounded number of times, any other failure returned.
+    /// A run's `deadline` bounds every dial, and no retry waits past it.
     fn post(
         &self,
         path: &str,
         body: Vec<u8>,
         mut headers: Vec<(String, String)>,
         timeout: Duration,
+        deadline: Option<Instant>,
         trace_id: Option<&str>,
     ) -> Result<(crate::net::http::Response, Duration), IntelError> {
         use crate::net::http;
-        use std::time::Instant;
         let path = path.to_string();
         if let Some(tid) = trace_id {
             headers.push((
@@ -595,6 +599,7 @@ impl Endpoint {
         let mut attempt: u32 = 0;
         let (resp, latency) = loop {
             let start = Instant::now();
+            let timeout = super::failover::bounded(timeout, deadline)?;
             let mut stream = self.transport.connect(timeout)?;
             let resp = http::send(
                 stream.as_mut(),
@@ -608,11 +613,16 @@ impl Endpoint {
             if resp.is_success() {
                 break (resp, latency);
             }
-            if super::failover::is_transient_status(resp.status) && attempt < TRANSIENT_RETRIES {
+            // Short exponential backoff (250ms, 500ms) — enough to ride out a
+            // blip, bounded so total added wait stays well under a second, and
+            // never past the run's deadline.
+            let delay = Duration::from_millis(250 * (1u64 << attempt));
+            if super::failover::is_transient_status(resp.status)
+                && attempt < TRANSIENT_RETRIES
+                && deadline.is_none_or(|d| Instant::now() + delay < d)
+            {
                 attempt += 1;
-                // Short exponential backoff (250ms, 500ms) — enough to ride out a
-                // blip, bounded so total added wait stays well under a second.
-                std::thread::sleep(Duration::from_millis(250 * (1u64 << (attempt - 1))));
+                std::thread::sleep(delay);
                 continue;
             }
             let snippet: String = resp.body_str().chars().take(512).collect();

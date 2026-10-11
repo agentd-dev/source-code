@@ -1117,7 +1117,6 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
     // a field added here later lands unclassified, which is the point.
     "a2a.bearer",
-    "a2a.conversation_ttl",
     "a2a.cors",
     "a2a.device_grant",
     "a2a.events",
@@ -1138,7 +1137,6 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "store.file",
     "store.http",
     "store.mcp",
-    "store.audit",
     "store.retention",
     // The orchestration contract: what an orchestrator sees on exit, which run
     // this is, how long a drain gets, and whether the process watches its own
@@ -1175,7 +1173,6 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "observability.otel",
     "observability.metrics_addr",
     "observability.health_file",
-    "observability.report_file",
     "observability.events_ring",
     "observability.traceparent",
     // Which of the agent's memory every status reader is shown.
@@ -2081,11 +2078,9 @@ pub struct Budget {
     /// every turn until an operator noticed a gauge, which is the shape of
     /// control this project treats as worse than an absent one.
     pub lifetime_exhausted: LifetimeExhausted,
-    pub scope: Option<Vec<BudgetScope>>,
     pub on_exhausted: BudgetTactic,
     pub slow: Slow,
     pub degrade: Degrade,
-    pub reserve: Reserve,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -2124,15 +2119,6 @@ impl WindowUnit {
     pub fn is_calendar(self) -> bool {
         matches!(self, WindowUnit::Day | WindowUnit::Week)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BudgetScope {
-    Instance,
-    Run,
-    Conversation,
-    Principal,
 }
 
 /// What the process does when the lifetime token ceiling is reached.
@@ -2177,22 +2163,6 @@ pub struct Slow {
 #[serde(deny_unknown_fields, default)]
 pub struct Degrade {
     pub model: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Reserve {
-    pub estimate: ReserveEstimate,
-    pub fixed: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ReserveEstimate {
-    #[default]
-    Context,
-    Fixed,
-    None,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -2832,7 +2802,6 @@ pub struct Store {
     pub durability: Durability,
     pub retention: Retention,
     pub on_error: StoreOnError,
-    pub audit: bool,
     pub timeout: Option<Dur>,
     /// Refuse a durable write whose serialized state exceeds this many bytes.
     /// `None` (the default) is unbounded, which keeps today's behaviour for an
@@ -3472,7 +3441,6 @@ pub struct A2a {
     pub bearer: Option<Secret>,
     pub principals: Vec<Principal>,
     pub peers: Vec<A2aPeer>,
-    pub conversation_ttl: Option<Dur>,
     pub push: A2aPush,
     pub cors: A2aCors,
     pub device_grant: DeviceGrant,
@@ -3865,7 +3833,6 @@ pub struct Observability {
     pub otel: Otel,
     pub metrics_addr: Option<String>,
     pub health_file: Option<String>,
-    pub report_file: Option<String>,
     pub events_ring: Option<u32>,
     pub audit: Audit,
     pub traceparent: Option<String>,
@@ -3913,8 +3880,6 @@ impl RuntimeEvents {
 #[serde(deny_unknown_fields, default)]
 pub struct Otel {
     pub endpoint: Option<String>,
-    pub traces: Option<bool>,
-    pub metrics: Option<bool>,
     pub logs: Option<bool>,
 }
 
@@ -5323,11 +5288,6 @@ pub const ALIASES: &[Alias] = &[
         kind: AliasKind::Set,
     },
     Alias {
-        flag: "--report-file",
-        path: "observability.report_file",
-        kind: AliasKind::Set,
-    },
-    Alias {
         flag: "--events-ring",
         path: "observability.events_ring",
         kind: AliasKind::Set,
@@ -6400,7 +6360,7 @@ fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
     {
         return;
     }
-    let sugar = json!({
+    let mut sugar = json!({
         "name": "main",
         "steps": {
             "start": { "kind": "once" },
@@ -6412,6 +6372,10 @@ fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
             "done":  { "kind": "finish", "depends_on": ["work"], "status": "completed", "output": "{{steps.work.output}}" }
         }
     });
+    // The run is the job, so the job's deadline (`--deadline`) is the run's.
+    if let Some(d) = settings.limits.run.deadline {
+        sugar["limits"] = json!({"deadline": format!("{}ms", d.0.as_millis())});
+    }
     // Both sides, together: `settings` is what runs, `doc` is what the
     // effective-config output and the document rules read.
     settings.workflows.push(sugar.clone());
@@ -7229,6 +7193,20 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 "intelligence.roles.turn ({turn:?}) and intelligence.model ({model:?}) both name \
                  the turn model; say it once"
             ),
+        );
+    }
+    // The top-level connection serves the agent's turns: with a real endpoint
+    // and no model named for them, every request would go out with an empty
+    // model for the provider to refuse.
+    if s.intelligence
+        .endpoints
+        .iter()
+        .any(|e| !e.starts_with("mock:"))
+        && s.intelligence.reference(ModelRole::Turn).is_none()
+    {
+        err(
+            &mut d,
+            "intelligence: no model is named for the agent's turns — set intelligence.model (--model, MODEL) or intelligence.roles.turn".into(),
         );
     }
     for role in ModelRole::ALL {
@@ -8240,6 +8218,24 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     }
 
     // a2a
+    // The A2A listener, the webhook listener and the A2A peer client are the
+    // `a2a` build feature's: a binary built without it would load them and
+    // serve nothing, dial nobody.
+    #[cfg(not(feature = "a2a"))]
+    for (what, set) in [
+        ("a2a.listen", s.a2a.listen.is_some()),
+        ("webhooks.listen", s.webhooks.listen.is_some()),
+        ("a2a.peers", !s.a2a.peers.is_empty()),
+    ] {
+        if set {
+            err(
+                &mut d,
+                format!(
+                    "{what} needs the a2a build feature, which this binary was built without — use a release binary, or build with --features a2a"
+                ),
+            );
+        }
+    }
     if let Some(l) = &s.a2a.listen {
         match super::ServeTarget::parse(l) {
             Ok(super::ServeTarget::Http { bind, tls }) => {
@@ -8549,6 +8545,18 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!("a2a.principals[{i}]: `any` cannot grant the operator role"),
+            );
+        }
+        // A `san` or `sub` rule matches only a client certificate the
+        // listener verified, and only `client_ca` makes the listener ask for
+        // one: without it the rule loads and admits nobody, ever. (`any`
+        // also names every caller left over, certificate or not.)
+        if (m.san.is_some() || m.sub.is_some()) && s.a2a.tls.client_ca.is_none() {
+            err(
+                &mut d,
+                format!(
+                    "a2a.principals[{i}]: a certificate rule (san | sub) matches only a client certificate the listener verifies — set a2a.tls.client_ca, or match a bearer with bearer_ref"
+                ),
             );
         }
         // A grant naming an operator-only op on anyone but an operator would
@@ -8965,11 +8973,6 @@ fn validate_budget(b: &Budget, at: &str, d: &mut Diagnostics) {
             "{at}.on_exhausted is degrade but {at}.degrade.model is not set"
         ));
     }
-    if b.reserve.estimate == ReserveEstimate::Fixed && b.reserve.fixed.is_none() {
-        d.errors.push(format!(
-            "{at}.reserve.estimate is fixed but {at}.reserve.fixed is not set"
-        ));
-    }
 }
 
 /// What one workflow step asks of the model catalogue that it cannot give
@@ -9155,6 +9158,36 @@ fn validate_connection(c: &Connection<'_>, d: &mut Diagnostics) {
             ));
         }
     }
+    // A model connection takes its credential as `Authorization: Bearer …`
+    // (or signs itself, for aws). Two auth shapes produce no bearer, and would
+    // load and authenticate nothing: a static credential under a header other
+    // than `Authorization`, and an x509 SVID, which is a TLS client identity.
+    // A build without `oauth` has no credential machinery for a model
+    // connection at all, so there every auth would load and send nothing.
+    #[cfg(not(feature = "oauth"))]
+    if c.auth.is_some() {
+        d.errors.push(format!(
+            "{at}.auth needs the oauth build feature, which this binary was built without — use a release binary, or build with --features oauth"
+        ));
+    }
+    if let Some(a) = c.auth {
+        if a.kind == AuthKind::Static
+            && a.token.is_none()
+            && a.header
+                .as_deref()
+                .is_some_and(|h| !h.eq_ignore_ascii_case("authorization"))
+        {
+            d.errors.push(format!(
+                "{at}.auth: a static credential under its own header ({}) is not sent to a model endpoint — use auth.token (sent as Authorization: Bearer), or {at}.headers for a custom header",
+                a.header.as_deref().unwrap_or_default()
+            ));
+        }
+        if a.kind == AuthKind::Spiffe && a.svid.as_deref() == Some("x509") {
+            d.errors.push(format!(
+                "{at}.auth: an x509 SVID is a TLS client identity, which a model connection does not present — use svid: jwt (a rotating bearer)"
+            ));
+        }
+    }
     for (name, value) in c.headers {
         if super::is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
             d.errors.push(format!(
@@ -9307,7 +9340,6 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
 /// one of the two lists, and prefer [`RESTART_ONLY_PATHS`] when unsure: a
 /// refusal an operator can see beats an apply that lied.
 pub const RELOADABLE_PATHS: &[&str] = &[
-    "a2a.conversation_ttl",
     "a2a.cors",
     "a2a.introspection",
     "a2a.peers",
@@ -9377,7 +9409,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "observability.audit",
     "observability.log_content",
     "observability.log_level",
-    "observability.report_file",
     "observability.runtime_events",
     "observability.status_values",
     "search.server",
@@ -9387,7 +9418,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "skills.max_loaded",
     "skills.reference_prefix",
     "skills.sources",
-    "store.audit",
     "store.checkpoint",
     "store.durability",
     "store.on_error",
@@ -9578,10 +9608,13 @@ mod tests {
         for name in ["BILLING", "PEER"] {
             crate::sec::secret::set_prompted(name, "test-value".into());
         }
-        vec![(
-            "AGENTD_INTELLIGENCE_ENDPOINTS".into(),
-            "https://intel.example/v1".into(),
-        )]
+        vec![
+            (
+                "AGENTD_INTELLIGENCE_ENDPOINTS".into(),
+                "https://intel.example/v1".into(),
+            ),
+            ("AGENTD_INTELLIGENCE_MODEL".into(), "m-1".into()),
+        ]
     }
 
     // ---- schema ↔ struct agreement -----------------------------------------
@@ -9717,7 +9750,6 @@ mod tests {
             "intelligence.budget",
             "intelligence.budget.slow",
             "intelligence.budget.degrade",
-            "intelligence.budget.reserve",
             "mcp",
             "tools",
             "store",
@@ -10085,6 +10117,7 @@ mod tests {
     /// callback, so one under the prefix could take a suspended run's
     /// callback. Both route shapes a workflow can name are refused at load,
     /// with the reason; a path merely near the prefix is not.
+    #[cfg(feature = "a2a")]
     #[test]
     fn a_webhook_route_under_the_reserved_prefix_is_refused_at_load() {
         let cfg = |start: &str, wait: &str| {
@@ -10183,6 +10216,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn a_long_lived_instance_defaults_to_the_file_store_but_an_explicit_none_is_refused() {
         // An A2A listener makes the instance long-lived ⇒ the file store.
@@ -11258,6 +11292,7 @@ mod tests {
     /// The grant is the operator's way to open it, and `:::!endpoint` keeps
     /// working under it — the control that shows the refusal is the grant's,
     /// not a blanket one.
+    #[cfg(feature = "a2a")]
     #[test]
     fn the_interface_grant_lets_a_document_open_a_route() {
         for (block, ..) in DOCUMENT_ROUTES {
@@ -11312,6 +11347,7 @@ mod tests {
     /// A route the OPERATOR configures is theirs to open: the same workflow,
     /// written in the config beside a document with machinery of its own,
     /// loads with no grant at all.
+    #[cfg(feature = "a2a")]
     #[test]
     fn an_operator_configured_webhook_workflow_still_loads() {
         let doc = "You are the desk.\n\n:::!workflow{name=tick}\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s], status: completed}\n:::\n";
@@ -12293,6 +12329,8 @@ mod tests {
             &args(&[
                 "--intelligence",
                 "https://i",
+                "--model",
+                "m-1",
                 "--intelligence-token",
                 "sk-inline",
             ]),
@@ -12380,6 +12418,7 @@ mod tests {
     /// A loopback TCP listener with no credential makes every local caller
     /// that presents nothing the operator; the load says so, and stops saying
     /// so once any credential is configured.
+    #[cfg(feature = "a2a")]
     #[test]
     fn a_listener_without_a_credential_warns_that_every_local_process_is_the_operator() {
         crate::sec::secret::set_prompted("A2A_TEST_BEARER", "test-bearer".into());
@@ -12398,6 +12437,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn new_a2a_keys_require_a_listener() {
         let bearer = "  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n";
@@ -12444,6 +12484,74 @@ mod tests {
         assert_eq!(load_errors("agent: {ask_human_unowned: fallback}\n"), "");
     }
 
+    /// A model connection's credential reaches the wire as a bearer: a static
+    /// credential under another header, or an x509 SVID, would load and send
+    /// nothing, and is refused. A static `header: Authorization` is that
+    /// bearer, and loads.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn a_model_connection_refuses_a_credential_it_cannot_send() {
+        crate::sec::secret::set_prompted("INTEL_TEST_KEY", "k".into());
+        let with = |auth: &str| {
+            load_errors(&format!(
+                "intelligence:\n  endpoints: \"https://m.example/v1/chat/completions\"\n  model: m\n  auth: {auth}\n"
+            ))
+        };
+        let e = with("{kind: static, header: X-Api-Key, value: \"{{secret:INTEL_TEST_KEY}}\"}");
+        assert!(e.contains("under its own header (X-Api-Key)"), "{e}");
+        let e = with("{kind: spiffe, svid: x509, svid_file: /s.pem, key_file: /k.pem}");
+        assert!(e.contains("an x509 SVID is a TLS client identity"), "{e}");
+        for header in ["Authorization", "authorization"] {
+            let e = with(&format!(
+                "{{kind: static, header: {header}, value: \"Bearer {{{{secret:INTEL_TEST_KEY}}}}\"}}"
+            ));
+            assert_eq!(e, "", "header: {header} is the bearer");
+        }
+        assert_eq!(
+            with("{kind: static, token: \"{{secret:INTEL_TEST_KEY}}\"}"),
+            ""
+        );
+    }
+
+    /// A binary built without `oauth` sends no model credential at all, so
+    /// any `auth` on a model connection is refused rather than loaded.
+    #[cfg(not(feature = "oauth"))]
+    #[test]
+    fn a_build_without_oauth_refuses_a_model_credential() {
+        crate::sec::secret::set_prompted("INTEL_TEST_KEY", "k".into());
+        let e = load_errors(
+            "intelligence:\n  endpoints: \"https://m.example/v1/chat/completions\"\n  model: m\n  auth: {kind: static, token: \"{{secret:INTEL_TEST_KEY}}\"}\n",
+        );
+        assert!(
+            e.contains("intelligence.auth needs the oauth build feature"),
+            "{e}"
+        );
+    }
+
+    /// A binary built without `a2a` serves no listener and dials no peer, so
+    /// a configuration that asks for one is refused rather than loaded.
+    #[cfg(not(feature = "a2a"))]
+    #[test]
+    fn a_build_without_a2a_refuses_listeners_and_peers() {
+        for (yaml, what) in [
+            ("a2a: {listen: \"http://127.0.0.1:8420\"}\n", "a2a.listen"),
+            (
+                "webhooks: {listen: \"http://127.0.0.1:8088\"}\n",
+                "webhooks.listen",
+            ),
+            (
+                "a2a:\n  peers:\n    - {name: pal, endpoint: \"https://peer.example\"}\n",
+                "a2a.peers",
+            ),
+        ] {
+            let e = load_errors(yaml);
+            assert!(
+                e.contains(&format!("{what} needs the a2a build feature")),
+                "{what} must be refused in a build without a2a: {e}"
+            );
+        }
+    }
+
     #[test]
     fn webhooks_url_is_https_or_loopback_and_reachable() {
         for ok in [
@@ -12476,6 +12584,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn a2a_url_is_an_origin() {
         let at = |url: &str| {
@@ -12545,6 +12654,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn cors_origins_validation() {
         let at = |o: &str| {
@@ -12625,6 +12735,7 @@ mod tests {
         assert_eq!(at("https://ui.example.com."), "");
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn device_grant_validation() {
         let bearer = "  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n";
@@ -12763,7 +12874,7 @@ mod tests {
     fn operator_only_ops_are_refused_as_non_operator_grants() {
         assert_eq!(
             load_errors(
-                "a2a:\n  principals: [{id: p, match: {san: a.example}, role: user, grants: [\"workflow.signal\", \"config*\", \"admin*\"]}]\n"
+                "a2a:\n  tls: {cert: /c.pem, key: /k.pem, client_ca: /ca.pem}\n  principals: [{id: p, match: {san: a.example}, role: user, grants: [\"workflow.signal\", \"config*\", \"admin*\"]}]\n"
             ),
             ""
         );
@@ -12772,7 +12883,7 @@ mod tests {
         // there).
         for op in ["admin.set", "config", "debug.events", "_instance.result"] {
             let e = load_errors(&format!(
-                "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: user, grants: [\"{op}\"]}}]\n"
+                "a2a:\n  tls: {{cert: /c.pem, key: /k.pem, client_ca: /ca.pem}}\n  principals: [{{id: p, match: {{san: a.example}}, role: user, grants: [\"{op}\"]}}]\n"
             ));
             assert!(
                 e.contains(&format!(
@@ -12782,7 +12893,7 @@ mod tests {
             );
             assert_eq!(
                 load_errors(&format!(
-                    "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: operator, grants: [\"{op}\"]}}]\n"
+                    "a2a:\n  tls: {{cert: /c.pem, key: /k.pem, client_ca: /ca.pem}}\n  principals: [{{id: p, match: {{san: a.example}}, role: operator, grants: [\"{op}\"]}}]\n"
                 )),
                 "",
                 "{op} on an operator rule"
@@ -12815,7 +12926,7 @@ mod tests {
     fn principal_ids_are_unique_and_well_formed() {
         let rules = |a: &str, b: &str| {
             load_errors(&format!(
-                "a2a:\n  principals:\n    - {{id: \"{a}\", match: {{san: a.example}}, role: user}}\n    - {{id: \"{b}\", match: {{san: b.example}}, role: user}}\n"
+                "a2a:\n  tls: {{cert: /c.pem, key: /k.pem, client_ca: /ca.pem}}\n  principals:\n    - {{id: \"{a}\", match: {{san: a.example}}, role: user}}\n    - {{id: \"{b}\", match: {{san: b.example}}, role: user}}\n"
             ))
         };
         let e = rules("a", "a");
@@ -12839,7 +12950,7 @@ mod tests {
             "{san: a.example, bearer_ref: \"{{secret:A2A_TEST_BEARER}}\"}",
         ] {
             let e = load_errors(&format!(
-                "a2a:\n  principals:\n    - {{id: a, match: {m}, role: user}}\n"
+                "a2a:\n  tls: {{cert: /c.pem, key: /k.pem, client_ca: /ca.pem}}\n  principals:\n    - {{id: a, match: {m}, role: user}}\n"
             ));
             assert!(e.contains("match sets more than one of"), "{m}: {e}");
         }
@@ -12878,6 +12989,7 @@ mod tests {
 
     /// A wildcard bind is no address a caller can dial, so what the card and
     /// the issuer publish has to be stated.
+    #[cfg(feature = "a2a")]
     #[test]
     fn a_wildcard_bind_needs_a2a_url() {
         let a2a = |listen: &str, url: &str| {
@@ -13551,6 +13663,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn file_store_validation_diagnostics() {
         // `kind: file` needs no block at all.
@@ -13846,6 +13959,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn peer_references_resolve_and_all_four_kinds_gate_closed_egress() {
         // A `kind: peer` entry feeds a2a.peers[].service, and closed mode
@@ -14466,7 +14580,6 @@ mod tests {
     /// node's `effort` belong to it alone.
     #[test]
     fn reasoning_is_a_writing_kind_with_its_own_controls() {
-        const BEDROCK: &str = "    aws: {endpoints: \"https://bedrock-runtime.us-east-1.amazonaws.com\", dialect: bedrock, auth: {kind: aws, service: bedrock, region: us-east-1}}\n";
         let errors = |extra: &str| -> String {
             let doc = format!(
                 "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jevp: {{endpoints: \"https://jev.example/v1/decisions\", dialect: decisions}}\n{extra}"
@@ -14501,19 +14614,27 @@ mod tests {
                 "  models:\n    smart: {model: s-1}\n  roles: {turn: smart}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      t: {kind: think, prompt: x, effort: high, depends_on: [s]}\n      f: {kind: finish, depends_on: [t]}\n",
                 "effort: its model (smart) is not a reasoning model",
             ),
-            (
-                "  models:\n    deep: {kind: reasoning, provider: aws, model: \"arn:aws:bedrock:us-east-1:1:application-inference-profile/x\"}\n",
-                "a reasoning model on Bedrock names its family",
-            ),
         ] {
-            let e = errors(&format!("{BEDROCK}{extra}"));
+            let e = errors(extra);
             assert!(e.contains(why), "{extra}\n→ {e}");
         }
-        // A Bedrock reasoning model whose id names its family loads.
-        let ok = errors(&format!(
-            "{BEDROCK}  models:\n    deep: {{kind: reasoning, provider: aws, model: us.anthropic.claude-sonnet-5-v1:0}}\n    oss: {{kind: reasoning, provider: aws, model: openai.gpt-oss-120b-1:0}}\n"
-        ));
-        assert!(ok.is_empty(), "{ok}");
+        // Bedrock signs with an `aws` auth, which needs the `oauth` feature.
+        #[cfg(feature = "oauth")]
+        {
+            const BEDROCK: &str = "    aws: {endpoints: \"https://bedrock-runtime.us-east-1.amazonaws.com\", dialect: bedrock, auth: {kind: aws, service: bedrock, region: us-east-1}}\n";
+            let e = errors(&format!(
+                "{BEDROCK}  models:\n    deep: {{kind: reasoning, provider: aws, model: \"arn:aws:bedrock:us-east-1:1:application-inference-profile/x\"}}\n"
+            ));
+            assert!(
+                e.contains("a reasoning model on Bedrock names its family"),
+                "{e}"
+            );
+            // A Bedrock reasoning model whose id names its family loads.
+            let ok = errors(&format!(
+                "{BEDROCK}  models:\n    deep: {{kind: reasoning, provider: aws, model: us.anthropic.claude-sonnet-5-v1:0}}\n    oss: {{kind: reasoning, provider: aws, model: openai.gpt-oss-120b-1:0}}\n"
+            ));
+            assert!(ok.is_empty(), "{ok}");
+        }
     }
 
     /// A role is a model's name or `{model, confidence}`; a threshold is for

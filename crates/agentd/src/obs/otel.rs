@@ -11,10 +11,35 @@
 //! nothing). With the feature, a run records a `chat` span per model call and an
 //! `execute_tool` span per tool call, then flushes the whole trace — the
 //! `invoke_agent` run span (GenAI semconv) plus those children, one OTLP batch —
-//! to `OTEL_EXPORTER_OTLP_ENDPOINT` when it finishes. Best-effort: an export
-//! failure is logged-and-dropped; telemetry never fails a run.
+//! to `observability.otel.endpoint` (else `OTEL_EXPORTER_OTLP_ENDPOINT`) when
+//! it finishes. Best-effort: an export failure is logged-and-dropped;
+//! telemetry never fails a run.
 
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The configured OTLP endpoint (`observability.otel.endpoint`), set once by
+/// the process that exports spans — a turn worker, from its spawn payload.
+static ENDPOINT: OnceLock<String> = OnceLock::new();
+
+/// Record the configured OTLP endpoint for this process's span export. The
+/// environment's `OTEL_EXPORTER_OTLP_ENDPOINT` is the fallback when none is
+/// configured.
+pub fn set_endpoint(endpoint: Option<String>) {
+    if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
+        let _ = ENDPOINT.set(ep);
+    }
+}
+
+/// Where this process exports spans, if anywhere.
+#[cfg(feature = "otel")]
+fn endpoint() -> Option<String> {
+    ENDPOINT.get().cloned().or_else(|| {
+        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+}
 
 /// Current time as unix nanoseconds — a span start/end stamp.
 pub fn now_unix_nanos() -> u128 {
@@ -149,9 +174,7 @@ mod imp {
     impl RunSpan {
         /// Begin a run span, or `None` if there's no endpoint / trace to anchor it.
         pub(super) fn begin(trace_id: Option<&str>, start_unix_nanos: u128) -> Option<RunSpan> {
-            let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                .ok()
-                .filter(|s| !s.is_empty())?;
+            let endpoint = super::endpoint()?;
             let trace_id = trace_id?.to_string();
             Some(RunSpan {
                 span_id: crate::obs::trace::new_span_id(),

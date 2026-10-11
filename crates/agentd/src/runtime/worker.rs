@@ -333,11 +333,20 @@ pub fn run_turn(
             ..Default::default()
         };
         let chat_start = crate::obs::otel::now_unix_nanos();
-        let resp = match degraded.as_ref().unwrap_or(intel).complete(&req) {
+        let resp = match degraded
+            .as_ref()
+            .unwrap_or(intel)
+            .complete_by(&req, limits.deadline)
+        {
             Ok(r) => r,
             Err(e) => {
                 if let Some(rs) = run_span.as_mut() {
                     rs.record_chat(&model, 0, 0, false, chat_start);
+                }
+                // A call the run's deadline cut off ends the run on its
+                // deadline, not as an outage of the model.
+                if Instant::now() >= limits.deadline {
+                    finish_with!("deadline");
                 }
                 result.error = Some(format!("intel: {e}"));
                 finish_with!("failed");
@@ -642,6 +651,13 @@ fn run_decision(
         result.error = Some(why);
         result
     };
+    // A call that failed once the run's deadline passed ends the run on its
+    // deadline, whatever the call said.
+    let past_deadline = |mut result: TurnResult| {
+        result.status = "deadline".into();
+        result.error = Some("the run's deadline passed".into());
+        result
+    };
     let Some(job) = spec.decision.as_deref() else {
         return fail(result, "a decide turn carries no decision".into());
     };
@@ -679,16 +695,20 @@ fn run_decision(
     }
     bridge.progress("turn.think", json!({"turn": spec.turn_id, "round": 1}));
     let ask = |client: &IntelClient, model: &str| {
-        client.complete(&Request {
-            model: model.to_string(),
-            max_tokens,
-            temperature: Some(0.0),
-            decision: Some(job.decision.clone()),
-            ..Default::default()
-        })
+        client.complete_by(
+            &Request {
+                model: model.to_string(),
+                max_tokens,
+                temperature: Some(0.0),
+                decision: Some(job.decision.clone()),
+                ..Default::default()
+            },
+            limits.deadline,
+        )
     };
     let resp = match ask(degraded.as_ref().unwrap_or(intel), &model) {
         Ok(r) => r,
+        Err(_) if Instant::now() >= limits.deadline => return past_deadline(result),
         Err(e) => return fail(result, format!("intel: {e}")),
     };
     result.rounds = 1;
@@ -771,6 +791,7 @@ fn run_decision(
                 // One hop: the escalate model's answer is final.
                 unsure.clear();
             }
+            Err(_) if Instant::now() >= limits.deadline => return past_deadline(result),
             Err(e) => return fail(result, format!("intel (escalate): {e}")),
         }
     }

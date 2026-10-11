@@ -98,7 +98,7 @@ fn labels_are_declared_by_the_operator_not_derived_from_input() {
 fn a_principal_rate_quota_is_accepted_and_bound_to_the_principal() {
     let (code, log) = run(&format!(
         "{BASE}agent: {{ name: a }}\n\
-         a2a:\n  principals:\n\
+         a2a:\n  tls: {{ cert: /c.pem, key: /k.pem, client_ca: /ca.pem }}\n  principals:\n\
         \x20   - match: {{ sub: \"*@acme.example\" }}\n      role: user\n\
         \x20     labels: {{ tenant: acme }}\n\
         \x20     quotas: {{ rate: \"30/1m\", budget: {{ windows: [{{ per: day, tokens: 200000 }}] }} }}\n{WF}"

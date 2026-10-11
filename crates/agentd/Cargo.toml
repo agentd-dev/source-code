@@ -89,13 +89,18 @@ config-watch = ["hot-reload"]
 # existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
 # `--features otel` stays dependency-free (3 deps).
 otel = []
-# Built-in mock intelligence + mock MCP server (the hidden `--internal-mock-llm`
-# / `--internal-mock-mcp` re-exec modes) that the test + conformance suites drive.
-# Test scaffolding, never a shippable capability — so it's OFF in release and the
-# production binary carries none of it. Debug builds enable it automatically (the
+# Test scaffolding the test + conformance suites drive — mock MCP servers (the
+# hidden `--internal-mock-mcp` re-exec mode), crash points — never a shippable
+# capability, so it's OFF in release and the production binary carries none of
+# it. It includes `mock-models`, which the release ships on its own. Debug builds enable it automatically (the
 # `debug_assertions` cfg on the modules), so `cargo test` and the conformance
 # harness need no extra flag; an explicit `--release` test build can opt in here.
-internal-mocks = []
+internal-mocks = ["mock-models"]
+# The built-in mock model endpoint (`mock:final`, `mock:file:<playbook>`):
+# scripted chat and decision answers, for trying and testing an agent or a
+# workflow without a model provider. Shipped in the release binaries; the
+# rest of `internal-mocks` (mock MCP servers, crash points) is not.
+mock-models = []
 # CEL (Common Expression Language) for workflows: `{"op":"cel"}` predicates,
 # computed `assign.expr`, `infer.check` value constraints, and reactive `cel`
 # wake conditions — hermetic, non-Turing-complete, terminating expressions the

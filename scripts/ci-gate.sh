@@ -30,7 +30,8 @@ ROWS=(
   "--features oci"
   "--features decrypt"
   "--features mcp-events"
-  "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events"
+  "--features mock-models"
+  "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
   "--all-features"
 )
 

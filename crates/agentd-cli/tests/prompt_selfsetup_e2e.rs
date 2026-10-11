@@ -59,6 +59,8 @@ fn a_prompt_runs_once_and_prints_the_answer() {
             "How many open issues?",
             "--intelligence",
             &llm.uri,
+            "--model",
+            "m-1",
         ])
         .output()
         .expect("run agentd");
@@ -93,6 +95,8 @@ fn a_prompt_that_sets_up_recurring_work_leaves_a_live_daemon() {
             "Check the queue every 30 seconds from now on.",
             "--intelligence",
             &llm.uri,
+            "--model",
+            "m-1",
             // Defining a workflow persists its definition, so the instance
             // needs a store; `memory` is enough to prove the lifecycle.
             "--store-kind",

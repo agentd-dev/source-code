@@ -1234,6 +1234,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                     .clone()
                     .unwrap_or_else(|| "info".into()),
                 log_content: self.settings.observability.log_content,
+                otel_endpoint: self.settings.observability.otel.endpoint.clone(),
             },
             depth: 0,
             warm: false,

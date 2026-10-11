@@ -356,7 +356,6 @@ fn store_shape(s: &crate::config::settings::Store) -> Value {
         "kind": format!("{:?}", s.kind),
         "prefix": s.prefix(),
         "on_error": format!("{:?}", s.on_error),
-        "audit": s.audit,
         "checkpoint_debounce_ms": s.checkpoint.debounce_ms,
         "durability": format!("{:?}", s.durability),
         "timeout_ms": s.timeout.map(|d| d.0.as_millis() as u64),

@@ -1,6 +1,6 @@
 # RFC 0046: Kinds of intelligence — chat, reasoning and decision models, by role
 
-**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1–P4 implemented 2026-10-11; per-turn routing and decision guards (Q3) wait on measurement
+**Status:** Accepted 2026-10-10 (Q1–Q3 decided, §11); P1–P4 implemented 2026-10-11; P5 (structured generation, decision guards, per-turn routing) decided 2026-10-11
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-10
 **Depends on:** RFC 0031 (endpoint authentication: every provider is signed and credentialed like `intelligence.endpoints` is today), RFC 0037 (service catalog and egress: every provider endpoint is an egress destination), RFC 0042 (what a served document may configure), RFC 0038 (the prompt template).
@@ -211,7 +211,7 @@ pub struct Answer {
 ```
 
 - **Native** (`decision` kind): `intel/decisions.rs` maps it onto the [JEV-OR] body and back. A vendor limit (questions, options, levels, state size) is the vendor's 4xx, surfaced as the call's error with the vendor's reason — agentd never truncates a state silently.
-- **Emulated** (`chat`, `reasoning`): one structured-output call with every question in one schema — `{<id>: {"choice": <enum>, "confidence": <0..1>}}`, `{"noul": <0..1>}`, `{"score": <number>, "confidence": <0..1>}` — through the dialect's existing structured-output path (`intelligence.structured_output`). `probabilities` from logprobs where the dialect returns them (OpenAI-compatible `logprobs` on the choice token); otherwise absent. `calibrated: false` on every emulated answer, so a threshold on it is visibly a threshold on a self-report.
+- **Emulated** (`chat`, `reasoning`): one structured-output call with every question in one schema — `{<id>: {"choice": <enum>, "confidence": <0..1>}}`, `{"noul": <0..1>}`, `{"score": <number>, "confidence": <0..1>}` — through structured generation (§5.8). `probabilities` from logprobs where the dialect returns them (OpenAI-compatible `logprobs` on the choice token); otherwise absent. `calibrated: false` on every emulated answer, so a threshold on it is visibly a threshold on a self-report.
 - **Usage** is counted like any call: input and output tokens into the budget and the governor's reservation (§9).
 
 ### 5.6 Confidence, abstention, escalation
@@ -236,6 +236,15 @@ The roles' answers under their thresholds: preflight → `task`, as a missing ve
 | `bedrock` | the model family's `additionalModelRequestFields` | as the family's native dialect |
 
 Keeping thinking blocks across tool rounds needs one change to the transcript: an assistant message may carry opaque reasoning parts, which the dialect that produced them re-sends and every other path ignores. They are never shown on the feed, never logged unless `log_content` is on, and never survive compaction.
+
+### 5.8 Structured generation
+
+A decision role with no decision model bound runs on the turn model (§5.4), which answers through structured generation: the provider constrains its output to the answer's JSON Schema, rather than the prompt asking for JSON and agentd hoping. The same holds for every call that has a schema — an emulated decision, `classify`/`route`/`judge` and `think`/`agent` nodes with an `output_schema`, the `think` tool's, preflight, compaction, the goal check, and the approve judge on a closed ask.
+
+- **The request carries the schema** (`Request.output_schema`), and each dialect asks for it natively: OpenAI-compatible `response_format: {type: json_schema, json_schema: {name, schema, strict}}`; Anthropic `output_config.format: {type: json_schema, schema}` (beside `output_config.effort`); Bedrock, for a Claude model, the same in `additionalModelRequestFields`. Bedrock's other families have no native form agentd sends; they are asked in the prompt.
+- **The wire schema is the answer's, made sendable**: each object with `properties` is closed (`additionalProperties: false` — a narrower answer still validates); the constraints providers refuse (`minimum`/`maximum`, `minLength`/`maxLength`, `pattern`, item counts, unknown `format`s) are left out of the wire copy and checked after. A schema with a free-form object (no `properties`), `oneOf`, `not` or conditionals has no native form on Anthropic, and is asked in the prompt; OpenAI takes any schema, `strict: true` only when every object is closed and requires all its properties.
+- **The answer is still validated** against the full schema, and a miss is re-asked as today — a provider that ignores the format, a refusal, or a cut-off answer is caught the same way.
+- **`structured_output: auto | prompt`**, per connection (top-level and each provider): `auto` (the default) asks natively wherever the dialect and schema allow; `prompt` never sends a format, for an OpenAI-compatible server that refuses `response_format`. The former `json_schema` and `tool` values are removed: nothing read them, and a forced tool call is refused by current Claude models.
 
 ## 6. Workflows
 
@@ -291,7 +300,34 @@ The agent's own turn keeps one model, `roles.turn`. It reaches the other kinds t
 
 Both are ordinary internal tools: listed in the catalogue, narrowed by `agent.tools`, budgeted, audited.
 
-Two loop-level uses of a decision model are left for after measurement (§11 Q3): routing each turn to a model by a preflight decision about its difficulty, and decision-model guards on steps and event matches (`when: {noul: …, confidence: …}`).
+Two loop-level uses of a decision (§11 Q3, P5), both on `roles.decide`/`roles.preflight` — a decision model natively, else the turn model through structured generation (§5.8):
+
+**Per-turn routing.** `intelligence.routes` names the models a turn may run on, each with when to use it:
+
+```yaml
+intelligence:
+  roles: { turn: smart, preflight: jev }
+  routes:
+    fast: "a quick answer, a status question or one simple operation"
+    deep: "multi-step work, analysis, or anything that needs careful reasoning"
+```
+
+Preflight answers one more question — `route`, a choice over the routes' models with their descriptions as criteria (a `route` enum in a chat preflight's schema) — and the turn that answers the message runs on the chosen model instead of `roles.turn`, logged `turn.routed {ctx, model}`. No verdict (preflight failed, or a decision model under the role's `confidence`) runs the turn on `roles.turn`. Each route is a declared `chat` or `reasoning` model; `routes` with `agent.preflight: never` is refused at load (nothing would choose); under `auto`, only messages preflight looks at are routed. `routes` is operator-only: it moves every turn, as `roles.approve` moves every approval.
+
+**Decision guards.** A step's `when:` is CEL, or a decision:
+
+```yaml
+refund:
+  kind: agent
+  depends_on: [triage]
+  when:
+    noul: "The customer explicitly asks for their money back."
+    state: "{{ inputs.ticket }}"      # default: the outputs of depends_on (or the inputs)
+    confidence: 0.8                  # optional; the guard holds only this surely
+    model: jev                       # optional; default roles.decide
+```
+
+At load the guard becomes a `decide` step of its own, `<id>.when` (a `.` is never in an author's id), with the guarded step's `depends_on` and one question, `holds`; the guarded step depends on it and runs only when the statement holds (`noul` ≥ 0.5) and the answer is sure — else it is pruned like a false CEL guard. Under a `confidence` (the guard's, else `roles.decide`'s), an unsure answer is asked again on the guard model's `escalate` model when it names one, whose answer is final; without one, the unsure answer prunes the step — escalate-else-`continue`, the `decide` tool's default, with the pruning done by the guarded step. The guard's decision is an ordinary step: visible in the run, charged to its budget, durable across a restart. Event matches (`filter`, a wait's `match`) stay CEL: a model call there would run inside the reactor for every event, before any run exists to charge it to; a decision about an event is a guarded first step.
 
 ## 8. Security
 
@@ -338,11 +374,13 @@ Each phase brings a field together with what it does — no key is accepted befo
 **P4 — reasoning.** `kind: reasoning`, `reasoning: {effort, budget}`, `effort` on nodes and `think`, the per-dialect mapping, reasoning parts across tool rounds.
 *As built (P4):* the effort default is `medium`. Anthropic is asked `thinking: {type: adaptive}` with `output_config: {effort}` — current Claude models refuse `budget_tokens` — and the budget form only when the model names a `budget`. Every dialect raises its output cap by the thinking's room (`budget`, else 2048 / 8192 / 24576 by effort), and budget admission counts it. On Bedrock the family comes from the model id: `anthropic.…` takes the Anthropic fields, `openai.…` `reasoning_effort`, both in `additionalModelRequestFields`; a reasoning model whose id names neither is refused at load. A message that thought is kept whole (`Message::Assistant.reasoning`: its content blocks in order, tagged `dialect:model`) and is re-sent verbatim only to the same dialect and model — a fallback or degrade model gets the text and tool calls rebuilt. It rides the wire only — the worker's in-turn messages and a warm subagent's transcript, cleared when its next turn starts — never the supervisor's context. Reasoning-token counts are not split out of the output tokens (`completion_tokens_details` is not read): the budget counts them as output, which they are.
 
+**P5 — structured generation, decision guards, routing.** `Request.output_schema` and the per-dialect native format, `structured_output: auto | prompt` per connection, every schema-bearing call through it (§5.8); `when:` decisions on steps; `intelligence.routes` chosen by preflight (§7).
+
 Decided by the user, 2026-10-10:
 
 - **Q1 — May a decision model approve on the operator's behalf?** Yes, guarded: only bound explicitly, operator-only, with a required threshold, and never over untrusted input (§8).
 - **Q2 — Remove the three old keys outright?** Yes, per the standing no-legacy rule; `--model`/`MODEL` are unaffected.
-- **Q3 — Per-turn model routing and decision guards (§7)?** After P4, once decision calls are measured in real runs.
+- **Q3 — Per-turn model routing and decision guards (§7)?** After P4, once decision calls are measured in real runs. *Revised 2026-10-11:* build them now (P5); where no decision model is configured, the main model answers through structured generation (§5.8).
 - **Scope:** all four phases, in order, each reviewed once, gated and pushed when green.
 
 Open, with recommendations:

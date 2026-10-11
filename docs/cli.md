@@ -20,7 +20,9 @@ agentd <ask>
   or a long-lived daemon. See [Jobs, daemons and triggers](modes-and-triggers.md).
 - `--prompt` delivers one task as a message to the agent's root context, with
   its full tool surface, and exits when the instance has nothing long-lived
-  armed.
+  armed. The turn's outcome is the exit code, as a run's is: `4` when the
+  model cannot be reached, `7` when a budget refuses or ends the turn, `124`
+  past the deadline.
 - `--instruction` without a workflow is the one-shot sugar: agentd generates
   a `once → agent → finish` workflow named `main`. With nothing long-lived
   configured, the process exits when that run ends.

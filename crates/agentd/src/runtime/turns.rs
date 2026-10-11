@@ -403,6 +403,9 @@ impl Runtime {
                 self.apply_lifetime_exhausted(&reason);
                 self.log
                     .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
+                if ctx_id == crate::context::ROOT {
+                    self.root_turn_exit = Some(crate::exit::BUDGET);
+                }
                 if let Some(c) = self.contexts.get_mut(&ctx_id) {
                     c.append(Msg::note(format!("turn not run: {reason}")));
                 }
@@ -414,6 +417,9 @@ impl Runtime {
             Admission::Refuse { reason } | Admission::Fail { reason } => {
                 self.log
                     .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
+                if ctx_id == crate::context::ROOT {
+                    self.root_turn_exit = Some(crate::exit::BUDGET);
+                }
                 if let Some(c) = self.contexts.get_mut(&ctx_id) {
                     c.append(Msg::note(format!("turn not run: {reason}")));
                 }
@@ -502,6 +508,9 @@ impl Runtime {
             Err(e) => {
                 self.log
                     .error("turn.spawn.fail", json!({"ctx": ctx_id, "err": e}));
+                if ctx_id == crate::context::ROOT {
+                    self.root_turn_exit = Some(crate::exit::GENERIC);
+                }
                 if let Some(r) = reservation {
                     self.governor.release(r);
                 }
@@ -1468,6 +1477,11 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             finish = turn.finish.clone();
             reply_text = turn.text.clone();
             needs_compaction = c.needs_compaction(compact_at);
+        }
+        // The root context's latest turn is what a `--prompt` job came to.
+        if ctx_id == crate::context::ROOT {
+            self.root_turn_exit = (turn.status != "completed")
+                .then(|| super::reactor::turn_exit_code(&turn.status, turn.error.as_deref()));
         }
         if let Some(t) = &reply_text
             && !t.is_empty()

@@ -686,6 +686,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         webhook_handler: None,
         activity: BTreeMap::new(),
         last_root_reply: None,
+        root_turn_exit: None,
         #[cfg(feature = "a2a")]
         feed_marks: BTreeMap::new(),
         #[cfg(feature = "a2a")]

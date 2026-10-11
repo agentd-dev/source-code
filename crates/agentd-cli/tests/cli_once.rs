@@ -128,6 +128,32 @@ fn a_once_job_exits_4_on_unreachable_intel() {
     );
 }
 
+/// A `--prompt` one-shot is a turn, not a `once` run, and its turn's outcome
+/// is the job's exit code: an unreachable model is exit 4 here too, where it
+/// used to end the job 0 with nothing on stdout.
+#[test]
+fn a_prompt_exits_4_on_unreachable_intel() {
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args([
+            "--prompt",
+            "say hello",
+            "--intelligence",
+            "http://127.0.0.1:9",
+            "--model",
+            "m",
+            "--log-level",
+            "error",
+        ])
+        .output()
+        .expect("run agentd");
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "expected exit 4 (intel unavailable); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn bad_flag_exits_2() {
     let exe = env!("CARGO_BIN_EXE_agentd");

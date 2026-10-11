@@ -526,6 +526,9 @@ pub struct Runtime {
     /// The newest root-context reply, so a `--prompt` job can print its answer
     /// (a prompt runs as a turn, not as a `once` run with an output).
     pub(crate) last_root_reply: Option<String>,
+    /// The exit code the root context's turns came to, when one did not
+    /// complete: a `--prompt` job has no `once` run to read its code from.
+    pub(crate) root_turn_exit: Option<i32>,
     /// Per-item marks behind the feed's section diffing (`feed_tick`): the
     /// item's fingerprint, its kind and who may see it — the last two so its
     /// departure reaches exactly the principals its updates did.
@@ -1497,7 +1500,14 @@ impl Runtime {
                 }
             }
         }
-        if self.job_runs.is_empty() && self.job_shape {
+        // A job's root turn that did not complete — the answer to a
+        // `--prompt` — is the job's outcome too. A daemon's turns are its
+        // callers' business, not its exit code's.
+        let root_turn = self.root_turn_exit.filter(|_| self.job_shape);
+        if let Some(c) = root_turn {
+            code = c;
+        }
+        if self.job_runs.is_empty() && self.job_shape && root_turn.is_none() {
             // Nothing ever ran (no workflow fired) — a configuration edge; report success.
             return crate::exit::SUCCESS;
         }
@@ -2083,6 +2093,77 @@ pub fn run_exit_code(r: &RunState) -> i32 {
         }
         RunStatus::Cancelled => crate::exit::GENERIC,
         _ => crate::exit::PARTIAL,
+    }
+}
+
+/// The exit code a turn's outcome maps to, read as [`run_exit_code`] reads a
+/// run's. A worker that died without a result says why in its own exit code
+/// (`Exited(4)` when the model could not be reached), which is kept.
+pub fn turn_exit_code(status: &str, error: Option<&str>) -> i32 {
+    use crate::exit;
+    match status {
+        "completed" => exit::SUCCESS,
+        "refused" => exit::REFUSED,
+        "exhausted_steps" | "exhausted_tokens" => exit::BUDGET,
+        "deadline" => exit::DEADLINE,
+        _ => {
+            let e = error.unwrap_or("");
+            let died = e
+                .split_once("Exited(")
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .and_then(|(n, _)| n.parse::<i32>().ok())
+                .filter(|c| {
+                    [
+                        exit::INTEL_UNAVAILABLE,
+                        exit::MCP_REQUIRED_DOWN,
+                        exit::BUDGET,
+                        exit::DEADLINE,
+                    ]
+                    .contains(c)
+                });
+            match died {
+                Some(c) => c,
+                None if e.contains("exhausted") || e.contains("budget") => exit::BUDGET,
+                None if e.contains("deadline") => exit::DEADLINE,
+                None if e.contains("intel") => exit::INTEL_UNAVAILABLE,
+                None => exit::GENERIC,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod turn_exit_tests {
+    use super::turn_exit_code;
+    use crate::exit;
+
+    #[test]
+    fn a_turn_outcome_maps_to_the_exit_contract() {
+        for (status, error, code) in [
+            ("completed", None, exit::SUCCESS),
+            ("refused", None, exit::REFUSED),
+            ("exhausted_steps", None, exit::BUDGET),
+            ("exhausted_tokens", None, exit::BUDGET),
+            ("deadline", None, exit::DEADLINE),
+            (
+                "failed",
+                Some("intel: connection refused"),
+                exit::INTEL_UNAVAILABLE,
+            ),
+            (
+                "failed",
+                Some("worker exited without a result (Exited(4))"),
+                exit::INTEL_UNAVAILABLE,
+            ),
+            (
+                "failed",
+                Some("worker exited without a result (Signaled(9))"),
+                exit::GENERIC,
+            ),
+            ("cancelled", None, exit::GENERIC),
+        ] {
+            assert_eq!(turn_exit_code(status, error), code, "{status} {error:?}");
+        }
     }
 }
 

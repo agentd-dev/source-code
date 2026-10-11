@@ -109,12 +109,13 @@ What the child does not get matters as much:
 - **No stored credential.** The durable record keeps the model reference, not
   the resolved connection; a restore resolves the model again.
 
-> **Limit.** The child connects to its servers itself, and the server
-> description it receives carries the connection but not the parent's
-> per-server tool filters (`mcp.servers[].allow` and `exclude`) or the `ns`
-> prefix. The child sees every tool the server advertises, under the server's
-> own names. Use the spawn's `tools` grant to cut tools a child must not
-> reach, and write its patterns against the names the server advertises.
+The child connects to its servers itself, and offers exactly the MCP tools
+the agent's registry offers a subagent on them, under the registry's names:
+the supervisor sends the list with the spawn. A server's `allow` and
+`exclude` (a referenced service's ceiling included), its `ns`, a profile
+server's contract names and `tools.disabled` reach the child that way, and a
+spawn's `tools` grant, a policy rule and the calls routed back to the
+supervisor all name the same tool.
 
 Two calls still come back to the supervisor. With `security.policies` set,
 the supervisor names every tool of the child's servers that a policy rule

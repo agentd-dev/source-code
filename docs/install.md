@@ -249,22 +249,15 @@ mock-llm done
 configuration provide: the internal tools, the store, the listener, the
 workflows.
 
-When a configuration needs a feature the binary was built without, the
-answer depends on the feature. Validation refuses an A2A listener, a cron
-schedule, a CEL expression or a `mock:` endpoint, and names the feature:
+When a configuration needs a feature the binary was built without,
+validation refuses it and names the feature: an A2A listener, a cron
+schedule, a CEL expression, a `mock:` endpoint, a metrics address,
+`security.exec.enabled: true`, and the rest in [Build features and
+crates](features.md).
 
 ```text
 {"event":"config.invalid","msg":"a2a.listen needs the a2a build feature, which this binary was built without — use a release binary, or build with --features a2a"}
 ```
-
-Some settings are accepted and do nothing instead, such as a metrics address
-in a build without `metrics`. [Build features and crates](features.md)
-lists what each missing feature does.
-
-> **Limit.** `security.exec.enabled: true` is one of the settings accepted
-> silently. A binary built without `exec` takes it and offers the agent no
-> command runner, without a warning. Run the coding agent on the binary you
-> built with `exec`.
 
 ## Next steps
 

@@ -100,8 +100,7 @@ enrollment-token reference that does not resolve, exits 2 before any network
 call. Enrollment and the first agent token happen on the first signed request.
 
 The release binaries and the container image include the `aauth` feature. A
-binary built without it accepts `security.aauth` and signs nothing, with no
-warning.
+binary built without it refuses `security.aauth` at load, exit `2`.
 
 ## Choose an enrollment mode
 

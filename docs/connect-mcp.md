@@ -133,14 +133,11 @@ field of the `auth:` block.
 | a SPIFFE workload identity | `auth: {kind: spiffe, svid: jwt \| x509, …}` | no |
 | an AAuth agent signature | `security.aauth` set for the instance; see [AAuth agent identity](aauth.md) | no |
 
-A connection presents one credential mechanism. `auth` wins over `oauth`,
-and either wins over AAuth signing; `headers` are sent in every case. An
-instance with an AAuth identity signs every server that has neither `auth`
-nor `oauth`; set `aauth: false` on a server to leave it unsigned.
-
-> **Warning.** agentd accepts `auth` and `oauth` on the same server and
-> uses `auth`. The `oauth` block is then ignored without a warning, so set
-> one or the other.
+A connection presents one credential mechanism: `auth` or `oauth` (setting
+both is refused at load), and either wins over AAuth signing; `headers` are
+sent in every case. An instance with an AAuth identity signs every server
+that has neither `auth` nor `oauth`; set `aauth: false` on a server to leave
+it unsigned.
 
 The same mechanisms as configuration, each validated:
 

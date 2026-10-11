@@ -3080,7 +3080,7 @@
                   ]
                 },
                 "unenforceable": {
-                  "description": "what a `trust` pin whose keys cannot be resolved locally means at startup — `author_keys` that are all instruction:// JWKS uris need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore",
+                  "description": "what a `trust` pin that names no key file means at startup — `author_keys` that are instruction:// JWKS uris, or none, need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore. A key file that cannot be read always refuses (exit 2)",
                   "enum": [
                     "warn",
                     "refuse",

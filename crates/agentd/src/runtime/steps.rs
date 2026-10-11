@@ -4092,8 +4092,10 @@ pub(crate) fn workflow_documents(
 
 /// A `file:` entry's document, read from the local filesystem as a
 /// definition. Shared with `--validate-config`, which reads the same files.
+/// A file on disk is held to the config file's rule for credentials: a
+/// webhook verifier's secret is a reference.
 pub(crate) fn read_workflow_file(path: &str, entry: &Value) -> Result<Value, String> {
-    std::fs::read_to_string(path)
+    let def = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
         .and_then(|t| {
             crate::config::file::parse_document(
@@ -4101,7 +4103,18 @@ pub(crate) fn read_workflow_file(path: &str, entry: &Value) -> Result<Value, Str
                 crate::config::file::Format::detect(Some(std::path::Path::new(path)), &t),
             )
         })
-        .and_then(|d| as_definition(d, entry))
+        .and_then(|d| as_definition(d, entry))?;
+    let mut secrets = Vec::new();
+    crate::config::settings::webhook_secrets(&def, "", &mut secrets);
+    if let Some((at, _)) = secrets
+        .iter()
+        .find(|(_, v)| !crate::sec::secret::has_secret_ref(v))
+    {
+        return Err(format!(
+            "{at} carries an inline credential; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}}"
+        ));
+    }
+    Ok(def)
 }
 
 /// A resolved document as a definition: a mapping, which takes its entry's

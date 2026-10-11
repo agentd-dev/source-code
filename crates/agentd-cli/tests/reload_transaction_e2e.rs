@@ -835,7 +835,9 @@ fn skills_from_a_server_the_reload_adds_are_discovered() {
 /// credential or timeout re-dials it, where comparing the endpoint, headers
 /// and AAuth flag alone kept the old connection — the old credential — while
 /// the reload reported `mcp`. A change to its tags alone, which only the
-/// registry reads, keeps the live connection.
+/// registry reads, keeps the live connection. (An MCP server's `auth` needs
+/// the `oauth` build feature.)
+#[cfg(feature = "oauth")]
 #[test]
 fn a_changed_credential_or_timeout_redials_the_server_and_its_tags_do_not() {
     let a = common::spawn_mock_mcp("mock://a", false);

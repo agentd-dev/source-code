@@ -281,6 +281,21 @@ The families a document may use are the grant, intersected with the source's
 is pinned, and with what the delivery signature attests on a registry read
 with a `reader`. A signed folder is capped by its narrowest file.
 
+A document that arrived over the wire (a `url:`, `oci:` or `mcp:` source, or
+a subagent template's `url:` or `oci:` source) never uses `compose` or
+`identity`, whatever the grant or the signature says: the specification's
+floor. Each such block is refused:
+
+```text
+line 3: `:::!agent` is in the `compose` family, which a document that arrived over the wire never uses (§7.8) — declare it in the operator's configuration
+```
+
+Nor does such a document reach them through the blocks every document may
+use: a `url:` or `oci:` document whose `:::!config` writes `a2a.peers`, or
+that names a secret (`{{secret:…}}`, `{{secret-file:…}}`, `@secret-ref/…`)
+in a header, a step or a declaration, is refused at load, since the secret
+would go wherever the document points it.
+
 > **Note.** A name outside this table grants nothing and is not refused at
 > load. Spell the family exactly: `compose`, not `composition`.
 
@@ -364,7 +379,7 @@ omit `agent.instruction`.
 | `dir` | `--instruction.dir` | A folder path, or `{path, glob, order}`. | At load and on each reload. |
 | `dir.glob` | `--instruction.glob` | Comma-separated globs relative to `path`. `**` recurses. Default `*.md,*.markdown,*.txt,*.instruction`. | — |
 | `dir.order` | `--instruction.order` | `name` (default, path order) or `date` (modification time, oldest first). | — |
-| `url` | `--instruction.url` | An `https://` URL, fetched with a plain `GET` and no credential. Up to 3 redirects are followed; a body over 8 MiB is refused. agentd also fetches a plain `http://` URL, so write `https://` outside development. | At load and on each reload. |
+| `url` | `--instruction.url` | An `https://` URL (plain `http://` to a loopback host only), fetched with a plain `GET` and no credential. Up to 3 redirects are followed, each held to the same rule and to `security.egress`; a redirect from `https://` to `http://` is refused, and so is a body over 8 MiB. | At load and on each reload. |
 | `oci` | `--instruction.oci` | `ghcr.io/acme/agent:v3` or `…@sha256:…` (`oci://` implied), or `{ref, cosign_key}`. | At load; a tag is polled. |
 | `mcp` | `--instruction.mcp` | A resource URI any connected server serves, or `{server, resource, events}`. `events` lists MCP Events types, as a name or `{name, arguments}`, whose occurrences re-read the instruction. | At runtime; followed by notification, poll and events. |
 
@@ -432,10 +447,12 @@ At startup an unreadable source stops the start: exit `2` for a load-time
 source, exit `6` for an `mcp` source. See [CLI, environment and exit
 codes](cli.md) for every exit code.
 
-`unenforceable` says what a trust pin means when this load cannot use any of
-its author keys: they are all registry `instruction://…keys.json` URIs, or
-key files it cannot read. `warn` logs one warning and loads the document
-unverified; `refuse` exits `2`; `ignore` says nothing.
+`unenforceable` says what a trust pin means when it names no key file this
+load can use: its author keys are registry `instruction://…keys.json` URIs,
+or none at all. `warn` logs one warning and loads the document unverified;
+`refuse` exits `2`; `ignore` says nothing. A key file that cannot be read is
+not this case: the document is refused, exit `2`, whatever `unenforceable`
+says.
 
 ### Trust pins
 

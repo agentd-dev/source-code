@@ -62,9 +62,9 @@ agentd --version
 agentd 1.18.0
 ```
 
-> **Warning.** A release binary accepts the `security.exec` settings below
-> and then offers the agent no command runner, without a warning. Run this
-> tutorial on the binary you built in step 1.
+> **Note.** A release binary leaves out `exec`, so it refuses
+> `security.exec.enabled: true` below at load, exit `2`. Run this tutorial on
+> the binary you built in step 1.
 
 ## Step 2: Write the configuration
 

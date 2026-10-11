@@ -386,11 +386,39 @@ impl Runtime {
                 })
                 .collect()
         };
+        // The child's MCP catalogue, by the registry's names
+        // (`SpawnPayload::mcp_routes`): each MCP tool the registry offers a
+        // subagent on the servers it was handed, and a profile server's
+        // contract tools under the contract's name where the mapping is a
+        // plain rename the child can make itself.
+        let profiles = crate::registry::profile_servers(&self.settings);
+        let mcp_routes: std::collections::BTreeMap<String, (String, String)> = self
+            .registry
+            .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
+            .iter()
+            .filter_map(|d| match self.registry.get(&d.name).map(|t| &t.imp) {
+                Some(crate::registry::Impl::Mcp { server, tool }) if servers.contains(server) => {
+                    Some((d.name.clone(), (server.clone(), tool.clone())))
+                }
+                Some(crate::registry::Impl::Mapped(m))
+                    if servers.contains(&m.server)
+                        && m.args.is_none()
+                        && m.result.is_none()
+                        && profiles
+                            .get(d.name.split('.').next().unwrap_or(""))
+                            .is_some_and(|p| *p == m.server) =>
+                {
+                    Some((d.name.clone(), (m.server.clone(), m.tool.clone())))
+                }
+                _ => None,
+            })
+            .collect();
         let mut payload = SpawnPayload {
             instruction: instruction.clone(),
             output_contract,
             context_seed,
             gated_tools,
+            mcp_routes: Some(mcp_routes),
             // An explicit `model:` (from the call, the template or the spawn
             // defaults) overrides the parent's turn model; otherwise the child
             // runs on it. Resolved like every other model reference — its

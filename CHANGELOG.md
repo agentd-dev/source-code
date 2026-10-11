@@ -30,13 +30,55 @@ named; those are fixed below.
   flight included, and the run exits 124.
 - OTLP traces go to `observability.otel.endpoint`; only the logs did, and
   traces read the environment variable alone.
+- A `--prompt` one-shot exits with its turn's outcome — `4` when the model
+  cannot be reached, `7` when a budget refuses or ends the turn, `124` past
+  the deadline — where it exited 0 with nothing on stdout.
+- A system prompt template's `#each` copied all the template's data for
+  every item, so a long list took time quadratic in its length; it is
+  linear.
+- A subagent's record ends with its child, however the child ends: on a
+  budget (`exhausted_steps`, `exhausted_tokens`, `deadline`), killed by a
+  signal, or torn down by the supervisor. It stayed `running`, so a wait on
+  it never answered and it held a `breadth` slot for ever. A child's
+  deadline also bounds its model call in flight.
+
+**Security.**
+
+- A trust pin whose author key file cannot be read refuses the instruction.
+  It fell back to `unenforceable`, so under the default `warn` an unsigned
+  document loaded with a warning.
+- A document that arrived over the wire — a `url:`, `oci:` or `mcp:`
+  instruction, or a subagent template's `url:` or `oci:` source — never
+  uses the `compose` or `identity` families, whatever the grant or the
+  signature says: the specification's §7.8 floor. Nor does it reach them
+  through blocks every document may use: a `:::!config` that writes
+  `a2a.peers`, or a secret named in a header or a step, which would send
+  the operator's credential wherever the document points it.
+- A subagent sees each MCP server as the agent does: the supervisor sends
+  the child the registry's own list of its tools. A tool the operator
+  excluded or disabled is not reachable from a child, and a child's tools
+  carry the agent's names whatever order its servers come in, so a tool a
+  `security.policies` rule gates is always routed back to the supervisor.
+- A `url:` document source is HTTPS (plain `http://` to a loopback host
+  only) at every redirect hop, is never downgraded from `https://`, and
+  each redirect target is held to `security.egress`.
+- In a config file or a workflow file, webhook verifier secrets (`bearer`,
+  `header.equals`, `hmac.secret`) and `a2a.principals[].match.bearer_ref`
+  are references, as every other credential there is.
 
 **Changed (breaking).** These load and did nothing; they are refused at load
 now: a real model connection with no model named; an A2A principal rule
-matching a client certificate (`san`, `sub`) without `a2a.tls.client_ca`;
-`a2a.listen`, `webhooks.listen` or `a2a.peers` in a binary built without the
-`a2a` feature; a model connection's `auth` that sends no bearer (a static
-credential under its own header, an x509 SVID).
+matching a client certificate (`san`, `sub`) without `a2a.tls.client_ca`; a
+model connection's `auth` that sends no bearer (a static credential under a
+header other than `Authorization`, an x509 SVID); an MCP server with both
+`auth` and `oauth`; and, in a binary built without the feature that reads
+it, `a2a.listen`, `webhooks.listen` and `a2a.peers` (`a2a`),
+`observability.metrics_addr` (`metrics`), `observability.otel` (`otel`),
+`security.aauth` and an MCP server's `aauth: true` (`aauth`),
+`security.exec.enabled` (`exec`), a model connection's or an MCP server's
+`auth` or `oauth` (`oauth`), and `lifecycle.watch_config` (`config-watch`).
+A subagent's `tools` grant names tools as the agent's catalogue does: with a
+server's `ns` prefix, and `<server>.<tool>` where the name is taken.
 
 **Removed.** Keys that were accepted and read by nothing:
 `observability.report_file` (`--report-file`), `observability.otel.traces`,

@@ -130,6 +130,13 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
         if top.is_empty() || !top.keys().all(|k| keys.contains(k)) {
             continue; // not an agentd configuration
         }
+        // A sample for a build with `exec`, which the release set leaves
+        // out, is checked by a build that has it: this one refuses it.
+        if !cfg!(feature = "exec")
+            && doc.pointer("/security/exec/enabled") == Some(&serde_json::Value::Bool(true))
+        {
+            continue;
+        }
         let dir = scratch.join(format!("sample-{checked}"));
         std::fs::create_dir_all(&dir).unwrap();
         for need in needs(&body) {

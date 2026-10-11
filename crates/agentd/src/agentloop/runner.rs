@@ -24,7 +24,7 @@ use crate::subagent::protocol::ALLOWED_TOOLS_ROLE;
 use crate::supervisor::budget::Budget;
 use crate::wire::intel::{Message, Request, ToolDef, Usage};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,7 +76,15 @@ pub struct LoopInput {
     /// subagent's control thread on `ControlMsg::Cancel`). `None` for a run with
     /// no external canceller.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// The MCP tools to offer, by name, each with its server and the
+    /// server's own tool name — a subagent's are the supervisor's registry's
+    /// ([`SpawnPayload::mcp_routes`](crate::subagent::protocol::SpawnPayload)).
+    /// `None` offers every server's tools under the names they advertise.
+    pub routes: Option<BTreeMap<String, (String, String)>>,
 }
+
+/// Catalogue name → (server index, the server's own tool name).
+type Routing = HashMap<String, (usize, String)>;
 
 /// The durable state of an agent session: the scoped tool catalogue, the
 /// resource-awareness map, and the **conversation transcript** — everything that
@@ -86,8 +94,10 @@ pub struct LoopInput {
 /// another [`Session::run_turn`].
 pub struct Session<'a> {
     servers: &'a [McpClient],
+    /// The MCP tools offered ([`LoopInput::routes`]).
+    routes: Option<BTreeMap<String, (String, String)>>,
     tools: Vec<ToolDef>,
-    tool_to_server: HashMap<String, usize>,
+    tool_to_server: Routing,
     resources: ResourceCatalogue,
     model: String,
     messages: Vec<Message>,
@@ -113,7 +123,7 @@ impl<'a> Session<'a> {
         self_handler: &mut dyn SelfHandler,
     ) -> Result<Session<'a>, LoopAbort> {
         let allowed = seed_grants(&input.seed);
-        let (mut tools, mut tool_to_server) = build_catalogue(servers)?;
+        let (mut tools, mut tool_to_server) = build_catalogue(servers, input.routes.as_ref())?;
         // CODE-REGISTERED tools win a name collision: drop the MCP entry so the
         // catalogue offers ONE def per name, and it is the one dispatch will
         // actually run. Otherwise the model would be shown a schema it is not
@@ -152,6 +162,7 @@ impl<'a> Session<'a> {
         messages.push(Message::user(&input.instruction));
         Ok(Session {
             servers,
+            routes: input.routes.clone(),
             tools,
             tool_to_server,
             resources,
@@ -168,7 +179,7 @@ impl<'a> Session<'a> {
     /// catalogue for its whole life. Self-tools and `resource.read` are
     /// re-merged and the transcript is untouched, so a refresh costs no context.
     pub fn refresh_tools(&mut self, self_handler: &mut dyn SelfHandler) -> Result<(), LoopAbort> {
-        let (mut tools, mut tool_to_server) = build_catalogue(self.servers)?;
+        let (mut tools, mut tool_to_server) = build_catalogue(self.servers, self.routes.as_ref())?;
         // Same code-tool precedence as `prepare`: first-party wins the name.
         let code = crate::tools::defs();
         if !code.is_empty() {
@@ -531,26 +542,41 @@ fn truncate_for_log(s: &str) -> String {
 }
 
 /// Build the model's tool catalogue from every connected server, plus a
-/// name→server-index routing map. On a name collision the FIRST server in
-/// configuration order wins, so routing is deterministic and a later server
-/// cannot capture a name an earlier one already publishes. A call to a name no
-/// server publishes is reported as unknown at dispatch time.
+/// name→(server, tool) routing map. With `routes` the catalogue is exactly
+/// those tools, under those names — the registry's, for a subagent — each
+/// described from its server's current `tools/list`; a routed tool its server
+/// no longer lists is left out. Without, every server's tools are offered as
+/// advertised, and on a name collision the first server in configuration
+/// order keeps the name, so a later server cannot capture an earlier one's
+/// calls. A call to a name not in the map is reported as unknown at dispatch.
 fn build_catalogue(
     servers: &[McpClient],
-) -> Result<(Vec<ToolDef>, HashMap<String, usize>), LoopAbort> {
+    routes: Option<&BTreeMap<String, (String, String)>>,
+) -> Result<(Vec<ToolDef>, Routing), LoopAbort> {
     let mut tools = Vec::new();
-    let mut routing = HashMap::new();
+    let mut routing = Routing::new();
     for (i, server) in servers.iter().enumerate() {
         let listed = server
             .list_tools()
             .map_err(|e| LoopAbort::Mcp(e.to_string()))?;
         for t in listed {
-            routing.entry(t.name.clone()).or_insert(i);
-            tools.push(ToolDef {
-                name: t.name,
-                description: t.description.unwrap_or_default(),
-                input_schema: t.input_schema,
-            });
+            let names: Vec<String> = match routes {
+                Some(r) => r
+                    .iter()
+                    .filter(|(_, (s, tool))| s == server.name() && *tool == t.name)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                None if routing.contains_key(&t.name) => Vec::new(),
+                None => vec![t.name.clone()],
+            };
+            for name in names {
+                routing.insert(name.clone(), (i, t.name.clone()));
+                tools.push(ToolDef {
+                    name,
+                    description: t.description.clone().unwrap_or_default(),
+                    input_schema: t.input_schema.clone(),
+                });
+            }
         }
     }
     Ok((tools, routing))
@@ -578,11 +604,7 @@ fn grant_permits(grants: &[Vec<String>], name: &str) -> bool {
 /// Drop everything the grants exclude from an assembled catalogue AND from the
 /// routing map — the map is what `dispatch_tool` consults, so filtering both is
 /// what makes an excluded MCP tool unreachable rather than merely unadvertised.
-fn narrow_catalogue(
-    grants: &[Vec<String>],
-    tools: &mut Vec<ToolDef>,
-    routing: &mut HashMap<String, usize>,
-) {
+fn narrow_catalogue(grants: &[Vec<String>], tools: &mut Vec<ToolDef>, routing: &mut Routing) {
     if grants.is_empty() {
         return;
     }
@@ -596,12 +618,13 @@ fn narrow_catalogue(
 /// bounded by the step and deadline budget rather than by this call.
 fn dispatch_tool(
     servers: &[McpClient],
-    routing: &HashMap<String, usize>,
+    routing: &Routing,
     name: &str,
     arguments: &Value,
 ) -> (String, bool) {
     match routing.get(name) {
-        Some(&i) => {
+        Some((i, tool)) => {
+            let i = *i;
             // A flat subagent paces its own calls against the per-server rate
             // limit too, not just the reactor: its pacing registry was seeded
             // when it dialed its granted servers, so a fan-out of children
@@ -609,7 +632,7 @@ fn dispatch_tool(
             if let Err(e) = crate::mcp::pace::take(servers[i].name()) {
                 return (e, true);
             }
-            match servers[i].call_tool(name, Some(arguments.clone())) {
+            match servers[i].call_tool(tool, Some(arguments.clone())) {
                 Ok(res) => (res.text(), res.is_error()),
                 Err(e) => (format!("tool transport error: {e}"), true),
             }
@@ -809,9 +832,13 @@ mod tests {
         .expect("register");
         let mut tool_to_server = HashMap::new();
         // The MCP side ALSO publishes the colliding name (a rogue/coincidental server).
-        tool_to_server.insert("runner.code_tool".to_string(), 0usize);
+        tool_to_server.insert(
+            "runner.code_tool".to_string(),
+            (0usize, "runner.code_tool".to_string()),
+        );
         let sess = Session {
             servers: &[],
+            routes: None,
             tools: vec![],
             tool_to_server,
             resources: ResourceCatalogue {
@@ -848,7 +875,7 @@ mod tests {
         let mut tool_to_server = HashMap::new();
         let mut tools: Vec<ToolDef> = Vec::new();
         for n in mcp {
-            tool_to_server.insert(n.to_string(), 0usize);
+            tool_to_server.insert(n.to_string(), (0usize, n.to_string()));
             tools.push(ToolDef {
                 name: n.into(),
                 description: String::new(),
@@ -866,6 +893,7 @@ mod tests {
         }
         let sess = Session {
             servers: &[],
+            routes: None,
             tools,
             tool_to_server,
             resources: ResourceCatalogue {
@@ -986,6 +1014,7 @@ mod tests {
             max_tokens: 1000,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             cancel: None,
+            routes: None,
         };
         let mut handler = GrowingHandler { grown: false };
         let mut session = Session::prepare(&[], &input, &mut handler).unwrap();
@@ -1037,6 +1066,7 @@ mod tests {
             max_tokens: 1000,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             cancel: None,
+            routes: None,
         };
         let mut handler = TwoTools;
         let narrowed = Session::prepare(&[], &grant, &mut handler).unwrap();
@@ -1132,6 +1162,7 @@ mod tests {
                 max_tokens: 100_000,
                 deadline: Instant::now() + Duration::from_secs(10),
                 cancel: None,
+                routes: None,
             }
         }
 

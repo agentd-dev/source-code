@@ -335,7 +335,7 @@ form that names the source.
 | `agent.instruction.mcp` | URI, or `{server, resource, events}` | — | live · op | A resource a configured MCP server serves, read and subscribed. `server` picks the server to ask; `events` names MCP Events types whose occurrences re-read the instruction (needs `mcp-events`). |
 | `agent.instruction.refresh` | `auto \| off \|` duration | `auto` | live · op | How often to re-read the source. |
 | `agent.instruction.unavailable` | `auto \| keep \| freeze \| drain \| exit` | `auto` | live · op | What to do when the source stops answering after startup. |
-| `agent.instruction.unenforceable` | `warn \| refuse \| ignore` | `warn` | live · op | What a `trust` pin whose keys cannot be resolved at load means. `refuse` is exit 2. |
+| `agent.instruction.unenforceable` | `warn \| refuse \| ignore` | `warn` | live · op | What a `trust` pin that names no key file means at load (its author keys are `instruction://` URIs, or none). `refuse` is exit 2. A key file that cannot be read is always exit 2. |
 | `agent.instruction.decrypt.keys` | list of paths | `[]` | live · op | Recipient key files for an encrypted envelope (age v1 or JWE): an `AGE-SECRET-KEY-1…` identity, 64 hex characters, or base64. Needs `decrypt`. |
 | `agent.instruction.decrypt.passphrase` | secret | — | live · op | The passphrase for an age scrypt envelope. |
 | `agent.instruction.trust[]` | list of pins | `[]` | **restart** · op | Who may sign the document. Needs `sign`. |
@@ -1227,6 +1227,8 @@ inline.
 | `a2a.bearer` | `config file: a2a.bearer carries an inline credential; …` |
 | `security.aauth.enroll_token` | `config file: security.aauth.enroll_token carries an inline credential; …` |
 | `mcp.servers[].oauth.client_secret` | `config file: mcp server '<name>' oauth.client_secret carries an inline credential; …` |
+| `a2a.principals[].match.bearer_ref` | `config file: a2a.principals[0].match.bearer_ref carries an inline credential; …` |
+| a webhook verifier's `bearer`, `header.equals` and `hmac.secret`: `webhooks.default_auth`, and the `auth` of every `webhook` start and webhook wait | `config file: workflows[0].steps.hook.auth.hmac.secret carries an inline credential; …` |
 | every `auth.token`, `auth.client_secret`, `auth.value` | `<where>: auth.token carries an inline credential; use a {{secret:…}} reference` |
 | a credential-shaped header (`Authorization` and similar) in `intelligence.headers`, a provider's, an MCP server's, a peer's or `store.http.headers` | `intelligence.headers['authorization'] looks like a credential but has an inline value; …` |
 

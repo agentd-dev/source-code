@@ -148,6 +148,7 @@ fn main() {
         max_tokens: 20_000,
         deadline: Instant::now() + Duration::from_secs(120),
         cancel: None,
+        routes: None,
     };
     match run_loop(&intel, &servers, &input, &mut NoSelfTools, &log) {
         Ok((outcome, usage)) => {
@@ -260,8 +261,11 @@ tool that reaches the network or touches secrets is yours to account for.
 The minimal binary above is this level: `run_loop` runs one agentic turn and
 returns `(Outcome, Usage)` as plain Rust values. The run is bounded by the
 same budget machinery the stock CLI uses (steps, tokens, a deadline, and a
-cooperative cancel flag you can flip from another thread). The trade-off: the
-reasoning runs in your process, with no supervisor around it. For a kill
+cooperative cancel flag you can flip from another thread). `routes` names
+the MCP tools to offer, each mapped to its server and the server's own tool
+name; `None` offers every server's tools under the names they advertise, the
+first server in the list keeping a name two of them share. The trade-off:
+the reasoning runs in your process, with no supervisor around it. For a kill
 ladder around the model, run the full runtime.
 
 ### The full supervised runtime

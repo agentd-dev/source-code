@@ -897,8 +897,9 @@ targets. Review it in a diff the way you review a credential.
 **No redirects.** The HTTP client follows none, so a redirect comes back as a
 plain response and the redirect pivot does not exist for the `http` step. Two
 document fetches, both from an operator-named reference at load, follow
-redirects: the `url:` instruction source, up to three hops, and the OCI blob
-fetch, which follows a registry's CDN.
+redirects: the `url:` instruction source, up to three hops, each held to
+HTTPS (plain `http://` only to a loopback host, never after `https://`) and to
+`security.egress`; and the OCI blob fetch, which follows a registry's CDN.
 
 ## Where the instruction came from
 

@@ -30,13 +30,36 @@ pub mod fileset; // dir:+glob:+order: — one implementation, shared by workflow
 /// GET a document over HTTP(S) — the `url:` document source. Redirects are
 /// followed; a non-2xx is a refusal naming the status, because an error page
 /// silently installed as an agent's instruction is the worst outcome here.
-pub fn http_get(url: &str) -> Result<String, String> {
+///
+/// Every hop is held to the rule the first URL is: plaintext `http://` to a
+/// loopback host only, and never after `https://` — a source cannot be
+/// bounced to plaintext, or to a local service, by its own server. The caller
+/// holds the first URL to the egress policy; `egress` holds each redirect
+/// target to it.
+pub fn http_get(url: &str, egress: &dyn Fn(&str) -> Result<(), String>) -> Result<String, String> {
     use crate::net::http::{self, Url};
     const MAX_REDIRECTS: usize = 3;
     const MAX_BYTES: usize = 8 * 1024 * 1024;
     let mut current = url.to_string();
-    for _ in 0..=MAX_REDIRECTS {
+    let mut was_tls = false;
+    for hop in 0..=MAX_REDIRECTS {
         let u = Url::parse(&current).map_err(|e| format!("url {current}: {e}"))?;
+        if !u.is_tls() {
+            if was_tls {
+                return Err(format!(
+                    "{current}: a redirect from https:// to plaintext http:// is refused"
+                ));
+            }
+            if !http::is_loopback_host(&u.host) {
+                return Err(format!(
+                    "{current}: plaintext http:// is allowed for a loopback host only; use https://"
+                ));
+            }
+        }
+        if hop > 0 {
+            egress(&current).map_err(|e| format!("redirect to {current}: {e}"))?;
+        }
+        was_tls = u.is_tls();
         let tcp = http::connect_tcp(&u.host, u.port, std::time::Duration::from_secs(30))
             .map_err(|e| format!("connect {}: {e}", u.host))?;
         let mut stream: Box<dyn http::Stream> = if u.is_tls() {
@@ -866,6 +889,51 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loopback server that answers every request with `status` and,
+    /// when given, a `Location`; returns its base URL.
+    fn redirector(status: u16, location: Option<String>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let _ = conn.read(&mut buf);
+                let loc = location
+                    .as_deref()
+                    .map(|l| format!("Location: {l}\r\n"))
+                    .unwrap_or_default();
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status} X\r\n{loc}Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A document source is HTTPS, or plaintext to a loopback host — at
+    /// every hop, so a server cannot bounce the fetch elsewhere — and each
+    /// redirect target is held to the egress policy.
+    #[test]
+    fn a_document_fetch_holds_every_hop_to_https_and_egress() {
+        let open = |_: &str| Ok(());
+        let e = http_get("http://example.com/agent.md", &open).unwrap_err();
+        assert!(e.contains("loopback host only"), "{e}");
+        let away = redirector(302, Some("http://example.com/agent.md".into()));
+        let e = http_get(&format!("{away}/agent.md"), &open).unwrap_err();
+        assert!(e.contains("loopback host only"), "{e}");
+        let target = redirector(200, None);
+        let hop = redirector(301, Some(format!("{target}/agent.md")));
+        assert_eq!(http_get(&format!("{hop}/agent.md"), &open).unwrap(), "ok");
+        let closed = |u: &str| Err(format!("{u} is not in the catalogue"));
+        let e = http_get(&format!("{hop}/agent.md"), &closed).unwrap_err();
+        assert!(
+            e.contains("redirect to") && e.contains("not in the catalogue"),
+            "{e}"
+        );
+    }
 
     /// The chain: a user default, the project's file, a machine-local overlay —
     /// in that order, so each is overridden by the more specific one. Rungs

@@ -119,6 +119,16 @@ fn every_shipped_example_config_validates() {
         // desks that use it are meant to be run as `-c services.yaml -c
         // <desk>.yaml`, and validating a desk alone reports every service it
         // references as undeclared. Layer it exactly as the README does.
+        // An example for a build with `exec` — left out of the release
+        // set — is checked by a build that has it: this one refuses it.
+        if !cfg!(feature = "exec")
+            && agentd::config::yaml::parse(&text)
+                .ok()
+                .and_then(|d| d.pointer("/security/exec/enabled").cloned())
+                == Some(serde_json::Value::Bool(true))
+        {
+            continue;
+        }
         let catalog = f.with_file_name("services.yaml");
         let layered = catalog.exists() && catalog != *f;
         if !layered && f.file_name().is_some_and(|n| n == "services.yaml") {

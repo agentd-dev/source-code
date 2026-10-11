@@ -74,17 +74,17 @@ see when the feature is missing.
 | `a2a.listen`, `a2a.peers`, `webhooks.listen`, and so every `webhook` node and A2A start | `a2a` | refused at load: `a2a.listen needs the a2a build feature, which this binary was built without — …` |
 | a `schedule` start with `cron:` | `cron` | refused at load: `cron schedules require the 'cron' build feature` |
 | any CEL expression | `cel` | refused at load: `… uses an expression, which needs the 'cel' build feature (bare paths work without it)` |
-| `auth.kind: oauth2`; any `auth` or `oauth` block on an MCP server; `agentd --login` | `oauth` | an intelligence `auth` the build cannot apply is refused at load; an MCP server's `auth` and `oauth` blocks are not applied |
-| `observability.metrics_addr` | `metrics` | nothing is served on the address |
-| `observability.otel.*` | `otel` | nothing is exported |
+| any `auth` on a model connection; any `auth` or `oauth` block on an MCP server; `agentd --login` | `oauth` | refused at load: `mcp.servers[].auth needs the oauth build feature, which this binary was built without — …` |
+| `observability.metrics_addr` | `metrics` | refused at load: `observability.metrics_addr needs the metrics build feature, …` |
+| `observability.otel.endpoint`, `observability.otel.logs: true` | `otel` | refused at load: `observability.otel needs the otel build feature, …` |
 | `SIGHUP` reload | `hot-reload` | `SIGHUP` keeps its default action and ends the process |
-| `lifecycle.watch_config` | `config-watch` | no watch is installed |
-| `security.aauth.*`, `mcp.servers[].aauth` | `aauth` | requests are not signed |
+| `lifecycle.watch_config: true` | `config-watch` | refused at load: `lifecycle.watch_config needs the config-watch build feature, …` |
+| `security.aauth`, `mcp.servers[].aauth: true` | `aauth` | refused at load: `security.aauth needs the aauth build feature, …` |
 | `agent.instruction.trust` | `sign` | a pinned instruction refuses startup: `… this build cannot verify signatures — rebuild with --features sign` |
 | an `oci` instruction, prompt or template source | `oci` | refused at load: `… an oci:// source requires building with --features oci` |
 | `agent.instruction.decrypt`, or any encrypted envelope | `decrypt` | the envelope is recognised and refused; ciphertext never reaches the model |
 | `mcp.servers[].events`, `event_grants`, `agent.instruction.mcp.events`, `wait {on: event, subscribe:}` | `mcp-events` | refused at load: `mcp.servers[0]: MCP Events bindings and grants require building with --features mcp-events` |
-| `security.exec.enabled: true` | `exec` | the `exec` tool stays a mapping to an MCP server |
+| `security.exec.enabled: true` | `exec` | refused at load: `security.exec.enabled needs the exec build feature, …` |
 | `mock:` endpoints | `mock-models` (or a debug build) | refused at load: `mock: intelligence needs a build with --features mock-models` |
 
 Every path and its feature is in the [Configuration reference](configuration.md).

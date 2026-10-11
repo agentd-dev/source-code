@@ -307,6 +307,7 @@ pub fn run() -> i32 {
         max_tokens: payload.limits.max_tokens,
         deadline: Instant::now() + Duration::from_millis(payload.limits.deadline_ms.max(1)),
         cancel: Some(Arc::clone(&cancel)),
+        routes: payload.mcp_routes.clone(),
     };
 
     // A subagent has no in-child orchestration self-tools: the tree is flat.

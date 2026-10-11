@@ -434,8 +434,6 @@ resources. It reads one resource by URI.
   fixed 60 s timeout; a per-server `timeout` does not reach them.
 - **Tags are per server.** The union of every key under `tags` applies to
   every tool of the server.
-- **One credential.** With both `auth` and `oauth` on a server, `auth` is
-  used and `oauth` is ignored without a warning.
 - **MCP Events is a draft.** Its methods, error codes and capability key may
   change. Push delivery is not implemented; `poll` and `webhook` are.
 - **Invisible losses.** Two losses do not show on the wire: a server that

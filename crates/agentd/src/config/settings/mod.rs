@@ -873,15 +873,23 @@ pub fn classify_instruction(v: &str) -> InstructionValue {
 /// instruction today — so `file:`, `dir:` + `glob:` + `order:` and `url:` mean
 /// exactly what they mean for the agent, rather than nearly.
 ///
-/// Returns the text and any warnings. `mcp:` is refused: an MCP resource is
-/// read and SUBSCRIBED by the runtime's client, which does not exist at config
-/// load, so a template that wants one belongs in a child with its own
-/// `agent.instruction`.
+/// `mcp:` is refused: an MCP resource is read and SUBSCRIBED by the
+/// runtime's client, which does not exist at config load, so a template that
+/// wants one belongs in a child with its own `agent.instruction`.
+/// A document [`resolve_document_source`] read: its text, any warnings, and
+/// whether it arrived over the wire (a `url:` or `oci:` source), where the
+/// §7.8 floor applies to its blocks.
+pub struct ResolvedDocument {
+    pub text: String,
+    pub warnings: Vec<String>,
+    pub over_the_wire: bool,
+}
+
 pub fn resolve_document_source(
     v: &Value,
     at: &str,
     policy: &EgressPolicy,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<ResolvedDocument, String> {
     let spec: InstructionSpec = match v {
         Value::String(scalar) => {
             let key = instruction_key(scalar);
@@ -896,25 +904,36 @@ pub fn resolve_document_source(
         .source_value()
         .map_err(|e| format!("{at}: {e}"))?
         .ok_or_else(|| format!("{at} names no source"))?;
+    let local = |text: String, warnings: Vec<String>| ResolvedDocument {
+        text,
+        warnings,
+        over_the_wire: false,
+    };
+    let wire = |text: String| ResolvedDocument {
+        text,
+        warnings: Vec::new(),
+        over_the_wire: true,
+    };
     if let Some(dir) = spec.dir.as_ref() {
         let c = combine_folder(dir, at)?;
-        return Ok((c.text, c.warnings));
+        return Ok(local(c.text, c.warnings));
     }
     if let Some(text) = spec.text.as_deref() {
-        return Ok((text.to_string(), Vec::new()));
+        return Ok(local(text.to_string(), Vec::new()));
     }
     if let Some(path) = value.strip_prefix("file://") {
         let expanded = expand_home(path);
         let text =
             std::fs::read_to_string(&expanded).map_err(|e| format!("{at} file {path:?}: {e}"))?;
-        return Ok((text, Vec::new()));
+        return Ok(local(text, Vec::new()));
     }
     if value.starts_with("https://") || value.starts_with("http://") {
         policy
             .allows(ServiceKind::Http, &value)
             .map_err(|e| format!("{at}: {e}"))?;
-        let text = crate::config::http_get(&value).map_err(|e| format!("{at} {value}: {e}"))?;
-        return Ok((text, Vec::new()));
+        let text = crate::config::http_get(&value, &|u| policy.allows(ServiceKind::Http, u))
+            .map_err(|e| format!("{at} {value}: {e}"))?;
+        return Ok(wire(text));
     }
     if value.starts_with("oci://") {
         policy
@@ -930,7 +949,7 @@ pub fn resolve_document_source(
                     .map_err(|e| format!("{at} {value}: {e}"))?;
             let text = String::from_utf8(pulled.bytes)
                 .map_err(|_| format!("{at} {value}: the artifact is not UTF-8"))?;
-            return Ok((text, Vec::new()));
+            return Ok(wire(text));
         }
         #[cfg(not(feature = "oci"))]
         return Err(format!(
@@ -944,7 +963,7 @@ pub fn resolve_document_source(
              name a file, dir, url or oci source here"
         ));
     }
-    Ok((value, Vec::new()))
+    Ok(local(value, Vec::new()))
 }
 
 /// Unix seconds, for signature `exp` checks.
@@ -4414,6 +4433,9 @@ impl Settings {
         let mut instruction_origin: Option<InstructionOrigin> = None;
         let mut instruction_path: Option<String> = None;
         let mut instruction_dir_files: Vec<String> = Vec::new();
+        // Fetched from a URL or pulled from a registry rather than read from
+        // the operator's own disk: the §7.8 floor applies to its blocks.
+        let mut over_the_wire = false;
         let mut instruction_warnings: Vec<String> = Vec::new();
         // The SHORT form naming a folder — `--instruction ./instructions/`, or
         // a path that turns out to be a directory. It sets the very `dir:` the
@@ -4513,6 +4535,7 @@ impl Settings {
                     uri,
                     manifest_digest: pulled.manifest_digest,
                 });
+                over_the_wire = true;
             }
             #[cfg(not(feature = "oci"))]
             return Err(format!(
@@ -4547,11 +4570,13 @@ impl Settings {
             egress_policy
                 .allows(ServiceKind::Http, &url)
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
-            let text = crate::config::http_get(&url)
-                .map_err(|e| format!("{source}: agent.instruction {url}: {e}"))?;
+            let text =
+                crate::config::http_get(&url, &|u| egress_policy.allows(ServiceKind::Http, u))
+                    .map_err(|e| format!("{source}: agent.instruction {url}: {e}"))?;
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("instruction".into(), Value::String(text));
             }
+            over_the_wire = true;
         }
         // An ENCRYPTED instruction (RFC 0041) decrypts here, before anything
         // inspects it — an envelope carries no `:::` markers, so running the
@@ -4613,15 +4638,15 @@ impl Settings {
         #[cfg(feature = "sign")]
         let attested_capabilities: Option<Vec<String>> = {
             let mut attested: Option<Vec<String>> = None;
-            // Pins exist but name no key material this load can read — their
-            // `author_keys` are all registry JWKS URIs. The operator said what
-            // that means, and it means the same for a folder as for one
-            // document: the pins are the same whichever shape carried it.
+            // Pins exist but name no key file — their `author_keys` are
+            // registry JWKS URIs, or empty. The operator said what that
+            // means, and it means the same for a folder as for one document:
+            // the pins are the same whichever shape carried it.
             let unenforceable = |warnings: &mut Vec<String>| -> Result<(), String> {
                 let why = "agent.instruction.trust pins a publisher, but its author_keys \
-                           are all instruction:// JWKS uris — resolving one needs the \
-                           registry client, which a file/dir/url/oci load does not have. \
-                           Point author_keys at a key FILE to verify this document";
+                           name no key file — instruction:// JWKS uris, or none at all, \
+                           need the registry client, which a file/dir/url/oci load does \
+                           not have. Point author_keys at a key FILE to verify this document";
                 match instruction_spec.unenforceable {
                     InstructionUnenforceable::Ignore => Ok(()),
                     InstructionUnenforceable::Warn => {
@@ -4767,6 +4792,9 @@ impl Settings {
             // `::!human`s takes that human's principal AND channel, of which the
             // folded `to` keeps only one (`config::humans`).
             let folded = crate::config::idoc::parse(&instr).and_then(|parsed| {
+                if over_the_wire {
+                    crate::config::idoc::check_wire_floor(&parsed)?;
+                }
                 let mut ex = crate::config::idoc::fold_full(
                     &parsed,
                     &granted,
@@ -4783,6 +4811,20 @@ impl Settings {
                     gate_channels = channels;
                     if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                         a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
+                    }
+                    // §7.8 reaches past the block kinds: a document from
+                    // the wire gets no identity or credential through the
+                    // blocks every document may use either.
+                    let reached = if over_the_wire {
+                        crate::config::idoc::wire_floor_effects(&ex)
+                    } else {
+                        Vec::new()
+                    };
+                    if !reached.is_empty() {
+                        return Err(format!(
+                            "{source}: the instruction arrived over the wire and {} — a fetched document reaches no identity or credential (§7.8); declare it in the operator's configuration",
+                            reached.join(" and ")
+                        ));
                     }
                     let forbidden = document_wrote_operator_config(&ex.config);
                     if !forbidden.is_empty() {
@@ -4875,13 +4917,13 @@ impl Settings {
             let text = match &v {
                 Value::String(sc) if instruction_key(sc) == "text" => sc.clone(),
                 _ => {
-                    let (text, warns) = resolve_document_source(
+                    let resolved = resolve_document_source(
                         &v,
                         &format!("{source}: agent.prompt"),
                         &egress_policy,
                     )?;
-                    instruction_warnings.extend(warns);
-                    text
+                    instruction_warnings.extend(resolved.warnings);
+                    resolved.text
                 }
             };
             // End matter is the document's record (S27), not the task: it
@@ -4930,10 +4972,37 @@ impl Settings {
                     continue;
                 }
                 let at = format!("{source}: subagents.templates.{name}.instruction");
-                let (text, warns) = resolve_document_source(v, &at, &egress_policy)?;
-                instruction_warnings.extend(warns);
+                let resolved = resolve_document_source(v, &at, &egress_policy)?;
+                instruction_warnings.extend(resolved.warnings);
+                // A template folds with every family, as the operator's own
+                // text — but one fetched from a URL or a registry is not, and
+                // the §7.8 floor holds for it. One that does not parse is
+                // reported where templates compile.
+                if resolved.over_the_wire
+                    && let Ok(parsed) = crate::config::idoc::parse(&resolved.text)
+                {
+                    if let Err(refused) = crate::config::idoc::check_wire_floor(&parsed) {
+                        return Err(refused
+                            .iter()
+                            .map(|r| format!("{at}: {r}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"));
+                    }
+                    if let Ok(ex) = crate::config::idoc::extract(
+                        &resolved.text,
+                        &crate::config::idoc::all_families(),
+                    ) {
+                        let reached = crate::config::idoc::wire_floor_effects(&ex);
+                        if !reached.is_empty() {
+                            return Err(format!(
+                                "{at}: the document arrived over the wire and {} — a fetched document reaches no identity or credential (§7.8)",
+                                reached.join(" and ")
+                            ));
+                        }
+                    }
+                }
                 if let Some(o) = t.as_object_mut() {
-                    o.insert("instruction".into(), Value::String(text));
+                    o.insert("instruction".into(), Value::String(resolved.text));
                 }
             }
         }
@@ -7544,6 +7613,17 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             for e in validate_auth_block(auth, &format!("mcp server '{}'", srv.name)) {
                 err(&mut d, e);
             }
+            // A server presents one credential, and `auth` would win: an
+            // `oauth` beside it would load and never be sent.
+            if srv.oauth.is_some() {
+                err(
+                    &mut d,
+                    format!(
+                        "mcp server '{}' sets both `auth` and `oauth`; a server presents one credential — keep one",
+                        srv.name
+                    ),
+                );
+            }
         }
     }
     // services catalog
@@ -8217,21 +8297,66 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         );
     }
 
-    // a2a
-    // The A2A listener, the webhook listener and the A2A peer client are the
-    // `a2a` build feature's: a binary built without it would load them and
-    // serve nothing, dial nobody.
-    #[cfg(not(feature = "a2a"))]
-    for (what, set) in [
-        ("a2a.listen", s.a2a.listen.is_some()),
-        ("webhooks.listen", s.webhooks.listen.is_some()),
-        ("a2a.peers", !s.a2a.peers.is_empty()),
-    ] {
-        if set {
+    // Settings that only a build feature reads. A binary built without it
+    // would load each one and do nothing — serve nothing, dial nobody, send
+    // no credential, export nothing — so it is refused, naming the feature.
+    let unbuilt: &[(&str, bool, &str)] = &[
+        #[cfg(not(feature = "a2a"))]
+        ("a2a.listen", s.a2a.listen.is_some(), "a2a"),
+        #[cfg(not(feature = "a2a"))]
+        ("webhooks.listen", s.webhooks.listen.is_some(), "a2a"),
+        #[cfg(not(feature = "a2a"))]
+        ("a2a.peers", !s.a2a.peers.is_empty(), "a2a"),
+        #[cfg(not(feature = "metrics"))]
+        (
+            "observability.metrics_addr",
+            s.observability.metrics_addr.is_some(),
+            "metrics",
+        ),
+        #[cfg(not(feature = "otel"))]
+        (
+            "observability.otel",
+            s.observability.otel.endpoint.is_some() || s.observability.otel.logs == Some(true),
+            "otel",
+        ),
+        #[cfg(not(feature = "aauth"))]
+        ("security.aauth", s.security.aauth.is_some(), "aauth"),
+        #[cfg(not(feature = "aauth"))]
+        (
+            "mcp.servers[].aauth",
+            s.mcp.servers.iter().any(|m| m.aauth == Some(true)),
+            "aauth",
+        ),
+        #[cfg(not(feature = "exec"))]
+        ("security.exec.enabled", s.security.exec.enabled, "exec"),
+        #[cfg(not(feature = "oauth"))]
+        (
+            "mcp.servers[].auth",
+            s.mcp
+                .servers
+                .iter()
+                .any(|m| m.auth.is_some() || m.oauth.is_some()),
+            "oauth",
+        ),
+        #[cfg(not(all(unix, feature = "config-watch")))]
+        (
+            "lifecycle.watch_config",
+            s.lifecycle.watch_config,
+            "config-watch",
+        ),
+    ];
+    for (what, set, feature) in unbuilt {
+        if *set {
+            // `exec` is the one feature the release binaries leave out.
+            let get = if *feature == "exec" {
+                format!("build with --features {feature}")
+            } else {
+                format!("use a release binary, or build with --features {feature}")
+            };
             err(
                 &mut d,
                 format!(
-                    "{what} needs the a2a build feature, which this binary was built without — use a release binary, or build with --features a2a"
+                    "{what} needs the {feature} build feature, which this binary was built without — {get}"
                 ),
             );
         }
@@ -9245,7 +9370,72 @@ fn secret_violations(file_doc: &Value) -> Vec<String> {
             }
         }
     }
+    if let Some(principals) = file_doc
+        .pointer("/a2a/principals")
+        .and_then(Value::as_array)
+    {
+        for (i, p) in principals.iter().enumerate() {
+            if let Some(Value::String(v)) = p.pointer("/match/bearer_ref")
+                && !crate::sec::secret::has_secret_ref(v)
+            {
+                out.push(format!(
+                    "config file: a2a.principals[{i}].match.bearer_ref carries an inline credential; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}}"
+                ));
+            }
+        }
+    }
+    let mut hooks = Vec::new();
+    webhook_secrets(file_doc, "", &mut hooks);
+    for (at, v) in hooks {
+        if !crate::sec::secret::has_secret_ref(&v) {
+            out.push(format!(
+                "config file: {at} carries an inline credential; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}}"
+            ));
+        }
+    }
     out
+}
+
+/// Every webhook verifier's secret in a document — `bearer`, `header.equals`
+/// and `hmac.secret` of `webhooks.default_auth` and of each route's `auth`,
+/// a `webhook` start's or a webhook wait's, nested in a body or not — with
+/// where it sits. A whole-document walk, as [`hmac_algos`] is, because a
+/// workflow's steps are untyped here.
+pub(crate) fn webhook_secrets(v: &Value, at: &str, out: &mut Vec<(String, String)>) {
+    match v {
+        Value::Object(o) => {
+            for (k, child) in o {
+                let here = if at.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{at}.{k}")
+                };
+                if (k == "auth" || k == "default_auth")
+                    && let Some(a) = child.as_object()
+                {
+                    for (field, value) in [
+                        ("bearer", a.get("bearer")),
+                        (
+                            "header.equals",
+                            a.get("header").and_then(|h| h.get("equals")),
+                        ),
+                        ("hmac.secret", a.get("hmac").and_then(|h| h.get("secret"))),
+                    ] {
+                        if let Some(Value::String(s)) = value {
+                            out.push((format!("{here}.{field}"), s.clone()));
+                        }
+                    }
+                }
+                webhook_secrets(child, &here, out);
+            }
+        }
+        Value::Array(a) => {
+            for (i, child) in a.iter().enumerate() {
+                webhook_secrets(child, &format!("{at}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12133,6 +12323,34 @@ mod tests {
         );
     }
 
+    /// A pin whose author key file is missing refuses an unsigned instruction
+    /// at load, under the default `unenforceable: warn` too: the key file
+    /// says which publisher signs, and a key that cannot be read does not
+    /// make the document unenforceable — it makes it unverified.
+    #[test]
+    #[cfg(feature = "sign")]
+    fn an_unreadable_pinned_key_refuses_an_unsigned_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("agent.md");
+        std::fs::write(&doc, "be terse\n").unwrap();
+        let missing = dir.path().join("absent.pub");
+        let e = Settings::from_document(
+            json!({"agent": {"name": "a", "preflight": "never",
+                      "instruction": {"file": doc.to_string_lossy(),
+                          "trust": [{"uri": "instruction://ins_42",
+                                     "publisher": "https://pub.example",
+                                     "author_keys": [missing.to_string_lossy()]}]}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            MERGED_DOCUMENT,
+        )
+        .expect_err("an unsigned document loaded under a pin whose key is missing");
+        assert!(
+            e.contains("absent.pub") && e.contains("cannot be used"),
+            "{e}"
+        );
+    }
+
     /// The short form takes a folder too — the value is classified, and a
     /// path that IS a directory is a directory.
     #[test]
@@ -12526,6 +12744,89 @@ mod tests {
             e.contains("intelligence.auth needs the oauth build feature"),
             "{e}"
         );
+    }
+
+    /// A webhook verifier's secret and a principal's `bearer_ref` in a config
+    /// file are references, as every other credential there is — wherever
+    /// the route sits.
+    #[test]
+    fn webhook_secrets_in_a_file_are_references() {
+        let errors = |doc: &str| match load_doc(doc) {
+            Ok(l) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        let e = errors(
+            "webhooks:\n  default_auth: {hmac: {secret: s3cret}}\nworkflows:\n  - name: w\n    steps:\n      hook: {kind: webhook, path: /in, auth: {bearer: tok, header: {name: X-K, equals: k}}}\n      f: {kind: finish, depends_on: [hook]}\na2a:\n  principals:\n    - {id: bot, match: {bearer_ref: plain}, role: user}\n",
+        );
+        for at in [
+            "webhooks.default_auth.hmac.secret",
+            "workflows[0].steps.hook.auth.bearer",
+            "workflows[0].steps.hook.auth.header.equals",
+            "a2a.principals[0].match.bearer_ref",
+        ] {
+            assert!(
+                e.contains(&format!("config file: {at} carries an inline credential")),
+                "{at}: {e}"
+            );
+        }
+        crate::sec::secret::set_prompted("HOOK_TEST_KEY", "k".into());
+        let e =
+            errors("webhooks:\n  default_auth: {hmac: {secret: \"{{secret:HOOK_TEST_KEY}}\"}}\n");
+        assert!(!e.contains("inline credential"), "{e}");
+    }
+
+    /// A setting only a build feature reads is refused in a build without
+    /// it, naming the feature, rather than loaded to do nothing.
+    #[test]
+    fn a_setting_for_a_feature_this_build_lacks_is_refused() {
+        crate::sec::secret::set_prompted("MCP_TEST_TOKEN", "t".into());
+        let cases: &[(&str, &str)] = &[
+            #[cfg(not(feature = "metrics"))]
+            (
+                "observability: {metrics_addr: \"127.0.0.1:0\"}\n",
+                "observability.metrics_addr needs the metrics build feature",
+            ),
+            #[cfg(not(feature = "otel"))]
+            (
+                "observability: {otel: {endpoint: \"http://127.0.0.1:4318\"}}\n",
+                "observability.otel needs the otel build feature",
+            ),
+            #[cfg(not(feature = "exec"))]
+            (
+                "security: {exec: {enabled: true}}\n",
+                "security.exec.enabled needs the exec build feature",
+            ),
+            #[cfg(not(feature = "oauth"))]
+            (
+                "mcp: {servers: [{name: s, endpoint: \"https://s.example/mcp\", auth: {kind: static, token: \"{{secret:MCP_TEST_TOKEN}}\"}}]}\n",
+                "mcp.servers[].auth needs the oauth build feature",
+            ),
+            #[cfg(not(feature = "aauth"))]
+            (
+                "mcp: {servers: [{name: s, endpoint: \"https://s.example/mcp\", aauth: true}]}\n",
+                "mcp.servers[].aauth needs the aauth build feature",
+            ),
+            #[cfg(not(all(unix, feature = "config-watch")))]
+            (
+                "lifecycle: {watch_config: true}\n",
+                "lifecycle.watch_config needs the config-watch build feature",
+            ),
+        ];
+        for (yaml, says) in cases {
+            let e = load_errors(yaml);
+            assert!(e.contains(says), "{yaml} → {e}");
+        }
+    }
+
+    /// One credential per MCP server: `auth` beside `oauth` is refused, rather
+    /// than `oauth` loading and never being sent.
+    #[test]
+    fn an_mcp_server_with_auth_and_oauth_is_refused() {
+        crate::sec::secret::set_prompted("MCP_TEST_TOKEN", "t".into());
+        let e = load_errors(
+            "mcp:\n  servers:\n    - name: s\n      endpoint: \"https://s.example/mcp\"\n      auth: {kind: static, token: \"{{secret:MCP_TEST_TOKEN}}\"}\n      oauth: {token_url: \"https://id.example/token\", client_id: c, client_secret: \"{{secret:MCP_TEST_TOKEN}}\"}\n",
+        );
+        assert!(e.contains("sets both `auth` and `oauth`"), "{e}");
     }
 
     /// A binary built without `a2a` serves no listener and dials no peer, so
@@ -13757,13 +14058,23 @@ mod tests {
 
     // ---- service catalog & egress policy -----------------------------------
 
-    const CATALOG: &str = "store: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
+    const CATALOG: &str = "store: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
 
     #[test]
     fn service_reference_inherits_and_narrows() {
+        // The entry's credential, where the build can send one (`auth` on an
+        // MCP server needs `oauth`).
+        let catalog = if cfg!(feature = "oauth") {
+            CATALOG.replace(
+                "    headers: {X-Env: prod}\n",
+                "    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n",
+            )
+        } else {
+            CATALOG.to_string()
+        };
         let f = write_tmp(
             &format!(
-                "{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing, allow: [charge_lookup], ns: fin}}\n"
+                "{catalog}mcp:\n  servers:\n    - {{name: money, service: billing, allow: [charge_lookup], ns: fin}}\n"
             ),
             "yaml",
         );
@@ -13774,7 +14085,7 @@ mod tests {
         .unwrap();
         let s = &loaded.settings.mcp.servers[0];
         assert_eq!(s.endpoint, "https://billing.example/mcp", "inherited");
-        assert!(s.auth.is_some(), "inherited auth");
+        assert_eq!(s.auth.is_some(), cfg!(feature = "oauth"), "inherited auth");
         assert_eq!(s.headers["X-Env"], "prod", "inherited headers");
         assert_eq!(s.allow.as_deref(), Some(&["charge_lookup".to_string()][..]));
         assert_eq!(

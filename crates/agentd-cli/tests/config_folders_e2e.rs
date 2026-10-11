@@ -683,3 +683,28 @@ workflows:
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A workflow file on disk is held to the config file's rule for
+/// credentials: a webhook verifier's secret is a reference, where the
+/// workflow sits in its own file as much as inline.
+#[test]
+fn an_inline_webhook_secret_in_a_workflow_file_is_refused() {
+    let (root, home, work) = project("hooksecret");
+    std::fs::write(
+        work.join("hook.yaml"),
+        "name: hook\nsteps:\n  in: {kind: webhook, path: /in, auth: {hmac: {secret: s3cret}}}\n  f: {kind: finish, depends_on: [in]}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work.join("c.yml"),
+        "agent: { name: c, instruction: x }\nstore: { kind: memory }\nintelligence: { endpoints: \"https://x/v1\", model: m }\nworkflows:\n  - file: hook.yaml\n",
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &["-c", "c.yml", "--validate-config"]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains("steps.in.auth.hmac.secret carries an inline credential"),
+        "{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -1192,6 +1192,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             // anything a policy might touch was left out of `mcp_routes` and
             // put in `internal`, so there is nothing more to name here.
             gated_tools: Vec::new(),
+            mcp_routes: None,
             // An explicit `model:` on the node wins; then the model the
             // turn's role is bound to — summarising and triage are recurring
             // fixed costs that do not need the agent's main model.

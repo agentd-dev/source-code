@@ -255,6 +255,15 @@ pub struct SpawnPayload {
     /// because the parent evaluates the policy when the request arrives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gated_tools: Vec<String>,
+    /// The MCP tools the child offers, by the names the supervisor's
+    /// registry gives them, each with the server and the server's own tool
+    /// name: the server's `allow`/`exclude`, its `ns`, a profile server's
+    /// contract names and a disabled tool are the registry's decisions, so
+    /// a `tools` grant, a policy rule and the gated list name what the child
+    /// shows. `None` (a loop run with no registry) offers each server's tools
+    /// as advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_routes: Option<std::collections::BTreeMap<String, (String, String)>>,
     pub limits: Limits,
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
@@ -679,6 +688,7 @@ mod tests {
                 content: "prior note".into(),
             }],
             gated_tools: Vec::new(),
+            mcp_routes: None,
             intelligence: IntelConfig {
                 uri: "https://intel.example".into(),
                 token: Some("secret".into()),

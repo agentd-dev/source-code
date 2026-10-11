@@ -168,13 +168,13 @@ Narrow in two steps:
   `tools` hides, and that server's trifecta tags still count.
 - **`tools`** cuts individual tools inside those servers. Patterns are `*`,
   an exact name, or a prefix ending in `*`, matched against the names the
-  server itself advertises (without any `ns` prefix the parent shows). The
-  child enforces the grant on its catalogue and on every call.
+  agent's own catalogue shows: with a server's `ns` prefix, and as
+  `<server>.<tool>` where a tool's name is already taken. The child enforces
+  the grant on its catalogue and on every call.
 
-> **Warning.** A child connects to its servers directly and sees every tool a
-> server advertises: the parent's `mcp.servers[].allow` and `exclude` filters
-> do not travel with it. When a server offers tools a child must never call,
-> name the allowed ones in `tools`.
+A child sees each server as the agent does: the server's `allow` and
+`exclude` and `tools.disabled` decide which of its tools exist for the child
+too, and its tools carry the same names.
 
 The child's instruction is the whole brief: it does not see the parent's
 conversation. Pass background in `context`, a list of `{role, content}`

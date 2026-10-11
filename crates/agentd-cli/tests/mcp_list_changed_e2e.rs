@@ -146,7 +146,9 @@ fn tools_change_refreshes_a_warm_subagent(protocol_version: &str) -> common::Moc
     // clients would hear of it (the mock hands the handle back); then send
     // the helper a message, which is its next turn. The helper — identified
     // by its own system prompt, which the turn's transcript never contains —
-    // looks something up in its first turn, and after that answers at once.
+    // looks something up in its first turn — by the registry's name for the
+    // server's `search.query`, which an agentd contract holds — and after
+    // that answers at once.
     let llm = spawn_mock_llm(&json!({
         "turns": [
             {"tool_calls": [{"name": "subagent.run", "arguments": {
@@ -161,7 +163,7 @@ fn tools_change_refreshes_a_warm_subagent(protocol_version: &str) -> common::Moc
         "match": [
             {"when_contains": "Result for helper-ready", "content": "standing by"},
             {"when_contains": "You are agentd, an autonomous agent.",
-             "tool_calls": [{"name": "search.query", "arguments": {"query": "helper-ready"}}]}
+             "tool_calls": [{"name": "mock.search.query", "arguments": {"query": "helper-ready"}}]}
         ]
     }));
     let daemon = Daemon::start(&format!(

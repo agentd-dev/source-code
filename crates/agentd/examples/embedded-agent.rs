@@ -107,6 +107,7 @@ fn main() {
         max_tokens: 20_000,
         deadline: Instant::now() + Duration::from_secs(120),
         cancel: None,
+        routes: None,
     };
     match run_loop(&intel, &servers, &input, &mut NoSelfTools, &log) {
         Ok((outcome, usage)) => {

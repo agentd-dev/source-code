@@ -57,18 +57,27 @@ pub fn front_matter_signature(doc: &[u8]) -> Option<String> {
 /// Read an Ed25519 public key from a FILE — raw 32 bytes, 64 hex chars, or
 /// base64url. The registry path can also resolve a JWKS over MCP; this half is
 /// what a file/dir/url/oci source can use, with no client and no network.
-pub fn load_key_file(path: &str) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
+pub fn load_key_file(path: &str) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     if bytes.len() == 32 {
-        return Some(bytes);
+        return Ok(bytes);
     }
     let text = String::from_utf8_lossy(&bytes).trim().to_string();
-    if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
-        return (0..32)
+    let key = if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+        (0..32)
             .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
-            .collect();
-    }
-    crate::b64::url_decode(&text).ok().filter(|v| v.len() == 32)
+            .collect()
+    } else {
+        crate::b64::url_decode(&text).ok().filter(|v| v.len() == 32)
+    };
+    key.ok_or_else(|| {
+        format!("{path}: not an Ed25519 public key (raw 32 bytes, 64 hex characters, or base64url)")
+    })
+}
+
+/// Whether an `author_keys` entry names a registry JWKS rather than a key file.
+pub fn is_jwks_uri(entry: &str) -> bool {
+    entry.starts_with("instruction://")
 }
 
 /// What verifying a document against the pinned publishers concluded.
@@ -76,9 +85,10 @@ pub fn load_key_file(path: &str) -> Option<Vec<u8>> {
 pub enum Authorship {
     /// No pin carries a publisher — nothing was asked for.
     Unpinned,
-    /// Pins exist, but none of them names key material this build can read
-    /// without a registry client (their `author_keys` are all `instruction://`
-    /// JWKS URIs). The caller applies `agent.instruction.unenforceable`.
+    /// Pins exist, but none of them names a key file: their `author_keys` are
+    /// `instruction://` JWKS URIs, or empty (discovered from a registry read),
+    /// which need the registry client. The caller applies
+    /// `agent.instruction.unenforceable`.
     NoLocalKeys,
     /// The document's own signature verified against a pinned publisher.
     Verified {
@@ -113,15 +123,25 @@ pub fn verify_authored(
         return Ok(Authorship::Unpinned);
     }
     // Only FILE key material is usable here: resolving a JWKS needs the
-    // registry client, which a file/oci/url load does not have.
-    let keys: Vec<(&InstructionSource, Vec<u8>)> = pinned
-        .iter()
-        .flat_map(|p| {
-            p.author_keys
-                .iter()
-                .filter_map(|k| load_key_file(k).map(|key| (*p, key)))
-        })
-        .collect();
+    // registry client, which a file/oci/url load does not have. A key file
+    // that cannot be read refuses the document rather than dropping out: a
+    // pin left with no key would verify nothing, and an unsigned document
+    // would then load under it.
+    let mut keys: Vec<(&InstructionSource, Vec<u8>)> = Vec::new();
+    for p in &pinned {
+        for k in p.author_keys.iter().filter(|k| !is_jwks_uri(k)) {
+            let key = load_key_file(k).map_err(|e| {
+                Refusal::new(
+                    "attestation",
+                    format!(
+                        "the author key pinned for publisher {:?} cannot be used — {e}",
+                        p.publisher
+                    ),
+                )
+            })?;
+            keys.push((*p, key));
+        }
+    }
     if keys.is_empty() {
         return Ok(Authorship::NoLocalKeys);
     }
@@ -415,6 +435,29 @@ mod authored_tests {
             verify_authored(b"plain instruction", &[], 100).unwrap(),
             Authorship::Unpinned
         );
+    }
+
+    /// A pinned key file that cannot be read refuses the document — an
+    /// unsigned one included. Dropping the key instead left the pin with
+    /// nothing to verify against, and the unsigned document loaded under it.
+    #[test]
+    fn a_pinned_key_file_that_cannot_be_read_refuses_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, signed) = key_and_doc(dir.path(), "be terse\n", &["material"]);
+        let missing = dir.path().join("absent.pub").to_string_lossy().into_owned();
+        let garbled = dir.path().join("garbled.pub");
+        std::fs::write(&garbled, "not a key").unwrap();
+        let garbled = garbled.to_string_lossy().into_owned();
+        for key in [&missing, &garbled] {
+            for doc in [signed.as_bytes(), b"unsigned\n".as_slice()] {
+                let e = verify_authored(doc, &[pin(key, &[])], 100).unwrap_err();
+                assert!(
+                    e.to_string().contains("cannot be used")
+                        && e.to_string().contains(key.as_str()),
+                    "{e}"
+                );
+            }
+        }
     }
 
     /// Pins whose keys live only in a registry JWKS cannot be checked by a

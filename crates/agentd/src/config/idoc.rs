@@ -10,7 +10,80 @@
 
 pub use instruction_core::doc::*;
 
+use instruction_core::Refusal;
 use std::collections::BTreeMap;
+
+/// The §7.8 hard floor: a document that arrived over the wire — fetched from
+/// a URL, pulled from an OCI registry, read from an MCP server — never uses
+/// the families of the spec's floor (`compose`, `identity`), whatever the
+/// operator granted or its author signed. Each block of one is refused,
+/// naming its line; the list is the registry's, so it is the spec's.
+pub fn check_wire_floor(doc: &Document) -> Result<(), Vec<Refusal>> {
+    fn recur(b: &Block, floor: &[String], errs: &mut Vec<Refusal>) {
+        if let Some(family) = b.grant()
+            && floor.iter().any(|f| f == family)
+        {
+            errs.push(Refusal::at(
+                b.line,
+                "wire-floor",
+                format!(
+                    "`:::!{}` is in the `{family}` family, which a document that arrived over \
+                     the wire never uses (§7.8) — declare it in the operator's configuration",
+                    b.kind
+                ),
+            ));
+        }
+        for c in &b.children {
+            recur(c, floor, errs);
+        }
+    }
+    let mut errs = Vec::new();
+    for b in doc.blocks() {
+        recur(b, registry().wire_floor(), &mut errs);
+    }
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+/// What a document's fold would give it of the floor's families through
+/// blocks every document may use: `a2a.peers` written by `:::!config`, and a
+/// secret named anywhere in its configuration, workflows or declarations
+/// (`{{secret:…}}`, `{{secret-file:…}}`; an `@secret-ref/` folds into one) —
+/// which a header or a step would then send wherever the document points
+/// it. Empty when it reaches neither.
+pub fn wire_floor_effects(ex: &Extraction) -> Vec<String> {
+    let mut out = Vec::new();
+    if ex
+        .config
+        .get("a2a")
+        .and_then(|a| a.get("peers"))
+        .is_some_and(|p| !p.is_null())
+    {
+        out.push("writes a2a.peers".to_string());
+    }
+    let names_a_secret = |v: &serde_json::Value| {
+        let s = v.to_string();
+        s.contains("{{secret") || s.contains("@secret-ref/")
+    };
+    if names_a_secret(&serde_json::Value::Object(ex.config.clone()))
+        || ex.workflows.iter().any(names_a_secret)
+        || ex.declarations.values().flatten().any(names_a_secret)
+    {
+        out.push("names a secret".to_string());
+    }
+    out
+}
+
+/// [`extract_with_facts`] for a document that arrived over the wire: the
+/// §7.8 floor is checked before anything folds.
+pub fn extract_from_wire(
+    text: &str,
+    granted: &std::collections::BTreeSet<String>,
+    facts: &BTreeMap<String, String>,
+) -> Result<Extraction, Vec<Refusal>> {
+    let doc = parse(text)?;
+    check_wire_floor(&doc)?;
+    fold_full(&doc, granted, &BTreeMap::new(), facts, &|_| None)
+}
 
 /// The runtime FACTS agentd supplies to `when` and `unless` (§5.2 context
 /// keys) — the one place they are made, so the agent's own instruction, a
@@ -82,6 +155,53 @@ pub fn model_family(model: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// A document reaches the floor's families through ordinary blocks too:
+    /// peers by `:::!config`, a credential by a secret in a header.
+    #[test]
+    fn the_wire_floor_sees_peers_and_secrets_an_ordinary_block_writes() {
+        let all = super::all_families();
+        let peers = super::extract(
+            "Hi.\n\n:::!config\na2a:\n  peers:\n    - {name: p, endpoint: \"https://p.example\"}\n:::\n",
+            &all,
+        )
+        .unwrap();
+        assert_eq!(super::wire_floor_effects(&peers), ["writes a2a.peers"]);
+        let secret = super::extract(
+            "Hi.\n\n:::!mcp{name=s}\nendpoint: https://s.example/mcp\nheaders: {Authorization: \"Bearer {{secret:TOKEN}}\"}\n:::\n",
+            &all,
+        )
+        .unwrap();
+        assert_eq!(super::wire_floor_effects(&secret), ["names a secret"]);
+        let plain = super::extract(
+            "Hi.\n\n:::!mcp{name=s}\nendpoint: https://s.example/mcp\n:::\n",
+            &all,
+        )
+        .unwrap();
+        assert!(super::wire_floor_effects(&plain).is_empty());
+    }
+
+    /// The floor refuses each block in its families, naming the line, and
+    /// leaves every other block alone.
+    #[test]
+    fn the_wire_floor_refuses_compose_and_identity_blocks() {
+        let doc = super::parse(
+            "Hi.\n\n:::!agent{name=r}\ntemplate: t\n:::\n\n:::!peer{name=p}\nendpoint: https://p.example\n:::\n",
+        )
+        .unwrap();
+        let refused = super::check_wire_floor(&doc).unwrap_err();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(
+            refused.iter().all(|r| r.code == "wire-floor"),
+            "{refused:?}"
+        );
+        assert_eq!(refused[0].line, Some(3));
+        let ok = super::parse(
+            "Hi.\n\n:::!workflow{name=w}\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s]}\n:::\n",
+        )
+        .unwrap();
+        assert!(super::check_wire_floor(&ok).is_ok());
+    }
+
     use super::*;
 
     #[test]

@@ -100,7 +100,7 @@ fn top_level_properties(
                         "mcp": instruction_mcp_source(),
                         "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
                         "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
-                        "unenforceable": { "enum": ["warn", "refuse", "ignore"], "description": "what a `trust` pin whose keys cannot be resolved locally means at startup — `author_keys` that are all instruction:// JWKS uris need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore" },
+                        "unenforceable": { "enum": ["warn", "refuse", "ignore"], "description": "what a `trust` pin that names no key file means at startup — `author_keys` that are instruction:// JWKS uris, or none, need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore. A key file that cannot be read always refuses (exit 2)" },
                         "trust": instruction_trust,
                         "decrypt": { "type": "object", "additionalProperties": false, "description": "recipient keys for an encrypted envelope (RFC 0041)", "properties": {
                             "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64" },

@@ -96,7 +96,7 @@ fn resolve_verify_key(
     kid: Option<&str>,
 ) -> Option<(Vec<u8>, String)> {
     for src in sources {
-        if src.starts_with("instruction://") {
+        if crate::config::attest::is_jwks_uri(src) {
             let Ok(r) = client.read_resource(src) else {
                 continue;
             };
@@ -117,23 +117,8 @@ fn resolve_verify_key(
                     return Some((key, state));
                 }
             }
-        } else if let Ok(bytes) = std::fs::read(src) {
-            let key = match bytes.len() {
-                32 => Some(bytes),
-                _ => {
-                    let text = String::from_utf8_lossy(&bytes).trim().to_string();
-                    if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
-                        (0..32)
-                            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
-                            .collect()
-                    } else {
-                        crate::b64::url_decode(&text).ok().filter(|v| v.len() == 32)
-                    }
-                }
-            };
-            if let Some(key) = key {
-                return Some((key, "active".to_string()));
-            }
+        } else if let Ok(key) = crate::config::attest::load_key_file(src) {
+            return Some((key, "active".to_string()));
         }
     }
     None
@@ -1529,7 +1514,7 @@ impl Runtime {
                         .filter(|c| attested.as_ref().is_none_or(|a| a.contains(c)))
                         .cloned()
                         .collect();
-                    match crate::config::idoc::extract_with_facts(
+                    match crate::config::idoc::extract_from_wire(
                         &raw,
                         &granted,
                         &self.settings.agent.instruction_facts,
@@ -2055,7 +2040,7 @@ impl Runtime {
                         if let Some(caps) = &attested {
                             granted.retain(|g| caps.contains(g));
                         }
-                        match crate::config::idoc::extract_with_facts(
+                        match crate::config::idoc::extract_from_wire(
                             &raw,
                             &granted,
                             &self.settings.agent.instruction_facts,

@@ -446,20 +446,16 @@ trust:
 ```
 
 `author_keys` takes key files (a raw 32-byte, hex or base64url Ed25519 public
-key) or `instruction://…keys.json` URIs a registry serves. A local load cannot
-fetch a registry URI, and it cannot use a key file it cannot read.
-`unenforceable` decides what such a pin means:
+key) or `instruction://…keys.json` URIs a registry serves. A key file that
+cannot be read, such as a typo in its path, refuses the document: exit `2`.
+A local load cannot fetch a registry URI, and `unenforceable` decides what a
+pin with no key file means:
 
 | Value | Behaviour |
 |---|---|
 | `warn` (default) | One warning at startup; the document loads unverified. |
 | `refuse` | Exit `2`. |
 | `ignore` | Silence, for one config shared across deployments that differ. |
-
-> **Warning.** A key file path agentd cannot read, such as a typo, is treated
-> like a key it cannot resolve. Under the default `warn`, an unsigned document
-> then loads with only a warning. Set `unenforceable: refuse` wherever the pin
-> is the point.
 
 The trust pins are restart-only: a reload never changes which publishers or
 keys are trusted. A binary built without the `sign` feature refuses any pin at
@@ -592,9 +588,14 @@ agentd does with its blocks:
   run from an inbound request, write a `:::!workflow` with a `webhook` start
   under the same `interface` grant.
 
-> **Limit.** agentd applies the operator's grant to `url:` and `oci:`
-> documents without the specification's floor for `compose` and `identity`.
-> Grant those families only for sources you control.
+A document that arrives over the wire, from a `url:`, `oci:` or `mcp:`
+source, never uses the `compose` or `identity` families, whatever you grant,
+and reaches neither through the blocks every document may use: a
+`:::!config` that writes `a2a.peers`, or a secret named in a header or a
+step, refuses it too. A `url:` or `oci:` document is refused at load, exit
+`2`; an `mcp:` document when it is read, exit `6` at startup, and on an
+update the running text stays. Those blocks belong in a document on your
+own disk, or in the configuration itself.
 
 ## Traps
 

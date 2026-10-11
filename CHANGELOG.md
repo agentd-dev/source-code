@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.18.0 — MCP 2026-07-28, MCP Events, and kinds of intelligence
 
 Reading the substrate an MCP Events bridge would stand on (RFC 0045) found
 eleven defects in agentd's streams, webhooks and resource subscriptions, and
@@ -24,8 +24,8 @@ revision, and both drift checks run against it. Documents gain author notes,
 end matter, named and conditional rules, reasons, `unless` and `otherwise`,
 typed parameters, overrides, label styles and `!eval`. Some delivered bytes of
 existing version-1 documents change too, and the entries below list each one.
-agentd-instruction 0.3.0 carries this work. Its API is breaking (see Crates),
-and it is not yet published.
+agentd-instruction 0.3.0 carries this work; its API is breaking (see
+Crates), and it was published ahead of this release.
 
 And agentd speaks MCP 2026-07-28 (RFC 0045's P1): every connection starts
 with `server/discover`, the revision with no handshake and no session, and a
@@ -47,6 +47,18 @@ do. Operators bind event types with fixed arguments; inside an operator's
 grant, a workflow's `wait` and the model (the `events.*` tools) subscribe at
 runtime. The feature ships in the release binaries and says at load that it
 tracks a draft.
+
+And intelligence comes in kinds (RFC 0046). A model is a chat, reasoning or
+decision model, reached on a named provider, and every job the agent does —
+its turns, thinking, deciding, triage, compaction, the goal check and
+approvals — runs on the model its role names. A decision model answers typed
+questions with a confidence (`decide`, `classify`, `route` and `judge`,
+preflight, the goal check, guarded approvals); where none is configured, the
+turn model answers through structured generation, held to the answer's
+schema by the provider. A reasoning model thinks at an effort; a step may be
+guarded by a decision; preflight may route each turn to a model. Building
+the guards found the workflow routing edges broken in six places, each fixed
+below.
 
 ### MCP Events (RFC 0045 P2, P3)
 
@@ -1141,13 +1153,12 @@ the instance and to the conversation they ran for.
 
 ### Crates
 
-agentd-mcp has breaking API changes: `McpError::SessionExpired` is a new
+agentd-mcp 3.0.0 has breaking API changes: `McpError::SessionExpired` is a new
 variant, and `capabilities()` and `protocol_version()` return owned values,
 because the negotiated state now belongs to the live connection, which a
 re-dial replaces. It now needs rmcp ^3.5, connects discover-first (see the
 P1 section), and `HttpTransport::send` returns a non-2xx JSON-RPC error body
-as the response. Its version is decided when it is published; nothing is
-published yet.
+as the response.
 
 agentd-instruction 0.3.0 re-vendors Instruction Specification 345f275
 (registry revision 1.1); CI pins that revision. Every source file in it now

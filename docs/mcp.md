@@ -89,7 +89,7 @@ capability:
 //                    Mcp-Method: server/discover, no Mcp-Session-Id)
 { "jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":{
     "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-    "io.modelcontextprotocol/clientInfo":{"name":"agentd","version":"1.17.0",
+    "io.modelcontextprotocol/clientInfo":{"name":"agentd","version":"1.18.0",
                                           "title":"<instance>"},  // title = the instance name
     "io.modelcontextprotocol/clientCapabilities":{}              // a boot connection declares none
 }}}
@@ -122,7 +122,7 @@ handshake of **2025-11-25**, which is what every older server answers:
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},
-    "clientInfo":{"name":"agentd","version":"1.17.0","title":"<instance>"}
+    "clientInfo":{"name":"agentd","version":"1.18.0","title":"<instance>"}
 }}
 // server → agentd   (header: Mcp-Session-Id: <session>)
 { "jsonrpc":"2.0","id":1,"result":{

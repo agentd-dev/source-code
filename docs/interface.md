@@ -444,7 +444,7 @@ describe a screen the shipped client does not draw.
 
 ```tui
 # agentd tui — chat
-agentd 1.17.0 triage-1 debug
+agentd 1.18.0 triage-1 debug
 ▌  Triage the newest issue
 ⠋ working
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -465,7 +465,7 @@ A subagent is a real child process the supervisor owns. The list is live:
 
 ```tui
 # agentd tui — subagents
-agentd 1.17.0 triage-1 debug
+agentd 1.18.0 triage-1 debug
   handle               mode        status      tokens   updated
 ▸ sa-review            supervised  running     4120     0s
   sa-lint              detached    failed      260      0s
@@ -477,7 +477,7 @@ agentd 1.17.0 triage-1 debug
 
 ```tui
 # agentd tui — subagent detail
-agentd 1.17.0 triage-1 debug
+agentd 1.18.0 triage-1 debug
 subagent sa-review
 status        running
 mode          supervised
@@ -499,7 +499,7 @@ m message · k stop · esc/backspace back · tab next screen
 
 ```tui
 # agentd tui — confirming a stop
-agentd 1.17.0 triage-1 debug
+agentd 1.18.0 triage-1 debug
 subagent sa-review
 status        running
 mode          supervised
@@ -519,7 +519,7 @@ are missing and why.
 
 ```tui
 # agentd tui — debug
-agentd 1.17.0 triage-1 debug
+agentd 1.18.0 triage-1 debug
 feed
     1 run           {"id":"pipeline-01M0C0","workflow":"pipeline","status":"running","steps":"3/7"}
     2 step          {"run":"pipeline-01M0C0","step":"fetch","kind":"mcp.tool","phase":"start"}

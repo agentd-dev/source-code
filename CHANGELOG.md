@@ -388,6 +388,11 @@ the instance and to the conversation they ran for.
   parent's turn model, whatever it had been spawned on.
 - A subagent's stored payload no longer carries its resolved intelligence
   headers, which may hold credentials; only the model reference is kept.
+- No temperature is sent to a Claude model — on `dialect: anthropic`, or an
+  `anthropic.…` model on Bedrock. agentd asked every call at temperature 0,
+  which Claude Opus 4.7 and every Claude model since refuse with a 400: no
+  current Claude model could serve a single call. Claude models that still
+  take a temperature now run at their own default.
 
 ### Security (breaking)
 

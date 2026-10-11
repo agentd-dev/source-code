@@ -133,7 +133,9 @@ the top-level `system` field; tools map to Anthropic's
 `{name, description, input_schema}` (same `input_schema` key — passed through
 verbatim). Assistant tool calls serialize as `tool_use` content blocks; tool
 results as `tool_result` blocks. `stop_reason` normalises into the same finish
-reason, usage from `usage.{input_tokens,output_tokens}`.
+reason, usage from `usage.{input_tokens,output_tokens}`. No `temperature` is
+sent: current Claude models refuse one, and the models that take one run at
+their own default.
 
 ### `bedrock` — the Amazon Bedrock Converse wire
 
@@ -142,7 +144,8 @@ The one dialect that requires an auth block: `intelligence.auth.kind` must be
 (validation rejects the pair otherwise). The model id rides the **URL path** —
 `/model/{modelId}/converse` — not the request body, so `model:` is the Bedrock
 model id or an inference-profile id/ARN. Tool-calling and system prompts map
-onto the Converse shapes. See
+onto the Converse shapes. A Claude model (`anthropic.…`, optionally
+region-prefixed) is sent no `temperature`, as on the `anthropic` dialect. See
 [Authentication](authentication.md#enterprise-llm-providers-azure-google-aws)
 for a complete block.
 

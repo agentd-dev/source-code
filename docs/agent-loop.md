@@ -206,7 +206,8 @@ note, marks the inbox event done, and drops the job.
 The worker prepends the system message, appends the slice, and iterates. Guards
 run in a fixed order at the top of **every** round: cancelled → past deadline →
 rounds exhausted → tokens exhausted → budget admission → model call. Requests go
-out at temperature 0 unless the turn overrides it.
+out at temperature 0 unless the turn overrides it — except to a Claude model,
+which is sent none ([Intelligence](intelligence.md#anthropic-post-v1messages)).
 
 ```mermaid
 sequenceDiagram

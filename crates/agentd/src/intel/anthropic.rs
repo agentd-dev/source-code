@@ -62,11 +62,10 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
                 json!(req.max_tokens as u64 + r.budget_tokens()),
             );
         }
+        // No temperature either: current Claude models refuse one (400),
+        // and the models that take one run at their own default.
         None => {
             body.insert("max_tokens".into(), json!(req.max_tokens));
-            if let Some(t) = req.temperature {
-                body.insert("temperature".into(), json!(t));
-            }
         }
     }
     body.insert("messages".into(), json!(messages));
@@ -283,6 +282,21 @@ mod tests {
                 .all(|b| b["type"] == "tool_use"),
             "another model is sent the message without them: {other}"
         );
+    }
+
+    /// No temperature reaches a Claude model: current ones refuse it.
+    #[test]
+    fn a_claude_model_is_sent_no_temperature() {
+        let req = Request {
+            model: "claude-sonnet-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 64,
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let v: Value = serde_json::from_slice(&build_request(&req, None).0).unwrap();
+        assert!(v.get("temperature").is_none(), "{v}");
+        assert_eq!(v["max_tokens"], 64);
     }
 
     #[test]

@@ -106,9 +106,13 @@ pub fn build_request(req: &Request, _token: Option<&str>) -> (Vec<u8>, Vec<(Stri
                 json!(req.max_tokens as u64 + r.budget_tokens()),
             );
         }
+        // A Claude model takes no temperature either: current ones refuse
+        // it, as on Anthropic's own API.
         None => {
             inference.insert("maxTokens".into(), json!(req.max_tokens));
-            if let Some(t) = req.temperature {
+            if let Some(t) = req.temperature
+                && model_family(&req.model) != Some(Family::Anthropic)
+            {
                 inference.insert("temperature".into(), json!(t));
             }
         }
@@ -458,6 +462,11 @@ mod tests {
         assert_eq!(v["messages"][0]["role"], "user");
         assert_eq!(v["messages"][0]["content"][0]["text"], "hi");
         assert_eq!(v["inferenceConfig"]["maxTokens"], 256);
+        // A Claude model is sent no temperature; another family keeps it.
+        assert!(v["inferenceConfig"].get("temperature").is_none(), "{v}");
+        let mut llama = req();
+        llama.model = "meta.llama3-70b-instruct-v1:0".into();
+        let v: Value = serde_json::from_slice(&build_request(&llama, None).0).unwrap();
         assert_eq!(v["inferenceConfig"]["temperature"], 0.0);
         assert_eq!(v["toolConfig"]["tools"][0]["toolSpec"]["name"], "read_file");
         assert_eq!(

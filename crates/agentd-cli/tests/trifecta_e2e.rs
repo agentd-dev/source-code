@@ -206,13 +206,13 @@ fn a_file_defined_consumer_refuses_the_start() {
 }
 
 /// A daemon whose stderr log a test reads, stopped on drop.
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 struct Daemon {
     child: std::process::Child,
     log: std::path::PathBuf,
 }
 
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 impl Daemon {
     fn spawn(cfg: &Path) -> Daemon {
         let log = cfg.with_extension("log");
@@ -251,7 +251,7 @@ impl Daemon {
     }
 }
 
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 impl Drop for Daemon {
     fn drop(&mut self) {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
@@ -281,7 +281,7 @@ fn names_all(m: &str, workflow: &str, server: &str) -> bool {
 /// A reload that gives the consumer's server the `egress` leg completes the
 /// trifecta, and is refused; restoring the original then reloads to
 /// "nothing", so no section of the refused reload had applied.
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 #[test]
 fn a_reload_introducing_the_path_is_refused_and_the_running_config_stays() {
     let a = common::spawn_mock_mcp("mock://a", false);
@@ -378,7 +378,7 @@ fn a_reload_introducing_the_path_is_refused_and_the_running_config_stays() {
 /// refuses one that would read the tainted stream into sensitive + egress,
 /// and one it stored while that was two legs is left out — said out loud —
 /// by the reload that adds the third, without vetoing the operator's reload.
-#[cfg(feature = "hot-reload")]
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
 #[test]
 fn an_agent_written_definition_is_held_to_the_same_check() {
     let t = tempfile::tempdir().unwrap();

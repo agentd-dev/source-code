@@ -57,7 +57,7 @@ agent:
     You are concise and verify before you claim.
 
 intelligence:
-  endpoints: https://api.openai.com/v1    # OpenAI-compatible wire; a comma-list is failover
+  endpoints: https://api.openai.com/v1/chat/completions    # OpenAI-compatible wire; a comma-list is failover
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"      # a REFERENCE — never paste the key
   budget:

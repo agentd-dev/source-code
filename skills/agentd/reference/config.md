@@ -66,7 +66,7 @@ listener (it requires `a2a.listen`); `fallback` (the default) applies
 
 ```yaml
 intelligence:
-  endpoints: https://api.openai.com/v1     # comma-list ⇒ failover order
+  endpoints: https://api.openai.com/v1/chat/completions     # comma-list ⇒ failover order
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"       # or token_file, or `auth:` for OAuth/SigV4/SPIFFE
   budget:

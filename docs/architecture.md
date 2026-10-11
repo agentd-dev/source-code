@@ -494,7 +494,7 @@ agent:
   instruction: You triage incoming issues and write a one-paragraph summary.
 
 intelligence:
-  endpoints: https://api.openai.com/v1
+  endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"
 

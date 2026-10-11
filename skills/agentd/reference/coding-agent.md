@@ -34,7 +34,7 @@ agent:
   ask_human_fallback: wait    # a question with nobody to answer it parks
 
 intelligence:
-  endpoints: https://api.openai.com/v1
+  endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"
   budget:

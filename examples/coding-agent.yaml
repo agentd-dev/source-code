@@ -33,7 +33,7 @@ agent:
   ask_human_fallback: wait
 
 intelligence:
-  endpoints: https://api.openai.com/v1
+  endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
   # A reference, never the key itself — resolved from the environment at start.
   token: "{{secret:OPENAI_API_KEY}}"

@@ -77,7 +77,7 @@ A complete, runnable example:
 
 ```yaml
 intelligence:
-  endpoints: https://api.openai.com/v1
+  endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
   token: "{{secret:OPENAI_KEY}}"
 store: { kind: mcp, mcp: { server: state } }

@@ -30,7 +30,7 @@ for the root context (`context_id: root`) with the principal `operator`:
 
 ```bash
 agentd --prompt "Summarize yesterday's failed deploys and open a ticket" \
-       --intelligence https://api.openai.com/v1 \
+       --intelligence https://api.openai.com/v1/chat/completions \
        --mcp github=https://mcp.internal/github
 ```
 

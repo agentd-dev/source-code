@@ -49,7 +49,7 @@ services:
     rate: "120/1m"
 
 intelligence:
-  endpoints: ["https://api.openai.com/v1"]
+  endpoints: ["https://api.openai.com/v1/chat/completions"]
   token: "{{secret:OPENAI_API_KEY}}"
   models:
     quick: { model: gpt-5.1-mini, window: 128000 }

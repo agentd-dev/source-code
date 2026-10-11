@@ -45,7 +45,7 @@ agent:
 # catalogue, and config that exists to demonstrate a feature is still config
 # someone has to read.)
 intelligence:
-  endpoints: https://api.openai.com/v1
+  endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1-mini
   token: "{{secret:OPENAI_API_KEY}}"
   budget:

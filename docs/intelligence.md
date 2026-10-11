@@ -280,7 +280,7 @@ intelligence:
   # endpoints, dialect, token / token_file, headers, auth, timeout.
   providers:
     openai:
-      endpoints: https://api.openai.com/v1
+      endpoints: https://api.openai.com/v1/chat/completions
       token: "{{secret:OPENAI_API_KEY}}"
 
   models:

@@ -912,8 +912,12 @@ A false `when` guard prunes only in the top-level scheduler. Inside a nested bod
 CEL or decision, still marks the step `skipped`, and a skipped step *satisfies*
 its dependents: the body runs its own smaller scheduler, and the tail behind a
 guarded-off step there runs rather than pruning away. `switch` is the exception: it prunes its
-untaken targets at any depth, body included — and inside a body a pruned step
-satisfies nothing, so anything depending only on it never becomes ready.
+untaken targets at any depth, body included, and a body prunes the tail behind
+them as the top level does. The routing edges work in a body as at the top: a
+wait's `on_timeout` branch is parked until the timeout routes to it (and
+pruned when the wait is answered), and a failure a routing edge took —
+`on_timeout`, `on_error: goto` — fails the body only when its target declined
+or failed; the success path behind it is pruned.
 
 ```mermaid
 flowchart TD
@@ -921,6 +925,7 @@ flowchart TD
     B -->|"Running or Suspended"| C["counts as in flight"]
     B -->|"terminal"| D["nothing to do"]
     B -->|"Pending"| E{"forced by switch, goto or on_timeout?"}
+    E -->|"yes, with a decision guard"| GA["ask the guard again; wait on its answer"]
     E -->|"yes"| J
     E -->|"no"| Q{"has dependencies, and every one Pruned?"}
     Q -->|"yes"| K["mark Pruned, rerun the fixpoint"]
@@ -929,7 +934,7 @@ flowchart TD
     F -->|"no"| H{"all dependencies Done, Skipped or Pruned?"}
     H -->|"no"| I["not ready yet"]
     H -->|"yes"| J{"when guard: CEL, or the decision's answer"}
-    J -->|"absent, true, or surely holds"| R
+    J -->|"absent, true, or surely holds"| R["READY"]
     J -->|"false, does not hold, or unsure"| K
     J -->|"CEL error"| L["the run fails"]
     R --> M{"ready set empty?"}

@@ -219,6 +219,39 @@ tracks a draft.
 sent one at a time); agentd's answers to a server's requests are bounded at
 5s; an elicitation's `$schema` and property order are kept.
 
+### Workflow routing edges
+
+A routing edge — a `switch` case, `on_error: goto`, a wait's `on_timeout` —
+runs its target past its dependencies. Building decision guards on routed
+steps found the edges broken in six places; each fix has a test that fails
+on the old code.
+
+**Fixed.**
+
+- A routed step ran whatever its CEL `when` said: the edge marked it ready
+  before the guard was looked at, so a guarded case, recovery step or timeout
+  branch was never guarded. The edge now skips only the dependency wait; a
+  recovery step whose guard declines leaves the failure standing, and the run
+  fails with it. A decision guard on a routed step is asked first.
+- Inside a body, a wait's `on_timeout` branch ran at the body's entry — before
+  any timeout — and the timeout then failed the body anyway. It is parked
+  until the timeout routes to it, pruned when the wait is answered, and the
+  body completes on it.
+- Inside a body, `on_error: goto` never recovered anything: the body failed on
+  the failure before its target could run. A failure an edge took fails the
+  body only when its target declined or failed; a target routed on in turn
+  answers for itself, so a chain of edges runs to its end.
+- Inside a body, a step depending on a `switch` case that was not chosen
+  stayed pending, and the body never finished. A body prunes the tail behind
+  an untaken case, as the top level does, and prunes a step that depends on a
+  failure an edge took — a step the top level never runs either.
+- Inside a body, a step could run twice: a step that finished inline drove
+  the body again, and the outer pass then ran the rest of its ready list a
+  second time. Both schedulers now dispatch only a step still pending.
+- A routed step caught running by a crash lost its routing on restore, and
+  waited on the dependency the edge had routed around — for a recovery step,
+  the very step that failed — so the run stalled.
+
 ### Kinds of intelligence (RFC 0046 P1–P5)
 
 **Added (P5 — structured generation, decision guards, routing).**
@@ -287,12 +320,7 @@ shape that is not a CEL string is refused at load. A conversation's
 compaction window was fixed when the conversation was created, so a restart
 or reload that moved the turn model to a smaller window left a restored
 conversation compacting against the old one; it now follows the live
-settings at each turn. A step a `switch` case, `on_error: goto` or a wait's
-`on_timeout` routed to ran whatever its CEL `when` said — the routing edge
-marked it ready before the guard was looked at, so a guarded case, recovery
-step or timeout branch was never guarded. The edge now skips only the
-dependency wait: the guard is evaluated as for any step, and a recovery step
-whose guard declines leaves the failure standing.
+settings at each turn.
 
 **Added (P4 — reasoning).**
 

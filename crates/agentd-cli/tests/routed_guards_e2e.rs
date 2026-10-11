@@ -227,3 +227,176 @@ fn a_switch_case_in_a_body_is_held_to_its_cel_when() {
     assert_eq!(out["t"], "skipped", "{out}\n{log}");
     assert!(!started(&log, "sub.t"), "{log}");
 }
+
+/// Inside a body, a wait's `on_timeout` branch is parked until the timeout
+/// routes to it — it used to run at the body's entry, and the timeout then
+/// failed the body anyway. Now the wait's success path is pruned, the branch
+/// runs after the timeout, and the body completes on it.
+#[test]
+fn a_timeout_branch_in_a_body_runs_on_the_timeout_and_the_body_completes() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ park: {{ kind: wait, on: signal, signal: nobody-fires-this, timeout: 300ms, on_timeout: plan_b }}, ok: {{ kind: assign, depends_on: [park], value: replied }}, plan_b: {{ kind: assign, value: \"plan b\" }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ ok: \"{{{{ /steps/sub.ok/status }}}}\", plan_b: \"{{{{ /steps/sub.plan_b/output }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["ok"], "pruned", "{out}\n{log}");
+    assert_eq!(out["plan_b"], "plan b", "{out}");
+    let lines: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    let at = |pred: &dyn Fn(&Value) -> bool| lines.iter().position(pred);
+    let routed = at(&|v| v["event"] == "step.timeout_routed").expect("routed");
+    let ran = at(&|v| v["event"] == "step.start" && v["step"] == "sub.plan_b").expect("ran");
+    assert!(
+        routed < ran,
+        "the branch runs on the timeout, not at entry: {log}"
+    );
+}
+
+/// …and when the wait is answered, the branch is pruned, never run.
+#[cfg(feature = "cel")]
+#[test]
+fn a_timeout_branch_in_a_body_is_pruned_when_the_wait_is_answered() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ park: {{ kind: wait, on: condition, condition: \"true\", timeout: 5s, on_timeout: plan_b }}, ok: {{ kind: assign, depends_on: [park], value: replied }}, plan_b: {{ kind: assign, value: \"plan b\" }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ ok: \"{{{{ /steps/sub.ok/output }}}}\", plan_b: \"{{{{ /steps/sub.plan_b/status }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["ok"], "replied", "{out}\n{log}");
+    assert_eq!(out["plan_b"], "pruned", "{out}");
+    assert!(!started(&log, "sub.plan_b"), "{log}");
+}
+
+/// A recovery step in a body runs: the body used to fail before the
+/// `on_error: goto` it had taken could run its target. Now the failure is
+/// handled once the target has run, and the body completes on it.
+#[test]
+fn a_recovery_step_in_a_body_runs_and_the_body_completes() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ bad: {{ kind: fail, message: boom, on_error: \"goto:fix\" }}, after: {{ kind: assign, depends_on: [bad], value: after }}, fix: {{ kind: assign, depends_on: [bad], value: fixed }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ fix: \"{{{{ /steps/sub.fix/output }}}}\", after: \"{{{{ /steps/sub.after/status }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["fix"], "fixed", "{out}\n{log}");
+    assert_eq!(
+        out["after"], "pruned",
+        "the success path is off the live path: {out}"
+    );
+}
+
+/// …and one whose guard declines leaves the failure standing: the body fails
+/// with it.
+#[cfg(feature = "cel")]
+#[test]
+fn a_recovery_step_in_a_body_that_declines_leaves_the_failure_standing() {
+    let (code, _out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ bad: {{ kind: fail, message: boom, on_error: \"goto:fix\" }}, fix: {{ kind: assign, depends_on: [bad], value: fixed, when: \"false\" }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed }}\n"
+    ));
+    assert_ne!(code, Some(0), "{log}");
+    assert!(!started(&log, "sub.fix"), "{log}");
+    let done = events(&log, "run.done");
+    assert_eq!(done.len(), 1, "{log}");
+    assert!(
+        done[0]["err"].as_str().is_some_and(|e| e.contains("boom")),
+        "{log}"
+    );
+}
+
+/// A `switch` in a body prunes its untaken case's whole tail, and the body
+/// completes — a step depending only on the untaken case used to stay
+/// pending, and the body never finished.
+#[test]
+fn an_untaken_case_in_a_body_prunes_its_tail_and_the_body_completes() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ r: {{ kind: switch, on: a, cases: {{ a: t, b: u }} }}, t: {{ kind: assign, depends_on: [r], value: \"t ran\" }}, u: {{ kind: assign, depends_on: [r], value: \"u ran\" }}, u2: {{ kind: assign, depends_on: [u], value: \"after u\" }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ t: \"{{{{ /steps/sub.t/output }}}}\", u2: \"{{{{ /steps/sub.u2/status }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["t"], "t ran", "{out}\n{log}");
+    assert_eq!(out["u2"], "pruned", "{out}");
+}
+
+/// A chain of edges in a body — a timeout routed to a wait that times out
+/// in turn — runs to its end, as at the top level: each link answers for
+/// itself, and the body completes on the last.
+#[test]
+fn a_chain_of_timeouts_in_a_body_runs_to_its_end() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ ask: {{ kind: wait, on: signal, signal: nobody, timeout: 200ms, on_timeout: remind }}, remind: {{ kind: wait, on: signal, signal: nobody2, timeout: 200ms, on_timeout: escalate }}, escalate: {{ kind: assign, value: escalated }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ e: \"{{{{ /steps/sub.escalate/output }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["e"], "escalated", "{out}\n{log}");
+}
+
+/// A step that depends on a failure an edge took never runs — the failure's
+/// success path is dead, as at the top level — even beside a live
+/// dependency, and even while the recovery is still in flight.
+#[test]
+fn a_join_behind_a_routed_failure_in_a_body_never_runs() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ other: {{ kind: assign, value: o }}, bad: {{ kind: fail, message: boom, on_error: \"goto:fix\" }}, fix: {{ kind: sleep, depends_on: [bad], duration: 200ms }}, join: {{ kind: assign, depends_on: [bad, other], value: \"join ran\" }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ join: \"{{{{ /steps/sub.join/status }}}}\", fix: \"{{{{ /steps/sub.fix/status }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["join"], "pruned", "{out}\n{log}");
+    assert_eq!(out["fix"], "done", "{out}");
+    assert!(!started(&log, "sub.join"), "{log}");
+}
+
+/// A fallback that is both a wait's `on_timeout` target and another step's
+/// `goto` target stays parked while either could still route to it: the
+/// wait being answered does not prune it, the later failure runs it, and its
+/// tail runs after it.
+#[cfg(feature = "cel")]
+#[test]
+fn a_fallback_two_edges_share_waits_for_both_in_a_body() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ park: {{ kind: wait, on: condition, condition: \"true\", timeout: 5s, on_timeout: plan_b }}, slow: {{ kind: sleep, duration: 300ms }}, charge: {{ kind: fail, depends_on: [slow], message: declined, on_error: \"goto:plan_b\" }}, plan_b: {{ kind: assign, value: \"plan b\" }}, notify: {{ kind: assign, depends_on: [plan_b], value: notified }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ pb: \"{{{{ /steps/sub.plan_b/status }}}}\", n: \"{{{{ /steps/sub.notify/status }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["pb"], "done", "{out}\n{log}");
+    assert_eq!(out["n"], "done", "{out}");
+}
+
+/// Each body step runs once: a step that finishes inline drives the body
+/// again, and that pass ran the rest of the outer pass's ready list, which
+/// then ran it a second time.
+#[test]
+fn each_body_step_runs_once() {
+    let (code, out, log) = run(&format!(
+        "{BASE}workflows:\n  - name: w\n    steps:\n\
+         \x20     s:   {{ kind: once }}\n\
+         \x20     sub: {{ kind: subgraph, depends_on: [s], body: {{ steps: {{ a: {{ kind: assign, value: a, writes: acc, mode: append }}, b: {{ kind: assign, value: b, writes: acc, mode: append }}, w: {{ kind: sleep, duration: 300ms }} }} }} }}\n\
+         \x20     f:   {{ kind: finish, depends_on: [sub], status: completed, output: {{ acc: \"{{{{ vars.acc }}}}\" }} }}\n"
+    ));
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(out["acc"], json!(["a", "b"]), "{out}\n{log}");
+    let starts = events(&log, "step.start");
+    for step in ["sub.a", "sub.b", "sub.w"] {
+        assert_eq!(
+            starts.iter().filter(|e| e["step"] == step).count(),
+            1,
+            "{step}: {log}"
+        );
+    }
+}

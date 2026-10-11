@@ -378,7 +378,8 @@ impl RunState {
             st.error = None;
             st.wait = None;
             st.cache_key = None;
-            st.forced = false;
+            // `forced` stays: a routed step caught running by a crash is
+            // replayed as routed — past its dependencies, as the edge sent it.
             st.attempt
         };
         if !self.status.is_terminal() {
@@ -794,6 +795,26 @@ pub fn render_spec(step: &Step, data: &Data) -> Result<Map<String, Value>, Strin
 mod tests {
     use super::*;
     use crate::engine::model::parse_workflow;
+
+    /// A routed step keeps its mark while it runs, so a crash that leaves it
+    /// `running` replays it as routed — past its dependencies, as the edge
+    /// sent it — rather than waiting on a dependency that failed.
+    #[test]
+    fn a_routed_step_keeps_its_mark_while_it_runs() {
+        let w = parse_workflow(&json!({"name": "w", "steps": {
+            "go": {"kind": "once"},
+            "bad": {"kind": "fail", "depends_on": ["go"], "on_error": "goto:fix"},
+            "fix": {"kind": "noop", "depends_on": ["bad"]},
+            "f": {"kind": "finish", "depends_on": ["fix"]}
+        }}))
+        .unwrap();
+        let mut run = RunState::new("r", &w, start_at("go"), json!({}));
+        run.steps.entry("fix".into()).or_default().forced = true;
+        run.begin_step("fix");
+        assert!(run.steps["fix"].forced);
+        let saved: RunState = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        assert!(saved.steps["fix"].forced);
+    }
 
     /// The whole point of the key: RETRIES of one step share it, different
     /// operations do not, and the remote learns nothing from it.

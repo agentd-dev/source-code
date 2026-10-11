@@ -1121,6 +1121,11 @@ impl Runtime {
                     if self.draining && !shutdown_capable {
                         return;
                     }
+                    // A step that finished inline may have driven the run on,
+                    // and that pass may already have run the rest of this list.
+                    if !self.still_pending(run_id, &s) {
+                        continue;
+                    }
                     self.execute_step(run_id, &s);
                 }
             }

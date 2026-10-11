@@ -75,6 +75,24 @@ pub fn scoped_id(parent: &str, step: &str) -> String {
     format!("{parent}.{step}")
 }
 
+/// Where a routing edge took a step that ended `status`: its `on_timeout`
+/// target for a timeout (else its `on_error: goto`), its `goto` target for a
+/// failure — `None` when no edge took it.
+fn routed_to(step: &Step, status: StepStatus) -> Option<String> {
+    let goto = || match &step.on_error {
+        OnError::Goto(t) => Some(t.clone()),
+        _ => None,
+    };
+    match status {
+        StepStatus::Timeout => step
+            .field_str("on_timeout")
+            .map(str::to_string)
+            .or_else(goto),
+        StepStatus::Failed => goto(),
+        _ => None,
+    }
+}
+
 /// The definition a (possibly scoped) run-record id runs: the id with each
 /// `[<index>]` dropped (`each[3].ask` → `each.ask`), since every element and
 /// iteration of a body runs the one step. A branch is part of the definition
@@ -466,6 +484,33 @@ impl Runtime {
                         continue;
                     }
                     StepStatus::Failed | StepStatus::Timeout | StepStatus::Cancelled => {
+                        // A failure a routing edge took — `on_timeout`,
+                        // `on_error: goto` — is handled once its target has
+                        // run, waited on while the target has not, and stands
+                        // when the target declined (its guard) or failed.
+                        // A target that failed and was routed on in turn — a
+                        // chain of edges — answers for itself at its own entry.
+                        if let Some(target) = routed_to(&body.steps[id], st.status) {
+                            match snapshot
+                                .get(&scoped_id(scope_id, &target))
+                                .map(|t| t.status)
+                            {
+                                Some(StepStatus::Done) => continue,
+                                Some(t) if !t.is_terminal() => {
+                                    all_terminal = false;
+                                    continue;
+                                }
+                                Some(t)
+                                    if body
+                                        .steps
+                                        .get(&target)
+                                        .is_some_and(|ts| routed_to(ts, t).is_some()) =>
+                                {
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         if failed.is_none() {
                             failed = Some(
                                 st.error
@@ -536,10 +581,74 @@ impl Runtime {
                     ready.push(sid);
                     continue;
                 }
-                let deps_ok = step.depends_on.iter().all(|d| {
+                // An `on_timeout` target is reached by routing only: parked
+                // until an edge forces it — its decision guard with it — and
+                // pruned once every step that could route to it (by
+                // `on_timeout`, or by `on_error: goto` as well) has ended
+                // without doing so.
+                let parked = step.guarding.as_deref().unwrap_or(id.as_str());
+                if step.depends_on.is_empty()
+                    && body
+                        .steps
+                        .values()
+                        .any(|s| s.field_str("on_timeout") == Some(parked))
+                {
+                    let sources: Vec<&String> = body
+                        .steps
+                        .values()
+                        .filter(|s| {
+                            s.field_str("on_timeout") == Some(parked)
+                                || matches!(&s.on_error, OnError::Goto(t) if t == parked)
+                        })
+                        .map(|s| &s.id)
+                        .collect();
+                    let routed = snapshot
+                        .get(&scoped_id(scope_id, parked))
+                        .is_some_and(|t| t.forced);
+                    let ended = sources.iter().all(|src| {
+                        snapshot
+                            .get(&scoped_id(scope_id, src))
+                            .is_some_and(|t| t.status.is_terminal())
+                    });
+                    if ended && !routed {
+                        if let Some(r) = self.runs.get_mut(run_id) {
+                            r.end_step(&sid, StepStatus::Pruned, None, None);
+                        }
+                        changed = true;
+                    }
+                    continue;
+                }
+                // A failure a routing edge took leaves its success path dead:
+                // a step depending on one never runs (at the top level it is
+                // blocked for good; a body, which must finish, prunes it).
+                let routed_dep = step.depends_on.iter().any(|d| {
+                    snapshot.get(&scoped_id(scope_id, d)).is_some_and(|s| {
+                        body.steps
+                            .get(d)
+                            .is_some_and(|ds| routed_to(ds, s.status).is_some())
+                    })
+                });
+                // A pruned dependency is not waited on (an uneven join), and a
+                // step whose every dependency is pruned is pruned too, so an
+                // untaken branch's tail ends with it — as at the top level.
+                let pruned = |d: &String| {
                     snapshot
                         .get(&scoped_id(scope_id, d))
-                        .is_some_and(|s| s.status.is_satisfied())
+                        .is_some_and(|s| s.status == StepStatus::Pruned)
+                };
+                if routed_dep || (!step.depends_on.is_empty() && step.depends_on.iter().all(pruned))
+                {
+                    if let Some(r) = self.runs.get_mut(run_id) {
+                        r.end_step(&sid, StepStatus::Pruned, None, None);
+                    }
+                    changed = true;
+                    continue;
+                }
+                let deps_ok = step.depends_on.iter().all(|d| {
+                    pruned(d)
+                        || snapshot
+                            .get(&scoped_id(scope_id, d))
+                            .is_some_and(|s| s.status.is_satisfied())
                 });
                 let deps_failed = step.depends_on.iter().any(|d| {
                     snapshot.get(&scoped_id(scope_id, d)).is_some_and(|s| {
@@ -606,10 +715,24 @@ impl Runtime {
             if !self.parent_running(run_id, &strip_scope_suffix(scope_id)) {
                 break;
             }
+            // A step that finishes inline drives this body again, and that
+            // pass may already have run the rest of this list.
+            if !self.still_pending(run_id, &sid) {
+                continue;
+            }
             self.execute_step_pub(run_id, &sid);
         }
         let _ = parent;
         BodyState::Waiting
+    }
+
+    /// Whether a step a ready list named is still pending — not started by a
+    /// pass that ran meanwhile.
+    pub(crate) fn still_pending(&self, run_id: &str, sid: &str) -> bool {
+        self.runs
+            .get(run_id)
+            .and_then(|r| r.steps.get(sid))
+            .is_none_or(|s| s.status == StepStatus::Pending)
     }
 
     /// A body step's CEL `when`, over its scope's data.

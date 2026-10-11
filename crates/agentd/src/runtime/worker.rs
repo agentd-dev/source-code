@@ -197,6 +197,9 @@ pub fn run_turn(
     bridge: &mut dyn Bridge,
     log: &Logger,
 ) -> TurnResult {
+    if spec.kind == TurnKind::Decide {
+        return run_decision(spec, limits, intel, bridge, log);
+    }
     let start = Instant::now();
     let mut result = TurnResult {
         status: "completed".into(),
@@ -287,64 +290,20 @@ pub fn run_turn(
                     .map(|t| tokens::estimate(&t.name) + tokens::estimate_value(&t.input_schema))
                     .sum::<u64>()
                 + max_tokens_per_call as u64;
-            loop {
-                match bridge.budget_request(estimate, limits.deadline) {
-                    None => finish_with!("cancelled"),
-                    Some(BudgetReply {
-                        ok: true,
-                        degrade: Some(cfg),
-                        ..
-                    }) if cfg.model.as_deref().unwrap_or_default() != model => {
-                        let to = cfg.model.clone().unwrap_or_default();
-                        match cfg.client() {
-                            Ok(mut c) => {
-                                c.set_trace_id(intel.trace_id().map(str::to_string));
-                                log.info(
-                                    "turn.model_degraded",
-                                    json!({"turn": spec.turn_id, "from": model, "to": to, "provider": cfg.provider}),
-                                );
-                                model = to;
-                                degraded = Some(c);
-                            }
-                            // The turn goes on on the model it has: a degrade
-                            // is a saving, not a reason to fail the work.
-                            Err(e) => log.warn(
-                                "turn.model_degrade_failed",
-                                json!({"turn": spec.turn_id, "to": to, "err": e.to_string()}),
-                            ),
-                        }
-                        break;
-                    }
-                    Some(BudgetReply { ok: true, .. }) => break,
-                    Some(BudgetReply {
-                        ok: false,
-                        wait_ms,
-                        reason,
-                        ..
-                    }) => {
-                        if let Some(r) = reason {
-                            result.error = Some(format!("budget: {r}"));
-                            finish_with!(if r.contains("refus") {
-                                "refused"
-                            } else {
-                                "exhausted_tokens"
-                            });
-                        }
-                        let remaining = limits.deadline.saturating_duration_since(Instant::now());
-                        let wait = Duration::from_millis(wait_ms.max(50)).min(remaining);
-                        if wait.is_zero() {
-                            finish_with!("deadline");
-                        }
-                        log.info(
-                            "turn.budget_wait",
-                            json!({"turn": spec.turn_id, "wait_ms": wait.as_millis() as u64}),
-                        );
-                        std::thread::sleep(wait);
-                        if bridge.cancelled() {
-                            finish_with!("cancelled");
-                        }
-                    }
+            if let Err((status, error)) = admit(
+                spec,
+                limits,
+                bridge,
+                intel,
+                estimate,
+                &mut model,
+                &mut degraded,
+                log,
+            ) {
+                if error.is_some() {
+                    result.error = error;
                 }
+                finish_with!(status);
             }
         }
         // The model call. Announce it first: the supervisor turns this into the
@@ -360,6 +319,7 @@ pub fn run_turn(
             tools: tools.clone(),
             max_tokens: max_tokens_per_call,
             temperature: spec.temperature.or(Some(0.0)),
+            ..Default::default()
         };
         let chat_start = crate::obs::otel::now_unix_nanos();
         let resp = match degraded.as_ref().unwrap_or(intel).complete(&req) {
@@ -487,6 +447,30 @@ pub fn run_turn(
                             messages.push(assistant.to_wire());
                             delta.push(assistant);
                             last_text = Some(text);
+                            // A deciding node on a chat model: its answer's own
+                            // `confidence` is held to the node's threshold — a
+                            // self-report, the only one a chat model gives.
+                            let mut v = v;
+                            // A confidence outside 0..1 (a percentage, say) is
+                            // no confidence: it would clear any threshold.
+                            if let Some(sure) = spec.sure
+                                && !v
+                                    .get("confidence")
+                                    .and_then(Value::as_f64)
+                                    .filter(|c| (0.0..=1.0).contains(c))
+                                    .is_some_and(|c| c >= sure.confidence)
+                            {
+                                if sure.on_unsure == crate::subagent::protocol::OnUnsure::Continue {
+                                    v["unsure"] = json!(true);
+                                } else {
+                                    result.error = Some(format!(
+                                        "unsure: the answer's confidence is under {}",
+                                        sure.confidence
+                                    ));
+                                    result.value = Some(v);
+                                    finish_with!("failed");
+                                }
+                            }
                             result.value = Some(v);
                             finish_with!("completed");
                         }
@@ -538,6 +522,265 @@ pub fn run_turn(
         let _ = start;
         finish_with!("completed");
     }
+}
+
+/// Ask the supervisor for budget admission for one call of `estimate`
+/// tokens, waiting while it says wait. A degrade grant moves the turn to the
+/// degrade model's client (`degraded`) and wire model (`model`). `Err` is the
+/// status the turn ends with, and why.
+#[allow(clippy::too_many_arguments)]
+fn admit(
+    spec: &TurnSpec,
+    limits: &TurnLimits,
+    bridge: &mut dyn Bridge,
+    intel: &IntelClient,
+    estimate: u64,
+    model: &mut String,
+    degraded: &mut Option<IntelClient>,
+    log: &Logger,
+) -> Result<(), (&'static str, Option<String>)> {
+    loop {
+        match bridge.budget_request(estimate, limits.deadline) {
+            None => return Err(("cancelled", None)),
+            Some(BudgetReply {
+                ok: true,
+                degrade: Some(cfg),
+                ..
+            }) if cfg.model.as_deref().unwrap_or_default() != model.as_str() => {
+                let to = cfg.model.clone().unwrap_or_default();
+                match cfg.client() {
+                    Ok(mut c) => {
+                        c.set_trace_id(intel.trace_id().map(str::to_string));
+                        log.info(
+                            "turn.model_degraded",
+                            json!({"turn": spec.turn_id, "from": model, "to": to, "provider": cfg.provider}),
+                        );
+                        *model = to;
+                        *degraded = Some(c);
+                    }
+                    // The turn goes on on the model it has: a degrade is a
+                    // saving, not a reason to fail the work.
+                    Err(e) => log.warn(
+                        "turn.model_degrade_failed",
+                        json!({"turn": spec.turn_id, "to": to, "err": e.to_string()}),
+                    ),
+                }
+                return Ok(());
+            }
+            Some(BudgetReply { ok: true, .. }) => return Ok(()),
+            Some(BudgetReply {
+                ok: false,
+                wait_ms,
+                reason,
+                ..
+            }) => {
+                if let Some(r) = reason {
+                    let status = if r.contains("refus") {
+                        "refused"
+                    } else {
+                        "exhausted_tokens"
+                    };
+                    return Err((status, Some(format!("budget: {r}"))));
+                }
+                let remaining = limits.deadline.saturating_duration_since(Instant::now());
+                let wait = Duration::from_millis(wait_ms.max(50)).min(remaining);
+                if wait.is_zero() {
+                    return Err(("deadline", None));
+                }
+                log.info(
+                    "turn.budget_wait",
+                    json!({"turn": spec.turn_id, "wait_ms": wait.as_millis() as u64}),
+                );
+                std::thread::sleep(wait);
+                if bridge.cancelled() {
+                    return Err(("cancelled", None));
+                }
+            }
+        }
+    }
+}
+
+/// A `Decide` turn (RFC 0046 §5.5–5.6): one decision, admitted like any call,
+/// answered natively or emulated by the client; an unsure answer under
+/// `escalate` asked once more on the escalate model, whose answer is final;
+/// under `fail` (or `escalate` with nowhere to go) the turn fails, under
+/// `continue` the answer is marked. The answers — not the state, which is
+/// content — are logged (`intel.decision`).
+fn run_decision(
+    spec: &TurnSpec,
+    limits: &TurnLimits,
+    intel: &IntelClient,
+    bridge: &mut dyn Bridge,
+    log: &Logger,
+) -> TurnResult {
+    use crate::subagent::protocol::OnUnsure;
+    use crate::wire::decision;
+    let mut result = TurnResult {
+        status: "completed".into(),
+        ..Default::default()
+    };
+    let fail = |mut result: TurnResult, why: String| {
+        result.status = "failed".into();
+        result.error = Some(why);
+        result
+    };
+    let Some(job) = spec.decision.as_deref() else {
+        return fail(result, "a decide turn carries no decision".into());
+    };
+    let questions = job.decision.questions.len() as u32;
+    let max_tokens = if spec.max_tokens_per_call > 0 {
+        spec.max_tokens_per_call
+    } else {
+        256 + 64 * questions
+    };
+    let mut model = limits.model.clone();
+    let mut degraded: Option<IntelClient> = None;
+    if spec.budget_admission {
+        let estimate =
+            tokens::estimate_value(&job.decision.state) + 64 * questions as u64 + max_tokens as u64;
+        if let Err((status, error)) = admit(
+            spec,
+            limits,
+            bridge,
+            intel,
+            estimate,
+            &mut model,
+            &mut degraded,
+            log,
+        ) {
+            result.status = status.into();
+            result.error = error;
+            return result;
+        }
+    }
+    if bridge.cancelled() {
+        result.status = "cancelled".into();
+        return result;
+    }
+    bridge.progress("turn.think", json!({"turn": spec.turn_id, "round": 1}));
+    let ask = |client: &IntelClient, model: &str| {
+        client.complete(&Request {
+            model: model.to_string(),
+            max_tokens,
+            temperature: Some(0.0),
+            decision: Some(job.decision.clone()),
+            ..Default::default()
+        })
+    };
+    let resp = match ask(degraded.as_ref().unwrap_or(intel), &model) {
+        Ok(r) => r,
+        Err(e) => return fail(result, format!("intel: {e}")),
+    };
+    result.rounds = 1;
+    result.usage.input_tokens += resp.usage.input_tokens;
+    result.usage.output_tokens += resp.usage.output_tokens;
+    let mut served = resp.fallback.clone().unwrap_or_else(|| model.clone());
+    let Some(mut answers) = resp.decision else {
+        let why = crate::intel::decisions::parse_emulated(
+            resp.text.as_deref().unwrap_or(""),
+            &job.decision,
+        )
+        .err()
+        .unwrap_or_else(|| "no answers".into());
+        return fail(
+            result,
+            format!("intel: the answer is not a decision: {why}"),
+        );
+    };
+    let mut unsure = spec
+        .sure
+        .map(|s| decision::unsure(&answers, s.confidence))
+        .unwrap_or_default();
+    let mut escalated = false;
+    if !unsure.is_empty()
+        && spec.sure.is_some_and(|s| s.on_unsure == OnUnsure::Escalate)
+        && let Some(cfg) = &job.escalate
+    {
+        // The second call is a call like the first: admitted (a squeezed
+        // budget may refuse it, or move it to the degrade model) and
+        // cancellable.
+        let mut to = cfg.model.clone().unwrap_or_default();
+        let mut squeezed: Option<IntelClient> = None;
+        if spec.budget_admission {
+            let estimate = tokens::estimate_value(&job.decision.state)
+                + 64 * questions as u64
+                + max_tokens as u64;
+            if let Err((status, error)) = admit(
+                spec,
+                limits,
+                bridge,
+                intel,
+                estimate,
+                &mut to,
+                &mut squeezed,
+                log,
+            ) {
+                result.status = status.into();
+                result.error = error;
+                return result;
+            }
+        }
+        if bridge.cancelled() {
+            result.status = "cancelled".into();
+            return result;
+        }
+        log.info(
+            "intel.decision.escalate",
+            json!({"turn": spec.turn_id, "from": served, "to": to, "unsure": unsure}),
+        );
+        let again = match squeezed {
+            Some(c) => ask(&c, &to),
+            None => cfg.client().and_then(|mut c| {
+                c.set_trace_id(intel.trace_id().map(str::to_string));
+                ask(&c, &to)
+            }),
+        };
+        match again {
+            Ok(r) => {
+                result.usage.input_tokens += r.usage.input_tokens;
+                result.usage.output_tokens += r.usage.output_tokens;
+                let Some(a) = r.decision else {
+                    return fail(
+                        result,
+                        "intel: the escalate model's answer is not a decision".into(),
+                    );
+                };
+                answers = a;
+                served = r.fallback.unwrap_or(to);
+                escalated = true;
+                // One hop: the escalate model's answer is final.
+                unsure.clear();
+            }
+            Err(e) => return fail(result, format!("intel (escalate): {e}")),
+        }
+    }
+    let shown: serde_json::Map<String, Value> = answers
+        .iter()
+        .map(|(id, a)| (id.clone(), a.to_output(job.decision.questions.get(id))))
+        .collect();
+    log.info(
+        "intel.decision",
+        json!({"turn": spec.turn_id, "model": served, "escalated": escalated, "answers": shown, "unsure": unsure}),
+    );
+    result.value = Some(decision::shaped(
+        job.shape,
+        &job.decision,
+        &answers,
+        &unsure,
+        &served,
+        escalated,
+    ));
+    if !unsure.is_empty() && spec.sure.is_none_or(|s| s.on_unsure != OnUnsure::Continue) {
+        let threshold = spec.sure.map(|s| s.confidence).unwrap_or_default();
+        return fail(
+            result,
+            format!(
+                "unsure: {} answered under confidence {threshold}",
+                unsure.join(", ")
+            ),
+        );
+    }
+    result
 }
 
 fn render_len(m: &Message) -> String {

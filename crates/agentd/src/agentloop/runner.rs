@@ -358,6 +358,7 @@ impl<'a> Session<'a> {
                 tools: self.tools.clone(),
                 max_tokens: PER_CALL_MAX_TOKENS,
                 temperature: Some(0.0),
+                ..Default::default()
             };
 
             log.debug(

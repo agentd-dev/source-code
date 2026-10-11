@@ -322,6 +322,7 @@ fn goal_judge_call(intel: &IntelConfig, statement: &str, summary: &Value) -> Val
         tools: vec![],
         max_tokens: 300,
         temperature: Some(0.0),
+        ..Default::default()
     };
     match client.complete(&req) {
         Ok(resp) => parse_verdict(&resp.text.unwrap_or_default()),

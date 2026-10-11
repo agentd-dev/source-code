@@ -127,6 +127,7 @@ fn native_bedrock_dialect_signs_the_dynamic_path_and_round_trips() {
         }],
         max_tokens: 32,
         temperature: Some(0.0),
+        decision: None,
     };
     let resp = intel.complete(&req).expect("completion succeeds");
 

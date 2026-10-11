@@ -160,11 +160,12 @@ matches on.
 | `think` | `prompt` | `output_schema` `reads` `check` `retries` `skills` `system` `model` | One model call. `output_schema` shapes the answer; `check`/`retries` re-ask until it conforms. |
 | `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` `model` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. `context` is a seed-message array, or the object form `{template: <name>, seed: […]}` — `template` names an entry in `context.templates` to render this step's system prompt with, in place of the instance default. |
 | `subagent` | `instruction` *or* `template` | `params` `mode` `tools` `servers` `limits` `priority` `context` `output_contract` `output_schema` `skills` `durable` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. `template` instantiates a `subagents.templates` entry — `params` fill its declared holes (schema-checked), `tools`/`servers` are refused (the template defines the grant), and an instance-tier template spawns a full child daemon whose handle is an A2A peer name. `limits` adds OS caps — `memory` (RLIMIT_AS), `cpu` (RLIMIT_CPU) — beside `steps`/`tokens`/`deadline`; `priority: low\|normal\|high` maps to niceness and sheds low first under pressure. |
-| `classify` | `input` `classes` | `prompt` `skills` `model` | Puts `input` into one of `classes`. |
+| `classify` | `input` `classes` | `prompt` `skills` `model` `confidence` `on_unsure` | Puts `input` into one of `classes` — a list, or a map of class → what it covers. Output `{class, confidence, …}`; on a decision model also `probabilities`, `calibrated: true`. |
 | `extract` | `input` `output_schema` | `prompt` `skills` `model` | Pulls `input` into the shape of `output_schema`. No tools — the safest way to read untrusted text. |
 | `summarize` | `input` | `length` `prompt` `skills` `model` | Shortens `input` to `length`. |
-| `judge` | `input` `rubric` | `prompt` `skills` `model` | Scores `input` against a `rubric`. |
-| `route` | `input` `choices` | `prompt` `skills` `model` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
+| `judge` | `input` `rubric` | `levels` `prompt` `skills` `model` `confidence` `on_unsure` | Judges `input` against a `rubric`: `{verdict: pass\|fail, score, confidence, …}`. On a decision model the verdict is a noul (`probability`), and `levels` adds a `score` and `level` on that scale; `reasons` come only from a chat model. |
+| `route` | `input` `choices` | `prompt` `skills` `model` `confidence` `on_unsure` | Picks one of `choices` for `input`: `{choice, confidence, …}`. The model-driven alternative to `switch`. |
+| `decide` | `state` `questions` | `model` `confidence` `on_unsure` | Several typed questions about one `state`, one call ([below](#decisions)). |
 | `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. In an instruction document, `to: "@human/<name>"` addresses one of the document's `::!human`s: its principal, or the operators, with its channel announced ([below](#addressed-gates)). `reply_uri` is refused at load — nothing implements it. |
 
 `model` names an `intelligence.models` model on any kind that makes a model
@@ -175,7 +176,64 @@ provider, and an unknown one is exit 2 rather than a run asking for a model
 nobody serves. Without `model:`, a node runs on its kind's role
 (`intelligence.roles`): `think` on `think`; `classify`, `route` and `judge` on
 `decide`; `agent`, `extract` and `summarize` on `turn`
-([intelligence.md](intelligence.md#providers-models-and-roles)).
+([intelligence.md](intelligence.md#providers-models-and-roles)). A decision
+model (`kind: decision`) serves only the kinds that decide — `decide`,
+`classify`, `route`, `judge` — and a node that writes refuses one at load.
+
+### Decisions
+
+`decide` asks named typed questions about one `state` — text, a list of
+texts, or a JSON object — and answers each:
+
+```yaml
+triage:
+  kind: decide
+  model: jev                                   # default: roles.decide
+  state: "{{ inputs.ticket }}"
+  questions:
+    queue:  { choice: { billing: "payment problems", tech: "bugs and outages" } }
+    urgent: { noul: "The customer cannot work at all." }
+    mood:   { score: [calm, annoyed, angry, furious] }
+    refund: { noul: "The customer asks for money back.", instructions: "Only an explicit request counts." }
+  confidence: 0.75
+  on_unsure: escalate
+```
+
+A `choice` names its options (a list, or option → criterion); a `noul` is a
+statement, answered with the probability it is true; a `score` lists levels,
+lowest first, answered with a position on the scale. At most 16 questions,
+2 to 32 options or levels each. The output has one entry per question —
+`{choice, probabilities?, confidence}`, `{noul, confidence}`, `{score, level,
+probabilities?, confidence}`, each with `calibrated` — plus `model` (what
+answered) and `escalated`.
+
+On a decision model the decision is answered natively (`calibrated: true`);
+on a chat model it is one structured call with every question in it, and its
+`confidence` is a self-report (`calibrated: false`). `classify`, `route` and
+`judge` are the same one-question decision on a decision model and the
+presets they always were on a chat model. On a decision model they keep
+their outputs' keys but write no prose: `judge` has no `reasons`, and its
+`score` is the verdict's probability on its 0..10 scale (with `levels:`, the
+position on those levels, and `level`); `classify` and `route` have no
+`reason`, and `skills` do not apply (a `prompt` becomes the question's
+guidance). A `confidence` outside 0..1 counts as none.
+
+**`confidence`** is the least sureness an answer is acted on with — a
+choice's or score's `confidence`; for a noul its distance from a coin flip,
+doubled (`|p − 0.5| × 2`). **`on_unsure`** says what an answer under it does:
+`escalate` asks the same decision once more on the model's `escalate` model
+and takes that answer as final (`escalated: true`); `fail` fails the node;
+`continue` hands the answer on with `unsure: true`. The default is `escalate`
+where the model names an `escalate` model, else `fail` — a threshold you set
+is never quietly ignored. On a chat model's preset, `confidence` is held to
+the answer's own self-reported `confidence`, and there is nothing to escalate
+to. `on_unsure: escalate` on a node whose model names no `escalate` model is
+refused at load.
+
+The agent reaches the same contract with the **`decide` tool** — `{state,
+questions, confidence?}` on `roles.decide` — where an unsure answer is
+escalated when it can be and otherwise handed back marked `unsure`, for the
+agent to weigh.
 
 ---
 

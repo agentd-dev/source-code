@@ -131,6 +131,7 @@ fn intel_dial_is_aauth_signed_when_identity_installed() {
         tools: Vec::new(),
         max_tokens: 16,
         temperature: Some(0.0),
+        decision: None,
     };
     intel.complete(&req).expect("completion succeeds");
 

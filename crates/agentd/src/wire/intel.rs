@@ -75,13 +75,17 @@ pub struct ToolDef {
 }
 
 /// A request to the intelligence endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     pub model: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// A decision to answer instead of a conversation to continue (RFC 0046
+    /// §5.5): a `decisions` endpoint answers it natively, a chat endpoint
+    /// emulates it. `messages` and `tools` are unused when it is set.
+    pub decision: Option<super::decision::Decision>,
 }
 
 /// Why the model stopped — drives the loop's branch (tool-use vs final) and
@@ -125,6 +129,8 @@ pub struct Response {
     /// The fallback model that answered, when the model asked was
     /// unavailable; `None` when it answered itself.
     pub fallback: Option<String>,
+    /// The answers, when the request was a decision.
+    pub decision: Option<super::decision::Answers>,
 }
 
 impl Response {
@@ -172,6 +178,7 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),
             fallback: None,
+            decision: None,
         };
         assert!(r.wants_tools());
     }

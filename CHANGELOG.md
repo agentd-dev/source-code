@@ -219,7 +219,50 @@ tracks a draft.
 sent one at a time); agentd's answers to a server's requests are bounded at
 5s; an elicitation's `$schema` and property order are kept.
 
-### Kinds of intelligence (RFC 0046 P1)
+### Kinds of intelligence (RFC 0046 P1, P2)
+
+**Added (P2 — decisions).**
+
+- `intelligence.models.<n>.kind`: `chat` (the default) or `decision`. A
+  decision model answers typed questions about a state — `choice`, `noul`,
+  `score` — natively, on a provider with the new `dialect: decisions` (the
+  endpoint is the decisions resource's full URL; the body is the shape Jev,
+  OpenRouter and Strands Decider share). A chat model answers the same
+  decision by emulation, one structured call, `calibrated: false`.
+- The `decide` node: `{state, questions, model?, confidence?, on_unsure?}` →
+  one entry per question plus `model` and `escalated`; on `roles.decide`
+  when it names no model. `classify`, `route` and `judge` are the same
+  one-question decision on a decision model (`judge` gains `levels:`, a
+  score beside its verdict), and the presets they were on a chat model.
+- `confidence` and `on_unsure` (`escalate | fail | continue`) on every
+  deciding node, and `intelligence.models.<n>.escalate`: an answer under the
+  threshold is asked once more on the escalate model (final), fails the
+  node, or is handed on `unsure: true`. The default escalates where it can
+  and otherwise fails — a threshold is never quietly ignored.
+- The `decide` tool for the agent, on `roles.decide`: an unsure answer is
+  escalated where it can be, else handed back marked.
+- Kinds checked at load: a decision model only where something decides, a
+  chat model never on a decisions provider, a chat model's fallback never a
+  decision model, the top-level connection never `dialect: decisions`.
+- `intel.decision` and `intel.decision.escalate` log lines (answers, never
+  the state). The built-in mock LLM answers decisions (a playbook's
+  `decisions` rules).
+
+**Changed (P2).** `classify` takes `classes` as a list or a map of class →
+what it covers; the `route` and `judge` presets ask for and return a
+`confidence`, and a chat `judge` with `levels:` returns a `level`. On a
+decision model the three keep their outputs' keys but write no prose:
+`judge` has no `reasons` and its `score` is the verdict's probability on
+its 0..10 scale (with `levels:`, the position on those levels), and
+`classify` and `route` have no `reason`. A `confidence` outside 0..1 is no
+confidence: a native one is an error, a chat model's fails the threshold.
+A decision's answers are checked whole; a chat model that misses the shape
+is told why and asked once more, and the tokens of both are counted.
+
+**Fixed (P2).** The `think` tool, preflight and compaction — and now the
+`decide` tool — spent tokens no budget saw: their workers' admissions were
+released as granted and nothing charged what they used. It is charged to
+the instance and to the conversation they ran for.
 
 **Changed (breaking).**
 

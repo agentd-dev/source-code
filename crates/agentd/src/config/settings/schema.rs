@@ -134,7 +134,7 @@ fn top_level_properties(
                 }
             }));
     let endpoints = json!({ "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" });
-    let dialect = json!({ "enum": ["openai", "anthropic", "bedrock"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)" });
+    let dialect = json!({ "enum": ["openai", "anthropic", "bedrock", "decisions"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)" });
     let role = |what: &str| json!({ "type": "string", "description": format!("the model {what}; default: roles.turn") });
     m.insert("intelligence".to_string(), json!({
                 "type": "object", "additionalProperties": false,
@@ -152,7 +152,9 @@ fn top_level_properties(
                             "timeout": duration } } },
                     "models": { "type": "object", "description": "named models: cost/quality tiering inside one workflow without forking a process. A model names the connection it is reached on and cannot describe one", "additionalProperties": {
                         "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
+                            "kind": { "enum": ["chat", "decision"], "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing" },
                             "model": { "type": "string", "description": "the wire model name sent to the provider" },
+                            "escalate": { "type": "string", "description": "a decision model's: the model an unsure answer is asked again on, once" },
                             "provider": { "type": "string", "description": "the connection: a name under intelligence.providers; default the top-level one. Operator-only" },
                             "window": { "type": "integer", "minimum": 1, "description": "this model's context window, so compaction stops guessing from the model NAME" },
                             "fallback": { "type": "string", "description": "the model used when this one is unavailable (every endpoint failed or broken open) — a ladder that walks down, across providers, instead of failing" } } } },

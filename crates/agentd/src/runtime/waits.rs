@@ -426,6 +426,12 @@ impl Runtime {
                     ),
                 }
             }
+            // A decision model answers the deciding kinds natively; a `decide`
+            // node is always a decision (emulated on a chat model).
+            "decide" => self.step_decide(run_id, step_id, step, spec, data),
+            "classify" | "judge" | "route" if self.decides_natively(spec) => {
+                self.step_decide(run_id, step_id, step, spec, data)
+            }
             "classify" | "extract" | "summarize" | "judge" | "route" => {
                 self.step_preset(run_id, step_id, step, spec, data)
             }
@@ -1970,20 +1976,26 @@ impl Runtime {
             .unwrap_or_default();
         let (prompt, schema) = match step.kind.as_str() {
             "classify" => {
-                let classes: Vec<String> = spec
-                    .get("classes")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // A list of class names, or a map of name → what it covers.
+                let (classes, described): (Vec<String>, Vec<String>) = match spec.get("classes") {
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|c| (c.to_string(), c.to_string()))
+                        .unzip(),
+                    Some(Value::Object(o)) => o
+                        .iter()
+                        .map(|(c, d)| match d.as_str() {
+                            Some(d) if !d.is_empty() => (c.clone(), format!("{c} ({d})")),
+                            _ => (c.clone(), c.clone()),
+                        })
+                        .unzip(),
+                    _ => (Vec::new(), Vec::new()),
+                };
                 (
                     format!(
                         "Classify the input into exactly one of these classes: {}.{extra}\n\nInput:\n{input_text}\n\nReply with ONLY a JSON object {{\"class\": <one of the classes>, \"confidence\": <0..1>, \"reason\": <short>}}.",
-                        classes.join(", ")
+                        described.join(", ")
                     ),
                     json!({"type": "object", "properties": {"class": {"enum": classes}, "confidence": {"type": "number"}, "reason": {"type": "string"}}, "required": ["class"]}),
                 )
@@ -2014,11 +2026,30 @@ impl Runtime {
             }
             "judge" => {
                 let rubric = spec.get("rubric").cloned().unwrap_or(Value::Null);
+                // `levels:` places the input on the author's scale too.
+                let levels: Vec<String> = spec
+                    .get("levels")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut schema = json!({"type": "object", "properties": {"verdict": {"enum": ["pass", "fail"]}, "score": {"type": "number"}, "confidence": {"type": "number"}, "reasons": {"type": "array", "items": {"type": "string"}}}, "required": ["verdict"]});
+                let level_ask = if levels.is_empty() {
+                    String::new()
+                } else {
+                    schema["properties"]["level"] = json!({"enum": levels});
+                    schema["required"] = json!(["verdict", "level"]);
+                    format!(", \"level\": <one of {levels:?}, lowest first>")
+                };
                 (
                     format!(
-                        "Judge the input against the rubric.{extra}\n\nRubric:\n{rubric}\n\nInput:\n{input_text}\n\nReply with ONLY a JSON object {{\"verdict\": \"pass\"|\"fail\", \"score\": <0..10>, \"reasons\": [<short strings>]}}."
+                        "Judge the input against the rubric.{extra}\n\nRubric:\n{rubric}\n\nInput:\n{input_text}\n\nReply with ONLY a JSON object {{\"verdict\": \"pass\"|\"fail\", \"score\": <0..10>, \"confidence\": <0..1>{level_ask}, \"reasons\": [<short strings>]}}."
                     ),
-                    json!({"type": "object", "properties": {"verdict": {"enum": ["pass", "fail"]}, "score": {"type": "number"}, "reasons": {"type": "array", "items": {"type": "string"}}}, "required": ["verdict"]}),
+                    schema,
                 )
             }
             _ => {
@@ -2033,10 +2064,10 @@ impl Runtime {
                 };
                 (
                     format!(
-                        "Route the input to exactly one of these choices: {}.{extra}\n\nInput:\n{input_text}\n\nReply with ONLY a JSON object {{\"choice\": <one of the choices>, \"reason\": <short>}}.",
+                        "Route the input to exactly one of these choices: {}.{extra}\n\nInput:\n{input_text}\n\nReply with ONLY a JSON object {{\"choice\": <one of the choices>, \"confidence\": <0..1>, \"reason\": <short>}}.",
                         choices.join(", ")
                     ),
-                    json!({"type": "object", "properties": {"choice": {"enum": choices}, "reason": {"type": "string"}}, "required": ["choice"]}),
+                    json!({"type": "object", "properties": {"choice": {"enum": choices}, "confidence": {"type": "number"}, "reason": {"type": "string"}}, "required": ["choice"]}),
                 )
             }
         };
@@ -2061,7 +2092,13 @@ impl Runtime {
         // The node's own kind picks its model when it names none: a decision
         // runs on `roles.decide`, shaping text on the turn's model.
         let role = super::steps::node_role(&step.kind);
-        self.step_turn_pub(run_id, step_id, &think, &think_spec, data, role);
+        // `confidence` on a chat model is held to the answer's own (a
+        // self-report); there is no model to escalate to.
+        let work = super::steps::StepWork {
+            decision: None,
+            sure: super::decide::node_sureness(spec, false),
+        };
+        self.step_turn_pub(run_id, step_id, &think, &think_spec, data, role, work);
     }
 
     /// Step `cache {key, ttl}`: a memoized output by key (memory `_cache/<hash>`).

@@ -1684,7 +1684,9 @@
           "classes",
           "prompt",
           "skills",
-          "model"
+          "model",
+          "confidence",
+          "on_unsure"
         ],
         "implemented": true,
         "required": [
@@ -1710,6 +1712,21 @@
           "on"
         ],
         "start": true
+      },
+      "decide": {
+        "fields": [
+          "state",
+          "questions",
+          "model",
+          "confidence",
+          "on_unsure"
+        ],
+        "implemented": true,
+        "required": [
+          "state",
+          "questions"
+        ],
+        "start": false
       },
       "dedupe": {
         "fields": [
@@ -1879,9 +1896,12 @@
         "fields": [
           "input",
           "rubric",
+          "levels",
           "prompt",
           "skills",
-          "model"
+          "model",
+          "confidence",
+          "on_unsure"
         ],
         "implemented": true,
         "required": [
@@ -2137,7 +2157,9 @@
           "choices",
           "prompt",
           "skills",
-          "model"
+          "model",
+          "confidence",
+          "on_unsure"
         ],
         "implemented": true,
         "required": [
@@ -2554,6 +2576,7 @@
             "summarize",
             "judge",
             "route",
+            "decide",
             "agent",
             "subagent",
             "human"
@@ -3515,11 +3538,12 @@
           "type": "object"
         },
         "dialect": {
-          "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)",
+          "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)",
           "enum": [
             "openai",
             "anthropic",
-            "bedrock"
+            "bedrock",
+            "decisions"
           ]
         },
         "endpoints": {
@@ -3550,9 +3574,20 @@
           "additionalProperties": {
             "additionalProperties": false,
             "properties": {
+              "escalate": {
+                "description": "a decision model's: the model an unsure answer is asked again on, once",
+                "type": "string"
+              },
               "fallback": {
                 "description": "the model used when this one is unavailable (every endpoint failed or broken open) — a ladder that walks down, across providers, instead of failing",
                 "type": "string"
+              },
+              "kind": {
+                "description": "chat (default) generates and emulates decisions; decision answers typed questions natively, on a `dialect: decisions` provider, and writes nothing",
+                "enum": [
+                  "chat",
+                  "decision"
+                ]
               },
               "model": {
                 "description": "the wire model name sent to the provider",
@@ -3584,11 +3619,12 @@
                 "$ref": "#/$defs/Auth"
               },
               "dialect": {
-                "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)",
+                "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)",
                 "enum": [
                   "openai",
                   "anthropic",
-                  "bedrock"
+                  "bedrock",
+                  "decisions"
                 ]
               },
               "endpoints": {

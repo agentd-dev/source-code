@@ -223,6 +223,7 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         stop_reason,
         usage: usage.unwrap_or_default(),
         fallback: None,
+        decision: None,
     })
 }
 
@@ -261,6 +262,7 @@ mod tests {
             }],
             max_tokens: 256,
             temperature: Some(0.0),
+            decision: None,
         }
     }
 
@@ -333,6 +335,7 @@ mod tests {
             tools: vec![],
             max_tokens: 8,
             temperature: None,
+            decision: None,
         };
         let v: Value = serde_json::from_slice(&build_request(&r, None).0).unwrap();
         let msgs = v["messages"].as_array().unwrap();

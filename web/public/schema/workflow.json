@@ -183,7 +183,9 @@
           "classes",
           "prompt",
           "skills",
-          "model"
+          "model",
+          "confidence",
+          "on_unsure"
         ],
         "implemented": true,
         "required": [
@@ -209,6 +211,21 @@
           "on"
         ],
         "start": true
+      },
+      "decide": {
+        "fields": [
+          "state",
+          "questions",
+          "model",
+          "confidence",
+          "on_unsure"
+        ],
+        "implemented": true,
+        "required": [
+          "state",
+          "questions"
+        ],
+        "start": false
       },
       "dedupe": {
         "fields": [
@@ -378,9 +395,12 @@
         "fields": [
           "input",
           "rubric",
+          "levels",
           "prompt",
           "skills",
-          "model"
+          "model",
+          "confidence",
+          "on_unsure"
         ],
         "implemented": true,
         "required": [
@@ -636,7 +656,9 @@
           "choices",
           "prompt",
           "skills",
-          "model"
+          "model",
+          "confidence",
+          "on_unsure"
         ],
         "implemented": true,
         "required": [
@@ -1053,6 +1075,7 @@
             "summarize",
             "judge",
             "route",
+            "decide",
             "agent",
             "subagent",
             "human"

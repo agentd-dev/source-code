@@ -187,6 +187,7 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         stop_reason,
         usage: usage.unwrap_or_default(),
         fallback: None,
+        decision: None,
     })
 }
 
@@ -206,6 +207,7 @@ mod tests {
             }],
             max_tokens: 256,
             temperature: Some(0.0),
+            decision: None,
         }
     }
 

@@ -351,9 +351,16 @@ impl Endpoint {
         trace_id: Option<&str>,
     ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
         use super::{anthropic, openai};
-        use crate::net::http;
         use std::collections::HashMap;
-        use std::time::Instant;
+
+        if let Some(d) = &req.decision {
+            return self.decide_once(req, d, timeout, trace_id);
+        }
+        if self.provider == Provider::Decisions {
+            return Err(IntelError::Unsupported(
+                "a decisions endpoint answers decisions, not conversations".into(),
+            ));
+        }
 
         // Provider tool-name compatibility: real OpenAI/Anthropic reject tool names
         // that aren't `^[a-zA-Z0-9_-]+$`, but agentd uses dotted namespaced names
@@ -398,10 +405,11 @@ impl Endpoint {
         };
 
         use super::bedrock;
-        let (body, mut headers) = match self.provider {
+        let (body, headers) = match self.provider {
             Provider::OpenAiCompatible => openai::build_request(req, self.token.as_deref()),
             Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
             Provider::Bedrock => bedrock::build_request(req, self.token.as_deref()),
+            Provider::Decisions => unreachable!("answered above"),
         };
         // The effective request path: fixed for OpenAI and Anthropic; Bedrock
         // derives `/model/{modelId}/converse` from the request. The SAME string
@@ -409,6 +417,103 @@ impl Endpoint {
         // signature covers the exact request-target. Recomputing it separately
         // for either use would silently invalidate every signature.
         let path = self.provider.request_path(&self.http_path, req);
+        let (resp, latency) = self.post(&path, body, headers, timeout, trace_id)?;
+
+        let mut parsed = match self.provider {
+            Provider::OpenAiCompatible => openai::parse_response(&resp.body),
+            Provider::Anthropic => anthropic::parse_response(&resp.body),
+            Provider::Bedrock => bedrock::parse_response(&resp.body),
+            Provider::Decisions => unreachable!("answered above"),
+        }
+        .map_err(IntelError::Parse)?;
+        // Undo the wire sanitization: route by the original (dotted) tool names.
+        if !wire_to_orig.is_empty() {
+            for tc in &mut parsed.tool_calls {
+                if let Some(orig) = wire_to_orig.get(&tc.name) {
+                    tc.name = orig.clone();
+                }
+            }
+        }
+        Ok((parsed, latency))
+    }
+
+    /// Answer a decision (RFC 0046 §5.5): natively on a `decisions` endpoint,
+    /// else by asking this chat endpoint every question in one call — its
+    /// answers then uncalibrated.
+    fn decide_once(
+        &self,
+        req: &crate::wire::intel::Request,
+        d: &crate::wire::decision::Decision,
+        timeout: Duration,
+        trace_id: Option<&str>,
+    ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
+        use super::decisions;
+        use crate::wire::intel::{Message, Request, Response, StopReason};
+        if self.provider == Provider::Decisions {
+            let (body, headers) = decisions::build_request(&req.model, d, self.token.as_deref());
+            let (resp, latency) = self.post(&self.http_path, body, headers, timeout, trace_id)?;
+            let (answers, usage) =
+                decisions::parse_response(&resp.body, d).map_err(IntelError::Parse)?;
+            let answered = Response {
+                text: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+                usage,
+                fallback: None,
+                decision: Some(answers),
+            };
+            return Ok((answered, latency));
+        }
+        let mut chat = Request {
+            model: req.model.clone(),
+            messages: decisions::emulation_messages(d),
+            max_tokens: req.max_tokens,
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let (mut resp, mut latency) = self.complete_once(&chat, timeout, trace_id)?;
+        // A chat model that misses the shape is told why and asked once
+        // more. Either way the tokens it spent are on the response: an answer
+        // that is still not a decision comes back with `decision: None` and
+        // its usage, for the caller to fail and to count.
+        let text = resp.text.clone().unwrap_or_default();
+        match decisions::parse_emulated(&text, d) {
+            Ok(answers) => resp.decision = Some(answers),
+            Err(why) => {
+                chat.messages.push(Message::Assistant {
+                    text: Some(text),
+                    tool_calls: Vec::new(),
+                });
+                chat.messages.push(Message::User(format!(
+                    "That answer cannot be used: {why}. Reply again with ONLY the JSON object, every question answered."
+                )));
+                let first = resp.usage;
+                let (again, l) = self.complete_once(&chat, timeout, trace_id)?;
+                latency += l;
+                resp = again;
+                resp.usage.input_tokens += first.input_tokens;
+                resp.usage.output_tokens += first.output_tokens;
+                resp.decision =
+                    decisions::parse_emulated(resp.text.as_deref().unwrap_or(""), d).ok();
+            }
+        }
+        Ok((resp, latency))
+    }
+
+    /// POST one request body to this endpoint and read the answer: the trace
+    /// header, the configured headers and the signatures added, a transient
+    /// status retried a bounded number of times, any other failure returned.
+    fn post(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        mut headers: Vec<(String, String)>,
+        timeout: Duration,
+        trace_id: Option<&str>,
+    ) -> Result<(crate::net::http::Response, Duration), IntelError> {
+        use crate::net::http;
+        use std::time::Instant;
+        let path = path.to_string();
         if let Some(tid) = trace_id {
             headers.push((
                 "traceparent".into(),
@@ -478,22 +583,7 @@ impl Endpoint {
             let snippet: String = resp.body_str().chars().take(512).collect();
             return Err(IntelError::Http(resp.status, snippet));
         };
-
-        let mut parsed = match self.provider {
-            Provider::OpenAiCompatible => openai::parse_response(&resp.body),
-            Provider::Anthropic => anthropic::parse_response(&resp.body),
-            Provider::Bedrock => bedrock::parse_response(&resp.body),
-        }
-        .map_err(IntelError::Parse)?;
-        // Undo the wire sanitization: route by the original (dotted) tool names.
-        if !wire_to_orig.is_empty() {
-            for tc in &mut parsed.tool_calls {
-                if let Some(orig) = wire_to_orig.get(&tc.name) {
-                    tc.name = orig.clone();
-                }
-            }
-        }
-        Ok((parsed, latency))
+        Ok((resp, latency))
     }
 }
 

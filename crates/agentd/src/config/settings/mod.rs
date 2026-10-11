@@ -1700,6 +1700,9 @@ impl Connection<'_> {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ModelTier {
+    /// What the model does: `chat` (the default) generates; `decision`
+    /// answers typed questions about a state (RFC 0046 §5.1) and only that.
+    pub kind: ModelKind,
     /// The wire model name sent to the provider. Required.
     pub model: Option<String>,
     /// The connection it is reached on: a name under `providers`. Absent, the
@@ -1714,6 +1717,31 @@ pub struct ModelTier {
     /// providers, instead of failing. (A squeezed budget moves a turn to
     /// `budget.degrade.model`, not down this ladder.)
     pub fallback: Option<String>,
+    /// A decision model's: the model an unsure answer is asked again on
+    /// (RFC 0046 §5.6), once; its answer is final.
+    pub escalate: Option<String>,
+}
+
+/// A model's kind (RFC 0046 §5.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    /// Generates text, tool calls or JSON — and answers a decision by
+    /// emulation, uncalibrated.
+    #[default]
+    Chat,
+    /// Answers decisions natively, on a `dialect: decisions` provider; writes
+    /// nothing.
+    Decision,
+}
+
+impl ModelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelKind::Chat => "chat",
+            ModelKind::Decision => "decision",
+        }
+    }
 }
 
 /// The model each job runs on. Each names a declared model (or, with no
@@ -1833,6 +1861,12 @@ impl Intelligence {
     pub fn role_window(&self, role: ModelRole) -> Option<u64> {
         self.reference(role)
             .and_then(|r| self.tier(&r).and_then(|t| t.window))
+    }
+
+    /// A reference's kind: its declared model's, else `chat` (a literal is a
+    /// chat model on the top-level connection).
+    pub fn kind_of(&self, reference: &str) -> ModelKind {
+        self.tier(reference).map(|t| t.kind).unwrap_or_default()
     }
 
     /// The connection a model reference is reached on: its model's
@@ -6934,6 +6968,69 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     &mut d,
                     format!("{at}.fallback: a model cannot fall back to itself"),
                 );
+            } else if t.kind == ModelKind::Chat && s.intelligence.kind_of(f) == ModelKind::Decision
+            {
+                // A chat model is asked to write; a decision model cannot. A
+                // decision model's fallback may be chat, which emulates.
+                err(
+                    &mut d,
+                    format!(
+                        "{at}.fallback: {f:?} is a decision model, and a chat model's fallback must write too"
+                    ),
+                );
+            }
+        }
+        // The kind and the connection go together: a decision model is
+        // reached on a `dialect: decisions` provider, a chat model never is.
+        let decisions_dialect = s
+            .intelligence
+            .connection(t.provider.as_deref())
+            .and_then(|c| c.dialect)
+            == Some("decisions");
+        match t.kind {
+            ModelKind::Decision => {
+                if !decisions_dialect {
+                    err(
+                        &mut d,
+                        format!(
+                            "{at}: a decision model is reached on a provider with `dialect: decisions`"
+                        ),
+                    );
+                }
+                if t.window.is_some() {
+                    err(
+                        &mut d,
+                        format!("{at}.window: a decision model has no transcript to fit"),
+                    );
+                }
+                match &t.escalate {
+                    Some(e) if e == name => err(
+                        &mut d,
+                        format!("{at}.escalate: a model cannot escalate to itself"),
+                    ),
+                    Some(e) if !s.intelligence.models.contains_key(e) => {
+                        err(&mut d, format!("{at}.escalate: no model named {e:?}"))
+                    }
+                    _ => {}
+                }
+            }
+            ModelKind::Chat => {
+                if decisions_dialect {
+                    err(
+                        &mut d,
+                        format!(
+                            "{at}: a `dialect: decisions` provider answers decisions only — declare the model `kind: decision`"
+                        ),
+                    );
+                }
+                if t.escalate.is_some() {
+                    err(
+                        &mut d,
+                        format!(
+                            "{at}.escalate: escalation re-asks an unsure decision; it is a decision model's"
+                        ),
+                    );
+                }
             }
         }
     }
@@ -6982,6 +7079,25 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             (ModelRole::Approve, Some(op)) => &op.models,
             _ => &s.intelligence.models,
         };
+        // Every role but `decide` writes, and so needs a chat model.
+        // Decision models in preflight, the goal check and approvals are
+        // RFC 0046 phase 3; until then they write too.
+        let in_section = match (role, s.intelligence.operator.as_deref()) {
+            (ModelRole::Approve, Some(op)) => op,
+            _ => &s.intelligence,
+        };
+        if role != ModelRole::Decide
+            && let Some(r) = in_section.reference(role)
+            && in_section.kind_of(&r) == ModelKind::Decision
+        {
+            err(
+                &mut d,
+                format!(
+                    "intelligence.roles.{}: {r:?} is a decision model; this role needs one that writes (a chat model)",
+                    role.as_str()
+                ),
+            );
+        }
         if let Some(r) = s.intelligence.roles.get(role)
             && !catalogue.is_empty()
             && !catalogue.contains_key(r)
@@ -6992,6 +7108,54 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     "intelligence.roles.{}: {r:?} is not a declared model (known: {})",
                     role.as_str(),
                     catalogue.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            );
+        }
+    }
+
+    // What qualifies a spawn or a budget names a model that writes: a child
+    // and a degraded turn both generate.
+    let spawn_and_budget_models = [
+        (
+            "intelligence.budget.degrade.model".to_string(),
+            s.intelligence.budget.degrade.model.clone(),
+        ),
+        (
+            "agent.conversation_budget.degrade.model".to_string(),
+            s.agent
+                .conversation_budget
+                .as_ref()
+                .and_then(|b| b.degrade.model.clone()),
+        ),
+        (
+            "subagents.defaults.model".to_string(),
+            s.subagents.defaults.model.clone(),
+        ),
+    ]
+    .into_iter()
+    .chain(
+        s.subagents
+            .templates
+            .iter()
+            .map(|(n, t)| (format!("subagents.templates.{n}.model"), t.model.clone())),
+    )
+    .chain(s.a2a.principals.iter().enumerate().map(|(i, p)| {
+        (
+            format!("a2a.principals[{i}].quotas.budget.degrade.model"),
+            p.quotas
+                .as_ref()
+                .and_then(|q| q.budget.as_ref())
+                .and_then(|b| b.degrade.model.clone()),
+        )
+    }));
+    for (field, reference) in spawn_and_budget_models {
+        if let Some(r) = reference
+            && s.intelligence.kind_of(&r) == ModelKind::Decision
+        {
+            err(
+                &mut d,
+                format!(
+                    "{field}: {r:?} is a decision model; this needs one that writes (a chat model)"
                 ),
             );
         }
@@ -7731,29 +7895,18 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         } else {
             wf_names.insert(name.to_string(), i);
         }
-        // A `model:` on a node names a TIER once a catalogue exists. Catching
-        // the typo here keeps it a startup error instead of a run that
-        // silently asks the provider for a model called `smal`.
-        if !s.intelligence.models.is_empty()
-            && let Some(steps) = obj.get("steps").and_then(Value::as_object)
-        {
+        // What each inline step asks of the model catalogue — the same check
+        // `model_refusals` makes of every workflow at load, here so that
+        // `--validate-config` reports it too.
+        if let Some(steps) = obj.get("steps").and_then(Value::as_object) {
             for (sid, st) in steps {
-                let Some(m) = st.get("model").and_then(Value::as_str) else {
+                let (Some(kind), Some(spec)) =
+                    (st.get("kind").and_then(Value::as_str), st.as_object())
+                else {
                     continue;
                 };
-                if !s.intelligence.models.contains_key(m) {
-                    err(
-                        &mut d,
-                        format!(
-                            "workflow '{name}' step '{sid}': model {m:?} is not a declared model (known: {})",
-                            s.intelligence
-                                .models
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    );
+                for e in step_model_refusals(s, kind, spec) {
+                    err(&mut d, format!("workflow '{name}' step '{sid}': {e}"));
                 }
             }
         }
@@ -8553,6 +8706,118 @@ fn validate_budget(b: &Budget, at: &str, d: &mut Diagnostics) {
     }
 }
 
+/// What one workflow step asks of the model catalogue that it cannot give
+/// (RFC 0046 §6): a `model:` that is not declared; a decision model on a
+/// node that writes; `on_unsure: escalate` with no model to escalate to; a
+/// decision model asked to choose among fewer than 2 or more than 32
+/// options. Each reason is phrased to follow `workflow … step …: `.
+pub(crate) fn step_model_refusals(
+    s: &Settings,
+    kind: &str,
+    spec: &Map<String, Value>,
+) -> Vec<String> {
+    use crate::engine::model::DECIDING_KINDS;
+    let intel = &s.intelligence;
+    let mut out = Vec::new();
+    let named = spec.get("model").and_then(Value::as_str);
+    if let Some(m) = named
+        && !intel.models.is_empty()
+        && !intel.models.contains_key(m)
+    {
+        out.push(format!(
+            "model {m:?} is not a declared model (known: {})",
+            intel.models.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+        return out;
+    }
+    let deciding = DECIDING_KINDS.contains(&kind);
+    if let Some(m) = named
+        && intel.kind_of(m) == ModelKind::Decision
+        && !deciding
+    {
+        out.push(format!(
+            "model {m:?} is a decision model; a `{kind}` node writes, so it needs a chat model (decisions run in decide, classify, route and judge)"
+        ));
+    }
+    if !deciding {
+        return out;
+    }
+    let reference = named
+        .map(str::to_string)
+        .or_else(|| intel.reference(ModelRole::Decide));
+    let model = reference.as_deref().and_then(|r| intel.tier(r));
+    if spec.get("on_unsure").and_then(Value::as_str) == Some("escalate")
+        && !model.is_some_and(|t| t.escalate.is_some())
+    {
+        out.push(format!(
+            "on_unsure: escalate, but its model ({}) names no `escalate` model",
+            reference.as_deref().unwrap_or("none")
+        ));
+    }
+    if model.is_some_and(|t| t.kind == ModelKind::Decision) {
+        let field = match kind {
+            "classify" => Some("classes"),
+            "route" => Some("choices"),
+            _ => None,
+        };
+        if let Some(field) = field {
+            let n = match spec.get(field) {
+                Some(Value::Array(a)) => a.len(),
+                Some(Value::Object(o)) => o.len(),
+                _ => 0,
+            };
+            if !(2..=crate::wire::decision::MAX_OPTIONS).contains(&n) {
+                out.push(format!(
+                    "{field}: {n} — a decision model chooses among 2 to {}",
+                    crate::wire::decision::MAX_OPTIONS
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// [`step_model_refusals`] for every step of `w`, nested bodies included,
+/// and its own budget's degrade model — for every way a workflow arrives:
+/// configured inline, from a file, a URL, a folder or a resource, stored,
+/// or written by the agent (`runtime::steps::reference_errors`).
+pub(crate) fn model_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Vec<String> {
+    use crate::engine::model::Step;
+    fn walk<'a>(steps: impl Iterator<Item = &'a Step>, out: &mut Vec<&'a Step>) {
+        for st in steps {
+            out.push(st);
+            for body in st.body.iter().chain(st.branches.values()) {
+                walk(body.steps.values(), out);
+            }
+        }
+    }
+    let mut steps = Vec::new();
+    walk(w.steps.values(), &mut steps);
+    let mut out: Vec<String> = steps
+        .into_iter()
+        .flat_map(|st| {
+            step_model_refusals(s, &st.kind, &st.spec)
+                .into_iter()
+                .map(move |e| format!("workflow {:?} step {:?}: {e}", w.name, st.id))
+        })
+        .collect();
+    if let Some(m) = w
+        .limits
+        .budget
+        .as_ref()
+        .and_then(|b| b.get("degrade"))
+        .and_then(|d| d.get("model"))
+        .and_then(Value::as_str)
+        && s.intelligence.kind_of(m) == ModelKind::Decision
+    {
+        out.push(format!(
+            "workflow {:?}: limits.budget.degrade.model {m:?} is a decision model; a degraded turn writes, so it needs a chat model",
+            w.name
+        ));
+    }
+    out
+}
+
 /// One intelligence connection's own rules, the same for the top-level one
 /// and every provider: dialable endpoints, a known dialect with the
 /// credential it needs, a coherent `auth:` block, and no inline credential in
@@ -8581,7 +8846,13 @@ fn validate_connection(c: &Connection<'_>, d: &mut Diagnostics) {
     if let Some(dialect) = c.dialect {
         if crate::intel::client::Provider::from_dialect(Some(dialect)).is_none() {
             d.errors.push(format!(
-                "{at}.dialect: {dialect:?} (want openai|anthropic|bedrock)"
+                "{at}.dialect: {dialect:?} (want openai|anthropic|bedrock|decisions)"
+            ));
+        }
+        // The top-level connection serves the agent's turns, which write.
+        if dialect == "decisions" && c.name.is_none() {
+            d.errors.push(format!(
+                "{at}.dialect: decisions — the top-level connection serves the agent's turns; a decision model's endpoint goes under intelligence.providers"
             ));
         }
         // Native Bedrock authenticates by SigV4 — an `auth: {kind: aws}` is
@@ -13789,6 +14060,71 @@ mod tests {
             "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example/v1\"}\nsecurity: {egress: closed}\nservices:\n  p: {kind: intelligence, endpoint: \"https://p.example/v1\"}\n",
         );
         assert!(!e.contains("intelligence provider"), "{e}");
+    }
+
+    /// A model's kind goes with its connection and with what it is asked to
+    /// do: a decision model on a decisions provider, answering decisions;
+    /// a chat model anywhere else, writing.
+    #[test]
+    fn kinds_are_checked_against_connections_roles_and_spawns() {
+        let errors = |extra: &str| -> String {
+            let doc = format!(
+                "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jevp: {{endpoints: \"https://jev.example/v1/decisions\", dialect: decisions}}\n    chatp: {{endpoints: \"https://chat.example/v1\"}}\n{extra}"
+            );
+            match load_doc(&doc) {
+                Ok(l) => validate(&l).errors.join("; "),
+                Err(e) => e.to_string(),
+            }
+        };
+        let ok = errors(
+            "  models:\n    smart: {model: s-1}\n    jev: {kind: decision, provider: jevp, model: j-1, escalate: smart, fallback: smart}\n  roles: {turn: smart, decide: jev}\n",
+        );
+        assert!(ok.is_empty(), "{ok}");
+        for (extra, why) in [
+            (
+                "  models:\n    jev: {kind: decision, provider: chatp, model: j-1}\n",
+                "reached on a provider with `dialect: decisions`",
+            ),
+            (
+                "  models:\n    jev: {kind: decision, model: j-1}\n",
+                "reached on a provider with `dialect: decisions`",
+            ),
+            (
+                "  models:\n    c: {provider: jevp, model: c-1}\n",
+                "answers decisions only",
+            ),
+            (
+                "  models:\n    jev: {kind: decision, provider: jevp, model: j-1, window: 9}\n",
+                "no transcript",
+            ),
+            (
+                "  models:\n    c: {model: c-1, escalate: c2}\n    c2: {model: c-2}\n",
+                "it is a decision model's",
+            ),
+            (
+                "  models:\n    c: {model: c-1, fallback: jev}\n    jev: {kind: decision, provider: jevp, model: j-1}\n",
+                "a chat model's fallback must write too",
+            ),
+            (
+                "  models:\n    jev: {kind: decision, provider: jevp, model: j-1}\n  roles: {think: jev}\n",
+                "intelligence.roles.think: \"jev\" is a decision model",
+            ),
+            (
+                "  models:\n    jev: {kind: decision, provider: jevp, model: j-1}\n  budget: {degrade: {model: jev}}\n",
+                "intelligence.budget.degrade.model: \"jev\" is a decision model",
+            ),
+            (
+                "  models:\n    jev: {kind: decision, provider: jevp, model: j-1, escalate: nobody}\n",
+                "escalate: no model named",
+            ),
+            (
+                "  dialect: decisions\n",
+                "the top-level connection serves the agent's turns",
+            ),
+        ] {
+            let e = errors(extra);
+            assert!(e.contains(why), "{extra}\n→ {e}");
+        }
     }
 
     /// The judge that answers on the operator's behalf resolves in the

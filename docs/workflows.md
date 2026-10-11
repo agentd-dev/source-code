@@ -297,17 +297,21 @@ read at restore, where it decides what happens to a step caught in flight.
 | `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system`, `model` |
 | `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system`, `model` |
 | `subagent` | **`instruction`** *or* **`template`** (never both), `params` (only with `template`), `mode`, `tools`, `servers`, `limits`, `priority`, `context`, `output_contract`, `output_schema`, `skills`, `durable` |
-| `classify` | **`input`**, **`classes`**, `prompt`, `skills`, `model` |
+| `classify` | **`input`**, **`classes`**, `prompt`, `skills`, `model`, `confidence`, `on_unsure` |
 | `extract` | **`input`**, **`output_schema`**, `prompt`, `skills`, `model` |
 | `summarize` | **`input`**, `length`, `prompt`, `skills`, `model` |
-| `judge` | **`input`**, **`rubric`**, `prompt`, `skills`, `model` |
-| `route` | **`input`**, **`choices`**, `prompt`, `skills`, `model` |
+| `judge` | **`input`**, **`rubric`**, `levels`, `prompt`, `skills`, `model`, `confidence`, `on_unsure` |
+| `route` | **`input`**, **`choices`**, `prompt`, `skills`, `model`, `confidence`, `on_unsure` |
+| `decide` | **`state`**, **`questions`**, `model`, `confidence`, `on_unsure` |
 
 `agent` takes a full tool-using turn against the workflow caller's tool plan,
 with rounds bounded only by the step's budget and limits. `think` is the
 tool-free variant, capped at three rounds. The five presets are sugar: each
 synthesises a fixed prompt frame and output schema and runs through the same
-`think` machinery. `think` takes `prompt`; `agent` and `subagent` take
+`think` machinery — on a chat model. On a decision model (`kind: decision`)
+`classify`, `route` and `judge` are one native question each, and `decide`
+asks several about one state; see
+[node-registry.md](node-registry.md#decisions). `think` takes `prompt`; `agent` and `subagent` take
 `instruction` — the fields are not interchangeable, and using the wrong one is a
 validation error.
 

@@ -447,6 +447,8 @@ impl Runtime {
             temperature: None,
             max_tokens_per_call: 0,
             turn_id: turn_id.clone(),
+            decision: None,
+            sure: None,
         };
         let launch = TurnLaunch {
             spec,
@@ -588,6 +590,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             temperature: Some(0.0),
             max_tokens_per_call: 1024,
             turn_id: self.next_id("preflight"),
+            decision: None,
+            sure: None,
         };
         let stage_id = {
             self.seq += 1;
@@ -1158,8 +1162,20 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 extra,
                 reservation,
             } => {
-                if let Some(r) = reservation {
-                    self.governor.settle(r, turn.usage);
+                // The `think` and `decide` tools, preflight and compaction run
+                // with no dispatch reservation: their worker's per-call
+                // admissions are released as granted, so what they spent is
+                // charged here — to the instance and to the conversation they
+                // ran for — or no budget ever saw it.
+                match reservation {
+                    Some(r) => self.governor.settle(r, turn.usage),
+                    None => {
+                        let scopes = ctx
+                            .as_deref()
+                            .map(|c| self.conversation_scopes(c))
+                            .unwrap_or_default();
+                        self.governor.charge(turn.usage, &scopes);
+                    }
                 }
                 self.on_think_done(&purpose, ctx.as_deref(), reply_to, extra, turn);
             }
@@ -1382,6 +1398,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             temperature: Some(0.0),
             max_tokens_per_call: 4096,
             turn_id: self.next_id("compact"),
+            decision: None,
+            sure: None,
         };
         let extra = json!({"fold": req.fold, "version": req.version, "keep_last": keep_last});
         let launch = TurnLaunch {
@@ -1506,7 +1524,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 self.apply_fallback_compaction(ctx_id, &req, reply_to);
             }
             _ => {
-                // `think` tool: hand the value (or the error) back to the requester.
+                // `think` and `decide` tools: hand the value (or the error)
+                // back to the requester.
                 if let Some((node, id)) = reply_to {
                     if turn.status == "completed" {
                         let v = turn
@@ -1520,7 +1539,12 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                             node,
                             id,
                             Value::String(format!(
-                                "think {}: {}",
+                                "{} {}: {}",
+                                if purpose == "decide" {
+                                    "decide"
+                                } else {
+                                    "think"
+                                },
                                 turn.status,
                                 turn.error.unwrap_or_default()
                             )),

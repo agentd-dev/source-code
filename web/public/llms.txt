@@ -407,6 +407,7 @@ Required fields in **bold**.
 | `summarize` | shorten **`input`**; `length` |
 | `judge` | score **`input`** against a **`rubric`** |
 | `route` | pick one of **`choices`** for **`input`** |
+| `decide` | typed questions — `choice`, `noul`, `score` — about one **`state`**; **`questions`**, `confidence`, `on_unsure` |
 | `human` | ask a person — **`question`**, `schema`, `to`, `timeout`. Suspends durably; the answer can arrive after a restart |
 
 ### 7.4 On every step

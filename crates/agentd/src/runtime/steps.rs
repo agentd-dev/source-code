@@ -87,9 +87,17 @@ pub(crate) struct PreparedWorkflows {
 pub(crate) fn node_role(kind: &str) -> ModelRole {
     match kind {
         "think" => ModelRole::Think,
-        "classify" | "route" | "judge" => ModelRole::Decide,
+        k if crate::engine::model::DECIDING_KINDS.contains(&k) => ModelRole::Decide,
         _ => ModelRole::Turn,
     }
+}
+
+/// What a step turn does beyond its prompt: a decision to answer instead,
+/// and a deciding node's `confidence`/`on_unsure`.
+#[derive(Default)]
+pub(crate) struct StepWork {
+    pub decision: Option<Box<crate::subagent::protocol::DecisionJob>>,
+    pub sure: Option<crate::subagent::protocol::Sureness>,
 }
 
 impl Runtime {
@@ -588,6 +596,9 @@ impl Runtime {
             &self.settings,
             w,
         ));
+        // Every model a step names, at any depth, is one the catalogue has,
+        // of a kind the step can use.
+        errs.extend(crate::config::settings::model_refusals(&self.settings, w));
         errs
     }
 
@@ -2014,7 +2025,15 @@ impl Runtime {
             }
             "agent" | "think" => {
                 let role = node_role(&step.kind);
-                self.step_turn(run_id, step_id, &step, &spec, &data, role)
+                self.step_turn(
+                    run_id,
+                    step_id,
+                    &step,
+                    &spec,
+                    &data,
+                    role,
+                    StepWork::default(),
+                )
             }
             "foreach" | "batch" | "iterate" | "parallel" | "race" | "subgraph" => {
                 self.nested_start(run_id, step_id, &step, &spec)
@@ -2022,7 +2041,7 @@ impl Runtime {
             "wait" | "join" | "workflow" | "message" | "workflow.signal" | "workflow.wait"
             | "workflow.cancel" | "subagent" | "human" | "mcp.resource" | "a2a.delegate"
             | "a2a.send" | "a2a.wait" | "classify" | "extract" | "summarize" | "judge"
-            | "route" => {
+            | "route" | "decide" => {
                 self.execute_orchestration_step(run_id, step_id, &step, &spec, &data, &step_caller)
             }
             "switch" => {
@@ -2327,6 +2346,7 @@ impl Runtime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_turn_pub(
         &mut self,
         run_id: &str,
@@ -2335,12 +2355,15 @@ impl Runtime {
         spec: &Map<String, Value>,
         data: &template::Data,
         role: ModelRole,
+        work: StepWork,
     ) {
-        self.step_turn(run_id, step_id, step, spec, data, role)
+        self.step_turn(run_id, step_id, step, spec, data, role, work)
     }
 
     /// An `agent`/`think` step → a turn worker (budget-admitted), on the
-    /// node's `model:` or else `role`'s.
+    /// node's `model:` or else `role`'s. With a decision in `work`, the worker
+    /// answers it instead (RFC 0046 §5.5).
+    #[allow(clippy::too_many_arguments)]
     fn step_turn(
         &mut self,
         run_id: &str,
@@ -2349,8 +2372,10 @@ impl Runtime {
         spec: &Map<String, Value>,
         data: &template::Data,
         role: ModelRole,
+        work: StepWork,
     ) {
-        let is_think = step.kind == "think";
+        let deciding = work.decision.is_some();
+        let is_think = step.kind == "think" || deciding;
         let prompt = if is_think {
             spec.get("prompt").and_then(Value::as_str).unwrap_or("")
         } else {
@@ -2564,7 +2589,9 @@ impl Runtime {
                 .unwrap_or(600_000),
         );
         let spec = TurnSpec {
-            kind: if is_think {
+            kind: if deciding {
+                TurnKind::Decide
+            } else if is_think {
                 TurnKind::Think
             } else {
                 TurnKind::Agent
@@ -2591,6 +2618,8 @@ impl Runtime {
                     .map(|s| s.attempt)
                     .unwrap_or(1)
             ),
+            decision: work.decision,
+            sure: work.sure,
         };
         let launch = super::turns::TurnLaunch {
             spec,

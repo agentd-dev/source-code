@@ -7,6 +7,7 @@ pub mod anthropic;
 // bedrock` selector is set.
 pub mod bedrock;
 pub mod client;
+pub mod decisions;
 // Intelligence transport resilience: the endpoint list, per-endpoint health +
 // circuit breaker, and the sticky-primary failover policy. Always compiled and
 // dependency-free. A single-endpoint list drives exactly the same code path as

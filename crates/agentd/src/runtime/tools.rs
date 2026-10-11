@@ -793,6 +793,13 @@ impl Runtime {
                 },
                 None => err("think as a step is the `think` kind".into()),
             },
+            "decide" => match caller.node {
+                Some(node) => match self.start_decide(caller, &args, (node, caller.req)) {
+                    Ok(child) => ToolOutcome::Deferred(PendingKind::Think { child }),
+                    Err(e) => err(e),
+                },
+                None => err("decide as a step is the `decide` kind".into()),
+            },
             // ---- lifecycle ----
             "finish" => {
                 // The turn worker records the finish itself and reports it in
@@ -1257,6 +1264,79 @@ impl Runtime {
         }
     }
 
+    /// Launch a `decide` child for a tool request (RFC 0046 §7): the decision
+    /// on `roles.decide`, its answers handed back as the tool's result. An
+    /// answer under the call's `confidence` is asked again on the decision
+    /// model's `escalate` model when it names one, else marked `unsure` —
+    /// the agent asked, and it reads the mark; failing the call would only
+    /// hide the answers from it.
+    pub(crate) fn start_decide(
+        &mut self,
+        caller: &ToolCaller,
+        args: &Value,
+        reply_to: (NodeId, u64),
+    ) -> Result<NodeId, String> {
+        use crate::subagent::protocol::{DecisionJob, OnUnsure, TurnKind, TurnSpec};
+        let decision = crate::wire::decision::Decision {
+            state: args.get("state").cloned().unwrap_or(Value::Null),
+            questions: crate::wire::decision::Decision::parse_questions(
+                args.get("questions").unwrap_or(&Value::Null),
+            )
+            .map_err(|e| format!("decide: {e}"))?,
+        };
+        let reference = self
+            .settings
+            .intelligence
+            .reference(crate::config::settings::ModelRole::Decide);
+        let escalate = reference
+            .as_deref()
+            .and_then(|r| self.settings.intelligence.tier(r))
+            .and_then(|t| t.escalate.clone())
+            .map(|e| self.intel_config(Some(&e)));
+        let sure = args
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|confidence| crate::subagent::protocol::Sureness {
+                confidence: confidence.clamp(0.0, 1.0),
+                on_unsure: if escalate.is_some() {
+                    OnUnsure::Escalate
+                } else {
+                    OnUnsure::Continue
+                },
+            });
+        let ctx_id = caller.context_id();
+        let spec = TurnSpec {
+            kind: TurnKind::Decide,
+            budget_admission: self.governor.is_active(),
+            turn_id: self.next_id("decide"),
+            decision: Some(Box::new(DecisionJob {
+                decision,
+                shape: crate::wire::decision::Shape::Decide,
+                escalate,
+            })),
+            sure,
+            ..Default::default()
+        };
+        let launch = super::turns::TurnLaunch {
+            spec,
+            kind: ChildKind::Think {
+                purpose: "decide".into(),
+                ctx: Some(ctx_id.clone()),
+                reply_to: Some(reply_to),
+                extra: Value::Null,
+                reservation: None,
+            },
+            servers: Vec::new(),
+            max_steps: 1,
+            max_tokens: self.settings.limits.run.tokens(),
+            deadline_ms: 300_000,
+            agent_path: format!("decide/{ctx_id}"),
+            model: None,
+            role: crate::config::settings::ModelRole::Decide,
+        };
+        self.spawn_turn(launch)
+    }
+
     /// Launch a `think` child for a tool request / a step.
     pub(crate) fn start_think(
         &mut self,
@@ -1309,6 +1389,8 @@ impl Runtime {
             temperature: Some(0.0),
             max_tokens_per_call: 0,
             turn_id: self.next_id("think"),
+            decision: None,
+            sure: None,
         };
         let launch = super::turns::TurnLaunch {
             spec,

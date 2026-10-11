@@ -208,7 +208,9 @@
       "classes",
       "prompt",
       "skills",
-      "model"
+      "model",
+      "confidence",
+      "on_unsure"
     ],
     "implemented": true,
     "kind": "classify",
@@ -237,6 +239,22 @@
       "on"
     ],
     "start": true
+  },
+  "decide": {
+    "fields": [
+      "state",
+      "questions",
+      "model",
+      "confidence",
+      "on_unsure"
+    ],
+    "implemented": true,
+    "kind": "decide",
+    "required": [
+      "state",
+      "questions"
+    ],
+    "start": false
   },
   "dedupe": {
     "category": "data",
@@ -431,9 +449,12 @@
     "fields": [
       "input",
       "rubric",
+      "levels",
       "prompt",
       "skills",
-      "model"
+      "model",
+      "confidence",
+      "on_unsure"
     ],
     "implemented": true,
     "kind": "judge",
@@ -733,7 +754,9 @@
       "choices",
       "prompt",
       "skills",
-      "model"
+      "model",
+      "confidence",
+      "on_unsure"
     ],
     "implemented": true,
     "kind": "route",

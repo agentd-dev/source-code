@@ -160,6 +160,7 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         stop_reason,
         usage: usage.unwrap_or_default(),
         fallback: None,
+        decision: None,
     })
 }
 
@@ -180,6 +181,7 @@ mod tests {
             }],
             max_tokens: 100,
             temperature: None,
+            decision: None,
         };
         let (body, headers) = build_request(&req, Some("sk-ant"));
         let v: Value = serde_json::from_slice(&body).unwrap();

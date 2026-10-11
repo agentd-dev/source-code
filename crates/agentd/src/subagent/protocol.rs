@@ -354,6 +354,54 @@ pub enum TurnKind {
     /// A bounded agentic run for a workflow `agent` step / subagent: tools,
     /// output contract/schema, ends with a result.
     Agent,
+    /// One decision (RFC 0046 §5.5): no conversation, typed answers out —
+    /// native on a decision model, emulated on a chat model.
+    Decide,
+}
+
+/// A `Decide` turn's work: the decision, how its answers are handed back,
+/// and the model an unsure one is asked again on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionJob {
+    pub decision: crate::wire::decision::Decision,
+    #[serde(default)]
+    pub shape: crate::wire::decision::Shape,
+    /// The `escalate` model, resolved; asked once when an answer is unsure
+    /// and `on_unsure` is `escalate`, and final whatever its confidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate: Option<IntelConfig>,
+}
+
+/// The least sureness an answer is acted on with, and what an answer under
+/// it does (RFC 0046 §5.6) — a `confidence` on a deciding node.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sureness {
+    pub confidence: f64,
+    pub on_unsure: OnUnsure,
+}
+
+/// What an answer under the threshold does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnUnsure {
+    /// Ask the same decision again on the model's `escalate` model; its
+    /// answer is final.
+    Escalate,
+    /// Fail the node.
+    Fail,
+    /// Hand the answer on, marked `unsure: true`.
+    Continue,
+}
+
+impl OnUnsure {
+    pub fn parse(s: &str) -> Option<OnUnsure> {
+        match s {
+            "escalate" => Some(OnUnsure::Escalate),
+            "fail" => Some(OnUnsure::Fail),
+            "continue" => Some(OnUnsure::Continue),
+            _ => None,
+        }
+    }
 }
 
 /// The turn worker's input: everything the child needs to run exactly one turn
@@ -403,6 +451,13 @@ pub struct TurnSpec {
     /// The turn id (for logs and idempotency).
     #[serde(default)]
     pub turn_id: String,
+    /// A `Decide` turn's decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<Box<DecisionJob>>,
+    /// A deciding node's `confidence` and `on_unsure`: checked against a
+    /// decision's answers, or a structured answer's own `confidence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sure: Option<Sureness>,
 }
 
 /// A finished turn. `messages` is the transcript DELTA — only the assistant and

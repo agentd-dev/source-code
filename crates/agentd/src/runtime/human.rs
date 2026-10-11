@@ -1101,6 +1101,7 @@ UNDECIDED.";
         tools: vec![],
         max_tokens: 400,
         temperature: Some(0.0),
+        ..Default::default()
     };
     match client.complete(&req) {
         Ok(resp) => json!({"answer": resp.text.unwrap_or_default()}),

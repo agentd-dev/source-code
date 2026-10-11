@@ -34,6 +34,11 @@ pub const DEFAULT_FAN_OUT: u64 = 4;
 pub const MAX_ITERATIONS: u64 = 10_000;
 pub const MAX_ID_LEN: usize = 64;
 
+/// The node kinds that DECIDE (RFC 0046 §6): they run on `roles.decide`
+/// when they name no model, and they are the only ones a decision model may
+/// serve — every other intelligence node writes.
+pub const DECIDING_KINDS: &[&str] = &["decide", "classify", "route", "judge"];
+
 /// A step kind's metadata.
 #[derive(Debug, Clone, Copy)]
 pub struct KindInfo {
@@ -613,7 +618,15 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "classify",
         false,
-        &["input", "classes", "prompt", "skills", "model"],
+        &[
+            "input",
+            "classes",
+            "prompt",
+            "skills",
+            "model",
+            "confidence",
+            "on_unsure",
+        ],
         &["input", "classes"],
         true,
         false,
@@ -637,7 +650,16 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "judge",
         false,
-        &["input", "rubric", "prompt", "skills", "model"],
+        &[
+            "input",
+            "rubric",
+            "levels",
+            "prompt",
+            "skills",
+            "model",
+            "confidence",
+            "on_unsure",
+        ],
         &["input", "rubric"],
         true,
         false,
@@ -645,8 +667,26 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "route",
         false,
-        &["input", "choices", "prompt", "skills", "model"],
+        &[
+            "input",
+            "choices",
+            "prompt",
+            "skills",
+            "model",
+            "confidence",
+            "on_unsure",
+        ],
         &["input", "choices"],
+        true,
+        false,
+    ),
+    // Several typed questions about one state, one call (RFC 0046 §6): on a
+    // decision model natively, on a chat model emulated.
+    k(
+        "decide",
+        false,
+        &["state", "questions", "model", "confidence", "on_unsure"],
+        &["state", "questions"],
         true,
         false,
     ),
@@ -1990,6 +2030,34 @@ fn parse_step(
             ));
         }
     }
+    // `confidence` and `on_unsure` (RFC 0046 §5.6) on the kinds that decide.
+    if DECIDING_KINDS.contains(&kind.as_str()) {
+        if let Some(c) = spec.get("confidence")
+            && !c.as_f64().is_some_and(|c| (0.0..=1.0).contains(&c))
+        {
+            errs.push(format!("{at}: confidence is a number from 0 to 1"));
+        }
+        if let Some(u) = spec.get("on_unsure")
+            && !matches!(u.as_str(), Some("escalate" | "fail" | "continue"))
+        {
+            errs.push(format!("{at}: on_unsure is escalate, fail or continue"));
+        }
+        if spec.get("on_unsure").is_some() && spec.get("confidence").is_none() {
+            errs.push(format!(
+                "{at}: on_unsure says what an answer under `confidence` does; set confidence"
+            ));
+        }
+    }
+    if kind == "judge"
+        && let Some(l) = spec.get("levels")
+        && !l
+            .as_array()
+            .is_some_and(|a| a.len() >= 2 && a.len() <= 32 && a.iter().all(Value::is_string))
+    {
+        errs.push(format!(
+            "{at}: levels is a list of 2 to 32 level names, lowest first"
+        ));
+    }
     // Kind-specific sanity.
     match kind.as_str() {
         // `rate: "<burst>/<per>s"` — arrival throttling, the same spelling as
@@ -2478,6 +2546,13 @@ fn parse_step(
                     crate::cel::compile_check(c.trim().trim_start_matches("CEL:").trim())
             {
                 errs.push(format!("{at}: assert.condition: {e}"));
+            }
+        }
+        "decide" => {
+            if let Some(q) = spec.get("questions")
+                && let Err(e) = crate::wire::decision::Decision::parse_questions(q)
+            {
+                errs.push(format!("{at}: {e}"));
             }
         }
         "think" | "agent" => {

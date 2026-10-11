@@ -84,6 +84,7 @@ fn intelligence_headers_and_bearer_reach_the_llm() {
         tools: Vec::new(),
         max_tokens: 16,
         temperature: Some(0.0),
+        decision: None,
     };
     intel.complete(&req).expect("completion succeeds");
 

@@ -769,6 +769,20 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
     c(
+        "decide",
+        "intelligence",
+        "Ask typed questions about a state and get calibrated answers you can act on: each question is a choice (one of named options), a noul (the probability a statement is true) or a score (a position on ordered levels). Use it for a yes/no, a pick or a rating rather than prose. Answers carry `confidence`; with `confidence:` set, an answer under it is re-asked on a stronger model when one is configured, else marked `unsure: true`.",
+        obj(
+            json!({"state": {"description": "What is decided about: text, a list of texts, or a JSON object"},
+                   "questions": {"type": "object", "description": "id → {choice: {option: criterion} | [option…]} | {noul: \"<statement>\"} | {score: [level…]}, each with an optional `instructions`; at most 16", "additionalProperties": {"type": "object"}},
+                   "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "The least confidence an answer is acted on with"}}),
+            &["state", "questions"],
+        ),
+        any(),
+        true,
+        ALL,
+    );
+    c(
         "finish",
         "lifecycle",
         "Finish the current unit of work with a status and an optional output.",
@@ -1200,6 +1214,7 @@ mod tests {
             "await",
             "context.compact",
             "think",
+            "decide",
             "finish",
             "status",
             "knowledge.search",

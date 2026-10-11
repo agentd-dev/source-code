@@ -36,6 +36,9 @@ pub enum Provider {
     /// Amazon Bedrock Converse — the model id rides the URL path, not the body,
     /// and auth is SigV4 (an `intelligence.auth: {kind: aws}`), not a bearer.
     Bedrock,
+    /// A decision model's endpoint (RFC 0046 §5.5): it answers decisions, not
+    /// conversations, at the full URL configured.
+    Decisions,
 }
 
 impl Provider {
@@ -44,6 +47,7 @@ impl Provider {
             Provider::OpenAiCompatible => openai::DEFAULT_PATH,
             Provider::Anthropic => anthropic::DEFAULT_PATH,
             Provider::Bedrock => bedrock::DEFAULT_PATH,
+            Provider::Decisions => super::decisions::DEFAULT_PATH,
         }
     }
 
@@ -55,6 +59,7 @@ impl Provider {
             None | Some("openai") | Some("openai-compatible") => Some(Provider::OpenAiCompatible),
             Some("anthropic") => Some(Provider::Anthropic),
             Some("bedrock") => Some(Provider::Bedrock),
+            Some("decisions") => Some(Provider::Decisions),
             Some(_) => None,
         }
     }
@@ -719,6 +724,7 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             temperature: Some(0.0),
+            decision: None,
         };
         // Past the breaker's threshold, so the dead model is broken open.
         for _ in 0..4 {

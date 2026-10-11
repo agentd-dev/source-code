@@ -20,6 +20,7 @@ pub mod breaker;
 pub mod children;
 #[cfg(feature = "a2a")]
 pub mod conversations;
+pub(crate) mod decide; // deciding nodes + the decide tool (RFC 0046 P2)
 pub mod env; // system-prompt data + the default template
 pub mod events;
 #[cfg(feature = "exec")]

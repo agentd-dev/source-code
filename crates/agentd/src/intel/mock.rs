@@ -31,6 +31,11 @@
 //!   "match": [ {"when_contains": "\"preflight\"", "content": "{\"intent\":\"task\"}"} ] }
 //! ```
 //!
+//! A decisions request (`{model, state, questions}`, RFC 0046) is answered from
+//! the playbook's `decisions` rules — `[{"when_contains": "…", "answers":
+//! {"<id>": {"type": "choice", "choice": "…", "confidence": 0.8}}}]` — or
+//! with a sure default per question.
+//!
 //! `match[]` rules are tried first (the first whose `when_contains` substring
 //! appears in the request body answers); otherwise `turns[i]` answers where `i`
 //! is the number of `role: tool` messages already in the transcript (clamped to
@@ -122,6 +127,28 @@ fn handle(mut stream: TcpStream, script: &str) {
     let Some(body) = read_request_body(&mut stream) else {
         return;
     };
+    // A decisions request (RFC 0046 §5.5) — `{model, state, questions}` —
+    // is answered as a decision model would answer it.
+    if let Ok(req) = serde_json::from_str::<serde_json::Value>(&body)
+        && req
+            .get("questions")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        let playbook = script.strip_prefix("file:").and_then(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        });
+        let payload = decision_response(playbook.as_ref(), &req, &body);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
     if let Some(path) = script.strip_prefix("file:") {
         let payload = match std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
@@ -299,6 +326,60 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         ("json", _) => final_answer(r#"{"verdict":"approve","score":9}"#),
         _ => final_answer("mock-llm done"),
     }
+}
+
+/// Answer a decisions request: a playbook's `decisions` rule — the first whose
+/// `when_contains` substring is in the request body, else the first with
+/// none — supplies `answers` (and `usage`) in the native shape; anything the
+/// rule leaves unanswered, or a request with no playbook, gets a sure
+/// default: a choice's first option, a noul of 0.9, a score's top level.
+fn decision_response(
+    playbook: Option<&serde_json::Value>,
+    req: &serde_json::Value,
+    body: &str,
+) -> String {
+    use serde_json::{Value, json};
+    let rule = playbook
+        .and_then(|p| p.get("decisions"))
+        .and_then(Value::as_array)
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|r| {
+                    r.get("when_contains")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| body.contains(n))
+                })
+                .or_else(|| rules.iter().find(|r| r.get("when_contains").is_none()))
+        });
+    let mut answers = serde_json::Map::new();
+    for (id, q) in req["questions"].as_object().into_iter().flatten() {
+        if let Some(a) = rule.and_then(|r| r["answers"].get(id)) {
+            answers.insert(id.clone(), a.clone());
+            continue;
+        }
+        let a = match q["type"].as_str() {
+            Some("choice") => {
+                let first = q["criteria"]
+                    .as_object()
+                    .and_then(|c| c.keys().next().cloned())
+                    .unwrap_or_default();
+                json!({"type": "choice", "choice": first, "confidence": 0.9})
+            }
+            Some("score") => {
+                let top = q["criteria"]
+                    .as_array()
+                    .map_or(0, |l| l.len().saturating_sub(1));
+                json!({"type": "score", "score": top, "confidence": 0.9})
+            }
+            _ => json!({"type": "noul", "noul": 0.9}),
+        };
+        answers.insert(id.clone(), a);
+    }
+    let usage = rule
+        .and_then(|r| r.get("usage").cloned())
+        .unwrap_or(json!({"input_tokens": 40, "output_tokens": 8}));
+    json!({"answers": answers, "usage": usage}).to_string()
 }
 
 /// Answer from a `file:` playbook (see the module doc): a `match` rule by

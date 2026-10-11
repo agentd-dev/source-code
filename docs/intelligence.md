@@ -82,10 +82,12 @@ provider auth; agentd talks plaintext HTTP to it over loopback only. Any other
 
 ## The wire: OpenAI-compatible by default
 
-agentd ships **three** in-binary adapters, selected with `intelligence.dialect`
-(`--intelligence-dialect`, `AGENTD_INTELLIGENCE_DIALECT`): `openai` (the
-default), `anthropic`, and `bedrock`. The bias is deliberate: few adapters, thin
-binary, push provider quirks to a gateway.
+agentd ships **three** in-binary chat adapters, selected with
+`intelligence.dialect` (`--intelligence-dialect`, `AGENTD_INTELLIGENCE_DIALECT`):
+`openai` (the default), `anthropic`, and `bedrock` — and a fourth, `decisions`,
+for a decision model's endpoint, on a provider only ([Kinds of
+model](#kinds-of-model-chat-and-decision)). The bias is deliberate: few
+adapters, thin binary, push provider quirks to a gateway.
 
 ### Canonical: `openai-compatible` `POST /v1/chat/completions`
 
@@ -340,6 +342,45 @@ and is never handed down the chain. Readiness follows the chain: `/readyz`
 reports the intelligence down only when no model in it answered. A `fallback` cycle is refused at
 startup — a degradation ladder that loops is a hang under exactly the
 conditions it exists to survive.
+
+### Kinds of model: chat and decision
+
+A model is `kind: chat` (the default) or `kind: decision`. A chat model
+generates — text, tool calls, JSON. A **decision model** answers typed
+questions about a state and writes nothing: Jev-style models, OpenRouter's
+decisions resource, Strands Decider, OpenAI's Decisions API. It is reached on a
+provider with `dialect: decisions`, whose endpoint is the decisions resource's
+**full URL**, posted as is:
+
+```yaml
+intelligence:
+  providers:
+    openrouter:
+      endpoints: https://openrouter.ai/api/alpha/decisions
+      dialect: decisions
+      token: "{{secret:OPENROUTER_API_KEY}}"
+  models:
+    smart: {model: claude-opus-5-5}
+    jev:   {kind: decision, provider: openrouter, model: typesafe/jev-1.13, escalate: smart}
+  roles: {turn: smart, decide: jev}
+```
+
+The body is the shape those vendors share — `{model, state, questions}` in,
+`{answers, usage}` out — and every answer is checked: a question left
+unanswered, an option nobody offered, a probability out of range is an error,
+never a decision acted on with a hole in it. A vendor's own limit (state size,
+questions, options) is its 4xx, surfaced with its reason.
+
+A decision model serves only what decides: `roles.decide` and the `decide`,
+`classify`, `route` and `judge` nodes ([node-registry.md](node-registry.md#decisions)).
+Every other role and node writes and refuses one at load, as do
+`subagents.defaults.model`, a template's `model`, and `budget.degrade.model`.
+A chat model may answer a decision too — one structured call with every
+question in it, its confidence a self-report (`calibrated: false`) — so a
+decision model's `fallback` and `escalate` may be chat models; a chat model's
+`fallback` may not be a decision model. A decision's answers are logged
+(`intel.decision`: question ids, answers, confidence, `escalated`); its state
+is content and is not.
 
 **What a served document may set.** An instruction document may declare
 models and bind every role but `approve` — *which* model, never where it

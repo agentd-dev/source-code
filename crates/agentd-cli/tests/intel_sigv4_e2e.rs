@@ -95,6 +95,7 @@ fn intelligence_dial_is_sigv4_signed_for_aws_auth() {
         tools: Vec::new(),
         max_tokens: 8,
         temperature: Some(0.0),
+        decision: None,
     };
     intel.complete(&req).expect("completion succeeds");
 

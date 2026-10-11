@@ -529,6 +529,16 @@ pub fn guard_holds(output: Option<&Value>) -> bool {
             .is_some_and(|p| p >= 0.5)
 }
 
+/// Whether a step's CEL `when` lets it run over `data` (no `when`: yes).
+pub fn when_holds(step: &Step, data: &Data) -> Result<bool, String> {
+    let Some(w) = &step.when else {
+        return Ok(true);
+    };
+    let expr = w.trim().trim_start_matches("CEL:").trim();
+    let vars: Vec<(&str, &Value)> = data.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    crate::cel::eval_bool(expr, &vars)
+}
+
 /// Compute the ready steps. `when` guards are evaluated over `data`, and a
 /// decision guard's answer read from its step; a guard that does not hold
 /// prunes the step (durably) — hence `&mut RunState`.
@@ -560,19 +570,54 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
             if ready.contains(&id) {
                 continue;
             }
+            // A decision guard whose step has ended — a `switch` case not
+            // chosen — has nothing left to decide, and is not asked.
+            if !st.forced
+                && let Some(t) = &step.guarding
+                && run.steps.get(t).is_some_and(|s| s.status.is_terminal())
+            {
+                run.end_step(&id, StepStatus::Pruned, None, None);
+                changed = true;
+                continue;
+            }
+            // A routing edge — a `switch` case, `on_error: goto`, `on_timeout`
+            // — runs its target past its dependencies, never past its guard.
             if st.forced {
-                ready.push(id.clone());
+                // A decision guard is asked first, and again when the edge
+                // re-arms a step that ran: forced in its turn, with the target
+                // waiting on its answer as any dependant does.
+                if let Some(g) = &step.guard {
+                    let gst = run.steps.entry(g.clone()).or_default();
+                    if !matches!(gst.status, StepStatus::Running | StepStatus::Suspended) {
+                        gst.status = StepStatus::Pending;
+                        gst.forced = true;
+                    }
+                    if let Some(t) = run.steps.get_mut(&id) {
+                        t.forced = false;
+                    }
+                    run.touch();
+                    changed = true;
+                    continue;
+                }
+                if when_holds(step, data).map_err(|e| format!("step {id:?}: when: {e}"))? {
+                    ready.push(id.clone());
+                } else {
+                    run.end_step(&id, StepStatus::Pruned, None, None);
+                    changed = true;
+                }
                 continue;
             }
             // An `on_timeout` target is reached by ROUTING only: dep-less by
             // design (depending on the wait would also fire it on success),
-            // it stays parked until the timeout forces it.
+            // it stays parked until the timeout forces it — and so does its
+            // decision guard, which inherits its (absent) dependencies.
+            let parked = step.guarding.as_deref().unwrap_or(id.as_str());
             if step.depends_on.is_empty()
                 && !step.is_start()
                 && wf
                     .steps
                     .values()
-                    .any(|s| s.field_str("on_timeout") == Some(id.as_str()))
+                    .any(|s| s.field_str("on_timeout") == Some(parked))
             {
                 continue;
             }
@@ -617,19 +662,11 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
             if !deps_ok {
                 continue;
             }
-            if let Some(w) = &step.when {
-                let expr = w.trim().trim_start_matches("CEL:").trim();
-                let vars: Vec<(&str, &Value)> = data.iter().map(|(k, v)| (k.as_str(), v)).collect();
-                match crate::cel::eval_bool(expr, &vars) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Not taken, so nothing that depends only on it runs.
-                        run.end_step(&id, StepStatus::Pruned, None, None);
-                        changed = true;
-                        continue;
-                    }
-                    Err(e) => return Err(format!("step {id:?}: when: {e}")),
-                }
+            if !when_holds(step, data).map_err(|e| format!("step {id:?}: when: {e}"))? {
+                // Not taken, so nothing that depends only on it runs.
+                run.end_step(&id, StepStatus::Pruned, None, None);
+                changed = true;
+                continue;
             }
             // A decision guard is the step's only dependency, and it has
             // answered: anything but a sure "holds" — it does not hold, it was

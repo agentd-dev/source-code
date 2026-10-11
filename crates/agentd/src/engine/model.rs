@@ -1629,7 +1629,6 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
                     steps.insert(id.clone(), step);
                 }
             }
-            check_routed_guards(&format!("workflow {name:?}"), &steps, &mut errs);
         }
     }
     if !errs.is_empty() {
@@ -2835,36 +2834,6 @@ fn parse_guard(
     })
 }
 
-/// A routing edge — a `switch` case or default, `on_error: goto`, a wait's
-/// `on_timeout` — runs its target whatever the target depends on, so a
-/// decision guard on the target would never be asked. Refused where it is
-/// written: the guard belongs on a step after the target.
-fn check_routed_guards(at: &str, steps: &BTreeMap<String, Step>, errs: &mut Vec<String>) {
-    for s in steps.values() {
-        let mut targets: Vec<&str> = Vec::new();
-        if s.kind == "switch" {
-            if let Some(cases) = s.field("cases").and_then(Value::as_object) {
-                targets.extend(cases.values().filter_map(Value::as_str));
-            }
-            targets.extend(s.field_str("default"));
-        }
-        if let OnError::Goto(t) = &s.on_error {
-            targets.push(t);
-        }
-        targets.extend(s.field_str("on_timeout"));
-        for t in targets {
-            if steps.get(t).is_some_and(|t| t.guard.is_some()) {
-                errs.push(format!(
-                    "{at} step {t:?}: {:?} routes to this step, which runs it past its \
-                     dependencies — its decision guard would never be asked; guard a step \
-                     after it instead",
-                    s.id
-                ));
-            }
-        }
-    }
-}
-
 /// Parse + validate a nested body `{steps: {…}}`. `entry_state` is what a
 /// decision guard on a step with no dependencies decides about.
 fn parse_body(
@@ -2899,7 +2868,6 @@ fn parse_body(
             steps.insert(bid.clone(), step);
         }
     }
-    check_routed_guards(at, &steps, errs);
     let body = Body { steps };
     for s in body.steps.values() {
         for d in &s.depends_on {
@@ -3162,9 +3130,15 @@ fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
         .values()
         .filter_map(|s| s.field_str("on_timeout").map(str::to_string))
         .collect();
-    // A non-start step with no dependencies is an unreachable root.
+    // A non-start step with no dependencies is an unreachable root — but for
+    // an `on_timeout` target and its decision guard, which inherits the
+    // target's (absent) dependencies.
     for s in wf.steps.values() {
-        if !s.is_start() && s.depends_on.is_empty() && !timeout_targets.contains(&s.id) {
+        let routed = timeout_targets.contains(&s.id)
+            || s.guarding
+                .as_ref()
+                .is_some_and(|t| timeout_targets.contains(t));
+        if !s.is_start() && s.depends_on.is_empty() && !routed {
             errs.push(format!("workflow {name:?} step {:?}: a non-start step must depend on something (unreachable root)", s.id));
         }
     }
@@ -3186,12 +3160,20 @@ fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
                 reachable.insert(s.id.clone());
                 changed = true;
             }
-            // Routing edges reach too.
+            // Routing edges reach too, and a reached step's decision guard
+            // with it (the edge asks the guard first).
             if reachable.contains(&s.id)
                 && let Some(t) = s.field_str("on_timeout")
                 && !reachable.contains(t)
             {
                 reachable.insert(t.to_string());
+                changed = true;
+            }
+            if reachable.contains(&s.id)
+                && let Some(g) = &s.guard
+                && !reachable.contains(g)
+            {
+                reachable.insert(g.clone());
                 changed = true;
             }
         }
@@ -3676,32 +3658,39 @@ mod tests {
             e.contains("a start node cannot carry a decision guard"),
             "{e}"
         );
+        // A routing edge — a `switch` case or default, `on_error: goto`,
+        // `on_timeout` — may target a guarded step: the edge asks the guard
+        // first. An `on_timeout` target's guard inherits its (absent)
+        // dependencies, and is neither an unreachable root nor unreached.
         for router in [
             json!({"kind": "switch", "depends_on": ["s"], "on": "a", "cases": {"a": "g"}}),
             json!({"kind": "switch", "depends_on": ["s"], "on": "a", "cases": {}, "default": "g"}),
             json!({"kind": "noop", "depends_on": ["s"], "on_error": "goto:g"}),
         ] {
-            let e = refused(json!({
+            wf(json!({"name": "w", "steps": {
                 "s": {"kind": "once"},
                 "r": router,
                 "g": {"kind": "noop", "depends_on": ["r"], "when": {"noul": "x"}},
                 "f": {"kind": "finish", "depends_on": ["g"]}
-            }));
-            assert!(
-                e.contains("step \"g\": \"r\" routes to this step")
-                    && e.contains("would never be asked"),
-                "{e}"
-            );
+            }}))
+            .unwrap();
         }
-        // The same inside a body.
-        let e = refused(json!({
+        let w = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "ask": {"kind": "wait", "depends_on": ["s"], "on": "signal", "signal": "x", "timeout": "1s", "on_timeout": "late"},
+            "late": {"kind": "noop", "when": {"noul": "x"}},
+            "f": {"kind": "finish", "depends_on": ["ask"]}
+        }}))
+        .unwrap();
+        assert!(w.steps["late.when"].depends_on.is_empty());
+        wf(json!({"name": "w", "steps": {
             "s": {"kind": "once"},
             "sub": {"kind": "subgraph", "depends_on": ["s"], "body": {"steps": {
                 "r": {"kind": "switch", "on": "a", "cases": {"a": "g"}},
                 "g": {"kind": "noop", "depends_on": ["r"], "when": {"noul": "x"}}}}},
             "f": {"kind": "finish", "depends_on": ["sub"]}
-        }));
-        assert!(e.contains("\"r\" routes to this step"), "{e}");
+        }}))
+        .unwrap();
         let e = refused(json!({
             "s": {"kind": "once"},
             "sub": {"kind": "subgraph", "depends_on": ["s"], "when": {"noul": "x"},

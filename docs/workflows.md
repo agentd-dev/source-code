@@ -900,6 +900,13 @@ step's only dependency, and an answer that does not surely hold — the
 statement is false, or the answer is marked unsure — prunes the step exactly
 as a false CEL guard does.
 
+A routing edge — a `switch` case, `on_error: goto`, a wait's `on_timeout` —
+runs its target past its dependencies, never past its guard: a routed step's
+CEL `when` is evaluated as any step's, and a decision guard is asked first
+(again, when the edge re-arms a step that ran), the step waiting on its
+answer. A recovery step whose guard declines leaves the failure standing, and
+the run fails with it.
+
 A false `when` guard prunes only in the top-level scheduler. Inside a nested body
 — `foreach`, `batch`, `iterate`, `parallel`, `race`, `subgraph` — a false guard,
 CEL or decision, still marks the step `skipped`, and a skipped step *satisfies*
@@ -913,8 +920,8 @@ flowchart TD
     A["step, in topological order"] --> B{"status"}
     B -->|"Running or Suspended"| C["counts as in flight"]
     B -->|"terminal"| D["nothing to do"]
-    B -->|"Pending"| E{"forced by switch or goto?"}
-    E -->|"yes"| R["READY"]
+    B -->|"Pending"| E{"forced by switch, goto or on_timeout?"}
+    E -->|"yes"| J
     E -->|"no"| Q{"has dependencies, and every one Pruned?"}
     Q -->|"yes"| K["mark Pruned, rerun the fixpoint"]
     Q -->|"no"| F{"any dependency Failed, Cancelled or Timeout?"}

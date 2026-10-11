@@ -483,7 +483,56 @@ impl Runtime {
                     continue;
                 }
                 let step = &body.steps[id];
+                // A decision guard whose step has ended — a `switch` case not
+                // chosen — has nothing left to decide, and is not asked.
+                if !st.forced
+                    && let Some(t) = &step.guarding
+                    && snapshot
+                        .get(&scoped_id(scope_id, t))
+                        .is_some_and(|s| s.status.is_terminal())
+                {
+                    if let Some(r) = self.runs.get_mut(run_id) {
+                        r.end_step(&sid, StepStatus::Skipped, None, None);
+                    }
+                    changed = true;
+                    continue;
+                }
+                // A routing edge runs its target past its dependencies, never
+                // past its guard: a decision guard is asked first (again, when
+                // the edge re-arms a step that ran), and a CEL `when` is
+                // evaluated as for any step.
                 if st.forced {
+                    if let Some(g) = &step.guard {
+                        if let Some(r) = self.runs.get_mut(run_id) {
+                            let gst = r.steps.entry(scoped_id(scope_id, g)).or_default();
+                            if !matches!(gst.status, StepStatus::Running | StepStatus::Suspended) {
+                                gst.status = StepStatus::Pending;
+                                gst.forced = true;
+                            }
+                            if let Some(t) = r.steps.get_mut(&sid) {
+                                t.forced = false;
+                            }
+                            r.touch();
+                        }
+                        changed = true;
+                        continue;
+                    }
+                    if step.when.is_some() {
+                        match self.scoped_when(run_id, &sid, step) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Some(r) = self.runs.get_mut(run_id) {
+                                    r.end_step(&sid, StepStatus::Skipped, None, None);
+                                }
+                                changed = true;
+                                continue;
+                            }
+                            Err(e) => {
+                                failed = Some(format!("{id}: when: {e}"));
+                                continue;
+                            }
+                        }
+                    }
                     ready.push(sid);
                     continue;
                 }
@@ -507,22 +556,8 @@ impl Runtime {
                 if !deps_ok {
                     continue;
                 }
-                if let Some(w) = &step.when {
-                    let scope = {
-                        let wf = self
-                            .definition_for_run(run_id)
-                            .unwrap_or_else(unreachable_wf);
-                        self.runs
-                            .get(run_id)
-                            .and_then(|r| self.resolve_step(&wf, r, &sid))
-                            .and_then(|(_, s)| s)
-                            .unwrap_or_default()
-                    };
-                    let data = self.scoped_data_view(run_id, &scope);
-                    let expr = w.trim().trim_start_matches("CEL:").trim();
-                    let vars: Vec<(&str, &Value)> =
-                        data.iter().map(|(k, v)| (k.as_str(), v)).collect();
-                    match crate::cel::eval_bool(expr, &vars) {
+                if step.when.is_some() {
+                    match self.scoped_when(run_id, &sid, step) {
                         Ok(true) => {}
                         Ok(false) => {
                             if let Some(r) = self.runs.get_mut(run_id) {
@@ -575,6 +610,22 @@ impl Runtime {
         }
         let _ = parent;
         BodyState::Waiting
+    }
+
+    /// A body step's CEL `when`, over its scope's data.
+    fn scoped_when(&mut self, run_id: &str, sid: &str, step: &Step) -> Result<bool, String> {
+        let scope = {
+            let wf = self
+                .definition_for_run(run_id)
+                .unwrap_or_else(unreachable_wf);
+            self.runs
+                .get(run_id)
+                .and_then(|r| self.resolve_step(&wf, r, sid))
+                .and_then(|(_, s)| s)
+                .unwrap_or_default()
+        };
+        let data = self.scoped_data_view(run_id, &scope);
+        crate::engine::run::when_holds(step, &data)
     }
 
     /// Whether the run is live and the parent step still running.

@@ -252,10 +252,10 @@ sent one at a time); agentd's answers to a server's requests are bounded at
   (a `foreach`/`batch` element in its body). Under a `confidence` (the
   guard's, else `roles.decide`'s) an unsure answer is escalated where the
   model names an `escalate` model and otherwise prunes the step; doubt never
-  fails the run. A guard on a start node, on a step a `switch`, `on_error:
-  goto` or `on_timeout` routes to (which would run it past its guard), or on
-  a `subgraph` with a body step named `when` is refused at load, and the
-  guard's model is held to the deciding kinds' checks.
+  fails the run. A step a `switch`, `on_error: goto` or `on_timeout` routes
+  to may carry one: the edge asks the guard first. A guard on a start node,
+  or on a `subgraph` with a body step named `when`, is refused at load, and
+  the guard's model is held to the deciding kinds' checks.
 - Per-turn routing: `intelligence.routes` maps each model a turn may run on
   to when to use it (`fast: "a quick answer"`, `deep: "careful multi-step
   work"`). Preflight chooses one for each message it looks at — on a decision
@@ -287,7 +287,12 @@ shape that is not a CEL string is refused at load. A conversation's
 compaction window was fixed when the conversation was created, so a restart
 or reload that moved the turn model to a smaller window left a restored
 conversation compacting against the old one; it now follows the live
-settings at each turn.
+settings at each turn. A step a `switch` case, `on_error: goto` or a wait's
+`on_timeout` routed to ran whatever its CEL `when` said — the routing edge
+marked it ready before the guard was looked at, so a guarded case, recovery
+step or timeout branch was never guarded. The edge now skips only the
+dependency wait: the guard is evaluated as for any step, and a recovery step
+whose guard declines leaves the failure standing.
 
 **Added (P4 — reasoning).**
 

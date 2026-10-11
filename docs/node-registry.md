@@ -272,11 +272,12 @@ names one, whose answer is final; otherwise the unsure answer prunes the
 step. A guard never fails the run for doubt: escalate-else-`continue`, as for
 the `decide` tool. A guard that cannot be honoured is refused at load: an
 unknown field, an empty `noul`, a `confidence` outside 0..1, a model the
-deciding kinds refuse, a guard on a start node, on a step a `switch` case,
-`on_error: goto` or `on_timeout` routes to (a routing edge runs its target
-past its dependencies, so the guard would never be asked — guard a step
-after it), or on a `subgraph` whose body has a step named `when` (both would
-be `<id>.when` in the run). Event matches (`filter`, a wait's `match`) stay
+deciding kinds refuse, a guard on a start node, or on a `subgraph` whose
+body has a step named `when` (both would be `<id>.when` in the run). A step a
+`switch` case, `on_error: goto` or `on_timeout` routes to may carry one: the
+edge asks the guard first and the step waits on its answer; a case not
+chosen has its guard pruned unasked, and a timeout branch's guard waits for
+the timeout as the branch does. Event matches (`filter`, a wait's `match`) stay
 CEL: a decision about an event is a guarded first step.
 
 ---

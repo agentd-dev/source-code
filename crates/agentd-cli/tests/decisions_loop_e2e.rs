@@ -201,8 +201,13 @@ fn no_judge_answers_a_gate_whose_run_carries_outside_input() {
         )
     );
     let poster = std::thread::spawn(move || {
-        // Post once the listener is up.
-        for _ in 0..200 {
+        // Post once the listener is up, and until agentd answers. agentd
+        // answers every request it reads, so a connection that ends with no
+        // HTTP answer was not served by it — the port is free between the test
+        // choosing it and agentd binding it — and is posted again. A request
+        // served twice would show as two runs below.
+        let mut last = String::from("(never connected)");
+        for _ in 0..400 {
             if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
                 use std::io::{Read, Write};
                 let body = r#"{"release": "v9"}"#;
@@ -212,12 +217,15 @@ fn no_judge_answers_a_gate_whose_run_carries_outside_input() {
                     body.len()
                 );
                 let mut out = String::new();
-                let _ = s.read_to_string(&mut out);
-                return out;
+                let read = s.read_to_string(&mut out);
+                if out.starts_with("HTTP/") {
+                    return out;
+                }
+                last = format!("{out:?} ({read:?}), with no HTTP answer");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        String::from("(never connected)")
+        last
     });
     let (_, log) = run_until(&cfg, 20, |l| !events(l, "run.done").is_empty());
     let answer = poster.join().unwrap_or_default();

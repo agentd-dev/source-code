@@ -112,8 +112,8 @@ const feed = (m, kind, data) => m.apply({ seq: ++seq, ts: seq, kind, data });
 function populate(mirror) {
   seq = 0;
   mirror.setSession(session());
-  mirror.bootstrap({ version: '1.19.0', instance: 'triage-1', model: 'gpt-5.1' });
-  mirror.onHello({ seq: 0, resume: 0, resync: false, introspection: true, version: '1.19.0' });
+  mirror.bootstrap({ version: '1.19.1', instance: 'triage-1', model: 'gpt-5.1' });
+  mirror.onHello({ seq: 0, resume: 0, resync: false, introspection: true, version: '1.19.1' });
   mirror.setConn('ready');
   feed(mirror, 'run', { id: 'pipeline-01M0C0', workflow: 'pipeline', status: 'running', steps: '3/7' });
   const step = (s, extra = {}) => feed(mirror, 'step', { run: 'pipeline-01M0C0', step: s, ...extra });

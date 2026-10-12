@@ -40,9 +40,9 @@ curl -fsSL https://agentd.dev/install.sh | sh
 ```
 
 ```text
-agentd downloading agentd-v1.19.0-x86_64-unknown-linux-musl.tar.gz ...
+agentd downloading agentd-v1.19.1-x86_64-unknown-linux-musl.tar.gz ...
 agentd checksum ok
-agentd installed agentd 1.19.0 to /usr/local/bin/agentd
+agentd installed agentd 1.19.1 to /usr/local/bin/agentd
 ```
 
 It installs to `/usr/local/bin` when that is writable and to
@@ -54,12 +54,12 @@ Pass options after `sh -s --`, or set the matching environment variable:
 
 | Option | Variable | Effect |
 |---|---|---|
-| `--version <tag>` | `AGENTD_VERSION` | Install that release instead of the latest, for example `v1.19.0` |
+| `--version <tag>` | `AGENTD_VERSION` | Install that release instead of the latest, for example `v1.19.1` |
 | `--dir <path>` | `AGENTD_INSTALL_DIR` | Install into that directory |
 | `--no-verify` | `AGENTD_NO_VERIFY=1` | Skip the checksum check (it warns that it did) |
 
 ```bash
-curl -fsSL https://agentd.dev/install.sh | sh -s -- --version v1.19.0 --dir "$HOME/bin"
+curl -fsSL https://agentd.dev/install.sh | sh -s -- --version v1.19.1 --dir "$HOME/bin"
 ```
 
 The script needs `curl` or `wget`, and `tar`. It verifies with `sha256sum`
@@ -75,7 +75,7 @@ at `https://github.com/agentd-dev/source-code/releases`. Set the tag and the
 architecture (`x86_64` or `aarch64`), then fetch, check and unpack:
 
 ```bash
-TAG=v1.19.0
+TAG=v1.19.1
 ARCH=x86_64
 curl -fsSLO "https://github.com/agentd-dev/source-code/releases/download/$TAG/agentd-$TAG-$ARCH-unknown-linux-musl.tar.gz"
 curl -fsSLO "https://github.com/agentd-dev/source-code/releases/download/$TAG/SHA256SUMS"
@@ -85,8 +85,8 @@ tar xzf "agentd-$TAG-$ARCH-unknown-linux-musl.tar.gz"
 ```
 
 ```text
-agentd-v1.19.0-x86_64-unknown-linux-musl.tar.gz: OK
-agentd 1.19.0
+agentd-v1.19.1-x86_64-unknown-linux-musl.tar.gz: OK
+agentd 1.19.1
 ```
 
 The archive holds a single file, `agentd`. Move it anywhere on your `PATH`:
@@ -104,7 +104,7 @@ The image is `ghcr.io/agentd-dev/agentd`, built for `linux/amd64` and
 docker run --rm ghcr.io/agentd-dev/agentd:latest --version
 ```
 
-Each release is tagged by its full version (`1.19.0`), its minor line
+Each release is tagged by its full version (`1.19.1`), its minor line
 (`1.19`) and its major line (`1`), and the newest is also `latest`. Pin a
 full version or a digest for anything you deploy.
 
@@ -213,7 +213,7 @@ agentd --version
 ```
 
 ```text
-agentd 1.19.0
+agentd 1.19.1
 ```
 
 Then validate a configuration without running anything. This one names a

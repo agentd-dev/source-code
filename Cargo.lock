@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-cli"
-version = "1.19.0"
+version = "1.19.1"
 dependencies = [
  "agentd-core",
  "libc",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-core"
-version = "1.19.0"
+version = "1.19.1"
 dependencies = [
  "a2a-lf",
  "a2a-pb",

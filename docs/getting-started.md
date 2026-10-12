@@ -159,7 +159,7 @@ all):
   "run_id": "01M4P4S9DGF68J6J4XN9DF2NBT",
   "trace_id": "ec8a5ca41008bc6596c89199c65d9b9c",
   "ts": "2026-10-11T18:49:43.088Z",
-  "version": "1.19.0"
+  "version": "1.19.1"
 }
 ```
 

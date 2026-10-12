@@ -71,7 +71,13 @@ A daemon ends with a **drain**. These begin one:
 A drain stops intake, lets in-flight work finish within
 `lifecycle.drain_timeout` (default 25 seconds), checkpoints and exits: 0
 after a signal or an operator's drain, or the code a `finish` or a failure
-set.
+set. Work still running at the timeout is stopped and left for the next
+start rather than failed: its step runs again, its message is answered
+again, its subagent is spawned again. An exit the agent asks for — a
+`finish` with `exit: true`, `lifetime_exhausted: exit`, a store that cannot
+write — stops in-flight work at once and leaves it the same way, but still
+runs the deinit workflows below. A job drained before its work finished
+exits with its work's code — 3 for a run left unfinished — not 0.
 [Supervision and containment](harness.md#the-kill-ladder) describes how
 children are stopped.
 
@@ -174,9 +180,10 @@ Two start kinds let a daemon run work at the edges of its own life.
   the process can take calls.
 - **Deinit.** An `event` start with `on: lifecycle.shutdown` fires when a
   drain begins, and the drain **waits** for that run, within
-  `drain_timeout`, before the process exits. Use it to deregister, so the
-  third party stops calling a process that is going away. Its payload says
-  why: `{"reason": "signal"}` or `{"reason": "exit"}`, among others.
+  `drain_timeout`, before the process exits — a drain an exit asked for
+  too. Use it to deregister, so the third party stops calling a process
+  that is going away. Its payload says why: `{"reason": "signal"}` or
+  `{"reason": "exit"}`, among others.
 
 ```yaml
 agent:
@@ -208,10 +215,13 @@ workflows:
 ```
 
 Keep deinit workflows to fast steps that need no model — `http`,
-`mcp.tool`, data steps. The drain is winding child processes down at the same
-time, so an `agent` step there competes with the shutdown it belongs to.
-Only `lifecycle.shutdown` runs are admitted during a drain; every other
-queued firing stays in the durable inbox for the next start.
+`mcp.tool`, data steps. They share `drain_timeout` with the work in flight,
+and once the timeout passes, or a second signal forces the drain, it stops
+everything, deinit runs included, so an `agent` step there competes with
+the shutdown it belongs to. A deinit run cut short this way is cancelled,
+not resumed: the next start does not run the last one's shutdown at its
+boot. Only `lifecycle.shutdown` runs are admitted during a drain; every
+other queued firing stays in the durable inbox for the next start.
 
 ## A2A as a trigger
 

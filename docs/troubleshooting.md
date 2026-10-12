@@ -89,7 +89,7 @@ common codes:
 | Code | Usually means | Look at |
 |---|---|---|
 | 2 | configuration or usage error | the `config.invalid` lines |
-| 3 | partial: a run stalled | `run.stalled` and the step that never became ready |
+| 3 | partial: a run stalled, or a drain cut the job short | `run.stalled` and the step that never became ready; `drain.interrupted` |
 | 4 | the model was unreachable, or refused the credential, after retries | the `run.done` error, `intel` in its text |
 | 6 | a required MCP server is down, or the durable store did not open | `mcp.connect.fail`, `proc.exit` |
 | 7 | a budget was exhausted: steps or tokens | the run's limits |
@@ -131,6 +131,7 @@ The events that explain a run, in the order they usually help:
 | `human.ask`, `human.answer.rejected`, `human.ask.failed`, `human.judge.withheld` | a gate opened, refused an answer, failed, or was kept from a judge |
 | `run.deadline`, `run.refused`, `run.dropped` | the run hit its deadline; a restore refused it; concurrency dropped a start |
 | `start.inputs.invalid`, `run.inputs.invalid` | a trigger's inputs did not render, or did not match `inputs.schema`; no run was created |
+| `drain.interrupted` | what a drain stopped and left for the next start |
 | `restore.step.replay`, `restore.step.skipped`, `restore.step.failed` | what a restart did with a step caught running |
 
 For a run that is still live, attach the [terminal or web UI](interface.md)
@@ -156,6 +157,23 @@ where nothing was ready and nothing was in flight. The usual causes:
 - **A step failed first.** The error then names it: `step "x" failed first:
   …`. The run ends `failed`, not `stalled`. Look at that step, not the one
   that never ran.
+
+### A run a drain interrupted
+
+A drain lets the work in flight finish within `lifecycle.drain_timeout`.
+What still runs when the timeout passes, or when a second signal forces the
+drain, is stopped and named on one `drain.interrupted` line: the steps left
+`running`, the conversation turns whose messages stay in the inbox, the
+subagents recorded `parked`, and the `lifecycle.shutdown` runs it cut
+short, which are cancelled rather than resumed. None of it failed, and the
+next start takes each up: look for `restore.step.replay` for a step and
+`subagent.respawn` for a subagent. A job a drain cut short exits 3.
+
+If drains keep stopping work, raise `drain_timeout`, and the orchestrator's
+grace period with it. A turn blocked on `ask_human` always holds a drain to
+its timeout, because the listener takes no answers while draining; its task
+goes back to `working` (`human.ask.drained`), and the turn asks on it again
+after the restart.
 
 ## Workflow traps
 

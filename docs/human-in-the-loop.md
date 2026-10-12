@@ -408,6 +408,12 @@ fires when a gate is answered, with `{task, via}`.
   so a late answer starts a fresh turn in that conversation instead of
   resuming the call. A gate whose asking turn ended for any other reason is
   failed with that reason, so nobody answers into the void.
+- A drain that stops a turn at a gate is the exception. The listener takes
+  no answers while draining, so the turn holds the drain to its timeout
+  and is stopped then. Its task goes back to `working` rather than
+  failing, the turn runs again after the restart, and it asks on the same
+  task. A gate task opened for that ask alone is cancelled instead; the
+  replay opens its own.
 - The policy, timeout and addressee of a policy gate on a workflow step are
   durable too.
 

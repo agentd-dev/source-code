@@ -150,7 +150,7 @@ intelligence:
 
 | `lifetime_exhausted` | The instance |
 |---|---|
-| `drain` (default) | finishes the work in flight, then exits `0`, for an orchestrator to restart with a fresh allowance |
+| `drain` (default) | finishes the work in flight and exits as a drain does: `0` for a daemon, for an orchestrator to restart with a fresh allowance |
 | `refuse` | stays up and refuses every new admission |
 | `exit` | stops at once and exits `7` |
 

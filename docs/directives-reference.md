@@ -439,7 +439,7 @@ past its deadline:
 |---|---|
 | `keep` | Carry on with the last good instruction. |
 | `freeze` | Finish live work, refuse new work until a re-read succeeds. |
-| `drain` | Finish live work, then exit `0`. |
+| `drain` | Finish live work, then exit (`0` for a daemon). |
 | `exit` | Exit `6` at once. |
 | `auto` | `freeze` when a trust pin names a publisher for this source, `keep` otherwise. |
 

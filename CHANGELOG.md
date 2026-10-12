@@ -58,6 +58,54 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - An `observability.otel.endpoint` the exporter cannot POST to, such as a
   bare `host:port` or a `grpc://` URL, is refused at load. It loaded, and
   every export failed.
+- A drain lets running work finish, and nothing it stops is failed.
+  `SIGTERM`, `SIGINT`, `admin.drain` and a `drain` policy cancelled every
+  child at once and sent `SIGTERM` to any still running 5 seconds later, so
+  a step whose turn was in a model call failed with "worker exited without
+  a result", its run failed with it, and the restart had nothing to resume.
+  A conversation turn, a step's turn, the thinks serving them, a subagent
+  and a call out on an executor thread now run on until
+  `lifecycle.drain_timeout` and record their results as usual, and each run
+  stops at its next step, checkpointed, for the next start. What still runs
+  at the timeout, or when a second signal forces the drain, is killed and
+  left for the next start: its step stays `running` and is replayed as a
+  step a crash caught running is, a conversation turn's message stays in
+  the inbox, and a subagent is recorded `parked` and spawned again, a
+  `detached` one included. A `sync` subagent a stopped turn was waiting on
+  is recorded `cancelled` instead, since the turn's replay asks for it
+  again. A warm subagent, which never ends on its own, is cancelled as the
+  drain begins and parked the same way, and an exit asked for — a `finish`
+  with `exit: true`, `lifetime_exhausted: exit`, a store that cannot write
+  — still stops what runs at once, and parks it too, while the
+  `lifecycle.shutdown` workflows run to their end. One `drain.interrupted`
+  line names what was left. No step starts inside a `foreach`, `parallel`
+  or other body during a drain, as none starts at the top level.
+- A turn a drain stopped at an `ask_human` gate is asked again after the
+  restart. The gate's task was failed ("the asking turn ended before the
+  gate was answered"), so the caller was told the work failed and the
+  turn's replay found nobody to ask. The task goes back to `working`, and
+  the replay asks on it.
+- A `lifecycle.shutdown` run a forced drain cuts short is cancelled. It
+  stayed in the store, and the next start ran it at its boot: a
+  deregistration from the last shutdown could land after the new
+  instance's registration.
+- An instance-tier child drains with its parent. The parent's drain left it
+  running and exited, so a parent that is PID 1 took it down with `SIGKILL`
+  as its namespace closed. The parent now sends it `SIGTERM` as the drain
+  begins, waits for it within its own `drain_timeout`, and records it
+  `parked`, so the restarted parent spawns it again.
+- A job a drain cut short does not exit 0. Every drain exited 0, so a
+  Kubernetes Job evicted mid-run reported success for work it never did. A
+  job's drain exits with the code an idle exit would: 3 for a run left
+  unfinished, as the exit-code table says of a job that ended with a run
+  unfinished, and 3 for a turn or subagent the drain stopped or work it
+  never let start. A daemon still drains to 0.
+- `agent_drains_total{phase="forced"}` is written when the drain timeout, a
+  second signal or an exit asked for stops work that was still running, an
+  abandoned drain included. Every drain counted `completed`.
+- A message whose turn was stopped — by a drain, or a crash — reaches the
+  model once when the next start answers it. Its replay appended it to the
+  conversation a second time, so the model read it twice.
 
 **Removed.**
 

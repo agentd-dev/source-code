@@ -27,7 +27,7 @@ Init has five duties. agentd performs four of them as its day job.
 |---|---|
 | Reap orphans | One thread owns `waitpid(-1, WNOHANG)` for the whole process, and the supervisor sets `PR_SET_CHILD_SUBREAPER`. A reparented orphan is reaped and its status discarded, so zombies never pile up. |
 | Supervise and restart | A restart governor with backoff and a circuit breaker, dead and stuck detectors, and a kill ladder: cancel, `SIGTERM` to the process group, then `SIGKILL`. Every child dies with its parent. |
-| Handle signals | Real handlers from the first instruction: `SIGTERM` drains (finish in-flight work, refuse new work, exit), `SIGHUP` reloads the configuration, `SIGCHLD` wakes the reaper. |
+| Handle signals | Real handlers from the first instruction: `SIGTERM` drains (refuse new work, finish in-flight work within `lifecycle.drain_timeout`, park what still runs then for the next start, exit), `SIGHUP` reloads the configuration, `SIGCHLD` wakes the reaper. |
 | Own system state | Workflows are a dependency graph over durable state. Per-child resource limits, niceness by priority and cgroups are resource control; pressure shedding under low memory or disk is graceful degradation. |
 | Bring up the world | **Not done, deliberately.** Mounting `/proc`, `/sys` and `/dev`, setting the hostname and raising loopback is a twenty-line shim that runs first (see [Boot](#boot-from-power-button-to-first-turn)). |
 

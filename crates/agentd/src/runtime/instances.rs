@@ -645,6 +645,11 @@ impl Runtime {
         else {
             return false;
         };
+        // One the drain asked to drain itself is left for the next life.
+        if self.park_drained_instance(&handle, r) {
+            self.persist_subagent(&handle);
+            return true;
+        }
         let (status, error) = match (&r.outcome, self.subagents[&handle].retiring_since) {
             (_, Some(_)) => ("retired", None),
             (crate::supervisor::reap::WaitOutcome::Exited(0), None) => ("completed", None),

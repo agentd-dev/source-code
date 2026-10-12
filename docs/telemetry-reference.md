@@ -258,6 +258,7 @@ case.
 |---|---|---|---|
 | `drain.abandon` | warn | `children` | The drain overran `drain_timeout` plus 3 s; the remaining children were killed. |
 | `drain.done` | info | `reason` | The drain finished; the process exits next. |
+| `drain.interrupted` | info | `runs`, `steps`, `subagents`, `thinks`, `turns` | What the drain stopped and left for the next start: each step left `running` (`run/step`), each conversation turn with the inbox event that replays it (`ctx`, `inbox_event`), each think worker's purpose, each subagent recorded `parked`, and each `lifecycle.shutdown` run a forced drain cut short, which is cancelled rather than left. Written before `drain.done`, only when something was left. |
 | `drain.start` | info | `children`, `reason`, `runs` | A graceful drain began (`SIGTERM`, `SIGINT`, `admin.drain` or a policy). |
 
 ### exec
@@ -306,6 +307,7 @@ case.
 | `human.answer.undelivered` | warn | `task`, `via` |  |
 | `human.answered` | info | `by`, `labels`, `sid`, `task`, `via` | A person answered. |
 | `human.ask` | info | `channel`, `deadline_ms`, `question`, `task` | A question went to a person. |
+| `human.ask.drained` | info | `state`, `task` | The drain stopped the turn that asked. The gate's task is back to `TASK_STATE_WORKING`, and the turn's replay asks on it again; a gate task opened for that ask alone is `TASK_STATE_CANCELED`. |
 | `human.ask.failed` | warn | `err`, `task` |  |
 | `human.ask.parked` | info | `ask`, `deadline_ms`, `note` |  |
 | `human.ask.pruned` | warn | `err`, `task` |  |
@@ -332,7 +334,8 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `instance.exited` | info | `handle`, `pid`, `status` |  |
+| `instance.drain` | info | `handle`, `pid` | The parent's drain sent the child `SIGTERM`, so it drains itself. |
+| `instance.exited` | info | `handle`, `pid`, `status` | `status` is `parked` for a child that drained at its parent's drain; the next start spawns it again. A `sync` child a stopped turn waited on is `cancelled` instead: the turn's replay spawns it again. |
 | `instance.kill` | warn | `handle`, `note`, `pid` |  |
 | `instance.metered` | info | `delta_tokens`, `handle`, `total_tokens` |  |
 | `instance.mirror` | info | `handle`, `seq`, `stream` |  |
@@ -679,7 +682,7 @@ case.
 | `subagent.kill` | info | `handle` | A subagent was stopped. |
 | `subagent.respawn` | info | `handle`, `node` |  |
 | `subagent.restore.bad_payload` | warn | `handle` |  |
-| `subagent.result` | info | `err`, `handle`, `status`, `tokens` | A subagent reported its result. |
+| `subagent.result` | info | `err`, `handle`, `status`, `tokens` | A subagent reported its result. `cancelled` for a `sync` one a drain stopped with the turn waiting on it, which asks for it again when it replays. |
 | `subagent.spawn` | info | `cpu_seconds`, `depth`, `handle`, `memory_bytes`, `mode`, `node`, `pid`, `priority`, `servers` | A subagent process started. |
 | `subagent.swap_intel` | info | `endpoint_change` |  |
 | `subagent.turn` | info | `handle`, `status` |  |
@@ -816,7 +819,7 @@ Use the log events for anything a series below does not cover.
 | `agent_up` | gauge | | live | `1` while the process answers the scrape |
 | `agent_ready` | gauge | | live | `1` unless draining or every model endpoint is reported down; the same verdict as `/readyz` |
 | `agent_paused` | gauge | | live | `1` while an instance-wide `admin.pause` holds |
-| `agent_drains_total` | counter | `phase`: `started`, `completed`, `forced`, `other` | live | Drain transitions. An abandoned drain also counts `completed`; `forced` is never written. |
+| `agent_drains_total` | counter | `phase`: `started`, `completed`, `forced`, `other` | live | Drains. `started` when one begins; at its end, `completed` when everything running finished within `drain_timeout`, or `forced` when the timeout, a second signal or an exit asked for stopped work that was still running, an abandoned drain included. |
 | `agent_config_reload_total` | counter | `result`: `applied`, `rejected`, `other` | live | Reloads: `applied`, or `rejected` when the reload was refused (`config.reload.invalid`, `config.reload.restart_required`) and the running configuration stands |
 | `agent_config_generation` | gauge | | live | Applied reloads since start, the number also stamped into the durable manifest |
 | `agent_reactor_stalls_total` | counter | | live | Times the supervisor loop went 5 s or more without a tick, which `/healthz` answers `503` for; counted when the loop ticks again. A slow start before the loop runs is not counted. |

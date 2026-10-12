@@ -773,8 +773,9 @@ pub enum InstructionUnavailable {
     /// agent stops taking on anything it cannot justify, without abandoning
     /// what it already accepted.
     Freeze,
-    /// Finish live work, then exit 0 — an orchestrator restarts the pod and
-    /// startup re-reads the source, which is the natural repair.
+    /// Finish live work, then exit (0 for a daemon) — an orchestrator
+    /// restarts the pod and startup re-reads the source, which is the natural
+    /// repair.
     Drain,
     /// Stop now, exit non-zero. For an agent whose instruction is so
     /// load-bearing that running without a fresh one is worse than not
@@ -2150,8 +2151,9 @@ impl WindowUnit {
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LifetimeExhausted {
-    /// Finish live work, then exit 0. The default: an orchestrator restarts the
-    /// instance with a fresh window, which is what a lifetime budget is for.
+    /// Finish live work, then exit (0 for a daemon). The default: an
+    /// orchestrator restarts the instance with a fresh window, which is what a
+    /// lifetime budget is for.
     #[default]
     Drain,
     /// Refuse every admission and stay up — for an operator who would rather

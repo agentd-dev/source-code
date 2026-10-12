@@ -142,28 +142,51 @@ queue, or add a `schedule` start that sweeps for outstanding items.
 
 `SIGTERM` or `SIGINT` starts a bounded drain:
 
-1. Readiness turns off and the triggers stop admitting work. Workflows with
-   an `event` start on `lifecycle.shutdown` fire at this point.
-2. Every child process (turn workers and subagents) is asked to cancel. A
-   child still running 5 seconds later gets `SIGTERM`, and `SIGKILL` 2
-   seconds after that. No new workflow step or conversation turn starts.
-3. The drain waits for the `lifecycle.shutdown` runs, up to
-   `lifecycle.drain_timeout` (default 25 s).
-4. agentd checkpoints its durable state, flushes its log and exits **0**.
+1. Readiness turns off and the triggers stop admitting work. No new workflow
+   step or conversation turn starts. Workflows with an `event` start on
+   `lifecycle.shutdown` fire at this point, and only their steps still start.
+2. Work already running runs on: a conversation turn, a step's turn, the
+   think and decide workers serving them, a subagent, an `http` or MCP call
+   out on an executor thread. Each records its result as usual, and its run
+   then stops at its next step. A warm subagent, which never ends on its
+   own, is cancelled at once; an instance-tier child is sent `SIGTERM` and
+   drains itself.
+3. The drain waits for that work and for the `lifecycle.shutdown` runs, up
+   to `lifecycle.drain_timeout` (default 25 s). A drain the agent's own exit
+   began — a `finish` with `exit: true`, `lifetime_exhausted: exit` — stops
+   that work at once instead, and waits only for the `lifecycle.shutdown`
+   runs.
+4. agentd checkpoints its durable state, flushes its log and exits.
 
-What happens to work in flight depends on where it is. A run that is waiting
-(on a timer, a signal, a person, or for its next step) stays in the store and
-resumes when the instance starts again, on the definition it started with. A
-step whose turn worker is cut off mid-call fails, and its run fails with it.
-To let running steps finish before a planned restart, pause the instance
-first, wait until `status` shows no child processes, then drain; see
-[Operate a running daemon](operations.md#drain-for-a-rolling-update).
+Nothing the drain stops is failed. When the timeout passes, or a second
+`SIGTERM` or `SIGINT` forces the drain, the children still running are
+killed and their work is left for the next start: a step whose turn was cut
+off stays `running` in the store and runs again, as a step a crash caught
+running does, a conversation turn's message stays in the inbox and is
+answered again,
+and a subagent is recorded `parked` and started again. One `drain.interrupted`
+line names what was left. A run that is waiting (on a timer, a signal, a
+person, or for its next step) stays in the store as it is. All of it resumes
+when the instance starts again, on the definitions it started with, so a
+drain that is stopped loses only the partial work of the calls it cut off.
+The exception is a `lifecycle.shutdown` run the drain cut short: it is
+cancelled, since it belongs to the shutdown that is over, and the next
+start does not run it at its boot.
 
-A clean drain exits 0, not 143, so a rolled pod looks like a clean shutdown.
-A second `SIGTERM` or `SIGINT` forces the shutdown at once. When
-`drain_timeout` passes, agentd kills the children that remain; if any is
-still alive 3 seconds later, it logs `drain.abandon` and exits anyway. The
-worst case is therefore `drain_timeout` plus about 3 seconds.
+A daemon's drain exits **0**, not 143, so a rolled pod looks like a clean
+shutdown. A job's drain exits with the job's own code: one whose work the
+drain cut short exits 3, never 0, so a Job controller does not record a
+success for work that did not happen. A job keeps no state by default
+(`store.kind: none`), so its next run starts the work again rather than
+resuming it.
+
+When `drain_timeout` passes, agentd kills the children that remain; if any
+is still alive 3 seconds later, it logs `drain.abandon` and exits anyway.
+The worst case is therefore `drain_timeout` plus about 3 seconds. A turn
+blocked on `ask_human` holds the drain to its timeout, since the listener
+takes no answers while draining. Its task goes back to `working` rather
+than failing, and the turn runs again after the restart and asks on the
+same task. A workflow `human` step holds nothing: it waits in the store.
 
 ### Keep the drain inside the grace period
 
@@ -336,6 +359,10 @@ podFailurePolicy:
 A budget stop is exit 7 and a missed deadline exit 124. If either should not
 count as a failure for your Job, `--budget-exit-code 0` remaps 7 (and 3);
 nothing remaps 124.
+
+A Job pod evicted or deleted mid-run drains and exits 3 when the drain cut
+its work short, so it counts against `backoffLimit` and the work runs again
+in a new pod. A remap of 3 turns that into a success as well.
 
 ### Job
 

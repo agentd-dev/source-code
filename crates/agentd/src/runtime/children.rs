@@ -4,7 +4,7 @@
 //! exactly one process that can orphan work and exactly one place that reaps.
 //! Children are spawned through `supervisor::spawn` (the reaper + PDEATHSIG +
 //! process groups), tracked here with their purpose, liveness and
-//! cancellation, and torn down by the kill ladder on drain.
+//! cancellation, and torn down by the kill ladder when a drain stops them.
 
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::kill::{Ladder, LadderAction, kill_group, term_group};
@@ -67,6 +67,16 @@ pub struct Child {
     /// [`Children::is_settled`]): the child's mere presence cannot give it,
     /// because a settled worker also stays in the table until it is reaped.
     pub settled: bool,
+    /// The kill ladder a drain stopped this child with: `Cancel` when it was
+    /// stopped, `SIGTERM` to its group after a grace, `SIGKILL` after another
+    /// — or `SIGKILL` at once when the drain is forced. `None` while the
+    /// child is let run.
+    pub stop: Option<Ladder>,
+    /// The drain stopped this child while it had work of its own, so what it
+    /// owed — a step's result, a turn's reply, a subagent's outcome — is left
+    /// for the next life, never failed. A child already cancelled for a reason
+    /// of its own (a run's cancel, a liveness verdict) keeps that reason.
+    pub parked: bool,
 }
 
 /// The children registry.
@@ -78,7 +88,6 @@ pub struct Children {
     pid_to_node: HashMap<i32, NodeId>,
     next: u64,
     liveness_cfg: LivenessConfig,
-    ladder: Option<Ladder>,
     last_ping: Instant,
     ping_seq: u64,
     /// The child reaped most recently, kept past its removal from `map` as
@@ -104,7 +113,6 @@ impl Children {
             pid_to_node: HashMap::new(),
             next: 1,
             liveness_cfg: LivenessConfig::from_env(),
-            ladder: None,
             last_ping: Instant::now(),
             ping_seq: 0,
             last_reaped: None,
@@ -181,6 +189,8 @@ impl Children {
             cancelled: false,
             tokens: 0,
             settled: false,
+            stop: None,
+            parked: false,
         };
         self.pid_to_node.insert(child.sub.pid(), node);
         self.map.insert(node, child);
@@ -263,7 +273,7 @@ impl Children {
             .is_some_and(|c| c.sub.send(msg).is_ok())
     }
 
-    /// Cancel a child gracefully (the kill ladder escalates on drain).
+    /// Cancel a child gracefully.
     pub fn cancel(&mut self, node: NodeId, reason: &str) -> bool {
         let Some(c) = self.map.get_mut(&node) else {
             return false;
@@ -306,49 +316,55 @@ impl Children {
             .collect()
     }
 
-    /// Begin the drain: cancel every child; the ladder escalates.
-    pub fn begin_drain(&mut self, reason: &str) {
-        for c in self.map.values_mut() {
-            c.cancelled = true;
-            let _ = c.sub.send(&ControlMsg::Cancel {
-                reason: reason.to_string(),
-            });
-        }
-        if self.ladder.is_none() {
-            self.ladder = Some(Ladder::with_defaults(Instant::now()));
-        }
-    }
-
-    /// Drive the ladder: `true` when every child is gone.
-    pub fn drive_drain(&mut self, force: bool) -> bool {
-        let all_exited = self.map.is_empty();
-        let Some(ladder) = self.ladder.as_mut() else {
-            return all_exited;
+    /// Stop `node` for the drain: `Cancel` it now and start its kill ladder
+    /// (see [`Child::stop`]). Whether it was live and not already stopped.
+    pub fn stop(&mut self, node: NodeId, reason: &str) -> bool {
+        let Some(c) = self.map.get_mut(&node) else {
+            return false;
         };
-        match ladder.poll(Instant::now(), all_exited, force) {
-            LadderAction::Wait => false,
-            LadderAction::Term => {
-                for c in self.map.values() {
-                    term_group(c.sub.pgid());
-                }
-                false
+        if c.stop.is_some() {
+            return false;
+        }
+        c.parked = !c.cancelled;
+        c.cancelled = true;
+        c.stop = Some(Ladder::with_defaults(Instant::now()));
+        let _ = c.sub.send(&ControlMsg::Cancel {
+            reason: reason.to_string(),
+        });
+        true
+    }
+
+    /// Climb each stopped child's ladder; `force` collapses every one to
+    /// `SIGKILL`. A child the drain lets run is not touched.
+    pub fn drive_stops(&mut self, force: bool) {
+        let now = Instant::now();
+        for c in self.map.values_mut() {
+            let Some(ladder) = c.stop.as_mut() else {
+                continue;
+            };
+            match ladder.poll(now, false, force) {
+                LadderAction::Term => term_group(c.sub.pgid()),
+                LadderAction::Kill => kill_group(c.sub.pgid()),
+                LadderAction::Wait | LadderAction::Done => {}
             }
-            LadderAction::Kill => {
-                for c in self.map.values() {
-                    kill_group(c.sub.pgid());
-                }
-                false
-            }
-            LadderAction::Done => true,
         }
     }
 
-    /// Forget every remaining child (after a forced kill at abandon).
-    pub fn abandon(&mut self) {
-        for (_, mut c) in self.map.drain() {
-            let _ = c.sub.kill();
-        }
+    /// Kill and forget every remaining child: a drain past its abandon grace,
+    /// or the process on its way out. Returns each one's node, kind, whether
+    /// its unit was settled and whether the drain parked it, so what it owed
+    /// can still be left for the next life.
+    pub fn abandon(&mut self) -> Vec<(NodeId, ChildKind, bool, bool)> {
+        let gone = self
+            .map
+            .drain()
+            .map(|(node, mut c)| {
+                let _ = c.sub.kill();
+                (node, c.kind, c.settled, c.parked)
+            })
+            .collect();
         self.pid_to_node.clear();
+        gone
     }
 
     /// A status view.

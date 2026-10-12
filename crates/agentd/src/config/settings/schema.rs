@@ -31,7 +31,7 @@ pub fn schema() -> Value {
         "properties": {
             "windows": { "type": "array", "items": { "$ref": "#/$defs/BudgetWindow" } },
             "lifetime_tokens": { "type": "integer", "minimum": 0, "description": "hard ceiling; 0 = unbounded" },
-            "lifetime_exhausted": { "enum": ["drain", "refuse", "exit"], "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)" },
+            "lifetime_exhausted": { "enum": ["drain", "refuse", "exit"], "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit as a drain does, 0 for a daemon, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)" },
             "on_exhausted": { "enum": ["wait", "slow", "degrade", "refuse", "fail"] },
             "slow": { "type": "object", "additionalProperties": false, "properties": { "factor": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 } } },
             "degrade": { "type": "object", "additionalProperties": false, "properties": { "model": { "type": "string" } } }
@@ -99,7 +99,7 @@ fn top_level_properties(
                         "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "mcp": instruction_mcp_source(),
                         "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
-                        "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
+                        "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit, 0 for a daemon), exit" },
                         "unenforceable": { "enum": ["warn", "refuse", "ignore"], "description": "what a `trust` pin that names no key file means at startup — `author_keys` that are instruction:// JWKS uris, or none, need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore. A key file that cannot be read always refuses (exit 2)" },
                         "trust": instruction_trust,
                         "decrypt": { "type": "object", "additionalProperties": false, "description": "recipient keys for an encrypted envelope (RFC 0041)", "properties": {

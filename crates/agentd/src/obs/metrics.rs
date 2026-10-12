@@ -1298,10 +1298,8 @@ mod imp {
             );
 
             // --- lifecycle events ---------------------------------------------
-            // `agent_drains_total{phase}` is wired: the reactor's per-run teardown
-            // (`supervisor::reactor`) and the daemon's graceful wind-down
-            // (`triggers::mode`) both run in this (supervisor) process and bump
-            // `started`/`completed`/`forced`.
+            // `agent_drains_total{phase}`: the drain (`runtime::drain`) counts
+            // `started` as it begins, and `completed` or `forced` as it ends.
             labelled_counter(
                 &mut s,
                 "agent_drains_total",
@@ -2297,7 +2295,7 @@ mod imp {
             r.record_subagent_exited("cancelled");
             // the liveness check's kill (`Runtime::on_unhealthy_child`).
             r.record_subagent_stuck_kill("kill");
-            // drain phases (reactor.rs begin_drain/Done/timeout + mode.rs daemon).
+            // drain phases (`Runtime::begin_drain`, `Runtime::drain_step`).
             r.record_drain("started");
             r.record_drain("completed");
             r.record_drain("forced");

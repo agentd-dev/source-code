@@ -600,7 +600,7 @@
                   "type": "object"
                 },
                 "lifetime_exhausted": {
-                  "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+                  "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit as a drain does, 0 for a daemon, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
                   "enum": [
                     "drain",
                     "refuse",
@@ -893,7 +893,7 @@
               "type": "object"
             },
             "lifetime_exhausted": {
-              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit as a drain does, 0 for a daemon, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
               "enum": [
                 "drain",
                 "refuse",
@@ -2790,7 +2790,7 @@
               "type": "object"
             },
             "lifetime_exhausted": {
-              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit as a drain does, 0 for a daemon, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
               "enum": [
                 "drain",
                 "refuse",
@@ -3070,7 +3070,7 @@
                   "type": "array"
                 },
                 "unavailable": {
-                  "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit",
+                  "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit, 0 for a daemon), exit",
                   "enum": [
                     "auto",
                     "keep",
@@ -3412,7 +3412,7 @@
               "type": "object"
             },
             "lifetime_exhausted": {
-              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit as a drain does, 0 for a daemon, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
               "enum": [
                 "drain",
                 "refuse",

@@ -344,8 +344,18 @@ impl Runtime {
             // per conversation: a restart or reload that moves the turn
             // model or adds a smaller route moves a restored one too.
             c.model_window = window;
+            // A message replayed from the inbox after the turn that took it
+            // was stopped — by a drain, or a crash — is already this
+            // conversation's last word, unanswered: it is not said twice.
             if let Some(m) = job.message.clone() {
-                c.append(m);
+                let said = matches!(
+                    (c.messages.last(), &m),
+                    (Some(Msg::User { text: a, principal: p, .. }), Msg::User { text: b, principal: q, .. })
+                        if a == b && p == q
+                );
+                if !said {
+                    c.append(m);
+                }
             }
             for u in unknown {
                 c.append(Msg::note(format!(

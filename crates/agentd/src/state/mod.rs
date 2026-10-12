@@ -1198,6 +1198,29 @@ pub fn kill_point(name: &str) {
     }
 }
 
+/// A test **hold point**: with `AGENTD_TEST_HOLD_AT=<name>` set (debug /
+/// `internal-mocks` builds only), the process waits here until the file
+/// `AGENTD_TEST_HOLD_RELEASE` names exists, a minute at most — so a test can
+/// look at a live process at an exact instant, such as `/metrics` between a
+/// drain's end and the exit. Like [`kill_point`], it compiles to nothing in a
+/// release build without `internal-mocks`.
+pub fn hold_point(name: &str) {
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    {
+        if std::env::var("AGENTD_TEST_HOLD_AT").as_deref() == Ok(name) {
+            let release = std::env::var("AGENTD_TEST_HOLD_RELEASE").unwrap_or_default();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !std::path::Path::new(&release).exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    #[cfg(not(any(feature = "internal-mocks", debug_assertions)))]
+    {
+        let _ = name;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

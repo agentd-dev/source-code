@@ -877,12 +877,16 @@ impl Runtime {
         }
     }
 
-    /// Restore: re-spawn non-detached, non-terminal subagents (`attempt + 1`).
+    /// Restore: re-spawn non-detached, non-terminal subagents (`attempt + 1`),
+    /// and every one a drain parked — a detached one too, which a crash does
+    /// not revive but a drain's own stopping must not lose.
     pub(crate) fn respawn_restored_subagents(&mut self) {
         let handles: Vec<String> = self
             .subagents
             .values()
-            .filter(|s| !is_terminal_status(&s.status) && s.mode != "detached")
+            .filter(|s| {
+                !is_terminal_status(&s.status) && (s.mode != "detached" || s.status == "parked")
+            })
             .map(|s| s.handle.clone())
             .collect();
         for handle in handles {

@@ -238,46 +238,79 @@ the same tick. In practice `Dead` comes from the reaper, not the classifier.
 
 ## The kill ladder
 
-A drain — `SIGTERM`, `SIGINT`, a `finish` with `exit: true`, or another
-reason to stop — escalates on a fixed, clock-driven ladder over every child
-at once. The signalling refuses any process group of 1 or less, so the
-supervisor can never signal init or itself.
+A drain — `SIGTERM`, `SIGINT`, `admin.drain`, a `finish` with `exit: true`,
+or another reason to stop — spawns nothing new and lets the children already
+running finish: a turn worker, a think, a subagent. The kill ladder is for
+the children it stops, each on a clock of its own:
+
+- a warm subagent, which never ends on its own, as the drain begins;
+- every child, when an exit is asked for: a `finish` with `exit: true`,
+  `lifetime_exhausted: exit`, a store that cannot write — every child but
+  those working for a `lifecycle.shutdown` run, which the drain still waits
+  for;
+- every child still running when `lifecycle.drain_timeout` passes or a
+  second signal arrives, straight to `SIGKILL`.
+
+The signalling refuses any process group of 1 or less, so the supervisor can
+never signal init or itself.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Cancel: drain begins, Cancel to every child
-  Cancel --> Term: after 5 s, SIGTERM to every group
-  Term --> Kill: after 2 s more, SIGKILL to every group
-  Cancel --> Kill: force, a second signal or drain_timeout
-  Term --> Kill: force
-  Cancel --> Done: every child reaped
-  Term --> Done: every child reaped
-  Kill --> Done: every child reaped
-  Kill --> Abandon: drain_timeout plus 3 s, children remain
-  Done --> [*]: forced checkpoint, then exit
-  Abandon --> [*]: drop the rest, log drain.abandon
+  [*] --> Runs: the drain begins
+  Runs --> Reaped: the child finishes and exits
+  Runs --> Cancel: stopped, Cancel to the child
+  Cancel --> Term: after 5 s, SIGTERM to its group
+  Term --> Kill: after 2 s more, SIGKILL to its group
+  Runs --> Kill: forced, drain_timeout or a second signal
+  Cancel --> Kill: forced
+  Term --> Kill: forced
+  Cancel --> Reaped: it exits
+  Term --> Reaped: it exits
+  Kill --> Reaped: it exits
+  Kill --> Abandoned: drain_timeout plus 3 s
+  Reaped --> [*]
+  Abandoned --> [*]: dropped, drain.abandon
 ```
 
 | Stage | When | Action |
 |---|---|---|
-| Cancel | t = 0 | `Cancel` to every child; no new spawns |
-| Term | t + 5 s | `SIGTERM` to every remaining group |
-| Kill | t + 7 s | `SIGKILL` to every remaining group |
-| Force | a second signal, or `lifecycle.drain_timeout` (default 25 s) | straight to `SIGKILL`, once |
+| Runs | t = 0 | no new spawns; the running children run on |
+| Cancel | when the drain stops a child | `Cancel` to that child |
+| Term | 5 s after its `Cancel` | `SIGTERM` to its group |
+| Kill | 7 s after its `Cancel` | `SIGKILL` to its group |
+| Force | `lifecycle.drain_timeout` (default 25 s), or a second signal | straight to `SIGKILL` for every child left, once |
 | Abandon | drain timeout + 3 s | drop the remaining children, checkpoint, exit |
+
+Nothing a drain stops is failed. A step whose turn worker it stopped stays
+`running` in the final checkpoint and is replayed by the next start; a
+conversation turn it stopped leaves its message in the inbox; a gate such a
+turn had open puts its task back to `working`, and the replay asks on it
+again; a subagent it stopped is recorded `parked` and spawned again. A
+`sync` subagent a stopped turn was waiting on is recorded `cancelled`
+instead, because the turn's replay asks for it again, and a parked one
+would run twice. A child that ends on its own with a real failure during
+the drain fails as it would at any other time. One `drain.interrupted` line
+names what the drain left. When its timeout, a second signal or an exit
+stopped work, `agent_drains_total` counts the drain `forced` rather than
+`completed`.
 
 The worst case with the default drain timeout is 28 seconds. Keep it below
 your orchestrator's grace period (`terminationGracePeriodSeconds` in
 Kubernetes), or the orchestrator's `SIGKILL` lands first and you lose the
 final checkpoint. Nothing can validate that for you, because agentd cannot
-see the orchestrator's number. A clean drain exits 0, not 143; the exit
-codes are listed in [CLI, environment and exit
-codes](cli.md).
+see the orchestrator's number. A daemon's drain exits 0, not 143, and a
+job's exits with its work's code; the exit codes are listed in [CLI,
+environment and exit codes](cli.md).
 
-While the ladder runs, the drain also waits for any workflow run started by
-an `event {on: lifecycle.shutdown}` start node — the deinit hook described in
-[Jobs, daemons and triggers](modes-and-triggers.md#init-and-deinit) — within
-the same `drain_timeout`.
+Besides its children, the drain waits for any workflow run started by an
+`event {on: lifecycle.shutdown}` start node — the deinit hook described in
+[Jobs, daemons and triggers](modes-and-triggers.md#init-and-deinit) — for
+the calls out on executor threads, and for instance-tier children, which it
+sends `SIGTERM` as it begins so each drains itself, all within the same
+`drain_timeout`. A drain an exit asked for waits for the deinit runs and
+the instance-tier children, not for the other calls out. A deinit run a
+forced drain cuts short is cancelled rather than left, so the next start
+does not run the last one's shutdown at its boot.
 
 ## Admission and pressure
 

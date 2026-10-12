@@ -452,6 +452,15 @@ pub struct Runtime {
     pub(crate) paused: bool,
     pub(crate) drain_started: Option<Instant>,
     pub(crate) drain_reason: String,
+    /// The drain had to stop work that was still running: its timeout passed,
+    /// a second signal came, or an exit was asked for (`runtime::drain`).
+    pub(crate) drain_forced: bool,
+    /// Instance-tier children the drain asked to drain themselves, and whether
+    /// its force has killed each since. One that then exits is parked for the
+    /// next life rather than closed.
+    pub(crate) drain_instances: BTreeMap<String, bool>,
+    /// What the drain stopped and left for the next life.
+    pub(crate) drain_left: super::drain::Left,
     pub(crate) idle_since: Option<Instant>,
     /// The intelligence connections — the top-level one and each provider —
     /// with their credentials resolved. Models are not here: they resolve
@@ -1201,11 +1210,22 @@ impl Runtime {
                     self.log.warn("intel.health", json!({"all_down": all_down}));
                 }
             }
+            // A child the drain is stopping starts nothing more: its wait for
+            // the answer ends on the cancel it was sent.
+            AgentMsg::ToolRequest { .. } | AgentMsg::BudgetRequest { .. }
+                if self.children.get(node).is_some_and(|c| c.stop.is_some()) => {}
             AgentMsg::ToolRequest { id, name, args } => self.on_tool_request(node, id, &name, args),
             AgentMsg::BudgetRequest { id, estimate } => self.on_budget_request(node, id, estimate),
             AgentMsg::TurnDone { turn } => {
                 crate::obs::metrics::record_unit_end(&turn.status);
-                self.on_turn_done(node, *turn)
+                // A turn the drain stopped ends `cancelled`: what it owed is
+                // left for the next life rather than recorded.
+                match self.parked_kind(node) {
+                    Some(kind) if turn.status == "cancelled" => {
+                        self.park_child(node, &kind, Some(turn.usage))
+                    }
+                    _ => self.on_turn_done(node, *turn),
+                }
             }
             AgentMsg::Turn { outcome } => {
                 crate::obs::metrics::record_unit_end(outcome.status.as_str());
@@ -1213,7 +1233,14 @@ impl Runtime {
             }
             AgentMsg::Result { outcome } => {
                 crate::obs::metrics::record_unit_end(outcome.status.as_str());
-                self.on_subagent_result(node, Ok(outcome))
+                match self.parked_kind(node) {
+                    Some(kind)
+                        if outcome.status == crate::agentloop::stop::TerminalStatus::Cancelled =>
+                    {
+                        self.park_child(node, &kind, None)
+                    }
+                    _ => self.on_subagent_result(node, Ok(outcome)),
+                }
             }
             AgentMsg::Failed { error } => {
                 let kind = self.children.get(node).map(|c| c.kind.clone());
@@ -1250,6 +1277,15 @@ impl Runtime {
         };
         self.activity_end(node);
         self.log.info("child.exit", json!({"node": node.0, "pid": r.pid, "kind": super::children::kind_label(&child.kind), "outcome": format!("{:?}", r.outcome)}));
+        // A child the drain stopped owes nothing in this life: what it was
+        // doing is left for the next (`runtime::drain`), and whatever waits
+        // on it is stopped with it.
+        if child.parked {
+            if !child.settled {
+                self.park_child(node, &child.kind, None);
+            }
+            return;
+        }
         // A child that died without its terminal frame: fail its unit.
         match child.kind {
             // Ask the STEP, not the child table, whether this worker died
@@ -1445,10 +1481,12 @@ impl Runtime {
             super::a2a_server::FeedVis::All,
             json!({"draining": true, "reason": reason}),
         );
-        self.children.begin_drain(reason);
+        // Work in flight runs on (`runtime::drain`); what has no end of its
+        // own — a warm subagent, an instance-tier child — is asked to stop.
+        self.stop_endless();
         // Deinitialization workflows: `event {on: lifecycle.shutdown}` starts
         // fire NOW — releasing a claimed webhook route, deregistering from a
-        // service, flushing a summary — and the drain below WAITS for exactly
+        // service, flushing a summary — and the drain WAITS for exactly
         // those runs (bounded by drain_timeout like everything else). The
         // mirror of `once {policy: always}`, which is the init workflow.
         self.fire_event_starts("lifecycle.shutdown", &json!({"reason": reason}));
@@ -1458,7 +1496,7 @@ impl Runtime {
     /// start — the runs drain must wait for. (Any of the workflow's runs
     /// counts: an in-flight ordinary run of a deinit-capable workflow is not
     /// distinguishable from the deinit run by the time both must finish.)
-    fn shutdown_runs_live(&self) -> usize {
+    pub(crate) fn shutdown_runs_live(&self) -> usize {
         let capable = |name: &str, hash: &str| {
             self.definition_for_run_ref(name, hash).is_some_and(|w| {
                 w.start_steps()
@@ -1494,45 +1532,17 @@ impl Runtime {
 
     /// Decide whether to exit now. Returns the exit code when done.
     fn lifecycle_step(&mut self) -> Option<i32> {
-        if let Some(code) = self.exit {
-            // A `finish {exit: true}` or a fatal store failure asked to exit:
-            // drain first.
-            if !self.draining {
-                self.begin_drain("exit");
-            }
-            if self.children.is_empty() {
-                return Some(code);
-            }
+        if self.exit.is_some() && !self.draining {
+            // A `finish {exit: true}`, a policy or a store that cannot write
+            // asked to exit: drain first, stopping what runs.
+            self.begin_drain("exit");
         }
         if self.draining {
-            let timeout = self.settings.lifecycle.drain_timeout();
-            let started = self.drain_started.unwrap_or_else(Instant::now);
-            let force = crate::signals::force() || started.elapsed() >= timeout;
-            let done =
-                self.children.drive_drain(force) && (force || self.shutdown_runs_live() == 0);
-            if done || started.elapsed() >= timeout + ABANDON_GRACE {
-                if !done {
-                    self.log
-                        .warn("drain.abandon", json!({"children": self.children.len()}));
-                    self.children.abandon();
-                }
-                crate::obs::metrics::record_drain("completed");
-                self.checkpoint(true);
-                self.log
-                    .info("drain.done", json!({"reason": self.drain_reason}));
-                return Some(self.exit.unwrap_or(crate::exit::SUCCESS));
-            }
-            return None;
+            return self.drain_step();
         }
         // Job shape / idle policy.
         let run_until = self.settings.lifecycle.run_until;
-        // `auto` re-reads the LIVE workflow set, not just the configured one:
-        // a long-lived workflow the agent defined at runtime (`workflow.create`
-        // — the self-setup shape, where a `--prompt` tells it to build its own
-        // loop/schedule/subscribe) turns the one-shot job into a daemon exactly
-        // as a configured one would have. Without this the instance idle-exits
-        // out from under the thing it was just asked to set up.
-        let job_now = self.job_shape && !self.workflows.values().any(|w| w.is_long_lived());
+        let job_now = self.job_now();
         let idle_policy = match run_until {
             RunUntil::Idle => true,
             RunUntil::Drained => false,
@@ -1571,11 +1581,22 @@ impl Runtime {
         None
     }
 
+    /// Whether the instance is a job right now. `auto` re-reads the LIVE
+    /// workflow set, not just the configured one: a long-lived workflow the
+    /// agent defined at runtime (`workflow.create` — the self-setup shape,
+    /// where a `--prompt` tells it to build its own loop/schedule/subscribe)
+    /// turns the one-shot job into a daemon exactly as a configured one would
+    /// have. Without this the instance idle-exits out from under the thing it
+    /// was just asked to set up.
+    pub(crate) fn job_now(&self) -> bool {
+        self.job_shape && !self.workflows.values().any(|w| w.is_long_lived())
+    }
+
     /// The exit code of a job-shaped instance, mapped from the `once`-started
     /// workflow's finish status. With several such runs the worst outcome
     /// wins, so a partial success is never reported as a clean exit. A daemon
     /// is not job-shaped and drains to 0.
-    fn job_exit_code(&self) -> i32 {
+    pub(crate) fn job_exit_code(&self) -> i32 {
         let mut code = crate::exit::SUCCESS;
         for id in &self.job_runs {
             if let Some(r) = self.runs.get(id) {

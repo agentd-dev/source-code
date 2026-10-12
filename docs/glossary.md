@@ -47,7 +47,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **dialect** | The wire format a connection speaks: `openai`, `anthropic`, `bedrock` or `decisions`. See [Intelligence wire reference](intelligence-reference.md). |
 | **directive** | A fenced block in an instruction document, such as `:::!workflow`, that declares machinery or shapes what the model reads. See [Instruction documents](directives.md). |
 | **discovery chain** | The config files agentd loads when none is named: the user's, the project's (`agentd.yml`) and the machine-local one (`agentd.local.yml`). See [How configuration works](configuration-model.md). |
-| **drain** | A graceful shutdown: admit no new work, let live work finish within `lifecycle.drain_timeout`, checkpoint, exit 0. See [Operate a running daemon](operations.md). |
+| **drain** | A graceful shutdown: admit no new work, let live work finish within `lifecycle.drain_timeout`, leave what still runs then for the next start, checkpoint, exit — 0 for a daemon, the work's code for a job. See [Operate a running daemon](operations.md). |
 
 ## E
 

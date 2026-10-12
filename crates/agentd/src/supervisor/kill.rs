@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The bounded teardown ladder.
 //!
-//! When a subtree must die (SIGTERM-to-agentd, a deadline/stuck verdict, or a
-//! tree-budget breach), the reactor tears it down **deepest-first** (children
-//! before parents, via `tree.deepest_first()`, so a parent can't spawn
-//! replacements mid-teardown — the `draining` flag also blocks new spawns) and
-//! escalates per the ladder: graceful `Cancel` → `killpg(SIGTERM)` after a
-//! grace → `killpg(SIGKILL)` after a kill-grace → reap. A second SIGTERM/SIGINT
-//! (`force`) collapses straight to SIGKILL. The whole budget is bounded and
-//! must stay **< the orchestrator's `terminationGracePeriodSeconds`**, or the
-//! orchestrator SIGKILLs agentd mid-teardown and the tree leaks; the reactor
-//! enforces that ceiling.
+//! A drain lets running work finish; the ladder is for the children it stops —
+//! a warm subagent as the drain begins, every child when an exit is asked
+//! for, and whatever still runs once `lifecycle.drain_timeout` passes. Each
+//! stopped child climbs its own ladder: graceful `Cancel` → `killpg(SIGTERM)`
+//! after a grace → `killpg(SIGKILL)` after a kill-grace → reap. A forced
+//! drain (its timeout, or a second SIGTERM/SIGINT) collapses straight to
+//! SIGKILL. The whole budget is bounded and must stay **< the orchestrator's
+//! `terminationGracePeriodSeconds`**, or the orchestrator SIGKILLs agentd
+//! mid-teardown and the tree leaks.
 //!
 //! The `killpg` calls are thin libc; the **escalation timing** is the pure,
 //! unit-tested [`Ladder`] state machine.

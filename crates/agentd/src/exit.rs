@@ -5,10 +5,10 @@
 //!
 //! | Code | Meaning                                             | Scheduler hint |
 //! |------|-----------------------------------------------------|----------------|
-//! | 0    | success (one-shot completed / clean SIGTERM drain)  | Complete       |
+//! | 0    | success (one-shot completed / a daemon's drain)     | Complete       |
 //! | 1    | generic/unspecified failure                         | retriable      |
 //! | 2    | config / usage error (validation)                   | non-retriable  |
-//! | 3    | partial result                                      | policy         |
+//! | 3    | partial result (a job's work left unfinished too)   | policy         |
 //! | 4    | intelligence unreachable / auth after retries       | retriable      |
 //! | 5    | semantic — task cannot be done / refused            | non-retriable  |
 //! | 6    | required MCP server failed to connect/handshake/die | retriable      |
@@ -17,9 +17,11 @@
 //! | 137  | killed by SIGKILL (128+9, OS-set) — often OOM       | raise memory   |
 //! | 143  | killed by SIGTERM (128+15, OS-set) — ungraceful     | —              |
 //!
-//! A clean SIGTERM drain returns **0, not 143**: draining on request is a
-//! success, not a kill. 137/143 only ever appear because the OS sets them when
-//! the kernel kills the process; agentd never calls `exit(137)` itself.
+//! A daemon's SIGTERM drain returns **0, not 143**: draining on request is a
+//! success, not a kill, and what the drain stopped resumes in the next life. A
+//! job's drain returns the job's own code, so one the drain cut short reads 3,
+//! never 0. 137/143 only ever appear because the OS sets them when the kernel
+//! kills the process; agentd never calls `exit(137)` itself.
 //!
 //! Beside the table this module states the per-code `podFailurePolicy`
 //! *intent* ([`pod_failure_intent`]) a control plane compiles into

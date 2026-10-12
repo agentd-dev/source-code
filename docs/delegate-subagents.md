@@ -331,7 +331,7 @@ subagent.run refused: 4 subagents live (limits.subagents.breadth = 4)
 |---|---|---|
 | `sync` (default) | The result, when the child finishes | Nothing more |
 | `async` | `{handle, status: "running"}` at once | `subagent.await`, `subagent.status`, or a workflow `wait {on: subagent}` |
-| `detached` | The handle at once | Nobody waits; a restart does not revive it |
+| `detached` | The handle at once | Nobody waits; a crash does not revive it, a drain's stop does |
 | `warm` | The handle at once | `subagent.send` for each further turn; see below |
 
 A result is `{handle, status, result, error}`. A string result longer than
@@ -393,6 +393,15 @@ A child that ends on its budget records `exhausted_steps`,
 `failed`. Either way the record is finished: `subagent.await` and
 `wait {on: subagent}` answer, and the child's `breadth` slot is free.
 
+A drain is the exception. A child runs on through it and records its result
+as usual; one the drain stops — still running at `lifecycle.drain_timeout`,
+or `warm` and so stopped as the drain begins — records `parked`. That record
+is not finished: a waiting step waits on, and the next start spawns the
+child again. A `sync` child that a turn's `subagent.run` was waiting on
+records `cancelled` instead. The drain stops that turn as well, and the
+turn's replay calls `subagent.run` again, so the parked child would run
+beside the new one.
+
 ## Keep a session warm
 
 A `warm` child stays alive after its first turn and runs one more turn for
@@ -408,7 +417,7 @@ assistant that reacts to a stream of events with context it built earlier.
 Then steer it with `subagent.send {handle, message}`. Messages sent during a
 turn queue in order. Each turn gets a fresh step, token and deadline budget.
 
-Two edges to plan for:
+Three edges to plan for:
 
 - **The supervisor's hard deadline is armed once.** It is the spawn's
   deadline plus 60 seconds, from the moment of the spawn. A session meant to
@@ -417,14 +426,21 @@ Two edges to plan for:
   is overwritten with a null result. Read each turn's output from the root
   notes (`subagent_result` in `agent.wake_on`) or poll `subagent.status`
   while it is alive.
+- **A drain stops it.** A warm child never ends on its own, so a drain
+  cancels it as the drain begins and records it `parked`. The next start
+  spawns it again from its instruction; the conversation it built is not
+  kept.
 
 ## Stop a child
 
 `subagent.kill {handle, reason}` marks the record `cancelled` at once and
 asks the child to stop. The child reads the request before its next step, so
 one inside a long model call finishes that call first; a child that does not
-stop is killed when liveness declares it unhealthy. On shutdown every child
-is cancelled, then sent SIGTERM at 5 seconds and SIGKILL at 7.
+stop is killed when liveness declares it unhealthy. On shutdown a child runs
+on until `lifecycle.drain_timeout` and is killed only if it is still running
+then; a warm child is cancelled at once, then sent SIGTERM at 5 seconds and
+SIGKILL at 7. A child the drain stops is recorded `parked`, not `cancelled`,
+unless it is a `sync` child a stopped turn was waiting on.
 `subagent.kill` works on flat children only; retire an instance child with
 `subagent.retire`.
 
@@ -706,12 +722,18 @@ reachable for the child's reports: on a unix listener the kernel identifies
 the child, and on a TCP listener with authentication `a2a.bearer` must be a
 `{{secret:…}}` reference, or the spawn is refused.
 
-`subagent.retire {handle}`, `ttl`, `until` and the parent's shutdown all
-retire a child the same way: it receives SIGTERM, drains its runs, checkpoints
-and exits. The parent kills it only if it is still running five seconds after
-the parent's `lifecycle.drain_timeout`. Its record closes as `retired` and its
-directory stays on disk. Live instance children start again from their
-composed configuration when the parent restarts.
+`subagent.retire {handle}`, `ttl` and `until` retire a child: it receives
+SIGTERM, drains its runs, checkpoints and exits. The parent kills it only if
+it is still running five seconds after the parent's
+`lifecycle.drain_timeout`. Its record closes as `retired` and its directory
+stays on disk.
+
+The parent's own drain stops a child the same way but does not retire it:
+the child receives SIGTERM as the drain begins and drains itself, and the
+parent waits for it within its own `drain_timeout`, killing it only if it is
+still running then. Its record says `parked`, and it starts again from its
+composed configuration when the parent restarts, as every live instance
+child does.
 
 > **Warning.** The parent's load checks a template's tier rules and its
 > boundary, but not the steps of its workflows. Those are validated when a

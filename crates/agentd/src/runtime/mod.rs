@@ -21,6 +21,7 @@ pub mod children;
 #[cfg(feature = "a2a")]
 pub mod conversations;
 pub(crate) mod decide; // deciding nodes + the decide tool (RFC 0046 P2)
+pub(crate) mod drain; // the graceful drain: what runs on, what it stops, what it parks
 pub mod env; // system-prompt data + the default template
 pub mod events;
 #[cfg(feature = "exec")]
@@ -634,6 +635,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         paused: false,
         drain_started: None,
         drain_reason: String::new(),
+        drain_forced: false,
+        drain_instances: Default::default(),
+        drain_left: Default::default(),
         idle_since: None,
         intel,
         trace_id: Some(trace.trace_id.clone()),

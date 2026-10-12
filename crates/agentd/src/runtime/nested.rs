@@ -707,6 +707,15 @@ impl Runtime {
             return BodyState::Done;
         }
         for sid in ready {
+            // A drain starts no step in a body either, as at the top level —
+            // asked before each, since one that starts may begin the drain.
+            if self.draining
+                && self
+                    .definition_for_run(run_id)
+                    .is_none_or(|wf| self.drain_holds(&wf))
+            {
+                break;
+            }
             // Stop if the run or the parent step ended meanwhile (a sibling's
             // failure may have failed the parent).
             if !self.parent_running(run_id, &strip_scope_suffix(scope_id)) {

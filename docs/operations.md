@@ -82,10 +82,12 @@ Every command is audited as `a2a.SendMessage:<op>` when an audit sink is on.
 ## Drain for a rolling update
 
 `admin.drain` begins the same graceful shutdown `SIGTERM` does. agentd stops
-admitting work, turns `/readyz` to 503, cancels its child processes,
-checkpoints, and exits **0**. Runs that are waiting stay in the durable store
-and resume when the instance starts again; a step whose turn is cut off
-mid-call fails with its run.
+admitting work and turns `/readyz` to 503, lets the turns, steps and
+subagents already running finish, checkpoints, and exits **0**. Each run
+stops at its next step, and runs that are waiting stay in the durable store;
+both resume when the instance starts again. Work still running at
+`lifecycle.drain_timeout` is stopped, not failed, and runs again after the
+restart.
 
 ```bash
 curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"drain-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.drain","reason":"rolling update"}}}]}}}'
@@ -109,14 +111,19 @@ What to know:
   above that total;
   [Deploy](deployment.md#keep-the-drain-inside-the-grace-period) shows the
   arithmetic.
+- What a drain stops is left for the next start: a step whose turn was cut
+  off stays `running` and runs again, a conversation turn's message is
+  answered again, and a subagent is recorded `parked` and started again. A
+  warm subagent is stopped as the drain begins, since it never ends on its
+  own; an instance-tier child drains itself, and the drain waits for it.
 - Workflows with an `event` start on `lifecycle.shutdown` fire as the drain
-  begins, and the drain waits for them.
-- To let running steps finish first, send `admin.pause`, poll `status`
-  until its `children` list is empty, then send `admin.drain`. A paused
-  instance starts no new step or turn, so nothing is in flight when the drain
-  begins.
-- The log shows `drain.start`, then `drain.done`, then `proc.exit` with
-  code 0.
+  begins, and the drain waits for them. One a forced drain cuts short is
+  cancelled, so the next start does not run it.
+- The log shows `drain.start`, then `drain.interrupted` when the drain
+  stopped work, naming the steps, turns and subagents it left, then
+  `drain.done`, then `proc.exit` with code 0. `agent_drains_total` counts
+  the drain `completed` when everything finished in time, and `forced` when
+  its timeout or a second signal stopped work.
 
 ## Pause and resume
 

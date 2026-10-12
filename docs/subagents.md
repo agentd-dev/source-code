@@ -160,7 +160,7 @@ collapses on its own.
 |---|---|---|
 | `sync` | One bounded agent loop, up to its step budget, then exits | The result when it lands; the call parks without blocking the reactor |
 | `async` | The same single loop | A handle at once; `subagent.await` or a workflow `wait` collects |
-| `detached` | The same single loop | A handle at once; nobody waits, and a restart does not revive it |
+| `detached` | The same single loop | A handle at once; nobody waits, and a crash does not revive it (a drain's stop does) |
 | `warm` | Stays alive and runs one turn per message | A handle at once; `subagent.send` steers it |
 
 A warm subagent prepares its session once, runs its instruction as the first
@@ -247,16 +247,25 @@ once at spawn.
 sends a cancel frame, which the child's loop reads before its next step. A
 child inside a long call keeps running, and spending, until that call
 returns or liveness declares it unhealthy, at which point the reactor kills
-its process group. Shutdown is where the escalation ladder lives: every
-child is cancelled together, then sent SIGTERM at 5 seconds and SIGKILL at 7,
-inside `lifecycle.drain_timeout`. [Supervision and containment](harness.md)
-covers liveness and the ladder in full.
+its process group.
+
+**A drain lets a child finish.** A `sync`, `async` or `detached` child runs
+on through a drain and records its result as usual; only one still running
+at `lifecycle.drain_timeout`, or when a second signal forces the drain, is
+killed. A `warm` child never ends on its own, so the drain cancels it as it
+begins. A child the drain stops is recorded `parked`, never `failed`, and
+the next start spawns it again — except a `sync` child a turn was waiting
+on, which is recorded `cancelled`: the drain stops that turn too, and its
+replay asks for the child again, so a parked one would run twice.
+[Supervision and containment](harness.md) covers liveness and the kill
+ladder in full.
 
 ## Restart is not resume
 
 At startup the reactor reads every `subagent/<handle>` record and re-spawns
-each one that is not terminal, except `detached` children, which were
-deliberately abandoned. The re-spawn bumps the record's `attempt`, and the
+each one that is not terminal, except a `detached` child a crash left
+running, which was deliberately abandoned; a `detached` child a drain
+parked comes back. The re-spawn bumps the record's `attempt`, and the
 child's model is resolved again against the live configuration, because the
 stored payload holds no credential. A reload resolves running children's
 models again too, and each applies the new connection at its next turn

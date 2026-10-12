@@ -1094,16 +1094,12 @@ impl Runtime {
         // a workflow that declares a `lifecycle.shutdown` start exists to run
         // DURING the drain (deregister the webhook, flush the summary), and
         // the drain gate waits for it. Everything else parks where it is,
-        // checkpointed, and resumes next life.
-        let shutdown_capable = self.draining
-            && wf
-                .start_steps()
-                .iter()
-                .any(|s| s.kind == "event" && s.field_str("on") == Some("lifecycle.shutdown"));
+        // checkpointed, and resumes next life. Asked before each step: one
+        // that starts may begin the drain (a lifetime ceiling it exhausts).
         match next {
             Ok(Next::Ready(steps)) => {
                 for s in steps {
-                    if self.draining && !shutdown_capable {
+                    if self.drain_holds(&wf) {
                         return;
                     }
                     // A step that finished inline may have driven the run on,

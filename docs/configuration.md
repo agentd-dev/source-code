@@ -395,7 +395,7 @@ What `unavailable` does after a successful start:
 |---|---|
 | `keep` | carry on with the last good instruction |
 | `freeze` | serve live work, refuse new work |
-| `drain` | finish live work, then exit 0 |
+| `drain` | finish live work, then exit (0 for a daemon) |
 | `exit` | stop at once, non-zero |
 | `auto` | `freeze` when the source is trust-pinned (a `publisher` under `trust`), otherwise `keep` |
 
@@ -495,7 +495,7 @@ bounds. All `intelligence.budget` paths are live · doc.
 | `intelligence.budget.slow.factor` | number, 0–1 | `0.5` | For `slow`: pace admissions to this share of the window rate. |
 | `intelligence.budget.degrade.model` | string | — | For `degrade`: the model a squeezed turn moves to. Required with `degrade`. |
 | `intelligence.budget.lifetime_tokens` | int | `0` (unbounded) | A ceiling across every run of the process. |
-| `intelligence.budget.lifetime_exhausted` | `drain \| refuse \| exit` | `drain` | What the process does once the ceiling is spent: finish live work and exit 0, stay up refusing new work, or exit 7 at once. |
+| `intelligence.budget.lifetime_exhausted` | `drain \| refuse \| exit` | `drain` | What the process does once the ceiling is spent: finish live work and exit (0 for a daemon), stay up refusing new work, or exit 7 at once. |
 
 The how-to, with the exit codes and gauges each choice produces, is
 [Control spend with budgets](budgets.md).
@@ -1010,7 +1010,7 @@ deadline exits 124; [cli.md](cli.md) has the full table.
 | `lifecycle.run_until` | `auto \| idle \| drained` | `auto` | restart · doc | `idle`: a job that exits once no work remains. `drained`: a daemon that exits only on a signal. `auto`: a daemon when the instance is long-lived (a listener, a `goal`, or a long-lived start node), otherwise a job. |
 | `lifecycle.idle_grace` | duration | `5s` | live · doc | How long an idle job waits before exiting. |
 | `lifecycle.until_signal` | string | — | live · doc | A signal whose delivery begins a graceful shutdown. |
-| `lifecycle.drain_timeout` | duration | `25s` | restart · op | The graceful drain budget on `SIGTERM`. Keep it below the pod's `terminationGracePeriodSeconds`. |
+| `lifecycle.drain_timeout` | duration | `25s` | restart · op | The graceful drain budget on `SIGTERM`: how long work already running may finish before the drain stops it and leaves it for the next start. Keep it below the pod's `terminationGracePeriodSeconds`. |
 | `lifecycle.run_id` | string | a fresh ULID | restart · op | Sent as `agent/run_id` in every MCP call's `_meta`, beside `agent/instance`. Set a stable one per unit of work (a Job name, an input hash) so servers can dedupe retries; the default correlates logs but dedupes nothing. |
 | `lifecycle.exit_code_map` | map: `"3"` or `"7"` → 0–255 | `{}` | restart · op | Remap the policy exit codes 3 (partial) and 7 (budget). Any other key is exit 2. |
 | `lifecycle.watch_config` | bool | `false` | restart · op | Reload when a config file, the instruction file or folder, a workflow file or folder, or a skill file changes. Needs a `--config` file and the `config-watch` feature. |

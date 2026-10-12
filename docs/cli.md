@@ -274,8 +274,8 @@ An unknown unit is exit 2: `unknown duration unit 'x' in 2x`.
 
 | Signal | Effect |
 |---|---|
-| `SIGTERM`, `SIGINT` | Begin a graceful drain: stop admitting work, wind down what runs, checkpoint, exit 0. Bounded by `lifecycle.drain_timeout`. |
-| A second `SIGTERM` or `SIGINT` | Force the shutdown: the child process groups are killed at once. |
+| `SIGTERM`, `SIGINT` | Begin a graceful drain: stop admitting work, let what runs finish, checkpoint, exit. Bounded by `lifecycle.drain_timeout`; what still runs then is stopped and left for the next start, not failed. A daemon exits 0; a job exits with its work's code. |
+| A second `SIGTERM` or `SIGINT` | Force the drain: the child process groups are killed at once, and their work is left for the next start. |
 | `SIGHUP` | Reload the configuration files, validate first, apply the reloadable settings. Needs the `hot-reload` feature; without it `SIGHUP` keeps its default action and ends the process. |
 
 [Operate a running daemon](operations.md) covers drain and reload in
@@ -293,7 +293,7 @@ into.
 | `0` | Success. A job finished `completed`, or a daemon drained cleanly after `SIGTERM`, `SIGINT`, `admin.drain` or a `drain` policy. | complete |
 | `1` | Generic failure. A run failed for a reason with no code of its own, or was cancelled. | retriable |
 | `2` | Configuration or usage error. Validation failed, a flag is unknown, a `file`, `url` or `oci` instruction could not be read at load, TLS material is unreadable, a listener could not bind, or the tool registry or workflow set does not build. Retrying reproduces it. | terminal |
-| `3` | Partial result. The run stalled, a loop was detected, the result was flagged partial, or the job ended with a run unfinished. | policy |
+| `3` | Partial result. The run stalled, a loop was detected, the result was flagged partial, or the job ended with a run unfinished — a job a drain cut short among them. | policy |
 | `4` | Model unreachable. Every model endpoint failed, or refused its credentials, after retries. | retriable |
 | `5` | Refused. The task cannot be done, or was refused. | terminal |
 | `6` | A required MCP server is down: something agentd cannot run without failed. The durable store did not open or restore, or the MCP resource the instruction names could not be read at startup. Also the instruction source becoming unreachable under `agent.instruction.unavailable: exit`. | retriable |
@@ -320,9 +320,16 @@ How to read them:
   tools, and adds them when the server comes up (`mcp.joined`). Exit 6 is for
   the store and the instruction source, which agentd cannot run safely
   without.
-- **A daemon exits 0 on a drain** even when individual runs failed; their
-  outcomes are in `run.done` and in the run records. Only a job's exit code
-  reflects its run.
+- **A daemon exits 0 on a drain** even when individual runs failed, or the
+  drain stopped work it resumes next start; their outcomes are in
+  `run.done` and in the run records. Only a job's exit code reflects its
+  run.
+- **A job a drain cut short does not exit 0.** A drain ends a job with the
+  code an idle exit would, so a run it left unfinished reads 3, and so
+  does a turn or subagent it stopped or work it never let start; a run
+  that had already failed keeps its own code. A Job controller must not
+  count work that did not happen as a success. A job keeps no state by
+  default, so its next run starts the work again.
 
 A one-shot job's code comes from the run the job started. When a job starts
 several runs, a run that did not succeed decides the code, so a partial

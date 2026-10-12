@@ -8,7 +8,7 @@ agentd installed and an API key for OpenAI or Anthropic.
 
 ## Before you start
 
-- **agentd 1.18 or later** on your `PATH`. [Install](install.md) covers the
+- **agentd 1.19 or later** on your `PATH`. [Install](install.md) covers the
   options; `agentd --version` checks it.
 - **An API key** for OpenAI or for Anthropic.
 - **For the last step**, Node.js 20 or newer and the display clients:
@@ -159,7 +159,7 @@ all):
   "run_id": "01M4P4S9DGF68J6J4XN9DF2NBT",
   "trace_id": "ec8a5ca41008bc6596c89199c65d9b9c",
   "ts": "2026-10-11T18:49:43.088Z",
-  "version": "1.18.0"
+  "version": "1.19.0"
 }
 ```
 

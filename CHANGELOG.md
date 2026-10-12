@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.19.0 — product documentation, and configuration that means what it says
 
 The documentation is rewritten as product documentation, for everyone who
 meets agentd: evaluators, newcomers, workflow authors, operators, security

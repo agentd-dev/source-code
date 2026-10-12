@@ -283,13 +283,16 @@ fn a_step_the_restore_skips_or_fails_is_said_in_its_runs_trace() {
 }
 
 /// A subagent a run kills is killed in the trace it was spawned in: the
-/// run's, not the process's.
+/// run's, not the process's. The child's call outlasts the kill step, so the
+/// child is running when it is killed; `subagent.kill` is graceful, so a child
+/// that started late and is already inside that call finishes it before it
+/// stops — the call is short enough for the daemon to exit inside the wait.
 #[test]
 fn a_subagent_a_run_kills_is_killed_in_the_runs_trace() {
     let play = common::unique_path("trace-kill", "json");
     std::fs::write(
         &play,
-        json!({"match": [{"when_contains": "SUB-TASK", "delay_ms": 30000, "content": "late"}]})
+        json!({"match": [{"when_contains": "SUB-TASK", "delay_ms": 8000, "content": "late"}]})
             .to_string(),
     )
     .unwrap();

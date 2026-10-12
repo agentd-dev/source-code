@@ -323,8 +323,8 @@ fn a_subagent_a_run_kills_is_killed_in_the_runs_trace() {
 }
 
 /// A run another run starts — as a child workflow, or by a signal it sends —
-/// is a span of the starter's trace, whose parent is the starter's span; and
-/// the starter's own trace is not the process's.
+/// is a span of the starter's trace, whose parent is the span of the step
+/// that started it; and the starter's own trace is not the process's.
 #[test]
 fn a_run_another_run_starts_continues_its_trace() {
     let mock = common::spawn_mock_mcp("mock://noop", false);
@@ -367,11 +367,19 @@ fn a_run_another_run_starts_continues_its_trace() {
         assert_eq!(run["trace_id"], parent["trace_id"], "{workflow}: {run}");
         assert_ne!(run["span_id"], parent["span_id"], "{workflow}: {run}");
     }
-    // The child workflow was asked for by the parent run: its span's parent
-    // is the parent run's.
+    // The child workflow was asked for by the parent run's `call` step: its
+    // span's parent is the step's, a child of the parent run's.
+    let call_step = events(&log, "step.start")
+        .into_iter()
+        .find(|l| l["run"] == parent["run"] && l["step"] == "call")
+        .unwrap_or_else(|| panic!("no call step:\n{log}"));
+    assert_eq!(
+        call_step["parent_span_id"], parent["span_id"],
+        "{call_step}"
+    );
     assert_eq!(
         started("child")["parent_span_id"],
-        parent["span_id"],
+        call_step["span_id"],
         "{log}"
     );
     // The child run's call is the parent's trace too.

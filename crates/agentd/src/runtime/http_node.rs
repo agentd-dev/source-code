@@ -154,18 +154,19 @@ impl crate::runtime::reactor::Runtime {
                 }
             }
         }
-        // The call is a span of the run's, named to the API it reaches in
-        // `traceparent` and `tracestate` — ahead of the signature — and on
-        // the step's `http.request` line. A step whose `headers` set either
-        // owns the trace context: agentd adds neither, and the line is the
-        // run's, since no span of agentd's went out.
+        // The call is a span of the step's, named to the API it reaches in
+        // `traceparent` and `tracestate` — ahead of the signature — on the
+        // step's `http.request` line, and as the CLIENT span it exports. A
+        // step whose `headers` set either owns the trace context: agentd
+        // adds neither, and the line is the step's, since no span of
+        // agentd's went out.
         let authored = headers.iter().any(|(k, _)| {
             k.eq_ignore_ascii_case("traceparent") || k.eq_ignore_ascii_case("tracestate")
         });
         let hop = if authored {
             None
         } else {
-            self.run_trace(run_id).map(|t| t.child())
+            self.step_trace(run_id, step_id).map(|t| t.child())
         };
         if let Some(t) = &hop {
             headers.extend(t.headers());
@@ -237,7 +238,7 @@ impl crate::runtime::reactor::Runtime {
 
         let line = match &hop {
             Some(h) => self.log.in_trace(Some(h)),
-            None => self.run_log(run_id),
+            None => self.step_log(run_id, step_id),
         };
         line.info(
             "http.request",
@@ -250,6 +251,7 @@ impl crate::runtime::reactor::Runtime {
         std::thread::Builder::new()
             .name("step:http".into())
             .spawn(move || {
+                let start = crate::obs::otel::now_unix_nanos();
                 let (output, is_error, error) = match do_http(
                     &url,
                     &method,
@@ -274,6 +276,18 @@ impl crate::runtime::reactor::Runtime {
                     }
                     Err(e) => (Value::Null, true, Some(format!("http: {e}"))),
                 };
+                crate::obs::otel::span(
+                    hop.as_ref(),
+                    &method,
+                    crate::obs::otel::Kind::Client,
+                    start,
+                )
+                .attr("http.request.method", method.as_str())
+                .attr("url.full", url.as_str())
+                .attr_opt("http.response.status_code", output["status"].as_u64())
+                .attr("agentd.run", r.as_str())
+                .attr("agentd.step", s.as_str())
+                .end(!is_error);
                 let _ = tx.send(super::events::Event::StepDone {
                     run: r,
                     step: s,

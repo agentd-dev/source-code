@@ -300,6 +300,13 @@ pub fn annotations(t: &Task) -> Value {
     if let Some(op) = &t.command {
         a["command"] = json!(op);
     }
+    // The span the task's work is done in, so a client can find its work in
+    // agentd's lines and traces — the span a `traceparent` response header
+    // names too.
+    if let Some(tc) = &t.trace {
+        a["traceId"] = json!(tc.trace_id);
+        a["spanId"] = json!(tc.span_id);
+    }
     a
 }
 

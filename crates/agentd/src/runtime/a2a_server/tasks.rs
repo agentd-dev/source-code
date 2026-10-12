@@ -630,6 +630,7 @@ impl Runtime {
         let span = self
             .a2a_upstream(inbound)
             .map_or_else(TraceContext::mint, |u| u.child());
+        self.a2a_span = Some(span.clone());
         if let Some(t) = self.tasks.get_mut(&id) {
             if let Some(r) = result {
                 t.set_result(r);

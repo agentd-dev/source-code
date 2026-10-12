@@ -336,7 +336,17 @@ impl super::reactor::Runtime {
                 .unwrap_or("_runtime")
                 .to_string();
             let id = crate::state::ulid::new();
-            match self.append_event(&ev.stream, &ev.subject, None, ev.data, &id, &source, None) {
+            // The event's `traceparent` is the span the line was in, so a
+            // watcher run continues the trace of what it watches.
+            match self.append_event(
+                &ev.stream,
+                &ev.subject,
+                None,
+                ev.data,
+                &id,
+                &source,
+                ev.trace.as_ref(),
+            ) {
                 Ok(_) => appended += 1,
                 Err(_) => refused += 1,
             }
@@ -831,15 +841,28 @@ impl crate::runtime::reactor::Runtime {
             .spawn(move || {
                 // Bound by name: a closure captures only what it mentions.
                 let _in_flight = in_flight;
+                let start = crate::obs::otel::now_unix_nanos();
                 let deadline = std::time::Instant::now() + timeout;
-                if let Err(e) = crate::mcp::a2a_client::send(
+                let sent = crate::mcp::a2a_client::send(
                     &endpoint,
                     auth,
                     &parts,
                     None,
                     Some(&msg_id),
                     deadline,
-                ) {
+                );
+                crate::obs::otel::span(
+                    hop.as_ref(),
+                    &format!("forward {st}"),
+                    crate::obs::otel::Kind::Client,
+                    start,
+                )
+                .attr("rpc.system", "jsonrpc")
+                .attr("rpc.method", "SendMessage")
+                .attr("messaging.destination.name", st.as_str())
+                .attr("agentd.a2a.peer", peer_name.as_str())
+                .end(sent.is_ok());
+                if let Err(e) = sent {
                     log.warn(
                         "stream.forward.failed",
                         json!({"stream": st, "subject": sub, "seq": seq, "peer": peer_name,
@@ -909,6 +932,7 @@ impl crate::runtime::reactor::Runtime {
             .spawn(move || {
                 // Bound by name: a closure captures only what it mentions.
                 let _in_flight = in_flight;
+                let start = crate::obs::otel::now_unix_nanos();
                 let outcome = crate::runtime::http_node::do_http(
                     &url,
                     "POST",
@@ -918,6 +942,13 @@ impl crate::runtime::reactor::Runtime {
                     std::time::Duration::from_secs(30),
                     allow_private,
                 );
+                let status = outcome.as_ref().ok().and_then(|v| v["status"].as_u64());
+                crate::obs::otel::span(hop.as_ref(), "POST", crate::obs::otel::Kind::Client, start)
+                    .attr("http.request.method", "POST")
+                    .destination(url.as_str())
+                    .attr("messaging.destination.name", st.as_str())
+                    .attr_opt("http.response.status_code", status)
+                    .end(status.is_some_and(|c| (200..400).contains(&c)));
                 // Logged either way at the level the outcome deserves: a
                 // forward that failed is not a lost event (the append stands),
                 // but it IS something an operator watching a downstream
@@ -938,6 +969,23 @@ impl crate::runtime::reactor::Runtime {
             })
             .ok();
     }
+}
+
+/// Export the PRODUCER span of an event appended for a request — a webhook
+/// route's or an `a2a` start's `into:` — which the runs consuming it
+/// continue. Its links are the request's span, named on the line about it.
+#[cfg(feature = "a2a")]
+pub(crate) fn append_span(event: &TraceContext, stream: &str, seq: u64, start_unix_nanos: u128) {
+    crate::obs::otel::span(
+        Some(event),
+        &format!("append {stream}"),
+        crate::obs::otel::Kind::Producer,
+        start_unix_nanos,
+    )
+    .attr("messaging.operation.type", "send")
+    .attr("messaging.destination.name", stream)
+    .attr("agentd.stream.seq", seq)
+    .end(true);
 }
 
 /// Resolve `by` against an event: a dot path, defaulting to the envelope's own

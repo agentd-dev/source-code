@@ -24,8 +24,8 @@ pub mod metrics;
 #[cfg(feature = "metrics")]
 pub mod serve;
 
-// OTLP span export (GenAI semconv). Always compiled, but the `RunSpan` recorder
-// (run span + `chat`/`execute_tool` children) is a no-op unless built
-// `--features otel` (the OTLP encoder + HTTP export are gated) — clean loop call
-// sites, zero default cost. Hand-rolled, dep-free.
+// OTLP span export (GenAI semconv). Always compiled, but every `Span` and the
+// turn's `RunSpan` recorder are no-ops unless built `--features otel` (the
+// OTLP encoder + HTTP export are gated) — clean call sites, zero default
+// cost. Hand-rolled, dep-free.
 pub mod otel;

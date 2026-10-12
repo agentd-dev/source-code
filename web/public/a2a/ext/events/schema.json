@@ -472,6 +472,13 @@
                 "null"
               ]
             },
+            "trace_id": {
+              "description": "a W3C trace id, 32 lowercase hex digits",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "updated_ms": {
               "minimum": 0,
               "type": "integer"
@@ -487,7 +494,8 @@
             "tokens_in",
             "tokens_out",
             "started_ms",
-            "updated_ms"
+            "updated_ms",
+            "trace_id"
           ],
           "type": "object"
         },
@@ -528,6 +536,10 @@
               "type": "string"
             },
             "target": true,
+            "trace_id": {
+              "description": "a W3C trace id, 32 lowercase hex digits",
+              "type": "string"
+            },
             "ts": {
               "minimum": 0,
               "type": "integer"
@@ -539,7 +551,8 @@
             "role",
             "action",
             "target",
-            "outcome"
+            "outcome",
+            "trace_id"
           ],
           "type": "object"
         },
@@ -889,6 +902,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "trace_id": {
+              "description": "a W3C trace id, 32 lowercase hex digits",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "updated": {
               "minimum": 0,
               "type": "integer"
@@ -910,7 +930,8 @@
             "output",
             "error",
             "task",
-            "principal"
+            "principal",
+            "trace_id"
           ],
           "type": "object"
         },
@@ -1008,6 +1029,13 @@
                 },
                 "step": {
                   "type": "string"
+                },
+                "trace_id": {
+                  "description": "a W3C trace id, 32 lowercase hex digits",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -1015,7 +1043,8 @@
                 "step",
                 "kind",
                 "phase",
-                "attempt"
+                "attempt",
+                "trace_id"
               ],
               "type": "object"
             },
@@ -1047,6 +1076,13 @@
                 "tokens": {
                   "minimum": 0,
                   "type": "integer"
+                },
+                "trace_id": {
+                  "description": "a W3C trace id, 32 lowercase hex digits",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -1056,7 +1092,8 @@
                 "status",
                 "attempt",
                 "tokens",
-                "err"
+                "err",
+                "trace_id"
               ],
               "type": "object"
             }

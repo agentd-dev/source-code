@@ -190,12 +190,15 @@ curl -s http://127.0.0.1:8088/hooks/ci -H "X-Signature: sha256=$sig" -H 'content
 ```
 
 ```
-{"status":"accepted","workflow":"on-ci"}
+{"run_id":"on-ci-01M4P4004VPT9M256ZXBGDGV3C","status":"accepted","trace_id":"f281fdc06f4dd1374e53be619f96e1fe","workflow":"on-ci"}
 ```
 
 The route answers `202` once the run is durably queued, and `401` for a bad
-signature. A repeated `Idempotency-Key` header is answered as a duplicate
-and starts nothing. `rate: "20/1s"` bounds how fast requests are admitted
+signature. The answer names the run and the trace it is in, and its
+`traceparent` header names the run's span. The run can still be refused
+after the `202`, by the workflow's `concurrency` or its `inputs.schema`;
+the `run.dropped` or `run.inputs.invalid` line then names that `run_id`. A repeated `Idempotency-Key`
+header is answered as a duplicate, naming the same run, and starts nothing. `rate: "20/1s"` bounds how fast requests are admitted
 (`429` with `Retry-After` past it), and `parallelism` how many run at once.
 
 ## Pass data between steps

@@ -168,6 +168,7 @@ impl FeedKind {
                     "error",
                     "task",
                     "principal",
+                    "trace_id",
                 ],
                 json!({
                     "id": string(),
@@ -183,6 +184,7 @@ impl FeedKind {
                     "error": string_or_null(),
                     "task": string_or_null(),
                     "principal": string_or_null(),
+                    "trace_id": trace_id_or_null(),
                 }),
             ),
             // A step starting, then the same step done — two pushes in
@@ -190,17 +192,18 @@ impl FeedKind {
             FeedKind::Step => json!({
                 "oneOf": [
                     closed(
-                        &["run", "step", "kind", "phase", "attempt"],
+                        &["run", "step", "kind", "phase", "attempt", "trace_id"],
                         json!({
                             "run": string(),
                             "step": string(),
                             "kind": string(),
                             "phase": {"const": "start"},
                             "attempt": count(),
+                            "trace_id": trace_id_or_null(),
                         }),
                     ),
                     closed(
-                        &["run", "step", "phase", "status", "attempt", "tokens", "err"],
+                        &["run", "step", "phase", "status", "attempt", "tokens", "err", "trace_id"],
                         json!({
                             "run": string(),
                             "step": string(),
@@ -209,6 +212,7 @@ impl FeedKind {
                             "attempt": count(),
                             "tokens": count(),
                             "err": string_or_null(),
+                            "trace_id": trace_id_or_null(),
                         }),
                     ),
                 ],
@@ -279,6 +283,7 @@ impl FeedKind {
                     "tokens_out",
                     "started_ms",
                     "updated_ms",
+                    "trace_id",
                 ],
                 json!({
                     "id": string(),
@@ -291,6 +296,7 @@ impl FeedKind {
                     "tokens_out": count(),
                     "started_ms": count(),
                     "updated_ms": count(),
+                    "trace_id": trace_id_or_null(),
                 }),
             ),
             // The slim status the section diff pushes. The nested documents
@@ -350,7 +356,15 @@ impl FeedKind {
             // The audit mirror: the audit record's own fields, and the sid
             // when the caller signed in with a session.
             FeedKind::Audit => closed(
-                &["ts", "principal", "role", "action", "target", "outcome"],
+                &[
+                    "ts",
+                    "principal",
+                    "role",
+                    "action",
+                    "target",
+                    "outcome",
+                    "trace_id",
+                ],
                 json!({
                     "ts": count(),
                     "principal": string_or_null(),
@@ -359,6 +373,7 @@ impl FeedKind {
                     "target": true,
                     "outcome": string(),
                     "sid": string(),
+                    "trace_id": trace_id(),
                 }),
             ),
             // From the FeedKind contract rather than from the call sites: the
@@ -529,6 +544,16 @@ fn string() -> Value {
 
 fn string_or_null() -> Value {
     json!({"type": ["string", "null"]})
+}
+
+/// A W3C trace id: the trace the item's work is done in.
+fn trace_id() -> Value {
+    json!({"type": "string", "description": "a W3C trace id, 32 lowercase hex digits"})
+}
+
+/// A W3C trace id, or `null` for work whose record predates traces.
+fn trace_id_or_null() -> Value {
+    json!({"type": ["string", "null"], "description": "a W3C trace id, 32 lowercase hex digits"})
 }
 
 fn count() -> Value {
@@ -739,6 +764,7 @@ mod tests {
         };
         let mut run = crate::engine::run::RunState::new("greet-1", &wf, start, json!({}));
         out.push((FeedKind::Run, run.summary()));
+        run.trace = Some(crate::obs::trace::TraceContext::mint());
         run.status = crate::engine::run::RunStatus::Completed;
         run.output = Some(json!("done"));
         run.finished = Some(1_790_631_626_178);
@@ -755,10 +781,20 @@ mod tests {
         }
 
         // `Activity::to_value`, with the id the push adds, in each phase.
-        for (phase, tool, task) in [
-            (Phase::Thinking, None, Some("t-1")),
-            (Phase::Tool, Some("subagent.run"), None),
-            (Phase::Waiting, Some("ask_human"), Some("t-2")),
+        for (phase, tool, task, trace) in [
+            (
+                Phase::Thinking,
+                None,
+                Some("t-1"),
+                Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+            ),
+            (Phase::Tool, Some("subagent.run"), None, None),
+            (
+                Phase::Waiting,
+                Some("ask_human"),
+                Some("t-2"),
+                Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+            ),
         ] {
             let a = Activity {
                 task: task.map(str::to_string),
@@ -770,6 +806,7 @@ mod tests {
                 tokens_out: 4,
                 started_ms: 1_790_631_625_858,
                 updated_ms: 1_790_631_625_858,
+                trace_id: trace.map(str::to_string),
             };
             let mut v = a.to_value();
             v["id"] = json!("1");
@@ -801,17 +838,18 @@ mod tests {
             (
                 FeedKind::Step,
                 json!({"attempt": 1, "kind": "sleep", "phase": "start",
-                       "run": "greet-01M3MZCH4MBN31C5JWJ2ABXMH0", "step": "w"}),
+                       "run": "greet-01M3MZCH4MBN31C5JWJ2ABXMH0", "step": "w",
+                       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}),
             ),
             (
                 FeedKind::Step,
                 json!({"attempt": 1, "err": null, "phase": "done", "run": "greet-01M3MZCH4MBN31C5JWJ2ABXMH0",
-                       "status": "done", "step": "w", "tokens": 0}),
+                       "status": "done", "step": "w", "tokens": 0, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}),
             ),
             (
                 FeedKind::Step,
                 json!({"attempt": 2, "err": "timed out", "phase": "done", "run": "r",
-                       "status": "timeout", "step": "w", "tokens": 30}),
+                       "status": "timeout", "step": "w", "tokens": 30, "trace_id": null}),
             ),
             (FeedKind::ConversationRemoved, json!({"id": "c-1"})),
             (
@@ -852,12 +890,14 @@ mod tests {
             (
                 FeedKind::Audit,
                 json!({"action": "a2a.SendMessage", "outcome": "ok", "principal": "operator",
-                       "role": "operator", "target": {"task": "292d3149"}, "ts": 1_790_631_625_852u64}),
+                       "role": "operator", "target": {"task": "292d3149"}, "ts": 1_790_631_625_852u64,
+                       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}),
             ),
             (
                 FeedKind::Audit,
                 json!({"action": "config.reload", "outcome": "ok", "principal": null, "role": null,
-                       "target": null, "ts": 1_790_631_625_852u64, "sid": "ds_0123456789abcdef"}),
+                       "target": null, "ts": 1_790_631_625_852u64, "sid": "ds_0123456789abcdef",
+                       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}),
             ),
         ]);
 

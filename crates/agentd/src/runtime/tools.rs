@@ -399,7 +399,7 @@ impl Runtime {
         if !labels.is_empty() {
             meta["agent/labels"] = json!(labels);
         }
-        crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
+        let call = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         let call_ctx = ctx.clone();
@@ -411,7 +411,16 @@ impl Runtime {
                 // operator answering an elicitation — is left to finish. A
                 // fixed default here would cut off a server configured
                 // with a longer `timeout` than the default.
+                let start = crate::obs::otel::now_unix_nanos();
                 let res = client.call_tool_with_meta(&mapping.tool, Some(mcp_args), meta);
+                crate::obs::otel::mcp_span(
+                    call.as_ref(),
+                    "tools/call",
+                    &mapping.tool,
+                    &mapping.server,
+                    res.as_ref().is_ok_and(|r| !r.is_error()),
+                    start,
+                );
                 let (result, is_error) = match res {
                     Ok(r) => {
                         // The result mapping sees `result`, the original `args` and `ctx`.
@@ -474,17 +483,27 @@ impl Runtime {
         if !labels.is_empty() {
             meta["agent/labels"] = json!(labels);
         }
-        crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
+        let call = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
+        let server = server.to_string();
         std::thread::Builder::new()
             .name(format!("mcp:{server}.{tool}"))
             .spawn(move || {
                 // Unbounded as a whole, for the reason `run_mapped` gives.
+                let start = crate::obs::otel::now_unix_nanos();
                 let (result, is_error) = match client.call_tool_with_meta(&tool, Some(args), meta) {
                     Ok(r) => (super::worker::tool_result_value(&r), r.is_error()),
                     Err(e) => (Value::String(format!("transport error: {e}")), true),
                 };
+                crate::obs::otel::mcp_span(
+                    call.as_ref(),
+                    "tools/call",
+                    &tool,
+                    &server,
+                    !is_error,
+                    start,
+                );
                 target.send(&tx, result, is_error);
             })
             .ok();
@@ -1305,6 +1324,7 @@ impl Runtime {
         std::thread::Builder::new()
             .name("tool:exec".into())
             .spawn(move || {
+                let started = crate::obs::otel::now_unix_nanos();
                 let (result, is_error) = match exec::run_command(
                     &cmd,
                     &argv,
@@ -1318,6 +1338,17 @@ impl Runtime {
                     Ok(v) => (v, false),
                     Err(e) => (Value::String(format!("exec: {e}")), true),
                 };
+                // Exported as the span its `TRACEPARENT` named, so what the
+                // command exports has its parent in the collector.
+                crate::obs::otel::span(
+                    Some(&trace),
+                    &format!("exec {cmd}"),
+                    crate::obs::otel::Kind::Internal,
+                    started,
+                )
+                .attr("process.executable.name", cmd.as_str())
+                .attr_opt("process.exit.code", result["exit_code"].as_i64())
+                .end(!is_error && result["exit_code"] == 0);
                 target.send(&tx, result, is_error);
             })
             .ok();

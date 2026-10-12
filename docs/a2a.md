@@ -366,13 +366,14 @@ credentials it carries.
 
 **One trace across both agents.** Every request of a delegation or a send —
 the card read, the send, each poll — carries the W3C `traceparent` and
-`tracestate` of a span of the parent's run, logged as the `span_id` of its
+`tracestate` of a span of the parent's step, logged as the `span_id` of its
 `a2a.delegate` or `a2a.send` line. The worker's listener reads them: the task
 and the run or turn the message becomes continue the parent's trace, under
 that line's span, and so does every MCP and model call the worker makes for
 it. A caller that cannot set headers may put `traceparent` in the message's
 `metadata`. The worker's answer names the task's span in a `traceparent`
-response header. A reply that wakes the parent's `a2a.wait` leaves the
+response header, and its task annotations name it as `traceId` and
+`spanId`. A reply that wakes the parent's `a2a.wait` leaves the
 waiting run in its own trace and names the reply's span as `link` on its
 `wait.resolved` line; a message that continues a task does the same on an
 `a2a.task.continued` line in the task's trace. [Observability](observability.md#correlate-with-other-services)

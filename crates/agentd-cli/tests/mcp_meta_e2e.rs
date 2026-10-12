@@ -300,7 +300,9 @@ fn probe(protocol_version: &str) -> common::MockMcp {
 /// it asks: the supervisor's lines about the run, the turn worker's and the
 /// subagent's, every request made for it — each a span of its own — and every
 /// model call carry the run's trace id. The process's trace is another, and
-/// only the supervisor's own requests carry it.
+/// only the supervisor's own requests carry it. A connection's requests for
+/// itself — its handshake, the lists it keeps its catalogue with — name the
+/// span of the process that made them, which that process exports.
 fn assert_one_trace(stderr: &str, mock: &common::MockMcp, llm: &MockLlm) {
     let log = lines(stderr);
     let start = log
@@ -413,6 +415,29 @@ fn assert_one_trace(stderr: &str, mock: &common::MockMcp, llm: &MockLlm) {
                 && trace_of(&m["_meta"]["traceparent"]) == trace),
         "the list step's request is the run's: {metas:?}"
     );
+    // Each process's own span: the supervisor's, a turn worker's, a
+    // subagent's — what its lines carry.
+    let supervisor = log
+        .iter()
+        .find(|l| l["event"] == "proc.start")
+        .and_then(|l| l["span_id"].as_str())
+        .expect("proc.start names the process span");
+    let own: BTreeSet<&str> = log
+        .iter()
+        .filter(|l| l["event"] == "proc.start" || l["comp"] == "agent")
+        .filter_map(|l| l["span_id"].as_str())
+        .collect();
+    let housekeeping = |m: &Value| {
+        [
+            "initialize",
+            "server/discover",
+            "tools/list",
+            "prompts/list",
+            "resources/list",
+            "resources/templates/list",
+        ]
+        .contains(&m["method"].as_str().unwrap_or(""))
+    };
     let mut spans = BTreeSet::new();
     let mut of_process = 0;
     for m in &metas {
@@ -420,25 +445,26 @@ fn assert_one_trace(stderr: &str, mock: &common::MockMcp, llm: &MockLlm) {
         if trace_of(tp) == process {
             of_process += 1;
             assert!(
-                [
-                    "initialize",
-                    "server/discover",
-                    "tools/list",
-                    "prompts/list",
-                    "resources/list",
-                    "resources/templates/list"
-                ]
-                .contains(&m["method"].as_str().unwrap_or("")),
+                housekeeping(m),
                 "a request made for the run went in the process trace: {m}"
             );
+            assert_eq!(span_of(tp), supervisor, "the supervisor's own: {m}");
         } else {
             assert_eq!(trace_of(tp), trace, "{m}");
         }
-        assert!(
-            spans.insert(span_of(tp).to_string()),
-            "a span id repeated: {m}"
-        );
+        if own.contains(span_of(tp)) {
+            assert!(
+                housekeeping(m),
+                "a request made for the run named a process's span: {m}"
+            );
+        } else {
+            assert!(
+                spans.insert(span_of(tp).to_string()),
+                "a span id repeated: {m}"
+            );
+        }
     }
+
     assert!(of_process > 0, "the supervisor's handshake: {metas:?}");
     let calls = metas.iter().filter(|m| m["method"] == "tools/call").count();
     assert!(calls >= 3, "{metas:?}");

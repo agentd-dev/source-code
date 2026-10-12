@@ -63,6 +63,7 @@ impl Runtime {
                 "action": ev.action,
                 "target": ev.target,
                 "outcome": ev.outcome,
+                "trace_id": ev.trace.unwrap_or(&self.trace).trace_id,
             });
             if let Some(sid) = ev.sid {
                 data["sid"] = json!(sid);
@@ -106,7 +107,12 @@ impl Runtime {
             // authorization path, and the append needs the state owner. The
             // tick drains it, which also puts these records behind the same
             // pressure gate as every other admission.
-            crate::obs::log::tap_direct(stream, "audit", record.clone());
+            crate::obs::log::tap_direct(
+                stream,
+                "audit",
+                record.clone(),
+                Some(ev.trace.unwrap_or(&self.trace).clone()),
+            );
         }
         if sinks.iter().any(|s| matches!(s, AuditSink::Store)) {
             // Append-only: a fresh ULID id per event (Kind::Audit is not indexed,

@@ -734,6 +734,7 @@ mod tests {
                 trace_id: None,
                 span_id: None,
                 parent_span_id: None,
+                trace_flags: None,
             },
             crate::obs::log::Level::Error,
         );
@@ -2137,6 +2138,7 @@ mod tests {
                 trace_id: None,
                 span_id: None,
                 parent_span_id: None,
+                trace_flags: None,
             },
             crate::obs::log::Level::Error,
         );

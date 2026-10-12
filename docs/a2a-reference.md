@@ -64,7 +64,7 @@ may call none. The public card is not a method; it is the document at
 | `WWW-Authenticate` | response | on `401` and on a bearer caller's `403` |
 | `Retry-After` | response | on `429`, and on the card's `503` |
 | `traceparent`, `tracestate` | request | W3C Trace Context: the work the request starts continues this trace, one span below it. One `traceparent` at most; a malformed one is ignored. Correlation only: never read by authentication, authorization, rate limits or deduplication |
-| `traceparent` | response | on an answer that names a task (`SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`): the span the task's work is done in |
+| `traceparent` | response | on an answer that names a task (`SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`): the span the task's work is done in, which the task-annotations `traceId` and `spanId` name too |
 
 The card, the `OPTIONS` preflights and the `/oauth2/*` endpoints take no
 `A2A-Version`: they are not JSON-RPC.

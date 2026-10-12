@@ -93,6 +93,13 @@ pub struct StepState {
     /// runs even if its dependencies are not terminal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forced: bool,
+    /// The span id of the attempt in flight: a child of the run's span, and
+    /// the parent of every request the step sends and every worker it
+    /// spawns. Minted when the attempt begins, durable with the run so a
+    /// suspended step resumes in it, and taken when the attempt's span is
+    /// exported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -385,6 +392,7 @@ impl RunState {
             st.error = None;
             st.wait = None;
             st.cache_key = None;
+            st.span = Some(crate::obs::trace::new_span_id());
             // `forced` stays: a routed step caught running by a crash is
             // replayed as routed — past its dependencies, as the edge sent it.
             st.attempt
@@ -508,6 +516,7 @@ impl RunState {
             "id": self.id, "workflow": self.workflow, "status": self.status, "start": self.start.node,
             "steps": self.progress(), "tokens": self.tokens, "created": self.created, "updated": self.updated,
             "finished": self.finished, "output": self.output, "error": self.error, "task": self.task, "principal": self.principal,
+            "trace_id": self.trace.as_ref().map(|t| &t.trace_id),
         })
     }
 }

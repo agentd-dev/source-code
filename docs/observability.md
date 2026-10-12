@@ -24,7 +24,7 @@ flowchart LR
   E -->|"captured by"| C["container runtime or journald"]
   S -->|"/metrics /healthz /readyz"| P["Prometheus and the kubelet"]
   W -->|"OTLP traces"| T["OTLP collector"]
-  S -->|"OTLP logs"| T
+  S -->|"OTLP traces and logs"| T
   S -->|"A2A status and event feed"| U["operators and display clients"]
 ```
 
@@ -331,11 +331,15 @@ otel:
   logs: true
 ```
 
-- **Traces.** Each turn worker sends one batch when its turn ends: an
-  `invoke_agent` span with a `chat` span per model call and an
-  `execute_tool` span per tool call, using the OpenTelemetry GenAI attribute
-  names. Setting the endpoint is enough.
-- **Logs.** `logs: true` mirrors the supervisor's log lines every 5 s.
+- **Traces.** Setting the endpoint is enough. The supervisor exports a span
+  per workflow run, per step attempt, per request it serves and per request
+  it sends; each turn worker exports its turn as an `invoke_agent` span with
+  a `chat` span per model call and an `execute_tool` span per tool call,
+  using the OpenTelemetry GenAI attribute names. Together they are one tree
+  per trace (below).
+- **Logs.** `logs: true` mirrors the supervisor's log lines every 5 s. Each
+  record's `traceId` and `spanId` are the line's, so a backend joins it to
+  its span.
 
 The endpoint is `http://` or `https://`; a bare `host:port` or a
 `grpc://` URL is refused at load. An `https://` collector's
@@ -343,16 +347,78 @@ certificate is checked against the bundled public roots plus
 `security.tls_ca`, as every outbound connection's is. Without `endpoint`,
 agentd reads `OTEL_EXPORTER_OTLP_ENDPOINT`. The endpoint is restart-only.
 
-Export is best effort and never fails a turn. A turn sends its trace as it
-ends, and each step of the send (connect, write, read) gives up after 5 s;
-logs go from a background thread. A batch that fails is dropped, not
-retried, and logged: `otel.export.failed` (warn) names the signal, the
+### The span tree
+
+Every span's id is the span id it has everywhere else: on the log lines
+about it, and in the `traceparent` agentd sent for it. So a span a
+downstream service exports under agentd's request has its parent in your
+collector, and a log line joins its span by `span_id`.
+
+```mermaid
+flowchart TD
+  C["the caller's span"] --> R["run triage: SERVER"]
+  R --> S1["step classify"]
+  R --> S2["step notify"]
+  S1 --> I["invoke_agent: the turn worker"]
+  I --> M["chat: CLIENT"]
+  I --> T["execute_tool: CLIENT, an MCP tools/call"]
+  S2 --> H["POST: CLIENT, the http step"]
+```
+
+- A **run** is a span from its start to its end. It is the SERVER span of
+  the request that started it — a `workflow.run` over A2A, a webhook
+  delivery — and a CONSUMER span for a `stream` or `correlate` start's
+  event; under the span that event was emitted in, or, for a `batch` or
+  `correlate` run, linked to each member's. A run an `a2a` start fires is
+  INTERNAL, under the SERVER span of the message it was fired for.
+- Each **step attempt** is a span under the run's, from the attempt's start
+  to its end. A retry is an attempt of its own.
+- A **turn worker** exports its turn as an `invoke_agent` span under the
+  step's span, or under the message's for a conversation turn, with a
+  `chat` span per model call and an `execute_tool` span per tool call. A
+  call to an MCP tool is a CLIENT span, the one its request sent.
+- Every request agentd sends for a unit of work is a **CLIENT** span: a
+  model call, an MCP request, an A2A request, an `http` step, a push, a
+  stream forward. What an MCP connection asks for itself — its handshake,
+  its lists, its subscriptions, an MCP Events poll — names the span of the
+  process that asks: the supervisor's, or a turn worker's `invoke_agent`.
+  A command the `exec` tool runs is a span, the one its `TRACEPARENT`
+  names. An `emit`, and an event an `into:` appends, is a PRODUCER span.
+- An **A2A message** is the SERVER span of its request, ending as agentd
+  routes it to a turn, a run or a waiting step. Any other A2A request, and a
+  webhook delivery that started no run, is a SERVER span under the caller's
+  span when the caller sent a `traceparent`.
+- The **process** is a span from its start to its exit: the root of a
+  one-shot job's tree.
+- A line's `link` and `links` are links of the span the line is in,
+  whatever `log_level` writes. A line about a span that has already ended
+  — the answer to a gate a conversation turn raised, after its message was
+  routed; a child's report, after the step that spawned it — puts them on
+  a span of its own, named for the line, under that span. A link to the
+  span's own parent is left out.
+- A push's and a stream forward's span names where it went —
+  `url.scheme`, `server.address`, `server.port` — and not the URL, whose
+  path or query is often a credential. An `http` step's names its
+  `url.full`, as its `http.request` line does.
+
+A span in a trace that is not sampled — an upstream `traceparent` with
+flags `00` — is not exported. The [reference](telemetry-reference.md#otlp-export)
+lists every span's name, kind and attributes.
+
+Export is best effort and never fails the work. The supervisor sends its
+spans from a background thread every 2 s, and what it still holds when it
+exits; a turn worker sends its turn as the turn ends. Each step of a send
+(connect, write, read) gives up after 5 s. An exit — the process's, or a
+turn worker's at the end of its turn — waits at most 3 s on its last
+spans and log records: once a batch fails or the time is up, what is left
+is dropped and counted lost. A batch that fails is dropped, not retried,
+and logged: `otel.export.failed` (warn) names the signal, the
 endpoint and the error when exports start failing, then at most once a
 minute while the collector keeps failing, and `otel.export.recovered`
 (info) says when it takes a batch again, also at most once a minute, so
 a collector that drops every other batch gets one line of each a minute,
-not one every batch. Each process counts on its own, so every turn whose
-trace fails logs its own line.
+not one every batch. Each process counts on its own, so the supervisor and
+every turn whose trace fails log their own lines.
 
 ## Correlate with other services
 
@@ -398,7 +464,10 @@ unit keeps its own and records the request as a `link`:
   `ask_human.answered` audit record;
 - a `wait {on: webhook}` callback, a webhook route's `signal:`, and any
   other signal that wakes a waiting step: on the run's `signal.delivered`
-  line, and on `webhook.callback` or `webhook.signal`;
+  line, and on `webhook.callback` or `webhook.signal`. The
+  `webhook.callback` line is in the callback's own span, under the
+  caller's; `webhook.signal` is in the span of the run or the event the
+  delivery became;
 - the event that wakes a `wait {on: event}`: on the run's `wait.resolved`
   line;
 - an A2A message that wakes a `wait {on: message}` or an `a2a.wait` — the
@@ -424,8 +493,12 @@ on every hop below it; a longer or malformed one is dropped and the
 Everything the unit does carries its trace:
 
 - The supervisor's lines about it carry its `trace_id` and `span_id`:
-  `run.start`, `step.*`, `run.done`, `turn.*`, `subagent.*`, `human.*`. So do
-  its audit records and its events on the `_runtime` stream.
+  `run.start`, `run.done`, `turn.*`, `subagent.*`, `human.*`, and
+  `step.start`, `step.done` and `step.retry` in the span of the step's
+  attempt. So do its audit records and its events
+  on the `_runtime` stream, whose `traceparent` names the span the line was
+  in: a workflow consuming `_runtime` continues the trace of what it
+  watches.
 - Its turn workers and subagents get its `traceparent` in their spawn payload
   and write it on every line.
 - Every model call sends a `traceparent` HTTP header. That includes the
@@ -446,7 +519,7 @@ Everything the unit does carries its trace:
   task's per delivery.
 - An `http` step sends them; its `http.request` line carries the span it
   sent. A step whose `headers` set `traceparent` or `tracestate` sends what
-  it set and nothing of agentd's, and its line is in the run's span.
+  it set and nothing of agentd's, and its line is in the step's span.
 - An `emit` records its span on the event as the CloudEvents
   distributed-tracing attributes `traceparent` and `tracestate`, durable
   with the event, and logs it on `stream.emit`. A `forward: {webhook}` push
@@ -454,12 +527,28 @@ Everything the unit does carries its trace:
 - An `exec` command gets it as the `TRACEPARENT` environment variable.
 - An instance child is started with it as its `observability.traceparent`.
 
-Each of these hops sends a span id of its own under the unit's span.
+Each of these hops sends a span id of its own under the span of the step
+or turn that sends it.
 
-An A2A answer that names a task carries a `traceparent` response header:
-the span the task's work is done in. `SendMessage`, `SendStreamingMessage`,
-`GetTask` and `SubscribeToTask` answers carry it. A browser page may send `traceparent` and
-`tracestate`, and read the response's `traceparent`, cross-origin.
+### Outputs that name the trace
+
+What agentd answers names the trace the work is in, so a caller can find it
+in your logs and traces:
+
+| Output | Names |
+|---|---|
+| An A2A answer that names a task (`SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`) | A `traceparent` response header: the span the task's work is done in |
+| A task's annotations (the task-annotations extension) | `traceId` and `spanId` of that span |
+| A webhook's `202`, its `respond: sync` answer, and a `duplicate` of a kept delivery | `run_id` and `trace_id` in the body, and a `traceparent` response header naming the run's span; an `into:` append names the event's trace. A `202`'s `run_id` is the run the delivery was queued as: `concurrency.on_overflow: drop` or the workflow's `inputs.schema` can still refuse it, and the `run.dropped` or `run.inputs.invalid` line names it as `run` |
+| `status`, `run.get`, `workflow.status`, and the `run`, `step` and `activity` events of the event feed | `trace_id` of each run, step and working unit; the operator's `status` names the process's trace too |
+| The `audit` events of the event feed | `trace_id` of the record |
+| Events on the `_runtime` stream | `traceparent`: the span the line was in |
+| OTLP log records | `traceId` and `spanId` |
+
+A browser page may send `traceparent` and `tracestate`, and read the
+response's `traceparent`, cross-origin. A one-shot job's stdout is the raw
+result and names nothing; its `proc.exit` line carries the process trace,
+which in a job is the work's.
 
 The process has a trace of its own for work that belongs to no unit: boot,
 reload, drain, the store, and the requests an MCP connection makes for

@@ -60,14 +60,17 @@ pub struct Activity {
     /// When the unit started (clients tick elapsed from this).
     pub started_ms: u64,
     pub updated_ms: u64,
+    /// The trace the unit's work is done in.
+    pub trace_id: Option<String>,
 }
 
 impl Activity {
-    fn new(task: Option<String>, ctx: Option<String>) -> Activity {
+    fn new(task: Option<String>, ctx: Option<String>, trace_id: Option<String>) -> Activity {
         let now = now_ms();
         Activity {
             task,
             ctx,
+            trace_id,
             phase: Phase::Thinking,
             tool: None,
             round: 0,
@@ -131,6 +134,7 @@ impl Activity {
             "tokens_out": self.tokens_out,
             "started_ms": self.started_ms,
             "updated_ms": self.updated_ms,
+            "trace_id": self.trace_id,
         })
     }
 }
@@ -140,10 +144,15 @@ impl Runtime {
     /// activity and publish the change.
     pub(crate) fn on_child_progress(&mut self, node: NodeId, event: &str, fields: &Value) {
         let (task, ctx) = self.unit_of(node);
+        let trace_id = self
+            .children
+            .get(node)
+            .and_then(|c| c.trace.as_ref())
+            .map(|t| t.trace_id.clone());
         let entry = self
             .activity
             .entry(node.0)
-            .or_insert_with(|| Activity::new(task.clone(), ctx.clone()));
+            .or_insert_with(|| Activity::new(task.clone(), ctx.clone(), trace_id));
         // A restored/late binding (the task id is minted after the spawn).
         if entry.task.is_none() && task.is_some() {
             entry.task = task;
@@ -241,7 +250,7 @@ mod tests {
 
     #[test]
     fn activity_folds_progress_and_reports_only_notable_changes() {
-        let mut a = Activity::new(Some("task-1".into()), Some("c1".into()));
+        let mut a = Activity::new(Some("task-1".into()), Some("c1".into()), None);
         assert_eq!(a.phase, Phase::Thinking);
         // A think announcement on round 1: the round moved ⇒ notable.
         assert!(a.apply("turn.think", &json!({"round": 1})));

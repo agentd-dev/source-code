@@ -24,7 +24,7 @@ fields are merged into it.
 | `comp` | yes | `supervisor` for the supervisor process, `agent` for turn workers and subagents |
 | `pid` | yes | The OS process id, which joins the log to `ps` and `pstree` |
 | `trace_id` | yes | The W3C trace id of the unit of work the line is about: a run, a conversation turn, a start firing, a subagent, an A2A task, or else the process. A run another run started continues its trace, and so does work that arrived under a `traceparent`: an A2A request, a webhook, a stream event, an MCP Events occurrence. The process continues `observability.traceparent`, else mints a random one. |
-| `span_id` | yes | The span the line is about: the run's, the step's, the worker's own, or an outbound hop's (`a2a.delegate`, `a2a.send`, `http.request`, `stream.emit`) — the span id that hop sent |
+| `span_id` | yes | The span the line is about: the run's, the step attempt's (`step.start`, `step.done`, `step.retry`), the worker's own, or an outbound hop's (`a2a.delegate`, `a2a.send`, `http.request`, `stream.emit`) — the span id that hop sent. With OTLP export on, it is the id of the exported span |
 | `parent_span_id` | no | That span's parent, when it has one |
 
 Rules a parser can rely on:
@@ -298,7 +298,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `http.request` | info | `method`, `run`, `step`, `url` | An `http` workflow node made a request; its `span_id` is the one the request sent as `traceparent`. When the step's `headers` set `traceparent` or `tracestate`, agentd sent none and the line is in the run's span. |
+| `http.request` | info | `method`, `run`, `step`, `url` | An `http` workflow node made a request; its `span_id` is the one the request sent as `traceparent`. When the step's `headers` set `traceparent` or `tracestate`, agentd sent none and the line is in the step's span. |
 
 ### human
 
@@ -574,10 +574,10 @@ case.
 | `run.create.fail` | error | `err`, `workflow` |  |
 | `run.deadline` | warn | `run` | A run passed its deadline; its children are cancelled. |
 | `run.done` | info | `err`, `output`, `run`, `status`, `workflow` | A workflow run ended with `status`. |
-| `run.dropped` | warn | `reason`, `workflow` | A start event was dropped by `concurrency.on_overflow: drop`. |
+| `run.dropped` | warn | `reason`, `run`, `workflow` | A start event was dropped by `concurrency.on_overflow: drop`. In the trace the run would have had; `run`: the id an answer already gave it (a webhook's `202`), or null. |
 | `run.evict.fail` | warn | `err`, `run` |  |
 | `run.evicted` | info | `run` |  |
-| `run.inputs.invalid` | warn | `errors`, `workflow` |  |
+| `run.inputs.invalid` | warn | `errors`, `run`, `workflow` | In the trace the run would have had; `run` as on `run.dropped`. |
 | `run.paused` | info | `before_step`, `reason`, `run` | One run was paused. |
 | `run.refused` | warn | `reason`, `run` | A run was refused with `reason`. |
 | `run.resumed` | info | `run` | One run was resumed. |
@@ -588,7 +588,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `signal.delivered` | info | `link`, `run`, `signal`, `step` | A signal woke a waiting step. In the waiting run's trace; `link` is the signal's `traceparent` — a webhook callback's, an A2A caller's, the sending run's. |
+| `signal.delivered` | info | `link`, `run`, `signal`, `step` | A signal woke a waiting step. In the waiting step's span; `link` is the signal's `traceparent` — a webhook callback's, an A2A caller's, the sending run's. |
 | `signal.received` | info | `delivered`, `inbox_event`, `name` | A workflow signal arrived. |
 
 ### skill
@@ -638,7 +638,7 @@ case.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `step.cache_hit` | info | `run`, `step` |  |
-| `step.done` | info | `attempt`, `err`, `run`, `status`, `step`, `tokens` | A workflow step ended with `status`. |
+| `step.done` | info | `attempt`, `err`, `run`, `status`, `step`, `tokens` | A workflow step ended with `status`. In the span of the attempt, as `step.start` and `step.retry` are. |
 | `step.goto` | info | `from`, `run`, `to` |  |
 | `step.output.artifact` | info | `artifact`, `run`, `size`, `step` |  |
 | `step.output.artifact_fail` | warn | `err`, `run`, `step` |  |
@@ -739,7 +739,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `wait.resolved` | info | `conversation`, `kind`, `link`, `run`, `status`, `step`, `stream`, `subject` | The run keeps its trace. For a `wait {on: event}`, `link` is the event's `traceparent`; for a `wait {on: message}` or `a2a.wait` (`kind: message`), the span the message was accepted in. |
+| `wait.resolved` | info | `conversation`, `kind`, `link`, `run`, `status`, `step`, `stream`, `subject` | In the waiting step's span: the run keeps its trace. For a `wait {on: event}`, `link` is the event's `traceparent`; for a `wait {on: message}` or `a2a.wait` (`kind: message`), the span the message was accepted in. |
 | `wait.resubscribe.fail` | error, warn | `server`, `uri`, `reason`, `err`, `failed?`, `parked?` | A wait could not be subscribed again. Error level when it can never be woken. |
 | `wait.resubscribed` | info | `reason`, `server`, `uri` | A suspended `wait on: resource` was subscribed again. |
 
@@ -749,7 +749,7 @@ case.
 |---|---|---|---|
 | `webhook.await.armed` | info | `path`, `run`, `step`, `url` |  |
 | `webhook.await.restored` | info | `path`, `run`, `step` |  |
-| `webhook.callback` | info | `link`, `path`, `resumed` | `link`: the `traceparent` the callback sent, or null. |
+| `webhook.callback` | info | `link`, `path`, `resumed` | In the callback's own span, under the caller's; `link`: the `traceparent` the callback sent, or null. |
 | `webhook.denied` | warn | `kind`, `path`, `reason` | A webhook request failed authentication. |
 | `webhook.duplicate` | info | `node`, `workflow` |  |
 | `webhook.filtered` | info | `node`, `workflow` |  |
@@ -760,7 +760,7 @@ case.
 | `webhook.into` | info | `links`, `node`, `seq`, `stream`, `subject`, `workflow` | In the appended event's own trace; `links` names the request's `traceparent`. |
 | `webhook.into.refused` | warn | `err`, `node`, `stream`, `workflow` |  |
 | `webhook.overflow` | warn | `action`, `path` | A webhook route was at its `parallelism`; `action` says what was done. |
-| `webhook.signal` | info | `link`, `node`, `resumed`, `signal`, `workflow` |  |
+| `webhook.signal` | info | `link`, `node`, `resumed`, `signal`, `workflow` | In the span of the run or the event the delivery became. |
 | `webhook.signal.invalid` | warn | `err`, `node`, `workflow` |  |
 
 ### webhooks
@@ -960,23 +960,58 @@ without the `tls` feature refuses an `https://`
 `OTEL_EXPORTER_OTLP_ENDPOINT`, read only at export, fails each export
 instead.
 
-**Traces.** With a collector configured, each turn worker and subagent loop
-exports one batch when it finishes: an `invoke_agent` span with a `chat`
-child per model call and an `execute_tool` child per tool call. Spans carry
-the `trace_id` of the unit of work the worker serves. A worker whose trace
-is not sampled — an upstream `traceparent` with flags `00` — exports
-nothing. The resource carries `service.name: agentd` and
-`service.version`.
+**Traces.** With a collector configured, agentd exports one tree of spans
+per trace. A span's id is the span id it has everywhere else: the
+`span_id` of the lines about it, and the span a `traceparent` agentd sent
+for it named. Its parent is the span it was started under, so a span a
+downstream service exports for agentd's request is a child of an exported
+span. What an MCP connection asks for itself — its handshake, its lists,
+its subscriptions, an MCP Events poll — names the span of the process that
+asks: `agentd`, or a worker's `invoke_agent`. The links of a span are the
+`link` and `links` of the lines in it, at any log level, but for a link to
+the span's own parent. A line naming them after its span has ended puts
+them on a span of its own, named for the line's `event`, under that span.
+A span in a trace that is not sampled — an upstream `traceparent` with
+flags `00` — is not exported. The resource carries `service.name: agentd`
+and `service.version`.
 
-| Span | Attributes |
-|---|---|
-| `invoke_agent` | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
-| `chat` | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
-| `execute_tool` | `gen_ai.operation.name`, `gen_ai.tool.name` |
+The supervisor exports its spans from a background thread every 2 s, and
+what it still holds when it exits. A turn worker or a subagent exports a
+turn's spans when the turn ends. An exit waits at most 3 s on these last
+exports, spans and log records together: once a batch fails or the time
+is up, the rest is dropped and counted lost.
 
-A span's status is OK or ERROR. Export is best effort and never fails the
-turn: each step of a send (connect, write, read) gives up after 5 s, and a
-batch that fails is dropped, not retried.
+| Span | Kind | Exported | Parent | Attributes |
+|---|---|---|---|---|
+| `agentd` | INTERNAL | at exit | `observability.traceparent`'s span, if any | `agentd.instance`, `agentd.run_id`, `agentd.exit_code` |
+| `run <workflow>` | SERVER for a run a `workflow.run` over A2A or a webhook delivery started, CONSUMER for a `stream` or `correlate` start's, else INTERNAL (an `a2a` start's included) | when the run ends | the span its start continued: the caller's, the message's for an `a2a` start, the emit's, the starting step's, the process's in a job | `agentd.run`, `agentd.workflow`, `agentd.start`, `agentd.task`, `agentd.run.status` |
+| `step <step>` | INTERNAL | when the attempt ends | the run's | `agentd.run`, `agentd.step`, `agentd.step.kind`, `agentd.step.attempt`, `agentd.step.status` |
+| `SendMessage` | SERVER | when the message is routed to a turn, a run or a waiting step | the caller's | `a2a.task.id`, `agentd.conversation`, `agentd.message.routed` |
+| `message` | INTERNAL | the same, for a message the runtime delivered itself: the `--prompt`, a `message` step | the sender's | as `SendMessage` |
+| `<A2A method>` | SERVER | when answered: a command answered at once, and any other A2A request that started no task under the caller's span, when its `traceparent` named one | the caller's | `rpc.system`, `rpc.method`, `a2a.task.id`, `agentd.command` |
+| `<METHOD> <route>` | SERVER | when answered: a webhook delivery that started no run under the sender's span, when its `traceparent` named one. Linked to the event it appended or the run a duplicate names. A callback is `<METHOD> webhook callback`, the span its `webhook.callback` line is in | the sender's | `http.request.method`, `http.route`, `http.response.status_code` |
+| `signal <name>` | INTERNAL | when delivered | the sender's | `agentd.signal`, `agentd.signal.delivered` |
+| `emit <stream>` | PRODUCER | when appended | the step's | `messaging.operation.type`, `messaging.destination.name`, `agentd.stream.seq` |
+| `append <stream>` | PRODUCER | when an `into:` appends: a trace of its own, linked to the request's span | none | as `emit` |
+| `tools/call <tool>`, `resources/read <uri>`, `prompts/get <name>`, `completion/complete <server>`, `resources/list <server>`, `resources/templates/list <server>` | CLIENT | when answered | the step's, the turn's, or the tool call's | `mcp.method.name`, `agentd.mcp.server`, `gen_ai.operation.name` and `gen_ai.tool.name` (`tools/call`), `mcp.resource.uri` (`resources/read`), `gen_ai.prompt.name` (`prompts/get`) |
+| `<METHOD>` | CLIENT | when answered: an `http` step's request, or a `forward: {webhook}` push | the step's, or the emit's | `http.request.method`, `http.response.status_code`; an `http` step's `url.full`, `agentd.run`, `agentd.step`; a forward's `url.scheme`, `server.address`, `server.port`, `messaging.destination.name` — not its URL, which can be a credential |
+| `a2a.send <peer>`, `a2a.delegate <peer>`, `instance.send <handle>`, `forward <stream>` | CLIENT | when answered; a delegation is one span, its card read, send and polls | the step's, the turn's, or the emit's | `rpc.system`, `rpc.method`, `agentd.a2a.peer`, `agentd.instance.handle`, `messaging.destination.name` |
+| `a2a.push` | CLIENT | when delivered | the task's | `http.request.method`, `url.scheme`, `server.address`, `server.port` — not the push URL, which can be a credential |
+| `exec <command>` | INTERNAL | when the command exits: the span its `TRACEPARENT` named | the step's, or the turn's that called the tool | `process.executable.name`, `process.exit.code` |
+| `<event>` | INTERNAL | when a line names `link` or `links` after the span it is in has ended: a `human.*` line about a conversation turn's gate, an `instance.*` line after the spawning step | the line's span | the line's links |
+| `chat` | CLIENT | when answered: a judge's or the goal check's model call | the gate's or the unit's | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+
+| Span (a turn worker's or a subagent's) | Kind | Parent | Attributes |
+|---|---|---|---|
+| `invoke_agent` | INTERNAL | the step's, or the message's for a conversation turn; a subagent's, the span that spawned it | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+| `chat` | CLIENT: one per model call, the span its request sent, kept by its retries, failovers and fallback | `invoke_agent` | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+| `execute_tool` | CLIENT for an MCP tool, the span its request sent; INTERNAL otherwise | `invoke_agent` | `gen_ai.operation.name`, `gen_ai.tool.name`, `mcp.method.name`, `agentd.mcp.server` |
+
+A decide turn is an `invoke_agent` span with a `chat` span per decision
+call. A span's status is OK or ERROR. Export is best effort and never fails
+the work: each step of a send (connect, write, read) gives up after 5 s, at
+most 8192 spans wait in a process, and a batch that fails is dropped, not
+retried. An exit gives its last exports 3 s in all.
 
 **Failures.** A failed export is logged as `otel.export.failed` (warn),
 naming the signal (`traces` or `logs`), the endpoint and the error, when
@@ -987,14 +1022,18 @@ again within a minute of that line, the failure is logged at once, and the
 next `otel.export.recovered` waits for the first batch taken after that
 minute. So a collector that drops every other batch gets one line of each
 a minute. `failures` counts the batches lost since the signal's last
-`otel.export.recovered`. Each process counts on its own: a turn worker
+`otel.export.recovered`, those an exit dropped behind a failed batch
+included. Each process counts on its own: a turn worker
 exports one trace, so each turn whose trace fails logs one line, while the
-supervisor's log export keeps one count for as long as it runs.
+supervisor's span and log exports keep one count each for as long as it
+runs.
 
 **Logs.** `observability.otel.logs: true` mirrors the supervisor process's
-log lines to the collector every 5 s. Each record's body is the event name,
-its severity the level, and the attribute `log.fields` the whole line as a
-JSON string. At most 8192 records wait between flushes; the rest are dropped.
+log lines to the collector every 5 s, and what is left when it exits. Each
+record's body is the event name, its severity the level, its `traceId` and
+`spanId` the line's `trace_id` and `span_id`, and the attribute `log.fields`
+the whole line as a JSON string. At most 8192 records wait between flushes;
+the rest are dropped.
 
 ## Audit records
 

@@ -1026,14 +1026,24 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         };
         let tx = self.events_tx.clone();
         let mut meta = json!({"agent/instance": self.instance, "agent/ctx": job.ctx});
-        crate::mcp::stamp_trace(&mut meta, job.trace.as_ref());
+        let call = crate::mcp::stamp_trace(&mut meta, job.trace.as_ref());
         self.staged_turns.insert(stage_id, job);
         std::thread::Builder::new()
             .name("knowledge.auto_context".into())
             .spawn(move || {
                 // Unbounded as a whole, like every data-path tool call (see
                 // `run_mapped`): the server's own `timeout` caps each silence.
-                let block = match client.call_tool_with_meta(&m.tool, Some(mcp_args), meta) {
+                let start = crate::obs::otel::now_unix_nanos();
+                let res = client.call_tool_with_meta(&m.tool, Some(mcp_args), meta);
+                crate::obs::otel::mcp_span(
+                    call.as_ref(),
+                    "tools/call",
+                    &m.tool,
+                    &m.server,
+                    res.as_ref().is_ok_and(|r| !r.is_error()),
+                    start,
+                );
+                let block = match res {
                     Ok(r) if !r.is_error() => {
                         let mut ctx = crate::store::mcp::result_ctx(&r);
                         ctx["args"] = args;

@@ -3,8 +3,9 @@
 //! declared stream so a workflow can react to it.
 //!
 //! What matters here is that the loop actually closes — a runtime event starts
-//! a run — and that the guards hold: undeclared streams and unknown families
-//! are startup errors, and the tap cannot feed itself.
+//! a run, in the trace of the run it reports on — and that the guards hold:
+//! undeclared streams and unknown families are startup errors, and the tap
+//! cannot feed itself.
 #![cfg(unix)]
 
 mod common;
@@ -58,6 +59,21 @@ fn a_runtime_event_can_start_a_run() {
     assert!(
         log.contains("\"workflow\":\"watcher\"") && log.contains("\"event\":\"run.start\""),
         "a runtime event should have started the watcher run\n{log}"
+    );
+    // And it continues the trace of what it watched: the event names the
+    // span its line was in — the `work` run's — and the watcher's run is a
+    // child of it.
+    let started = |workflow: &str| -> serde_json::Value {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["event"] == "run.start" && v["workflow"] == workflow)
+            .unwrap_or_else(|| panic!("no {workflow} run:\n{log}"))
+    };
+    let (work, watcher) = (started("work"), started("watcher"));
+    assert_eq!(watcher["trace_id"], work["trace_id"], "{watcher}\n{work}");
+    assert_eq!(
+        watcher["parent_span_id"], work["span_id"],
+        "{watcher}\n{work}"
     );
 }
 

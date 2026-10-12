@@ -18,7 +18,10 @@
 //! * the `http` step and an A2A push notification send the unit's span, and
 //!   an `http` step whose headers set the trace context sends only its own;
 //! * an MCP Events occurrence's `_meta.traceparent` starts its run in that
-//!   trace.
+//!   trace;
+//! * the outputs name the trace: a webhook's answer (`run_id`, `trace_id`, a
+//!   `traceparent` header naming the run's span), an A2A task's annotations,
+//!   `run.get`, `workflow.status` and `status`.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -403,12 +406,15 @@ fn two_daemons_over_a2a_are_one_trace() {
     assert_eq!(done["status"], "completed", "{done}\n{}", b.log());
     let started = a.wait_line("run.start", |v| v["workflow"] == "ask");
     let trace = started["trace_id"].as_str().unwrap().to_string();
-    // The hop: a span of the run's, on its own line.
+    // The hop: a span of the step's — itself a span of the run's — on its
+    // own line.
+    let step = a.wait_line("step.start", |v| v["step"] == "d");
+    assert_eq!(step["parent_span_id"], started["span_id"], "{step}");
     let hop = a.wait_line("a2a.delegate", |v| v["step"] == "d");
     assert_eq!(hop["trace_id"], trace.as_str(), "{hop}");
-    assert_eq!(hop["parent_span_id"], started["span_id"], "{hop}");
+    assert_eq!(hop["parent_span_id"], step["span_id"], "{hop}");
     let hop_span = hop["span_id"].as_str().unwrap();
-    assert_ne!(hop_span, started["span_id"].as_str().unwrap());
+    assert_ne!(hop_span, step["span_id"].as_str().unwrap());
 
     // The callee's run: the caller's trace, a child of the caller's hop.
     let run = b.wait_line("run.start", |v| v["workflow"] == "work");
@@ -602,7 +608,8 @@ fn webhook_post(addr: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
 
 /// A webhook that starts a run is the run's parent: the run continues the
 /// sender's trace. A callback to a run that waits does not move the run: it
-/// keeps its own trace and records the sender's span as a link.
+/// keeps its own trace and records the sender's span as a link, and the
+/// callback's own line is in the sender's trace.
 #[test]
 fn a_webhook_starts_a_run_in_its_trace_and_a_callback_is_a_link() {
     let (d, addr) = spawn_on("trace-hooks", "webhooks.listen", webhook_config);
@@ -633,6 +640,13 @@ fn a_webhook_starts_a_run_in_its_trace_and_a_callback_is_a_link() {
     assert_eq!(delivered["link"], UP_UNSAMPLED, "{delivered}");
     let callback = d.wait_line("webhook.callback", |_| true);
     assert_eq!(callback["link"], UP_UNSAMPLED, "{callback}");
+    // The callback request is a span of its own under the caller's.
+    assert_eq!(callback["trace_id"], trace_of(UP_UNSAMPLED), "{callback}");
+    assert_eq!(
+        callback["parent_span_id"],
+        span_of(UP_UNSAMPLED),
+        "{callback}"
+    );
     let done = d.wait_line("run.done", |v| v["workflow"] == "waiter");
     assert_eq!(
         done["trace_id"],
@@ -729,10 +743,10 @@ fn a_stream_consumer_continues_its_event_and_a_batch_links_its_members() {
     assert!(fired.get("parent_span_id").is_none(), "{fired}");
 }
 
-/// The `http` step sends the step's span, a child of the run's, as
+/// The `http` step sends a span of its own, a child of the step's, as
 /// `traceparent`: the API it reaches joins the run's trace. A step whose
 /// headers set the trace context owns it: agentd adds nothing — no second
-/// `tracestate` — and logs the request in the run's span, since none of its
+/// `tracestate` — and logs the request in the step's span, since none of its
 /// own went out.
 #[test]
 fn the_http_step_sends_its_span() {
@@ -764,9 +778,11 @@ fn the_http_step_sends_its_span() {
         .to_string();
     let line = d.wait_line("http.request", |v| v["step"] == "h");
     let run = d.wait_line("run.start", |v| v["workflow"] == "caller");
+    let step = d.wait_line("step.start", |v| v["step"] == "h");
     assert_eq!(trace_of(&sent), run["trace_id"].as_str().unwrap(), "{sent}");
     assert_eq!(span_of(&sent), line["span_id"].as_str().unwrap(), "{line}");
-    assert_eq!(line["parent_span_id"], run["span_id"], "{line}");
+    assert_eq!(line["parent_span_id"], step["span_id"], "{line}");
+    assert_eq!(step["parent_span_id"], run["span_id"], "{step}");
 
     let (headers, _) = api.find(|(_, body)| body["a"] == 2);
     assert_eq!(header(&headers, "traceparent"), None, "{headers:?}");
@@ -777,7 +793,8 @@ fn the_http_step_sends_its_span() {
         .collect();
     assert_eq!(states, ["k=v"], "{headers:?}");
     let line = d.wait_line("http.request", |v| v["step"] == "o");
-    assert_eq!(line["span_id"], run["span_id"], "{line}");
+    let step = d.wait_line("step.start", |v| v["step"] == "o");
+    assert_eq!(line["span_id"], step["span_id"], "{line}");
 }
 
 /// An MCP Events occurrence names the span the server produced it in, in its
@@ -823,4 +840,221 @@ fn an_mcp_events_occurrence_starts_its_run_in_its_trace() {
     let run = d.wait_line("run.start", |v| v["workflow"] == "on_tick");
     assert_eq!(run["trace_id"], trace_of(UP), "{run}");
     assert_eq!(run["parent_span_id"], span_of(UP), "{run}");
+}
+
+/// POST `{}` to `path` with `headers`: the status, the response headers
+/// (names lowercased) and the JSON body.
+fn webhook_send(
+    addr: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Value) {
+    let mut s = TcpStream::connect(addr).expect("connect webhook listener");
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let mut head = format!(
+        "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n"
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n{}");
+    s.write_all(head.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = s.read_to_string(&mut raw);
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (
+        status,
+        headers,
+        serde_json::from_str(body).unwrap_or(Value::Null),
+    )
+}
+
+/// A webhook's answer names the run the delivery became and the trace it is
+/// in: `run_id` and `trace_id` in the body, and the run's span in a
+/// `traceparent` response header — a `202`, a `respond: sync` answer, and a
+/// replay's `duplicate`, which names the run the kept delivery started. A
+/// run its inputs schema refuses after the `202` is named by the line that
+/// refuses it.
+#[test]
+fn a_webhook_reply_names_its_run_and_its_trace() {
+    let (d, addr) = spawn_on("trace-replies", "webhooks.listen", |port| {
+        format!(
+            "\
+             agent:\n  name: replies\n  instruction: test\n  preflight: never\n\
+             intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+             store:\n  kind: memory\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n\
+             workflows:\n\
+             \x20 - name: hooked\n\
+             \x20   steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/in, methods: [POST], auth: {{none: true}}}}\n\
+             \x20     f: {{kind: finish, depends_on: [h], status: completed}}\n\
+             \x20 - name: held\n\
+             \x20   steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/sync, methods: [POST], respond: sync, auth: {{none: true}}}}\n\
+             \x20     f: {{kind: finish, depends_on: [h], status: completed, output: done}}\n\
+             \x20 - name: strict\n\
+             \x20   inputs: {{schema: {{type: object, required: [order_id]}}}}\n\
+             \x20   steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/strict, methods: [POST], auth: {{none: true}}}}\n\
+             \x20     f: {{kind: finish, depends_on: [h], status: completed}}\n"
+        )
+    });
+    // The run's span, as its `run.start` line names it.
+    let run_span = |run: &str| -> String {
+        let start = d.wait_line("run.start", |v| v["run"] == run);
+        format!(
+            "00-{}-{}-01",
+            start["trace_id"].as_str().unwrap(),
+            start["span_id"].as_str().unwrap()
+        )
+    };
+
+    // 1. Accepted, under the sender's span.
+    let (status, headers, body) = webhook_send(
+        &addr,
+        "/hooks/in",
+        &[("traceparent", UP), ("idempotency-key", "k-1")],
+    );
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "accepted", "{body}");
+    let run = body["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no run_id: {body}"))
+        .to_string();
+    assert_eq!(body["trace_id"], trace_of(UP), "the sender's trace: {body}");
+    let named = run_span(&run);
+    assert_eq!(
+        header(&headers, "traceparent"),
+        Some(named.as_str()),
+        "{headers:?}"
+    );
+    let start = d.wait_line("run.start", |v| v["run"] == run.as_str());
+    assert_eq!(start["parent_span_id"], span_of(UP), "{start}");
+
+    // 2. A replay of the kept delivery names the run it started.
+    let (status, headers, body) = webhook_send(
+        &addr,
+        "/hooks/in",
+        &[("traceparent", UP), ("idempotency-key", "k-1")],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "duplicate", "{body}");
+    assert_eq!(body["run_id"], run.as_str(), "{body}");
+    assert_eq!(body["trace_id"], trace_of(UP), "{body}");
+    assert_eq!(
+        header(&headers, "traceparent"),
+        Some(named.as_str()),
+        "{headers:?}"
+    );
+
+    // 3. No traceparent: a trace of its own, named all the same.
+    let (status, headers, body) = webhook_send(&addr, "/hooks/in", &[]);
+    assert_eq!(status, 202, "{body}");
+    let fresh = body["run_id"].as_str().unwrap_or_else(|| panic!("{body}"));
+    let own = run_span(fresh);
+    assert_eq!(body["trace_id"], trace_of(&own), "{body}");
+    assert_ne!(body["trace_id"], trace_of(UP), "{body}");
+    assert_eq!(
+        header(&headers, "traceparent"),
+        Some(own.as_str()),
+        "{headers:?}"
+    );
+
+    // 4. `respond: sync`: the answer names the run it waited for.
+    let (status, headers, body) = webhook_send(&addr, "/hooks/sync", &[("traceparent", UP)]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["output"], "done", "{body}");
+    let held = body["run_id"].as_str().unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(body["trace_id"], trace_of(UP), "{body}");
+    assert_eq!(
+        header(&headers, "traceparent"),
+        Some(run_span(held).as_str()),
+        "{headers:?}"
+    );
+
+    // 5. A delivery queued as a run its inputs schema then refuses: the line
+    // that says so names the run the answer named, in its trace.
+    let (status, _, body) = webhook_send(&addr, "/hooks/strict", &[("traceparent", UP)]);
+    assert_eq!(status, 202, "{body}");
+    let refused = body["run_id"].as_str().unwrap_or_else(|| panic!("{body}"));
+    let invalid = d.wait_line("run.inputs.invalid", |v| v["workflow"] == "strict");
+    assert_eq!(invalid["run"], refused, "{invalid}");
+    assert_eq!(invalid["trace_id"], trace_of(UP), "{invalid}");
+}
+
+/// The outputs that describe a run name its trace: the A2A task's
+/// annotations (`traceId`, and `spanId` — the span the `traceparent` response
+/// header names), `run.get`, `workflow.status`, and the run summaries of
+/// `status`, whose operator document names the process's trace too.
+#[test]
+fn an_a2a_task_and_the_reads_of_its_run_name_the_trace() {
+    use agentd::runtime::surface::TASK_ANNOTATIONS_EXTENSION;
+    let mock = common::spawn_mock_mcp("mock://noop", false);
+    let (b, addr) = spawn_on("trace-reads", "a2a.listen", |port| {
+        callee_config(port, &mock.uri()).replace(
+            "  push:\n",
+            "  introspection:\n    enabled: true\n  push:\n",
+        )
+    });
+    let reply = post(
+        &addr,
+        &run_work()
+            .header("traceparent", UP)
+            .header("A2A-Extensions", TASK_ANNOTATIONS_EXTENSION),
+        None,
+    );
+    assert_eq!(reply.status, 200, "{reply:?}");
+    let task = reply.json()["result"]["task"].clone();
+    let ann = &task["metadata"][TASK_ANNOTATIONS_EXTENSION];
+    let start = b.wait_line("run.start", |v| v["workflow"] == "work");
+    let run = start["run"].as_str().unwrap().to_string();
+    let trace = trace_of(UP);
+    assert_eq!(ann["traceId"], trace, "{task}");
+    assert_eq!(ann["spanId"], start["span_id"], "the run's span: {task}");
+    let named = format!("00-{trace}-{}-01", start["span_id"].as_str().unwrap());
+    assert_eq!(
+        reply.header("traceparent"),
+        Some(named.as_str()),
+        "{reply:?}"
+    );
+    b.wait_line("run.done", |v| v["run"] == run.as_str());
+
+    // A read op's document: a Message's data part, or a task's result.
+    let read = |op: &str, args: Value| -> Value {
+        let r = common::SendMessage::command(op, args).result(&addr);
+        let data = &r["message"]["parts"][0]["data"];
+        if data.is_null() {
+            r["task"]["artifacts"][0]["parts"][0]["data"].clone()
+        } else {
+            data.clone()
+        }
+    };
+    let got = read("run.get", json!({"run": run}));
+    assert_eq!(got["run"]["trace_id"], trace, "{got}");
+    let status = read("workflow.status", json!({"run": run}));
+    assert_eq!(status["runs"][0]["trace_id"], trace, "{status}");
+    let doc = read("status", json!({}));
+    let listed = doc["runs"]
+        .as_array()
+        .and_then(|runs| runs.iter().find(|r| r["id"] == run.as_str()))
+        .unwrap_or_else(|| panic!("the run is not in status: {doc}"));
+    assert_eq!(listed["trace_id"], trace, "{listed}");
+    let proc_start = b.wait_line("proc.start", |_| true);
+    assert_eq!(
+        doc["trace_id"], proc_start["trace_id"],
+        "the process's trace: {doc}"
+    );
 }

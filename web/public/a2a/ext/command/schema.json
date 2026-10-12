@@ -1877,6 +1877,13 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "trace_id": {
+                  "description": "a W3C trace id, 32 lowercase hex digits",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "updated": {
                   "minimum": 0,
                   "type": "integer"
@@ -1902,6 +1909,7 @@
                 "error",
                 "task",
                 "principal",
+                "trace_id",
                 "vars"
               ],
               "type": "object"
@@ -1968,6 +1976,13 @@
                       "null"
                     ]
                   },
+                  "trace_id": {
+                    "description": "a W3C trace id, 32 lowercase hex digits",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "updated_ms": {
                     "minimum": 0,
                     "type": "integer"
@@ -1983,7 +1998,8 @@
                   "tokens_in",
                   "tokens_out",
                   "started_ms",
-                  "updated_ms"
+                  "updated_ms",
+                  "trace_id"
                 ],
                 "type": "object"
               },
@@ -2124,6 +2140,13 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "trace_id": {
+                    "description": "a W3C trace id, 32 lowercase hex digits",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "updated": {
                     "minimum": 0,
                     "type": "integer"
@@ -2145,7 +2168,8 @@
                   "output",
                   "error",
                   "task",
-                  "principal"
+                  "principal",
+                  "trace_id"
                 ],
                 "type": "object"
               },
@@ -2524,6 +2548,13 @@
                   "status": {
                     "type": "string"
                   },
+                  "trace_id": {
+                    "description": "the W3C trace id the run's work is in, 32 lowercase hex digits",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "workflow": {
                     "type": "string"
                   }
@@ -2533,7 +2564,8 @@
                   "workflow",
                   "status",
                   "output",
-                  "error"
+                  "error",
+                  "trace_id"
                 ],
                 "type": "object"
               },

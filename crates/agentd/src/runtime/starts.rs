@@ -454,11 +454,13 @@ impl Runtime {
         kind: &str,
     ) -> Admission {
         self.fire_start_run(workflow, node, spec, payload, kind, None, None)
+            .0
     }
 
     /// Like [`Runtime::fire_start`], with an optional pre-generated `run_id` (so a
     /// caller — e.g. a `respond: sync` webhook — can link the run before it starts),
     /// and the trace the run continues, when the firing has one (`parent`).
+    /// An accepted firing comes back with the span its run is.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_start_run(
         &mut self,
@@ -469,7 +471,7 @@ impl Runtime {
         kind: &str,
         run_id: Option<&str>,
         parent: Option<&TraceContext>,
-    ) -> Admission {
+    ) -> (Admission, Option<TraceContext>) {
         self.admit_start(
             workflow,
             node,
@@ -511,6 +513,7 @@ impl Runtime {
             parent,
             &[],
         )
+        .0
     }
 
     /// A durable stream consumer (`stream`, its `batch`, `correlate`) offers
@@ -561,6 +564,7 @@ impl Runtime {
             parent.as_ref(),
             &links,
         )
+        .0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -576,7 +580,7 @@ impl Runtime {
         carries: Option<&super::withhold::Carries>,
         parent: Option<&TraceContext>,
         links: &[String],
-    ) -> Admission {
+    ) -> (Admission, Option<TraceContext>) {
         // Every line about this firing carries the same identity, plus the
         // stream position when a consumer is offering an event.
         let fields = |extra: Value| -> Value {
@@ -599,7 +603,10 @@ impl Runtime {
             .is_some_and(|w| w.priority == crate::engine::model::Priority::Low);
         if let Some(cause) = self.pressure.refusal(low) {
             let line = fields(json!({"cause": cause}));
-            return self.refuse(workflow, node, origin.is_some(), Admission::Shed, line);
+            return (
+                self.refuse(workflow, node, origin.is_some(), Admission::Shed, line),
+                None,
+            );
         }
         // §7.7 revocation: a stale signed instruction source refuses NEW work
         // (live runs keep draining). The freeze clears on the next reachable
@@ -608,7 +615,10 @@ impl Runtime {
             let line = fields(json!({
                 "cause": "signed instruction source is stale past its freshness deadline (§7.7)"
             }));
-            return self.refuse(workflow, node, origin.is_some(), Admission::Frozen, line);
+            return (
+                self.refuse(workflow, node, origin.is_some(), Admission::Frozen, line),
+                None,
+            );
         }
         let inputs = match spec.get("inputs") {
             Some(mapping) => {
@@ -632,7 +642,7 @@ impl Runtime {
                         self.log
                             .warn("start.inputs.invalid", fields(json!({"err": e})));
                         self.start_held.remove(&Self::start_key(workflow, node));
-                        return Admission::InputsInvalid;
+                        return (Admission::InputsInvalid, None);
                     }
                 }
             }
@@ -713,16 +723,19 @@ impl Runtime {
                     fields(json!({"err": format!("inbox: {e}")})),
                 );
                 self.start_held.remove(&Self::start_key(workflow, node));
-                return Admission::TooLarge;
+                return (Admission::TooLarge, None);
             }
             Err(e) => {
                 let line = fields(json!({"err": format!("inbox: {e}")}));
-                return self.refuse(
-                    workflow,
-                    node,
-                    origin.is_some(),
-                    Admission::InboxFailed,
-                    line,
+                return (
+                    self.refuse(
+                        workflow,
+                        node,
+                        origin.is_some(),
+                        Admission::InboxFailed,
+                        line,
+                    ),
+                    None,
                 );
             }
         };
@@ -742,7 +755,7 @@ impl Runtime {
             st["iteration"] = json!(st["iteration"].as_u64().unwrap_or(0) + 1);
         }
         self.set_start_state(workflow, node, st);
-        Admission::Accepted
+        (Admission::Accepted, Some(trace))
     }
 
     /// Log a refused firing and return its outcome.

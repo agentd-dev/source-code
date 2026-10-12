@@ -783,17 +783,29 @@ impl Runtime {
                 .map(|t| t.child());
             let log = self.log.in_trace(hop.as_ref());
             let auth = crate::mcp::a2a_client::PeerAuth {
-                trace: hop,
+                trace: hop.clone(),
                 ..Default::default()
             };
             let h = handle.to_string();
             std::thread::Builder::new()
                 .name(format!("inst.send:{handle}"))
                 .spawn(move || {
+                    let start = crate::obs::otel::now_unix_nanos();
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    match crate::mcp::a2a_client::send(
-                        &endpoint, auth, &parts, None, None, deadline,
-                    ) {
+                    let sent =
+                        crate::mcp::a2a_client::send(&endpoint, auth, &parts, None, None, deadline);
+                    // The send is the CLIENT span the child's task continues.
+                    crate::obs::otel::span(
+                        hop.as_ref(),
+                        &format!("instance.send {h}"),
+                        crate::obs::otel::Kind::Client,
+                        start,
+                    )
+                    .attr("rpc.system", "jsonrpc")
+                    .attr("rpc.method", "SendMessage")
+                    .attr("agentd.instance.handle", h.as_str())
+                    .end(sent.is_ok());
+                    match sent {
                         Ok(_) => log.info("instance.send", json!({"handle": h})),
                         Err(e) => log.warn("instance.send", json!({"handle": h, "err": e})),
                     }

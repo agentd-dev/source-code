@@ -239,12 +239,15 @@ pub fn run_turn(
     let mut usage_total = Usage::default();
     let mut delta: Vec<Msg> = Vec::new();
     let mut last_text: Option<String> = None;
-    // The OTEL `invoke_agent` span for this turn — a no-op handle
-    // without the `otel` feature / an endpoint. `Option` so `finish` (which
-    // consumes the span) can be `take`n from the return-macro without a move
-    // across the loop.
+    // The turn's span: the `invoke_agent` span, the parent of every model
+    // call and tool call it makes. Its export is a no-op handle without the
+    // `otel` feature / an endpoint. `Option` so `finish` (which consumes the
+    // span) can be `take`n from the return-macro without a move across the
+    // loop.
+    let turn_span = crate::obs::trace::turn();
     let mut run_span = Some(crate::obs::otel::run_begin(
         log,
+        turn_span.as_ref(),
         crate::obs::otel::now_unix_nanos(),
     ));
 
@@ -333,16 +336,20 @@ pub fn run_turn(
             ..Default::default()
         };
         let chat_start = crate::obs::otel::now_unix_nanos();
-        let resp = match degraded
+        // The call is a span of the turn's, sent as its `traceparent` and
+        // exported as its `chat` span.
+        let call = turn_span
             .as_ref()
-            .unwrap_or(intel)
-            .complete_by(&req, limits.deadline)
-        {
+            .map(crate::obs::trace::TraceContext::child);
+        let client = degraded.as_ref().unwrap_or(intel);
+        let answered = match &call {
+            Some(c) => client.complete_in(&req, Some(limits.deadline), c),
+            None => client.complete_by(&req, limits.deadline),
+        };
+        let resp = match answered {
             Ok(r) => r,
             Err(e) => {
-                if let Some(rs) = run_span.as_mut() {
-                    rs.record_chat(&model, 0, 0, false, chat_start);
-                }
+                crate::obs::otel::chat_span(call.as_ref(), &model, 0, 0, false, chat_start);
                 // A call the run's deadline cut off ends the run on its
                 // deadline, not as an outage of the model.
                 if Instant::now() >= limits.deadline {
@@ -365,15 +372,14 @@ pub fn run_turn(
         }
         usage_total.input_tokens += resp.usage.input_tokens;
         usage_total.output_tokens += resp.usage.output_tokens;
-        if let Some(rs) = run_span.as_mut() {
-            rs.record_chat(
-                resp.fallback.as_deref().unwrap_or(&model),
-                resp.usage.input_tokens,
-                resp.usage.output_tokens,
-                true,
-                chat_start,
-            );
-        }
+        crate::obs::otel::chat_span(
+            call.as_ref(),
+            resp.fallback.as_deref().unwrap_or(&model),
+            resp.usage.input_tokens,
+            resp.usage.output_tokens,
+            true,
+            chat_start,
+        );
         // Carry the round's token usage upward too — the supervisor attributes
         // it to this turn's live activity (the instance counters are settled
         // separately from the terminal usage, so this never double-counts).
@@ -423,10 +429,20 @@ pub fn run_turn(
                     "turn.tool",
                     json!({"turn": spec.turn_id, "tool": tc.name, "i": i + 1, "of": resp.tool_calls.len()}),
                 );
-                let (content, is_error) = execute_call(spec, limits, tc, i, mcp, bridge, log);
-                if let Some(rs) = run_span.as_mut() {
-                    rs.record_tool(&tc.name, !is_error, tool_span_start);
-                }
+                // The call is a span of the turn's: an MCP tool's request
+                // sends it, and it is exported as the call's `execute_tool`.
+                let call = turn_span
+                    .as_ref()
+                    .map(crate::obs::trace::TraceContext::child);
+                let (content, is_error) =
+                    execute_call(spec, limits, tc, i, call.as_ref(), mcp, bridge, log);
+                crate::obs::otel::tool_span(
+                    call.as_ref(),
+                    &tc.name,
+                    mcp_route(spec, &tc.name).map(|(server, _)| ("tools/call", Some(server))),
+                    !is_error,
+                    tool_span_start,
+                );
                 log.info("tool.result", json!({"turn": spec.turn_id, "tool": tc.name, "is_error": is_error, "ms": call_start.elapsed().as_millis() as u64}));
                 let msg = Msg::tool(tc.id.clone(), tc.name.clone(), content, is_error);
                 messages.push(msg.to_wire());
@@ -634,12 +650,36 @@ fn admit(
 /// under `fail` (or `escalate` with nowhere to go) the turn fails, under
 /// `continue` the answer is marked. The answers — not the state, which is
 /// content — are logged (`intel.decision`).
+///
+/// The turn is an `invoke_agent` span like any other, and each model call it
+/// makes a `chat` span under it, sent as the call's `traceparent`.
 fn run_decision(
     spec: &TurnSpec,
     limits: &TurnLimits,
     intel: &IntelClient,
     bridge: &mut dyn Bridge,
     log: &Logger,
+) -> TurnResult {
+    let turn = crate::obs::trace::turn();
+    let span = crate::obs::otel::run_begin(log, turn.as_ref(), crate::obs::otel::now_unix_nanos());
+    let result = decide(spec, limits, intel, bridge, log, turn.as_ref());
+    span.finish(
+        &limits.model,
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.status == "completed",
+    );
+    result
+}
+
+/// The decision itself, in the turn's span `turn`.
+fn decide(
+    spec: &TurnSpec,
+    limits: &TurnLimits,
+    intel: &IntelClient,
+    bridge: &mut dyn Bridge,
+    log: &Logger,
+    turn: Option<&crate::obs::trace::TraceContext>,
 ) -> TurnResult {
     use crate::subagent::protocol::OnUnsure;
     use crate::wire::decision;
@@ -696,16 +736,24 @@ fn run_decision(
     }
     bridge.progress("turn.think", json!({"turn": spec.turn_id, "round": 1}));
     let ask = |client: &IntelClient, model: &str| {
-        client.complete_by(
-            &Request {
-                model: model.to_string(),
-                max_tokens,
-                temperature: Some(0.0),
-                decision: Some(job.decision.clone()),
-                ..Default::default()
-            },
-            limits.deadline,
-        )
+        let req = Request {
+            model: model.to_string(),
+            max_tokens,
+            temperature: Some(0.0),
+            decision: Some(job.decision.clone()),
+            ..Default::default()
+        };
+        let start = crate::obs::otel::now_unix_nanos();
+        let call = turn.map(crate::obs::trace::TraceContext::child);
+        let answered = match &call {
+            Some(c) => client.complete_in(&req, Some(limits.deadline), c),
+            None => client.complete_by(&req, limits.deadline),
+        };
+        let (input, output) = answered
+            .as_ref()
+            .map_or((0, 0), |r| (r.usage.input_tokens, r.usage.output_tokens));
+        crate::obs::otel::chat_span(call.as_ref(), model, input, output, answered.is_ok(), start);
+        answered
     };
     let resp = match ask(degraded.as_ref().unwrap_or(intel), &model) {
         Ok(r) => r,
@@ -872,12 +920,26 @@ fn seal_unanswered(delta: &mut Vec<Msg>, unanswered: &[ToolCall], status: &str) 
     }
 }
 
+/// The MCP server and tool a call to `name` goes to: none for an internal
+/// tool, which the supervisor answers.
+fn mcp_route<'a>(spec: &'a TurnSpec, name: &str) -> Option<(&'a str, &'a str)> {
+    if spec.internal.iter().any(|n| n == name) {
+        return None;
+    }
+    spec.mcp_routes
+        .get(name)
+        .map(|(server, tool)| (server.as_str(), tool.as_str()))
+}
+
 /// Dispatch one tool call: internal (round-trip) → MCP (own call) → code.
+/// An MCP tool's request is the span `call`.
+#[allow(clippy::too_many_arguments)]
 fn execute_call(
     spec: &TurnSpec,
     limits: &TurnLimits,
     tc: &ToolCall,
     index: usize,
+    call: Option<&crate::obs::trace::TraceContext>,
     mcp: &dyn McpCaller,
     bridge: &mut dyn Bridge,
     log: &Logger,
@@ -898,7 +960,7 @@ fn execute_call(
             ),
         };
     }
-    if let Some((server, tool)) = spec.mcp_routes.get(name) {
+    if let Some((server, tool)) = mcp_route(spec, name) {
         let remaining = limits.deadline.saturating_duration_since(Instant::now());
         let timeout = remaining.min(TOOL_CALL_CAP).max(Duration::from_millis(100));
         let mut meta = spec.tool_meta.clone().unwrap_or_else(|| json!({}));
@@ -907,6 +969,9 @@ fn execute_call(
                 "{}#{}.{}",
                 spec.idempotency_prefix, spec.turn_id, index
             ));
+        }
+        if let (Some(m), Some(c)) = (meta.as_object_mut(), call) {
+            m.extend(c.meta());
         }
         return match mcp.call(server, tool, tc.arguments.clone(), meta, timeout) {
             Ok(r) => r,
@@ -1034,6 +1099,7 @@ mod tests {
                 trace_id: None,
                 span_id: None,
                 parent_span_id: None,
+                trace_flags: None,
             },
             Level::Warn,
         )

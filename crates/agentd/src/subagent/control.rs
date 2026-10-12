@@ -817,6 +817,7 @@ fn build_logger(payload: &SpawnPayload, trace: &crate::obs::trace::TraceContext)
         trace_id: None,
         span_id: None,
         parent_span_id: None,
+        trace_flags: None,
     };
     ctx.set_trace(trace);
     Logger::new(ctx, level).with_content(t.log_content)
@@ -998,6 +999,7 @@ mod tests {
                 trace_id: None,
                 span_id: None,
                 parent_span_id: None,
+                trace_flags: None,
             },
             Level::Info,
         )

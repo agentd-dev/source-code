@@ -202,6 +202,23 @@ pub fn process() -> Option<TraceContext> {
     PROCESS.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The span of one turn in a turn worker or a subagent: the process's own
+/// span for its first — the child of the span its spawn payload named, and
+/// the span its lines carry — and, for each later turn of a subagent's
+/// session, a span of its own under the same parent. Every model call and
+/// tool call of the turn is a child of it.
+pub fn turn() -> Option<TraceContext> {
+    static FIRST_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let p = process()?;
+    if !FIRST_TAKEN.swap(true, Ordering::Relaxed) {
+        return Some(p);
+    }
+    Some(TraceContext {
+        span_id: new_span_id(),
+        ..p
+    })
+}
+
 /// Parse a `traceparent` per W3C Trace Context §3.2: `None` for version `ff`,
 /// an all-zero trace or parent id, a wrong length, a character that is not
 /// lowercase hex, or anything that is not ASCII. A version above `00` is read

@@ -132,8 +132,9 @@ pub struct IntelClient {
     /// to what is left of it, and no backoff sleeps past it.
     deadline: Cell<Option<Instant>>,
     /// The trace of the unit of work the calls serve; when set, every
-    /// completion carries a `traceparent` (a span of its own under it) and the
-    /// unit's `tracestate`, so the model call joins the unit's trace.
+    /// completion carries a `traceparent` (a span of its own under it, unless
+    /// the caller names the call's span) and the unit's `tracestate`, so the
+    /// model call joins the unit's trace.
     trace: Option<crate::obs::trace::TraceContext>,
     /// All-endpoints-down backoff policy. `None` — the default, used by
     /// `once`-mode — means a single sweep: all-down returns immediately and the
@@ -410,38 +411,86 @@ impl IntelClient {
     /// reported as one, it held `/readyz` at 503 for as long as the model
     /// stayed gone, which is the case a fallback exists for.
     pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
-        self.complete_until(req, self.deadline.get())
+        self.complete_until(req, self.deadline.get(), None)
     }
 
     /// [`Self::complete`], ended by `deadline` (a run's): a call in flight is
     /// cut off when the deadline passes, as the run is.
     pub fn complete_by(&self, req: &Request, deadline: Instant) -> Result<Response, IntelError> {
-        self.complete_until(req, Some(deadline))
+        self.complete_until(req, Some(deadline), None)
     }
 
+    /// [`Self::complete_by`], sent as the span `call` — a child of the unit's,
+    /// which the caller records as the call's `chat` span — so the span the
+    /// provider sees as its parent is the one agentd exports.
+    pub fn complete_in(
+        &self,
+        req: &Request,
+        deadline: Option<Instant>,
+        call: &crate::obs::trace::TraceContext,
+    ) -> Result<Response, IntelError> {
+        self.complete_until(req, deadline.or(self.deadline.get()), Some(call))
+    }
+
+    /// [`Self::complete`] for one of the supervisor's own model calls — a
+    /// judge's, the goal check's: sent as a span of `unit`'s and recorded as
+    /// the call's `chat` span.
+    pub fn complete_recorded(
+        &self,
+        req: &Request,
+        unit: Option<&crate::obs::trace::TraceContext>,
+    ) -> Result<Response, IntelError> {
+        let call = unit.map(crate::obs::trace::TraceContext::child);
+        let start = crate::obs::otel::now_unix_nanos();
+        let out = self.complete_until(req, self.deadline.get(), call.as_ref());
+        let (input, output) = out
+            .as_ref()
+            .map_or((0, 0), |r| (r.usage.input_tokens, r.usage.output_tokens));
+        crate::obs::otel::chat_span(call.as_ref(), &req.model, input, output, out.is_ok(), start);
+        out
+    }
+
+    /// One completion, sent as the span `call`, else as a span of its own
+    /// under the unit's. Every attempt it makes — a retry, a failover to
+    /// another endpoint, the fallback model — sends that one span: it is one
+    /// call.
     fn complete_until(
         &self,
         req: &Request,
         deadline: Option<Instant>,
+        call: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<Response, IntelError> {
+        let minted = call
+            .is_none()
+            .then(|| {
+                self.trace
+                    .as_ref()
+                    .map(crate::obs::trace::TraceContext::child)
+            })
+            .flatten();
+        let call = call.or(minted.as_ref());
         let before = self.deadline.replace(deadline);
-        let outcome = self.complete_chain(req);
+        let outcome = self.complete_chain(req, call);
         self.deadline.set(before);
         outcome
     }
 
-    fn complete_chain(&self, req: &Request) -> Result<Response, IntelError> {
+    fn complete_chain(
+        &self,
+        req: &Request,
+        call: Option<&crate::obs::trace::TraceContext>,
+    ) -> Result<Response, IntelError> {
         let Some(f) = &self.fallback else {
-            return self.complete_here(req);
+            return self.complete_here(req, call);
         };
-        let outcome = match self.complete_here(req) {
+        let outcome = match self.complete_here(req, call) {
             Err(e) if unavailable(&e) => {
                 let mut next = req.clone();
                 next.model = f.model.clone();
                 // The fallback is its own model, with its own controls.
                 next.reasoning = None;
                 f.client
-                    .complete_until(&next, self.deadline.get())
+                    .complete_until(&next, self.deadline.get(), call)
                     .map(|mut resp| {
                         resp.fallback.get_or_insert_with(|| f.model.clone());
                         resp
@@ -468,7 +517,11 @@ impl IntelClient {
     }
 
     /// One completion on this client's own endpoints.
-    fn complete_here(&self, req: &Request) -> Result<Response, IntelError> {
+    fn complete_here(
+        &self,
+        req: &Request,
+        call: Option<&crate::obs::trace::TraceContext>,
+    ) -> Result<Response, IntelError> {
         let owned;
         let req = match (&self.reasoning, &req.reasoning) {
             (Some(r), None) => {
@@ -490,13 +543,7 @@ impl IntelClient {
             failover::bounded(self.timeout, deadline)?;
             let sweep = {
                 let mut list = self.list.borrow_mut();
-                failover::complete_resilient(
-                    &mut list,
-                    req,
-                    self.timeout,
-                    deadline,
-                    self.trace.as_ref(),
-                )
+                failover::complete_resilient(&mut list, req, self.timeout, deadline, call)
             };
 
             // `set_intel_up` reflects the active endpoint's reachability (in rotation).

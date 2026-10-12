@@ -296,14 +296,21 @@ Fires on an inbound HTTP request.
   a string names another header.
 - `respond: ack` (default) answers `202` once the run is queued;
   `respond: sync` holds the response until the run ends.
+- An answer that started a run names it: `run_id` and `trace_id` in the
+  body, and a `traceparent` response header naming the run's span. So does
+  a duplicate of a delivery that started one. A `202`'s `run_id` is the run
+  the delivery was queued as: `concurrency.on_overflow: drop` or the
+  workflow's `inputs.schema` can still refuse it, and the `run.dropped` or
+  `run.inputs.invalid` line names it as `run`.
 - `rate` answers `429` with `Retry-After` past the burst. `parallelism`
   bounds concurrent runs; past it `on_overflow` decides: reject with `503`
   (default), `queue` or `drop`.
 - `signal: "name"` also fires that signal with the payload.
 - `into: {stream, subject}` appends the request to a durable stream instead
   of starting a run, after verification, filtering and rate limiting;
-  it answers `202 {"status":"appended"}`, or `503` when the append is
-  refused. It cannot be combined with `respond: sync`.
+  it answers `202 {"status":"appended"}`, with the event's `trace_id` and
+  its span in a `traceparent` header, or `503` when the append is refused.
+  It cannot be combined with `respond: sync`.
 - The run continues the trace the request's `traceparent` header names. An
   `into:` event starts a trace of its own, linked to it, and a `signal:`
   records it as a link on each run it wakes.

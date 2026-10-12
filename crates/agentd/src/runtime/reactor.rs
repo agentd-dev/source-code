@@ -24,6 +24,7 @@ use crate::engine::{RunState, RunStatus, Workflow};
 use crate::governor::Governor;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
+use crate::obs::otel::Kind as SpanKind;
 use crate::obs::trace::TraceContext;
 use crate::registry::Registry;
 use crate::state::{Durable, InboxEvent, Kind, now_ms};
@@ -548,6 +549,10 @@ pub struct Runtime {
     /// between requests. The unit of work the request starts continues it.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_trace: Option<TraceContext>,
+    /// The span of the request being served when its work is done within
+    /// it — a command answered at once — which is the request's SERVER span.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_span: Option<TraceContext>,
     /// Where a task transition is published so A2A subscribers see it.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_sink: Option<std::sync::Arc<crate::a2a::ports::StreamSink>>,
@@ -956,12 +961,116 @@ impl Runtime {
         self.runs.get(run_id).and_then(|r| r.trace.clone())
     }
 
-    /// The logger for a line about run `run_id` — the run, one of its steps,
-    /// a wait or a timer of its: the run's trace and span. The process trace
-    /// for a run no longer known.
+    /// The logger for a line about run `run_id` — the run, a wait or a timer
+    /// of its: the run's trace and span. The process trace for a run no
+    /// longer known.
     pub(crate) fn run_log(&self, run_id: &str) -> Logger {
         self.log
             .in_trace(self.runs.get(run_id).and_then(|r| r.trace.as_ref()))
+    }
+
+    /// The span of step `step_id`'s attempt in flight, a child of run
+    /// `run_id`'s: what every request the step sends and every worker it
+    /// spawns is under. The run's span for a step with no attempt in flight.
+    pub(crate) fn step_trace(&self, run_id: &str, step_id: &str) -> Option<TraceContext> {
+        let run = self.runs.get(run_id)?;
+        let t = run.trace.as_ref()?;
+        Some(match run.steps.get(step_id).and_then(|s| s.span.clone()) {
+            Some(span) => TraceContext {
+                span_id: span,
+                parent_span_id: Some(t.span_id.clone()),
+                ..t.clone()
+            },
+            None => t.clone(),
+        })
+    }
+
+    /// The logger for a line about step `step_id` of run `run_id`: its
+    /// attempt's span.
+    pub(crate) fn step_log(&self, run_id: &str, step_id: &str) -> Logger {
+        self.log.in_trace(self.step_trace(run_id, step_id).as_ref())
+    }
+
+    /// Export the span of step `step_id`'s attempt, now that it has ended
+    /// with `status`: once — the attempt gives its span up.
+    pub(crate) fn end_step_span(&mut self, run_id: &str, step_id: &str, kind: &str, status: &str) {
+        let trace = self.step_trace(run_id, step_id);
+        let Some(st) = self
+            .runs
+            .get_mut(run_id)
+            .and_then(|r| r.steps.get_mut(step_id))
+        else {
+            return;
+        };
+        if st.span.take().is_none() {
+            return;
+        }
+        let started = crate::obs::otel::ms_to_nanos(st.started.unwrap_or_else(now_ms));
+        crate::obs::otel::span(
+            trace.as_ref(),
+            &format!("step {step_id}"),
+            SpanKind::Internal,
+            started,
+        )
+        .attr("agentd.run", run_id)
+        .attr("agentd.step", step_id)
+        .attr("agentd.step.kind", kind)
+        .attr("agentd.step.attempt", st.attempt)
+        .attr("agentd.step.status", status)
+        .end(status == "done");
+    }
+
+    /// Export run `run_id`'s span, now that it has ended: from its start to
+    /// now, with the links its lines named, and before it the span of every
+    /// step attempt the run's end cut short. A run serving a request — an
+    /// A2A task's (a child run only shares its parent's task), a webhook
+    /// delivery's — is the SERVER span of that request; a run a stream event
+    /// started is its CONSUMER. A run an `a2a` start fired is INTERNAL: the
+    /// message it was fired for is that request's SERVER span, and the run
+    /// is under it.
+    pub(crate) fn end_run_span(&mut self, run_id: &str) {
+        let Some(run) = self.runs.get(run_id) else {
+            return;
+        };
+        let def = self.definition_for_run(run_id);
+        let open: Vec<(String, String, String)> = run
+            .steps
+            .iter()
+            .filter(|(_, s)| s.span.is_some())
+            .map(|(id, s)| {
+                let kind = def
+                    .as_ref()
+                    .and_then(|w| w.step(id).map(|d| d.kind.clone()))
+                    .unwrap_or_default();
+                let status = crate::runtime::nested::StatusLabel::as_label(&s.status);
+                (id.clone(), kind, status.to_string())
+            })
+            .collect();
+        let kind = match def.as_ref().and_then(|w| w.step(&run.start.node)) {
+            Some(s) if s.kind == "a2a" => SpanKind::Internal,
+            _ if run.task.is_some() && run.parent.is_none() => SpanKind::Server,
+            Some(s) if s.kind == "webhook" => SpanKind::Server,
+            Some(s) if matches!(s.kind.as_str(), "stream" | "correlate") => SpanKind::Consumer,
+            _ => SpanKind::Internal,
+        };
+        for (step, step_kind, status) in open {
+            self.end_step_span(run_id, &step, &step_kind, &status);
+        }
+        let Some(run) = self.runs.get(run_id) else {
+            return;
+        };
+        crate::obs::otel::span(
+            run.trace.as_ref(),
+            &format!("run {}", run.workflow),
+            kind,
+            crate::obs::otel::ms_to_nanos(run.created),
+        )
+        .attr("agentd.run", run_id)
+        .attr("agentd.workflow", &run.workflow)
+        .attr("agentd.start", &run.start.node)
+        .attr_opt("agentd.task", run.task.as_deref())
+        .attr("agentd.run.status", run.status.as_str())
+        .end(run.status == crate::engine::RunStatus::Completed);
     }
 
     /// The logger for a line about the child at `node` — a turn worker or a
@@ -979,8 +1088,8 @@ impl Runtime {
     }
 
     /// The span an internal tool call is made from: the turn worker's or
-    /// subagent's that asked, else the run's whose step it is. What the call
-    /// starts — a run, a signal, a message, a subagent — continues it.
+    /// subagent's that asked, else the attempt's of the step it is. What the
+    /// call starts — a run, a signal, a message, a subagent — continues it.
     pub(crate) fn caller_trace(&self, caller: &super::tools::ToolCaller) -> Option<TraceContext> {
         caller
             .node
@@ -993,14 +1102,18 @@ impl Runtime {
                     .and_then(|h| self.subagents.get(h))
                     .and_then(|s| s.trace.clone())
             })
-            .or_else(|| caller.run.as_deref().and_then(|r| self.run_trace(r)))
+            .or_else(|| match (caller.run.as_deref(), caller.step.as_deref()) {
+                (Some(r), Some(s)) => self.step_trace(r, s),
+                (Some(r), None) => self.run_trace(r),
+                _ => None,
+            })
     }
 
-    /// The span a deferred answer goes back to: the run's whose step waits,
-    /// or the worker's that asked.
+    /// The span a deferred answer goes back to: the attempt's of the step
+    /// that waits, or the worker's that asked.
     pub(crate) fn target_trace(&self, target: &Target) -> Option<TraceContext> {
         match target {
-            Target::Step(run, _) => self.run_trace(run),
+            Target::Step(run, step) => self.step_trace(run, step),
             Target::Child(node, _) => self.children.get(*node).and_then(|c| c.trace.clone()),
         }
     }
@@ -1087,6 +1200,18 @@ impl Runtime {
                         "signal.received",
                         json!({"inbox_event": ev.id, "name": name, "delivered": delivered}),
                     );
+                    // The signal is a span of its sender's: a run a `signal`
+                    // start fires for it is its child, a run it wakes links
+                    // to it.
+                    crate::obs::otel::span(
+                        ev.trace.as_ref(),
+                        &format!("signal {name}"),
+                        SpanKind::Internal,
+                        crate::obs::otel::ms_to_nanos(ev.ts),
+                    )
+                    .attr("agentd.signal", name.as_str())
+                    .attr("agentd.signal.delivered", delivered)
+                    .end(true);
                     self.inbox_done(&ev.id);
                 }
                 other => {
@@ -1116,7 +1241,36 @@ impl Runtime {
     /// An A2A message event, routed to whichever reader owns it. Control-plane
     /// ops are consumed first, then a waiting step, then a start node, and only
     /// what is left becomes a conversation turn.
+    ///
+    /// The message is the unit of work its request started, and its span
+    /// ends as it is routed: the SERVER span of that request — or, for a
+    /// message the runtime delivered itself (the prompt, a `message` step),
+    /// a span of the instance's. What it was routed to goes on under it — a
+    /// turn's worker, a run an `a2a` start fired — or names it as a link: a
+    /// run it woke, a child's report.
     fn on_a2a_message_event(&mut self, ev: &InboxEvent) {
+        let routed = self.route_a2a_message(ev);
+        let served = ev.payload["task"].is_string();
+        let (name, kind) = if served {
+            ("SendMessage", SpanKind::Server)
+        } else {
+            ("message", SpanKind::Internal)
+        };
+        crate::obs::otel::span(
+            ev.trace.as_ref(),
+            name,
+            kind,
+            crate::obs::otel::ms_to_nanos(ev.ts),
+        )
+        .attr_opt("a2a.task.id", ev.payload["task"].as_str())
+        .attr_opt("agentd.conversation", ev.payload["context_id"].as_str())
+        .attr("agentd.message.routed", routed)
+        .end(true);
+    }
+
+    /// Route an A2A message event (see [`Self::on_a2a_message_event`]) and say
+    /// where it went.
+    fn route_a2a_message(&mut self, ev: &InboxEvent) -> &'static str {
         let ctx = ev.payload["context_id"]
             .as_str()
             .unwrap_or("default")
@@ -1146,7 +1300,7 @@ impl Runtime {
         // traffic must not reach a model.
         #[cfg(feature = "a2a")]
         if self.handle_instance_op(ev) {
-            return;
+            return "instance";
         }
         // An inbound message has three possible readers, in this order. Only one
         // takes it: a message that woke a waiting step is an ANSWER, and a
@@ -1164,12 +1318,12 @@ impl Runtime {
                 "a2a.message.delivered",
                 json!({"inbox_event": ev.id, "conversation": ctx, "runs": woken}),
             );
-            return;
+            return "wait";
         }
         // 2. An `a2a` START node whose command and roles match — a peer or an
         //    operator asking for a workflow rather than a conversation.
         if self.fire_a2a_start(ev, &ctx) {
-            return;
+            return "start";
         }
         // 3. Otherwise it is what it looks like: something to answer.
         let skills = self.skills.references(&text);
@@ -1187,6 +1341,7 @@ impl Runtime {
             .owner_checked(owner_checked)
             .in_trace(ev.trace.clone()),
         );
+        "turn"
     }
 
     /// Without the `a2a` feature there is no listener to deliver a message, so a
@@ -1265,6 +1420,7 @@ impl Runtime {
                 // continue, and links to the message's.
                 let event_trace = TraceContext::mint();
                 let links: Vec<String> = ev.trace.iter().map(TraceContext::traceparent).collect();
+                let appended = crate::obs::otel::now_unix_nanos();
                 match self.append_event(
                     stream,
                     subject,
@@ -1274,12 +1430,15 @@ impl Runtime {
                     &workflow,
                     Some(&event_trace),
                 ) {
-                    Ok(seq) => self.log.in_trace(Some(&event_trace)).info(
-                        "start.a2a.into",
-                        json!({"workflow": workflow, "node": node, "conversation": ctx,
-                               "stream": stream, "subject": subject, "seq": seq,
-                               "links": links}),
-                    ),
+                    Ok(seq) => {
+                        self.log.in_trace(Some(&event_trace)).info(
+                            "start.a2a.into",
+                            json!({"workflow": workflow, "node": node, "conversation": ctx,
+                                   "stream": stream, "subject": subject, "seq": seq,
+                                   "links": links}),
+                        );
+                        crate::runtime::streams::append_span(&event_trace, stream, seq, appended);
+                    }
                     Err(e) => self.log.warn(
                         "start.a2a.into.refused",
                         json!({"workflow": workflow, "node": node, "stream": stream,
@@ -1295,7 +1454,7 @@ impl Runtime {
                        "command": op, "role": role}),
             );
             // The run is the message's unit of work, and continues its trace.
-            self.fire_start_run(
+            let _ = self.fire_start_run(
                 &workflow,
                 &node,
                 &spec,
@@ -1765,6 +1924,17 @@ impl Runtime {
         self.children.abandon();
         let _ = self.durable.flush(true);
         self.log.info("proc.exit", json!({"code": code, "uptime_ms": self.started.elapsed().as_millis() as u64, "turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out}));
+        // The process's own span — the parent of a job's work and of what
+        // belongs to no unit — ends with it, and what is still queued goes
+        // out before the process does.
+        let started =
+            crate::obs::otel::now_unix_nanos().saturating_sub(self.started.elapsed().as_nanos());
+        crate::obs::otel::span(Some(&self.trace), "agentd", SpanKind::Internal, started)
+            .attr("agentd.instance", &self.instance)
+            .attr("agentd.run_id", &self.run_id)
+            .attr("agentd.exit_code", i64::from(code))
+            .end(code == crate::exit::SUCCESS);
+        crate::obs::otel::shutdown(&self.log);
     }
 
     /// The job's result (the once-started run's output), for stdout.
@@ -1856,6 +2026,7 @@ impl Runtime {
         let mut doc = self.status_facts();
         let full = json!({
             "run_id": self.run_id,
+            "trace_id": self.trace.trace_id,
             "job_shape": self.job_shape,
             "store": {"kind": self.durable.store_kind(), "degraded": self.durable.is_degraded(), "generation": self.durable.manifest().generation},
             "workflows": self.workflows.values().map(|w| json!({"name": w.name, "hash": w.hash, "armed": w.armed, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),

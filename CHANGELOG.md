@@ -172,7 +172,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `a2a.delegate`'s card read, send and polls, an `a2a.send`, an `emit`
   forwarded to a peer and a message to an instance child. They carried
   none, so an agentd peer started a trace of its own. The hop is a span of
-  the run's, logged as the `span_id` of its `a2a.delegate` or `a2a.send`
+  the step's, logged as the `span_id` of its `a2a.delegate` or `a2a.send`
   line, and the peer's task and run are its children. An A2A push
   notification carries a span of the task's. A reply that wakes an
   `a2a.wait` or a `wait {on: message}` leaves the run in its trace and names
@@ -199,9 +199,52 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   run's trace and names the event's span as `link` on `wait.resolved`. An
   `emit` forwarded to a webhook sends `traceparent` and `tracestate`
   headers; an instance child's mirrored event keeps its producer's trace.
-- The `http` step sends the step's span as `traceparent` and `tracestate`,
-  unless its `headers` set either, when it sends only what they set. It sent
-  none.
+- The `http` step sends a span of the step's as `traceparent` and
+  `tracestate`, unless its `headers` set either, when it sends only what
+  they set. It sent none.
+- The exported spans are one tree. A turn exported its `invoke_agent` span
+  as a root, under no step or turn, with a `chat` and an `execute_tool` span
+  whose ids no request carried, so the span a model provider or an MCP
+  server recorded as its parent was never exported, and the supervisor
+  exported nothing: no run, step, request served or sent. The supervisor
+  now exports a span per workflow run, per step attempt, per A2A message and
+  per signal, a SERVER span per request it serves under a caller's span, a
+  CLIENT span per request it sends (MCP, model, A2A, `http` step, push,
+  forward) and a PRODUCER span per event it emits or appends, and the
+  process's span when it exits. A worker's `invoke_agent` is the span its
+  spawn payload names as its child — under the step's span, or the
+  message's — and its `chat` and `execute_tool` spans are the ones their
+  requests sent. A decide turn exports its spans too, and a command the
+  `exec` tool runs is the span its `TRACEPARENT` names. A run an `a2a`
+  start fires is INTERNAL, under the SERVER span of the message it was
+  fired for. A line's `link` and `links` are the links of the span it is
+  in, at any log level, so a `batch` run's span links its members'; a line
+  about a span that has already ended — the answer to a gate a conversation
+  turn raised, a child's report after its step — puts them on a span of its
+  own, named for the line, under it. A push's and a stream forward's span
+  names where the request went (`url.scheme`, `server.address`,
+  `server.port`), not its URL, which can be a credential. An unsampled
+  trace exports nothing. The supervisor's spans leave from a background
+  thread, never the loop, and an exit waits at most 3 s on what is left:
+  past that, or once a batch fails, the rest is dropped.
+- An OTLP log record names its span: `traceId` and `spanId` are the line's.
+  They were unset, so a backend could not join a record to its trace.
+- An event on the `_runtime` stream names the span its line was in as its
+  `traceparent`, so a workflow consuming `_runtime` continues the trace of
+  what it watches. It started an unrelated trace.
+- A webhook's answer names the run the delivery started: `run_id` and
+  `trace_id` in the body of a `202`, of a `respond: sync` answer and of a
+  `duplicate`, and a `traceparent` response header naming the run's span.
+  An `into:` append's answer names the event's trace. The sender could not
+  tell which run its delivery became. The `202` names the run the delivery
+  was queued as, which `concurrency.on_overflow: drop` or the workflow's
+  `inputs.schema` can still refuse: the `run.dropped` or
+  `run.inputs.invalid` line that says so names it as `run`, in its trace.
+- The outputs that describe work name its trace: an A2A task's annotations
+  (`traceId`, `spanId`), the run summaries of `status`, `run.get` and
+  `workflow.status`, the event feed's `run`, `step`, `activity` and `audit`
+  events (`trace_id`), and the operator's `status`, the process's
+  (`trace_id`).
 
 **Changed.**
 
@@ -229,6 +272,34 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `PeerAuth` has `trace`, `A2aBridge::call` and `A2aRequest` carry the
   request's, `RequestScope::in_trace` sets it, and `obs::trace` has
   `inbound`, `TraceContext::headers` and `TraceContext::from_members`.
+- A step attempt is a span of its own under the run's, kept on the step's
+  record. Its `step.start`, `step.done`, `step.retry`, `wait.resolved` and
+  `signal.delivered` lines are in it, and what the step sends — an MCP
+  request, an `http` request, an A2A request, an `emit`, a child run, a turn
+  worker — is under it, where it was under the run's span.
+- A model call sends one span for the whole completion: its retries, a
+  failover to another endpoint and its fallback model send the span its
+  `chat` records. Each POST sent a span of its own.
+- What an MCP connection asks for itself — its handshake, the lists that
+  keep the catalogue, subscriptions and MCP Events requests — names the
+  span of the process that asks: the supervisor's, or a turn worker's or
+  subagent's `invoke_agent`. Each named a span of its own under it, which
+  nothing exported.
+- A `wait {on: webhook}` callback's `webhook.callback` line is in a span of
+  the callback's own, under the caller's when it sent a `traceparent`, and
+  that span is the callback's exported SERVER span. A route's
+  `webhook.signal` line is in the span of the run or event the delivery
+  became. Both were in the process's span.
+- `agentd-core`: `obs::otel` exports spans built with `span` (a `Span` of a
+  `Kind`, with attributes, a request's `destination` and links), records a
+  turn's with `run_begin` (which takes the turn's span), `chat_span`,
+  `tool_span` and `mcp_span`, notes a line's links with `capture_links`,
+  and exports with `flush`, `arm_traces` and `shutdown`, an exit's within
+  `LAST_EXPORT`; `obs::trace::turn`
+  is a turn's span in a worker; `IntelClient::complete_in` sends a call as a
+  given span and `complete_recorded` records it; `mcp::stamp_trace` returns
+  the span it stamped; `LogCtx` has `trace_flags` and `trace()`;
+  `obs::log::tap_direct` and `TappedEvent` carry the span a record is in.
 
 **Removed.**
 

@@ -91,6 +91,10 @@ pub struct LogCtx {
     /// The span the line is about, and its parent.
     pub span_id: Option<String>,
     pub parent_span_id: Option<String>,
+    /// The trace's flags (`01` sampled, `00` not). Not written on the line:
+    /// it is what a carrier built from the line goes on with — the `_runtime`
+    /// stream's event — so an unsampled trace stays unsampled.
+    pub trace_flags: Option<String>,
 }
 
 impl LogCtx {
@@ -99,6 +103,18 @@ impl LogCtx {
         self.trace_id = Some(t.trace_id.clone());
         self.span_id = Some(t.span_id.clone());
         self.parent_span_id = t.parent_span_id.clone();
+        self.trace_flags = Some(t.flags.clone());
+    }
+
+    /// The span the line is in, when it is in one.
+    pub fn trace(&self) -> Option<crate::obs::trace::TraceContext> {
+        Some(crate::obs::trace::TraceContext {
+            trace_id: self.trace_id.clone()?,
+            span_id: self.span_id.clone()?,
+            parent_span_id: self.parent_span_id.clone(),
+            flags: self.trace_flags.clone().unwrap_or_else(|| "01".into()),
+            tracestate: None,
+        })
     }
 }
 
@@ -310,11 +326,13 @@ pub const EVENT_FAMILIES: &[&str] = &[
 ];
 
 /// One event awaiting its append: which stream, the subject (the event name),
-/// and the fields.
+/// the fields, and the span the line was in — the event's `traceparent`, so a
+/// run that consumes it continues the trace of what it reports on.
 pub struct TappedEvent {
     pub stream: String,
     pub subject: String,
     pub data: Value,
+    pub trace: Option<crate::obs::trace::TraceContext>,
 }
 
 /// How often a `sampled` family actually contributes.
@@ -365,18 +383,30 @@ pub fn runtime_tap_armed() -> bool {
 
 /// Queue one event for a stream directly, bypassing family selection. The
 /// audit sink uses this: audit records are chosen by `audit.sink`, not by the
-/// runtime-event family list, and they go to their own stream.
-pub fn tap_direct(stream: &str, subject: &str, data: Value) {
+/// runtime-event family list, and they go to their own stream. `trace` is the
+/// span the record is in.
+pub fn tap_direct(
+    stream: &str,
+    subject: &str,
+    data: Value,
+    trace: Option<crate::obs::trace::TraceContext>,
+) {
     if !runtime_tap_armed() {
         return;
     }
     let mut g = RUNTIME_TAP.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(t) = g.as_mut() {
-        push_bounded(t, stream.to_string(), subject.to_string(), data);
+        push_bounded(t, stream.to_string(), subject.to_string(), data, trace);
     }
 }
 
-fn push_bounded(t: &mut RuntimeTap, stream: String, subject: String, data: Value) {
+fn push_bounded(
+    t: &mut RuntimeTap,
+    stream: String,
+    subject: String,
+    data: Value,
+    trace: Option<crate::obs::trace::TraceContext>,
+) {
     if t.queue.len() >= t.cap {
         // Drop the NEW one and keep the oldest: under a storm the first
         // refusals say what started it, and the count says how bad it got.
@@ -387,6 +417,7 @@ fn push_bounded(t: &mut RuntimeTap, stream: String, subject: String, data: Value
         stream,
         subject,
         data,
+        trace,
     });
 }
 
@@ -411,7 +442,8 @@ impl Drop for TapDrainGuard {
 }
 
 /// The capture hot path, called from [`Logger::event`] for every emission.
-fn capture_to_tap(event: &str, line: &Value) {
+/// `ctx` is the logger's: the span the line is in.
+fn capture_to_tap(event: &str, line: &Value, ctx: &LogCtx) {
     if !runtime_tap_armed() || TAP_DRAINING.load(Ordering::Relaxed) != 0 {
         return;
     }
@@ -433,7 +465,7 @@ fn capture_to_tap(event: &str, line: &Value) {
     // Metadata, not payloads: the emitted line already excludes conversation
     // content unless `log_content` is on, and this carries it as-is so a
     // consumer reads the same fields an operator would see in the log.
-    push_bounded(t, stream, event.to_string(), line.clone());
+    push_bounded(t, stream, event.to_string(), line.clone(), ctx.trace());
 }
 
 /// Take everything queued since the last drain, plus how many were dropped.
@@ -574,8 +606,13 @@ impl Logger {
 
     /// Emit one event. `fields` should be a JSON object; its keys are merged
     /// after the canonical fields (event-specific data). Non-object `fields`
-    /// is ignored. Below `min` level: dropped cheaply.
+    /// is ignored. Below `min` level: dropped cheaply, but for the span links
+    /// it names.
     pub fn event(&self, level: Level, event: &str, fields: Value) {
+        // The spans the line names as `link` or `links` are links of the
+        // span it is in, written or not: what a span links to does not
+        // depend on the log level. A no-op unless spans are exported.
+        crate::obs::otel::capture_links(event, &self.ctx, &fields);
         if level < self.min {
             return;
         }
@@ -616,7 +653,7 @@ impl Logger {
         capture_to_ring(level.as_str(), event, &value);
         // Project the line onto the runtime-events stream when one is armed and
         // this family was selected. A single relaxed atomic load otherwise.
-        capture_to_tap(event, &value);
+        capture_to_tap(event, &value, &self.ctx);
         // Mirror to the OTLP logs exporter — a no-op (one atomic load) unless
         // `otel.logs` armed it. Best-effort, never blocks the write.
         crate::obs::otel::capture_log(
@@ -762,6 +799,7 @@ mod tests {
                 trace_id: None,
                 span_id: None,
                 parent_span_id: None,
+                trace_flags: None,
             },
             Level::Trace,
         );

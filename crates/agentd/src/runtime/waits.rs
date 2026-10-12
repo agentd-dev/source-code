@@ -19,6 +19,7 @@ use crate::context::ROOT;
 use crate::engine::model::Step;
 use crate::engine::run::StepStatus;
 use crate::engine::template::Data;
+use crate::obs::trace::TraceContext;
 use crate::state::{Kind, now_ms};
 use serde_json::{Map, Value, json};
 #[cfg(feature = "a2a")]
@@ -195,7 +196,7 @@ impl Runtime {
                 // A workflow's own step signals as the runtime: the operator
                 // wrote it, whoever the run happens to be working for.
                 let carries = self.run_carries(run_id);
-                let trace = self.run_trace(run_id);
+                let trace = self.step_trace(run_id, step_id);
                 let delivered = self.deliver_signal(
                     &name,
                     payload,
@@ -805,8 +806,8 @@ impl Runtime {
         }
         for (rid, sid, event) in resolved {
             // The run keeps its trace; the span the event was produced in is
-            // its link.
-            self.run_log(&rid).info(
+            // a link of the waiting step's.
+            self.step_log(&rid, &sid).info(
                 "wait.resolved",
                 json!({"run": rid, "step": sid, "kind": "event",
                        "stream": event.get("stream"), "subject": event.get("subject"),
@@ -929,7 +930,7 @@ impl Runtime {
             }
         }
         for (rid, sid, status, out, err) in resolve {
-            self.run_log(&rid).info(
+            self.step_log(&rid, &sid).info(
                 "wait.resolved",
                 json!({"run": rid, "step": sid, "status": status}),
             );
@@ -1193,7 +1194,7 @@ impl Runtime {
         };
         let mut woken = Vec::with_capacity(hits.len());
         for (rid, sid) in hits {
-            self.run_log(&rid).info(
+            self.step_log(&rid, &sid).info(
                 "wait.resolved",
                 json!({"run": rid, "step": sid, "kind": "message",
                        "conversation": conversation,
@@ -1280,7 +1281,7 @@ impl Runtime {
         for (rid, sid) in hits {
             delivered += 1;
             if let Some(t) = trace {
-                self.run_log(&rid).info(
+                self.step_log(&rid, &sid).info(
                     "signal.delivered",
                     json!({"run": rid, "step": sid, "signal": name, "link": t.traceparent()}),
                 );
@@ -1415,8 +1416,8 @@ impl Runtime {
             payload["parts"] = p;
         }
         let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
-        // The turn it starts continues the run's trace.
-        let trace = self.run_trace(run_id);
+        // The turn it starts continues the run's trace, under the step's span.
+        let trace = self.step_trace(run_id, step_id);
         if let Err(e) = self.accept_event(
             crate::runtime::events::kinds::A2A_MESSAGE,
             principal,
@@ -1547,8 +1548,8 @@ impl Runtime {
         };
         let cascade = spec.get("cascade").and_then(Value::as_bool).unwrap_or(true);
         let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0), "carries": self.run_carries(run_id)});
-        // The child run continues the parent's trace.
-        let trace = self.run_trace(run_id);
+        // The child run continues the parent's trace, under the step's span.
+        let trace = self.step_trace(run_id, step_id);
         match self.accept_event(
             kinds::WORKFLOW_RUN,
             self.runs.get(run_id).and_then(|r| r.principal.clone()),
@@ -1649,15 +1650,37 @@ impl Runtime {
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
-        // A request of the run's, a span of its own under it; a list mints
-        // one for each page it asks for.
-        let trace = self.run_trace(run_id);
-        let meta = trace.as_ref().map(|t| Value::Object(t.child().meta()));
-        let pages: Option<::mcp::http::RequestMeta> = trace
-            .map(|t| std::sync::Arc::new(move || t.child().meta()) as ::mcp::http::RequestMeta);
+        // A request of the step's, a span of its own under it; a list mints
+        // one for each page it asks for. Each is exported as the CLIENT span
+        // of its request.
+        let trace = self.step_trace(run_id, step_id);
+        let call = trace.as_ref().map(TraceContext::child);
+        let meta = call.as_ref().map(|t| Value::Object(t.meta()));
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<(TraceContext, u128)>>> =
+            std::sync::Arc::default();
+        let pages: Option<::mcp::http::RequestMeta> = trace.map(|t| {
+            let sent = std::sync::Arc::clone(&sent);
+            std::sync::Arc::new(move || {
+                let page = t.child();
+                let meta = page.meta();
+                if let Ok(mut s) = sent.lock() {
+                    s.push((page, crate::obs::otel::now_unix_nanos()));
+                }
+                meta
+            }) as ::mcp::http::RequestMeta
+        });
         std::thread::Builder::new()
             .name(format!("mcp.resource:{server}"))
             .spawn(move || {
+                // What the CLIENT span of each request names.
+                let (method, target) = match op.as_str() {
+                    "read" => ("resources/read", uri.clone()),
+                    "prompt" => ("prompts/get", name.clone()),
+                    "complete" => ("completion/complete", server.clone()),
+                    "list" => ("resources/list", server.clone()),
+                    _ => ("resources/templates/list", server.clone()),
+                };
+                let start = crate::obs::otel::now_unix_nanos();
                 let res: Result<Value, String> = match op.as_str() {
                     "read" => client.read_resource(&uri, meta.as_ref()).map(|r| {
                         let t = r.text();
@@ -1673,6 +1696,21 @@ impl Runtime {
                     Ok(v) => (v, false, None),
                     Err(e) => (Value::Null, true, Some(e)),
                 };
+                // The CLIENT span of each request the step sent: one, or
+                // one per page of a list, each until the next page was asked.
+                let paged = std::mem::take(&mut *sent.lock().unwrap_or_else(|e| e.into_inner()));
+                if paged.is_empty() {
+                    crate::obs::otel::mcp_span(call.as_ref(), method, &target, &server, !is_error, start);
+                } else {
+                    let ends: Vec<u128> = paged.iter().skip(1).map(|(_, at)| *at).collect();
+                    for (i, (page, at)) in paged.iter().enumerate() {
+                        let last = i + 1 == paged.len();
+                        crate::obs::otel::span(Some(page), &format!("{method} {target}"), crate::obs::otel::Kind::Client, *at)
+                            .attr("mcp.method.name", method)
+                            .attr("agentd.mcp.server", server.as_str())
+                            .end_at(ends.get(i).copied().unwrap_or_else(crate::obs::otel::now_unix_nanos), !last || !is_error);
+                    }
+                }
                 let _ = tx.send(super::events::Event::StepDone { run: r, step: s, output, is_error, error, tokens: 0 });
             })
             .ok();
@@ -1875,9 +1913,10 @@ impl Runtime {
         let (r, st) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
-        // The hop is a span of the run's, named on every request it makes and
-        // on its line: the peer's work is a child of it.
-        let hop = self.run_trace(run_id).map(|t| t.child());
+        // The hop is a span of the step's, named on every request it makes,
+        // on its line and as the CLIENT span it exports: the peer's work is a
+        // child of it.
+        let hop = self.step_trace(run_id, step_id).map(|t| t.child());
         auth.trace = hop.clone();
         self.log.in_trace(hop.as_ref()).info(
             "a2a.send",
@@ -1886,6 +1925,7 @@ impl Runtime {
         std::thread::Builder::new()
             .name(format!("a2a.send:{peer_name}"))
             .spawn(move || {
+                let start = crate::obs::otel::now_unix_nanos();
                 let deadline = std::time::Instant::now() + timeout;
                 let (output, is_error, error) = match crate::mcp::a2a_client::send(
                     &endpoint,
@@ -1898,6 +1938,16 @@ impl Runtime {
                     Ok(v) => (v, false, None),
                     Err(e) => (Value::Null, true, Some(e)),
                 };
+                crate::obs::otel::span(
+                    hop.as_ref(),
+                    &format!("a2a.send {peer_name}"),
+                    crate::obs::otel::Kind::Client,
+                    start,
+                )
+                .attr("rpc.system", "jsonrpc")
+                .attr("rpc.method", "SendMessage")
+                .attr("agentd.a2a.peer", peer_name.as_str())
+                .end(!is_error);
                 let _ = tx.send(super::events::Event::StepDone {
                     run: r,
                     step: st,
@@ -1976,8 +2026,9 @@ impl Runtime {
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
         // One span for the whole delegation — card, send, polls — under the
-        // run's, logged here: the peer's task is a child of it.
-        let hop = self.run_trace(run_id).map(|t| t.child());
+        // step's, logged here and exported as its CLIENT span: the peer's
+        // task is a child of it.
+        let hop = self.step_trace(run_id, step_id).map(|t| t.child());
         auth.trace = hop.clone();
         self.log.in_trace(hop.as_ref()).info(
             "a2a.delegate",
@@ -1986,6 +2037,7 @@ impl Runtime {
         std::thread::Builder::new()
             .name(format!("a2a.delegate:{peer_name}"))
             .spawn(move || {
+                let start = crate::obs::otel::now_unix_nanos();
                 let deadline = std::time::Instant::now() + timeout;
                 let (output, is_error, error) = match crate::mcp::a2a_client::delegate(
                     &endpoint,
@@ -2005,6 +2057,15 @@ impl Runtime {
                         (Value::Null, true, Some(e))
                     }
                 };
+                crate::obs::otel::span(
+                    hop.as_ref(),
+                    &format!("a2a.delegate {peer_name}"),
+                    crate::obs::otel::Kind::Client,
+                    start,
+                )
+                .attr("rpc.system", "jsonrpc")
+                .attr("agentd.a2a.peer", peer_name.as_str())
+                .end(!is_error);
                 let _ = tx.send(super::events::Event::StepDone {
                     run: r,
                     step: s,

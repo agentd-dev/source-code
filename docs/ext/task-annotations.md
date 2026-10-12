@@ -52,7 +52,9 @@ it.
         {"state": "TASK_STATE_WORKING", "ts": "2026-09-29T10:15:02.130Z"}
       ],
       "principal": "user:alice",
-      "command": "workflow.run"
+      "command": "workflow.run",
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "5e3cf0a1d2b4c697"
     }
   }
 }
@@ -67,6 +69,8 @@ it.
 | `askSchema` | no | the JSON Schema of the answer an `INPUT_REQUIRED` gate asks for, so a client can render a control rather than a text box |
 | `askChannel` | no | where an `INPUT_REQUIRED` gate is also announced: the `channel` of the instruction document's `::!human` it is addressed to. A place a bridge routes the question to; it never decides who may answer |
 | `command` | no | the [command](command.md) op that started the task |
+| `traceId` | no | the W3C trace id the task's work is in, 32 lowercase hex digits |
+| `spanId` | no | the W3C span id the task's work is done in, 16 lowercase hex digits: the span the answer's `traceparent` header names |
 
 The object is closed: the bundle refuses a member it does not name, so a fact
 added to the wire without the schema fails agentd's own tests.

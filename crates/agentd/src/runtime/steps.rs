@@ -772,9 +772,12 @@ impl Runtime {
                     return false;
                 }
                 crate::engine::model::OnOverflow::Drop => {
-                    self.log.warn(
+                    // In the trace the run would have had, naming the id an
+                    // answer may already have given it (a webhook's `202`).
+                    self.log.in_trace(ev.trace.as_ref()).warn(
                         "run.dropped",
-                        json!({"workflow": name, "reason": "concurrency"}),
+                        json!({"workflow": name, "run": ev.payload["run_id"].as_str(),
+                               "reason": "concurrency"}),
                     );
                     return true;
                 }
@@ -796,8 +799,10 @@ impl Runtime {
         if let Some(schema) = &w.inputs_schema
             && let Err(e) = crate::jsonschema::validate(schema, &inputs)
         {
-            self.log
-                .warn("run.inputs.invalid", json!({"workflow": name, "errors": e}));
+            self.log.in_trace(ev.trace.as_ref()).warn(
+                "run.inputs.invalid",
+                json!({"workflow": name, "run": ev.payload["run_id"].as_str(), "errors": e}),
+            );
             return true;
         }
         // A2A pre-generates the run id so its task can link before the run starts.
@@ -1428,7 +1433,7 @@ impl Runtime {
         if !crate::engine::model::pure_data_kind(&step.kind) {
             self.checkpoint(false);
         }
-        self.run_log(run_id).info(
+        self.step_log(run_id, step_id).info(
             "step.start",
             json!({"run": run_id, "step": step_id, "kind": step.kind, "attempt": attempt}),
         );
@@ -1442,7 +1447,8 @@ impl Runtime {
             "step",
             crate::runtime::a2a_server::FeedVis::Operator,
             json!({"run": run_id, "step": step_id, "kind": step.kind,
-                   "phase": "start", "attempt": attempt}),
+                   "phase": "start", "attempt": attempt,
+                   "trace_id": self.run_trace(run_id).map(|t| t.trace_id)}),
         );
         let mut data = match &scope {
             Some(sc) => self.scoped_data(run_id, sc),
@@ -1722,9 +1728,10 @@ impl Runtime {
                         .unwrap_or_default();
                     // What this run carries goes on the event, for whatever
                     // consumes it — and so does the span it was emitted in, a
-                    // child of the run's: a `stream` start's run continues it.
+                    // child of the step's: a `stream` start's run continues it.
                     let carries = self.run_carries(run_id);
-                    let emitted = self.run_trace(run_id).map(|t| t.child());
+                    let emitted = self.step_trace(run_id, step_id).map(|t| t.child());
+                    let emit_start = crate::obs::otel::now_unix_nanos();
                     match self
                         .append_carrying(
                             &stream,
@@ -1744,6 +1751,18 @@ impl Runtime {
                                 json!({"run": run_id, "step": step_id, "stream": stream,
                                        "subject": subject, "seq": seq}),
                             );
+                            // The emit is the event's PRODUCER span: the run a
+                            // consumer starts for it is its child.
+                            crate::obs::otel::span(
+                                emitted.as_ref(),
+                                &format!("emit {stream}"),
+                                crate::obs::otel::Kind::Producer,
+                                emit_start,
+                            )
+                            .attr("messaging.operation.type", "send")
+                            .attr("messaging.destination.name", &stream)
+                            .attr("agentd.stream.seq", seq)
+                            .end(true);
                             // `forward: {webhook: URL}` — push the event out as
                             // it appends (RFC 0035 §5). The DURABLE COPY is the
                             // source of truth and the push is only the
@@ -1978,9 +1997,10 @@ impl Runtime {
                     .map(str::to_string)
                     .unwrap_or_else(|| crate::engine::run::idempotency_key(run_id, step_id));
                 let mut meta = json!({"agent/idempotency_key": key, "agent/attempt": attempt, "agent/instance": self.instance, "agent/run": run_id});
-                // A span of the run's: a retry or a replay is another span in
-                // the same trace, the idempotency key unchanged.
-                crate::mcp::stamp_trace(&mut meta, self.run_trace(run_id).as_ref());
+                // A span of the step's: a retry or a replay is another span
+                // in the same trace, the idempotency key unchanged.
+                let call =
+                    crate::mcp::stamp_trace(&mut meta, self.step_trace(run_id, step_id).as_ref());
                 let timeout = step
                     .timeout_ms
                     .map(std::time::Duration::from_millis)
@@ -1998,6 +2018,7 @@ impl Runtime {
                 std::thread::Builder::new()
                     .name(format!("step:{server}.{tool}"))
                     .spawn(move || {
+                        let start = crate::obs::otel::now_unix_nanos();
                         let (output, is_error, error) = match client.call_tool_with_meta_within(
                             &tool,
                             Some(args),
@@ -2014,6 +2035,14 @@ impl Runtime {
                             }
                             Err(e) => (Value::Null, true, Some(format!("transport error: {e}"))),
                         };
+                        crate::obs::otel::mcp_span(
+                            call.as_ref(),
+                            "tools/call",
+                            &tool,
+                            &server,
+                            !is_error,
+                            start,
+                        );
                         let _ = tx.send(super::events::Event::StepDone {
                             run: r,
                             step: s,
@@ -2459,7 +2488,7 @@ impl Runtime {
                         c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>
                     })
                 };
-                let trace = self.run_trace(run_id);
+                let trace = self.step_trace(run_id, step_id);
                 self.skills
                     .load(name, None, &resolver, trace.as_ref())
                     .ok()
@@ -2637,10 +2666,10 @@ impl Runtime {
             decision: work.decision,
             sure: work.sure,
         };
-        // The step's span, under the run's: the worker it spawns is a span of
-        // its own beneath it, and a replay after a crash is another, in the
-        // same trace.
-        let step_trace = self.run_trace(run_id).map(|t| t.child());
+        // The span of the step's attempt, under the run's: the worker it
+        // spawns is a span of its own beneath it — its `invoke_agent` — and a
+        // replay after a crash is another attempt, in the same trace.
+        let step_trace = self.step_trace(run_id, step_id);
         let launch = super::turns::TurnLaunch {
             spec,
             kind: ChildKind::StepTurn {
@@ -2970,7 +2999,16 @@ impl Runtime {
             .and_then(|r| r.step(step_id))
             .map(|s| s.attempt)
             .unwrap_or(1);
-        self.run_log(run_id).info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        // The attempt is over: its lines are in its span, which is exported
+        // now — a retry is an attempt of its own.
+        let slog = self.step_log(run_id, step_id);
+        slog.info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        self.end_step_span(
+            run_id,
+            step_id,
+            &step.kind,
+            crate::runtime::nested::StatusLabel::as_label(&status),
+        );
         // Feed the circuit breaker, when this step keeps one. Every ATTEMPT
         // counts (a breaker measures calls, not runs) — except our own
         // fast-fails: refusing to dial is not evidence about the remote.
@@ -3025,6 +3063,7 @@ impl Runtime {
             crate::runtime::a2a_server::FeedVis::Operator,
             json!({"run": run_id, "step": step_id, "phase": "done",
                    "status": crate::runtime::nested::StatusLabel::as_label(&status), "attempt": attempt, "tokens": tokens,
+                   "trace_id": self.run_trace(run_id).map(|t| t.trace_id),
                    // Same 2 KiB cap the run drill-down applies: a step output can
                    // be an entire document, and a feed is not the place for it.
                    "err": error.as_deref().map(|e| {
@@ -3057,7 +3096,7 @@ impl Runtime {
                     let spread = (base / 5).max(1);
                     base.saturating_sub(spread) + (h % (spread * 2 + 1))
                 };
-                self.run_log(run_id).info("step.retry", json!({"run": run_id, "step": step_id, "attempt": attempt, "backoff_ms": backoff}));
+                slog.info("step.retry", json!({"run": run_id, "step": step_id, "attempt": attempt, "backoff_ms": backoff}));
                 if backoff == 0 {
                     if let Some(st) = self
                         .runs
@@ -3348,6 +3387,7 @@ impl Runtime {
         self.counters.runs_finished += 1;
         crate::obs::metrics::record_run(status.as_str());
         self.run_log(run_id).info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
+        self.end_run_span(run_id);
         self.governor.drop_scope(&format!("run:{run_id}"));
         // What the table says the run carries now goes on its record before
         // the sweep below can release the definition it ran under: the

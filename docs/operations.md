@@ -224,13 +224,21 @@ curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'conten
 ```
 
 `status` answers with the instance view: `instance`, `version`, `run_id`,
-`uptime_ms`, `draining`, `paused`, `job_shape`, the `store` (kind, degraded,
-generation), the armed `workflows`, live `runs`, `conversations`,
-`subagents`, OS `children`, `timers`, `inbox_pending`,
-`conversation_bindings`, the token `budget`, the `tools` count, `skills`,
-lifetime `counters`, the `instruction` (source, version, size; never the
-text), the active `model`, operator-published `values`, and recent
-`activity`. Each principal sees the parts it may.
+`trace_id` (the process's trace), `uptime_ms`, `draining`, `paused`,
+`job_shape`, the `store` (kind, degraded, generation), the armed
+`workflows`, live `runs`, `conversations`, `subagents`, OS `children`,
+`timers`, `inbox_pending`, `conversation_bindings`, the token `budget`, the
+`tools` count, `skills`, lifetime `counters`, the `instruction` (source,
+version, size; never the text), the active `model`, operator-published
+`values`, and recent `activity`. Each principal sees the parts it may.
+
+Every run in `status`, `run.get` and `workflow.status`, and every working
+unit in `activity`, names the trace its work is in as `trace_id`, so you can
+go from a run to its trace in your collector, or grep its log lines:
+
+```bash
+jq -c 'select(.trace_id == "f281fdc06f4dd1374e53be619f96e1fe")' agentd.log
+```
 
 | Read | Request | Who may |
 |---|---|---|

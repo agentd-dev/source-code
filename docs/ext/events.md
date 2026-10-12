@@ -94,21 +94,21 @@ admits the subscriber.
 |---|---|---|
 | `task` | its owner and operators | a task changed: the A2A `Task`, its `history` cut to the newest few messages |
 | `task.removed` | its owner and operators | a task left the task store (retention); `{id}` only |
-| `run` | its owner and operators | a workflow run's summary: status, per-step states, tokens, output, error |
+| `run` | its owner and operators | a workflow run's summary: status, per-step states, tokens, output, error, and the `trace_id` its work is in |
 | `run.removed` | its owner and operators | a run left the status view; `{id}` only |
-| `step` | operators | a step started (`phase: start`) or finished (`phase: done`) |
+| `step` | operators | a step started (`phase: start`) or finished (`phase: done`), with its run's `trace_id` |
 | `conversation` | its owner and operators | a conversation's status: size, turns, plan, skills |
 | `conversation.removed` | its owner and operators | a conversation left the status view; `{id}` only |
 | `subagent` | operators | a subagent's status |
 | `subagent.removed` | operators | a subagent left the status view; `{id}` only |
 | `child` | operators | an OS child process of the instance |
 | `child.removed` | operators | a child process left the status view; `{id}` only |
-| `activity` | its owner and operators | live activity of a unit of work: phase, tool, round, tokens |
+| `activity` | its owner and operators | live activity of a unit of work: phase, tool, round, tokens, and the `trace_id` its work is in |
 | `activity.removed` | its owner and operators | the unit of work left the status view; `{id}` only |
 | `status` | operators | the instance's slim status: draining, inbox, counters, budget, store |
 | `lifecycle` | every subscriber | the instance began draining, or was paused or resumed as a whole |
 | `config` | every subscriber | settings moved: which paths, and whether a reload or `admin.set` moved them |
-| `audit` | operators, while `a2a.introspection.enabled` | the audit mirror: who did what to what, and the outcome |
+| `audit` | operators, while `a2a.introspection.enabled` | the audit mirror: who did what to what, the outcome, and the `trace_id` of the record |
 | `auth` | operators | a device sign-in pending, approved or denied; a session revoked; a launch |
 
 A departure (`*.removed`) names what left and nothing else: its owner already

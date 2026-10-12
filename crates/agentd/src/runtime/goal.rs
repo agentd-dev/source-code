@@ -377,7 +377,7 @@ fn goal_judge_call(
         output_schema: Some(verdict_schema()),
         ..Default::default()
     };
-    match client.complete(&req) {
+    match client.complete_recorded(&req, Some(trace)) {
         Ok(resp) => {
             let mut v = parse_verdict(resp.text.as_deref().unwrap_or_default());
             v["usage"] = usage_value(resp.usage);
@@ -432,13 +432,16 @@ pub(crate) fn goal_decision_call(
         client.set_trace(Some(trace.clone()));
         let model = cfg.model.clone().unwrap_or_default();
         let resp = client
-            .complete(&Request {
-                model: model.clone(),
-                max_tokens: 384,
-                temperature: Some(0.0),
-                decision: Some(decision.clone()),
-                ..Default::default()
-            })
+            .complete_recorded(
+                &Request {
+                    model: model.clone(),
+                    max_tokens: 384,
+                    temperature: Some(0.0),
+                    decision: Some(decision.clone()),
+                    ..Default::default()
+                },
+                Some(trace),
+            )
             .map_err(|e| format!("intel: {e}"))?;
         usage.input_tokens += resp.usage.input_tokens;
         usage.output_tokens += resp.usage.output_tokens;

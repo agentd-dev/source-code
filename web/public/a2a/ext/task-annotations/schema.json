@@ -48,6 +48,10 @@
       "description": "who started the task",
       "type": "string"
     },
+    "spanId": {
+      "description": "the W3C span id the task's work is done in, 16 lowercase hex digits: the span a `traceparent` response header names",
+      "type": "string"
+    },
     "statusHistory": {
       "description": "every state the task has been in, oldest first",
       "items": {
@@ -69,6 +73,10 @@
         "type": "object"
       },
       "type": "array"
+    },
+    "traceId": {
+      "description": "the W3C trace id of the task's work, 32 lowercase hex digits",
+      "type": "string"
     }
   },
   "required": [

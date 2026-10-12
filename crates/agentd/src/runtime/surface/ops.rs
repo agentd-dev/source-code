@@ -783,13 +783,14 @@ fn workflow_status_result() -> Value {
     closed(
         &["runs"],
         json!({"runs": list_of(closed(
-            &["run", "workflow", "status", "output", "error"],
+            &["run", "workflow", "status", "output", "error", "trace_id"],
             json!({
                 "run": {"type": "string"},
                 "workflow": {"type": "string"},
                 "status": {"type": "string"},
                 "output": true,
                 "error": string_or_null(),
+                "trace_id": {"type": ["string", "null"], "description": "the W3C trace id the run's work is in, 32 lowercase hex digits"},
             }),
         ))}),
     )

@@ -391,6 +391,14 @@ pub fn task_annotations_bundle() -> Value {
                 "type": "string",
             },
             "command": {"description": "the command op that started the task", "type": "string"},
+            "traceId": {
+                "description": "the W3C trace id of the task's work, 32 lowercase hex digits",
+                "type": "string",
+            },
+            "spanId": {
+                "description": "the W3C span id the task's work is done in, 16 lowercase hex digits: the span a `traceparent` response header names",
+                "type": "string",
+            },
         },
         "additionalProperties": false,
     })

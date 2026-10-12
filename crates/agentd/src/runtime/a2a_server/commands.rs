@@ -602,9 +602,10 @@ fn no_such_run() -> Answer {
     Answer::Reply(err_obj(TASK_NOT_FOUND, "no such run"))
 }
 
-/// A compact run view for `workflow.status`.
+/// A compact run view for `workflow.status`, naming the trace the run is in.
 fn run_view(id: &str, r: &crate::engine::RunState) -> Value {
-    json!({"run": id, "workflow": r.workflow, "status": r.status.as_str(), "output": r.output, "error": r.error})
+    json!({"run": id, "workflow": r.workflow, "status": r.status.as_str(), "output": r.output, "error": r.error,
+           "trace_id": r.trace.as_ref().map(|t| &t.trace_id)})
 }
 
 #[cfg(test)]

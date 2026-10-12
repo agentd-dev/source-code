@@ -1222,7 +1222,7 @@ UNDECIDED.";
         output_schema: closed.as_deref().map(judge_answer_schema),
         ..Default::default()
     };
-    match client.complete(&req) {
+    match client.complete_recorded(&req, trace) {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             let answer = match closed {
@@ -1330,13 +1330,16 @@ fn human_decision_call(
         client.set_trace(trace.cloned());
         let model = cfg.model.clone().unwrap_or_default();
         let resp = client
-            .complete(&Request {
-                model: model.clone(),
-                max_tokens: 256,
-                temperature: Some(0.0),
-                decision: Some(decision.clone()),
-                ..Default::default()
-            })
+            .complete_recorded(
+                &Request {
+                    model: model.clone(),
+                    max_tokens: 256,
+                    temperature: Some(0.0),
+                    decision: Some(decision.clone()),
+                    ..Default::default()
+                },
+                trace,
+            )
             .ok()?;
         usage.input_tokens += resp.usage.input_tokens;
         usage.output_tokens += resp.usage.output_tokens;

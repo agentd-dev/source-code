@@ -901,7 +901,21 @@ impl StreamSink {
             let log = self.log.in_trace(span.as_ref());
             self.handle.spawn(async move {
                 let outcome = tokio::task::spawn_blocking(move || {
-                    crate::a2a::push::deliver(&target, &event, allow_private, span.as_ref())
+                    let start = crate::obs::otel::now_unix_nanos();
+                    let sent =
+                        crate::a2a::push::deliver(&target, &event, allow_private, span.as_ref());
+                    // The delivery is a CLIENT span of the task's: the one
+                    // its `traceparent` header named.
+                    crate::obs::otel::span(
+                        span.as_ref(),
+                        "a2a.push",
+                        crate::obs::otel::Kind::Client,
+                        start,
+                    )
+                    .attr("http.request.method", "POST")
+                    .destination(target.url.as_str())
+                    .end(sent.is_ok());
+                    sent
                 })
                 .await;
                 if let Ok(Err(e)) = outcome {

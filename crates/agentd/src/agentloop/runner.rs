@@ -20,6 +20,7 @@ use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
+use crate::obs::trace::TraceContext;
 use crate::subagent::protocol::ALLOWED_TOOLS_ROLE;
 use crate::supervisor::budget::Budget;
 use crate::wire::intel::{Message, Request, ToolDef, Usage};
@@ -312,12 +313,14 @@ impl<'a> Session<'a> {
             }
         }
         let mut last_text: Option<String> = None;
-        // otel spans: the `invoke_agent` span plus a `chat` child per model
-        // call and an `execute_tool` child per tool call, in the trace of the
-        // unit of work that spawned this subagent (the logger's). No-op
-        // without `--features otel`, so the wiring carries no `cfg`.
+        // The turn's span: the `invoke_agent` span, under the span that
+        // spawned this subagent, with a `chat` child per model call and an
+        // `execute_tool` child per tool call, each sent as its request's
+        // `traceparent`. The export is a no-op without `--features otel`, so
+        // the wiring carries no `cfg`.
+        let turn_span = crate::obs::trace::turn();
         let run_start = crate::obs::otel::now_unix_nanos();
-        let mut run_span = crate::obs::otel::run_begin(log, run_start);
+        let run_span = crate::obs::otel::run_begin(log, turn_span.as_ref(), run_start);
         let (mut tok_in, mut tok_out) = (0u64, 0u64);
 
         log.info(
@@ -386,20 +389,40 @@ impl<'a> Session<'a> {
                 json!({"step": budget.steps(), "messages": self.messages.len()}),
             );
             let chat_start = crate::obs::otel::now_unix_nanos();
+            // The call is a span of the turn's, sent as its `traceparent`.
+            let call = turn_span.as_ref().map(TraceContext::child);
+            let answered = match &call {
+                Some(c) => intel.complete_in(&req, Some(budget.deadline()), c),
+                None => intel.complete_by(&req, budget.deadline()),
+            };
             // The run's deadline bounds the call in flight too. One it cut
             // off is no outage of the model: the budget check at the head of
             // the loop ends the run on its deadline.
-            let resp = match intel.complete_by(&req, budget.deadline()) {
+            let resp = match answered {
                 Ok(r) => r,
-                Err(_) if Instant::now() >= budget.deadline() => continue,
-                Err(e) => return Err(LoopAbort::Intel(e.to_string())),
+                Err(e) => {
+                    crate::obs::otel::chat_span(
+                        call.as_ref(),
+                        &self.model,
+                        0,
+                        0,
+                        false,
+                        chat_start,
+                    );
+                    if Instant::now() >= budget.deadline() {
+                        continue;
+                    }
+                    run_span.finish(&self.model, tok_in, tok_out, false);
+                    return Err(LoopAbort::Intel(e.to_string()));
+                }
             };
             budget.record_usage(resp.usage);
             budget.record_step();
             crate::obs::metrics::record_loop_step();
             tok_in += resp.usage.input_tokens;
             tok_out += resp.usage.output_tokens;
-            run_span.record_chat(
+            crate::obs::otel::chat_span(
+                call.as_ref(),
                 &self.model,
                 resp.usage.input_tokens,
                 resp.usage.output_tokens,
@@ -435,6 +458,10 @@ impl<'a> Session<'a> {
                     }
                     log.info("tool.call", call);
                     let tool_start = crate::obs::otel::now_unix_nanos();
+                    // The call is a span of the turn's; an MCP request it
+                    // makes sends it.
+                    let call = turn_span.as_ref().map(TraceContext::child);
+                    let mut mcp: Option<(&str, Option<&str>)> = None;
                     let (content, is_error) = if !self.tool_permitted(&tc.name) {
                         // Refused, never served: the grant binds the DISPATCH,
                         // not just the definitions offered. A model that names a
@@ -448,7 +475,13 @@ impl<'a> Session<'a> {
                             true,
                         )
                     } else if tc.name == "resource.read" {
-                        read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
+                        mcp = Some(("resources/read", None));
+                        read_resource_tool(
+                            self.servers,
+                            &self.resources.owner,
+                            &tc.arguments,
+                            call.as_ref(),
+                        )
                     } else {
                         match self_handler.handle(&tc.name, &tc.arguments) {
                             Some(r) => r, // a self-tool (e.g. subagent.spawn)
@@ -456,16 +489,28 @@ impl<'a> Session<'a> {
                             // colliding remote name.
                             None => match crate::tools::dispatch(&tc.name, &tc.arguments) {
                                 Some(r) => r,
-                                None => dispatch_tool(
-                                    self.servers,
-                                    &self.tool_to_server,
-                                    &tc.name,
-                                    &tc.arguments,
-                                ),
+                                None => {
+                                    mcp = self.tool_to_server.get(&tc.name).map(|(i, _)| {
+                                        ("tools/call", Some(self.servers[*i].name()))
+                                    });
+                                    dispatch_tool(
+                                        self.servers,
+                                        &self.tool_to_server,
+                                        &tc.name,
+                                        &tc.arguments,
+                                        call.as_ref(),
+                                    )
+                                }
                             },
                         }
                     };
-                    run_span.record_tool(&tc.name, !is_error, tool_start);
+                    crate::obs::otel::tool_span(
+                        call.as_ref(),
+                        &tc.name,
+                        mcp,
+                        !is_error,
+                        tool_start,
+                    );
                     let mut result =
                         json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()});
                     if log.content_capture() {
@@ -628,6 +673,7 @@ fn dispatch_tool(
     routing: &Routing,
     name: &str,
     arguments: &Value,
+    call: Option<&TraceContext>,
 ) -> (String, bool) {
     match routing.get(name) {
         Some((i, tool)) => {
@@ -639,7 +685,9 @@ fn dispatch_tool(
             if let Err(e) = crate::mcp::pace::take(servers[i].name()) {
                 return (e, true);
             }
-            match servers[i].call_tool(tool, Some(arguments.clone())) {
+            // The request is the call's span.
+            let meta = Value::Object(call.map(TraceContext::meta).unwrap_or_default());
+            match servers[i].call_tool_with_meta(tool, Some(arguments.clone()), meta) {
                 Ok(res) => (res.text(), res.is_error()),
                 Err(e) => (format!("tool transport error: {e}"), true),
             }
@@ -754,6 +802,7 @@ fn read_resource_tool(
     servers: &[McpClient],
     owner: &HashMap<String, usize>,
     args: &Value,
+    call: Option<&TraceContext>,
 ) -> (String, bool) {
     let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
     if uri.is_empty() {
@@ -763,8 +812,9 @@ fn read_resource_tool(
         Some(i) => vec![*i],
         None => (0..servers.len()).collect(), // a templated/unlisted uri — try all
     };
+    let meta = call.map(|c| Value::Object(c.meta()));
     for i in candidates {
-        if let Ok(r) = servers[i].read_resource(uri, None) {
+        if let Ok(r) = servers[i].read_resource(uri, meta.as_ref()) {
             return (r.text(), false);
         }
     }
@@ -803,14 +853,15 @@ mod tests {
 
     #[test]
     fn resource_read_rejects_missing_uri() {
-        let (msg, err) = read_resource_tool(&[], &HashMap::new(), &json!({}));
+        let (msg, err) = read_resource_tool(&[], &HashMap::new(), &json!({}), None);
         assert!(err);
         assert!(msg.contains("uri"));
     }
 
     #[test]
     fn resource_read_no_server_is_an_error_observation() {
-        let (msg, err) = read_resource_tool(&[], &HashMap::new(), &json!({"uri": "file:///x"}));
+        let (msg, err) =
+            read_resource_tool(&[], &HashMap::new(), &json!({"uri": "file:///x"}), None);
         assert!(err);
         assert!(msg.contains("file:///x"));
     }
@@ -954,7 +1005,7 @@ mod tests {
     #[test]
     fn dispatch_unknown_tool_is_error_observation() {
         let routing = HashMap::new();
-        let (content, is_error) = dispatch_tool(&[], &routing, "ghost", &Value::Null);
+        let (content, is_error) = dispatch_tool(&[], &routing, "ghost", &Value::Null, None);
         assert!(is_error);
         assert!(content.contains("ghost"));
     }
@@ -1138,6 +1189,7 @@ mod tests {
                     trace_id: None,
                     span_id: None,
                     parent_span_id: None,
+                    trace_flags: None,
                 },
                 Level::Error, // keep the test quiet
             )

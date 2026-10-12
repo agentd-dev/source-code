@@ -71,23 +71,31 @@ pub fn tool_meta(run_id: &str, instance: &str) -> serde_json::Value {
 }
 
 /// Name, in a request's `_meta`, the unit of work it is made for: a span of
-/// its own under `unit`'s, with the unit's flags and `tracestate`. A request
-/// with none gets the process trace ([`from_spec`]).
-pub fn stamp_trace(meta: &mut serde_json::Value, unit: Option<&crate::obs::trace::TraceContext>) {
-    if let (Some(m), Some(t)) = (meta.as_object_mut(), unit) {
-        m.extend(t.child().meta());
+/// its own under `unit`'s, with the unit's flags and `tracestate` — returned,
+/// so the caller can record the request as that span. A request with none
+/// gets the process trace ([`from_spec`]).
+pub fn stamp_trace(
+    meta: &mut serde_json::Value,
+    unit: Option<&crate::obs::trace::TraceContext>,
+) -> Option<crate::obs::trace::TraceContext> {
+    let call = unit.map(crate::obs::trace::TraceContext::child)?;
+    if let Some(m) = meta.as_object_mut() {
+        m.extend(call.meta());
     }
+    Some(call)
 }
 
-/// The W3C trace context of one MCP request that names none of its own: a
-/// span of its own under the process trace ([`crate::obs::trace::process`]) —
-/// in the supervisor what belongs to no unit of work (a boot-time list, a
-/// re-dial, a subscription the connection holds for every waiter, an MCP
-/// Events poll), in a turn worker or a subagent the unit it serves. A request
-/// made for a unit of work names the unit's span itself, and that wins.
+/// The W3C trace context of one MCP request that names none of its own: the
+/// process's span ([`crate::obs::trace::process`]) — in the supervisor what
+/// belongs to no unit of work (a boot-time list, a re-dial, a subscription
+/// the connection holds for every waiter, an MCP Events poll), in a turn
+/// worker or a subagent the unit it serves. That span is exported (the
+/// supervisor's at exit, a worker's as its `invoke_agent`), so the server's
+/// span for the request has its parent in the collector. A request made for
+/// a unit of work names a span of its own under the unit's, and that wins.
 fn process_request_meta() -> serde_json::Map<String, serde_json::Value> {
     crate::obs::trace::process()
-        .map(|t| t.child().meta())
+        .map(|t| t.meta())
         .unwrap_or_default()
 }
 

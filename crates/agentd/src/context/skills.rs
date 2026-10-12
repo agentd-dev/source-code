@@ -349,18 +349,33 @@ impl Catalogue {
                     meta.source.server
                 )
             })?;
-            let request = trace.map(|t| Value::Object(t.child().meta()));
-            match meta.source.kind {
-                SkillSourceKind::Prompt => {
-                    let messages =
-                        server.get_prompt(&meta.source.reference, arguments, request.as_ref())?;
-                    prompt_messages_text(&messages)
-                }
-                SkillSourceKind::Resource => {
-                    server.read_resource(&meta.source.reference, request.as_ref())?
-                }
+            // The request is a span of the unit's, exported as its CLIENT
+            // span.
+            let call = trace.map(crate::obs::trace::TraceContext::child);
+            let request = call.as_ref().map(|t| Value::Object(t.meta()));
+            let start = crate::obs::otel::now_unix_nanos();
+            let (method, fetched) = match meta.source.kind {
+                SkillSourceKind::Prompt => (
+                    "prompts/get",
+                    server
+                        .get_prompt(&meta.source.reference, arguments, request.as_ref())
+                        .map(|messages| prompt_messages_text(&messages)),
+                ),
+                SkillSourceKind::Resource => (
+                    "resources/read",
+                    server.read_resource(&meta.source.reference, request.as_ref()),
+                ),
                 SkillSourceKind::Inline => unreachable!("handled above"),
-            }
+            };
+            crate::obs::otel::mcp_span(
+                call.as_ref(),
+                method,
+                &meta.source.reference,
+                &meta.source.server,
+                fetched.is_ok(),
+                start,
+            );
+            fetched?
         };
         if text.trim().is_empty() {
             return Err(format!("skill {name:?} has an empty body"));

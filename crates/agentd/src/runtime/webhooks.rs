@@ -224,13 +224,15 @@ fn marker_live(state: &Value, now: u64) -> bool {
 /// live marker in the current bucket or the one before it — no older bucket
 /// can hold one. An expired marker that the sweep has not reached yet
 /// answers nothing, so expiry does not depend on the sweep.
-fn is_replay(d: &Durable, workflow: &str, node: &str, key: &str, now: u64) -> bool {
-    [now, now.saturating_sub(IDEM_TTL_MS)].iter().any(|&at| {
-        matches!(
-            d.get(Kind::Memory, &idem_marker_id(workflow, node, key, at)),
-            Ok(Some(env)) if marker_live(&env.state, now)
+fn replay_of(d: &Durable, workflow: &str, node: &str, key: &str, now: u64) -> Option<Value> {
+    [now, now.saturating_sub(IDEM_TTL_MS)]
+        .iter()
+        .find_map(
+            |&at| match d.get(Kind::Memory, &idem_marker_id(workflow, node, key, at)) {
+                Ok(Some(env)) if marker_live(&env.state, now) => Some(env.state),
+                _ => None,
+            },
         )
-    })
 }
 
 /// The oldest bucket that may hold markers, as recorded; `None` when no
@@ -240,7 +242,9 @@ fn idem_floor(d: &Durable) -> Result<Option<u64>, crate::store::StoreError> {
         .and_then(|env| env.state.get("bucket").and_then(Value::as_u64)))
 }
 
-/// Write the marker for a delivery of `key` kept at `now`. On a store that
+/// Write the marker for a delivery of `key` kept at `now`, naming what it
+/// became — `unit`'s `run` and `traceparent` — so a replay is answered with
+/// them. On a store that
 /// cannot `list`, it is indexed first; an index write that fails does not
 /// keep the marker from being written — a marker the sweep cannot find is a
 /// leak, a marker missing is a duplicate run — and is answered as
@@ -257,6 +261,7 @@ fn record_marker(
     node: &str,
     key: &str,
     now: u64,
+    unit: &Value,
 ) -> Result<Option<crate::store::StoreError>, crate::store::StoreError> {
     let bucket = idem_bucket(now);
     let floor = match sweep.floor {
@@ -273,7 +278,11 @@ fn record_marker(
     } else {
         index_marker(d, sweep, bucket, &id).err()
     };
-    d.put(Kind::Memory, &id, json!({"at": now}), None)?;
+    let mut marker = json!({"at": now});
+    if let (Some(m), Some(u)) = (marker.as_object_mut(), unit.as_object()) {
+        m.extend(u.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    d.put(Kind::Memory, &id, marker, None)?;
     Ok(unindexed)
 }
 
@@ -387,6 +396,12 @@ fn sweep_pass(
     })
 }
 
+/// What a kept delivery became, recorded on its idempotency marker: the run
+/// it started and the span that run is.
+fn delivered_unit(run: &str, span: Option<&TraceContext>) -> Value {
+    json!({"run": run, "traceparent": span.map(TraceContext::traceparent)})
+}
+
 /// The answer to a delivery whose start node did not fire. A refusal that can
 /// pass is `503`, so the sender retries; an `inputs` mapping that cannot
 /// render this delivery is `422`, because retrying it fails the same way.
@@ -468,6 +483,14 @@ pub struct WebhookReply {
     pub status: u16,
     pub reason: &'static str,
     pub body: Value,
+    /// The span the delivery's work is done in — the run it started, the
+    /// event it appended — which the answer names in its `traceparent`
+    /// header, and whose trace id its body names as `trace_id`.
+    pub span: Option<TraceContext>,
+    /// The delivery's own span, when the runtime gave it one to log in — a
+    /// callback's, under the span the caller's `traceparent` named. The
+    /// listener exports it as the delivery's SERVER span.
+    pub served: Option<TraceContext>,
 }
 
 impl WebhookReply {
@@ -476,7 +499,24 @@ impl WebhookReply {
             status,
             reason,
             body,
+            span: None,
+            served: None,
         }
+    }
+
+    /// This answer, naming the run `run` the delivery started (or one an
+    /// earlier delivery of it did) and the span `span` its work is done in.
+    fn naming(mut self, run: Option<&str>, span: Option<TraceContext>) -> WebhookReply {
+        if let Some(body) = self.body.as_object_mut() {
+            if let Some(run) = run {
+                body.insert("run_id".into(), json!(run));
+            }
+            if let Some(t) = &span {
+                body.insert("trace_id".into(), json!(t.trace_id));
+            }
+        }
+        self.span = span;
+        self
     }
 }
 
@@ -664,7 +704,8 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
             let payload = self.payload(req, &path);
             let cb_path = path.clone();
             let trace = upstream_of(req);
-            return self.dispatch(move |tx| WebhookRequest {
+            // A callback's path is its capability: no span names it.
+            return self.dispatch(&req.method, None, trace.clone(), move |tx| WebhookRequest {
                 workflow: String::new(),
                 node: String::new(),
                 idem_key: None,
@@ -744,11 +785,21 @@ impl WebhookHandler {
     }
 
     /// Post a webhook request to the loop and block for its reply.
+    ///
+    /// The answer names the span the delivery's work is done in, in a
+    /// `traceparent` header. The delivery is a SERVER span: the run it
+    /// started is, when it started one under the sender's span; otherwise,
+    /// when the sender named a span, a span of its own under it is exported
+    /// here. A delivery that names no span and starts no run is in no trace.
     fn dispatch(
         &self,
+        method: &str,
+        route: Option<&str>,
+        upstream: Option<TraceContext>,
         build: impl FnOnce(SyncSender<WebhookReply>) -> WebhookRequest,
     ) -> ::mcp::http_server::RawResponse {
         use ::mcp::http_server::RawResponse as R;
+        let started = crate::obs::otel::now_unix_nanos();
         let (tx, rx) = sync_channel(1);
         if self
             .events_tx
@@ -762,11 +813,44 @@ impl WebhookHandler {
             );
         }
         match rx.recv_timeout(self.timeout) {
-            Ok(reply) => R::json(
-                reply.status,
-                reply.reason,
-                serde_json::to_vec(&reply.body).unwrap_or_default(),
-            ),
+            Ok(reply) => {
+                let opened = match (&reply.span, &upstream) {
+                    (Some(s), Some(u)) => s.parent_span_id.as_deref() == Some(u.span_id.as_str()),
+                    _ => false,
+                };
+                if !opened {
+                    // Linked to the work the delivery reached in another
+                    // span: the event it appended, a run it woke. The span
+                    // the runtime logged the delivery in, when it gave it
+                    // one.
+                    let own = reply
+                        .served
+                        .clone()
+                        .or_else(|| upstream.as_ref().map(TraceContext::child));
+                    let mut served = crate::obs::otel::span(
+                        own.as_ref(),
+                        &format!("{method} {}", route.unwrap_or("webhook callback")),
+                        crate::obs::otel::Kind::Server,
+                        started,
+                    )
+                    .attr("http.request.method", method)
+                    .attr_opt("http.route", route)
+                    .attr("http.response.status_code", reply.status);
+                    if let Some(t) = &reply.span {
+                        served = served.link(&t.traceparent());
+                    }
+                    served.end(reply.status < 400);
+                }
+                let mut r = R::json(
+                    reply.status,
+                    reply.reason,
+                    serde_json::to_vec(&reply.body).unwrap_or_default(),
+                );
+                if let Some(t) = &reply.span {
+                    r.headers.push(("traceparent", t.traceparent()));
+                }
+                r
+            }
             Err(_) => R::text(
                 504,
                 "Gateway Timeout",
@@ -863,15 +947,17 @@ impl WebhookHandler {
             route.respond_sync,
         );
         let trace = upstream_of(req);
-        self.dispatch(move |tx| WebhookRequest {
-            workflow,
-            node,
-            idem_key,
-            payload,
-            respond_sync,
-            callback: None,
-            trace,
-            reply: tx,
+        self.dispatch(&req.method, Some(path), trace.clone(), move |tx| {
+            WebhookRequest {
+                workflow,
+                node,
+                idem_key,
+                payload,
+                respond_sync,
+                callback: None,
+                trace,
+                reply: tx,
+            }
         })
     }
 }
@@ -1270,7 +1356,9 @@ impl crate::runtime::reactor::Runtime {
             // An operator-configured route: the runtime is the sender.
             // What the caller posted, the waiting run's own definition
             // carries already (`wait {on: webhook}`, `config::taint`). The
-            // run keeps its trace; the caller's is its link.
+            // run keeps its trace; the caller's is its link. The callback
+            // is a span of its own under the caller's, which its line is in.
+            let served = trace.as_ref().map(TraceContext::child);
             let delivered = self.deliver_signal(
                 &signal,
                 payload,
@@ -1280,17 +1368,19 @@ impl crate::runtime::reactor::Runtime {
                 &Default::default(),
                 trace.as_ref(),
             );
-            self.log.info(
+            self.log.in_trace(served.as_ref()).info(
                 "webhook.callback",
                 json!({"path": path, "resumed": delivered,
                        "link": trace.as_ref().map(TraceContext::traceparent)}),
             );
             let ok = delivered > 0;
-            let _ = reply.send(WebhookReply::ok(
+            let mut answer = WebhookReply::ok(
                 if ok { 200 } else { 404 },
                 if ok { "OK" } else { "Not Found" },
                 json!({"status": if ok { "resumed" } else { "no-waiter" }, "resumed": delivered}),
-            ));
+            );
+            answer.served = served;
+            let _ = reply.send(answer);
             return;
         }
 
@@ -1300,17 +1390,25 @@ impl crate::runtime::reactor::Runtime {
         // that was refused leaves no marker, so the sender's retry is processed.
         let marker = idem_key.as_deref();
         if let Some(key) = marker
-            && is_replay(&self.durable, &workflow, &node, key, now_ms())
+            && let Some(kept) = replay_of(&self.durable, &workflow, &node, key, now_ms())
         {
             self.log.info(
                 "webhook.duplicate",
                 json!({"workflow": workflow, "node": node}),
             );
-            let _ = reply.send(WebhookReply::ok(
-                200,
-                "OK",
-                json!({"status": "duplicate", "idempotency_key": key}),
-            ));
+            // The answer names what the kept delivery became, when its
+            // marker recorded it.
+            let span = kept["traceparent"]
+                .as_str()
+                .and_then(|tp| TraceContext::parse(tp, None));
+            let _ = reply.send(
+                WebhookReply::ok(
+                    200,
+                    "OK",
+                    json!({"status": "duplicate", "idempotency_key": key}),
+                )
+                .naming(kept["run"].as_str(), span),
+            );
             return;
         }
 
@@ -1384,6 +1482,7 @@ impl crate::runtime::reactor::Runtime {
                     // ended: it starts a trace of its own, which its consumers
                     // continue, and links to the sender's.
                     let event_trace = TraceContext::mint();
+                    let appended = crate::obs::otel::now_unix_nanos();
                     // `_acked`: the `202` below tells the sender the event is
                     // kept, so the stream head is saved before it is sent.
                     let answer = match self.append_event_acked(
@@ -1404,12 +1503,26 @@ impl crate::runtime::reactor::Runtime {
                                            "stream": stream, "subject": subject, "seq": seq,
                                            "links": links}),
                             );
-                            self.deliver_kept(marker, &workflow, &node, signal);
+                            crate::runtime::streams::append_span(
+                                &event_trace,
+                                stream,
+                                seq,
+                                appended,
+                            );
+                            self.deliver_kept(
+                                marker,
+                                &workflow,
+                                &node,
+                                signal,
+                                Some(&event_trace),
+                                json!({"traceparent": event_trace.traceparent()}),
+                            );
                             WebhookReply::ok(
                                 202,
                                 "Accepted",
                                 json!({"status": "appended", "stream": stream, "seq": seq}),
                             )
+                            .naming(None, Some(event_trace))
                         }
                         // A refused append (an undeclared stream, or
                         // pressure) must be visible to the CALLER, not
@@ -1440,7 +1553,7 @@ impl crate::runtime::reactor::Runtime {
                     // `on_run_terminal` with the run's result.
                     let run_id = format!("{workflow}-{}", crate::state::ulid::new());
                     self.webhook_sync.insert(run_id.clone(), reply);
-                    let admitted = self.fire_start_run(
+                    let (admitted, run_span) = self.fire_start_run(
                         &workflow,
                         &node,
                         &spec,
@@ -1450,32 +1563,51 @@ impl crate::runtime::reactor::Runtime {
                         trace.as_ref(),
                     );
                     if admitted == Admission::Accepted {
-                        self.deliver_kept(marker, &workflow, &node, signal);
+                        let unit = delivered_unit(&run_id, run_span.as_ref());
+                        self.deliver_kept(
+                            marker,
+                            &workflow,
+                            &node,
+                            signal,
+                            run_span.as_ref(),
+                            unit,
+                        );
                     } else if let Some(reply) = self.webhook_sync.remove(&run_id) {
                         // No run will reach a terminal status to answer it.
                         let _ = reply.send(not_fired(admitted));
                     }
                 } else {
                     // The run is the delivery's unit of work, and continues
-                    // the sender's trace.
-                    let admitted = self.fire_start_run(
+                    // the sender's trace. Its id is named now, so the answer
+                    // can say which run the delivery became.
+                    let run_id = format!("{workflow}-{}", crate::state::ulid::new());
+                    let (admitted, run_span) = self.fire_start_run(
                         &workflow,
                         &node,
                         &spec,
                         payload,
                         "webhook",
-                        None,
+                        Some(&run_id),
                         trace.as_ref(),
                     );
                     // A `202` for a firing that was refused would tell the sender
                     // to stop retrying an event nothing kept.
                     let answer = if admitted == Admission::Accepted {
-                        self.deliver_kept(marker, &workflow, &node, signal);
+                        let unit = delivered_unit(&run_id, run_span.as_ref());
+                        self.deliver_kept(
+                            marker,
+                            &workflow,
+                            &node,
+                            signal,
+                            run_span.as_ref(),
+                            unit,
+                        );
                         WebhookReply::ok(
                             202,
                             "Accepted",
                             json!({"status": "accepted", "workflow": workflow}),
                         )
+                        .naming(Some(&run_id), run_span)
                     } else {
                         not_fired(admitted)
                     };
@@ -1496,23 +1628,27 @@ impl crate::runtime::reactor::Runtime {
     /// appended, in this same pass: the route's `signal:` goes out, and the
     /// idempotency marker is written so a replay is answered `duplicate`.
     /// Neither happens for a delivery that was refused, because its sender
-    /// retries it.
+    /// retries it. `span` is the delivery's unit's: the run's, or the
+    /// appended event's.
     fn deliver_kept(
         &mut self,
         key: Option<&str>,
         workflow: &str,
         node: &str,
         signal: Option<(String, Value, Option<TraceContext>)>,
+        span: Option<&TraceContext>,
+        unit: Value,
     ) {
         if let Some((tpl, payload, trace)) = signal {
-            self.webhook_signal(&tpl, payload, workflow, node, trace.as_ref());
+            self.webhook_signal(&tpl, payload, workflow, node, trace.as_ref(), span);
         }
-        self.mark_delivered(key, workflow, node);
+        self.mark_delivered(key, workflow, node, &unit);
     }
 
     /// Fire a route's `signal:` template with the delivery's payload, in the
     /// trace the request named: a run it starts continues it, a run it wakes
-    /// records it as a link.
+    /// records it as a link. Its lines are in `unit`, the span of what the
+    /// delivery became.
     fn webhook_signal(
         &mut self,
         tpl: &str,
@@ -1520,6 +1656,7 @@ impl crate::runtime::reactor::Runtime {
         workflow: &str,
         node: &str,
         trace: Option<&TraceContext>,
+        unit: Option<&TraceContext>,
     ) {
         let data: crate::engine::template::Data = payload
             .as_object()
@@ -1538,19 +1675,19 @@ impl crate::runtime::reactor::Runtime {
                     &Default::default(),
                     trace,
                 );
-                self.log.info(
+                self.log.in_trace(unit).info(
                     "webhook.signal",
                     json!({"workflow": workflow, "node": node,
                            "signal": name, "resumed": resumed,
                            "link": trace.map(TraceContext::traceparent)}),
                 );
             }
-            Ok(other) => self.log.warn(
+            Ok(other) => self.log.in_trace(unit).warn(
                 "webhook.signal.invalid",
                 json!({"workflow": workflow, "node": node,
                        "err": format!("signal template must render to a string, got {other}")}),
             ),
-            Err(e) => self.log.warn(
+            Err(e) => self.log.in_trace(unit).warn(
                 "webhook.signal.invalid",
                 json!({"workflow": workflow, "node": node, "err": e}),
             ),
@@ -1565,7 +1702,7 @@ impl crate::runtime::reactor::Runtime {
     /// happened: the sender still gets its `2xx`, and a replay is processed
     /// again — a second run, or a second copy of the event under the same id,
     /// which stream consumers deduplicate. The line says so.
-    fn mark_delivered(&mut self, key: Option<&str>, workflow: &str, node: &str) {
+    fn mark_delivered(&mut self, key: Option<&str>, workflow: &str, node: &str, unit: &Value) {
         let Some(key) = key else {
             return;
         };
@@ -1576,6 +1713,7 @@ impl crate::runtime::reactor::Runtime {
             node,
             key,
             now_ms(),
+            unit,
         ) {
             Ok(None) => {}
             // Recorded, and kept out of the index: the sweep of a store that
@@ -1641,18 +1779,19 @@ impl crate::runtime::reactor::Runtime {
         let Some(reply) = self.webhook_sync.remove(run_id) else {
             return;
         };
-        let (status, body) = match self.runs.get(run_id) {
+        let (status, body, span) = match self.runs.get(run_id) {
             Some(run) => {
                 let ok = run.status.as_str() == "completed";
                 (
                     if ok { 200 } else { 502 },
                     json!({"status": run.status.as_str(), "output": run.output, "error": run.error}),
+                    run.trace.clone(),
                 )
             }
-            None => (410, json!({"status": "gone"})),
+            None => (410, json!({"status": "gone"}), None),
         };
         let reason = if status == 200 { "OK" } else { "Bad Gateway" };
-        let _ = reply.send(WebhookReply::ok(status, reason, body));
+        let _ = reply.send(WebhookReply::ok(status, reason, body).naming(Some(run_id), span));
     }
 
     /// A `wait: {on: webhook}` step: register a one-shot callback route and suspend
@@ -1880,20 +2019,29 @@ mod idempotency_tests {
         // The lookup a delivery makes applies the same rule, whether or not
         // the sweep has removed the marker yet.
         let d = durable();
-        assert!(!is_replay(&d, "w", "h", "k", at), "no marker, no replay");
+        assert!(
+            replay_of(&d, "w", "h", "k", at).is_none(),
+            "no marker, no replay"
+        );
         d.put(Kind::Memory, &idem_marker_id("w", "h", "k", at), m, None)
             .unwrap();
-        assert!(is_replay(&d, "w", "h", "k", at + 1));
+        assert!(replay_of(&d, "w", "h", "k", at + 1).is_some());
         assert!(
-            is_replay(&d, "w", "h", "k", at + IDEM_TTL_MS - 1),
+            replay_of(&d, "w", "h", "k", at + IDEM_TTL_MS - 1).is_some(),
             "from the next bucket"
         );
         assert!(
-            !is_replay(&d, "w", "h", "k", at + IDEM_TTL_MS),
+            replay_of(&d, "w", "h", "k", at + IDEM_TTL_MS).is_none(),
             "an expired marker"
         );
-        assert!(!is_replay(&d, "w", "h", "other", at + 1), "another key");
-        assert!(!is_replay(&d, "w", "h2", "k", at + 1), "another route");
+        assert!(
+            replay_of(&d, "w", "h", "other", at + 1).is_none(),
+            "another key"
+        );
+        assert!(
+            replay_of(&d, "w", "h2", "k", at + 1).is_none(),
+            "another route"
+        );
     }
 
     /// A store that counts what the sweep asks of it.
@@ -2001,12 +2149,21 @@ mod idempotency_tests {
             let mut writer = IdemSweep::default();
             for i in 0..60 {
                 let key = format!("k{life}-{i}");
-                record_marker(&d, &mut writer, "w", "h", &key, old_at + i as u64).unwrap();
+                record_marker(
+                    &d,
+                    &mut writer,
+                    "w",
+                    "h",
+                    &key,
+                    old_at + i as u64,
+                    &Value::Null,
+                )
+                .unwrap();
                 old.push(idem_marker_id("w", "h", &key, old_at + i as u64));
             }
         }
         let mut writer = IdemSweep::default();
-        record_marker(&d, &mut writer, "w", "h", "live", now - 1).unwrap();
+        record_marker(&d, &mut writer, "w", "h", "live", now - 1, &Value::Null).unwrap();
         let live = idem_marker_id("w", "h", "live", now - 1);
         let head = d.get(Kind::Memory, &index_head_id(7)).unwrap();
         let pages = head.and_then(|e| e.state["page"].as_u64()).unwrap() + 1;
@@ -2069,7 +2226,7 @@ mod idempotency_tests {
         // Recorded the way a delivery records them, by a life of its own.
         let mut writer = IdemSweep::default();
         let mut mark = |key: &str, at: u64| {
-            record_marker(&d, &mut writer, "w", "h", key, at).unwrap();
+            record_marker(&d, &mut writer, "w", "h", key, at, &Value::Null).unwrap();
             idem_marker_id("w", "h", key, at)
         };
         // Two buckets that have expired whole, three markers between them;

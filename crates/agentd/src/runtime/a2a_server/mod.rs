@@ -282,6 +282,7 @@ impl Runtime {
             trace,
             reply,
         } = req;
+        let started = crate::obs::otel::now_unix_nanos();
         // What this request activated, for every task it projects — however
         // deep in the handler the projection is made. Cleared with the
         // reserved id below, so nothing outside a request is ever annotated
@@ -290,6 +291,7 @@ impl Runtime {
         // The span the request's headers named, for the unit of work it
         // starts — cleared with the rest, so no later work continues it.
         self.a2a_trace = trace;
+        self.a2a_span = None;
         // Index this caller's declared budget and labels the first time they
         // appear, so everything downstream can find them by id alone — the run
         // record, the MCP `_meta` and the audit line all carry the id, never
@@ -369,6 +371,35 @@ impl Runtime {
             .map(|id| json!({"task": id}))
             .unwrap_or(Value::Null);
         let request_id = params["message"]["messageId"].as_str();
+        // The request's SERVER span. A command answered within it is its
+        // span. A request that opens a unit of work under the caller's span —
+        // a task's first message, a run — has the unit's span as its SERVER
+        // span: a message's ends as it is routed, a run's with the run. Any
+        // other request the caller named a span for is a span of its own
+        // under it. A request that names none and starts nothing is in no
+        // trace, and exports nothing.
+        let opened = span.as_ref().is_some_and(|s| {
+            upstream
+                .as_ref()
+                .is_some_and(|u| s.parent_span_id.as_deref() == Some(u.span_id.as_str()))
+        });
+        let served = self.a2a_span.take().or_else(|| {
+            upstream
+                .as_ref()
+                .filter(|_| !opened)
+                .map(crate::obs::trace::TraceContext::child)
+        });
+        crate::obs::otel::span(
+            served.as_ref(),
+            &method,
+            crate::obs::otel::Kind::Server,
+            started,
+        )
+        .attr("rpc.system", "jsonrpc")
+        .attr("rpc.method", method.as_str())
+        .attr_opt("a2a.task.id", answered.as_deref())
+        .attr_opt("agentd.command", op.as_deref())
+        .end(outcome == "ok");
         // In the trace of the work the call did, else of the caller's request.
         // A call on a task of another trace — a message continuing it, the
         // answer to its gate, a read — names the caller's span as its link.

@@ -214,6 +214,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     let trace =
         crate::obs::trace::TraceContext::resolve(settings.observability.traceparent.as_deref());
     crate::obs::trace::set_process(trace.clone());
+    // Where spans go, before the first one begins; the inherited environment
+    // variable is the fallback.
+    crate::obs::otel::set_endpoint(settings.observability.otel.endpoint.clone());
     let level = settings
         .observability
         .log_level
@@ -229,6 +232,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         trace_id: None,
         span_id: None,
         parent_span_id: None,
+        trace_flags: None,
     };
     ctx.set_trace(&trace);
     let log = Logger::new(ctx, level).with_content(settings.observability.log_content);
@@ -674,6 +678,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         a2a_active: surface::Active::NONE,
         #[cfg(feature = "a2a")]
         a2a_trace: None,
+        #[cfg(feature = "a2a")]
+        a2a_span: None,
         #[cfg(feature = "a2a")]
         a2a_sink: None,
         #[cfg(feature = "a2a")]
@@ -1245,6 +1251,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             std::time::Duration::from_millis(crate::obs::health::LIVENESS_STALE_AFTER_MS),
         );
     }
+    // OTLP span export: the supervisor's spans — runs, steps, turns, the
+    // requests it serves and sends — leave from a background thread, never
+    // from the loop. A no-op without an endpoint.
+    crate::obs::otel::arm_traces(&log);
     // OTLP logs export (optional): mirror the JSON-lines log surface
     // to `<endpoint>/v1/logs` when `observability.otel.logs` is on.
     #[cfg(feature = "otel")]

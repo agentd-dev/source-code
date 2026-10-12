@@ -553,14 +553,11 @@ impl Endpoint {
     ) -> Result<(crate::net::http::Response, Duration), IntelError> {
         use crate::net::http;
         let path = path.to_string();
-        // The call is a span of its own under the caller's: one id per
-        // `post`, kept by its transient retries, with the caller's flags and
-        // `tracestate`.
-        if let Some(t) = trace.map(|t| t.child()) {
-            headers.push(("traceparent".into(), t.traceparent()));
-            if let Some(ts) = t.tracestate {
-                headers.push(("tracestate".into(), ts));
-            }
+        // The call's span, as the caller named it: one id for the whole
+        // completion — its transient retries, a failover and a fallback
+        // included — with the unit's flags and `tracestate`.
+        if let Some(t) = trace {
+            headers.extend(t.headers());
         }
         // The configured `intelligence.headers` ride every dial — a gateway
         // routing header, for instance. Pushed BEFORE the AAuth headers so the

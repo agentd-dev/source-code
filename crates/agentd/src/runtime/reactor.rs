@@ -24,6 +24,7 @@ use crate::engine::{RunState, RunStatus, Workflow};
 use crate::governor::Governor;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
+use crate::obs::trace::TraceContext;
 use crate::registry::Registry;
 use crate::state::{Durable, InboxEvent, Kind, now_ms};
 use crate::subagent::protocol::AgentMsg;
@@ -158,6 +159,10 @@ pub struct TurnJob {
     /// `roles.turn`. It belongs to this job alone: the conversation's next
     /// message is routed by its own preflight.
     pub route: Option<String>,
+    /// The turn's trace: its inbox event's, so the turn, its preflight and
+    /// its knowledge retrieval are one span of the trace that delivered the
+    /// message.
+    pub trace: Option<TraceContext>,
 }
 
 impl TurnJob {
@@ -182,6 +187,7 @@ impl TurnJob {
             msg_depth: 0,
             owner_checked: false,
             route: None,
+            trace: None,
         }
     }
     /// The same job, carrying a delivered message's hop depth.
@@ -193,6 +199,11 @@ impl TurnJob {
     /// conversation (or not).
     pub fn owner_checked(mut self, checked: bool) -> TurnJob {
         self.owner_checked = checked;
+        self
+    }
+    /// The same job, as a span of `trace`.
+    pub fn in_trace(mut self, trace: Option<TraceContext>) -> TurnJob {
+        self.trace = trace;
         self
     }
 }
@@ -235,6 +246,11 @@ pub struct SubagentRecord {
     /// The payload (secret-free) for restore re-spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    /// The span that spawned this child — the step's, the turn's, the run's:
+    /// what the child's trace descends from, handed down again when it is
+    /// restored, and what the supervisor's lines about it carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceContext>,
     /// The template this child was instantiated from, and its tier
     /// (`flat` | `instance`). A freeform spawn carries neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,7 +482,9 @@ pub struct Runtime {
     /// with their credentials resolved. Models are not here: they resolve
     /// against the live settings at each call ([`Runtime::intel_config`]).
     pub(crate) intel: super::intel::Conns,
-    pub(crate) trace_id: Option<String>,
+    /// The process's trace: what lines and requests that belong to no unit of
+    /// work carry. Each unit has its own ([`crate::obs::trace`]).
+    pub(crate) trace: TraceContext,
     pub(crate) started: Instant,
     pub(crate) seq: u64,
     /// Minted once per process, so a key made of counters that begin again
@@ -874,32 +892,113 @@ impl Runtime {
     /// the loop. Write-ahead is the whole point — once acceptance is
     /// acknowledged to the outside world, a crash before the event is acted on
     /// must replay it rather than drop it.
+    ///
+    /// `parent` is the span of the unit of work that caused the event, when
+    /// one did (see [`accept_event_store`](Self::accept_event_store)).
     pub(crate) fn accept_event(
         &mut self,
         kind: &str,
         principal: Option<String>,
         payload: Value,
+        parent: Option<&TraceContext>,
     ) -> Result<String, String> {
-        self.accept_event_store(kind, principal, payload)
+        self.accept_event_store(kind, principal, payload, parent)
+            .map(|(id, _)| id)
             .map_err(|e| format!("inbox: {e}"))
     }
 
     /// [`accept_event`](Self::accept_event), with the store's refusal kept
     /// whole: a start firing has to tell a value that can never fit from a
     /// store that may come back.
+    ///
+    /// Every unit of work comes through here — every start kind, every A2A
+    /// message, the `--prompt` — so this is where its trace is resolved, once:
+    /// a span under `parent`, the unit that caused it (a run that ran a
+    /// workflow, sent a signal or a message), or a new trace. It is written
+    /// with the event, so a replay continues it, and the run or turn the event
+    /// becomes is that span.
     pub(crate) fn accept_event_store(
         &mut self,
         kind: &str,
         principal: Option<String>,
         payload: Value,
-    ) -> Result<String, crate::store::StoreError> {
-        let ev = InboxEvent::new(kind, principal, payload);
+        parent: Option<&TraceContext>,
+    ) -> Result<(String, TraceContext), crate::store::StoreError> {
+        let mut ev = InboxEvent::new(kind, principal, payload);
+        let trace = parent.map_or_else(TraceContext::mint, TraceContext::child);
+        ev.trace = Some(trace.clone());
         self.durable.inbox_put(&ev)?;
         let id = ev.id.clone();
         self.log
+            .in_trace(Some(&trace))
             .info("inbox.accepted", json!({"inbox_event": id, "kind": kind}));
         self.inbox_queue.push_back(ev);
-        Ok(id)
+        Ok((id, trace))
+    }
+
+    /// The parent of the work a process was started to do — the `--prompt`, a
+    /// `once` start's run: the process trace when the process is a job, so a
+    /// one-shot job is one trace, or when it continues an operator's
+    /// `observability.traceparent` (its span then has the caller's as its
+    /// parent), so the caller's trace reaches the work. A daemon's such unit
+    /// is a trace of its own, as any other: the process trace carries every
+    /// background request for the life of the process.
+    pub(crate) fn boot_parent(&self) -> Option<TraceContext> {
+        (self.job_now() || self.trace.parent_span_id.is_some()).then(|| self.trace.clone())
+    }
+
+    /// Run `run_id`'s trace, while the run is known.
+    pub(crate) fn run_trace(&self, run_id: &str) -> Option<TraceContext> {
+        self.runs.get(run_id).and_then(|r| r.trace.clone())
+    }
+
+    /// The logger for a line about run `run_id` — the run, one of its steps,
+    /// a wait or a timer of its: the run's trace and span. The process trace
+    /// for a run no longer known.
+    pub(crate) fn run_log(&self, run_id: &str) -> Logger {
+        self.log
+            .in_trace(self.runs.get(run_id).and_then(|r| r.trace.as_ref()))
+    }
+
+    /// The logger for a line about the child at `node` — a turn worker or a
+    /// subagent: the span it was spawned under.
+    pub(crate) fn child_log(&self, node: NodeId) -> Logger {
+        self.log
+            .in_trace(self.children.get(node).and_then(|c| c.trace.as_ref()))
+    }
+
+    /// The logger for a line about subagent `handle`: the span that spawned
+    /// it, kept on its record across a restart.
+    pub(crate) fn subagent_log(&self, handle: &str) -> Logger {
+        self.log
+            .in_trace(self.subagents.get(handle).and_then(|s| s.trace.as_ref()))
+    }
+
+    /// The span an internal tool call is made from: the turn worker's or
+    /// subagent's that asked, else the run's whose step it is. What the call
+    /// starts — a run, a signal, a message, a subagent — continues it.
+    pub(crate) fn caller_trace(&self, caller: &super::tools::ToolCaller) -> Option<TraceContext> {
+        caller
+            .node
+            .and_then(|n| self.children.get(n))
+            .and_then(|c| c.trace.clone())
+            .or_else(|| {
+                caller
+                    .subagent
+                    .as_deref()
+                    .and_then(|h| self.subagents.get(h))
+                    .and_then(|s| s.trace.clone())
+            })
+            .or_else(|| caller.run.as_deref().and_then(|r| self.run_trace(r)))
+    }
+
+    /// The span a deferred answer goes back to: the run's whose step waits,
+    /// or the worker's that asked.
+    pub(crate) fn target_trace(&self, target: &Target) -> Option<TraceContext> {
+        match target {
+            Target::Step(run, _) => self.run_trace(run),
+            Target::Child(node, _) => self.children.get(*node).and_then(|c| c.trace.clone()),
+        }
     }
 
     fn process_inbox(&mut self) {
@@ -978,15 +1077,16 @@ impl Runtime {
                         from.as_deref(),
                         &sender,
                         &carries,
+                        ev.trace.as_ref(),
                     );
-                    self.log.info(
+                    self.log.in_trace(ev.trace.as_ref()).info(
                         "signal.received",
                         json!({"inbox_event": ev.id, "name": name, "delivered": delivered}),
                     );
                     self.inbox_done(&ev.id);
                 }
                 other => {
-                    self.log.warn(
+                    self.log.in_trace(ev.trace.as_ref()).warn(
                         "inbox.unknown_kind",
                         json!({"inbox_event": ev.id, "kind": other}),
                     );
@@ -1054,7 +1154,7 @@ impl Runtime {
         let msg = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                          "text": text, "message_id": ev.payload.get("message_id").cloned()});
         if self.deliver_a2a_message(&ctx, &wire, &msg, principal.as_deref()) > 0 {
-            self.log.info(
+            self.log.in_trace(ev.trace.as_ref()).info(
                 "a2a.message.delivered",
                 json!({"inbox_event": ev.id, "conversation": ctx}),
             );
@@ -1078,7 +1178,8 @@ impl Runtime {
                 text,
             )
             .at_depth(depth)
-            .owner_checked(owner_checked),
+            .owner_checked(owner_checked)
+            .in_trace(ev.trace.clone()),
         );
     }
 
@@ -1167,12 +1268,22 @@ impl Runtime {
                 }
                 return true;
             }
-            self.log.info(
+            let flog = self.log.in_trace(ev.trace.as_ref());
+            flog.info(
                 "start.a2a.fired",
                 json!({"workflow": workflow, "node": node, "conversation": ctx,
                        "command": op, "role": role}),
             );
-            self.fire_start(&workflow, &node, &spec, payload, "a2a");
+            // The run is the message's unit of work, and continues its trace.
+            self.fire_start_run(
+                &workflow,
+                &node,
+                &spec,
+                payload,
+                "a2a",
+                None,
+                ev.trace.as_ref(),
+            );
             return true;
         }
         false
@@ -1222,7 +1333,8 @@ impl Runtime {
                 // left for the next life rather than recorded.
                 match self.parked_kind(node) {
                     Some(kind) if turn.status == "cancelled" => {
-                        self.park_child(node, &kind, Some(turn.usage))
+                        let trace = self.children.get(node).and_then(|c| c.trace.clone());
+                        self.park_child(node, &kind, trace.as_ref(), Some(turn.usage))
                     }
                     _ => self.on_turn_done(node, *turn),
                 }
@@ -1237,7 +1349,8 @@ impl Runtime {
                     Some(kind)
                         if outcome.status == crate::agentloop::stop::TerminalStatus::Cancelled =>
                     {
-                        self.park_child(node, &kind, None)
+                        let trace = self.children.get(node).and_then(|c| c.trace.clone());
+                        self.park_child(node, &kind, trace.as_ref(), None)
                     }
                     _ => self.on_subagent_result(node, Ok(outcome)),
                 }
@@ -1276,13 +1389,14 @@ impl Runtime {
             return;
         };
         self.activity_end(node);
-        self.log.info("child.exit", json!({"node": node.0, "pid": r.pid, "kind": super::children::kind_label(&child.kind), "outcome": format!("{:?}", r.outcome)}));
+        let clog = self.log.in_trace(child.trace.as_ref());
+        clog.info("child.exit", json!({"node": node.0, "pid": r.pid, "kind": super::children::kind_label(&child.kind), "outcome": format!("{:?}", r.outcome)}));
         // A child the drain stopped owes nothing in this life: what it was
         // doing is left for the next (`runtime::drain`), and whatever waits
         // on it is stopped with it.
         if child.parked {
             if !child.settled {
-                self.park_child(node, &child.kind, None);
+                self.park_child(node, &child.kind, child.trace.as_ref(), None);
             }
             return;
         }
@@ -1317,7 +1431,7 @@ impl Runtime {
                     if let Some(res) = reservation {
                         self.governor.release(res);
                     }
-                    self.log.warn(
+                    clog.warn(
                         "turn.failed",
                         json!({"node": node.0, "kind": super::children::kind_label(&child.kind), "err": "worker exited without a result"}),
                     );
@@ -1385,7 +1499,7 @@ impl Runtime {
     }
 
     fn on_unhealthy_child(&mut self, node: NodeId, health: crate::supervisor::liveness::Health) {
-        self.log.warn(
+        self.child_log(node).warn(
             "child.unhealthy",
             json!({"node": node.0, "health": format!("{health:?}")}),
         );

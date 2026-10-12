@@ -49,13 +49,25 @@ use crate::rmcp_transport::BootstrapFailure;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult,
     ElicitationAction, ElicitationCapability, ErrorCode, Implementation as RmcpImpl,
-    ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, SubscriptionFilter,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
+    SubscriptionFilter,
 };
 use rmcp::service::{
     ClientInitializeError, RoleClient, RunningService, Subscription, SubscriptionEnd,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt};
+
+/// One page of a list request: its cursor, and `meta` minted for this request
+/// alone, so each page is a request of its own.
+fn page_params(
+    meta: Option<&crate::http::RequestMeta>,
+    cursor: Option<String>,
+) -> PaginatedRequestParams {
+    let mut p = PaginatedRequestParams::default().with_cursor(cursor);
+    p.meta = meta.map(|m| RequestMetaObject::from(m()));
+    p
+}
 
 /// The revision agentd offers in `initialize`, and the only place it is named.
 ///
@@ -1151,21 +1163,44 @@ impl RmcpClient {
         serde_json::to_value(&res).map_err(|e| rpc_err(&self.name, "tools/call", e))
     }
 
-    pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
+    /// `resources/list`, following the cursor to the end. With `meta`, each
+    /// page's request carries what it mints as its `params._meta`.
+    pub fn list_resources(
+        &self,
+        meta: Option<&crate::http::RequestMeta>,
+    ) -> Result<Vec<Resource>, McpError> {
         let res = self
             .rt
-            .block_on(self.service.list_all_resources())
+            .block_on(async {
+                let mut all = Vec::new();
+                let mut cursor = None;
+                loop {
+                    let page = self
+                        .service
+                        .list_resources(Some(page_params(meta, cursor)))
+                        .await?;
+                    all.extend(page.resources);
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        return Ok::<_, rmcp::ServiceError>(all);
+                    }
+                }
+            })
             .map_err(|e| self.fail("resources/list", e))?;
         self.convert(&res, "resources/list")
     }
 
-    pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+    /// `resources/read`, with `meta` as its `params._meta`.
+    pub fn read_resource(
+        &self,
+        uri: &str,
+        meta: Option<serde_json::Map<String, Value>>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let mut params = ReadResourceRequestParams::new(uri.to_string());
+        params.meta = meta.map(RequestMetaObject::from);
         let res = self
             .rt
-            .block_on(
-                self.service
-                    .read_resource(ReadResourceRequestParams::new(uri.to_string())),
-            )
+            .block_on(self.service.read_resource(params))
             .map_err(|e| self.fail(&format!("resources/read {uri}"), e))?;
         self.convert(&res, "resources/read")
     }
@@ -1178,13 +1213,16 @@ impl RmcpClient {
         self.convert(&res, "prompts/list")
     }
 
+    /// `prompts/get`, with `meta` as its `params._meta`.
     pub fn get_prompt(
         &self,
         name: &str,
         arguments: Option<Value>,
+        meta: Option<serde_json::Map<String, Value>>,
     ) -> Result<crate::wire::GetPromptResult, McpError> {
         let mut params = rmcp::model::GetPromptRequestParams::new(name);
         params.arguments = arguments.and_then(|a| a.as_object().cloned());
+        params.meta = meta.map(RequestMetaObject::from);
         let res = self
             .rt
             .block_on(self.service.get_prompt(params))
@@ -1192,10 +1230,12 @@ impl RmcpClient {
         self.convert(&res, "prompts/get")
     }
 
+    /// `completion/complete`, with `meta` as its `params._meta`.
     pub fn complete(
         &self,
         reference: Value,
         argument: Value,
+        meta: Option<serde_json::Map<String, Value>>,
     ) -> Result<crate::wire::CompleteResult, McpError> {
         // Both halves are protocol-typed by the SDK: `ref` is a tagged union
         // over prompt/resource references, and a shape it does not recognise is
@@ -1204,20 +1244,38 @@ impl RmcpClient {
             .map_err(|e| rpc_err(&self.name, "completion/complete ref", e))?;
         let argument = serde_json::from_value(argument)
             .map_err(|e| rpc_err(&self.name, "completion/complete argument", e))?;
+        let mut params = rmcp::model::CompleteRequestParams::new(r#ref, argument);
+        params.meta = meta.map(RequestMetaObject::from);
         let res = self
             .rt
-            .block_on(
-                self.service
-                    .complete(rmcp::model::CompleteRequestParams::new(r#ref, argument)),
-            )
+            .block_on(self.service.complete(params))
             .map_err(|e| self.fail("completion/complete", e))?;
         self.convert(&res, "completion/complete")
     }
 
-    pub fn list_resource_templates(&self) -> Result<Vec<crate::wire::ResourceTemplate>, McpError> {
+    /// `resources/templates/list`, following the cursor to the end; `meta`
+    /// as for [`Self::list_resources`].
+    pub fn list_resource_templates(
+        &self,
+        meta: Option<&crate::http::RequestMeta>,
+    ) -> Result<Vec<crate::wire::ResourceTemplate>, McpError> {
         let res = self
             .rt
-            .block_on(self.service.list_all_resource_templates())
+            .block_on(async {
+                let mut all = Vec::new();
+                let mut cursor = None;
+                loop {
+                    let page = self
+                        .service
+                        .list_resource_templates(Some(page_params(meta, cursor)))
+                        .await?;
+                    all.extend(page.resource_templates);
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        return Ok::<_, rmcp::ServiceError>(all);
+                    }
+                }
+            })
             .map_err(|e| self.fail("resources/templates/list", e))?;
         self.convert(&res, "resources/templates/list")
     }

@@ -71,9 +71,13 @@ changes. [Architecture](architecture.md) shows the whole process tree.
 Each tool a server advertises is registered under its own name, or under
 `<server>.<tool>` when another tool already has that name, or `<ns>.<tool>`
 when the server sets a namespace. Every call carries agentd's correlation
-data in `_meta`: the run id, the instance, the W3C trace context and, where
-a retry may repeat the call, an idempotency key. A backing service uses it
-to attribute a call and to drop a duplicate.
+data in `_meta`: the run id, the instance and, where a retry may repeat the
+call, an idempotency key. A backing service uses it to attribute a call and
+to drop a duplicate. Every request, a call or any other, carries the W3C
+trace context of the unit of work it is made for in `_meta.traceparent`,
+under a span of its own. What a connection asks for itself — its handshake,
+the lists that keep the catalogue, subscriptions — carries the process
+trace.
 
 ## How a connection starts
 

@@ -578,7 +578,7 @@ fn admit(
                 let to = cfg.model.clone().unwrap_or_default();
                 match cfg.client() {
                     Ok(mut c) => {
-                        c.set_trace_id(intel.trace_id().map(str::to_string));
+                        c.set_trace(intel.trace().cloned());
                         log.info(
                             "turn.model_degraded",
                             json!({"turn": spec.turn_id, "from": model, "to": to, "provider": cfg.provider}),
@@ -773,7 +773,7 @@ fn run_decision(
         let again = match squeezed {
             Some(c) => ask(&c, &to),
             None => cfg.client().and_then(|mut c| {
-                c.set_trace_id(intel.trace_id().map(str::to_string));
+                c.set_trace(intel.trace().cloned());
                 ask(&c, &to)
             }),
         };
@@ -1032,6 +1032,8 @@ mod tests {
                 comp: Comp::Agent,
                 pid: 0,
                 trace_id: None,
+                span_id: None,
+                parent_span_id: None,
             },
             Level::Warn,
         )

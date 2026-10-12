@@ -75,7 +75,7 @@ impl Runtime {
                     Some(r) => {
                         r.status = crate::engine::RunStatus::Paused;
                         r.touch();
-                        self.log
+                        self.run_log(run)
                             .info("run.paused", json!({"run": run, "reason": reason}));
                         json!({"ok": true, "paused": run})
                     }
@@ -98,7 +98,7 @@ impl Runtime {
                     Some(r) if r.status == crate::engine::RunStatus::Paused => {
                         r.status = crate::engine::RunStatus::Running;
                         r.touch();
-                        self.log.info("run.resumed", json!({"run": run}));
+                        self.run_log(run).info("run.resumed", json!({"run": run}));
                         json!({"ok": true, "resumed": run})
                     }
                     Some(_) => {

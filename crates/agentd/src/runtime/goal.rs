@@ -17,6 +17,7 @@
 //! The check runs on a durable `{"kind":"goal"}` timer, so its cadence survives a
 //! restart.
 
+use crate::obs::trace::TraceContext;
 use serde_json::{Value, json};
 
 use crate::config::settings::{Goal, GoalAction, ModelKind, ModelRole};
@@ -228,6 +229,9 @@ impl crate::runtime::reactor::Runtime {
         let escalate = self.escalate_config(reference.as_deref());
         let confidence = self.settings.intelligence.role_confidence(ModelRole::Goal);
         let tx = self.events_tx.clone();
+        // The goal is the instance's, so its check is a span of the process
+        // trace.
+        let trace = self.trace.clone();
         let statement = g.statement.clone().unwrap_or_default();
         let stuck_det = no_progress >= stuck_after;
         // A compact snapshot — enough for the judge, not the whole status dump.
@@ -247,9 +251,16 @@ impl crate::runtime::reactor::Runtime {
             .name("goal-judge".into())
             .spawn(move || {
                 let mut result = if decided {
-                    goal_decision_call(&intel, escalate.as_ref(), confidence, &statement, &summary)
+                    goal_decision_call(
+                        &intel,
+                        escalate.as_ref(),
+                        confidence,
+                        &statement,
+                        &summary,
+                        &trace,
+                    )
                 } else {
-                    goal_judge_call(&intel, &statement, &summary)
+                    goal_judge_call(&intel, &statement, &summary, &trace)
                 };
                 if let Value::Object(m) = &mut result {
                     m.insert("stuck_det".into(), json!(stuck_det));
@@ -339,13 +350,19 @@ fn goal_every_ms(g: &Goal) -> u64 {
 
 /// The blocking LLM call (on an executor thread): ask the model to judge the goal.
 #[allow(clippy::too_many_arguments)]
-fn goal_judge_call(intel: &IntelConfig, statement: &str, summary: &Value) -> Value {
+fn goal_judge_call(
+    intel: &IntelConfig,
+    statement: &str,
+    summary: &Value,
+    trace: &TraceContext,
+) -> Value {
     // Built as a worker's client is — the dialect, the headers, the signer,
     // the fallbacks — so a working agent never has a broken watchdog.
-    let client = match intel.client() {
+    let mut client = match intel.client() {
         Ok(c) => c,
         Err(e) => return json!({"achieved": false, "stuck": false, "error": format!("intel: {e}")}),
     };
+    client.set_trace(Some(trace.clone()));
     let system = "You are the goal supervisor for an autonomous agent. Given the GOAL and the agent's current STATE, judge whether the goal is achieved and whether the agent is stuck (making no meaningful progress toward it). Reply with ONLY compact JSON: {\"achieved\": <bool>, \"stuck\": <bool>, \"reason\": \"<short>\"}.";
     let user = format!(
         "GOAL: {statement}\n\nSTATE:\n{}\n\nJudge now.",
@@ -387,6 +404,7 @@ pub(crate) fn goal_decision_call(
     confidence: Option<f64>,
     statement: &str,
     summary: &Value,
+    trace: &TraceContext,
 ) -> Value {
     use crate::wire::decision::{Decision, Question, unsure};
     let decision = Decision {
@@ -410,7 +428,8 @@ pub(crate) fn goal_decision_call(
     };
     let mut usage = crate::wire::intel::Usage::default();
     let mut ask = |cfg: &IntelConfig| -> Result<(crate::wire::decision::Answers, String), String> {
-        let client = cfg.client().map_err(|e| format!("intel: {e}"))?;
+        let mut client = cfg.client().map_err(|e| format!("intel: {e}"))?;
+        client.set_trace(Some(trace.clone()));
         let model = cfg.model.clone().unwrap_or_default();
         let resp = client
             .complete(&Request {

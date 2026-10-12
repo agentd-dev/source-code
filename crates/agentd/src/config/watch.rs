@@ -574,6 +574,8 @@ mod tests {
                 comp: Comp::Supervisor,
                 pid: std::process::id(),
                 trace_id: None,
+                span_id: None,
+                parent_span_id: None,
             },
             // Quiet: only emit errors during the test (info/fired lines are noise).
             Level::Error,

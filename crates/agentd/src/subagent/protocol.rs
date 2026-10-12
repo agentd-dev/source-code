@@ -662,8 +662,15 @@ pub struct Telemetry {
     pub instance: String,
     pub agent_id: String,
     pub agent_path: String,
+    /// The unit of work the child serves, as W3C Trace Context: the
+    /// `traceparent` names the span that spawned it — the step's, the turn's,
+    /// the spawning call's — with the unit's flags, and the child makes a span
+    /// of its own under it. Its log lines, its MCP requests and its model calls
+    /// all carry the trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trace_id: Option<String>,
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<String>,
     pub log_level: String,
     /// Content-capture policy: when true the child logs tool args and results,
     /// not just their lengths. Off by default because those payloads routinely
@@ -674,6 +681,22 @@ pub struct Telemetry {
     /// Absent, it falls back to the inherited `OTEL_EXPORTER_OTLP_ENDPOINT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_endpoint: Option<String>,
+}
+
+impl Telemetry {
+    /// The spawning span, when one was handed down.
+    pub fn trace(&self) -> Option<crate::obs::trace::TraceContext> {
+        crate::obs::trace::TraceContext::parse(
+            self.traceparent.as_deref()?,
+            self.tracestate.as_deref(),
+        )
+    }
+
+    /// Hand the child `t` as its spawning span.
+    pub fn set_trace(&mut self, t: &crate::obs::trace::TraceContext) {
+        self.traceparent = Some(t.traceparent());
+        self.tracestate = t.tracestate.clone();
+    }
 }
 
 #[cfg(test)]
@@ -723,7 +746,8 @@ mod tests {
                 instance: "i1".into(),
                 agent_id: "0.1".into(),
                 agent_path: "0.1".into(),
-                trace_id: None,
+                traceparent: None,
+                tracestate: None,
                 log_level: "info".into(),
                 log_content: false,
                 otel_endpoint: None,

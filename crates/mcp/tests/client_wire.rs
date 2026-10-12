@@ -2,11 +2,14 @@
 //! What a tools/call and the notification stream put on the wire, asserted
 //! from the server's side — the only side that can tell.
 //!
-//! * The persistent `_meta` a host stamps on a connection (run id, instance,
-//!   traceparent) reaches the server in `params._meta`, merged with any
+//! * The persistent `_meta` a host stamps on a connection's tool calls (run
+//!   id, instance) reaches the server in `params._meta`, merged with any
 //!   per-call meta, and the tool's `arguments` carry the tool's arguments and
 //!   nothing else: MCP reserves `params._meta`, and a strict tool schema
 //!   (`additionalProperties: false`) refuses a stray `_meta` argument.
+//! * The request meta a host gives a connection (a W3C trace context) rides
+//!   every request it sends, minted afresh for each, and a request that
+//!   carries its own keeps them.
 //! * A caller's per-call bound governs: a tool that never answers is a timeout
 //!   error inside the bound, not a wait for the connection's long default —
 //!   and the call it abandoned holds up no call after it.
@@ -23,6 +26,7 @@ mod common;
 
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -182,6 +186,19 @@ fn spawn_server(seen: Seen, get: GetMode) -> String {
                             );
                         }
                     },
+                    // Two pages, so a list is two requests.
+                    "resources/list" => {
+                        let result = if msg["params"]["cursor"] == "p2" {
+                            json!({"resources": [{"uri": "demo://b", "name": "b"}]})
+                        } else {
+                            json!({"resources": [{"uri": "demo://a", "name": "a"}], "nextCursor": "p2"})
+                        };
+                        respond(
+                            &mut w,
+                            "",
+                            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                        )
+                    }
                     _ => respond(
                         &mut w,
                         "",
@@ -278,6 +295,150 @@ fn the_connection_meta_rides_params_meta_merged_with_the_call_meta() {
     );
     assert_eq!(calls[1].body["params"]["_meta"]["agent/claim_key"], "k-1");
     assert_eq!(calls[1].body["params"]["arguments"], json!({"s": "again"}));
+}
+
+/// A host's request meta reaches every request the connection sends — the
+/// handshake, a `tools/list`, a `tools/call`, a `resources/read` —
+/// called afresh for each one, so each carries a span of its own; a request
+/// that names its own `traceparent` keeps it, and gets no `tracestate` but its
+/// own beside it.
+#[test]
+fn the_request_meta_rides_every_request_and_a_requests_own_trace_wins() {
+    let seen: Seen = Arc::default();
+    let ep = spawn_server(Arc::clone(&seen), GetMode::NotAllowed);
+    let minted = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&minted);
+    let mut c = McpClient::connect("wire", &ep, vec![], Duration::from_secs(10))
+        .expect("connect")
+        .with_request_meta(Arc::new(move || {
+            let span = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "traceparent".into(),
+                json!(format!(
+                    "00-0af7651916cd43dd8448eb211c80319c-{span:016x}-01"
+                )),
+            );
+            m.insert("tracestate".into(), json!("wire=1"));
+            m
+        }));
+    c.initialize().expect("initialize");
+    c.list_tools().expect("list");
+    c.call_tool("echo", Some(json!({"s": "hi"}))).expect("call");
+    // The stub answers a read with an empty result; what it received is the
+    // point.
+    let _ = c.read_resource("demo://x", None);
+    let own = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+    let _ = c.read_resource("demo://y", Some(&json!({"traceparent": own})));
+
+    let requests: Vec<Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.body.get("id").is_some() && r.body.get("method").is_some())
+        .map(|r| r.body.clone())
+        .collect();
+    let method =
+        |m: &str| -> Vec<&Value> { requests.iter().filter(|r| r["method"] == m).collect() };
+    for m in [
+        "server/discover",
+        "tools/list",
+        "tools/call",
+        "resources/read",
+    ] {
+        assert!(
+            !method(m).is_empty(),
+            "no {m} reached the server: {requests:?}"
+        );
+    }
+    let stamped: Vec<&str> = requests
+        .iter()
+        .filter(|r| r["params"]["uri"] != "demo://y")
+        .map(|r| {
+            assert_eq!(r["params"]["_meta"]["tracestate"], "wire=1", "{r}");
+            r["params"]["_meta"]["traceparent"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no traceparent: {r}"))
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<&&str> = stamped.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        stamped.len(),
+        "a span repeated: {stamped:?}"
+    );
+    let y = requests
+        .iter()
+        .find(|r| r["params"]["uri"] == "demo://y")
+        .expect("the second read");
+    assert_eq!(y["params"]["_meta"]["traceparent"], own, "{y}");
+    assert!(y["params"]["_meta"].get("tracestate").is_none(), "{y}");
+    assert_eq!(
+        minted.load(Ordering::SeqCst) as usize,
+        stamped.len() + 1,
+        "the source is called once per request"
+    );
+}
+
+/// A list made for one unit of work carries that unit's keys in place of the
+/// connection's, minted afresh for each page it asks for, so every page is a
+/// span of its own in the unit's trace.
+#[test]
+fn a_list_for_a_unit_carries_its_meta_on_every_page() {
+    let seen: Seen = Arc::default();
+    let ep = spawn_server(Arc::clone(&seen), GetMode::NotAllowed);
+    let mut c = McpClient::connect("wire", &ep, vec![], Duration::from_secs(10))
+        .expect("connect")
+        .with_request_meta(Arc::new(|| {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "traceparent".into(),
+                json!("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            );
+            m.insert("tracestate".into(), json!("wire=1"));
+            m
+        }));
+    c.initialize().expect("initialize");
+    let pages = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&pages);
+    let unit: mcp::http::RequestMeta = Arc::new(move || {
+        let span = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "traceparent".into(),
+            json!(format!(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-{span:016x}-01"
+            )),
+        );
+        m
+    });
+    let listed = c.list_resources(Some(&unit)).expect("list");
+    assert_eq!(listed.len(), 2, "{listed:?}");
+
+    let lists: Vec<Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.body["method"] == "resources/list")
+        .map(|r| r.body.clone())
+        .collect();
+    assert_eq!(lists.len(), 2, "{lists:?}");
+    let spans: std::collections::BTreeSet<&str> = lists
+        .iter()
+        .map(|r| {
+            let tp = r["params"]["_meta"]["traceparent"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no traceparent: {r}"));
+            assert!(
+                tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"),
+                "the unit's trace, not the connection's: {r}"
+            );
+            assert!(r["params"]["_meta"].get("tracestate").is_none(), "{r}");
+            tp
+        })
+        .collect();
+    assert_eq!(spans.len(), 2, "a span repeated: {lists:?}");
+    assert_eq!(pages.load(Ordering::SeqCst), 2);
 }
 
 #[test]

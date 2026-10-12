@@ -19,6 +19,7 @@ use crate::engine::run::{
 };
 use crate::engine::template;
 use crate::governor::Admission;
+use crate::obs::trace::TraceContext;
 use crate::registry::Caller;
 use crate::state::{InboxEvent, Kind, now_ms, ulid};
 use crate::subagent::protocol::{TurnKind, TurnResult, TurnSpec};
@@ -703,7 +704,11 @@ impl Runtime {
                         // A `once` start is autonomous work like any other
                         // trigger, so it is attributed the same way.
                         let acting = self.settings.identity.autonomous_id().to_string();
-                        let _ = self.accept_event(kinds::START_FIRED, Some(acting), json!({"workflow": name, "node": id, "payload": {"fired_at": now_ms()}, "inputs": inputs}));
+                        // What the process was started to do: a span of the
+                        // process trace in a job or under a caller's trace
+                        // (`Runtime::boot_parent`), else a trace of its own.
+                        let parent = self.boot_parent();
+                        let _ = self.accept_event(kinds::START_FIRED, Some(acting), json!({"workflow": name, "node": id, "payload": {"fired_at": now_ms()}, "inputs": inputs}), parent.as_ref());
                     }
                     "manual" => {}
                     // Long-lived starts are armed by arm_long_lived_starts.
@@ -717,7 +722,7 @@ impl Runtime {
     pub(crate) fn on_start_event(&mut self, ev: &InboxEvent) -> bool {
         let name = ev.payload["workflow"].as_str().unwrap_or("").to_string();
         let Some(w) = self.workflows.get(&name).cloned() else {
-            self.log.warn(
+            self.log.in_trace(ev.trace.as_ref()).warn(
                 "start.unknown_workflow",
                 json!({"inbox_event": ev.id, "workflow": name}),
             );
@@ -846,6 +851,9 @@ impl Runtime {
         // one. Triggers carry nothing and so start at 0.
         run.msg_depth = ev.payload["msg_depth"].as_u64().unwrap_or(0) as u32;
         run.key = ev.payload["key"].as_str().map(str::to_string);
+        // The run is the span its start event was accepted as. An event
+        // written before events carried one starts a trace here.
+        run.trace = Some(ev.trace.clone().unwrap_or_else(TraceContext::mint));
         // Durable before anything runs — unless the workflow opted out of the
         // class entirely (`durable: false`): a memory-only run writes nothing,
         // here or at any checkpoint.
@@ -871,7 +879,7 @@ impl Runtime {
         run.dirty = false;
         // The actor is on the line: "every effect names the human or the
         // schedule that caused it" is only true if you can read it back.
-        self.log.info(
+        self.log.in_trace(run.trace.as_ref()).info(
             "run.start",
             json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id,
                    "acting_for": run.principal, "key": run.key}),
@@ -1006,7 +1014,7 @@ impl Runtime {
             } else {
                 format!("workflow {name:?} definition is gone")
             };
-            self.log
+            self.run_log(run_id)
                 .warn("run.refused", json!({"run": run_id, "reason": reason}));
             if let Some(r) = self.runs.get_mut(run_id) {
                 r.finish(RunStatus::Refused, None, Some(reason));
@@ -1017,7 +1025,8 @@ impl Runtime {
         if let Some(r) = self.runs.get(run_id)
             && run::deadline_passed(r)
         {
-            self.log.warn("run.deadline", json!({"run": run_id}));
+            self.run_log(run_id)
+                .warn("run.deadline", json!({"run": run_id}));
             self.cancel_children_of_run(run_id, "run deadline");
             self.runs.get_mut(run_id).expect("present").finish(
                 RunStatus::Failed,
@@ -1123,7 +1132,7 @@ impl Runtime {
                     ),
                     None => "no ready step and no finish reached".to_string(),
                 };
-                self.log.warn(
+                self.run_log(run_id).warn(
                     "run.stalled",
                     json!({"run": run_id, "blocked_by": culprit.as_ref().map(|(s, _)| s)}),
                 );
@@ -1362,7 +1371,7 @@ impl Runtime {
                     Value::Null,
                 ) {
                     Ok(id) => {
-                        self.log.info(
+                        self.run_log(run_id).info(
                             "step.rate_wait",
                             json!({"run": run_id, "step": step_id, "rate": rate, "wait_ms": wait}),
                         );
@@ -1376,7 +1385,7 @@ impl Runtime {
                     Err(e) => {
                         // A store that cannot arm the wait must not turn a
                         // throttle into a hot loop; proceed unthrottled and say so.
-                        self.log.warn(
+                        self.run_log(run_id).warn(
                             "step.rate_wait_fail",
                             json!({"run": run_id, "step": step_id, "err": e.to_string()}),
                         );
@@ -1404,7 +1413,7 @@ impl Runtime {
                 r.dirty = true;
                 r.steps.entry(step_id.to_string()).or_default().status = StepStatus::Pending;
             }
-            self.log
+            self.run_log(run_id)
                 .info("run.paused", json!({"run": run_id, "before_step": step_id}));
             self.checkpoint(true);
             return;
@@ -1419,7 +1428,7 @@ impl Runtime {
         if !crate::engine::model::pure_data_kind(&step.kind) {
             self.checkpoint(false);
         }
-        self.log.info(
+        self.run_log(run_id).info(
             "step.start",
             json!({"run": run_id, "step": step_id, "kind": step.kind, "attempt": attempt}),
         );
@@ -1468,7 +1477,7 @@ impl Runtime {
         // `cache {key, ttl}`: a fresh memoized output skips the effect.
         let cache_key = match self.cache_lookup(&step, &spec, &data) {
             Some((_key, Some(hit))) => {
-                self.log
+                self.run_log(run_id)
                     .info("step.cache_hit", json!({"run": run_id, "step": step_id}));
                 self.finish_step(run_id, step_id, StepStatus::Done, Some(hit), None, 0);
                 return;
@@ -1515,7 +1524,7 @@ impl Runtime {
                     self.durable.manifest_update(|m| {
                         m.breakers.insert(key.clone(), st);
                     });
-                    self.log
+                    self.run_log(run_id)
                         .info("breaker.probe", json!({"breaker": key, "run": run_id}));
                 }
                 super::breaker::Gate::FastFail { retry_in_ms } => {
@@ -1727,7 +1736,7 @@ impl Runtime {
                         .map_err(|e| e.to_string())
                     {
                         Ok(seq) => {
-                            self.log.info(
+                            self.run_log(run_id).info(
                                 "stream.emit",
                                 json!({"run": run_id, "step": step_id, "stream": stream,
                                        "subject": subject, "seq": seq}),
@@ -1800,7 +1809,7 @@ impl Runtime {
                     self.note_root(format!("run {run_id}: {n}"));
                 }
                 if let Some(a) = spec.get("audit") {
-                    self.log.info(
+                    self.run_log(run_id).info(
                         "audit.emit",
                         json!({"run": run_id, "step": step_id, "audit": a}),
                     );
@@ -1964,7 +1973,10 @@ impl Runtime {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| crate::engine::run::idempotency_key(run_id, step_id));
-                let meta = json!({"agent/idempotency_key": key, "agent/attempt": attempt, "agent/instance": self.instance, "agent/run": run_id});
+                let mut meta = json!({"agent/idempotency_key": key, "agent/attempt": attempt, "agent/instance": self.instance, "agent/run": run_id});
+                // A span of the run's: a retry or a replay is another span in
+                // the same trace, the idempotency key unchanged.
+                crate::mcp::stamp_trace(&mut meta, self.run_trace(run_id).as_ref());
                 let timeout = step
                     .timeout_ms
                     .map(std::time::Duration::from_millis)
@@ -2443,8 +2455,9 @@ impl Runtime {
                         c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>
                     })
                 };
+                let trace = self.run_trace(run_id);
                 self.skills
-                    .load(name, None, &resolver)
+                    .load(name, None, &resolver, trace.as_ref())
                     .ok()
                     .map(|b| format!("### Skill: {}\n{}", b.name, b.body))
             })
@@ -2505,7 +2518,7 @@ impl Runtime {
         let reservation = match self.governor.admit(est, &scopes, now_ms()) {
             Admission::Ok { reservation, model } => {
                 if let Some(m) = model {
-                    self.log.info(
+                    self.run_log(run_id).info(
                         "budget.degraded",
                         json!({"run": run_id, "step": step_id, "model": m}),
                     );
@@ -2513,7 +2526,7 @@ impl Runtime {
                 Some(reservation)
             }
             Admission::Wait { until_ms, reason } => {
-                self.log.info(
+                self.run_log(run_id).info(
                     "budget.wait",
                     json!({"run": run_id, "step": step_id, "until_ms": until_ms, "reason": reason}),
                 );
@@ -2620,6 +2633,10 @@ impl Runtime {
             decision: work.decision,
             sure: work.sure,
         };
+        // The step's span, under the run's: the worker it spawns is a span of
+        // its own beneath it, and a replay after a crash is another, in the
+        // same trace.
+        let step_trace = self.run_trace(run_id).map(|t| t.child());
         let launch = super::turns::TurnLaunch {
             spec,
             kind: ChildKind::StepTurn {
@@ -2635,6 +2652,7 @@ impl Runtime {
             model: node_model,
             role,
             effort: node_effort,
+            trace: step_trace.clone(),
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -2645,7 +2663,7 @@ impl Runtime {
                 {
                     st.worker = Some(node.0.to_string());
                 }
-                self.log.info(
+                self.log.in_trace(step_trace.as_ref()).info(
                     "step.turn.spawn",
                     json!({"run": run_id, "step": step_id, "node": node.0}),
                 );
@@ -2908,11 +2926,11 @@ impl Runtime {
                         },
                     ) {
                         Ok(meta) => {
-                            self.log.info("step.output.artifact", json!({"run": run_id, "step": step_id, "artifact": meta["id"], "size": meta["size"]}));
+                            self.run_log(run_id).info("step.output.artifact", json!({"run": run_id, "step": step_id, "artifact": meta["id"], "size": meta["size"]}));
                             Some(json!({"$artifact": meta["id"], "size": meta["size"]}))
                         }
                         Err(e) => {
-                            self.log.warn(
+                            self.run_log(run_id).warn(
                                 "step.output.artifact_fail",
                                 json!({"run": run_id, "step": step_id, "err": e}),
                             );
@@ -2948,7 +2966,7 @@ impl Runtime {
             .and_then(|r| r.step(step_id))
             .map(|s| s.attempt)
             .unwrap_or(1);
-        self.log.info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        self.run_log(run_id).info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
         // Feed the circuit breaker, when this step keeps one. Every ATTEMPT
         // counts (a breaker measures calls, not runs) — except our own
         // fast-fails: refusing to dial is not evidence about the remote.
@@ -3035,7 +3053,7 @@ impl Runtime {
                     let spread = (base / 5).max(1);
                     base.saturating_sub(spread) + (h % (spread * 2 + 1))
                 };
-                self.log.info("step.retry", json!({"run": run_id, "step": step_id, "attempt": attempt, "backoff_ms": backoff}));
+                self.run_log(run_id).info("step.retry", json!({"run": run_id, "step": step_id, "attempt": attempt, "backoff_ms": backoff}));
                 if backoff == 0 {
                     if let Some(st) = self
                         .runs
@@ -3099,7 +3117,7 @@ impl Runtime {
                     st.status = StepStatus::Pending;
                     st.forced = true;
                 }
-                self.log.info(
+                self.run_log(run_id).info(
                     "step.timeout_routed",
                     json!({"run": run_id, "step": step_id, "to": t}),
                 );
@@ -3156,7 +3174,7 @@ impl Runtime {
             match routed {
                 Ok(next) => {
                     if !next.is_empty() {
-                        self.log.info(
+                        self.run_log(run_id).info(
                             "step.goto",
                             json!({"run": run_id, "from": step_id, "to": next}),
                         );
@@ -3246,13 +3264,14 @@ impl Runtime {
         for id in drop {
             // A non-durable run has nothing in the store to evict.
             let was_durable = self.runs.get(&id).is_none_or(|r| r.durable);
+            // Taken before the record goes: the lines are about the run.
+            let rlog = self.run_log(&id);
             self.runs.remove(&id);
             if was_durable && let Err(e) = self.durable.delete(crate::state::Kind::Run, &id) {
-                self.log
-                    .warn("run.evict.fail", json!({"run": id, "err": e.to_string()}));
+                rlog.warn("run.evict.fail", json!({"run": id, "err": e.to_string()}));
                 continue;
             }
-            self.log.info("run.evicted", json!({"run": id}));
+            rlog.info("run.evicted", json!({"run": id}));
         }
     }
 
@@ -3324,7 +3343,7 @@ impl Runtime {
         }
         self.counters.runs_finished += 1;
         crate::obs::metrics::record_run(status.as_str());
-        self.log.info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
+        self.run_log(run_id).info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
         self.governor.drop_scope(&format!("run:{run_id}"));
         // What the table says the run carries now goes on its record before
         // the sweep below can release the definition it ran under: the
@@ -3414,7 +3433,7 @@ impl Runtime {
                     let depth = self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0) + 1;
                     let cap = self.settings.limits.message_depth();
                     if depth > cap {
-                        self.log.warn(
+                        self.run_log(run_id).warn(
                             "message.too_deep",
                             json!({"run": run_id, "reason": "on_workflow_finished",
                                    "depth": depth, "max": cap}),
@@ -3422,13 +3441,15 @@ impl Runtime {
                         self.note_root(line);
                     } else {
                         let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+                        let trace = self.run_trace(run_id);
                         if let Err(e) = self.accept_event(
                             kinds::A2A_MESSAGE,
                             principal,
                             json!({"text": line.clone(), "context_id": crate::context::ROOT,
                                    "msg_depth": depth}),
+                            trace.as_ref(),
                         ) {
-                            self.log
+                            self.run_log(run_id)
                                 .warn("workflow.think.fail", json!({"run": run_id, "err": e}));
                             self.note_root(line);
                         }
@@ -3619,7 +3640,14 @@ impl Runtime {
                 // The run is handed its caller's text, and so carries what the
                 // caller does (`withhold`) — a workflow tool's run included.
                 let payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx, "msg_depth": caller.msg_depth, "carries": self.caller_carries(caller)});
-                match self.accept_event(kinds::WORKFLOW_RUN, caller.principal.clone(), payload) {
+                // The run continues its caller's trace.
+                let trace = self.caller_trace(caller);
+                match self.accept_event(
+                    kinds::WORKFLOW_RUN,
+                    caller.principal.clone(),
+                    payload,
+                    trace.as_ref(),
+                ) {
                     Ok(_) => {
                         // Process it right away so the caller learns the run id.
                         if let Some(ev) = self.inbox_queue.pop_back() {
@@ -3731,7 +3759,7 @@ impl Runtime {
                             r.dirty = true;
                         }
                     }
-                    self.log
+                    self.run_log(id)
                         .info("run.breakpoint", json!({"run": id, "before_step": step}));
                     return ToolOutcome::Ready(json!({"run": id, "break_before": step}), false);
                 }
@@ -3910,7 +3938,9 @@ impl Runtime {
             }
             "workflow.signal" => {
                 let sname = args["name"].as_str().unwrap_or("").to_string();
-                let _ = self.accept_event(kinds::SIGNAL, caller.principal.clone(), json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub(), "carries": self.caller_carries(caller)}));
+                // A run the signal starts continues the sender's trace.
+                let trace = self.caller_trace(caller);
+                let _ = self.accept_event(kinds::SIGNAL, caller.principal.clone(), json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub(), "carries": self.caller_carries(caller)}), trace.as_ref());
                 // The signal goes on the durable inbox; waits and `signal`
                 // start nodes are woken when the loop drains it, so no
                 // delivery count is available at this point.
@@ -4127,13 +4157,13 @@ pub(crate) fn read_resource_any(
             .get(server)
             .ok_or_else(|| format!("mcp server {server:?} is not connected"))?;
         return c
-            .read_resource(res)
+            .read_resource(res, None)
             .map(|r| r.text())
             .map_err(|e| e.to_string());
     }
     let mut last = String::from("no connected server serves it");
     for c in mcp.values() {
-        match c.read_resource(uri) {
+        match c.read_resource(uri, None) {
             Ok(r) => return Ok(r.text()),
             Err(e) => last = e.to_string(),
         }

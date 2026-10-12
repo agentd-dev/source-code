@@ -77,18 +77,24 @@ production capture.
 ## Read a log line
 
 Every line carries the same envelope: `ts`, `level`, `event`, `run_id`,
-`agent_id`, `agent_path`, `comp`, `pid` and `trace_id`. The event's own
-fields sit beside them. Keys are in alphabetical order, so parse by name.
+`agent_id`, `agent_path`, `comp`, `pid`, `trace_id` and `span_id`, and
+`parent_span_id` when the span has a parent. The event's own fields sit
+beside them. Keys are in alphabetical order, so parse by name.
 
 ```json
-{"agent_id":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","agent_path":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","comp":"agent","event":"turn.done","level":"info","pid":1845136,"rounds":1,"run_id":"01M4P4004MMJKM81HAZA0JFGP4","status":"completed","tokens_in":11,"tokens_out":5,"tool_calls":0,"trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.412Z","turn":"main-01M4P4004VPT9M256ZXBGDGV3C/work#1"}
+{"agent_id":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","agent_path":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","comp":"agent","event":"turn.done","level":"info","parent_span_id":"5e3cf0a1d2b4c697","pid":1845136,"rounds":1,"run_id":"01M4P4004MMJKM81HAZA0JFGP4","span_id":"a1b2c3d4e5f60718","status":"completed","tokens_in":11,"tokens_out":5,"tool_calls":0,"trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.412Z","turn":"main-01M4P4004VPT9M256ZXBGDGV3C/work#1"}
 ```
 
-Three fields do the correlation:
+Four fields do the correlation:
 
 - **`run_id`** is constant for the whole process tree: every line of one
   invocation shares it. Pin it with `--run-id` to make it meaningful across
   retries.
+- **`trace_id`** names the unit of work the line is about: a workflow run, a
+  conversation turn, and every worker and subagent they start share theirs
+  (see [Correlate with other services](#correlate-with-other-services)).
+  `span_id` is the span within it, and `parent_span_id` that span's
+  parent.
 - **`agent_path`** says which unit of work wrote the line, as a namespace. The
   supervisor is `0`; a workflow step's worker is `run/<run>/<step>`; a
   conversation turn is `turn/<ctx>`; a subagent is `sub/<handle>`. A prefix
@@ -350,19 +356,59 @@ trace fails logs its own line.
 
 ## Correlate with other services
 
-Every line carries a W3C `trace_id`. By default agentd derives it from the
-run id, so the same `--run-id` always maps to the same trace. To join an
-upstream trace, pass its `traceparent` when you start the process:
+Each unit of work is a W3C trace of its own. A unit is a start firing of any
+kind, an A2A message or the `--prompt`, and the run or conversation turn it
+becomes. agentd resolves its trace once, when it accepts the work. A run
+that another run starts continues the starter's trace one span below it:
+a child workflow, a `workflow.run` call, a signal or a `message` the run
+sends. Other work gets a new trace with a random id. The trace is stored
+with the inbox event and the run record. A replayed event, a run resumed
+after a restart, a drain, a wait or a human gate, a step replayed after a
+crash and a restored subagent carry on in the trace they started in.
+
+Everything the unit does carries its trace:
+
+- The supervisor's lines about it carry its `trace_id` and `span_id`:
+  `run.start`, `step.*`, `run.done`, `turn.*`, `subagent.*`, `human.*`. So do
+  its audit records and its events on the `_runtime` stream.
+- Its turn workers and subagents get its `traceparent` in their spawn payload
+  and write it on every line.
+- Every model call sends a `traceparent` HTTP header. That includes the
+  supervisor's own calls: the `approve` judge answering a gate, and the goal
+  check.
+- Every MCP request it makes sends a `traceparent` in `params._meta`:
+  `tools/call`, `resources/read`, `prompts/get`, `completion/complete`, and
+  the `resources/list` and `resources/templates/list` of an `mcp.resource`
+  step, one span per page.
+- An `exec` command gets it as the `TRACEPARENT` environment variable.
+- An instance child is started with it as its `observability.traceparent`.
+
+Each of these hops sends a span id of its own under the unit's span.
+
+The process has a trace of its own for work that belongs to no unit: boot,
+reload, drain, the store, and the requests an MCP connection makes for
+itself — its handshake, the list calls that keep the tool and skill
+catalogue, subscriptions and MCP Events polls. In a job, the work the
+process was started to do is a span of the process trace: the `--prompt`,
+and a run from a `once` start. So a one-shot job is one trace. In a daemon
+that work is a trace of its own, as any other unit's. To join an upstream
+trace, pass its `traceparent` when you start the process:
 
 ```bash
 agentd --config /etc/agentd/triage.yaml --traceparent 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 ```
 
-agentd then continues that trace id. Outbound, it sends a `traceparent` with
-a fresh span id on every model request (as an HTTP header) and on every MCP
-call (in `_meta`), and child processes inherit the trace id, so downstream
-spans line up under the run. An inbound A2A request's `traceparent` is not
-adopted.
+agentd continues that trace id, with the upstream span as its parent, and
+the `--prompt` or `once` run continues it in a daemon too. It keeps the
+upstream's sampling flag: an upstream `00` goes out as `00` on every hop,
+and a turn in an unsampled trace exports no spans. A `traceparent` that is
+not valid W3C (version `ff`, an all-zero id, a wrong length, uppercase hex,
+a character that is not ASCII) is ignored, and the process mints its own.
+The flag takes no `tracestate`, and nothing else supplies one, so the
+hops send none.
+
+An inbound A2A request's or webhook's `traceparent` is not adopted: the
+work it starts gets a trace of its own.
 
 ## Keep an audit trail
 
@@ -387,7 +433,7 @@ outcome. An A2A command's action names the method and the op, so
 `a2a.SendMessage:admin.drain` is a filterable action of its own:
 
 ```json
-{"action":"a2a.SendMessage:admin.drain","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"audit","instance":"probe","level":"info","outcome":"ok","pid":1852065,"principal":"operator","request_id":"m-6","role":"operator","run_id":"01M4P42Z69EJ2J6XDTWTFHP0GR","target":{"task":"01a12c41-84e3-7d91-9007-9a171a6601d3"},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","trace_id":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
+{"action":"a2a.SendMessage:admin.drain","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"audit","instance":"probe","level":"info","outcome":"ok","pid":1852065,"principal":"operator","request_id":"m-6","role":"operator","run_id":"01M4P42Z69EJ2J6XDTWTFHP0GR","span_id":"3e9b0c7d1a2f4865","target":{"task":"01a12c41-84e3-7d91-9007-9a171a6601d3"},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","trace_id":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
 ```
 
 On an `audit` line, `ts` is the record's own timestamp in milliseconds since

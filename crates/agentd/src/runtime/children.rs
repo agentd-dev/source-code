@@ -61,6 +61,9 @@ pub struct Child {
     pub liveness: Liveness,
     pub cancelled: bool,
     pub tokens: u64,
+    /// The span the child was spawned under (its spawn payload's), which the
+    /// supervisor's lines about it carry and whatever it asks for continues.
+    pub trace: Option<crate::obs::trace::TraceContext>,
     /// Whether this child's unit has been settled — a terminal frame
     /// (`TurnDone` / `Failed`) was folded back into the durable state. The
     /// reap path needs the answer *after* the record has left the table (see
@@ -162,11 +165,14 @@ impl Children {
     }
 
     /// Spawn a child (tracked with the reaper). The payload's `telemetry`
-    /// must already carry the correlation ids.
+    /// must already carry the correlation ids. `trace` is the span it is
+    /// spawned under, as handed to it in `telemetry`: kept whole here, with
+    /// the parent the `traceparent` cannot carry, for the lines about it.
     pub fn spawn(
         &mut self,
         payload: &SpawnPayload,
         kind: ChildKind,
+        trace: Option<crate::obs::trace::TraceContext>,
         deadline: Duration,
     ) -> std::io::Result<NodeId> {
         let node = NodeId(self.next);
@@ -188,6 +194,7 @@ impl Children {
             started: now,
             cancelled: false,
             tokens: 0,
+            trace,
             settled: false,
             stop: None,
             parked: false,
@@ -351,16 +358,24 @@ impl Children {
     }
 
     /// Kill and forget every remaining child: a drain past its abandon grace,
-    /// or the process on its way out. Returns each one's node, kind, whether
-    /// its unit was settled and whether the drain parked it, so what it owed
-    /// can still be left for the next life.
-    pub fn abandon(&mut self) -> Vec<(NodeId, ChildKind, bool, bool)> {
+    /// or the process on its way out. Returns each one's node, kind, trace,
+    /// whether its unit was settled and whether the drain parked it, so what
+    /// it owed can still be left for the next life.
+    pub fn abandon(
+        &mut self,
+    ) -> Vec<(
+        NodeId,
+        ChildKind,
+        Option<crate::obs::trace::TraceContext>,
+        bool,
+        bool,
+    )> {
         let gone = self
             .map
             .drain()
             .map(|(node, mut c)| {
                 let _ = c.sub.kill();
-                (node, c.kind, c.settled, c.parked)
+                (node, c.kind, c.trace, c.settled, c.parked)
             })
             .collect();
         self.pid_to_node.clear();

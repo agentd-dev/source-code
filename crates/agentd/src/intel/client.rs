@@ -131,9 +131,10 @@ pub struct IntelClient {
     /// for the length of [`Self::complete_by`]. Each attempt's timeout is cut
     /// to what is left of it, and no backoff sleeps past it.
     deadline: Cell<Option<Instant>>,
-    /// The run's trace id; when set, every completion carries a `traceparent`
-    /// header so the model call joins the run's distributed trace.
-    trace_id: Option<String>,
+    /// The trace of the unit of work the calls serve; when set, every
+    /// completion carries a `traceparent` (a span of its own under it) and the
+    /// unit's `tracestate`, so the model call joins the unit's trace.
+    trace: Option<crate::obs::trace::TraceContext>,
     /// All-endpoints-down backoff policy. `None` — the default, used by
     /// `once`-mode — means a single sweep: all-down returns immediately and the
     /// caller maps it to exit 4. `Some(policy)`, used by loop and reactive
@@ -241,7 +242,7 @@ impl IntelClient {
             // Generous per-call ceiling; the run deadline is the real bound.
             timeout: Duration::from_secs(120),
             deadline: Cell::new(None),
-            trace_id: None,
+            trace: None,
             alldown: None,
             health_reporter: None,
             last_all_down: std::cell::Cell::new(false),
@@ -340,13 +341,13 @@ impl IntelClient {
         self.health_reporter = Some(reporter);
     }
 
-    /// Stamp the run's trace id so each completion carries a `traceparent`
-    /// header and the model call joins the run's distributed trace.
-    pub fn set_trace_id(&mut self, trace_id: Option<String>) {
+    /// Stamp the trace of the unit of work these calls serve, so each
+    /// completion carries a `traceparent` header and joins it.
+    pub fn set_trace(&mut self, trace: Option<crate::obs::trace::TraceContext>) {
         if let Some(f) = &mut self.fallback {
-            f.client.set_trace_id(trace_id.clone());
+            f.client.set_trace(trace.clone());
         }
-        self.trace_id = trace_id;
+        self.trace = trace;
     }
 
     /// Enable the all-endpoints-down backoff for a long-lived `loop` or
@@ -370,10 +371,10 @@ impl IntelClient {
         self.list.borrow().len()
     }
 
-    /// The run's trace id, if stamped. A hot-swap reads it to re-stamp the
-    /// rebuilt client, so the run's trace survives a repoint unbroken.
-    pub fn trace_id(&self) -> Option<&str> {
-        self.trace_id.as_deref()
+    /// The unit's trace, if stamped. A hot-swap or a degrade reads it to
+    /// re-stamp the client it builds, so the trace survives a repoint unbroken.
+    pub fn trace(&self) -> Option<&crate::obs::trace::TraceContext> {
+        self.trace.as_ref()
     }
 
     /// Whether the all-endpoints-down backoff is enabled, which it is for a
@@ -494,7 +495,7 @@ impl IntelClient {
                     req,
                     self.timeout,
                     deadline,
-                    self.trace_id.as_deref(),
+                    self.trace.as_ref(),
                 )
             };
 
@@ -867,8 +868,8 @@ mod tests {
         // Construction does not connect; we only assert the trace id is held and
         // would be applied per endpoint (the per-endpoint dial appends it).
         let mut c = IntelClient::from_parts("https://intel.example", None).unwrap();
-        assert!(c.trace_id.is_none());
-        c.set_trace_id(Some("1234567890abcdef1234567890abcdef".into()));
-        assert!(c.trace_id.is_some());
+        assert!(c.trace.is_none());
+        c.set_trace(Some(crate::obs::trace::TraceContext::mint()));
+        assert!(c.trace.is_some());
     }
 }

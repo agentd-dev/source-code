@@ -98,7 +98,7 @@ fn resolve_verify_key(
 ) -> Option<(Vec<u8>, String)> {
     for src in sources {
         if crate::config::attest::is_jwks_uri(src) {
-            let Ok(r) = client.read_resource(src) else {
+            let Ok(r) = client.read_resource(src, None) else {
                 continue;
             };
             let Ok(v) = serde_json::from_str::<Value>(&r.text()) else {
@@ -207,25 +207,31 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         Some(r) => r,
         None => crate::state::ulid::new(),
     };
-    let trace = crate::obs::trace::resolve(&run_id, settings.observability.traceparent.as_deref());
+    // The process's own trace: what belongs to no unit of work — boot,
+    // reload, drain, the store, background MCP traffic. An operator's
+    // `observability.traceparent` is continued; otherwise it is minted. Each
+    // unit of work gets a trace of its own when it is accepted.
+    let trace =
+        crate::obs::trace::TraceContext::resolve(settings.observability.traceparent.as_deref());
+    crate::obs::trace::set_process(trace.clone());
     let level = settings
         .observability
         .log_level
         .as_deref()
         .and_then(Level::parse)
         .unwrap_or(Level::Info);
-    let log = Logger::new(
-        LogCtx {
-            run_id: run_id.clone(),
-            agent_id: "sup".into(),
-            agent_path: "0".into(),
-            comp: Comp::Supervisor,
-            pid: std::process::id(),
-            trace_id: Some(trace.trace_id.clone()),
-        },
-        level,
-    )
-    .with_content(settings.observability.log_content);
+    let mut ctx = LogCtx {
+        run_id: run_id.clone(),
+        agent_id: "sup".into(),
+        agent_path: "0".into(),
+        comp: Comp::Supervisor,
+        pid: std::process::id(),
+        trace_id: None,
+        span_id: None,
+        parent_span_id: None,
+    };
+    ctx.set_trace(&trace);
+    let log = Logger::new(ctx, level).with_content(settings.observability.log_content);
     log.info("proc.start", json!({"version": crate::VERSION, "instance": instance, "config_files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()}));
     for w in &loaded.warnings {
         log.warn("config.warning", json!({"warning": w}));
@@ -349,11 +355,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             .and_then(|mut c| c.initialize().map(|()| c))
         {
             Ok(mut c) => {
-                c.set_tool_meta(crate::mcp::tool_meta(
-                    &run_id,
-                    &instance,
-                    Some(&trace.trace_id),
-                ));
+                c.set_tool_meta(crate::mcp::tool_meta(&run_id, &instance));
                 let tools = c.list_tools().unwrap_or_default();
                 // What the connect's priming list and this one dropped.
                 report_dropped_tools(&log, &s.name, &c);
@@ -640,7 +642,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_left: Default::default(),
         idle_since: None,
         intel,
-        trace_id: Some(trace.trace_id.clone()),
+        trace,
         started: Instant::now(),
         seq: 0,
         process_nonce: crate::state::ulid::new(),
@@ -723,13 +725,18 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             Ok(mut r) => {
                 r.dirty = false;
                 if !r.status.is_terminal() {
+                    // A run carries on in the trace it started in; one
+                    // recorded before runs had traces starts one now.
+                    if r.trace.is_none() {
+                        r.trace = Some(crate::obs::trace::TraceContext::mint());
+                    }
                     // Replay policy: a step left `running` by the crash is
                     // re-executed under the SAME idempotency key, so a remote
                     // that already saw the first attempt can deduplicate it;
                     // a suspended step keeps the wait it was parked on.
                     for (id, st) in r.steps.iter_mut() {
                         if st.status == StepStatus::Running {
-                            log.info(
+                            log.in_trace(r.trace.as_ref()).info(
                                 "restore.step.replay",
                                 json!({"run": r.id, "step": id, "attempt": st.attempt}),
                             );
@@ -800,6 +807,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             role: Some("system"),
             request_id: None,
             sid: None,
+            trace: None,
         });
     }
 
@@ -934,7 +942,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                     if let Some(r) = rt.runs.get_mut(&rid) {
                         r.end_step(&sid, StepStatus::Skipped, None, None);
                     }
-                    rt.log.info(
+                    rt.run_log(&rid).info(
                         "restore.step.skipped",
                         json!({"run": rid, "step": sid, "on_replay": "skip"}),
                     );
@@ -952,7 +960,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                             ),
                         );
                     }
-                    rt.log.warn(
+                    rt.run_log(&rid).warn(
                         "restore.step.failed",
                         json!({"run": rid, "step": sid, "on_replay": "fail"}),
                     );
@@ -1026,7 +1034,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // Skill references in the instruction preload into the root context.
     let refs = rt.skills.references(&rt.instruction.text.clone());
     if !refs.is_empty() {
-        let unknown = rt.preload_skills(crate::context::ROOT, &refs, None);
+        let unknown = rt.preload_skills(crate::context::ROOT, &refs, None, None);
         for u in unknown {
             rt.note_root(format!(
                 "skill.unknown: {u:?} referenced by the instruction is not in the catalogue"
@@ -1255,12 +1263,16 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // instance up (`workflow.create` a loop/schedule/subscribe) instead of
     // only answering once. Whether the process then exits is the ordinary
     // lifecycle question: `auto` stays up iff something long-lived is armed.
+    // The prompt is what the process was started to do: its turn is traced
+    // as a `once` start's run is (`Runtime::boot_parent`).
+    let parent = rt.boot_parent();
     if let Some(prompt) = rt.settings.agent.prompt.clone()
         && !prompt.trim().is_empty()
         && let Err(err) = rt.accept_event(
             events::kinds::A2A_MESSAGE,
             Some("operator".into()),
             json!({"text": prompt, "context_id": crate::context::ROOT}),
+            parent.as_ref(),
         )
     {
         log.warn("prompt.reject", json!({"err": err}));
@@ -1276,7 +1288,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                     let kind = e["kind"].as_str().unwrap_or(events::kinds::A2A_MESSAGE).to_string();
                     let principal = e["principal"].as_str().map(str::to_string);
                     let payload = e.get("payload").cloned().unwrap_or(Value::Null);
-                    if let Err(err) = rt.accept_event(&kind, principal, payload) {
+                    if let Err(err) = rt.accept_event(&kind, principal, payload, None) {
                         log.warn("test.inbox.reject", json!({"err": err}));
                     }
                 }
@@ -1996,7 +2008,7 @@ impl Runtime {
         };
         let mut last_err = String::from("no connected MCP server serves it");
         for (name, c) in candidates {
-            match c.read_resource(res) {
+            match c.read_resource(res, None) {
                 Ok(r) => {
                     // An encrypted envelope served as a resource decrypts (or
                     // refuses) here — a decode failure is terminal, not a

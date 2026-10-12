@@ -149,7 +149,7 @@ the short one when both are set.
 | `--metrics-addr <ADDR>` | `observability.metrics_addr` | `AGENTD_METRICS_ADDR` | off |
 | `--health-file <PATH>` | `observability.health_file` | | off |
 | `--events-ring <N>` | `observability.events_ring` | | `1024` |
-| `--traceparent <W3C>` | `observability.traceparent` | `AGENTD_TRACEPARENT` | derived from the run id |
+| `--traceparent <W3C>` | `observability.traceparent` | `AGENTD_TRACEPARENT` | a random trace |
 | `--allow-trifecta` | `security.allow_trifecta` | `AGENTD_ALLOW_TRIFECTA` | `false` |
 | `--tls-ca <PATH>` | `security.tls_ca` | `AGENTD_TLS_CA` | bundled roots only |
 | `--aauth-provider`, `--aauth-key-file`, `--aauth-enroll-token`, `--aauth-enroll-assertion-file`, `--aauth-person-server` | `security.aauth.*` | | |

@@ -322,5 +322,6 @@ fn audit(rt: &Runtime, principal: &Principal, action: &str, target: Value) {
         role: Some(&role),
         request_id: None,
         sid: principal.session.as_deref(),
+        trace: None,
     });
 }

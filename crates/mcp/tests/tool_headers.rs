@@ -226,8 +226,8 @@ fn every_header_rmcp_adds_is_one_agentd_refuses() {
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     c.call_tool("regional", Some(json!({"region": "eu"})))
         .unwrap();
-    let _ = c.read_resource("demo://x");
-    let _ = c.get_prompt("p", None);
+    let _ = c.read_resource("demo://x", None);
+    let _ = c.get_prompt("p", None, None);
     let _ = c.subscribe("demo://x");
     let transport = [
         "host",

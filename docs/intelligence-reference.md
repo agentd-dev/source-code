@@ -29,9 +29,10 @@ and for operators reading a failed call. The concepts behind it are in
 | `decisions` | `/v1/decisions` | as configured |
 
 Every request is `POST`, HTTP/1.1, with `Connection: close`, on a fresh
-connection, non-streaming. When the run has a trace id, a `traceparent`
-header is added. The configured `headers` are added to every request,
-beside the headers the dialect sets.
+connection, non-streaming. Every request carries a `traceparent` header: a
+span of its own in the trace of the unit of work it serves, and that trace's
+`tracestate` when it has one. The configured `headers` are added to every
+request, beside the headers the dialect sets.
 
 ## OpenAI-compatible dialect
 

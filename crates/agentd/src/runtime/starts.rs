@@ -17,6 +17,7 @@ use super::events::kinds;
 use super::reactor::Runtime;
 use crate::engine::model::Step;
 use crate::engine::run::RunStatus;
+use crate::obs::trace::TraceContext;
 use crate::state::now_ms;
 use serde_json::{Map, Value, json};
 
@@ -452,11 +453,13 @@ impl Runtime {
         payload: Value,
         kind: &str,
     ) -> Admission {
-        self.fire_start_run(workflow, node, spec, payload, kind, None)
+        self.fire_start_run(workflow, node, spec, payload, kind, None, None)
     }
 
     /// Like [`Runtime::fire_start`], with an optional pre-generated `run_id` (so a
-    /// caller — e.g. a `respond: sync` webhook — can link the run before it starts).
+    /// caller — e.g. a `respond: sync` webhook — can link the run before it starts),
+    /// and the trace the run continues, when the firing has one (`parent`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_start_run(
         &mut self,
         workflow: &str,
@@ -465,13 +468,18 @@ impl Runtime {
         payload: Value,
         kind: &str,
         run_id: Option<&str>,
+        parent: Option<&TraceContext>,
     ) -> Admission {
-        self.admit_start(workflow, node, spec, payload, kind, run_id, None, None)
+        self.admit_start(
+            workflow, node, spec, payload, kind, run_id, None, None, parent,
+        )
     }
 
     /// Like [`Runtime::fire_start`], for a firing that hands the run text
     /// another run, child or peer carried (a signal): the start records it,
-    /// and the run carries it (`withhold`).
+    /// and the run carries it (`withhold`). The run continues `parent`, the
+    /// trace of the signal that fired it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_start_carrying(
         &mut self,
         workflow: &str,
@@ -480,6 +488,7 @@ impl Runtime {
         payload: Value,
         kind: &str,
         carries: &super::withhold::Carries,
+        parent: Option<&TraceContext>,
     ) -> Admission {
         self.admit_start(
             workflow,
@@ -490,6 +499,7 @@ impl Runtime {
             None,
             None,
             Some(carries),
+            parent,
         )
     }
 
@@ -522,6 +532,7 @@ impl Runtime {
             None,
             Some(origin),
             (!carries.is_empty()).then_some(&carries),
+            None,
         )
     }
 
@@ -536,6 +547,7 @@ impl Runtime {
         run_id: Option<&str>,
         origin: Option<Value>,
         carries: Option<&super::withhold::Carries>,
+        parent: Option<&TraceContext>,
     ) -> Admission {
         // Every line about this firing carries the same identity, plus the
         // stream position when a consumer is offering an event.
@@ -661,8 +673,8 @@ impl Runtime {
         // `start.fired` and the start-state bookkeeping: a firing whose inbox
         // write failed did not happen, and must neither say it did nor count
         // a loop iteration it never ran.
-        match self.accept_event_store(kinds::START_FIRED, Some(acting), ev) {
-            Ok(_) => {}
+        let trace = match self.accept_event_store(kinds::START_FIRED, Some(acting), ev, parent) {
+            Ok((_, trace)) => trace,
             // A size the store refuses before it is even asked is refused the
             // same way on every offer, so holding it would wedge a stream
             // consumer behind it for ever — the `inputs_invalid` case again.
@@ -685,9 +697,11 @@ impl Runtime {
                     line,
                 );
             }
-        }
+        };
         self.start_held.remove(&Self::start_key(workflow, node));
-        self.log.info("start.fired", fields(json!({})));
+        self.log
+            .in_trace(Some(&trace))
+            .info("start.fired", fields(json!({})));
         crate::obs::metrics::record_reaction();
         let mut st = self.start_state(workflow, node);
         st["last_fired"] = json!(now_ms());
@@ -831,7 +845,7 @@ impl Runtime {
         std::thread::Builder::new()
             .name(format!("mcp.subscribe:{server}"))
             .spawn(move || {
-                let content = client.read_resource(&u).ok().map(|r| {
+                let content = client.read_resource(&u, None).ok().map(|r| {
                     let t = r.text();
                     serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t))
                 });
@@ -933,6 +947,7 @@ impl Runtime {
         _broadcast: bool,
         sender: &super::waits::SignalSender,
         carries: &super::withhold::Carries,
+        trace: Option<&TraceContext>,
     ) -> u64 {
         let (by, may_start) = match sender {
             super::waits::SignalSender::Runtime => (None, None),
@@ -974,7 +989,7 @@ impl Runtime {
             if let Some(id) = &by {
                 trigger["principal"] = json!(id);
             }
-            self.fire_start_carrying(&workflow, &node, &spec, trigger, "signal", carries);
+            self.fire_start_carrying(&workflow, &node, &spec, trigger, "signal", carries, trace);
             fired += 1;
         }
         fired

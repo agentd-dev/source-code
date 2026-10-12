@@ -1906,6 +1906,7 @@ impl Runtime {
             role: None,
             request_id: None,
             sid: None,
+            trace: None,
         });
         self.log.info(event, line);
     }

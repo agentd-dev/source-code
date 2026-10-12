@@ -106,6 +106,66 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - A message whose turn was stopped — by a drain, or a crash — reaches the
   model once when the next start answers it. Its replay appended it to the
   conversation a second time, so the model read it twice.
+- Each unit of work is a trace of its own. A daemon put every run, turn and
+  child of its life in one trace, derived from the process run id, so a
+  pinned `--run-id` gave every life of it the same trace and a restart moved
+  resumed work into a new one. A start firing, an A2A message or the
+  `--prompt` gets a trace when it is accepted, kept with the inbox event and
+  the run: a replayed event, a run resumed after a restart, a drain, a wait or
+  a human gate, and a step replayed after a crash stay in it. A run another
+  run starts — a child workflow, `workflow.run`, a signal or a message it
+  sends — continues the starter's trace.
+- The supervisor's lines about a run, a step, a turn, a subagent, an
+  instance child or a gate carry that unit's `trace_id` — those a drain
+  writes as it parks them included — as its audit record's `trace` and its
+  events on the `_runtime` stream do. Every line carries `span_id`, and
+  `parent_span_id` when the span has a parent; the log format promised both
+  and no line had them.
+- Every MCP request carries a trace context of its own. The `traceparent`
+  was minted once per connection and sent on `tools/call` only, so every
+  call on a connection showed the same span and a `resources/read`,
+  `prompts/get` or `completion/complete` showed none. Each request now
+  carries a span of its own in `params._meta`, in the trace of the unit it is
+  made for, with `tracestate` beside it; an `mcp.resource` step's
+  `resources/list` and `resources/templates/list` carry the run's, a span
+  per page. What a connection asks for itself — its handshake, the lists
+  that keep the catalogue, subscriptions and MCP Events requests — carries
+  the process trace.
+- The `approve` judge and the goal check send a `traceparent` on their model
+  calls. They sent none.
+- An upstream `traceparent` keeps its sampling flag: an unsampled `00` went
+  out as `01` on every hop, and its turns exported their spans. A turn in an
+  unsampled trace exports none. The upstream's span is the parent of the
+  process's, where it was dropped. A `traceparent` is read as W3C Trace
+  Context says: version `ff` and uppercase hex are refused, and a later
+  version is read by its first four fields, where it was refused.
+- A turn worker's and a subagent's spawn payload carries the unit's
+  `traceparent` and `tracestate`, not only its trace id, so the worker's
+  lines, MCP requests and model calls are spans under the step or turn that
+  started it. A restored subagent keeps the trace it was spawned in, as the
+  supervisor's lines about it do.
+- An instance child continues the trace of the unit that spawned it, handed
+  to it as its `observability.traceparent`. Its environment is scrubbed, so
+  it started an unrelated trace. An `exec` command gets the unit's trace as
+  `TRACEPARENT` and `TRACESTATE`.
+
+**Changed.**
+
+- Without `observability.traceparent`, the process trace is random. It was
+  derived from the run id.
+- The work a process was started to do — the `--prompt`, and a run from a
+  `once` start — is a span of the process trace in a job, so a one-shot job
+  is one trace, and under `--traceparent`, so the caller's trace reaches the
+  work. A daemon's is a trace of its own, as any other unit's: the process
+  trace carries its background requests for as long as it runs.
+- `agentd-mcp`: `McpClient::read_resource`, `get_prompt` and `complete` take
+  the request's `_meta`, `list_resources` and `list_resource_templates` a
+  source minting each page's, and `McpClient::with_request_meta` stamps keys
+  into every request a connection sends, minted per request. `agentd-core`:
+  `LogCtx` has `span_id` and `parent_span_id`, `Logger::in_trace` writes the
+  lines about a unit of work, `mcp::tool_meta` takes no trace id, and a spawn
+  payload's `Telemetry` carries `traceparent` and `tracestate` in place of
+  `trace_id`.
 
 **Removed.**
 

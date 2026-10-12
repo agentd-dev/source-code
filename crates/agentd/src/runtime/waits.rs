@@ -195,6 +195,7 @@ impl Runtime {
                 // A workflow's own step signals as the runtime: the operator
                 // wrote it, whoever the run happens to be working for.
                 let carries = self.run_carries(run_id);
+                let trace = self.run_trace(run_id);
                 let delivered = self.deliver_signal(
                     &name,
                     payload,
@@ -202,6 +203,7 @@ impl Runtime {
                     Some(run_id),
                     &SignalSender::Runtime,
                     &carries,
+                    trace.as_ref(),
                 );
                 self.finish_step_pub(
                     run_id,
@@ -802,7 +804,7 @@ impl Runtime {
             }
         }
         for (rid, sid, event) in resolved {
-            self.log.info(
+            self.run_log(&rid).info(
                 "wait.resolved",
                 json!({"run": rid, "step": sid, "kind": "event",
                        "stream": event.get("stream"), "subject": event.get("subject")}),
@@ -924,7 +926,7 @@ impl Runtime {
             }
         }
         for (rid, sid, status, out, err) in resolve {
-            self.log.info(
+            self.run_log(&rid).info(
                 "wait.resolved",
                 json!({"run": rid, "step": sid, "status": status}),
             );
@@ -1110,8 +1112,9 @@ impl Runtime {
             .spawn(move || {
                 // A failed read still resolves the wait, as the inline read did:
                 // the update itself is the event, and `content: null` says the
-                // follow-up read did not land.
-                let content = client.read_resource(&u).ok().map(|r| {
+                // follow-up read did not land. One read serves every run
+                // waiting on the URI, so it is the process's.
+                let content = client.read_resource(&u, None).ok().map(|r| {
                     let t = r.text();
                     serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t))
                 });
@@ -1223,6 +1226,7 @@ impl Runtime {
     /// `run` named as the target), to `signal` start nodes, and into the
     /// recent-signals view. Returns how many waiting steps were woken. How far
     /// it reaches is the `sender`'s (see [`SignalSender`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver_signal(
         &mut self,
         name: &str,
@@ -1231,6 +1235,7 @@ impl Runtime {
         from_run: Option<&str>,
         sender: &SignalSender,
         carries: &super::withhold::Carries,
+        trace: Option<&crate::obs::trace::TraceContext>,
     ) -> u64 {
         let mut delivered = 0u64;
         let mut hits: Vec<(String, String)> = Vec::new();
@@ -1278,7 +1283,9 @@ impl Runtime {
             }
         }
         // Signal start nodes.
-        delivered += self.fire_signal_starts(name, &payload, target_run.is_none(), sender, carries);
+        // A run a signal starts continues the signal's trace.
+        delivered +=
+            self.fire_signal_starts(name, &payload, target_run.is_none(), sender, carries, trace);
         // When this signal is the configured `lifecycle.until_signal` it is the
         // retirement trigger: stop admitting, drain live runs, exit cleanly.
         // Delivery to whatever was parked on the signal happens first (above),
@@ -1360,7 +1367,7 @@ impl Runtime {
         let depth = self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0) + 1;
         let cap = self.settings.limits.message_depth();
         if depth > cap {
-            self.log.warn(
+            self.run_log(run_id).warn(
                 "message.too_deep",
                 json!({"run": run_id, "step": step_id, "conversation": ctx,
                        "depth": depth, "max": cap}),
@@ -1383,10 +1390,13 @@ impl Runtime {
             payload["parts"] = p;
         }
         let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+        // The turn it starts continues the run's trace.
+        let trace = self.run_trace(run_id);
         if let Err(e) = self.accept_event(
             crate::runtime::events::kinds::A2A_MESSAGE,
             principal,
             payload,
+            trace.as_ref(),
         ) {
             self.finish_step_pub(
                 run_id,
@@ -1512,10 +1522,13 @@ impl Runtime {
         };
         let cascade = spec.get("cascade").and_then(Value::as_bool).unwrap_or(true);
         let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0), "carries": self.run_carries(run_id)});
+        // The child run continues the parent's trace.
+        let trace = self.run_trace(run_id);
         match self.accept_event(
             kinds::WORKFLOW_RUN,
             self.runs.get(run_id).and_then(|r| r.principal.clone()),
             payload,
+            trace.as_ref(),
         ) {
             Ok(_) => {}
             Err(e) => {
@@ -1611,18 +1624,24 @@ impl Runtime {
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
+        // A request of the run's, a span of its own under it; a list mints
+        // one for each page it asks for.
+        let trace = self.run_trace(run_id);
+        let meta = trace.as_ref().map(|t| Value::Object(t.child().meta()));
+        let pages: Option<::mcp::http::RequestMeta> = trace
+            .map(|t| std::sync::Arc::new(move || t.child().meta()) as ::mcp::http::RequestMeta);
         std::thread::Builder::new()
             .name(format!("mcp.resource:{server}"))
             .spawn(move || {
                 let res: Result<Value, String> = match op.as_str() {
-                    "read" => client.read_resource(&uri).map(|r| {
+                    "read" => client.read_resource(&uri, meta.as_ref()).map(|r| {
                         let t = r.text();
                         json!({"uri": uri, "text": t, "json": serde_json::from_str::<Value>(&t).ok(), "contents": r.contents})
                     }).map_err(|e| e.to_string()),
-                    "list" => client.list_resources().map(|l| json!({"resources": l})).map_err(|e| e.to_string()),
-                    "prompt" => client.get_prompt(&name, arguments).map(|p| json!({"description": p.description, "messages": p.messages, "text": crate::context::skills::prompt_messages_text(&p.messages)})).map_err(|e| e.to_string()),
-                    "complete" => client.complete(reference.unwrap_or(Value::Null), argument.unwrap_or(Value::Null)).map(|c| serde_json::to_value(c).unwrap_or(Value::Null)).map_err(|e| e.to_string()),
-                    "templates" => client.list_resource_templates().map(|l| json!({"templates": l})).map_err(|e| e.to_string()),
+                    "list" => client.list_resources(pages.as_ref()).map(|l| json!({"resources": l})).map_err(|e| e.to_string()),
+                    "prompt" => client.get_prompt(&name, arguments, meta.as_ref()).map(|p| json!({"description": p.description, "messages": p.messages, "text": crate::context::skills::prompt_messages_text(&p.messages)})).map_err(|e| e.to_string()),
+                    "complete" => client.complete(reference.unwrap_or(Value::Null), argument.unwrap_or(Value::Null), meta.as_ref()).map(|c| serde_json::to_value(c).unwrap_or(Value::Null)).map_err(|e| e.to_string()),
+                    "templates" => client.list_resource_templates(pages.as_ref()).map(|l| json!({"templates": l})).map_err(|e| e.to_string()),
                     other => Err(format!("mcp.resource: op must be read|list|prompt|complete|templates (got {other:?})")),
                 };
                 let (output, is_error, error) = match res {
@@ -1831,7 +1850,7 @@ impl Runtime {
         let (r, st) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
-        self.log.info(
+        self.run_log(run_id).info(
             "a2a.send",
             json!({"run": run_id, "step": step_id, "to": peer_name}),
         );
@@ -1927,7 +1946,7 @@ impl Runtime {
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
-        self.log.info(
+        self.run_log(run_id).info(
             "a2a.delegate",
             json!({"run": run_id, "step": step_id, "peer": peer_name}),
         );

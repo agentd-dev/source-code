@@ -173,8 +173,18 @@ pub fn run() -> i32 {
         return crate::exit::USAGE;
     }
 
+    // This process is one span of the unit of work that spawned it: under the
+    // span the supervisor handed down, or a trace of its own when it was handed
+    // none. Everything it does is that unit's, so it is the process trace too —
+    // the one every MCP request it makes carries.
+    let trace = payload
+        .telemetry
+        .trace()
+        .map(|t| t.child())
+        .unwrap_or_else(crate::obs::trace::TraceContext::mint);
+    crate::obs::trace::set_process(trace.clone());
     let up: Up = Arc::new(Mutex::new(io::stdout()));
-    let log = build_logger(&payload);
+    let log = build_logger(&payload, &trace);
     let cancel = Arc::new(AtomicBool::new(false));
     // Turn-boundary suspension: the control thread sets this on `Pause` and
     // clears it on `Resume`; the loop waits between turns while it is set.
@@ -223,8 +233,8 @@ pub fn run() -> i32 {
     // fallback chain, each link on its own connection.
     let mut intel = match payload.intelligence.client() {
         Ok(mut c) => {
-            // Outbound LLM calls join the run's distributed trace.
-            c.set_trace_id(payload.telemetry.trace_id.clone());
+            // Outbound LLM calls join the unit's trace.
+            c.set_trace(Some(trace.clone()));
             // Bridge this child's intel reachability UP to the supervisor, which
             // has no LLM of its own, on each all-down transition.
             install_intel_health_reporter(&mut c, &up);
@@ -268,11 +278,10 @@ pub fn run() -> i32 {
                     serde_json::json!({"server": spec.name, "protocol": c.protocol_version()}),
                 );
                 // The same meta the reactor stamps on its own connections, so a
-                // server sees one run whichever process made the call.
+                // server sees one instance whichever process made the call.
                 c.set_tool_meta(crate::mcp::tool_meta(
                     &payload.telemetry.run_id,
                     &payload.telemetry.instance,
-                    payload.telemetry.trace_id.as_deref(),
                 ));
                 servers.push(c);
             }
@@ -576,7 +585,7 @@ fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
 fn rebuild_intel(swap: &SwapIntel, old: &IntelClient, log: &Logger) -> Option<IntelClient> {
     match swap.intelligence.client() {
         Ok(mut c) => {
-            c.set_trace_id(old.trace_id().map(str::to_string));
+            c.set_trace(old.trace().cloned());
             // A warm, long-lived loop keeps its all-down backoff across a swap:
             // a daemon must not start crashing on a transient outage merely
             // because it was repointed. The one-shot path never enables the
@@ -796,21 +805,21 @@ fn control_msg_label(msg: &ControlMsg) -> &'static str {
     }
 }
 
-fn build_logger(payload: &SpawnPayload) -> Logger {
+fn build_logger(payload: &SpawnPayload, trace: &crate::obs::trace::TraceContext) -> Logger {
     let t = &payload.telemetry;
     let level = Level::parse(&t.log_level).unwrap_or(Level::Info);
-    Logger::new(
-        LogCtx {
-            run_id: t.run_id.clone(),
-            agent_id: t.agent_id.clone(),
-            agent_path: t.agent_path.clone(),
-            comp: Comp::Agent,
-            pid: std::process::id(),
-            trace_id: t.trace_id.clone(),
-        },
-        level,
-    )
-    .with_content(t.log_content)
+    let mut ctx = LogCtx {
+        run_id: t.run_id.clone(),
+        agent_id: t.agent_id.clone(),
+        agent_path: t.agent_path.clone(),
+        comp: Comp::Agent,
+        pid: std::process::id(),
+        trace_id: None,
+        span_id: None,
+        parent_span_id: None,
+    };
+    ctx.set_trace(trace);
+    Logger::new(ctx, level).with_content(t.log_content)
 }
 
 pub(crate) fn send_up(up: &Up, msg: &AgentMsg) {
@@ -987,6 +996,8 @@ mod tests {
                 comp: Comp::Agent,
                 pid: 0,
                 trace_id: None,
+                span_id: None,
+                parent_span_id: None,
             },
             Level::Info,
         )

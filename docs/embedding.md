@@ -134,6 +134,8 @@ fn main() {
             comp: Comp::Agent,
             pid: std::process::id(),
             trace_id: None,
+            span_id: None,
+            parent_span_id: None,
         },
         Level::Info,
     );

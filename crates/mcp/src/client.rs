@@ -219,6 +219,18 @@ impl McpClient {
         self
     }
 
+    /// Stamp `meta`'s keys into the `params._meta` of every request this
+    /// connection sends — every kind, the SDK's own and a re-dial's included —
+    /// unless the request carries one of them already
+    /// ([`crate::http::RequestMeta`]). Call right after connect, as
+    /// [`Self::with_identity`].
+    pub fn with_request_meta(mut self, meta: crate::http::RequestMeta) -> Self {
+        if let Some(h) = Arc::get_mut(&mut self.http) {
+            h.set_request_meta(Some(meta));
+        }
+        self
+    }
+
     /// Attach a mutual-TLS client identity (a mounted cert chain + key) for a
     /// `https://` endpoint. A no-op on non-TLS endpoints (the identity is only
     /// presented during the TLS handshake). The private key is read from a
@@ -514,8 +526,15 @@ impl McpClient {
         })
     }
 
-    pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
-        self.sdk()?.list_resources()
+    /// `resources/list`, following cursor pagination to completion. `meta`
+    /// mints each page's `params._meta`, so a list made for one unit of work
+    /// carries its keys; `None` leaves the connection's own
+    /// ([`Self::with_request_meta`]).
+    pub fn list_resources(
+        &self,
+        meta: Option<&crate::http::RequestMeta>,
+    ) -> Result<Vec<Resource>, McpError> {
+        self.sdk()?.list_resources(meta)
     }
 
     /// `prompts/list`, following cursor pagination to completion.
@@ -524,11 +543,13 @@ impl McpClient {
     }
 
     /// `prompts/get` — render the named prompt template with `arguments` (a flat
-    /// string map). Gated on the server advertising `prompts`.
+    /// string map). Gated on the server advertising `prompts`. `meta` (an
+    /// object) is this request's `params._meta`.
     pub fn get_prompt(
         &self,
         name: &str,
         arguments: Option<Value>,
+        meta: Option<&Value>,
     ) -> Result<GetPromptResult, McpError> {
         if !self.capabilities().supports_prompts() {
             return Err(McpError::Capability(format!(
@@ -536,36 +557,49 @@ impl McpClient {
                 self.name
             )));
         }
-        self.sdk()?.get_prompt(name, arguments)
+        self.sdk()?.get_prompt(name, arguments, meta_object(meta))
     }
 
     /// `completion/complete` — argument autocompletion for a prompt / resource-
     /// template `reference`. Gated on the server advertising `completions`.
-    pub fn complete(&self, reference: Value, argument: Value) -> Result<CompleteResult, McpError> {
+    /// `meta` (an object) is this request's `params._meta`.
+    pub fn complete(
+        &self,
+        reference: Value,
+        argument: Value,
+        meta: Option<&Value>,
+    ) -> Result<CompleteResult, McpError> {
         if !self.capabilities().supports_completions() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no completions",
                 self.name
             )));
         }
-        self.sdk()?.complete(reference, argument)
+        self.sdk()?.complete(reference, argument, meta_object(meta))
     }
 
     /// `resources/templates/list`, paginated. Empty when the server doesn't
-    /// advertise `resources`.
-    pub fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
+    /// advertise `resources`. `meta` as for [`Self::list_resources`].
+    pub fn list_resource_templates(
+        &self,
+        meta: Option<&crate::http::RequestMeta>,
+    ) -> Result<Vec<ResourceTemplate>, McpError> {
         if !self.capabilities().supports_resources() {
             return Ok(Vec::new());
         }
-        // The SDK walks the cursor; pagination is its problem, not ours.
-        self.sdk()?.list_resource_templates()
+        self.sdk()?.list_resource_templates(meta)
     }
 
     /// `resources/read`. Always one request to the server: the SDK's response
     /// cache is disabled at connect, so an unreachable server or a JSON-RPC error
-    /// is an `Err`, never an earlier answer.
-    pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
-        self.sdk()?.read_resource(uri)
+    /// is an `Err`, never an earlier answer. `meta` (an object) is this
+    /// request's `params._meta`.
+    pub fn read_resource(
+        &self,
+        uri: &str,
+        meta: Option<&Value>,
+    ) -> Result<ReadResourceResult, McpError> {
+        self.sdk()?.read_resource(uri, meta_object(meta))
     }
 
     /// Subscribe to `uri`'s updates, by whichever mechanism the negotiated
@@ -627,6 +661,13 @@ impl McpClient {
             .map(|c| c.drain_listen_events())
             .unwrap_or_default()
     }
+}
+
+/// A request's own `params._meta`: `meta` when it is an object holding a key.
+fn meta_object(meta: Option<&Value>) -> Option<serde_json::Map<String, Value>> {
+    meta.and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+        .cloned()
 }
 
 /// The `params._meta` of one call: the connection's persistent meta with the

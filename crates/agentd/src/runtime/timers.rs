@@ -236,13 +236,13 @@ impl Runtime {
                     if let Some(r) = self.runs.get_mut(&run) {
                         r.touch();
                     }
-                    self.log.warn(
+                    self.run_log(&run).warn(
                         "restore.timer.repaired",
                         json!({"run": run, "step": step, "wait": kind, "deadline_ms": deadline, "timer": id}),
                     );
                 }
                 Err(e) => {
-                    self.log.error(
+                    self.run_log(&run).error(
                         "restore.timer.lost",
                         json!({"run": run, "step": step, "wait": kind, "err": e.to_string()}),
                     );

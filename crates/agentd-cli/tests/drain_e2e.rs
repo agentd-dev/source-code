@@ -31,7 +31,10 @@
 //!   workflows, and a shutdown run a forced drain cuts short is cancelled, so
 //!   the next life does not run it at its boot;
 //! - a job the drain cut short does not exit 0;
-//! - `agent_drains_total` says whether the drain completed or was forced.
+//! - `agent_drains_total` says whether the drain completed or was forced;
+//! - what the drain parks keeps its trace: the lines about a stopped step,
+//!   subagent, instance child or gate, and their replay in the next life, are
+//!   in the trace their unit started in, not either life's process trace.
 #![cfg(unix)]
 
 mod common;
@@ -183,6 +186,29 @@ impl Drop for Life {
     }
 }
 
+/// The trace a life's process lines are in.
+fn process_trace(log: &str) -> Value {
+    events(log, "proc.start")
+        .into_iter()
+        .find(|e| e["comp"] == "supervisor")
+        .map(|e| e["trace_id"].clone())
+        .unwrap_or_else(|| panic!("no proc.start:\n{}", tail(log)))
+}
+
+/// The run of `job` a life started, and the trace it started in — a trace of
+/// its own, since a daemon's runs are.
+fn job_run(log: &str) -> (String, Value) {
+    let start = events(log, "run.start")
+        .into_iter()
+        .find(|e| e["workflow"] == "job")
+        .unwrap_or_else(|| panic!("no run of job:\n{}", tail(log)));
+    assert_ne!(start["trace_id"], process_trace(log), "{}", tail(log));
+    (
+        start["run"].as_str().expect("run id").to_string(),
+        start["trace_id"].clone(),
+    )
+}
+
 /// No step failed and no run ended in this life.
 fn nothing_failed(log: &str) {
     assert!(
@@ -296,6 +322,32 @@ fn replayed(cfg: &str, play: &str, first: &str) {
         "the stopped step is replayed:\n{}",
         tail(&log)
     );
+    // In the trace the run started in: the replay, the step's new turn, and
+    // every line its worker writes.
+    let (run, trace) = job_run(first);
+    assert_ne!(
+        process_trace(&log),
+        trace,
+        "a new life has a trace of its own"
+    );
+    for e in events(&log, "restore.step.replay") {
+        assert_eq!(e["trace_id"], trace, "{e}");
+    }
+    let spawned = events(&log, "step.turn.spawn");
+    assert!(spawned.iter().any(|e| e["step"] == "one"), "{}", tail(&log));
+    for e in spawned {
+        assert_eq!(e["trace_id"], trace, "{e}");
+    }
+    let worker = format!("run/{run}/one");
+    let lines: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|l| l["comp"] == "agent" && l["agent_path"] == worker.as_str())
+        .collect();
+    assert!(!lines.is_empty(), "no worker lines:\n{}", tail(&log));
+    for l in lines {
+        assert_eq!(l["trace_id"], trace, "{l}");
+    }
 }
 
 #[test]
@@ -489,15 +541,34 @@ fn a_subagent_the_drain_stops_is_parked_and_comes_back() {
     );
     nothing_failed(&log);
 
+    // Spawned in the run's trace, it comes back in it.
+    let spawned = events(&log, "subagent.spawn")[0]["trace_id"].clone();
+    assert_eq!(spawned, job_run(&log).1, "{}", tail(&log));
+
     write_playbook(&play, 0);
     let log = subagent_second_life(&cfg);
+    let respawned: Vec<Value> = events(&log, "subagent.respawn")
+        .into_iter()
+        .filter(|e| e["handle"] == handle.as_str())
+        .collect();
     assert!(
-        events(&log, "subagent.respawn")
-            .iter()
-            .any(|e| e["handle"] == handle.as_str()),
+        !respawned.is_empty(),
         "the parked subagent is spawned again:\n{}",
         tail(&log)
     );
+    for e in respawned {
+        assert_eq!(e["trace_id"], spawned, "{e}");
+    }
+    let path = format!("sub/{handle}");
+    let lines: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|l| l["agent_path"] == path.as_str())
+        .collect();
+    assert!(!lines.is_empty(), "no subagent lines:\n{}", tail(&log));
+    for l in lines {
+        assert_eq!(l["trace_id"], spawned, "{l}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -858,13 +929,21 @@ fn a_sync_subagent_a_stopped_turn_waited_on_is_cancelled_not_run_twice() {
     assert_eq!(code, Some(0), "{}", tail(&log));
     nothing_failed(&log);
     let handle = spawned_handle(&log);
+    let cancelled: Vec<Value> = events(&log, "subagent.result")
+        .into_iter()
+        .filter(|e| e["handle"] == handle.as_str() && e["status"] == "cancelled")
+        .collect();
     assert!(
-        events(&log, "subagent.result")
-            .iter()
-            .any(|e| e["handle"] == handle.as_str() && e["status"] == "cancelled"),
+        !cancelled.is_empty(),
         "the subagent the stopped turn waited on is cancelled:\n{}",
         tail(&log)
     );
+    // Said in the subagent's trace, the one it was spawned in.
+    let spawned = events(&log, "subagent.spawn")[0]["trace_id"].clone();
+    assert_ne!(spawned, process_trace(&log), "{}", tail(&log));
+    for e in cancelled {
+        assert_eq!(e["trace_id"], spawned, "{e}");
+    }
     assert!(
         !events(&log, "drain.interrupted")
             .iter()
@@ -1174,6 +1253,20 @@ fn an_instance_child_drains_with_its_parent_and_comes_back() {
     let spawned = events(&log, "instance.spawn");
     let handle = spawned[0]["handle"].as_str().expect("handle").to_string();
     let pid = spawned[0]["pid"].as_i64().expect("pid") as i32;
+    // The lines about the child, in this life and the next, are in the trace
+    // of the run that spawned it.
+    let trace = spawned[0]["trace_id"].clone();
+    assert_ne!(trace, process_trace(&log), "{}", tail(&log));
+    let in_trace = |log: &str, event: &str| {
+        let about: Vec<Value> = events(log, event)
+            .into_iter()
+            .filter(|e| e["handle"] == handle.as_str())
+            .collect();
+        assert!(!about.is_empty(), "no {event}:\n{}", tail(log));
+        for e in about {
+            assert_eq!(e["trace_id"], trace, "{e}");
+        }
+    };
     let began = Instant::now();
     life.signal(libc::SIGTERM);
     let (code, log) = life.exit();
@@ -1210,6 +1303,8 @@ fn an_instance_child_drains_with_its_parent_and_comes_back() {
         0,
         "the parent waited for its child to exit"
     );
+    in_trace(&log, "instance.drain");
+    in_trace(&log, "instance.exited");
 
     let mut life = Life::start(&cfg, &[]);
     life.wait_for("the instance child to come back", |log| {
@@ -1227,6 +1322,8 @@ fn an_instance_child_drains_with_its_parent_and_comes_back() {
         "{}",
         tail(&log)
     );
+    in_trace(&log, "instance.respawn");
+    in_trace(&log, "instance.exited");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1314,13 +1411,26 @@ fn a_turn_stopped_at_a_gate_leaves_its_task_waiting_and_asks_again() {
         "the stopped turn's gate is not failed:\n{}",
         tail(&log)
     );
+    let drained: Vec<Value> = events(&log, "human.ask.drained")
+        .into_iter()
+        .filter(|e| e["task"] == task.as_str() && e["state"] == "TASK_STATE_WORKING")
+        .collect();
     assert!(
-        events(&log, "human.ask.drained")
-            .iter()
-            .any(|e| e["task"] == task.as_str() && e["state"] == "TASK_STATE_WORKING"),
+        !drained.is_empty(),
         "the gate's task goes back to working:\n{}",
         tail(&log)
     );
+    // Said in the asking turn's trace, as the ask was, and the replay asks in
+    // it again.
+    let asked = events(&log, "human.ask")
+        .into_iter()
+        .find(|e| e["task"] == task.as_str())
+        .unwrap_or_else(|| panic!("no human.ask:\n{}", tail(&log)));
+    let trace = asked["trace_id"].clone();
+    assert_ne!(trace, process_trace(&log), "{}", tail(&log));
+    for e in drained {
+        assert_eq!(e["trace_id"], trace, "{e}");
+    }
     assert!(
         events(&log, "drain.interrupted")
             .iter()
@@ -1345,7 +1455,7 @@ fn a_turn_stopped_at_a_gate_leaves_its_task_waiting_and_asks_again() {
     assert!(
         events(&life.log(), "human.ask")
             .iter()
-            .any(|e| e["task"] == task.as_str()),
+            .any(|e| e["task"] == task.as_str() && e["trace_id"] == trace),
         "{}",
         tail(&life.log())
     );

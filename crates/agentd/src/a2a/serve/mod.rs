@@ -732,6 +732,8 @@ mod tests {
                 comp: crate::obs::log::Comp::Supervisor,
                 pid: std::process::id(),
                 trace_id: None,
+                span_id: None,
+                parent_span_id: None,
             },
             crate::obs::log::Level::Error,
         );
@@ -2133,6 +2135,8 @@ mod tests {
                 comp: crate::obs::log::Comp::Supervisor,
                 pid: std::process::id(),
                 trace_id: None,
+                span_id: None,
+                parent_span_id: None,
             },
             crate::obs::log::Level::Error,
         );

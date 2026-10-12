@@ -71,9 +71,15 @@ pub trait SkillServer {
     fn supports_prompts(&self) -> bool;
     fn supports_resources(&self) -> bool;
     fn list_prompts(&self) -> Result<Vec<::mcp::wire::Prompt>, String>;
-    fn get_prompt(&self, name: &str, arguments: Option<Value>) -> Result<Vec<Value>, String>;
+    /// `meta` is the request's `params._meta` (the unit's trace).
+    fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        meta: Option<&Value>,
+    ) -> Result<Vec<Value>, String>;
     fn list_resources(&self) -> Result<Vec<::mcp::wire::Resource>, String>;
-    fn read_resource(&self, uri: &str) -> Result<String, String>;
+    fn read_resource(&self, uri: &str, meta: Option<&Value>) -> Result<String, String>;
 }
 
 impl SkillServer for crate::mcp::client::McpClient {
@@ -89,16 +95,21 @@ impl SkillServer for crate::mcp::client::McpClient {
     fn list_prompts(&self) -> Result<Vec<::mcp::wire::Prompt>, String> {
         crate::mcp::client::McpClient::list_prompts(self).map_err(|e| e.to_string())
     }
-    fn get_prompt(&self, name: &str, arguments: Option<Value>) -> Result<Vec<Value>, String> {
-        crate::mcp::client::McpClient::get_prompt(self, name, arguments)
+    fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        meta: Option<&Value>,
+    ) -> Result<Vec<Value>, String> {
+        crate::mcp::client::McpClient::get_prompt(self, name, arguments, meta)
             .map(|r| r.messages)
             .map_err(|e| e.to_string())
     }
     fn list_resources(&self) -> Result<Vec<::mcp::wire::Resource>, String> {
-        crate::mcp::client::McpClient::list_resources(self).map_err(|e| e.to_string())
+        crate::mcp::client::McpClient::list_resources(self, None).map_err(|e| e.to_string())
     }
-    fn read_resource(&self, uri: &str) -> Result<String, String> {
-        crate::mcp::client::McpClient::read_resource(self, uri)
+    fn read_resource(&self, uri: &str, meta: Option<&Value>) -> Result<String, String> {
+        crate::mcp::client::McpClient::read_resource(self, uri, meta)
             .map(|r| r.text())
             .map_err(|e| e.to_string())
     }
@@ -313,12 +324,13 @@ impl Catalogue {
     }
 
     /// Fetch (or serve from cache) a skill body. `servers` resolves the source
-    /// server by name.
+    /// server by name; a fetch is a request of `trace`'s, the unit that asked.
     pub fn load(
         &mut self,
         name: &str,
         arguments: Option<Value>,
         servers: &dyn Fn(&str) -> Option<std::sync::Arc<dyn SkillServer>>,
+        trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<SkillBody, String> {
         let meta = self
             .skills
@@ -337,12 +349,16 @@ impl Catalogue {
                     meta.source.server
                 )
             })?;
+            let request = trace.map(|t| Value::Object(t.child().meta()));
             match meta.source.kind {
                 SkillSourceKind::Prompt => {
-                    let messages = server.get_prompt(&meta.source.reference, arguments)?;
+                    let messages =
+                        server.get_prompt(&meta.source.reference, arguments, request.as_ref())?;
                     prompt_messages_text(&messages)
                 }
-                SkillSourceKind::Resource => server.read_resource(&meta.source.reference)?,
+                SkillSourceKind::Resource => {
+                    server.read_resource(&meta.source.reference, request.as_ref())?
+                }
                 SkillSourceKind::Inline => unreachable!("handled above"),
             }
         };
@@ -645,7 +661,12 @@ mod tests {
         fn list_prompts(&self) -> Result<Vec<Prompt>, String> {
             Ok(self.prompts.clone())
         }
-        fn get_prompt(&self, name: &str, arguments: Option<Value>) -> Result<Vec<Value>, String> {
+        fn get_prompt(
+            &self,
+            name: &str,
+            arguments: Option<Value>,
+            _meta: Option<&Value>,
+        ) -> Result<Vec<Value>, String> {
             let body = self.bodies.get(name).cloned().ok_or("no such prompt")?;
             let body = match arguments
                 .and_then(|a| a.get("target").and_then(Value::as_str).map(str::to_string))
@@ -660,7 +681,7 @@ mod tests {
         fn list_resources(&self) -> Result<Vec<Resource>, String> {
             Ok(self.resources.clone())
         }
-        fn read_resource(&self, uri: &str) -> Result<String, String> {
+        fn read_resource(&self, uri: &str, _meta: Option<&Value>) -> Result<String, String> {
             self.bodies
                 .get(uri)
                 .cloned()
@@ -780,16 +801,21 @@ mod tests {
             (n == "skills").then(|| f2.clone() as std::sync::Arc<dyn SkillServer>)
         };
         let b = c
-            .load("review-pr", Some(json!({"target": "PR #7"})), &servers)
+            .load(
+                "review-pr",
+                Some(json!({"target": "PR #7"})),
+                &servers,
+                None,
+            )
             .unwrap();
         assert!(b.body.contains("PR #7"));
         assert!(b.body.contains("truncated to skills.max_bytes"));
         assert!(c.body(&b.hash).is_some());
-        let d = c.load("deploy", None, &servers).unwrap();
+        let d = c.load("deploy", None, &servers, None).unwrap();
         assert!(d.body.starts_with("# Deploy"));
-        assert!(c.load("nope", None, &servers).is_err());
+        assert!(c.load("nope", None, &servers, None).is_err());
         assert!(
-            c.load("deploy", None, &|_| None).is_err(),
+            c.load("deploy", None, &|_| None, None).is_err(),
             "server not connected"
         );
         let block = render_bodies(&[&b, &d]).unwrap();
@@ -869,7 +895,7 @@ mod tests {
         // The body is already in hand — a skill is prose, so there is nothing
         // to fetch later and no server that can be down when it is read.
         let body = cat
-            .load("deploy", None, &|_| None)
+            .load("deploy", None, &|_| None, None)
             .expect("an inline body needs no server");
         assert!(body.body.contains("behind a flag"), "{}", body.body);
 

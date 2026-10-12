@@ -154,7 +154,7 @@ pub fn complete_resilient(
     req: &Request,
     timeout: Duration,
     deadline: Option<Instant>,
-    trace_id: Option<&str>,
+    trace: Option<&crate::obs::trace::TraceContext>,
 ) -> SweepResult {
     let order = list.attempt_order();
     let cfg = *list.breaker_config();
@@ -189,7 +189,7 @@ pub fn complete_resilient(
         }
         prev_idx = Some(idx);
 
-        let outcome = list.ep(idx).complete_once(req, timeout, deadline, trace_id);
+        let outcome = list.ep(idx).complete_once(req, timeout, deadline, trace);
         if outcome.is_err() && deadline.is_some_and(|d| Instant::now() >= d) {
             return ended_by_deadline(failover, breaker_changes);
         }

@@ -3,7 +3,9 @@
 //! record of *who did what* — every A2A call, every principal-driven tool/command,
 //! config reloads, restores, store conflicts, and kills. Each event is
 //! `{ts, principal, role, action, target, outcome, request_id, trace, instance}`
-//! — plus `sid` when the caller signed in with a session,
+//! — `trace` the trace id of the unit of work the action belongs to (a run, a
+//! turn, a tool call's), else the process's — plus `sid` when the caller
+//! signed in with a session,
 //! emitted to the configured sinks: `log` (a closed-vocabulary `audit` log line)
 //! and/or `store` (a durable, append-only `Kind::Audit` record, ULID-keyed — never
 //! CAS'd, never listed, so it cannot be rewritten). Audit is security telemetry:
@@ -27,6 +29,8 @@ pub(crate) struct AuditEvent<'a> {
     /// name — so this is the only thing in the trail that says WHICH of them
     /// acted, and it is what a revocation names.
     pub sid: Option<&'a str>,
+    /// The unit of work the action belongs to; `None` for the process's own.
+    pub trace: Option<&'a crate::obs::trace::TraceContext>,
 }
 
 impl Runtime {
@@ -77,7 +81,7 @@ impl Runtime {
             "target": ev.target,
             "outcome": ev.outcome,
             "request_id": ev.request_id,
-            "trace": self.trace_id,
+            "trace": ev.trace.unwrap_or(&self.trace).trace_id,
         });
         if let Some(sid) = ev.sid {
             record["sid"] = json!(sid);
@@ -85,7 +89,7 @@ impl Runtime {
         if sinks.iter().any(|s| matches!(s, AuditSink::Log)) {
             // A single closed-vocabulary `audit` event (never content-suppressed —
             // an audit trail is metadata, not conversation content).
-            self.log.info("audit", record.clone());
+            self.log.in_trace(ev.trace).info("audit", record.clone());
         }
         if sinks.iter().any(|s| matches!(s, AuditSink::Stream))
             && let Some(stream) = &self.settings.observability.audit.stream
@@ -136,6 +140,7 @@ impl Runtime {
                 role: Some(&role),
                 request_id,
                 sid: principal.session.as_deref(),
+                trace: None,
             },
             mirror_to_feed(method, op, outcome),
         );

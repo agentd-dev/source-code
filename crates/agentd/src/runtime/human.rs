@@ -163,6 +163,9 @@ impl Runtime {
         args: Value,
     ) -> super::tools::ToolOutcome {
         use super::tools::ToolOutcome;
+        // Lines and the audit record about this gate carry its unit's trace.
+        let trace = self.caller_trace(caller);
+        let hlog = self.log.in_trace(trace.as_ref());
         let question = {
             let q = args["question"].as_str().unwrap_or("").trim().to_string();
             let mut q = if q.is_empty() {
@@ -235,7 +238,7 @@ impl Runtime {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    self.log.info(
+                    hlog.info(
                         "human.auto_accepted",
                         json!({"question": question, "answer": text, "policy": "accept"}),
                     );
@@ -247,6 +250,7 @@ impl Runtime {
                         role: None,
                         request_id: None,
                         sid: None,
+                        trace: trace.as_ref(),
                     });
                     return ToolOutcome::Ready(
                         json!({"reply": text, "timed_out": false, "via": "accept"}),
@@ -255,7 +259,7 @@ impl Runtime {
                 }
                 let ask = self.next_id("ask");
                 let carries = self.caller_carries(caller);
-                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries);
+                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries, trace.clone());
                 return ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,
                     question,
@@ -270,7 +274,7 @@ impl Runtime {
             crate::config::settings::Approval::Auto => {
                 let ask = self.next_id("ask");
                 let carries = self.caller_carries(caller);
-                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries);
+                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries, trace.clone());
                 return ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,
                     question,
@@ -325,7 +329,7 @@ impl Runtime {
             ),
             AskHumanFallback::Wait => {
                 let ask = self.next_id("ask");
-                self.log.info(
+                hlog.info(
                     "human.ask.parked",
                     // The `fail` branch above names the cause; this one used to
                     // say only "no human channel", and it is the branch people
@@ -355,7 +359,7 @@ impl Runtime {
             AskHumanFallback::Auto => {
                 let ask = self.next_id("ask");
                 let carries = self.caller_carries(caller);
-                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries);
+                self.spawn_human_judge(&ask, &question, schema.as_ref(), &carries, trace.clone());
                 ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,
                     question,
@@ -388,6 +392,9 @@ impl Runtime {
     ) -> super::tools::ToolOutcome {
         use super::tools::ToolOutcome;
         use crate::a2a::tasks::{Link, State};
+        // Lines and the audit record about this gate carry its unit's trace.
+        let trace = self.caller_trace(caller);
+        let hlog = self.log.in_trace(trace.as_ref());
         // Where the gate is announced, when the document addressed the asking
         // `human` step to one of its humans. It never changes who may answer.
         let channel = match (&caller.run, &caller.step) {
@@ -473,7 +480,7 @@ impl Runtime {
         }
         self.task_persist(&task_id);
         self.task_sync(&task_id);
-        self.log.info(
+        hlog.info(
             "human.ask",
             json!({"task": task_id, "question": question, "deadline_ms": deadline_ms,
                    "channel": channel}),
@@ -486,6 +493,7 @@ impl Runtime {
             role: None,
             request_id: None,
             sid: None,
+            trace: trace.as_ref(),
         });
         ToolOutcome::Deferred(PendingKind::Human {
             task: task_id,
@@ -541,6 +549,9 @@ impl Runtime {
         let role = answerer.map(|p| format!("{:?}", p.role).to_lowercase());
         let sid = answerer.and_then(|p| p.session.as_deref());
         let p = self.pending.remove(i);
+        // Lines and the audit record about this gate carry its unit's trace.
+        let trace = self.target_trace(&p.target);
+        let hlog = self.log.in_trace(trace.as_ref());
         let PendingKind::Human {
             task,
             standalone,
@@ -568,7 +579,7 @@ impl Runtime {
             shaped = Some(value.clone());
             if let Err(errs) = crate::jsonschema::validate(&schema, &value) {
                 let q = question.clone();
-                self.log.info(
+                hlog.info(
                     "human.answer.rejected",
                     json!({"task": task, "errors": errs, "via": via}),
                 );
@@ -601,7 +612,7 @@ impl Runtime {
         {
             const LATE: &str = "ask_human: the asking turn ended before the answer arrived";
             self.human_task_fail(&task, LATE);
-            self.log.warn(
+            hlog.warn(
                 "human.answer.undelivered",
                 json!({"task": task, "via": via}),
             );
@@ -613,6 +624,7 @@ impl Runtime {
                 role: role.as_deref(),
                 request_id: None,
                 sid,
+                trace: trace.as_ref(),
             });
             return;
         }
@@ -622,7 +634,7 @@ impl Runtime {
             "answered"
         };
         self.human_task_settle(&task, standalone, note);
-        self.log.info(
+        hlog.info(
             "human.answered",
             json!({"task": task, "via": via, "by": answered_by, "sid": sid,
                    "labels": answerer.map(|p| &p.labels)}),
@@ -638,6 +650,7 @@ impl Runtime {
             role: role.as_deref(),
             request_id: None,
             sid,
+            trace: trace.as_ref(),
         });
         // A tool result must match `ask_human`'s DECLARED output shape,
         // `{reply, timed_out}` (see `registry/internal.rs`). Consumers read
@@ -682,6 +695,7 @@ impl Runtime {
         let task = task.clone();
         self.human_task_fail(&task, msg);
         self.log
+            .in_trace(self.target_trace(&p.target).as_ref())
             .warn("human.ask.failed", json!({"task": task, "err": msg}));
         // A policy gate that ends unanswered refuses its call, and says so in
         // the rule's words: the asker must not read "no answer" as "done".
@@ -864,7 +878,8 @@ impl Runtime {
                 self.task_sync(&task);
             }
             let carries = self.target_carries(&target);
-            self.spawn_human_judge(&task, &question, schema.as_ref(), &carries);
+            let trace = self.target_trace(&target);
+            self.spawn_human_judge(&task, &question, schema.as_ref(), &carries, trace);
         }
         for (target, end) in ends {
             // Re-find the entry by target on every iteration: ending an earlier
@@ -880,8 +895,10 @@ impl Runtime {
             };
             match end {
                 End::Prune(task, why) => {
+                    let trace = self.target_trace(&target);
                     self.pending.remove(i);
                     self.log
+                        .in_trace(trace.as_ref())
                         .warn("human.ask.pruned", json!({"task": task, "err": why}));
                     self.human_task_fail(&task, why);
                 }
@@ -903,13 +920,16 @@ impl Runtime {
 
     /// Spawn the `auto` judge on a background thread — same shape as the goal
     /// judge: an intel dial folded back through [`super::events::Event::Background`].
+    /// Its model calls are spans of `trace`, the unit whose gate it answers.
     pub(crate) fn spawn_human_judge(
         &mut self,
         ask: &str,
         question: &str,
         schema: Option<&Value>,
         carries: &crate::engine::run::Carries,
+        trace: Option<crate::obs::trace::TraceContext>,
     ) {
+        let hlog = self.log.in_trace(trace.as_ref());
         let tx = self.events_tx.clone();
         // Never over outside input (RFC 0046 §8): a judge's answer is no
         // more trusted than what it reads, and text in the ask can steer any
@@ -920,7 +940,7 @@ impl Runtime {
                 .why
                 .clone()
                 .unwrap_or_else(|| "outside input".into());
-            self.log.warn(
+            hlog.warn(
                 "human.judge.withheld",
                 json!({"ask": ask, "origins": carries.origins, "why": why}),
             );
@@ -954,7 +974,7 @@ impl Runtime {
         let intel = self.role_config(crate::config::settings::ModelRole::Approve);
         let schema = schema.cloned();
         let (ask, question) = (ask.to_string(), question.to_string());
-        self.log.info(
+        hlog.info(
             "human.judge.start",
             json!({"ask": ask, "question": question, "decided": decided}),
         );
@@ -968,9 +988,10 @@ impl Runtime {
                         confidence,
                         &question,
                         schema.as_ref(),
+                        trace.as_ref(),
                     )
                 } else {
-                    human_judge_call(&intel, &question, schema.as_ref())
+                    human_judge_call(&intel, &question, schema.as_ref(), trace.as_ref())
                 };
                 let _ = tx.send(super::events::Event::Background {
                     id: format!("human.judge:{ask}"),
@@ -1068,7 +1089,7 @@ impl Runtime {
             })
             .collect();
         for (task, run, step, question, deadline_ms, schema, addressee, policy) in gates {
-            self.log.info(
+            self.run_log(&run).info(
                 "human.ask.restored",
                 json!({"task": task, "run": run, "step": step}),
             );
@@ -1156,11 +1177,13 @@ fn human_judge_call(
     intel: &crate::subagent::protocol::IntelConfig,
     question: &str,
     schema: Option<&Value>,
+    trace: Option<&crate::obs::trace::TraceContext>,
 ) -> Value {
-    let client = match intel.client() {
+    let mut client = match intel.client() {
         Ok(c) => c,
         Err(e) => return json!({"error": format!("intel: {e}")}),
     };
+    client.set_trace(trace.cloned());
     let system = "You are answering ON BEHALF OF the unavailable human operator of an \
 autonomous agent. The agent asked the operator a question. Decide pragmatically and \
 conservatively: prefer the safe, reversible choice; never approve destructive or \
@@ -1259,12 +1282,13 @@ fn human_decision_call(
     confidence: Option<f64>,
     question: &str,
     schema: Option<&Value>,
+    trace: Option<&crate::obs::trace::TraceContext>,
 ) -> Value {
     use crate::wire::decision::{Decision, Question, unsure};
     let Some(options) = closed_answers(schema) else {
         return match escalate {
             Some((e, true)) => {
-                let mut r = human_judge_call(e, question, schema);
+                let mut r = human_judge_call(e, question, schema, trace);
                 r["escalated"] = json!(true);
                 r
             }
@@ -1287,7 +1311,8 @@ fn human_decision_call(
     let mut usage = crate::wire::intel::Usage::default();
     let mut ask = |cfg: &crate::subagent::protocol::IntelConfig|
      -> Option<(crate::wire::decision::Answers, String)> {
-        let client = cfg.client().ok()?;
+        let mut client = cfg.client().ok()?;
+        client.set_trace(trace.cloned());
         let model = cfg.model.clone().unwrap_or_default();
         let resp = client
             .complete(&Request {

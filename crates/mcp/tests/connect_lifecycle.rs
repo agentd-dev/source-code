@@ -125,7 +125,7 @@ fn a_2026_07_28_server_is_reached_through_server_discover_alone() {
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     c.list_tools().unwrap();
     c.call_tool("echo", Some(json!({}))).unwrap();
-    c.read_resource("demo://x").unwrap();
+    c.read_resource("demo://x", None).unwrap();
     std::thread::sleep(Duration::from_millis(1500));
 
     let all = methods(&seen);
@@ -406,7 +406,7 @@ fn a_session_stamped_by_a_2026_07_28_server_is_never_echoed() {
     c.call_tool("echo", Some(json!({}))).unwrap();
     // rmcp's server answers an unknown method `404` + -32601: on a request
     // that carried no session, that is not a lost session.
-    assert!(c.list_resource_templates().is_err());
+    assert!(c.list_resource_templates(None).is_err());
     for r in seen.lock().unwrap().iter() {
         assert_eq!(r.header("mcp-session-id"), None, "{}", r.method());
     }
@@ -438,7 +438,7 @@ fn a_session_stamped_on_a_refused_handshake_does_not_ride_the_re_probe() {
     });
     let c = connect(&ep, FirstRequest::Initialize).unwrap();
     c.list_tools().unwrap();
-    assert!(c.list_resource_templates().is_err());
+    assert!(c.list_resource_templates(None).is_err());
     let reqs = seen.lock().unwrap().clone();
     for r in reqs.iter().filter(|r| r.method() != "initialize") {
         assert_eq!(r.header("mcp-session-id"), None, "{}", r.method());

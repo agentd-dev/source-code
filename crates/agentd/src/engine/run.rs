@@ -240,6 +240,12 @@ pub struct RunState {
     /// Where the outside text this run carries entered ([`Carries`]).
     #[serde(default, skip_serializing_if = "Carries::is_empty")]
     pub carries: Carries,
+    /// The run's trace: its start event's, so the run is one span of the trace
+    /// whoever started it is in. Durable, so a run resumed after a restart, a
+    /// drain, a wait, a timer or a human gate carries on in the trace it
+    /// started in, and so does a step replayed after a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::obs::trace::TraceContext>,
     /// How many `message` hops caused this run, counted from the last trigger
     /// that was not itself a delivered message. A run started by a schedule,
     /// webhook or stream is depth 0; one started by an agent that a `message`
@@ -320,6 +326,7 @@ impl RunState {
             children: Vec::new(),
             parent: None,
             carries: Carries::default(),
+            trace: None,
             msg_depth: 0,
             key: None,
             attempt: 1,

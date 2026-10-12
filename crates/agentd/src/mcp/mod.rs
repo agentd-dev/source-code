@@ -61,15 +61,34 @@ pub mod pace {
 /// The `_meta` every `tools/call` on a connection carries, whichever process
 /// dialled it — the reactor at startup or on reload, or a subagent: the run id
 /// and instance, so a backing service can recognize a retried call and
-/// deduplicate its side effect, and a W3C `traceparent`, so the call joins the
-/// run's trace. One builder, because each dial site keeping its own copy is how
-/// a reload dropped the traceparent and a subagent the instance.
-pub fn tool_meta(run_id: &str, instance: &str, trace_id: Option<&str>) -> serde_json::Value {
-    let mut meta = serde_json::json!({"agent/run_id": run_id, "agent/instance": instance});
-    if let Some(tid) = trace_id {
-        meta["traceparent"] = crate::obs::trace::outbound_traceparent(tid).into();
+/// deduplicate its side effect. One builder, because each dial site keeping
+/// its own copy is how a subagent dropped the instance.
+///
+/// The trace is not here: it is per request ([`from_spec`]), since a
+/// connection serves many units of work.
+pub fn tool_meta(run_id: &str, instance: &str) -> serde_json::Value {
+    serde_json::json!({"agent/run_id": run_id, "agent/instance": instance})
+}
+
+/// Name, in a request's `_meta`, the unit of work it is made for: a span of
+/// its own under `unit`'s, with the unit's flags and `tracestate`. A request
+/// with none gets the process trace ([`from_spec`]).
+pub fn stamp_trace(meta: &mut serde_json::Value, unit: Option<&crate::obs::trace::TraceContext>) {
+    if let (Some(m), Some(t)) = (meta.as_object_mut(), unit) {
+        m.extend(t.child().meta());
     }
-    meta
+}
+
+/// The W3C trace context of one MCP request that names none of its own: a
+/// span of its own under the process trace ([`crate::obs::trace::process`]) —
+/// in the supervisor what belongs to no unit of work (a boot-time list, a
+/// re-dial, a subscription the connection holds for every waiter, an MCP
+/// Events poll), in a turn worker or a subagent the unit it serves. A request
+/// made for a unit of work names the unit's span itself, and that wins.
+fn process_request_meta() -> serde_json::Map<String, serde_json::Value> {
+    crate::obs::trace::process()
+        .map(|t| t.child().meta())
+        .unwrap_or_default()
 }
 
 /// Build an MCP client from a declared [`crate::config::McpServerSpec`]: resolve
@@ -157,7 +176,8 @@ pub fn from_spec(
             name: "agentd".into(),
             version: crate::VERSION.into(),
             title: WORKLOAD.get().cloned(),
-        });
+        })
+        .with_request_meta(std::sync::Arc::new(process_request_meta));
     // SPIFFE X.509-SVID mTLS: set the transport client identity from the
     // SPIRE-written cert + key when the server declares `auth: {kind: spiffe,
     // svid: x509}`. Needs `--features tls` (mTLS); a JWT-SVID rides the signer seam.

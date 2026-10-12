@@ -413,7 +413,12 @@ impl Runtime {
         let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
         "role": role_name(principal.role)});
-        match self.accept_event(kinds::A2A_MESSAGE, Some(principal.id.clone()), payload) {
+        match self.accept_event(
+            kinds::A2A_MESSAGE,
+            Some(principal.id.clone()),
+            payload,
+            None,
+        ) {
             Ok(inbox_id) => {
                 self.event_to_task.insert(inbox_id, task_id.clone());
                 if let Some(t) = self.tasks.get_mut(&task_id) {

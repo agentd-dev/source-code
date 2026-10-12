@@ -39,7 +39,9 @@
 //! `MOCK_REFUSED <code> <method> <reason>`, `MOCK_SESSION <id>`, `MOCK_GET`,
 //! `MOCK_SUBSCRIBE <uri>`, `MOCK_UNSUBSCRIBE <uri>`, `MOCK_LISTEN <filter>`,
 //! `MOCK_LISTEN_CLOSED <client|restart|done>`, `MOCK_CALL <params>`,
-//! `MOCK_READ <uri>`.
+//! `MOCK_READ <uri>`, and for every request `MOCK_META {"method": …,
+//! "_meta": …}` — what it carried in `params._meta`, a W3C trace context
+//! included.
 //!
 //! `mock.publish` edits `mock://instruction` (`… Edition <n>.`) and pushes
 //! nothing, so a test decides how the consumer hears of it.
@@ -569,6 +571,10 @@ fn accepted(stream: &mut TcpStream) {
 /// to stamp the `Mcp-Session-Id` header (on `initialize`, which only the
 /// 2025-11-25 edge passes on).
 fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) {
+    eprintln!(
+        "MOCK_META {}",
+        json!({"method": req.method, "_meta": meta_of(req.params.as_ref())})
+    );
     let uri = &state.uri;
     match req.method.as_str() {
         "initialize" => {

@@ -186,8 +186,14 @@ mod imp {
     }
 
     impl RunSpan {
-        /// Begin a run span, or `None` if there's no endpoint / trace to anchor it.
+        /// Begin a run span, or `None` if there's no endpoint / trace to
+        /// anchor it, or the trace is not sampled: an upstream's `00` is its
+        /// decision, so nothing in its trace is exported. In a turn worker or
+        /// a subagent the process trace is the unit's span.
         pub(super) fn begin(log: &Logger, start_unix_nanos: u128) -> Option<RunSpan> {
+            if crate::obs::trace::process().is_some_and(|t| !t.sampled()) {
+                return None;
+            }
             let endpoint = super::endpoint()?;
             let trace_id = log.ctx().trace_id.clone()?;
             Some(RunSpan {
@@ -551,6 +557,8 @@ mod imp {
                     comp: Comp::Agent,
                     pid: 0,
                     trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
                 },
                 Level::Error,
             )

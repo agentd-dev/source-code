@@ -18,6 +18,9 @@
 //! * **output cap** — stdout+stderr are truncated to `max_output` bytes.
 //! * **minimal env** — the child inherits ONLY the named `security.exec.env`
 //!   variables; the agent's own environment (and its secrets) is never passed.
+//!   It is handed the calling unit's trace as `TRACEPARENT` and `TRACESTATE`
+//!   (the OpenTelemetry environment carrier), so an instrumented command joins
+//!   it.
 //!
 //! The `exec` tool also carries the `sensitive` + `egress` trifecta tags, so the
 //! Rule-of-Two gate refuses to grant it alongside untrusted input.
@@ -61,6 +64,7 @@ pub(crate) fn resolve_cwd(workdir: &Path, req: Option<&str>) -> Result<PathBuf, 
 
 /// Run one allow-listed command and return `{stdout, stderr, exit_code,
 /// timed_out}`. The caller has already checked the allow-list + resolved `cwd`.
+/// `trace` is the command's span, handed to it as `TRACEPARENT`/`TRACESTATE`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_command(
     cmd: &str,
@@ -70,6 +74,7 @@ pub(crate) fn run_command(
     timeout: Duration,
     max_output: usize,
     env_pass: &[String],
+    trace: Option<&crate::obs::trace::TraceContext>,
 ) -> Result<Value, String> {
     let mut c = Command::new(cmd);
     c.args(argv)
@@ -84,6 +89,14 @@ pub(crate) fn run_command(
         if let Ok(v) = std::env::var(k) {
             c.env(k, v);
         }
+    }
+    // The trace is the call's, whatever the passed-through environment held.
+    if let Some(t) = trace {
+        c.env("TRACEPARENT", t.traceparent());
+        match &t.tracestate {
+            Some(ts) => c.env("TRACESTATE", ts),
+            None => c.env_remove("TRACESTATE"),
+        };
     }
     // Nor any descriptor the host left inheritable: a model-chosen command
     // gets its three pipes and nothing else, however agentd was started.
@@ -183,12 +196,48 @@ mod tests {
             Duration::from_secs(5),
             4096,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(out["stdout"], "hello world\n");
         assert_eq!(out["exit_code"], 0);
         assert_eq!(out["timed_out"], false);
         std::fs::remove_dir_all(&wd).ok();
+    }
+
+    /// The command is handed the calling unit's trace in the OpenTelemetry
+    /// environment carrier — over whatever the passed-through environment
+    /// held — and nothing of the agent's own besides.
+    #[test]
+    fn the_command_sees_the_calls_trace() {
+        let wd = tmp_workdir("trace");
+        let cwd = resolve_cwd(&wd, None).unwrap();
+        let trace = crate::obs::trace::TraceContext::child_of(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+            Some("congo=t61rcWkgMzE"),
+        )
+        .unwrap();
+        let out = run_command(
+            "sh",
+            &["-c".into(), "echo \"$TRACEPARENT|$TRACESTATE\"".into()],
+            &cwd,
+            None,
+            Duration::from_secs(5),
+            4096,
+            &["PATH".into()],
+            Some(&trace),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&wd).ok();
+        assert_eq!(
+            out["stdout"],
+            format!("{}|congo=t61rcWkgMzE\n", trace.traceparent()),
+            "{out}"
+        );
+        assert!(
+            trace.traceparent().ends_with("-00"),
+            "unsampled stays unsampled"
+        );
     }
 
     #[test]
@@ -203,6 +252,7 @@ mod tests {
             Duration::from_secs(5),
             4, // cap
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(out["stdout"], "abcd", "output is capped at 4 bytes");
@@ -221,6 +271,7 @@ mod tests {
             Duration::from_millis(200),
             4096,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(out["timed_out"], true, "killed at the deadline");
@@ -243,6 +294,7 @@ mod tests {
             Duration::from_millis(300),
             4096,
             &["PATH".into()],
+            None,
         )
         .unwrap();
         std::fs::remove_dir_all(&wd).ok();
@@ -314,6 +366,7 @@ mod tests {
                 Duration::from_secs(10),
                 4096,
                 &[],
+                None,
             )
             .unwrap_or_else(|e| panic!("run {i}: {e}"));
             assert_eq!(out["exit_code"], 0, "run {i}: {out}");
@@ -348,6 +401,7 @@ mod tests {
             Duration::from_secs(5),
             64 * 1024,
             &[],
+            None,
         )
         .unwrap();
         std::fs::remove_dir_all(&wd).ok();
@@ -382,6 +436,7 @@ mod tests {
             Duration::from_secs(5),
             8192,
             &["PATH".into()],
+            None,
         )
         .unwrap();
         let s = out["stdout"].as_str().unwrap();

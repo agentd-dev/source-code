@@ -1253,6 +1253,7 @@ impl crate::runtime::reactor::Runtime {
                 None,
                 &super::waits::SignalSender::Runtime,
                 &Default::default(),
+                None,
             );
             self.log.info(
                 "webhook.callback",
@@ -1412,6 +1413,7 @@ impl crate::runtime::reactor::Runtime {
                         payload,
                         "webhook",
                         Some(&run_id),
+                        None,
                     );
                     if admitted == Admission::Accepted {
                         self.deliver_kept(marker, &workflow, &node, signal);
@@ -1481,6 +1483,7 @@ impl crate::runtime::reactor::Runtime {
                     None,
                     &super::waits::SignalSender::Runtime,
                     &Default::default(),
+                    None,
                 );
                 self.log.info(
                     "webhook.signal",
@@ -1675,7 +1678,7 @@ impl crate::runtime::reactor::Runtime {
         {
             run.vars.insert(var.to_string(), json!(url.clone()));
         }
-        self.log.info(
+        self.run_log(run_id).info(
             "webhook.await.armed",
             json!({"run": run_id, "step": step_id, "path": path, "url": url}),
         );
@@ -1748,7 +1751,7 @@ impl crate::runtime::reactor::Runtime {
                             expires_ms,
                         },
                     );
-                    self.log.info(
+                    self.run_log(&run).info(
                         "webhook.await.restored",
                         json!({"run": run, "step": step, "path": path}),
                     );

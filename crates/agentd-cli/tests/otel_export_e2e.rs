@@ -9,6 +9,9 @@
 //! - A collector that drops every connection is named once per signal in a
 //!   short window — `otel.export.failed` with the signal, the endpoint and the
 //!   error — not once a batch.
+//! - Under an upstream `traceparent` that is not sampled (flags `00`), no
+//!   span is exported: the upstream's decision stands. The log lines still
+//!   go.
 #![cfg(all(unix, feature = "otel", feature = "tls"))]
 
 mod common;
@@ -126,6 +129,11 @@ struct Daemon {
 
 impl Daemon {
     fn start(tag: &str, endpoint: &str) -> Daemon {
+        Daemon::start_in(tag, endpoint, &[])
+    }
+
+    /// [`Daemon::start`] with `args` added to the command line.
+    fn start_in(tag: &str, endpoint: &str, args: &[&str]) -> Daemon {
         let cfg_path = common::unique_path(tag, "yaml");
         std::fs::write(
             &cfg_path,
@@ -148,6 +156,7 @@ impl Daemon {
                 "--prompt",
                 "say hello",
             ])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(err))
@@ -253,4 +262,56 @@ fn a_failing_collector_is_named_once_not_once_a_batch() {
         );
     }
     assert_eq!(failed.len(), 2, "{log}");
+}
+
+/// An upstream that did not sample is not overruled: the turn under its
+/// `traceparent` (flags `00`) exports no span, while the log lines, its own
+/// included, reach the collector.
+#[test]
+fn an_unsampled_upstream_trace_exports_no_spans() {
+    let (port, posts) = spawn_collector();
+    let daemon = Daemon::start_in(
+        "otel-unsampled",
+        &format!("https://127.0.0.1:{port}"),
+        &[
+            "--traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        ],
+    );
+    // A turn exports its spans before it exits, so by the time a log batch
+    // carries the supervisor's `child.exit` for it, they would have arrived.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut exited = false;
+    while !exited {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(post) = posts.recv_timeout(left) else {
+            panic!(
+                "no log batch with the turn's exit in 30 s:\n{}",
+                daemon.log()
+            );
+        };
+        match post.path.as_str() {
+            "/v1/traces" => panic!(
+                "an unsampled trace exported spans: {}\n{}",
+                post.body,
+                daemon.log()
+            ),
+            "/v1/logs" => {
+                exited = post.body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|r| r["body"]["stringValue"] == "child.exit"))
+            }
+            other => panic!("a POST to {other}"),
+        }
+    }
+    while let Ok(post) = posts.recv_timeout(Duration::from_millis(500)) {
+        assert_ne!(post.path, "/v1/traces", "{}", post.body);
+    }
+    // The turn ran, in the upstream's trace.
+    let log = daemon.log();
+    let done = events(&log, "turn.done");
+    assert!(!done.is_empty(), "{log}");
+    for e in done {
+        assert_eq!(e["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736", "{log}");
+    }
 }

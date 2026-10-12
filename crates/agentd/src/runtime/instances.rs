@@ -166,6 +166,11 @@ impl Runtime {
                 ));
             }
         }
+        // The child daemon is a span of the unit that spawned it: its process
+        // trace continues this one, and so does the work it starts itself.
+        let trace = self
+            .caller_trace(caller)
+            .unwrap_or_else(|| self.trace.clone());
         let doc = match self.compose_instance_doc(
             t,
             &prose,
@@ -176,6 +181,7 @@ impl Runtime {
             durable,
             &handle,
             parent_peer,
+            &trace,
         ) {
             Ok(d) => d,
             Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
@@ -219,6 +225,7 @@ impl Runtime {
             created: now_ms(),
             updated: now_ms(),
             payload: None,
+            trace: Some(trace.clone()),
             template: Some(tname.to_string()),
             tier: Some("instance".into()),
             pid: None,
@@ -235,7 +242,7 @@ impl Runtime {
             Ok(pid) => {
                 record.pid = Some(pid);
                 record.status = "running".into();
-                self.log.info(
+                self.log.in_trace(Some(&trace)).info(
                     "instance.spawn",
                     json!({"handle": handle, "template": tname, "pid": pid,
                            "socket": socket, "retire_at": retire_at, "until": until,
@@ -279,6 +286,7 @@ impl Runtime {
         durable: bool,
         handle: &str,
         parent_peer: Option<Value>,
+        trace: &crate::obs::trace::TraceContext,
     ) -> Result<Value, String> {
         let mut doc = t.fragment.clone();
         if !doc.is_object() {
@@ -385,6 +393,17 @@ impl Runtime {
             lifecycle["until_signal"] = json!(u);
         }
         doc["lifecycle"] = lifecycle;
+        // The spawning unit's span, which the child's process trace continues
+        // (`observability.traceparent` is operator-only, so no template wrote
+        // one). Its environment is scrubbed, so this is the one way across.
+        let observability = doc
+            .as_object_mut()
+            .expect("object")
+            .entry("observability")
+            .or_insert_with(|| json!({}));
+        if let Some(o) = observability.as_object_mut() {
+            o.insert("traceparent".into(), json!(trace.traceparent()));
+        }
         // The child inherits the parent's service catalog, egress posture and
         // trifecta override. A template cannot set any of these — they are
         // `OPERATOR_ONLY`, so `document_wrote_operator_config` refuses the
@@ -586,7 +605,7 @@ impl Runtime {
             if let Some(s) = self.subagents.get_mut(&h)
                 && let Some(pid) = s.pid
             {
-                self.log.warn(
+                self.subagent_log(&h).warn(
                     "instance.kill",
                     json!({"handle": h, "pid": pid, "note": "drain window elapsed"}),
                 );
@@ -621,7 +640,7 @@ impl Runtime {
             s.retiring_since = Some(now_ms());
             s.status = "retiring".into();
             s.dirty = true;
-            self.log.info(
+            self.subagent_log(handle).info(
                 "instance.retire",
                 json!({"handle": handle, "pid": pid, "why": why}),
             );
@@ -668,7 +687,7 @@ impl Runtime {
             s.updated = now_ms();
             s.dirty = true;
         }
-        self.log.info(
+        self.subagent_log(&handle).info(
             "instance.exited",
             json!({"handle": handle, "pid": r.pid, "status": status}),
         );
@@ -714,7 +733,7 @@ impl Runtime {
                         s.retiring_since = None;
                     }
                     crate::obs::metrics::record_subagent_restart("restored");
-                    self.log
+                    self.subagent_log(&handle)
                         .info("instance.respawn", json!({"handle": handle, "pid": pid}));
                     self.persist_subagent(&handle);
                 }
@@ -873,6 +892,8 @@ impl Runtime {
             );
             return Err(format!("no live instance child {handle:?}"));
         }
+        // A child's report is the work of the unit that spawned it.
+        let ilog = self.subagent_log(&handle);
         match op {
             InstanceOp::Result => {
                 if let Some(s) = self.subagents.get_mut(&handle) {
@@ -886,7 +907,7 @@ impl Runtime {
                         }));
                         s.updated = now_ms();
                         s.dirty = true;
-                        self.log.info("instance.result", json!({"handle": handle}));
+                        ilog.info("instance.result", json!({"handle": handle}));
                         self.persist_subagent(&handle);
                     }
                 }
@@ -905,7 +926,7 @@ impl Runtime {
                     .and_then(|t| self.settings.subagents.templates.get(t))
                     .is_some_and(|t| t.mirror_streams.iter().flatten().any(|m| *m == stream));
                 if !mirrored {
-                    self.log.warn(
+                    ilog.warn(
                         "instance.mirror.fail",
                         json!({"handle": handle, "stream": stream,
                                "err": "not one of the template's mirror_streams"}),
@@ -930,14 +951,14 @@ impl Runtime {
                 ) {
                     Ok(seq) => {
                         self.stream_dirty = true;
-                        self.log.info(
+                        ilog.info(
                             "instance.mirror",
                             json!({"handle": handle, "stream": stream, "seq": seq}),
                         );
                         Ok(format!("event mirrored into {stream} at {seq}"))
                     }
                     Err(e) => {
-                        self.log.warn(
+                        ilog.warn(
                             "instance.mirror.fail",
                             json!({"handle": handle, "stream": stream, "err": e}),
                         );
@@ -998,7 +1019,7 @@ impl Runtime {
                 s.tokens = total;
                 s.dirty = true;
             }
-            self.log.info(
+            self.subagent_log(&handle).info(
                 "instance.metered",
                 json!({"handle": handle, "delta_tokens": delta, "total_tokens": total}),
             );

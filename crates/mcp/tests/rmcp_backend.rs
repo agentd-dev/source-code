@@ -285,10 +285,10 @@ fn capabilities_come_from_the_discover_answer() {
     let (ep, seen) = spawn_server_with(Lifecycle::Stateless, offered);
     let c = connect(&ep);
     let (name, args) = prompt();
-    let got = c.get_prompt(name, args).expect("prompts/get");
+    let got = c.get_prompt(name, args, None).expect("prompts/get");
     assert_eq!(got.messages.len(), 1);
     let done = c
-        .complete(reference(), argument())
+        .complete(reference(), argument(), None)
         .expect("completion/complete");
     assert_eq!(done.completion.values, ["x1"]);
     c.subscribe("file:///a.txt").expect("listen");
@@ -308,11 +308,11 @@ fn capabilities_come_from_the_discover_answer() {
     let (ep, seen) = spawn_server_with(Lifecycle::Stateless, withheld);
     let c = connect(&ep);
     let (name, args) = prompt();
-    match c.get_prompt(name, args) {
+    match c.get_prompt(name, args, None) {
         Err(McpError::Capability(m)) => assert!(m.contains("prompts"), "{m}"),
         other => panic!("prompts were not offered: {other:?}"),
     }
-    match c.complete(reference(), argument()) {
+    match c.complete(reference(), argument(), None) {
         Err(McpError::Capability(m)) => assert!(m.contains("completions"), "{m}"),
         other => panic!("completions were not offered: {other:?}"),
     }
@@ -366,7 +366,7 @@ fn tools_and_resources_come_back_as_agentds_own_wire_types() {
         assert_eq!(tools[0].description.as_deref(), Some("echo a string"));
         assert_eq!(tools[0].input_schema["properties"]["s"]["type"], "string");
 
-        let resources = client.list_resources().expect("resources/list");
+        let resources = client.list_resources(None).expect("resources/list");
         assert_eq!(resources.len(), 1, "{lifecycle:?}");
         assert_eq!(resources[0].uri, "file:///a.txt");
 
@@ -550,7 +550,7 @@ fn every_read_reaches_the_server_even_when_it_offers_a_ttl() {
 
         for i in 1..=3 {
             let read = client
-                .read_resource("instruction://ins_x@stable")
+                .read_resource("instruction://ins_x@stable", None)
                 .unwrap_or_else(|e| panic!("{lifecycle:?}: {e}"));
             assert_eq!(
                 read.text(),
@@ -560,10 +560,10 @@ fn every_read_reaches_the_server_even_when_it_offers_a_ttl() {
         }
         for _ in 0..2 {
             client.list_tools().expect("tools/list");
-            client.list_resources().expect("resources/list");
+            client.list_resources(None).expect("resources/list");
             client.list_prompts().expect("prompts/list");
             client
-                .list_resource_templates()
+                .list_resource_templates(None)
                 .expect("resources/templates/list");
         }
         // A 2026-07-28 connection lists its tools once to start: rmcp sends
@@ -592,12 +592,12 @@ fn a_read_against_a_stopped_server_fails_instead_of_replaying_the_last_answer() 
         let (ep, stopper) = spawn_ttl_server(Arc::clone(&state), lifecycle);
         let client = connect(&ep, lifecycle);
         let uri = "instruction://ins_x@stable";
-        assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
+        assert_eq!(client.read_resource(uri, None).expect("read").text(), "v1");
         client.list_tools().expect("tools/list");
 
         stopper.stop();
 
-        match client.read_resource(uri) {
+        match client.read_resource(uri, None) {
             Err(McpError::Transport(m)) => {
                 assert!(
                     m.contains(&format!("resources/read {uri}")),
@@ -623,11 +623,11 @@ fn a_refusal_from_the_server_is_not_masked_by_an_earlier_answer() {
         let (ep, _stop) = spawn_ttl_server(Arc::clone(&state), lifecycle);
         let client = connect(&ep, lifecycle);
         let uri = "instruction://ins_x@stable";
-        assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
+        assert_eq!(client.read_resource(uri, None).expect("read").text(), "v1");
 
         state.fail_reads.store(true, Ordering::SeqCst);
 
-        let err = match client.read_resource(uri) {
+        let err = match client.read_resource(uri, None) {
             Err(e) => e,
             Ok(r) => panic!("{lifecycle:?}: the server refused, the client must say so: {r:?}"),
         };

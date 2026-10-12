@@ -30,6 +30,7 @@ use super::children::ChildKind;
 use super::reactor::{ABANDON_GRACE, PendingKind, Runtime, Target, is_terminal_status};
 use crate::engine::StepStatus;
 use crate::engine::model::{Step, Workflow};
+use crate::obs::trace::TraceContext;
 use crate::state::now_ms;
 use crate::supervisor::reap::{Reaped, WaitOutcome};
 use crate::supervisor::tree::NodeId;
@@ -110,7 +111,7 @@ impl Runtime {
             .filter_map(|s| Some((s.handle.clone(), s.pid?)))
             .collect();
         for (handle, pid) in daemons {
-            self.log
+            self.subagent_log(&handle)
                 .info("instance.drain", json!({"handle": handle, "pid": pid}));
             #[cfg(unix)]
             unsafe {
@@ -275,9 +276,9 @@ impl Runtime {
         if !done {
             self.log
                 .warn("drain.abandon", json!({"children": self.children.len()}));
-            for (node, kind, settled, parked) in self.children.abandon() {
+            for (node, kind, trace, settled, parked) in self.children.abandon() {
                 if parked && !settled {
-                    self.park_child(node, &kind, None);
+                    self.park_child(node, &kind, trace.as_ref(), None);
                 }
             }
             self.drain_forced = true;
@@ -347,11 +348,19 @@ impl Runtime {
             .map(|c| c.kind.clone())
     }
 
-    /// Leave what a child the drain stopped owed for the next life. `usage` is
-    /// what its turn spent, when it reported one before it stopped.
-    pub(crate) fn park_child(&mut self, node: NodeId, kind: &ChildKind, usage: Option<Usage>) {
+    /// Leave what a child the drain stopped owed for the next life. `trace`
+    /// is the span it was spawned under — the child may be reaped already —
+    /// and `usage` what its turn spent, when it reported one before it
+    /// stopped.
+    pub(crate) fn park_child(
+        &mut self,
+        node: NodeId,
+        kind: &ChildKind,
+        trace: Option<&TraceContext>,
+        usage: Option<Usage>,
+    ) {
         self.activity_end(node);
-        self.park_gates(node);
+        self.park_gates(node, trace);
         match kind {
             ChildKind::StepTurn {
                 run,
@@ -424,8 +433,9 @@ impl Runtime {
     /// on a task its caller owns goes back to `working`: the replay of the
     /// turn or step in the next life asks on that task again, and the answer
     /// is taken then. A gate task opened for this ask alone is cancelled,
-    /// since the replay opens its own.
-    fn park_gates(&mut self, node: NodeId) {
+    /// since the replay opens its own. Its line is in the asking child's
+    /// `trace`.
+    fn park_gates(&mut self, node: NodeId, trace: Option<&TraceContext>) {
         let asks = |p: &super::reactor::PendingTool| {
             matches!(p.target, Target::Child(n, _) if n == node)
                 && matches!(p.kind, PendingKind::Human { .. })
@@ -462,13 +472,13 @@ impl Runtime {
             t.transition(state, Some(why.to_string()));
             self.task_persist(&task);
             self.task_sync(&task);
-            self.log.info(
+            self.log.in_trace(trace).info(
                 "human.ask.drained",
                 json!({"task": task, "state": state.wire()}),
             );
         }
         #[cfg(not(feature = "a2a"))]
-        let _ = gates;
+        let _ = (gates, trace);
     }
 
     /// Record a subagent the drain stopped: `parked`, as a rule —
@@ -504,7 +514,7 @@ impl Runtime {
         s.dirty = true;
         let (tokens, error) = (s.tokens, s.error.clone());
         if asked_again {
-            self.log.info(
+            self.subagent_log(handle).info(
                 "subagent.result",
                 json!({"handle": handle, "status": status, "tokens": tokens, "err": error}),
             );
@@ -549,7 +559,7 @@ impl Runtime {
         }
         self.park_subagent(handle);
         let status = self.subagents.get(handle).map(|s| s.status.clone());
-        self.log.info(
+        self.subagent_log(handle).info(
             "instance.exited",
             json!({"handle": handle, "pid": r.pid, "status": status}),
         );

@@ -61,6 +61,7 @@ impl Runtime {
             role: Some("operator"),
             request_id: None,
             sid: None,
+            trace: None,
         });
         match outcome {
             Ok(changed) => {
@@ -341,11 +342,7 @@ impl Runtime {
                 .and_then(|mut c| c.initialize().map(|()| c))
             {
                 Ok(mut c) => {
-                    c.set_tool_meta(crate::mcp::tool_meta(
-                        &self.run_id,
-                        &self.instance,
-                        self.trace_id.as_deref(),
-                    ));
+                    c.set_tool_meta(crate::mcp::tool_meta(&self.run_id, &self.instance));
                     set.insert(s.name.clone(), Arc::new(c));
                     fresh.push(s.name.clone());
                 }

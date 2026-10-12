@@ -312,9 +312,10 @@ impl<'a> Session<'a> {
             }
         }
         let mut last_text: Option<String> = None;
-        // otel run trace: the `invoke_agent` span plus a `chat` child per model
-        // call and an `execute_tool` child per tool call. No-op without
-        // `--features otel`, so the wiring carries no `cfg`. One trace per turn.
+        // otel spans: the `invoke_agent` span plus a `chat` child per model
+        // call and an `execute_tool` child per tool call, in the trace of the
+        // unit of work that spawned this subagent (the logger's). No-op
+        // without `--features otel`, so the wiring carries no `cfg`.
         let run_start = crate::obs::otel::now_unix_nanos();
         let mut run_span = crate::obs::otel::run_begin(log, run_start);
         let (mut tok_in, mut tok_out) = (0u64, 0u64);
@@ -711,7 +712,7 @@ fn collect_resources(servers: &[McpClient]) -> ResourceCatalogue {
     let mut entries = Vec::new();
     let mut truncated = false;
     'outer: for (i, s) in servers.iter().enumerate() {
-        let Ok(list) = s.list_resources() else {
+        let Ok(list) = s.list_resources(None) else {
             continue;
         };
         for r in list {
@@ -763,7 +764,7 @@ fn read_resource_tool(
         None => (0..servers.len()).collect(), // a templated/unlisted uri — try all
     };
     for i in candidates {
-        if let Ok(r) = servers[i].read_resource(uri) {
+        if let Ok(r) = servers[i].read_resource(uri, None) {
             return (r.text(), false);
         }
     }
@@ -1135,6 +1136,8 @@ mod tests {
                     comp: Comp::Agent,
                     pid: 0,
                     trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
                 },
                 Level::Error, // keep the test quiet
             )

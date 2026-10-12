@@ -362,6 +362,7 @@ impl Runtime {
                     Some(&principal.id),
                     &sender,
                     &carries,
+                    None,
                 );
                 Answer::Done {
                     link: None,
@@ -443,7 +444,12 @@ impl Runtime {
                 "started"
             ));
         }
-        match self.accept_event(kinds::WORKFLOW_RUN, Some(principal.id.clone()), payload) {
+        match self.accept_event(
+            kinds::WORKFLOW_RUN,
+            Some(principal.id.clone()),
+            payload,
+            None,
+        ) {
             Ok(_) => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.transition(State::Working, None);

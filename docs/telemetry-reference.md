@@ -23,7 +23,9 @@ fields are merged into it.
 | `agent_path` | yes | Which unit of work wrote the line (see below) |
 | `comp` | yes | `supervisor` for the supervisor process, `agent` for turn workers and subagents |
 | `pid` | yes | The OS process id, which joins the log to `ps` and `pstree` |
-| `trace_id` | yes | The W3C trace id: adopted from `observability.traceparent`, else derived from `run_id` |
+| `trace_id` | yes | The W3C trace id of the unit of work the line is about: a run, a conversation turn, a start firing, a subagent, or else the process. A run another run started continues its trace; the process continues `observability.traceparent`, else mints a random one. |
+| `span_id` | yes | The span the line is about: the run's, the step's, the worker's own |
+| `parent_span_id` | no | That span's parent, when it has one |
 
 Rules a parser can rely on:
 
@@ -41,8 +43,8 @@ Rules a parser can rely on:
 A supervisor line and a turn worker line from the same run:
 
 ```json
-{"acting_for":"system","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"run.start","inbox_event":"01M4P4004T51G3953PXYBDCPQS","key":null,"level":"info","node":"start","pid":1845135,"run":"main-01M4P4004VPT9M256ZXBGDGV3C","run_id":"01M4P4004MMJKM81HAZA0JFGP4","trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.395Z","workflow":"main"}
-{"agent_id":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","agent_path":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","comp":"agent","event":"turn.done","level":"info","pid":1845136,"rounds":1,"run_id":"01M4P4004MMJKM81HAZA0JFGP4","status":"completed","tokens_in":11,"tokens_out":5,"tool_calls":0,"trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.412Z","turn":"main-01M4P4004VPT9M256ZXBGDGV3C/work#1"}
+{"acting_for":"system","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"run.start","inbox_event":"01M4P4004T51G3953PXYBDCPQS","key":null,"level":"info","node":"start","parent_span_id":"7c2d9e4f10a3b856","pid":1845135,"run":"main-01M4P4004VPT9M256ZXBGDGV3C","run_id":"01M4P4004MMJKM81HAZA0JFGP4","span_id":"3f8a6b1c0d2e4975","trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.395Z","workflow":"main"}
+{"agent_id":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","agent_path":"run/main-01M4P4004VPT9M256ZXBGDGV3C/work","comp":"agent","event":"turn.done","level":"info","parent_span_id":"5e3cf0a1d2b4c697","pid":1845136,"rounds":1,"run_id":"01M4P4004MMJKM81HAZA0JFGP4","span_id":"a1b2c3d4e5f60718","status":"completed","tokens_in":11,"tokens_out":5,"tool_calls":0,"trace_id":"f281fdc06f4dd1374e53be619f96e1fe","ts":"2026-10-11T18:35:54.412Z","turn":"main-01M4P4004VPT9M256ZXBGDGV3C/work#1"}
 ```
 
 ### agent_path values
@@ -958,8 +960,10 @@ instead.
 
 **Traces.** With a collector configured, each turn worker and subagent loop
 exports one batch when it finishes: an `invoke_agent` span with a `chat`
-child per model call and an `execute_tool` child per tool call. Spans share
-the instance's `trace_id`. The resource carries `service.name: agentd` and
+child per model call and an `execute_tool` child per tool call. Spans carry
+the `trace_id` of the unit of work the worker serves. A worker whose trace
+is not sampled — an upstream `traceparent` with flags `00` — exports
+nothing. The resource carries `service.name: agentd` and
 `service.version`.
 
 | Span | Attributes |
@@ -1004,7 +1008,7 @@ JSON string. At most 8192 records wait between flushes; the rest are dropped.
 | `target` | What it was done to |
 | `outcome` | `ok`, or the refusal or failure |
 | `request_id` | The A2A message id, when there is one |
-| `trace` | The instance's `trace_id` |
+| `trace` | The `trace_id` of the unit of work the action belongs to (a run, a turn, a tool call's), else the instance's |
 | `sid` | The sign-in session, when the caller used one |
 
 The `action` of an A2A call is `a2a.<method>`, or `a2a.<method>:<op>` when

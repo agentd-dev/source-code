@@ -363,13 +363,13 @@ impl Endpoint {
         req: &crate::wire::intel::Request,
         timeout: Duration,
         deadline: Option<Instant>,
-        trace_id: Option<&str>,
+        trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
         use super::{anthropic, openai};
         use std::collections::HashMap;
 
         if let Some(d) = &req.decision {
-            return self.decide_once(req, d, timeout, deadline, trace_id);
+            return self.decide_once(req, d, timeout, deadline, trace);
         }
         if self.provider == Provider::Decisions {
             return Err(IntelError::Unsupported(
@@ -440,7 +440,7 @@ impl Endpoint {
         // signature covers the exact request-target. Recomputing it separately
         // for either use would silently invalidate every signature.
         let path = self.provider.request_path(&self.http_path, req);
-        let (resp, latency) = self.post(&path, body, headers, timeout, deadline, trace_id)?;
+        let (resp, latency) = self.post(&path, body, headers, timeout, deadline, trace)?;
 
         let mut parsed = match self.provider {
             Provider::OpenAiCompatible => openai::parse_response(&resp.body),
@@ -478,14 +478,14 @@ impl Endpoint {
         d: &crate::wire::decision::Decision,
         timeout: Duration,
         deadline: Option<Instant>,
-        trace_id: Option<&str>,
+        trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
         use super::decisions;
         use crate::wire::intel::{Message, Request, Response, StopReason};
         if self.provider == Provider::Decisions {
             let (body, headers) = decisions::build_request(&req.model, d, self.token.as_deref());
             let (resp, latency) =
-                self.post(&self.http_path, body, headers, timeout, deadline, trace_id)?;
+                self.post(&self.http_path, body, headers, timeout, deadline, trace)?;
             let (answers, usage) =
                 decisions::parse_response(&resp.body, d).map_err(IntelError::Parse)?;
             let answered = Response {
@@ -511,7 +511,7 @@ impl Endpoint {
             output_schema: Some(decisions::emulation_schema(d)),
             ..Default::default()
         };
-        let (mut resp, mut latency) = self.complete_once(&chat, timeout, deadline, trace_id)?;
+        let (mut resp, mut latency) = self.complete_once(&chat, timeout, deadline, trace)?;
         // A chat model that misses the shape is told why and asked once
         // more. Either way the tokens it spent are on the response: an answer
         // that is still not a decision comes back with `decision: None` and
@@ -526,7 +526,7 @@ impl Endpoint {
                     "That answer cannot be used: {why}. Reply again with ONLY the JSON object, every question answered."
                 )));
                 let first = resp.usage;
-                let (again, l) = self.complete_once(&chat, timeout, deadline, trace_id)?;
+                let (again, l) = self.complete_once(&chat, timeout, deadline, trace)?;
                 latency += l;
                 resp = again;
                 resp.usage.input_tokens += first.input_tokens;
@@ -549,15 +549,18 @@ impl Endpoint {
         mut headers: Vec<(String, String)>,
         timeout: Duration,
         deadline: Option<Instant>,
-        trace_id: Option<&str>,
+        trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<(crate::net::http::Response, Duration), IntelError> {
         use crate::net::http;
         let path = path.to_string();
-        if let Some(tid) = trace_id {
-            headers.push((
-                "traceparent".into(),
-                crate::obs::trace::outbound_traceparent(tid),
-            ));
+        // The call is a span of its own under the caller's: one id per
+        // `post`, kept by its transient retries, with the caller's flags and
+        // `tracestate`.
+        if let Some(t) = trace.map(|t| t.child()) {
+            headers.push(("traceparent".into(), t.traceparent()));
+            if let Some(ts) = t.tracestate {
+                headers.push(("tracestate".into(), ts));
+            }
         }
         // The configured `intelligence.headers` ride every dial — a gateway
         // routing header, for instance. Pushed BEFORE the AAuth headers so the

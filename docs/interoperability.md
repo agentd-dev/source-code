@@ -176,10 +176,10 @@ model provider; the guarded local command runner (`exec`) is in neither.
 
 | Standard | How agentd uses it |
 |---|---|
-| JSON Lines | every log event on stderr, one object per line, with a run id and a trace id; the result of a one-shot run on stdout |
+| JSON Lines | every log event on stderr, one object per line, with a run id and the trace and span of the unit of work it is about; the result of a one-shot run on stdout |
 | Prometheus text exposition 0.0.4 | `/metrics`, beside `/healthz` and `/readyz`, on the address `observability.metrics_addr` names |
 | OpenTelemetry OTLP/HTTP (JSON) | spans per run, mapped to the GenAI semantic conventions, and the log stream with `observability.otel.logs: true`, both sent to `observability.otel.endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT` when it is unset) |
-| W3C Trace Context | a `traceparent` adopted at start from `--traceparent` or `AGENTD_TRACEPARENT`, and sent on every MCP request and every model request |
+| W3C Trace Context | a trace per unit of work (a run, a conversation turn), continued from the run that started it, and the process's own continued from `--traceparent` or `AGENTD_TRACEPARENT`; a `traceparent`, with the trace's `tracestate` when it has one, sent on every MCP request and every model request, and as `TRACEPARENT` to an `exec` command; a trace whose upstream is unsampled stays unsampled and exports no spans |
 | Exit codes | a stable table a Kubernetes `podFailurePolicy` can branch on; see [CLI, environment and exit codes](cli.md) |
 
 [Events and metrics reference](telemetry-reference.md) lists every event and

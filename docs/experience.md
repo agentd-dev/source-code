@@ -124,8 +124,9 @@ step "work" failed: turn failed: intel: all intelligence endpoints down (last er
 **The streams never mix: stdout is the agent's result, stderr is
 telemetry**, one JSON object per line, so you can redirect them apart
 without a parser. Every line carries the same canonical fields — `ts`,
-`level`, `event`, `run_id`, `trace_id`, `agent_id`, `agent_path`, `comp`,
-`pid` — and then whatever the event carries.
+`level`, `event`, `run_id`, `trace_id`, `span_id`, `agent_id`,
+`agent_path`, `comp`, `pid`, and `parent_span_id` when the span has a
+parent — and then whatever the event carries.
 
 - `run_id` is constant for the whole invocation, so it joins every process
   in the tree.

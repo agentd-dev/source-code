@@ -5,9 +5,16 @@
 //! us correlation for free).
 //!
 //! One NDJSON event per line to **stderr** (stdout is reserved for the
-//! agent's result). The canonical line schema is:
-//! `ts level event run_id agent_id agent_path comp pid [span_id parent_span_id
-//! trace_id] [dur_ms] [err] <event-specific>`.
+//! agent's result). Every line carries `ts level event run_id agent_id
+//! agent_path comp pid`, then `trace_id`, `span_id` and `parent_span_id` when
+//! known, then the event's own fields. `run_id` is the process's; a workflow
+//! run is the event field `run`.
+//!
+//! The trace is the line's unit of work's: a line about a run, a step, a turn,
+//! a start firing, an inbox event, a subagent or a delivery is written through
+//! [`Logger::in_trace`] and carries that unit's trace id and span; a line
+//! about the process (boot, reload, drain, the store) carries the process
+//! trace ([`crate::obs::trace`]).
 
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
@@ -70,8 +77,9 @@ impl Comp {
 }
 
 /// The correlation context stamped on every line. Children inherit `run_id`
-/// and `trace_id` and extend `agent_path` (the cheap subtree-query superpower:
-/// an `agent_path` prefix selects a subtree with no backend join).
+/// and extend `agent_path` (the cheap subtree-query superpower: an
+/// `agent_path` prefix selects a subtree with no backend join), and take the
+/// trace of the unit of work they serve.
 #[derive(Debug, Clone)]
 pub struct LogCtx {
     pub run_id: String,
@@ -80,6 +88,18 @@ pub struct LogCtx {
     pub comp: Comp,
     pub pid: u32,
     pub trace_id: Option<String>,
+    /// The span the line is about, and its parent.
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+}
+
+impl LogCtx {
+    /// Set the trace fields to `t`'s.
+    pub fn set_trace(&mut self, t: &crate::obs::trace::TraceContext) {
+        self.trace_id = Some(t.trace_id.clone());
+        self.span_id = Some(t.span_id.clone());
+        self.parent_span_id = t.parent_span_id.clone();
+    }
 }
 
 /// A logger bound to one [`LogCtx`]. Cheap to clone (clones the ctx); writes
@@ -540,6 +560,18 @@ impl Logger {
         &self.ctx
     }
 
+    /// This logger for the lines about one unit of work — a run, a step, a
+    /// turn, a start firing, a subagent: the same process context, with the
+    /// unit's trace id and span in place of the process's. `None` (a unit
+    /// whose record predates traces) keeps the process trace.
+    pub fn in_trace(&self, t: Option<&crate::obs::trace::TraceContext>) -> Logger {
+        let mut l = self.clone();
+        if let Some(t) = t {
+            l.ctx.set_trace(t);
+        }
+        l
+    }
+
     /// Emit one event. `fields` should be a JSON object; its keys are merged
     /// after the canonical fields (event-specific data). Non-object `fields`
     /// is ignored. Below `min` level: dropped cheaply.
@@ -562,8 +594,14 @@ impl Logger {
         );
         m.insert("comp".into(), Value::String(self.ctx.comp.as_str().into()));
         m.insert("pid".into(), Value::Number(self.ctx.pid.into()));
-        if let Some(tid) = &self.ctx.trace_id {
-            m.insert("trace_id".into(), Value::String(tid.clone()));
+        for (k, v) in [
+            ("trace_id", &self.ctx.trace_id),
+            ("span_id", &self.ctx.span_id),
+            ("parent_span_id", &self.ctx.parent_span_id),
+        ] {
+            if let Some(v) = v {
+                m.insert(k.into(), Value::String(v.clone()));
+            }
         }
         if let Value::Object(extra) = fields {
             for (k, v) in extra {
@@ -722,6 +760,8 @@ mod tests {
                 comp: Comp::Supervisor,
                 pid: 1,
                 trace_id: None,
+                span_id: None,
+                parent_span_id: None,
             },
             Level::Trace,
         );

@@ -96,7 +96,7 @@ impl Runtime {
         let Some(caller) = self.child_caller(node, id) else {
             return;
         };
-        self.log.info("tool.request", json!({"node": node.0, "req": id, "tool": name, "caller": caller.label(), "args": if self.log.content_capture() { args.clone() } else { Value::Null }}));
+        self.child_log(node).info("tool.request", json!({"node": node.0, "req": id, "tool": name, "caller": caller.label(), "args": if self.log.content_capture() { args.clone() } else { Value::Null }}));
         let outcome = self.execute_tool(&caller, name, args);
         self.child_tool_outcome(node, id, name, outcome);
     }
@@ -173,7 +173,7 @@ impl Runtime {
 
     /// Answer a child's tool request.
     pub(crate) fn reply_tool(&mut self, node: NodeId, req: u64, result: Value, is_error: bool) {
-        self.log.debug(
+        self.child_log(node).debug(
             "tool.reply",
             json!({"node": node.0, "req": req, "is_error": is_error}),
         );
@@ -399,6 +399,7 @@ impl Runtime {
         if !labels.is_empty() {
             meta["agent/labels"] = json!(labels);
         }
+        crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         let call_ctx = ctx.clone();
@@ -473,6 +474,7 @@ impl Runtime {
         if !labels.is_empty() {
             meta["agent/labels"] = json!(labels);
         }
+        crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         std::thread::Builder::new()
@@ -740,10 +742,13 @@ impl Runtime {
                         c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>
                     })
                 };
-                match self
-                    .skills
-                    .load(&name, args.get("arguments").cloned(), &resolver)
-                {
+                let trace = self.caller_trace(caller);
+                match self.skills.load(
+                    &name,
+                    args.get("arguments").cloned(),
+                    &resolver,
+                    trace.as_ref(),
+                ) {
                     Ok(body) => {
                         let max_loaded = self.settings.skills.max_loaded.unwrap_or(8) as usize;
                         let c = self.context_for(&ctx_id, caller.principal.as_deref());
@@ -815,6 +820,7 @@ impl Runtime {
                     .map(|k| k as usize)
                     .unwrap_or(self.settings.context.keep_last.unwrap_or(12) as usize);
                 let target = args.get("target_tokens").and_then(Value::as_u64);
+                let trace = self.caller_trace(caller);
                 match caller.node {
                     // Deferred only when a compaction child will answer; one
                     // answered on the spot (nothing to fold, one already
@@ -825,6 +831,7 @@ impl Runtime {
                             keep_last,
                             target,
                             Some((node, caller.req)),
+                            trace.as_ref(),
                         ) {
                             ToolOutcome::Deferred(PendingKind::Think {
                                 child: NodeId(u64::MAX),
@@ -953,6 +960,7 @@ impl Runtime {
                     role: None,
                     request_id: None,
                     sid: None,
+                    trace: self.caller_trace(caller).as_ref(),
                 });
                 // Shadow mode says plainly that the call was HELD, never
                 // returning a synthetic success. A schema-conformant fake is
@@ -1107,7 +1115,8 @@ impl Runtime {
         approved: bool,
         by: &str,
     ) {
-        self.log.info(
+        let trace = self.target_trace(target);
+        self.log.in_trace(trace.as_ref()).info(
             "tool.policy.decided",
             json!({"tool": call.tool, "rule": call.rule, "approved": approved, "by": by}),
         );
@@ -1119,6 +1128,7 @@ impl Runtime {
             role: None,
             request_id: None,
             sid: None,
+            trace: trace.as_ref(),
         });
         if !approved {
             let msg = format!(
@@ -1205,10 +1215,13 @@ impl Runtime {
         if owner_checked {
             payload["owner_checked"] = Value::Bool(true);
         }
+        // The turn it starts continues the sender's trace.
+        let trace = self.caller_trace(caller);
         match self.accept_event(
             super::events::kinds::A2A_MESSAGE,
             caller.principal.clone(),
             payload,
+            trace.as_ref(),
         ) {
             Ok(_) => ToolOutcome::Ready(
                 json!({"delivered": true, "conversation": ctx, "depth": depth}),
@@ -1276,12 +1289,17 @@ impl Runtime {
         let max_output = cfg.max_output.unwrap_or(1 << 20) as usize;
         let env_pass = cfg.env.clone();
 
-        self.log.info(
+        self.log.in_trace(self.caller_trace(caller).as_ref()).info(
             "exec.run",
             json!({"cmd": cmd, "argc": argv.len(), "cwd": cwd.display().to_string(), "timeout_ms": timeout.as_millis() as u64, "caller": caller.label()}),
         );
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
+        // The command is a span of its own under the caller's.
+        let trace = self
+            .caller_trace(caller)
+            .unwrap_or_else(|| self.trace.clone())
+            .child();
         std::thread::Builder::new()
             .name("tool:exec".into())
             .spawn(move || {
@@ -1293,6 +1311,7 @@ impl Runtime {
                     timeout,
                     max_output,
                     &env_pass,
+                    Some(&trace),
                 ) {
                     Ok(v) => (v, false),
                     Err(e) => (Value::String(format!("exec: {e}")), true),
@@ -1391,6 +1410,7 @@ impl Runtime {
             model: None,
             role: crate::config::settings::ModelRole::Decide,
             effort: None,
+            trace: self.caller_trace(caller),
         };
         self.spawn_turn(launch)
     }
@@ -1492,6 +1512,7 @@ impl Runtime {
             model: None,
             role: crate::config::settings::ModelRole::Think,
             effort,
+            trace: self.caller_trace(caller),
         };
         self.spawn_turn(launch)
     }

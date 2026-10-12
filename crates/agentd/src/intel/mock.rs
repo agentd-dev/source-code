@@ -45,6 +45,11 @@
 //! tool call's `arguments_from_tool_result` maps argument names to JSON
 //! pointers into the last tool result, so a call can name what an earlier
 //! one returned — a run id, a handle — that no script can know beforehand.
+//!
+//! The hidden mode writes one `MOCK_LLM_TRACE {"traceparent": …,
+//! "tracestate": …}` line to stderr per request — the W3C headers as they
+//! arrived — so an e2e can assert the trace a model call carried. The
+//! in-process mock writes nothing: its stderr is agentd's own.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -78,7 +83,7 @@ pub fn inprocess(script: &str) -> Result<String, String> {
     let sc = script.to_string();
     std::thread::Builder::new()
         .name("mock-intel".into())
-        .spawn(move || serve(listener, &sc))
+        .spawn(move || serve(listener, &sc, false))
         .map_err(|e| format!("mock intelligence: spawn: {e}"))?;
     servers.insert(script.to_string(), addr.clone());
     Ok(addr)
@@ -98,7 +103,7 @@ pub fn run(addr_file: &str, script: &str) -> i32 {
         eprintln!("mock-llm: write {addr_file}: {e}");
         return crate::exit::GENERIC;
     }
-    serve(listener, script);
+    serve(listener, script, true);
     0
 }
 
@@ -108,17 +113,21 @@ pub fn run(addr_file: &str, script: &str) -> i32 {
 /// sequential accept loop would serialize every caller behind the slowest
 /// in-flight one, coupling concurrent tests' timing and queueing two runs that
 /// share one mock behind a 12s hang.
-fn serve(listener: TcpListener, script: &str) {
+/// `announce`: write each request's trace headers to stderr (the hidden mode).
+fn serve(listener: TcpListener, script: &str, announce: bool) {
     for stream in listener.incoming().flatten() {
         let script = script.to_string();
-        std::thread::spawn(move || handle(stream, &script));
+        std::thread::spawn(move || handle(stream, &script, announce));
     }
 }
 
-fn handle(mut stream: TcpStream, script: &str) {
-    let Some(body) = read_request_body(&mut stream) else {
+fn handle(mut stream: TcpStream, script: &str, announce: bool) {
+    let Some((body, trace)) = read_request_body(&mut stream) else {
         return;
     };
+    if announce {
+        eprintln!("MOCK_LLM_TRACE {}", serde_json::Value::Object(trace));
+    }
     // A decisions request (RFC 0046 §5.5) — `{model, state, questions}` —
     // is answered as a decision model would answer it.
     if let Ok(req) = serde_json::from_str::<serde_json::Value>(&body)
@@ -236,10 +245,14 @@ fn handle(mut stream: TcpStream, script: &str) {
 }
 
 /// Read an HTTP/1.1 request: headers up to the blank line, then `Content-Length`
-/// body bytes. Returns the request body (the chat-completions JSON).
-fn read_request_body(stream: &mut TcpStream) -> Option<String> {
+/// body bytes. Returns the request body (the chat-completions JSON) and its
+/// W3C trace headers (`traceparent`, `tracestate`), by lowercase name.
+fn read_request_body(
+    stream: &mut TcpStream,
+) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
     let mut reader = BufReader::new(stream);
     let mut content_length = 0usize;
+    let mut trace = serde_json::Map::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -255,10 +268,16 @@ fn read_request_body(stream: &mut TcpStream) -> Option<String> {
         {
             content_length = v.trim().parse().unwrap_or(0);
         }
+        if let Some((k, v)) = t.split_once(':') {
+            let k = k.trim().to_ascii_lowercase();
+            if k == "traceparent" || k == "tracestate" {
+                trace.insert(k, serde_json::Value::String(v.trim().to_string()));
+            }
+        }
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).ok()?;
-    Some(String::from_utf8_lossy(&body).into_owned())
+    Some((String::from_utf8_lossy(&body).into_owned(), trace))
 }
 
 /// The scripted assistant turn as an OpenAI chat-completion body.

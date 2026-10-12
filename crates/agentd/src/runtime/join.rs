@@ -179,11 +179,7 @@ impl Runtime {
         if !errs.is_empty() {
             return Err(errs);
         }
-        client.set_tool_meta(crate::mcp::tool_meta(
-            &self.run_id,
-            &self.instance,
-            self.trace_id.as_deref(),
-        ));
+        client.set_tool_meta(crate::mcp::tool_meta(&self.run_id, &self.instance));
         super::report_dropped_tools(&self.log, server, &client);
         let count = built.last().map_or(0, |t| t.tools.len());
         let protocol = client.protocol_version();

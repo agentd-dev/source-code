@@ -199,6 +199,13 @@ pub struct InboxEvent {
     pub payload: Value,
     #[serde(default)]
     pub status: InboxStatus,
+    /// The trace of the unit of work this event starts, resolved when it was
+    /// accepted (`Runtime::accept_event_store`): continued from whoever caused
+    /// it, or minted. Beside the payload, never in it — a payload is what the
+    /// caller sent, and must not be able to say whose trace this is — and
+    /// durable, so a replay continues the trace the event started in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::obs::trace::TraceContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -218,6 +225,7 @@ impl InboxEvent {
             principal,
             payload,
             status: InboxStatus::Pending,
+            trace: None,
         }
     }
 }

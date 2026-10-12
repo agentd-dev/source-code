@@ -148,7 +148,8 @@ deduplicate:
 |---|---|
 | `agent/run_id` | every call |
 | `agent/instance` | every call |
-| `traceparent` | every call made with an active trace (W3C trace context) |
+| `traceparent` | every request of any kind: a span of its own in the trace of the unit of work it is made for (an `mcp.resource` step's lists included, one span per page), or the process trace for the connection's own handshake, catalogue lists, subscriptions and MCP Events requests (W3C trace context, SEP-414) |
+| `tracestate` | beside `traceparent`, when the trace has one |
 | `agent/ctx` | calls made during a conversation turn |
 | `agent/idempotency_key` | calls from a turn, from an `mcp.tool` step (stable across the step's retries, or its `idempotency.value`), and from the supervisor's tool registry |
 | `agent/attempt`, `agent/run` | calls from an `mcp.tool` step |

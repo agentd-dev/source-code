@@ -219,7 +219,7 @@ impl crate::runtime::reactor::Runtime {
             .map(|a| a.iter().filter_map(Value::as_u64).collect())
             .unwrap_or_default();
 
-        self.log.info(
+        self.run_log(run_id).info(
             "http.request",
             json!({"run": run_id, "step": step_id, "method": method, "url": url}),
         );

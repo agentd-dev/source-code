@@ -1045,7 +1045,7 @@ process.
 | `observability.metrics_addr` | `host:port` or `:port` | unset | restart · op | Serve `/metrics`, `/healthz` and `/readyz`. Needs `metrics`. |
 | `observability.health_file` | path | unset | restart · op | A liveness file rewritten every second; `alive` turns false when the supervisor has not ticked for 10 seconds. |
 | `observability.events_ring` | int | `1024` | restart · op | Log lines held in memory for the introspection ops; allocated only when introspection is on. |
-| `observability.traceparent` | W3C traceparent | minted from the run id | restart · op | Continue an upstream trace. |
+| `observability.traceparent` | W3C traceparent | a random trace | restart · op | Continue an upstream trace: the process's, and the work it was started to do. |
 | `observability.otel.endpoint` | URL | `$OTEL_EXPORTER_OTLP_ENDPOINT` | restart · op | The OTLP/HTTP base URL, `http://` or `https://`; anything else is refused at load. Each run's spans are sent to `<endpoint>/v1/traces`. Needs `otel`; `https://` also needs `tls`. |
 | `observability.otel.logs` | bool | `false` | restart · op | Also send the log lines to `<endpoint>/v1/logs`. |
 | `observability.audit.sink` | list of `log \| store \| stream` | unset (no audit records) | live · op | Where audit records go. `store` needs a store; `stream` needs `audit.stream`. |

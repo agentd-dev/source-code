@@ -96,6 +96,15 @@ impl MockMcp {
         let want = format!("MOCK_SUBSCRIBE {uri}");
         self.log().lines().filter(|l| *l == want).count()
     }
+    /// Every request that reached the mock, in arrival order, as
+    /// `{"method": …, "_meta": …}`: what each carried in `params._meta`.
+    pub fn metas(&self) -> Vec<Value> {
+        self.log()
+            .lines()
+            .filter_map(|l| l.strip_prefix("MOCK_META "))
+            .filter_map(|m| serde_json::from_str(m).ok())
+            .collect()
+    }
     /// Stop the server mid-test: afterwards its port refuses connections.
     /// Idempotent — a second call (or the drop) is a no-op on a reaped child.
     pub fn stop(&mut self) {

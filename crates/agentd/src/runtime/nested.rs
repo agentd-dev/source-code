@@ -388,7 +388,7 @@ impl Runtime {
                 },
             ) {
                 Ok(meta) => return json!({"$artifact": meta["id"]}),
-                Err(e) => self.log.warn(
+                Err(e) => self.run_log(run_id).warn(
                     "nested.items.artifact_fail",
                     json!({"run": run_id, "step": step_id, "err": e}),
                 ),

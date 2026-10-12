@@ -259,7 +259,9 @@ fn streamable_http_full_lifecycle() {
     assert_eq!(notes[0].method, "notifications/resources/updated");
 
     // resources/read round-trips.
-    let read = client.read_resource("mock://res").expect("resources/read");
+    let read = client
+        .read_resource("mock://res", None)
+        .expect("resources/read");
     assert_eq!(read.contents.len(), 1);
 
     // The session id AND the negotiated MCP-Protocol-Version are echoed on every
@@ -641,7 +643,7 @@ fn client_prompts_and_completions() {
     assert_eq!(prompts[0].arguments[0].required, Some(true));
 
     let got = client
-        .get_prompt("greet", Some(json!({"who": "world"})))
+        .get_prompt("greet", Some(json!({"who": "world"})), None)
         .expect("prompts/get");
     assert_eq!(got.messages.len(), 1);
     assert_eq!(got.description.as_deref(), Some("greeting"));
@@ -650,6 +652,7 @@ fn client_prompts_and_completions() {
         .complete(
             json!({"type": "ref/prompt", "name": "greet"}),
             json!({"name": "who", "value": "al"}),
+            None,
         )
         .expect("completion/complete");
     assert_eq!(comp.completion.values, ["alice", "alan"]);

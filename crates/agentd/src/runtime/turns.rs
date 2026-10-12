@@ -10,6 +10,7 @@ use crate::config::settings::ModelRole;
 use crate::context::compact::{self, CompactionRequest};
 use crate::context::{ContextState, Msg, ROOT, skills};
 use crate::governor::Admission;
+use crate::obs::trace::TraceContext;
 use crate::registry::{Caller, ToolClass};
 use crate::state::now_ms;
 use crate::subagent::protocol::{
@@ -49,6 +50,10 @@ pub(crate) struct TurnLaunch {
     /// How hard a reasoning model thinks for this turn — a node's or a
     /// `think` call's `effort`, over the model's own (RFC 0046 §5.7).
     pub effort: Option<crate::wire::intel::Effort>,
+    /// The span the worker is spawned under — the step's, the turn's, the
+    /// calling worker's — handed down in its spawn payload. `None` spawns it
+    /// under the process trace.
+    pub trace: Option<TraceContext>,
 }
 
 impl Runtime {
@@ -305,6 +310,7 @@ impl Runtime {
     /// they finish.
     fn start_root_turn(&mut self, mut job: TurnJob) -> Result<(), TurnDefer> {
         let ctx_id = job.ctx.clone();
+        let tlog = self.log.in_trace(job.trace.as_ref());
         // A caller's turn runs in a conversation that caller owns. Ingress
         // already bound its `contextId` to one (`runtime::conversations`);
         // this is the second lock, for a job that reached the queue some
@@ -314,7 +320,7 @@ impl Runtime {
         if job.owner_checked
             && let Err(why) = self.listener_may_turn(&job)
         {
-            self.log.warn(
+            tlog.warn(
                 "turn.refused.not_owner",
                 json!({"ctx": ctx_id, "principal": job.principal, "reason": why}),
             );
@@ -332,7 +338,12 @@ impl Runtime {
         }
         // Append the message + preload skills (once).
         if job.message.is_some() || !job.skills.is_empty() {
-            let unknown = self.preload_skills(&ctx_id, &job.skills, job.principal.as_deref());
+            let unknown = self.preload_skills(
+                &ctx_id,
+                &job.skills,
+                job.principal.as_deref(),
+                job.trace.as_ref(),
+            );
             let window = self.model_window();
             let c = if ctx_id == ROOT {
                 self.contexts.root()
@@ -392,13 +403,12 @@ impl Runtime {
         let reservation = match self.governor.admit(est, &scopes, now_ms()) {
             Admission::Ok { reservation, model } => {
                 if let Some(m) = model {
-                    self.log
-                        .info("budget.degraded", json!({"ctx": ctx_id, "model": m}));
+                    tlog.info("budget.degraded", json!({"ctx": ctx_id, "model": m}));
                 }
                 Some(reservation)
             }
             Admission::Wait { until_ms, reason } => {
-                self.log.info(
+                tlog.info(
                     "budget.wait",
                     json!({"ctx": ctx_id, "until_ms": until_ms, "reason": reason}),
                 );
@@ -412,8 +422,7 @@ impl Runtime {
             Admission::Exhausted { reason } => {
                 self.apply_lifetime_exhausted(&reason);
                 crate::obs::metrics::record_refusal("budget");
-                self.log
-                    .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
+                tlog.warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
                 if ctx_id == crate::context::ROOT {
                     self.root_turn_exit = Some(crate::exit::BUDGET);
                 }
@@ -427,8 +436,7 @@ impl Runtime {
             }
             Admission::Refuse { reason } | Admission::Fail { reason } => {
                 crate::obs::metrics::record_refusal("budget");
-                self.log
-                    .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
+                tlog.warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
                 if ctx_id == crate::context::ROOT {
                     self.root_turn_exit = Some(crate::exit::BUDGET);
                 }
@@ -447,12 +455,11 @@ impl Runtime {
         // `roles.turn`, as no route would.
         let routed = match job.route.take() {
             Some(r) if self.settings.intelligence.routes.contains_key(&r) => {
-                self.log
-                    .info("turn.routed", json!({"ctx": ctx_id, "model": r}));
+                tlog.info("turn.routed", json!({"ctx": ctx_id, "model": r}));
                 Some(r)
             }
             Some(r) => {
-                self.log.warn(
+                tlog.warn(
                     "turn.route_removed",
                     json!({"ctx": ctx_id, "model": r, "reason": "no longer under intelligence.routes; the turn runs on roles.turn"}),
                 );
@@ -509,6 +516,7 @@ impl Runtime {
             model: routed,
             role: ModelRole::Turn,
             effort: None,
+            trace: job.trace.clone(),
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -516,12 +524,11 @@ impl Runtime {
                 if let Some(c) = self.contexts.get_mut(&ctx_id) {
                     c.turns += 1;
                 }
-                self.log.info("turn.spawn", json!({"ctx": ctx_id, "node": node.0, "turn": turn_id, "inbox_event": job.event}));
+                tlog.info("turn.spawn", json!({"ctx": ctx_id, "node": node.0, "turn": turn_id, "inbox_event": job.event}));
                 Ok(())
             }
             Err(e) => {
-                self.log
-                    .error("turn.spawn.fail", json!({"ctx": ctx_id, "err": e}));
+                tlog.error("turn.spawn.fail", json!({"ctx": ctx_id, "err": e}));
                 if ctx_id == crate::context::ROOT {
                     self.root_turn_exit = Some(crate::exit::GENERIC);
                 }
@@ -613,6 +620,7 @@ impl Runtime {
     /// Launch the preflight think for a staged job.
     fn start_preflight(&mut self, job: TurnJob) -> Result<(), TurnDefer> {
         let ctx_id = job.ctx.clone();
+        let tlog = self.log.in_trace(job.trace.as_ref());
         let plan_block = self
             .contexts
             .get(&ctx_id)
@@ -722,17 +730,16 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             model: None,
             role: ModelRole::Preflight,
             effort: None,
+            trace: job.trace.clone(),
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
-                self.log
-                    .info("preflight.start", json!({"ctx": ctx_id, "node": node.0}));
+                tlog.info("preflight.start", json!({"ctx": ctx_id, "node": node.0}));
                 self.staged_turns.insert(stage_id, job);
                 Ok(())
             }
             Err(e) => {
-                self.log
-                    .warn("preflight.spawn_fail", json!({"ctx": ctx_id, "err": e}));
+                tlog.warn("preflight.spawn_fail", json!({"ctx": ctx_id, "err": e}));
                 self.turn_queue.push_back(job);
                 Ok(())
             }
@@ -813,6 +820,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         let Some(mut job) = self.staged_turns.remove(&stage_id) else {
             return;
         };
+        let tlog = self.log.in_trace(job.trace.as_ref());
         let verdict = match (turn.status.as_str(), &turn.value) {
             ("completed", Some(v)) if extra["decided"] == json!(true) => {
                 self.preflight_verdict(ctx_id, v, extra)
@@ -822,7 +830,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         };
         match &verdict {
             Some(v) => {
-                self.log.info("preflight.verdict", json!({"ctx": ctx_id, "intent": v["intent"], "needs_plan": v["needs_plan"], "risk": v["risk"], "route": v["route"], "skills": v["skills"]}));
+                tlog.info("preflight.verdict", json!({"ctx": ctx_id, "intent": v["intent"], "needs_plan": v["needs_plan"], "risk": v["risk"], "route": v["route"], "skills": v["skills"]}));
                 // The route this message's turn runs on — only one of the
                 // routes: a model's answer outside them is no route.
                 job.route = v["route"]
@@ -876,16 +884,21 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                     c.touch();
                 }
                 if let Some(progress) = seeded {
-                    self.log.info(
+                    tlog.info(
                         "plan.updated",
                         json!({"ctx": ctx_id, "op": "preflight", "progress": progress}),
                     );
                 }
 
                 if !skills.is_empty() {
-                    let unknown = self.preload_skills(ctx_id, &skills, job.principal.as_deref());
+                    let unknown = self.preload_skills(
+                        ctx_id,
+                        &skills,
+                        job.principal.as_deref(),
+                        job.trace.as_ref(),
+                    );
                     if !unknown.is_empty() {
-                        self.log.warn(
+                        tlog.warn(
                             "preflight.skills_unknown",
                             json!({"ctx": ctx_id, "skills": unknown}),
                         );
@@ -898,7 +911,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                         // The asker's own view, and a count of only that.
                         let status = self.status_for(job.principal.as_deref());
                         let text = super::reactor::status_summary(&status);
-                        self.deliver_reply(ctx_id, &text, job.event.as_deref());
+                        self.deliver_reply(ctx_id, &text, job.event.as_deref(), job.trace.as_ref());
                         return;
                     }
                     "clarify" if !clarifications.is_empty() => {
@@ -906,7 +919,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                             "Before I act, please clarify:\n- {}",
                             clarifications.join("\n- ")
                         );
-                        self.deliver_reply(ctx_id, &text, job.event.as_deref());
+                        self.deliver_reply(ctx_id, &text, job.event.as_deref(), job.trace.as_ref());
                         return;
                     }
                     _ => {}
@@ -931,7 +944,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                     }
                 }
             }
-            None => self.log.warn(
+            None => tlog.warn(
                 "preflight.failed",
                 json!({"ctx": ctx_id, "status": turn.status, "err": turn.error}),
             ),
@@ -941,11 +954,18 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
     }
 
     /// Record + log a deterministic reply (no model turn); the inbox event is done.
-    pub(crate) fn deliver_reply(&mut self, ctx_id: &str, text: &str, event: Option<&str>) {
+    pub(crate) fn deliver_reply(
+        &mut self,
+        ctx_id: &str,
+        text: &str,
+        event: Option<&str>,
+        trace: Option<&TraceContext>,
+    ) {
+        let tlog = self.log.in_trace(trace);
         if let Some(c) = self.contexts.get_mut(ctx_id) {
             c.append(Msg::assistant(Some(text.to_string()), Vec::new()));
         }
-        self.log.info("turn.reply", json!({"ctx": ctx_id, "deterministic": true, "chars": text.chars().count(), "text": if self.log.content_capture() { Value::String(text.to_string()) } else { Value::Null }}));
+        tlog.info("turn.reply", json!({"ctx": ctx_id, "deterministic": true, "chars": text.chars().count(), "text": if self.log.content_capture() { Value::String(text.to_string()) } else { Value::Null }}));
         // An A2A task (if this reply answers one) completes with the text.
         #[cfg(feature = "a2a")]
         self.a2a_task_for_event(
@@ -969,6 +989,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
     /// Run `knowledge.search` for the message on an executor thread; the job
     /// resumes with the hits rendered as a system block.
     fn start_knowledge_retrieval(&mut self, mut job: TurnJob) -> Result<(), TurnDefer> {
+        let tlog = self.log.in_trace(job.trace.as_ref());
         let top_k = self.settings.knowledge.auto_context.top_k.unwrap_or(5);
         let max_bytes = self
             .settings
@@ -993,8 +1014,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         let mcp_args = match crate::registry::Registry::map_args(&m, &args, &ctx) {
             Ok(a) => a,
             Err(e) => {
-                self.log
-                    .warn("knowledge.auto_context.args", json!({"err": e}));
+                tlog.warn("knowledge.auto_context.args", json!({"err": e}));
                 job.knowledge_done = true;
                 self.turn_queue.push_back(job);
                 return Ok(());
@@ -1005,7 +1025,8 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             self.seq
         };
         let tx = self.events_tx.clone();
-        let meta = json!({"agent/instance": self.instance, "agent/ctx": job.ctx});
+        let mut meta = json!({"agent/instance": self.instance, "agent/ctx": job.ctx});
+        crate::mcp::stamp_trace(&mut meta, job.trace.as_ref());
         self.staged_turns.insert(stage_id, job);
         std::thread::Builder::new()
             .name("knowledge.auto_context".into())
@@ -1035,7 +1056,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         let Some(mut job) = self.staged_turns.remove(&stage_id) else {
             return;
         };
-        self.log.info("knowledge.auto_context", json!({"ctx": job.ctx, "hit": block.is_some(), "bytes": block.as_ref().map(|b| b.len()).unwrap_or(0)}));
+        self.log.in_trace(job.trace.as_ref()).info("knowledge.auto_context", json!({"ctx": job.ctx, "hit": block.is_some(), "bytes": block.as_ref().map(|b| b.len()).unwrap_or(0)}));
         job.knowledge = block;
         job.knowledge_done = true;
         self.turn_queue.push_back(job);
@@ -1150,7 +1171,9 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         ctx_id: &str,
         names: &[String],
         principal: Option<&str>,
+        trace: Option<&TraceContext>,
     ) -> Vec<String> {
+        let tlog = self.log.in_trace(trace);
         let mut unknown = Vec::new();
         if names.is_empty() {
             return unknown;
@@ -1162,7 +1185,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 mcp.get(server)
                     .map(|c| c.clone() as std::sync::Arc<dyn skills::SkillServer>)
             };
-            match self.skills.load(name, None, &resolver) {
+            match self.skills.load(name, None, &resolver, trace) {
                 Ok(body) => {
                     let c = if ctx_id == ROOT {
                         self.contexts.root()
@@ -1170,18 +1193,16 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                         self.contexts.conversation(ctx_id, principal)
                     };
                     if let Err(e) = c.load_skill(name, &body.hash, max_loaded) {
-                        self.log
-                            .warn("skill.load.refused", json!({"skill": name, "err": e}));
+                        tlog.warn("skill.load.refused", json!({"skill": name, "err": e}));
                     } else {
-                        self.log.info(
+                        tlog.info(
                             "skill.loaded",
                             json!({"ctx": ctx_id, "skill": name, "hash": &body.hash[..12]}),
                         );
                     }
                 }
                 Err(e) => {
-                    self.log
-                        .warn("skill.unknown", json!({"skill": name, "err": e}));
+                    tlog.warn("skill.unknown", json!({"skill": name, "err": e}));
                     unknown.push(name.clone());
                 }
             }
@@ -1193,12 +1214,13 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
 
     /// Spawn a turn worker child.
     pub(crate) fn spawn_turn(&mut self, launch: TurnLaunch) -> Result<NodeId, String> {
+        let tlog = self.log.in_trace(launch.trace.as_ref());
         let servers: Vec<crate::config::McpServerSpec> = launch
             .servers
             .iter()
             .filter_map(|n| self.spawn_spec(n))
             .collect();
-        let payload = SpawnPayload {
+        let mut payload = SpawnPayload {
             instruction: String::new(),
             output_contract: None,
             context_seed: Vec::new(),
@@ -1224,7 +1246,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                         // Checked at load and at the call; a reload that moved
                         // the role to a model that does not reason since is
                         // said, not hidden.
-                        None => self.log.warn(
+                        None => tlog.warn(
                             "turn.effort_ignored",
                             json!({"agent_path": launch.agent_path, "effort": e.as_str(), "model": cfg.model}),
                         ),
@@ -1250,7 +1272,8 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 instance: self.instance.clone(),
                 agent_id: launch.agent_path.clone(),
                 agent_path: launch.agent_path.clone(),
-                trace_id: self.trace_id.clone(),
+                traceparent: None,
+                tracestate: None,
                 log_level: self
                     .settings
                     .observability
@@ -1265,11 +1288,15 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             role: Role::Turn,
             turn: Some(Box::new(launch.spec)),
         };
+        // The worker is a span of the unit it works for: its lines, its MCP
+        // requests and its model calls carry the unit's trace.
+        let trace = launch.trace.unwrap_or_else(|| self.trace.clone());
+        payload.telemetry.set_trace(&trace);
         // The model is on the line. It used to be one instance-global string,
         // so nobody had to ask which one a turn ran on; now a step can name a
         // tier, and "how much did that cost and on what" is an operational
         // question with a per-turn answer.
-        self.log.info(
+        tlog.info(
             "turn.model",
             json!({"agent_path": launch.agent_path, "role": launch.role.as_str(), "model": payload.intelligence.model, "provider": payload.intelligence.provider}),
         );
@@ -1279,6 +1306,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             .spawn(
                 &payload,
                 launch.kind,
+                Some(trace),
                 Duration::from_millis(launch.deadline_ms),
             )
             .map_err(|e| e.to_string())?;
@@ -1312,7 +1340,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 }
             }
             Admission::Wait { until_ms, reason } => {
-                self.log.info(
+                self.child_log(node).info(
                     "budget.wait",
                     json!({"node": node.0, "until_ms": until_ms, "reason": reason}),
                 );
@@ -1358,7 +1386,8 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             return;
         };
         let kind = child.kind.clone();
-        self.log.info("turn.done", json!({"node": node.0, "kind": super::children::kind_label(&kind), "status": turn.status, "rounds": turn.rounds, "tool_calls": turn.tool_calls, "tokens": turn.usage.total()}));
+        let trace = child.trace.clone();
+        self.log.in_trace(trace.as_ref()).info("turn.done", json!({"node": node.0, "kind": super::children::kind_label(&kind), "status": turn.status, "rounds": turn.rounds, "tool_calls": turn.tool_calls, "tokens": turn.usage.total()}));
         match kind {
             ChildKind::RootTurn {
                 ctx,
@@ -1369,7 +1398,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 if let Some(r) = reservation {
                     self.governor.settle(r, turn.usage);
                 }
-                self.finish_root_turn(&ctx, event.as_deref(), turn);
+                self.finish_root_turn(&ctx, event.as_deref(), turn, trace);
             }
             ChildKind::StepTurn {
                 run,
@@ -1403,7 +1432,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                         self.governor.charge(turn.usage, &scopes);
                     }
                 }
-                self.on_think_done(&purpose, ctx.as_deref(), reply_to, extra, turn);
+                self.on_think_done(&purpose, ctx.as_deref(), reply_to, extra, turn, trace);
             }
             ChildKind::Subagent { .. } => {}
         }
@@ -1427,7 +1456,8 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             return;
         };
         self.children.mark_settled(node);
-        self.log.warn(
+        let trace = self.children.get(node).and_then(|c| c.trace.clone());
+        self.log.in_trace(trace.as_ref()).warn(
             "turn.failed",
             json!({"node": node.0, "kind": super::children::kind_label(&kind), "err": error}),
         );
@@ -1446,7 +1476,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 if let Some(r) = reservation {
                     self.governor.release(r);
                 }
-                self.finish_root_turn(&ctx, event.as_deref(), failed);
+                self.finish_root_turn(&ctx, event.as_deref(), failed, trace);
             }
             ChildKind::StepTurn {
                 run,
@@ -1468,7 +1498,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 if let Some(r) = reservation {
                     self.governor.release(r);
                 }
-                self.on_think_done(&purpose, ctx.as_deref(), reply_to, extra, failed);
+                self.on_think_done(&purpose, ctx.as_deref(), reply_to, extra, failed, trace);
             }
             ChildKind::Subagent { .. } => {}
         }
@@ -1478,7 +1508,14 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
 
     /// Fold a finished root/conversation turn into its context; deliver the
     /// reply; mark the inbox event done; maybe compact.
-    fn finish_root_turn(&mut self, ctx_id: &str, event: Option<&str>, turn: TurnResult) {
+    fn finish_root_turn(
+        &mut self,
+        ctx_id: &str,
+        event: Option<&str>,
+        turn: TurnResult,
+        trace: Option<TraceContext>,
+    ) {
+        let tlog = self.log.in_trace(trace.as_ref());
         let compact_at = self.settings.context.compact_at.unwrap_or(0.7);
         let keep_last = self.settings.context.keep_last.unwrap_or(12) as usize;
         let mut finish: Option<Value> = None;
@@ -1512,7 +1549,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             self.last_root_reply = Some(t.clone());
             // Recorded and logged here; a caller waiting over A2A gets it
             // through the task transition below.
-            self.log.info("turn.reply", json!({"ctx": ctx_id, "chars": t.chars().count(), "text": if self.log.content_capture() { Value::String(t.clone()) } else { Value::Null }}));
+            tlog.info("turn.reply", json!({"ctx": ctx_id, "chars": t.chars().count(), "text": if self.log.content_capture() { Value::String(t.clone()) } else { Value::Null }}));
         }
         // An A2A task (if this turn answers one) transitions to match the turn.
         #[cfg(feature = "a2a")]
@@ -1529,24 +1566,24 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             self.inbox_done(ev);
         }
         if let Some(f) = finish {
-            self.on_root_finish(ctx_id, &f);
+            self.on_root_finish(ctx_id, &f, trace.as_ref());
         }
         if needs_compaction {
-            self.start_compaction(ctx_id, keep_last, None, None);
+            self.start_compaction(ctx_id, keep_last, None, None, trace.as_ref());
         }
     }
 
     /// The root called `finish`. In job shape that ends the process with an
     /// exit code derived from the reported status; a daemon only records a
     /// note and keeps running unless the call asked for `exit: true`.
-    fn on_root_finish(&mut self, ctx_id: &str, f: &Value) {
+    fn on_root_finish(&mut self, ctx_id: &str, f: &Value, trace: Option<&TraceContext>) {
         let status = f
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("completed")
             .to_string();
         let exit = f.get("exit").and_then(Value::as_bool).unwrap_or(false);
-        self.log.info(
+        self.log.in_trace(trace).info(
             "root.finish",
             json!({"ctx": ctx_id, "status": status, "exit": exit, "job_shape": self.job_shape}),
         );
@@ -1575,7 +1612,9 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         keep_last: usize,
         target_tokens: Option<u64>,
         reply_to: Option<(NodeId, u64)>,
+        trace: Option<&TraceContext>,
     ) -> bool {
+        let tlog = self.log.in_trace(trace);
         let req = match self
             .contexts
             .get(ctx_id)
@@ -1652,17 +1691,18 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             model: None,
             role: ModelRole::Compaction,
             effort: None,
+            trace: trace.cloned(),
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
-                self.log.info(
+                tlog.info(
                     "context.compaction.start",
                     json!({"ctx": ctx_id, "node": node.0, "fold": req.fold}),
                 );
                 true
             }
             Err(e) => {
-                self.log.warn(
+                tlog.warn(
                     "context.compaction.spawn_fail",
                     json!({"ctx": ctx_id, "err": e}),
                 );
@@ -1706,7 +1746,9 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         reply_to: Option<(NodeId, u64)>,
         extra: Value,
         turn: TurnResult,
+        trace: Option<TraceContext>,
     ) {
+        let tlog = self.log.in_trace(trace.as_ref());
         match purpose {
             "preflight" => {
                 let stage = extra["job"].as_u64().unwrap_or(0);
@@ -1730,7 +1772,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                         .map(|c| compact::apply_compaction(c, &req, v));
                     match out {
                         Some(Ok(o)) => {
-                            self.log.info("context.compacted", json!({"ctx": ctx_id, "folded": o.folded, "version": o.version, "before": o.before_tokens, "after": o.after_tokens}));
+                            tlog.info("context.compacted", json!({"ctx": ctx_id, "folded": o.folded, "version": o.version, "before": o.before_tokens, "after": o.after_tokens}));
                             // Evict skill bodies that no context still holds:
                             // compaction can drop the last reference to one,
                             // and the cache is keyed by hash across contexts.
@@ -1747,14 +1789,14 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                             }
                             return;
                         }
-                        Some(Err(e)) => self.log.warn(
+                        Some(Err(e)) => tlog.warn(
                             "context.compaction.apply_fail",
                             json!({"ctx": ctx_id, "err": e}),
                         ),
                         None => {}
                     }
                 } else {
-                    self.log.warn(
+                    tlog.warn(
                         "context.compaction.think_failed",
                         json!({"ctx": ctx_id, "status": turn.status, "err": turn.error}),
                     );

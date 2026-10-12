@@ -25,6 +25,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// What a host stamps into the `params._meta` of every request a socket
+/// sends. Called once per request, so a W3C trace context (SEP-414:
+/// `traceparent`, `tracestate`) gives each request a span of its own. The
+/// keys go as a set: a request whose `_meta` already holds any of them — a
+/// caller's own `traceparent` for one call — keeps its own and gets none of
+/// these, so a `tracestate` never rides beside another context's
+/// `traceparent`.
+pub type RequestMeta = std::sync::Arc<dyn Fn() -> serde_json::Map<String, Value> + Send + Sync>;
+
 /// A resolved MCP endpoint: where to connect + the HTTP `path`/`Host` to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpEndpoint {
@@ -303,6 +312,8 @@ pub struct HttpTransport {
     /// An optional per-request AAuth signer. `None` = the endpoint is called
     /// unsigned (the default; static-bearer/mTLS auth is unaffected).
     signer: Option<std::sync::Arc<dyn RequestSigner>>,
+    /// The host's `_meta` for every request; see [`RequestMeta`].
+    request_meta: Option<RequestMeta>,
 }
 
 impl HttpTransport {
@@ -315,6 +326,7 @@ impl HttpTransport {
             session: Mutex::new(None),
             session_lost: AtomicBool::new(false),
             signer: None,
+            request_meta: None,
         }
     }
 
@@ -333,6 +345,7 @@ impl HttpTransport {
             session: Mutex::new(None),
             session_lost: AtomicBool::new(false),
             signer: self.signer.clone(),
+            request_meta: self.request_meta.clone(),
         }
     }
 
@@ -364,6 +377,37 @@ impl HttpTransport {
     pub fn with_signer(mut self, signer: Option<std::sync::Arc<dyn RequestSigner>>) -> Self {
         self.signer = signer;
         self
+    }
+
+    /// Stamp `meta` into every request this socket sends ([`RequestMeta`]).
+    pub fn set_request_meta(&mut self, meta: Option<RequestMeta>) {
+        self.request_meta = meta;
+    }
+
+    /// The request as sent: `body` with the host's [`RequestMeta`] added to
+    /// `params._meta`. `None` — `body` goes as it is — for a notification, a
+    /// body that is not a JSON-RPC request object, a `_meta` that is not an
+    /// object or already holds one of the keys, and a socket with no source.
+    fn stamped(&self, request_id: Option<i64>, body: &[u8]) -> Option<Vec<u8>> {
+        let source = self.request_meta.as_ref()?;
+        request_id?;
+        let mut v: Value = serde_json::from_slice(body).ok()?;
+        let obj = v.as_object_mut()?;
+        obj.get("method")?;
+        let params = obj
+            .entry("params")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()?;
+        let meta = params
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()?;
+        let add = source();
+        if add.keys().any(|k| meta.contains_key(k)) {
+            return None;
+        }
+        meta.extend(add);
+        serde_json::to_vec(&v).ok()
     }
 
     /// Attach a mutual-TLS client identity (used only for `https://` endpoints).
@@ -480,9 +524,11 @@ impl HttpTransport {
         mut on_notification: F,
         hangup: &Hangup,
     ) -> Result<Option<Value>, HttpError> {
+        // Stamped once: every AAuth retry sends, and signs, the same bytes.
+        let stamped = self.stamped(request_id, body);
         let out = self.send_attempts(
             request_id,
-            body,
+            stamped.as_deref().unwrap_or(body),
             timeout,
             extra_headers,
             &mut on_notification,

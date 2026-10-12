@@ -778,7 +778,7 @@ impl crate::runtime::reactor::Runtime {
         let (endpoint, auth) = match self.a2a_peer_conn_pub(peer, timeout, "stream forward") {
             Ok(v) => v,
             Err(e) => {
-                self.log.warn(
+                self.run_log(run_id).warn(
                     "stream.forward.refused",
                     json!({"run": run_id, "step": step_id, "stream": stream, "err": e}),
                 );
@@ -849,7 +849,7 @@ impl crate::runtime::reactor::Runtime {
             settings::ServiceKind::Http,
             url,
         ) {
-            self.log.warn(
+            self.run_log(run_id).warn(
                 "stream.forward.refused",
                 json!({"run": run_id, "step": step_id, "stream": stream, "err": e}),
             );

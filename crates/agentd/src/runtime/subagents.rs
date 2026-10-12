@@ -121,7 +121,8 @@ impl Runtime {
                     s.updated = now_ms();
                     s.dirty = true;
                 }
-                self.log.info("subagent.kill", json!({"handle": handle}));
+                self.subagent_log(&handle)
+                    .info("subagent.kill", json!({"handle": handle}));
                 ToolOutcome::Ready(json!({"ok": true, "handle": handle}), false)
             }
             "subagent.status" => {
@@ -448,7 +449,8 @@ impl Runtime {
                 instance: self.instance.clone(),
                 agent_id: handle.clone(),
                 agent_path: format!("sub/{handle}"),
-                trace_id: self.trace_id.clone(),
+                traceparent: None,
+                tracestate: None,
                 log_level: self
                     .settings
                     .observability
@@ -472,6 +474,12 @@ impl Runtime {
         if let Some(a) = &allow {
             payload.narrow_tools(a);
         }
+        // The child is a span of the unit that spawned it — the asking
+        // worker's, else the run's — and so is everything it does.
+        let trace = self
+            .caller_trace(caller)
+            .unwrap_or_else(|| self.trace.clone());
+        payload.telemetry.set_trace(&trace);
         // A durable record BEFORE the spawn (restore re-spawns pending ones).
         let mut record = SubagentRecord {
             handle: handle.clone(),
@@ -491,6 +499,7 @@ impl Runtime {
             created: now_ms(),
             updated: now_ms(),
             payload: Some(secret_free_payload(&payload)),
+            trace: Some(trace.clone()),
             template: tmeta.as_ref().map(|(n, _)| n.clone()),
             tier: tmeta.as_ref().map(|(_, t)| t.clone()),
             pid: None,
@@ -511,12 +520,13 @@ impl Runtime {
             ChildKind::Subagent {
                 handle: handle.clone(),
             },
+            Some(trace.clone()),
             Duration::from_millis(deadline_ms),
         ) {
             Ok(node) => {
                 record.node = Some(node);
                 record.status = "running".into();
-                self.log.info("subagent.spawn", json!({"handle": handle, "mode": mode, "node": node.0, "pid": self.children.pid_of(node), "depth": depth + 1, "servers": servers.len(), "priority": priority.as_str(), "memory_bytes": memory_bytes, "cpu_seconds": cpu_seconds}));
+                self.log.in_trace(Some(&trace)).info("subagent.spawn", json!({"handle": handle, "mode": mode, "node": node.0, "pid": self.children.pid_of(node), "depth": depth + 1, "servers": servers.len(), "priority": priority.as_str(), "memory_bytes": memory_bytes, "cpu_seconds": cpu_seconds}));
                 let persist = record.durable;
                 self.subagents.insert(handle.clone(), record);
                 if persist {
@@ -688,7 +698,7 @@ impl Runtime {
             s.updated = now_ms();
             s.dirty = true;
         }
-        self.log.info(
+        self.subagent_log(&handle).info(
             "subagent.turn",
             json!({"handle": handle, "status": outcome.status.as_str()}),
         );
@@ -746,7 +756,7 @@ impl Runtime {
             s.updated = now_ms();
             s.dirty = true;
         }
-        self.log.info(
+        self.subagent_log(&handle).info(
             "subagent.result",
             json!({"handle": handle, "status": status, "tokens": tokens, "err": error}),
         );
@@ -895,7 +905,7 @@ impl Runtime {
                 continue;
             };
             let Ok(mut payload) = serde_json::from_value::<SpawnPayload>(payload_v) else {
-                self.log
+                self.subagent_log(&handle)
                     .warn("subagent.restore.bad_payload", json!({"handle": handle}));
                 if let Some(s) = self.subagents.get_mut(&handle) {
                     s.status = "failed".into();
@@ -908,12 +918,19 @@ impl Runtime {
             // live settings: its connection and credential may have moved
             // since, and a stored one is never replayed.
             payload.intelligence = self.intel_config(payload.intelligence.reference.as_deref());
+            // It carries on in the trace it was spawned in, as the
+            // supervisor's lines about it do.
+            let trace = self.subagents.get(&handle).and_then(|s| s.trace.clone());
+            if let Some(t) = &trace {
+                payload.telemetry.set_trace(t);
+            }
             let deadline = Duration::from_millis(payload.limits.deadline_ms.max(1000));
             match self.children.spawn(
                 &payload,
                 ChildKind::Subagent {
                     handle: handle.clone(),
                 },
+                trace,
                 deadline,
             ) {
                 Ok(node) => {
@@ -924,7 +941,7 @@ impl Runtime {
                         s.dirty = true;
                     }
                     crate::obs::metrics::record_subagent_restart("restored");
-                    self.log.info(
+                    self.subagent_log(&handle).info(
                         "subagent.respawn",
                         json!({"handle": handle, "node": node.0}),
                     );

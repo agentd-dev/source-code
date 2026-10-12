@@ -195,6 +195,13 @@ pub struct Task {
     /// the promise the caller was given.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub push: Vec<PushTarget>,
+    /// The span the task's work is done in: the unit of work the message that
+    /// opened it became — continuing the caller's trace when its request named
+    /// one — or the run or turn whose gate it is. A message that continues the
+    /// task continues it, and a push about the task is a span of it. Durable
+    /// with the task, so a restored task keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::obs::trace::TraceContext>,
     #[serde(skip)]
     pub dirty: bool,
     /// Settled, and not read back since. A blocking `SendMessage` answers
@@ -227,8 +234,18 @@ impl Task {
             messages: Vec::new(),
             status_seq: 0,
             push: Vec::new(),
+            trace: None,
             dirty: true,
             unread: false,
+        }
+    }
+
+    /// The span the task's work is done in, set once: the first unit of work
+    /// it tracks names it, and every later one continues it.
+    pub fn set_trace(&mut self, trace: crate::obs::trace::TraceContext) {
+        if self.trace.is_none() {
+            self.trace = Some(trace);
+            self.dirty = true;
         }
     }
 

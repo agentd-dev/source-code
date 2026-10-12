@@ -786,6 +786,8 @@ pub struct SendMessage {
     return_immediately: bool,
     streaming: bool,
     bearer: Option<String>,
+    /// Headers beyond the ones the spec's shape needs — a W3C `traceparent`.
+    extra: Vec<(String, String)>,
 }
 
 impl SendMessage {
@@ -812,6 +814,7 @@ impl SendMessage {
             return_immediately: false,
             streaming: false,
             bearer: None,
+            extra: Vec::new(),
         }
     }
 
@@ -845,6 +848,18 @@ impl SendMessage {
         self
     }
 
+    /// Send the header `name: value` too — a W3C `traceparent`, say.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.extra.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Set the message's `metadata`.
+    pub fn metadata(mut self, metadata: Value) -> Self {
+        self.message["metadata"] = metadata;
+        self
+    }
+
     pub fn method(&self) -> &'static str {
         if self.streaming {
             "SendStreamingMessage"
@@ -873,6 +888,7 @@ impl SendMessage {
         if let Some(b) = &self.bearer {
             h.push(("Authorization".to_string(), format!("Bearer {b}")));
         }
+        h.extend(self.extra.iter().cloned());
         h
     }
 

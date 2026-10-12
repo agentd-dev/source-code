@@ -31,6 +31,7 @@ use serde_json::{Map, Value, json};
 use crate::config::settings::{WebhookAuth, Webhooks};
 use crate::engine::model::RESERVED_HOOK_PREFIX;
 use crate::obs::log::Logger;
+use crate::obs::trace::TraceContext;
 use crate::runtime::events::Event;
 use crate::runtime::starts::Admission;
 use crate::runtime::streams::AppendError;
@@ -441,6 +442,11 @@ pub struct WebhookRequest {
     /// Set when this is an **await callback** (a `wait: {on: webhook}` resume): the
     /// signal token to deliver, and the path to unregister.
     pub callback: Option<(String, String)>, // (signal, path)
+    /// The span the request's `traceparent`/`tracestate` headers named: a run
+    /// the delivery fires continues it; a run it resumes, or an event it
+    /// appends, records it as a link. Correlation only — never a key, a
+    /// credential or a rate.
+    pub trace: Option<TraceContext>,
     pub reply: SyncSender<WebhookReply>,
 }
 
@@ -657,6 +663,7 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
             }
             let payload = self.payload(req, &path);
             let cb_path = path.clone();
+            let trace = upstream_of(req);
             return self.dispatch(move |tx| WebhookRequest {
                 workflow: String::new(),
                 node: String::new(),
@@ -664,6 +671,7 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
                 payload,
                 respond_sync: false,
                 callback: Some((signal, cb_path)),
+                trace,
                 reply: tx,
             });
         }
@@ -854,6 +862,7 @@ impl WebhookHandler {
             route.node.clone(),
             route.respond_sync,
         );
+        let trace = upstream_of(req);
         self.dispatch(move |tx| WebhookRequest {
             workflow,
             node,
@@ -861,9 +870,23 @@ impl WebhookHandler {
             payload,
             respond_sync,
             callback: None,
+            trace,
             reply: tx,
         })
     }
+}
+
+/// The span an inbound request's `traceparent`/`tracestate` headers name, if
+/// they name one ([`crate::obs::trace::inbound`]). Read after every check the
+/// request is held to, and by none of them.
+pub(crate) fn upstream_of(req: &::mcp::http_server::RawRequest) -> Option<TraceContext> {
+    let all = |name: &'static str| {
+        req.headers
+            .iter()
+            .filter(move |(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    crate::obs::trace::inbound(all("traceparent"), all("tracestate"))
 }
 
 /// A subset of inbound headers exposed to the workflow (drops hop-by-hop /
@@ -1236,6 +1259,7 @@ impl crate::runtime::reactor::Runtime {
             payload,
             respond_sync,
             callback,
+            trace,
             reply,
         } = req;
 
@@ -1245,7 +1269,8 @@ impl crate::runtime::reactor::Runtime {
             self.webhook_callbacks.lock().unwrap().remove(&path);
             // An operator-configured route: the runtime is the sender.
             // What the caller posted, the waiting run's own definition
-            // carries already (`wait {on: webhook}`, `config::taint`).
+            // carries already (`wait {on: webhook}`, `config::taint`). The
+            // run keeps its trace; the caller's is its link.
             let delivered = self.deliver_signal(
                 &signal,
                 payload,
@@ -1253,11 +1278,12 @@ impl crate::runtime::reactor::Runtime {
                 None,
                 &super::waits::SignalSender::Runtime,
                 &Default::default(),
-                None,
+                trace.as_ref(),
             );
             self.log.info(
                 "webhook.callback",
-                json!({"path": path, "resumed": delivered}),
+                json!({"path": path, "resumed": delivered,
+                       "link": trace.as_ref().map(TraceContext::traceparent)}),
             );
             let ok = delivered > 0;
             let _ = reply.send(WebhookReply::ok(
@@ -1335,7 +1361,7 @@ impl crate::runtime::reactor::Runtime {
                 let signal = spec
                     .get("signal")
                     .and_then(Value::as_str)
-                    .map(|tpl| (tpl.to_string(), payload.clone()));
+                    .map(|tpl| (tpl.to_string(), payload.clone(), trace.clone()));
                 // `into: {stream, subject}` — APPEND the request instead of
                 // firing a run (RFC 0035 §5). This is what gives a webhook
                 // replay-after-downtime: a run fired at request time is lost
@@ -1354,6 +1380,10 @@ impl crate::runtime::reactor::Runtime {
                         .clone()
                         .unwrap_or_else(|| crate::state::ulid::new().to_string());
                     let correlation = idem_key.as_deref();
+                    // The event is consumed later, after the sender's span has
+                    // ended: it starts a trace of its own, which its consumers
+                    // continue, and links to the sender's.
+                    let event_trace = TraceContext::mint();
                     // `_acked`: the `202` below tells the sender the event is
                     // kept, so the stream head is saved before it is sent.
                     let answer = match self.append_event_acked(
@@ -1363,12 +1393,16 @@ impl crate::runtime::reactor::Runtime {
                         payload,
                         &id,
                         &workflow,
+                        Some(&event_trace),
                     ) {
                         Ok(seq) => {
-                            self.log.info(
+                            let links: Vec<String> =
+                                trace.iter().map(TraceContext::traceparent).collect();
+                            self.log.in_trace(Some(&event_trace)).info(
                                 "webhook.into",
                                 json!({"workflow": workflow, "node": node,
-                                           "stream": stream, "subject": subject, "seq": seq}),
+                                           "stream": stream, "subject": subject, "seq": seq,
+                                           "links": links}),
                             );
                             self.deliver_kept(marker, &workflow, &node, signal);
                             WebhookReply::ok(
@@ -1413,7 +1447,7 @@ impl crate::runtime::reactor::Runtime {
                         payload,
                         "webhook",
                         Some(&run_id),
-                        None,
+                        trace.as_ref(),
                     );
                     if admitted == Admission::Accepted {
                         self.deliver_kept(marker, &workflow, &node, signal);
@@ -1422,7 +1456,17 @@ impl crate::runtime::reactor::Runtime {
                         let _ = reply.send(not_fired(admitted));
                     }
                 } else {
-                    let admitted = self.fire_start(&workflow, &node, &spec, payload, "webhook");
+                    // The run is the delivery's unit of work, and continues
+                    // the sender's trace.
+                    let admitted = self.fire_start_run(
+                        &workflow,
+                        &node,
+                        &spec,
+                        payload,
+                        "webhook",
+                        None,
+                        trace.as_ref(),
+                    );
                     // A `202` for a firing that was refused would tell the sender
                     // to stop retrying an event nothing kept.
                     let answer = if admitted == Admission::Accepted {
@@ -1458,16 +1502,25 @@ impl crate::runtime::reactor::Runtime {
         key: Option<&str>,
         workflow: &str,
         node: &str,
-        signal: Option<(String, Value)>,
+        signal: Option<(String, Value, Option<TraceContext>)>,
     ) {
-        if let Some((tpl, payload)) = signal {
-            self.webhook_signal(&tpl, payload, workflow, node);
+        if let Some((tpl, payload, trace)) = signal {
+            self.webhook_signal(&tpl, payload, workflow, node, trace.as_ref());
         }
         self.mark_delivered(key, workflow, node);
     }
 
-    /// Fire a route's `signal:` template with the delivery's payload.
-    fn webhook_signal(&mut self, tpl: &str, payload: Value, workflow: &str, node: &str) {
+    /// Fire a route's `signal:` template with the delivery's payload, in the
+    /// trace the request named: a run it starts continues it, a run it wakes
+    /// records it as a link.
+    fn webhook_signal(
+        &mut self,
+        tpl: &str,
+        payload: Value,
+        workflow: &str,
+        node: &str,
+        trace: Option<&TraceContext>,
+    ) {
         let data: crate::engine::template::Data = payload
             .as_object()
             .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -1483,12 +1536,13 @@ impl crate::runtime::reactor::Runtime {
                     None,
                     &super::waits::SignalSender::Runtime,
                     &Default::default(),
-                    None,
+                    trace,
                 );
                 self.log.info(
                     "webhook.signal",
                     json!({"workflow": workflow, "node": node,
-                           "signal": name, "resumed": resumed}),
+                           "signal": name, "resumed": resumed,
+                           "link": trace.map(TraceContext::traceparent)}),
                 );
             }
             Ok(other) => self.log.warn(

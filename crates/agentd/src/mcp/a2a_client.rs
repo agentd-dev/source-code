@@ -52,6 +52,11 @@
 //! oauth2 device-login / SPIFFE JWT-SVID), an **mTLS** client identity (SPIFFE
 //! X.509-SVID), a per-request **AWS SigV4** signature (`kind: aws`), and an
 //! ambient **AAuth** signature when a process identity is installed.
+//!
+//! Trace: a hop a unit of work makes is a span of its own
+//! ([`PeerAuth::trace`]), sent as `traceparent` and `tracestate` on every
+//! request of the hop, so a peer that reads W3C Trace Context continues the
+//! caller's trace.
 
 use crate::a2a::peer::{self as a2a, PeerCard};
 use crate::config::A2aEndpoint;
@@ -345,6 +350,12 @@ pub struct PeerAuth {
     /// AAuth still apply). Alongside it, an ambient process AAuth identity signs
     /// every outbound A2A dial when one is configured.
     pub signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
+    /// The span this hop is, when a unit of work makes it: sent as
+    /// `traceparent` and `tracestate` on every request of the hop — the card
+    /// read, the send, each poll — ahead of the signatures, so an agentd peer
+    /// continues the caller's trace. Not a credential: a card is never cached
+    /// under it.
+    pub trace: Option<crate::obs::trace::TraceContext>,
 }
 
 /// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
@@ -536,8 +547,8 @@ impl HttpConn {
 
     /// The headers every request carries: the protocol version, the
     /// extensions it activates (those the peer requires, plus `marked` — the
-    /// ones the message itself is marked with), the peer credential, and the
-    /// signatures over this exact request.
+    /// ones the message itself is marked with), the hop's W3C trace context,
+    /// the peer credential, and the signatures over this exact request.
     fn request_headers(
         &self,
         method: &str,
@@ -554,6 +565,9 @@ impl HttpConn {
         }
         if !active.is_empty() {
             out.push(("A2A-Extensions".to_string(), active.join(", ")));
+        }
+        if let Some(t) = &self.auth.trace {
+            out.extend(t.headers());
         }
         out.extend(self.auth.headers.iter().cloned());
         out.extend(self.signature_headers(method, path, body));

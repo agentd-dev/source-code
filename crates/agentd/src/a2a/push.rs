@@ -62,7 +62,16 @@ pub fn check_url(url: &str, allow_private: bool) -> Result<(), String> {
 /// authentication (§4.3.3). `X-A2A-Notification-Token` is an interop header the
 /// a2a-python 1.x receiver reads: 1.0 does not define it, but that receiver
 /// takes the caller's token from it, so a registered token travels there.
-pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Result<(), String> {
+///
+/// `trace` is the delivery's own span, a child of the task's: sent as
+/// `traceparent` and `tracestate`, so the receiver joins the trace the task's
+/// work was done in. The body stays the spec's `StreamResponse`.
+pub fn deliver(
+    target: &PushTarget,
+    event: &Value,
+    allow_private: bool,
+    trace: Option<&crate::obs::trace::TraceContext>,
+) -> Result<(), String> {
     // Guarded again here, not only at registration: the name resolved once when
     // the caller registered, and nothing stops it resolving elsewhere now. This
     // re-check carries the scheme rule; the address rule is what the dial below
@@ -75,6 +84,9 @@ pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Resul
         ("content-type".into(), "application/a2a+json".into()),
         ("user-agent".into(), format!("agentd/{}", crate::VERSION)),
     ];
+    if let Some(t) = trace {
+        headers.extend(t.headers());
+    }
     if !target.token.is_empty() {
         // The caller's own token, echoed so the receiver can distinguish a real
         // delivery from anything else that finds the URL.
@@ -370,9 +382,20 @@ mod tests {
             }),
         };
         // Loopback, so the operator's `allow_private` is what lets it through.
-        deliver(&target, &json!({"task": {"id": "t"}}), true).expect("delivered");
+        // The delivery is a span of the task's, named to the receiver.
+        let span = crate::obs::trace::TraceContext::child_of(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            Some("congo=t61rcWkgMzE"),
+        )
+        .unwrap();
+        deliver(&target, &json!({"task": {"id": "t"}}), true, Some(&span)).expect("delivered");
         let (head, body) = seen.join().unwrap();
         let has = |h: &str| head.iter().any(|l| l.eq_ignore_ascii_case(h));
+        assert!(
+            has(&format!("traceparent: {}", span.traceparent())),
+            "{head:?}"
+        );
+        assert!(has("tracestate: congo=t61rcWkgMzE"), "{head:?}");
         assert!(has("authorization: Basic dTpw"), "{head:?}");
         assert!(has("content-type: application/a2a+json"), "{head:?}");
         assert!(has("x-a2a-notification-token: caller-token"), "{head:?}");

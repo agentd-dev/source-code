@@ -8,7 +8,8 @@
 //! wire: `MOCK_EVENTS_LIST <cursor>` and `MOCK_EVENTS_POLL <params>`.
 //!
 //! Control tools (`tools/call`, unlisted): `mock.event {topic, count, id?,
-//! bad_schema?, oversize?, malformed?}` appends occurrences;
+//! bad_schema?, oversize?, malformed?, traceparent?, tracestate?}` appends
+//! occurrences, the last two as the occurrence's `_meta`;
 //! `mock.events_changed {}` lists a third type, `mock.later`, and tells every
 //! listen that asked for `eventsListChanged`; `mock.event_trim {topic}` drops everything appended so far and one more
 //! occurrence the client never read, so its next poll is answered `truncated`; `mock.events_fail {code, data?,
@@ -277,6 +278,17 @@ pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
                 o.insert("name".into(), json!("mock.tick"));
                 o.insert("timestamp".into(), json!("2026-10-10T00:00:00Z"));
                 o.insert("data".into(), data);
+                // The trace the server produced the occurrence in, where the
+                // SEP-414 keys go.
+                let mut meta = Map::new();
+                for key in ["traceparent", "tracestate"] {
+                    if let Some(v) = args.get(key).filter(|v| v.is_string()) {
+                        meta.insert(key.into(), v.clone());
+                    }
+                }
+                if !meta.is_empty() {
+                    o.insert("_meta".into(), Value::Object(meta));
+                }
                 g.log
                     .entry(topic.clone())
                     .or_default()

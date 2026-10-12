@@ -148,6 +148,60 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   to it as its `observability.traceparent`. Its environment is scrubbed, so
   it started an unrelated trace. An `exec` command gets the unit's trace as
   `TRACEPARENT` and `TRACESTATE`.
+- An A2A request's `traceparent` and `tracestate` are continued. The
+  listener read neither, on TCP or on the unix socket, so a caller's trace
+  ended at agentd's door. The task a request opens and the run or turn it
+  becomes are spans under the caller's span, its flags and `tracestate`
+  kept; a caller that cannot set a header may put them in the message's
+  `metadata`. A message that continues a task continues the task's trace,
+  which is stored with the task and kept across a restart, and records the
+  request's `traceparent` as `link` on an `a2a.task.continued` line.
+  `workflow.run`,
+  an `a2a` start and `workflow.signal` continue it in the run they start; a
+  child's `_instance.*` report is recorded in the trace of the unit that
+  spawned the child, with the report's span as `link`. A browser page may
+  send both headers.
+- The answer to a human gate over A2A leaves the gate's run in its trace and
+  records the answering request's `traceparent` as `link` on the
+  `human.answered` line and the `ask_human.answered` audit record. The audit
+  record of an A2A call is in the trace of the task it answered, else of the
+  caller's request; it named the process trace. When that task is in
+  another trace than the caller's, the record names the caller's span as
+  `link`.
+- Every A2A request agentd makes carries `traceparent` and `tracestate`: an
+  `a2a.delegate`'s card read, send and polls, an `a2a.send`, an `emit`
+  forwarded to a peer and a message to an instance child. They carried
+  none, so an agentd peer started a trace of its own. The hop is a span of
+  the run's, logged as the `span_id` of its `a2a.delegate` or `a2a.send`
+  line, and the peer's task and run are its children. An A2A push
+  notification carries a span of the task's. A reply that wakes an
+  `a2a.wait` or a `wait {on: message}` leaves the run in its trace and names
+  the span the message was accepted in as `link` on the run's new
+  `wait.resolved` line; nothing in the run named the reply.
+  `a2a.message.delivered` names the runs it woke.
+- A webhook route continues the request's `traceparent`: the run it fires
+  is a span under the sender's. A `wait {on: webhook}` callback, a route's
+  `signal:`, and any signal that wakes a waiting step leave the run in its
+  trace and record the sender's `traceparent` as `link` on a new
+  `signal.delivered` line in it; `webhook.callback` and `webhook.signal`
+  carry the `link` too. An MCP Events occurrence's `_meta.traceparent`, or
+  its webhook delivery's header, is the parent of the run its event starts.
+  The trace was dropped at each, the header surviving only as data in the
+  run's `headers`.
+- A stream event records the span it was emitted in, as the CloudEvents
+  distributed-tracing attributes `traceparent` and `tracestate` on the
+  durable envelope, and a `stream` start's run continues it. Nothing about
+  the producer's trace was kept, so a consumer started a trace of its own.
+  A `batch` or `correlate` run starts a new trace and names each member's
+  `traceparent` in `links` on its `start.fired` line; an event appended with
+  `into:` by a webhook or an `a2a` start does the same, `links` on its
+  `webhook.into` or `start.a2a.into` line. A `wait {on: event}` keeps its
+  run's trace and names the event's span as `link` on `wait.resolved`. An
+  `emit` forwarded to a webhook sends `traceparent` and `tracestate`
+  headers; an instance child's mirrored event keeps its producer's trace.
+- The `http` step sends the step's span as `traceparent` and `tracestate`,
+  unless its `headers` set either, when it sends only what they set. It sent
+  none.
 
 **Changed.**
 
@@ -166,6 +220,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   lines about a unit of work, `mcp::tool_meta` takes no trace id, and a spawn
   payload's `Telemetry` carries `traceparent` and `tracestate` in place of
   `trace_id`.
+- An A2A answer that names a task — `SendMessage`, `SendStreamingMessage`,
+  `GetTask`, `SubscribeToTask` — carries a `traceparent` response header
+  naming the span the task's work is done in, which CORS exposes to a page.
+- A stream event's envelope has `traceparent` and `tracestate` when the
+  event was produced in a trace, so a `stream` start's output has them too.
+- `agentd-core`: `a2a::push::deliver` takes the delivery's trace,
+  `PeerAuth` has `trace`, `A2aBridge::call` and `A2aRequest` carry the
+  request's, `RequestScope::in_trace` sets it, and `obs::trace` has
+  `inbound`, `TraceContext::headers` and `TraceContext::from_members`.
 
 **Removed.**
 

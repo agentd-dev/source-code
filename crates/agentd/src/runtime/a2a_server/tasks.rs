@@ -8,6 +8,7 @@ use crate::a2a::errors::TASK_NOT_FOUND;
 use crate::a2a::errors::{INVALID_PARAMS, TASK_NOT_CANCELABLE};
 use crate::a2a::tasks::{Link, PushTarget, State, Task};
 use crate::a2a::wire::{Annotations, DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
+use crate::obs::trace::TraceContext;
 use crate::runtime::reactor::{PendingKind, Runtime};
 use crate::runtime::surface::{Active, Ext};
 use serde_json::{Value, json};
@@ -624,11 +625,17 @@ impl Runtime {
         result: Option<Value>,
     ) -> Value {
         let id = self.task_create(ctx, principal, link, Some(inbound));
+        // Done within the request: its span is a child of the caller's, or a
+        // trace of its own.
+        let span = self
+            .a2a_upstream(inbound)
+            .map_or_else(TraceContext::mint, |u| u.child());
         if let Some(t) = self.tasks.get_mut(&id) {
             if let Some(r) = result {
                 t.set_result(r);
             }
             t.transition(State::Completed, text);
+            t.set_trace(span);
         }
         self.task_persist(&id);
         self.task_sync(&id);

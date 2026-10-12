@@ -4,8 +4,9 @@
 //! config reloads, restores, store conflicts, and kills. Each event is
 //! `{ts, principal, role, action, target, outcome, request_id, trace, instance}`
 //! — `trace` the trace id of the unit of work the action belongs to (a run, a
-//! turn, a tool call's), else the process's — plus `sid` when the caller
-//! signed in with a session,
+//! turn, a tool call's, an A2A request's), else the process's — plus `sid`
+//! when the caller signed in with a session and `link` (a `traceparent`) when
+//! a request from another trace caused it, as the answer to a gate does,
 //! emitted to the configured sinks: `log` (a closed-vocabulary `audit` log line)
 //! and/or `store` (a durable, append-only `Kind::Audit` record, ULID-keyed — never
 //! CAS'd, never listed, so it cannot be rewritten). Audit is security telemetry:
@@ -31,6 +32,10 @@ pub(crate) struct AuditEvent<'a> {
     pub sid: Option<&'a str>,
     /// The unit of work the action belongs to; `None` for the process's own.
     pub trace: Option<&'a crate::obs::trace::TraceContext>,
+    /// A span of another trace that caused the action without becoming its
+    /// parent — the request that answered a gate or continued a task:
+    /// recorded as `link`, its `traceparent`.
+    pub link: Option<&'a crate::obs::trace::TraceContext>,
 }
 
 impl Runtime {
@@ -86,6 +91,9 @@ impl Runtime {
         if let Some(sid) = ev.sid {
             record["sid"] = json!(sid);
         }
+        if let Some(link) = ev.link {
+            record["link"] = json!(link.traceparent());
+        }
         if sinks.iter().any(|s| matches!(s, AuditSink::Log)) {
             // A single closed-vocabulary `audit` event (never content-suppressed —
             // an audit trail is metadata, not conversation content).
@@ -115,8 +123,11 @@ impl Runtime {
         }
     }
 
-    /// Audit an A2A request (the principal, the method/op, the outcome).
+    /// Audit an A2A request (the principal, the method/op, the outcome), in
+    /// `trace`: the work it did, else the caller's request. `link` is the
+    /// caller's span when that work is in another trace.
     #[cfg(feature = "a2a")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn audit_a2a(
         &self,
         method: &str,
@@ -125,6 +136,8 @@ impl Runtime {
         outcome: &str,
         target: Value,
         request_id: Option<&str>,
+        trace: Option<&crate::obs::trace::TraceContext>,
+        link: Option<&crate::obs::trace::TraceContext>,
     ) {
         let action = match op {
             Some(o) => format!("a2a.{method}:{o}"),
@@ -140,7 +153,8 @@ impl Runtime {
                 role: Some(&role),
                 request_id,
                 sid: principal.session.as_deref(),
-                trace: None,
+                trace,
+                link,
             },
             mirror_to_feed(method, op, outcome),
         );

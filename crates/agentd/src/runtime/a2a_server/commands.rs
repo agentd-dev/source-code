@@ -355,6 +355,9 @@ impl Runtime {
                 } else {
                     Default::default()
                 };
+                // A run the signal starts continues the caller's trace; a run
+                // it wakes keeps its own and records the caller's as a link.
+                let trace = self.a2a_upstream(message);
                 let delivered = self.deliver_signal(
                     &name,
                     payload,
@@ -362,7 +365,7 @@ impl Runtime {
                     Some(&principal.id),
                     &sender,
                     &carries,
-                    None,
+                    trace.as_ref(),
                 );
                 Answer::Done {
                     link: None,
@@ -444,16 +447,24 @@ impl Runtime {
                 "started"
             ));
         }
-        match self.accept_event(
-            kinds::WORKFLOW_RUN,
-            Some(principal.id.clone()),
-            payload,
-            None,
-        ) {
-            Ok(_) => {
+        // The run is the request's unit of work: it continues the caller's
+        // trace, and its task is done in the run's span.
+        let parent = self.a2a_upstream(message);
+        match self
+            .accept_event_store(
+                kinds::WORKFLOW_RUN,
+                Some(principal.id.clone()),
+                payload,
+                parent.as_ref(),
+            )
+            .map_err(|e| format!("inbox: {e}"))
+        {
+            Ok((_, trace)) => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.transition(State::Working, None);
+                    t.set_trace(trace);
                 }
+                self.task_persist(&task_id);
                 self.task_sync(&task_id);
                 self.task_reply(&task_id)
             }

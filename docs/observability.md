@@ -358,13 +358,68 @@ trace fails logs its own line.
 
 Each unit of work is a W3C trace of its own. A unit is a start firing of any
 kind, an A2A message or the `--prompt`, and the run or conversation turn it
-becomes. agentd resolves its trace once, when it accepts the work. A run
-that another run starts continues the starter's trace one span below it:
-a child workflow, a `workflow.run` call, a signal or a `message` the run
-sends. Other work gets a new trace with a random id. The trace is stored
-with the inbox event and the run record. A replayed event, a run resumed
-after a restart, a drain, a wait or a human gate, a step replayed after a
-crash and a restored subagent carry on in the trace they started in.
+becomes. agentd resolves its trace once, when it accepts the work, and
+continues whatever caused it, one span below the cause's span:
+
+- a run that another run starts: a child workflow, a `workflow.run` call, a
+  signal or a `message` the run sends;
+- an A2A request's `traceparent` and `tracestate` headers: the task the
+  request opens and the run or turn it becomes. A caller that cannot set a
+  header may put `traceparent` and `tracestate` in the message's `metadata`;
+  the header wins when both are there. A message that continues a task
+  continues the task's trace, and records the caller's as a link (below);
+- a webhook route's request headers: the run the delivery fires;
+- a stream event's `traceparent` attribute: the run a `stream` start fires
+  for it;
+- an MCP Events occurrence's `_meta.traceparent`, or the webhook delivery's
+  `traceparent` header when the occurrence names none: the event it is kept
+  as, and so the run a `stream` start fires for it.
+
+Other work gets a new trace with a random id. The trace is stored with the
+inbox event, the run record and the A2A task. A replayed event, a run
+resumed after a restart, a drain, a wait or a human gate, a step replayed
+after a crash, a restored task and a restored subagent carry on in the
+trace they started in.
+
+Some work has more than one cause, or runs long after its cause ended. It
+starts a trace of its own and names its causes as links, by their
+`traceparent`:
+
+- a `batch` or `correlate` run: `links` on its `start.fired` line, one per
+  member event;
+- an event a webhook route or an `a2a` start appends with `into:`: the event
+  gets a new trace, which its consumers continue, and `links` on the
+  `webhook.into` or `start.a2a.into` line names the request's span.
+
+Work that only resumes a unit does not move it to another trace. The
+unit keeps its own and records the request as a `link`:
+
+- the answer to a human gate over A2A: on the `human.answered` line and the
+  `ask_human.answered` audit record;
+- a `wait {on: webhook}` callback, a webhook route's `signal:`, and any
+  other signal that wakes a waiting step: on the run's `signal.delivered`
+  line, and on `webhook.callback` or `webhook.signal`;
+- the event that wakes a `wait {on: event}`: on the run's `wait.resolved`
+  line;
+- an A2A message that wakes a `wait {on: message}` or an `a2a.wait` — the
+  reply of an asynchronous exchange: on the run's `wait.resolved` line, the
+  span agentd accepted the message in. That span is a child of the
+  sender's, and the `a2a.message.delivered` line in it names the runs it
+  woke;
+- a message that continues an A2A task: on an `a2a.task.continued` line in
+  the task's trace.
+
+The audit record of an A2A call whose task is in another trace than the
+caller's — a message continuing it, the answer to its gate, a read — names
+the caller's span as `link`.
+
+An inbound `traceparent` is correlation and nothing more. No identity,
+authorization, rate limit, idempotency key or deduplication reads it. One
+that is not valid W3C is ignored and the work gets a trace of its own; two
+`traceparent` headers on one request are not valid. The `tracestate` beside
+a valid one is kept within the W3C limits (32 members, 512 bytes) and sent
+on every hop below it; a longer or malformed one is dropped and the
+`traceparent` kept.
 
 Everything the unit does carries its trace:
 
@@ -380,10 +435,31 @@ Everything the unit does carries its trace:
   `tools/call`, `resources/read`, `prompts/get`, `completion/complete`, and
   the `resources/list` and `resources/templates/list` of an `mcp.resource`
   step, one span per page.
+- Every A2A request it makes sends `traceparent` and `tracestate` HTTP
+  headers: an `a2a.delegate` (its card read, its send and every poll), an
+  `a2a.send`, an `emit` forwarded to a peer and a message to an instance
+  child. The span is the hop's, logged as `span_id` on its `a2a.delegate` or
+  `a2a.send` line, so an agentd peer's task and run are its children. An
+  instance child's reports home (`_instance.result`, `_instance.emit`) are
+  A2A requests like any other.
+- An A2A push notification about its task sends them too, a span of the
+  task's per delivery.
+- An `http` step sends them; its `http.request` line carries the span it
+  sent. A step whose `headers` set `traceparent` or `tracestate` sends what
+  it set and nothing of agentd's, and its line is in the run's span.
+- An `emit` records its span on the event as the CloudEvents
+  distributed-tracing attributes `traceparent` and `tracestate`, durable
+  with the event, and logs it on `stream.emit`. A `forward: {webhook}` push
+  sends them as headers.
 - An `exec` command gets it as the `TRACEPARENT` environment variable.
 - An instance child is started with it as its `observability.traceparent`.
 
 Each of these hops sends a span id of its own under the unit's span.
+
+An A2A answer that names a task carries a `traceparent` response header:
+the span the task's work is done in. `SendMessage`, `SendStreamingMessage`,
+`GetTask` and `SubscribeToTask` answers carry it. A browser page may send `traceparent` and
+`tracestate`, and read the response's `traceparent`, cross-origin.
 
 The process has a trace of its own for work that belongs to no unit: boot,
 reload, drain, the store, and the requests an MCP connection makes for
@@ -404,11 +480,8 @@ upstream's sampling flag: an upstream `00` goes out as `00` on every hop,
 and a turn in an unsampled trace exports no spans. A `traceparent` that is
 not valid W3C (version `ff`, an all-zero id, a wrong length, uppercase hex,
 a character that is not ASCII) is ignored, and the process mints its own.
-The flag takes no `tracestate`, and nothing else supplies one, so the
-hops send none.
-
-An inbound A2A request's or webhook's `traceparent` is not adopted: the
-work it starts gets a trace of its own.
+The flag takes no `tracestate`; a unit's comes from the request that
+started it, if any.
 
 ## Keep an audit trail
 

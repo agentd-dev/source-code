@@ -23,8 +23,8 @@ fields are merged into it.
 | `agent_path` | yes | Which unit of work wrote the line (see below) |
 | `comp` | yes | `supervisor` for the supervisor process, `agent` for turn workers and subagents |
 | `pid` | yes | The OS process id, which joins the log to `ps` and `pstree` |
-| `trace_id` | yes | The W3C trace id of the unit of work the line is about: a run, a conversation turn, a start firing, a subagent, or else the process. A run another run started continues its trace; the process continues `observability.traceparent`, else mints a random one. |
-| `span_id` | yes | The span the line is about: the run's, the step's, the worker's own |
+| `trace_id` | yes | The W3C trace id of the unit of work the line is about: a run, a conversation turn, a start firing, a subagent, an A2A task, or else the process. A run another run started continues its trace, and so does work that arrived under a `traceparent`: an A2A request, a webhook, a stream event, an MCP Events occurrence. The process continues `observability.traceparent`, else mints a random one. |
+| `span_id` | yes | The span the line is about: the run's, the step's, the worker's own, or an outbound hop's (`a2a.delegate`, `a2a.send`, `http.request`, `stream.emit`) — the span id that hop sent |
 | `parent_span_id` | no | That span's parent, when it has one |
 
 Rules a parser can rely on:
@@ -147,14 +147,15 @@ case.
 |---|---|---|---|
 | `a2a.conn` | debug | `err` | A connection could not be served. |
 | `a2a.context.unavailable` | warn | `err`, `principal` |  |
-| `a2a.delegate` | info | `peer`, `run`, `step` |  |
+| `a2a.delegate` | info | `peer`, `run`, `step` | Its `span_id` is the delegation's, sent as `traceparent` on every request of it. |
 | `a2a.denied` | warn | `principal`, `rule`, `method`, `op`, `reason`, `status`, `sid?`, `suppressed?` | The listener refused a request. `reason`: `unauthenticated`, `invalid_credential`, `no_role`, `not_permitted`, `rate_limited`, `auth_failures_limited`. Refusals a stranger can cause are written once per source and reason per minute; `suppressed` counts the rest. |
 | `a2a.introspection` | info | `enabled` |  |
 | `a2a.listen` | info | `authority`, `bound`, `device_grant`, `events`, `implicit_operator`, `introspection`, `mtls`, `required`, `tls`, `url` | The listener bound, with the posture it enforces. |
-| `a2a.message.delivered` | info | `conversation`, `inbox_event` |  |
-| `a2a.push.failed` | warn | `err`, `task` |  |
+| `a2a.message.delivered` | info | `conversation`, `inbox_event`, `runs` | A message woke the waiting steps of `runs`. In the span the message was accepted in, which each run's `wait.resolved` names as `link`. |
+| `a2a.push.failed` | warn | `err`, `task` | In the span the delivery sent. |
 | `a2a.push.registered` | info | `config`, `principal`, `task` |  |
-| `a2a.send` | info | `run`, `step`, `to` |  |
+| `a2a.send` | info | `run`, `step`, `to` | Its `span_id` is the send's, sent as `traceparent`. |
+| `a2a.task.continued` | info | `inbox_event`, `link`, `task` | A message continued a task. In the task's trace; `link` is the `traceparent` the request named. |
 | `a2a.task.encode.fail` | warn | `err`, `task` |  |
 | `a2a.task.evict.fail` | warn | `err`, `task` |  |
 | `a2a.task.evicted` | info | `task` |  |
@@ -179,7 +180,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `audit` | info | `instance`, `principal`, `role`, `action`, `target`, `outcome`, `request_id`, `trace`, `sid?` | One audit record, when `observability.audit.sink` includes `log`. |
+| `audit` | info | `instance`, `principal`, `role`, `action`, `target`, `outcome`, `request_id`, `trace`, `sid?`, `link?` | One audit record, when `observability.audit.sink` includes `log`. |
 | `audit.emit` | info | `audit`, `run`, `step` | An `emit` step wrote an `audit` record. |
 | `audit.store.fail` | warn | `action`, `err` | An audit record could not be stored. The audited action still stands. |
 
@@ -297,17 +298,17 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `http.request` | info | `method`, `run`, `step`, `url` | An `http` workflow node made a request. |
+| `http.request` | info | `method`, `run`, `step`, `url` | An `http` workflow node made a request; its `span_id` is the one the request sent as `traceparent`. When the step's `headers` set `traceparent` or `tracestate`, agentd sent none and the line is in the run's span. |
 
 ### human
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `human.answer.not_addressed` | info | `addressee`, `from`, `task` |  |
-| `human.answer.override` | warn | `addressee`, `by`, `sid`, `task` | An operator answered a gate addressed to someone else. |
-| `human.answer.rejected` | info | `errors`, `task`, `via` |  |
-| `human.answer.undelivered` | warn | `task`, `via` |  |
-| `human.answered` | info | `by`, `labels`, `sid`, `task`, `via` | A person answered. |
+| `human.answer.not_addressed` | info | `addressee`, `from`, `link`, `task` |  |
+| `human.answer.override` | warn | `addressee`, `by`, `link`, `sid`, `task` | An operator answered a gate addressed to someone else. |
+| `human.answer.rejected` | info | `errors`, `link`, `task`, `via` |  |
+| `human.answer.undelivered` | warn | `link`, `task`, `via` |  |
+| `human.answered` | info | `by`, `labels`, `link`, `sid`, `task`, `via` | A person answered. In the gate's trace; `link` is the `traceparent` the answering request named, or null. |
 | `human.ask` | info | `channel`, `deadline_ms`, `question`, `task` | A question went to a person. |
 | `human.ask.drained` | info | `state`, `task` | The drain stopped the turn that asked. The gate's task is back to `TASK_STATE_WORKING`, and the turn's replay asks on it again; a gate task opened for that ask alone is `TASK_STATE_CANCELED`. |
 | `human.ask.failed` | warn | `err`, `task` |  |
@@ -340,7 +341,7 @@ case.
 | `instance.exited` | info | `handle`, `pid`, `status` | `status` is `parked` for a child that drained at its parent's drain; the next start spawns it again. A `sync` child a stopped turn waited on is `cancelled` instead: the turn's replay spawns it again. |
 | `instance.kill` | warn | `handle`, `note`, `pid` |  |
 | `instance.metered` | info | `delta_tokens`, `handle`, `total_tokens` |  |
-| `instance.mirror` | info | `handle`, `seq`, `stream` |  |
+| `instance.mirror` | info | `handle`, `link`, `seq`, `stream` | `link`: the span of the child's report. |
 | `instance.mirror.fail` | warn | `err`, `handle`, `stream` |  |
 | `instance.op.fail` | warn | `err`, `op` |  |
 | `instance.op.orphan` | warn | `handle`, `note`, `op` |  |
@@ -348,7 +349,7 @@ case.
 | `instance.op.unknown` | warn | `op` |  |
 | `instance.parent_peer` | warn | `note` |  |
 | `instance.respawn` | info | `handle`, `pid` |  |
-| `instance.result` | info | `handle` |  |
+| `instance.result` | info | `handle`, `link` | `link`: the span of the child's report. |
 | `instance.retire` | info | `handle`, `pid`, `why` |  |
 | `instance.send` | info, warn | `handle`, `err?` |  |
 | `instance.spawn` | info | `handle`, `pid`, `retire_at`, `singleton`, `socket`, `template`, `until` | An instance-tier subagent started. |
@@ -587,6 +588,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
+| `signal.delivered` | info | `link`, `run`, `signal`, `step` | A signal woke a waiting step. In the waiting run's trace; `link` is the signal's `traceparent` — a webhook callback's, an A2A caller's, the sending run's. |
 | `signal.received` | info | `delivered`, `inbox_event`, `name` | A workflow signal arrived. |
 
 ### skill
@@ -610,9 +612,9 @@ case.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `start.a2a.fired` | info | `command`, `conversation`, `node`, `role`, `workflow` |  |
-| `start.a2a.into` | info | `conversation`, `node`, `seq`, `stream`, `subject`, `workflow` |  |
+| `start.a2a.into` | info | `conversation`, `links`, `node`, `seq`, `stream`, `subject`, `workflow` | In the appended event's own trace; `links` names the message's span. |
 | `start.a2a.into.refused` | warn | `err`, `node`, `stream`, `workflow` |  |
-| `start.fired` | info | `workflow`, `node`, `kind`, stream fields | A start node fired. |
+| `start.fired` | info | `workflow`, `node`, `kind`, stream fields, `links?` | A start node fired. A `batch` or `correlate` firing starts a trace of its own, and `links` names each member event's `traceparent`. |
 | `start.frozen` | warn | `workflow`, `node`, `kind`, `cause`, stream fields | A firing was refused because the instruction source is frozen. |
 | `start.inbox.failed` | warn | `workflow`, `node`, `kind`, `err`, stream fields | A firing could not be written to the durable inbox. |
 | `start.inputs.invalid` | warn | `workflow`, `node`, `kind`, `err`, stream fields | The start's `inputs` did not render; the firing is cancelled. |
@@ -664,7 +666,7 @@ case.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `stream.consumer.skipped` | warn | `events`, `from`, `node`, `stream`, `to`, `workflow` | Events a consumer had not read are gone (trimmed or unreadable). |
-| `stream.emit` | info | `run`, `seq`, `step`, `stream`, `subject` |  |
+| `stream.emit` | info | `run`, `seq`, `step`, `stream`, `subject` | Its `span_id` is the one the event records as `traceparent`. |
 | `stream.event.corrupt` | warn | `err`, `node`, `seq`, `stream`, `workflow` |  |
 | `stream.forward.failed` | warn | `durable`, `err`, `peer`, `seq`, `status`, `stream`, `subject` |  |
 | `stream.forward.refused` | warn | `err`, `run`, `step`, `stream` |  |
@@ -737,7 +739,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `wait.resolved` | info | `kind`, `run`, `status`, `step`, `stream`, `subject` |  |
+| `wait.resolved` | info | `conversation`, `kind`, `link`, `run`, `status`, `step`, `stream`, `subject` | The run keeps its trace. For a `wait {on: event}`, `link` is the event's `traceparent`; for a `wait {on: message}` or `a2a.wait` (`kind: message`), the span the message was accepted in. |
 | `wait.resubscribe.fail` | error, warn | `server`, `uri`, `reason`, `err`, `failed?`, `parked?` | A wait could not be subscribed again. Error level when it can never be woken. |
 | `wait.resubscribed` | info | `reason`, `server`, `uri` | A suspended `wait on: resource` was subscribed again. |
 
@@ -747,7 +749,7 @@ case.
 |---|---|---|---|
 | `webhook.await.armed` | info | `path`, `run`, `step`, `url` |  |
 | `webhook.await.restored` | info | `path`, `run`, `step` |  |
-| `webhook.callback` | info | `path`, `resumed` |  |
+| `webhook.callback` | info | `link`, `path`, `resumed` | `link`: the `traceparent` the callback sent, or null. |
 | `webhook.denied` | warn | `kind`, `path`, `reason` | A webhook request failed authentication. |
 | `webhook.duplicate` | info | `node`, `workflow` |  |
 | `webhook.filtered` | info | `node`, `workflow` |  |
@@ -755,10 +757,10 @@ case.
 | `webhook.idempotency.sweep.fail` | warn | `err` |  |
 | `webhook.idempotency.unindexed` | warn | `err`, `node`, `workflow` |  |
 | `webhook.idempotency.unrecorded` | warn | `err`, `node`, `workflow` | A delivery's idempotency marker could not be written; a replay runs again. |
-| `webhook.into` | info | `node`, `seq`, `stream`, `subject`, `workflow` |  |
+| `webhook.into` | info | `links`, `node`, `seq`, `stream`, `subject`, `workflow` | In the appended event's own trace; `links` names the request's `traceparent`. |
 | `webhook.into.refused` | warn | `err`, `node`, `stream`, `workflow` |  |
 | `webhook.overflow` | warn | `action`, `path` | A webhook route was at its `parallelism`; `action` says what was done. |
-| `webhook.signal` | info | `node`, `resumed`, `signal`, `workflow` |  |
+| `webhook.signal` | info | `link`, `node`, `resumed`, `signal`, `workflow` |  |
 | `webhook.signal.invalid` | warn | `err`, `node`, `workflow` |  |
 
 ### webhooks
@@ -1008,8 +1010,9 @@ JSON string. At most 8192 records wait between flushes; the rest are dropped.
 | `target` | What it was done to |
 | `outcome` | `ok`, or the refusal or failure |
 | `request_id` | The A2A message id, when there is one |
-| `trace` | The `trace_id` of the unit of work the action belongs to (a run, a turn, a tool call's), else the instance's |
+| `trace` | The `trace_id` of the unit of work the action belongs to (a run, a turn, a tool call's, an A2A request's task), else the instance's |
 | `sid` | The sign-in session, when the caller used one |
+| `link` | The `traceparent` of a request from another trace that caused the action without starting it — the answer to a gate, a message continuing a task, any A2A call on a task of another trace — when there is one |
 
 The `action` of an A2A call is `a2a.<method>`, or `a2a.<method>:<op>` when
 the message carried a command: `a2a.SendMessage:admin.drain`,

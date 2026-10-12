@@ -251,6 +251,7 @@ impl Runtime {
                         request_id: None,
                         sid: None,
                         trace: trace.as_ref(),
+                        link: None,
                     });
                     return ToolOutcome::Ready(
                         json!({"reply": text, "timed_out": false, "via": "accept"}),
@@ -477,6 +478,10 @@ impl Runtime {
             // later gate on the same task that has none clears it.
             t.ask_channel = channel.clone();
             t.transition(State::InputRequired, Some(question.clone()));
+            // A gate task of its own is done in the asking unit's span.
+            if let Some(trace) = &trace {
+                t.set_trace(trace.clone());
+            }
         }
         self.task_persist(&task_id);
         self.task_sync(&task_id);
@@ -494,6 +499,7 @@ impl Runtime {
             request_id: None,
             sid: None,
             trace: trace.as_ref(),
+            link: None,
         });
         ToolOutcome::Deferred(PendingKind::Human {
             task: task_id,
@@ -538,16 +544,23 @@ impl Runtime {
     /// record names them — and since every operator's id is `operator`, what
     /// tells them apart is the session they signed in with and the labels
     /// their rule gave them, so both are recorded too.
+    ///
+    /// The gate's run or turn keeps its own trace. `link` is the span the
+    /// answering request named, from the caller's trace: recorded on the
+    /// lines and the audit record as `link`, so the answer can be followed
+    /// back to whoever sent it without the gate changing traces.
     pub(crate) fn human_answer(
         &mut self,
         i: usize,
         text: &str,
         via: &str,
         answerer: Option<&crate::a2a::Principal>,
+        link: Option<&crate::obs::trace::TraceContext>,
     ) {
         let answered_by = answerer.map(|p| p.id.as_str());
         let role = answerer.map(|p| format!("{:?}", p.role).to_lowercase());
         let sid = answerer.and_then(|p| p.session.as_deref());
+        let linked = link.map(crate::obs::trace::TraceContext::traceparent);
         let p = self.pending.remove(i);
         // Lines and the audit record about this gate carry its unit's trace.
         let trace = self.target_trace(&p.target);
@@ -581,7 +594,7 @@ impl Runtime {
                 let q = question.clone();
                 hlog.info(
                     "human.answer.rejected",
-                    json!({"task": task, "errors": errs, "via": via}),
+                    json!({"task": task, "errors": errs, "via": via, "link": linked}),
                 );
                 // An `auto` judge that cannot produce the shape must not spin.
                 if via == "auto" {
@@ -614,7 +627,7 @@ impl Runtime {
             self.human_task_fail(&task, LATE);
             hlog.warn(
                 "human.answer.undelivered",
-                json!({"task": task, "via": via}),
+                json!({"task": task, "via": via, "link": linked}),
             );
             self.audit(super::audit::AuditEvent {
                 action: "ask_human.answered",
@@ -625,6 +638,7 @@ impl Runtime {
                 request_id: None,
                 sid,
                 trace: trace.as_ref(),
+                link,
             });
             return;
         }
@@ -637,7 +651,7 @@ impl Runtime {
         hlog.info(
             "human.answered",
             json!({"task": task, "via": via, "by": answered_by, "sid": sid,
-                   "labels": answerer.map(|p| &p.labels)}),
+                   "labels": answerer.map(|p| &p.labels), "link": linked}),
         );
         // The record names WHO, not just how: an addressed gate is only worth
         // declaring if the audit line can be read back as "this person decided
@@ -651,6 +665,7 @@ impl Runtime {
             request_id: None,
             sid,
             trace: trace.as_ref(),
+            link,
         });
         // A tool result must match `ask_human`'s DECLARED output shape,
         // `{reply, timed_out}` (see `registry/internal.rs`). Consumers read
@@ -1017,7 +1032,7 @@ impl Runtime {
         match result["answer"].as_str() {
             Some(a) if !a.trim().is_empty() && a.trim() != UNDECIDED => {
                 let answer = a.trim().to_string();
-                self.human_answer(i, &answer, "auto", None);
+                self.human_answer(i, &answer, "auto", None, None);
             }
             Some(_) => self.human_fail(i, "ask_human: the auto judge could not decide (UNDECIDED)"),
             None => {

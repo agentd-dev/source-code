@@ -6,13 +6,26 @@
 //! turn it becomes. Its trace is resolved once, where the event is written
 //! ahead (`Runtime::accept_event_store`): continued from the unit that caused
 //! it when there is one (a run that called `workflow.run`, sent a signal or a
-//! message, or ran a child workflow), else minted with a random trace id. The
-//! inbox event and the run record keep it, so a replayed event, a resumed run
-//! and a restored subagent carry on in the trace they started in. Everything
-//! the unit does carries it: the supervisor's log lines about it, the turn
+//! message, or ran a child workflow) or from the span the work arrived under
+//! (an A2A request's or a webhook's `traceparent` header, a stream event's
+//! `traceparent` attribute, an MCP Events occurrence's `_meta`), else minted
+//! with a random trace id. The inbox event, the run record and the A2A task
+//! keep it, so a replayed event, a resumed run, a restored task and a
+//! restored subagent carry on in the trace they started in. Everything the
+//! unit does carries it: the supervisor's log lines about it, the turn
 //! workers and subagents it spawns (their spawn payload holds the unit's
 //! `traceparent` and `tracestate`), every MCP request and every model call
-//! they make, and the instance children and `exec` commands it starts.
+//! they make, the instance children and `exec` commands it starts, and every
+//! outbound hop — an A2A request, an A2A push, an `http` step, a stream
+//! `forward:` — each a span of its own.
+//!
+//! Work with several causes, or caused long after its cause ended — a
+//! `batch` or `correlate` run, an event a webhook or an A2A message appends
+//! with `into:` — starts a trace of its own and records the causes'
+//! `traceparent`s as links. So does what only resumes work: a gate's answer,
+//! a webhook callback or a signal to a waiting run is a `link` on the run,
+//! which keeps its trace. An inbound trace is correlation and nothing more:
+//! no identity, authorization, rate, idempotency key or dedup reads it.
 //!
 //! The process has a trace of its own for what belongs to no unit — boot,
 //! reload, drain, the store, background MCP traffic: `observability.traceparent`
@@ -127,6 +140,50 @@ impl TraceContext {
         }
         m
     }
+
+    /// The same keys as HTTP request headers, for a request that is this
+    /// span: `traceparent`, and `tracestate` when there is one. Pushed before
+    /// any signature header, so a signer that covers headers covers these.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let mut h = vec![("traceparent".to_string(), self.traceparent())];
+        if let Some(ts) = &self.tracestate {
+            h.push(("tracestate".to_string(), ts.clone()));
+        }
+        h
+    }
+
+    /// The span a carrier names in `traceparent`/`tracestate` members of
+    /// `v` — a stream event's envelope (the CloudEvents distributed-tracing
+    /// attributes), an MCP occurrence's `_meta`, an A2A message's `metadata`.
+    /// `None` when there is no `traceparent` or a malformed one.
+    pub fn from_members(v: &Value) -> Option<TraceContext> {
+        let tp = v.get("traceparent")?.as_str()?;
+        Self::parse(tp, v.get("tracestate").and_then(Value::as_str))
+    }
+}
+
+/// The span an inbound HTTP request names in its W3C headers — every
+/// `traceparent` and every `tracestate` field the request carried, as
+/// received: the upstream a unit the request starts continues, or links to.
+/// `None` when there is no `traceparent`, more than one, or a malformed one,
+/// and the receiver starts a trace of its own. Several `tracestate` fields
+/// are one list (W3C Trace Context §3.3.1.1); one over the limits or
+/// malformed is dropped and the `traceparent` kept.
+///
+/// Correlation only: what a caller sends here never decides who it is, what
+/// it may do, how fast, or whether a delivery is a duplicate.
+pub fn inbound<'a>(
+    traceparent: impl IntoIterator<Item = &'a str>,
+    tracestate: impl IntoIterator<Item = &'a str>,
+) -> Option<TraceContext> {
+    let mut tps = traceparent.into_iter();
+    let tp = tps.next()?;
+    if tps.next().is_some() {
+        return None;
+    }
+    let ts: Vec<&str> = tracestate.into_iter().collect();
+    let ts = (!ts.is_empty()).then(|| ts.join(","));
+    TraceContext::parse(tp, ts.as_deref())
 }
 
 /// The process's own trace: what a line or a request that belongs to no unit
@@ -472,6 +529,36 @@ mod tests {
         assert_eq!(tc.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
         assert!(tc.tracestate.is_none());
         assert!(!tc.meta().contains_key("tracestate"));
+    }
+
+    /// An inbound request's headers: one `traceparent` names the upstream
+    /// span as given — its flags too — and its `tracestate` fields are one
+    /// list; two `traceparent` fields, or a malformed one, name nothing.
+    #[test]
+    fn an_inbound_request_names_its_upstream_span() {
+        let up = inbound([UP], ["rojo=00f067aa0ba902b7", "congo=t61rcWkgMzE"]).unwrap();
+        assert_eq!(up.traceparent(), UP);
+        assert!(up.parent_span_id.is_none());
+        assert_eq!(
+            up.tracestate.as_deref(),
+            Some("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE")
+        );
+        let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        assert_eq!(inbound([unsampled], []).unwrap().flags, "00");
+        assert!(inbound([UP, UP], []).is_none());
+        assert!(inbound(["garbage"], ["k=v"]).is_none());
+        assert!(inbound([], ["k=v"]).is_none());
+        // A bad list costs only itself.
+        let kept = inbound([UP], ["Bad=x"]).unwrap();
+        assert!(kept.tracestate.is_none());
+        let headers = kept.headers();
+        assert_eq!(headers, vec![("traceparent".to_string(), UP.to_string())]);
+        let from = TraceContext::from_members(
+            &serde_json::json!({"traceparent": UP, "tracestate": "k=v"}),
+        )
+        .unwrap();
+        assert_eq!(from.tracestate.as_deref(), Some("k=v"));
+        assert!(TraceContext::from_members(&serde_json::json!({"traceparent": 1})).is_none());
     }
 
     #[test]

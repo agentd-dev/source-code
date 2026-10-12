@@ -544,6 +544,10 @@ pub struct Runtime {
     /// task-annotations.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_active: super::surface::Active,
+    /// The span the W3C headers of the request being served named; `None`
+    /// between requests. The unit of work the request starts continues it.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_trace: Option<TraceContext>,
     /// Where a task transition is published so A2A subscribers see it.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_sink: Option<std::sync::Arc<crate::a2a::ports::StreamSink>>,
@@ -1153,10 +1157,12 @@ impl Runtime {
         //    message}`) — the reply half of an asynchronous exchange.
         let msg = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                          "text": text, "message_id": ev.payload.get("message_id").cloned()});
-        if self.deliver_a2a_message(&ctx, &wire, &msg, principal.as_deref()) > 0 {
+        let woken =
+            self.deliver_a2a_message(&ctx, &wire, &msg, principal.as_deref(), ev.trace.as_ref());
+        if !woken.is_empty() {
             self.log.in_trace(ev.trace.as_ref()).info(
                 "a2a.message.delivered",
-                json!({"inbox_event": ev.id, "conversation": ctx}),
+                json!({"inbox_event": ev.id, "conversation": ctx, "runs": woken}),
             );
             return;
         }
@@ -1254,11 +1260,25 @@ impl Runtime {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| crate::state::ulid::new().to_string());
-                match self.append_event(stream, subject, Some(ctx), payload, &id, &workflow) {
-                    Ok(seq) => self.log.info(
+                // Consumed later, after the sender's request has ended: the
+                // event starts a trace of its own, which its consumers
+                // continue, and links to the message's.
+                let event_trace = TraceContext::mint();
+                let links: Vec<String> = ev.trace.iter().map(TraceContext::traceparent).collect();
+                match self.append_event(
+                    stream,
+                    subject,
+                    Some(ctx),
+                    payload,
+                    &id,
+                    &workflow,
+                    Some(&event_trace),
+                ) {
+                    Ok(seq) => self.log.in_trace(Some(&event_trace)).info(
                         "start.a2a.into",
                         json!({"workflow": workflow, "node": node, "conversation": ctx,
-                               "stream": stream, "subject": subject, "seq": seq}),
+                               "stream": stream, "subject": subject, "seq": seq,
+                               "links": links}),
                     ),
                     Err(e) => self.log.warn(
                         "start.a2a.into.refused",

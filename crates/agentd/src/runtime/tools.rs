@@ -961,6 +961,7 @@ impl Runtime {
                     request_id: None,
                     sid: None,
                     trace: self.caller_trace(caller).as_ref(),
+                    link: None,
                 });
                 // Shadow mode says plainly that the call was HELD, never
                 // returning a synthetic success. A schema-conformant fake is
@@ -1129,6 +1130,7 @@ impl Runtime {
             request_id: None,
             sid: None,
             trace: trace.as_ref(),
+            link: None,
         });
         if !approved {
             let msg = format!(

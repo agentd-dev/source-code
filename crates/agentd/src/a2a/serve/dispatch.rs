@@ -22,6 +22,7 @@ use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::ports;
 use crate::a2a::principals::{Resolution, Via};
+use crate::obs::trace::TraceContext;
 use crate::runtime::surface::{
     A2A_PROTOCOL_VERSION, Active, Command, Ext, Reply, Route, SpecMethod, accepts_version,
     check_command, negotiate, owner_of, parse_extension_header, route_of,
@@ -401,6 +402,11 @@ async fn dispatch(
         );
     }
 
+    // The span the caller's W3C headers name: the work this request starts
+    // continues it. Read here, once, for TCP and unix alike, and only ever
+    // carried as correlation — every decision above was made without it.
+    let trace = upstream_of(&headers);
+
     // Every check has passed: the handler runs, and its answer — only its
     // answer — echoes what the request activated.
     let resp = answer(
@@ -415,10 +421,33 @@ async fn dispatch(
             command,
             bearer_used,
             active,
+            trace,
         },
     )
     .await;
     echoed(resp, active)
+}
+
+/// The span a request's `traceparent` and `tracestate` headers name, if they
+/// name one ([`crate::obs::trace::inbound`]).
+fn upstream_of(headers: &HeaderMap) -> Option<TraceContext> {
+    let all = |name: &'static str| {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap_or_default())
+    };
+    crate::obs::trace::inbound(all("traceparent"), all("tracestate"))
+}
+
+/// `resp` with a `traceparent` response header naming the span agentd did
+/// the request's work in — the task's, when the answer is a task — so a
+/// caller can find its work in agentd's lines and traces.
+fn traced(mut resp: Response, span: Option<String>) -> Response {
+    if let Some(v) = span.and_then(|s| axum::http::HeaderValue::from_str(&s).ok()) {
+        resp.headers_mut().insert("traceparent", v);
+    }
+    resp
 }
 
 /// A request every check has passed, as the answer needs it.
@@ -432,6 +461,8 @@ struct Admitted {
     command: Option<Command>,
     bearer_used: bool,
     active: Active,
+    /// The span the request's W3C headers named ([`upstream_of`]).
+    trace: Option<TraceContext>,
 }
 
 /// Pipeline step 12: the answer to `route`.
@@ -445,6 +476,7 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         command,
         bearer_used,
         active,
+        trace,
     } = req;
     let send = matches!(
         route,
@@ -497,7 +529,12 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
             .is_some_and(|spec| spec.reply == Reply::Message)
     {
         let streamed = route == Route::Spec(SpecMethod::SendStreamingMessage);
-        return message_reply(app, id, params, principal, streamed, bearer_used, active).await;
+        let asked = Asked {
+            principal,
+            active,
+            trace,
+        };
+        return message_reply(app, id, params, asked, streamed, bearer_used).await;
     }
 
     // Everything else is the specification's: the SDK's router parses it,
@@ -515,8 +552,9 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         .expect("build request");
     *request.headers_mut() = headers;
     let alive = app.liveness.as_ref().and_then(|l| l(&principal));
-    let scope = ports::RequestScope::new(principal, via, active);
+    let scope = ports::RequestScope::new(principal, via, active).in_trace(trace);
     let kept = Arc::clone(&scope.error);
+    let span = Arc::clone(&scope.span);
     let protocol = app.protocol.clone();
     let answered = ports::with_request(scope, async move {
         protocol
@@ -541,7 +579,11 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         },
         empty_result: route == Route::Spec(SpecMethod::DeleteTaskPushNotificationConfig),
     };
-    faithful(resp, fidelity, app.request_timeout, alive).await
+    let span = span.lock().ok().and_then(|s| s.clone());
+    traced(
+        faithful(resp, fidelity, app.request_timeout, alive).await,
+        span,
+    )
 }
 
 /// Integers past ±2^53 in `v`, as the doubles a `google.protobuf.Value` holds
@@ -742,22 +784,29 @@ fn sent_message(params: &Value) -> Result<a2a_types::Message, String> {
     Ok(req.message)
 }
 
-/// The runtime's answer to `verb`, as a JSON-RPC envelope for `id`.
-async fn round_trip(
-    app: &Arc<App>,
-    id: Value,
-    verb: &str,
-    params: Value,
+/// Who asked the runtime, and under what: the caller, the extensions the
+/// request activated, and the span its W3C headers named.
+struct Asked {
     principal: Principal,
     active: Active,
-) -> Value {
+    trace: Option<TraceContext>,
+}
+
+/// The runtime's answer to `verb`, as a JSON-RPC envelope for `id`.
+async fn round_trip(app: &Arc<App>, id: Value, verb: &str, params: Value, asked: Asked) -> Value {
     let bridge = Arc::clone(&app.bridge);
     let verb = verb.to_string();
-    let v = tokio::task::spawn_blocking(move || bridge.call(&verb, params, principal, active))
-        .await
-        .unwrap_or_else(
-            |e| json!({"_error": {"code": errors::INTERNAL_ERROR, "message": e.to_string()}}),
-        );
+    let Asked {
+        principal,
+        active,
+        trace,
+    } = asked;
+    let v =
+        tokio::task::spawn_blocking(move || bridge.call(&verb, params, principal, active, trace))
+            .await
+            .unwrap_or_else(
+                |e| json!({"_error": {"code": errors::INTERNAL_ERROR, "message": e.to_string()}}),
+            );
     match ports::error_of(&v) {
         Some(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
         None => json!({"jsonrpc": "2.0", "id": id, "result": v}),
@@ -781,12 +830,11 @@ async fn message_reply(
     app: &Arc<App>,
     id: Value,
     params: Value,
-    principal: Principal,
+    asked: Asked,
     streamed: bool,
     bearer_used: bool,
-    active: Active,
 ) -> Response {
-    let envelope = round_trip(app, id, "SendMessage", params, principal, active).await;
+    let envelope = round_trip(app, id, "SendMessage", params, asked).await;
     if envelope.get("error").is_some() {
         return error_response(envelope, bearer_used);
     }

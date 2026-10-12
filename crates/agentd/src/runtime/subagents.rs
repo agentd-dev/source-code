@@ -62,7 +62,8 @@ impl Runtime {
                     // send that then fails leaves the child carrying more
                     // than it was handed, which errs toward withholding.
                     self.steer_carries(&handle, &carries);
-                    return self.instance_send(&handle, &message);
+                    let trace = self.caller_trace(caller);
+                    return self.instance_send(&handle, &message, trace.as_ref());
                 }
                 let Some(node) = self.subagents.get(&handle).and_then(|s| s.node) else {
                     return err(format!("subagent {handle:?} is not running"));

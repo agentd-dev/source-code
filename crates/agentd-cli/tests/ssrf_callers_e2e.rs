@@ -157,6 +157,7 @@ fn a_peer_supplied_push_target_inside_the_appliance_is_refused_without_being_dia
         &target(&format!("http://{addr}/hook")),
         &json!({"e": 1}),
         false,
+        None,
     )
     .expect_err("a loopback webhook is refused even though the scheme rule allows it");
     assert!(
@@ -173,6 +174,7 @@ fn a_peer_supplied_push_target_inside_the_appliance_is_refused_without_being_dia
         &target("https://169.254.169.254/latest/meta-data/"),
         &json!({"e": 1}),
         false,
+        None,
     )
     .expect_err("the cloud metadata endpoint is refused");
     assert!(meta.contains("link-local"), "{meta}");
@@ -186,7 +188,7 @@ fn a_target_the_operator_allowed_still_arrives_with_the_host_header_on_the_name(
     // still has to happen — through the same vetted dial.
     let (port, seen) = spawn_receiver();
     let url = format!("http://127.0.0.1:{port}/hook");
-    push::deliver(&target(&url), &json!({"kind": "status-update"}), true)
+    push::deliver(&target(&url), &json!({"kind": "status-update"}), true, None)
         .expect("the allowed delivery reaches the receiver");
 
     let got = seen

@@ -67,6 +67,10 @@ pub struct A2aRequest {
     /// The extensions the request activated. The runtime projects a task's
     /// annotations only while task-annotations is among them.
     pub active: Active,
+    /// The span the request's `traceparent`/`tracestate` headers named: a
+    /// unit of work the request starts continues it. Correlation only —
+    /// nothing about who the caller is or what it may do reads it.
+    pub trace: Option<crate::obs::trace::TraceContext>,
     pub reply: SyncSender<Value>,
 }
 
@@ -153,14 +157,23 @@ impl A2aBridge {
 
     /// Post a request to the loop and wait for its reply. Blocking — an async
     /// caller (the A2A ports) runs this on a blocking thread. `active` is what
-    /// the request activated ([`Active::NONE`] for a call no request made).
-    pub fn call(&self, method: &str, params: Value, principal: Principal, active: Active) -> Value {
+    /// the request activated ([`Active::NONE`] for a call no request made),
+    /// `trace` the span its W3C headers named.
+    pub fn call(
+        &self,
+        method: &str,
+        params: Value,
+        principal: Principal,
+        active: Active,
+        trace: Option<crate::obs::trace::TraceContext>,
+    ) -> Value {
         let (reply_tx, reply_rx) = sync_channel(1);
         let req = A2aRequest {
             method: method.to_string(),
             params,
             principal,
             active,
+            trace,
             reply: reply_tx,
         };
         if self.events_tx.send(Event::A2a(Box::new(req))).is_err() {
@@ -266,6 +279,7 @@ impl Runtime {
             params,
             principal,
             active,
+            trace,
             reply,
         } = req;
         // What this request activated, for every task it projects — however
@@ -273,6 +287,9 @@ impl Runtime {
         // reserved id below, so nothing outside a request is ever annotated
         // for a caller who did not ask.
         self.a2a_active = active;
+        // The span the request's headers named, for the unit of work it
+        // starts — cleared with the rest, so no later work continues it.
+        self.a2a_trace = trace;
         // Index this caller's declared budget and labels the first time they
         // appear, so everything downstream can find them by id alone — the run
         // record, the MCP `_meta` and the audit line all carry the id, never
@@ -308,18 +325,34 @@ impl Runtime {
         };
         self.reserved_task_id = None;
         self.a2a_active = Active::NONE;
+        // The caller's span: its headers', else its message's `metadata`.
+        let upstream = self.a2a_upstream(&params["message"]);
+        self.a2a_trace = None;
+        // The task this answers, and the span its work is done in.
+        let answered = out["task"]["id"]
+            .as_str()
+            .or(out["id"].as_str())
+            .map(str::to_string);
+        let span = answered
+            .as_deref()
+            .and_then(|id| self.tasks.get(id))
+            .and_then(|t| t.trace.clone());
         // A stream opening on the task this answers: the position of the last
         // transition published for it, read here on the loop that publishes
         // them, so the stream skips exactly the transitions this answer
-        // already shows (`a2a::ports::Fanout`).
+        // already shows (`a2a::ports::Fanout`). Beside it, the span the task's
+        // work is done in, which the listener names in its response header.
         let mut out = out;
         if params["_attach"] == json!(true)
             && let Some(sink) = &self.a2a_sink
-            && let Some(id) = out["task"]["id"].as_str().or(out["id"].as_str())
+            && let Some(id) = answered.as_deref()
         {
             let seq = sink.seq(id);
             if let Some(o) = out.as_object_mut() {
                 o.insert("_seq".into(), json!(seq));
+                if let Some(t) = &span {
+                    o.insert("_trace".into(), json!(t.traceparent()));
+                }
             }
         }
         // Audit every A2A call: who (principal + role), what (method + command
@@ -336,6 +369,11 @@ impl Runtime {
             .map(|id| json!({"task": id}))
             .unwrap_or(Value::Null);
         let request_id = params["message"]["messageId"].as_str();
+        // In the trace of the work the call did, else of the caller's request.
+        // A call on a task of another trace — a message continuing it, the
+        // answer to its gate, a read — names the caller's span as its link.
+        let trace = span.or_else(|| upstream.as_ref().map(|u| u.child()));
+        let link = upstream.filter(|u| trace.as_ref().is_some_and(|t| t.trace_id != u.trace_id));
         self.audit_a2a(
             &method,
             op.as_deref(),
@@ -343,6 +381,8 @@ impl Runtime {
             outcome,
             target,
             request_id,
+            trace.as_ref(),
+            link.as_ref(),
         );
         let _ = reply.send(out);
     }

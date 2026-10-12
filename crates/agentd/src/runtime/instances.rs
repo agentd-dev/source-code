@@ -750,8 +750,16 @@ impl Runtime {
 
     /// `subagent.send` to an instance child: the message rides A2A over the
     /// child's unix socket and lands in its conversation surface.
-    /// Fire-and-forget from the reactor's view (a thread does the dial).
-    pub(crate) fn instance_send(&mut self, handle: &str, message: &str) -> ToolOutcome {
+    /// Fire-and-forget from the reactor's view (a thread does the dial). The
+    /// send is a span of `trace`, the sending unit's — else of the span the
+    /// child was spawned in — so the turn it becomes in the child continues
+    /// the sender's trace.
+    pub(crate) fn instance_send(
+        &mut self,
+        handle: &str,
+        message: &str,
+        trace: Option<&crate::obs::trace::TraceContext>,
+    ) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
         let Some(s) = self.subagents.get(handle) else {
             return err(format!("no such subagent {handle:?}"));
@@ -769,19 +777,22 @@ impl Runtime {
                 Err(e) => return err(format!("instance {handle:?}: {e}")),
             };
             let parts = json!([{"text": message}]);
-            let log = self.log.clone();
+            let hop = trace
+                .cloned()
+                .or_else(|| s.trace.clone())
+                .map(|t| t.child());
+            let log = self.log.in_trace(hop.as_ref());
+            let auth = crate::mcp::a2a_client::PeerAuth {
+                trace: hop,
+                ..Default::default()
+            };
             let h = handle.to_string();
             std::thread::Builder::new()
                 .name(format!("inst.send:{handle}"))
                 .spawn(move || {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     match crate::mcp::a2a_client::send(
-                        &endpoint,
-                        Default::default(),
-                        &parts,
-                        None,
-                        None,
-                        deadline,
+                        &endpoint, auth, &parts, None, None, deadline,
                     ) {
                         Ok(_) => log.info("instance.send", json!({"handle": h})),
                         Err(e) => log.warn("instance.send", json!({"handle": h, "err": e})),
@@ -795,7 +806,7 @@ impl Runtime {
         }
         #[cfg(not(feature = "a2a"))]
         {
-            let _ = (message, &sock);
+            let _ = (message, &sock, trace);
             err(format!(
                 "instance {handle:?}: subagent.send to an instance child needs --features a2a"
             ))
@@ -845,7 +856,8 @@ impl Runtime {
             );
             format!("{} is operator-only", op.name())
         })?;
-        self.consume_instance_op(admitted, args)
+        let report = self.a2a_trace.clone();
+        self.consume_instance_op(admitted, args, report.as_ref())
     }
 
     /// An `_instance.*` report that reached the durable inbox. Returns true
@@ -858,7 +870,7 @@ impl Runtime {
             None => false,
             Some(Ok((admitted, args))) => {
                 let op = admitted.op();
-                if let Err(e) = self.consume_instance_op(admitted, &args) {
+                if let Err(e) = self.consume_instance_op(admitted, &args, ev.trace.as_ref()) {
                     self.log
                         .warn("instance.op.fail", json!({"op": op.name(), "err": e}));
                 }
@@ -878,9 +890,18 @@ impl Runtime {
         }
     }
 
+    /// Consume a child's report. Its lines are in the trace of the unit that
+    /// spawned the child, and name the report's own span — the child's
+    /// request, continued — as their `link`.
     #[cfg(feature = "a2a")]
-    fn consume_instance_op(&mut self, admitted: Admitted, args: &Value) -> Result<String, String> {
+    fn consume_instance_op(
+        &mut self,
+        admitted: Admitted,
+        args: &Value,
+        report: Option<&crate::obs::trace::TraceContext>,
+    ) -> Result<String, String> {
         let op = admitted.op();
+        let link = report.map(crate::obs::trace::TraceContext::traceparent);
         let handle = args["handle"].as_str().unwrap_or("").to_string();
         let live = self.subagents.get(&handle).is_some_and(|s| {
             s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status)
@@ -907,7 +928,7 @@ impl Runtime {
                         }));
                         s.updated = now_ms();
                         s.dirty = true;
-                        ilog.info("instance.result", json!({"handle": handle}));
+                        ilog.info("instance.result", json!({"handle": handle, "link": link}));
                         self.persist_subagent(&handle);
                     }
                 }
@@ -941,6 +962,9 @@ impl Runtime {
                 let data = event.get("data").cloned().unwrap_or(Value::Null);
                 let id = format!("{handle}/{}", event["id"].as_str().unwrap_or("?"));
                 let source = format!("instance:{handle}");
+                // The mirrored copy keeps the span the child's event was
+                // produced in, so a consumer here continues the child's trace.
+                let produced = crate::obs::trace::TraceContext::from_members(&event);
                 match self.append_event(
                     &stream,
                     &subject,
@@ -948,12 +972,13 @@ impl Runtime {
                     data,
                     &id,
                     &source,
+                    produced.as_ref(),
                 ) {
                     Ok(seq) => {
                         self.stream_dirty = true;
                         ilog.info(
                             "instance.mirror",
-                            json!({"handle": handle, "stream": stream, "seq": seq}),
+                            json!({"handle": handle, "stream": stream, "seq": seq, "link": link}),
                         );
                         Ok(format!("event mirrored into {stream} at {seq}"))
                     }

@@ -323,5 +323,6 @@ fn audit(rt: &Runtime, principal: &Principal, action: &str, target: Value) {
         request_id: None,
         sid: principal.session.as_deref(),
         trace: None,
+        link: None,
     });
 }

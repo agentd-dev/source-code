@@ -804,10 +804,13 @@ impl Runtime {
             }
         }
         for (rid, sid, event) in resolved {
+            // The run keeps its trace; the span the event was produced in is
+            // its link.
             self.run_log(&rid).info(
                 "wait.resolved",
                 json!({"run": rid, "step": sid, "kind": "event",
-                       "stream": event.get("stream"), "subject": event.get("subject")}),
+                       "stream": event.get("stream"), "subject": event.get("subject"),
+                       "link": event.get("traceparent")}),
             );
             // What the event carried, the run it wakes carries.
             let carries = super::starts::event_carries(&event);
@@ -1136,7 +1139,7 @@ impl Runtime {
     }
 
     /// An A2A message arrived on a conversation: resolve every step suspended
-    /// waiting for one. Returns how many were woken.
+    /// waiting for one. Returns the runs it woke.
     ///
     /// This is what makes the asynchronous half of an A2A conversation
     /// expressible: `wait {on: message}` and `a2a.wait` both suspend on a
@@ -1149,13 +1152,18 @@ impl Runtime {
     /// non-operator); a wait names either. Which messages wake it is
     /// [`message_wait_matches`]'s rule — the conversation AND the sender, so
     /// nobody wakes somebody else's run by naming its conversation.
+    ///
+    /// `trace` is the span the message was accepted in. A run it wakes keeps
+    /// its own trace and records it as the `link` of its `wait.resolved`
+    /// line: the reply resumed the run, it did not cause it.
     pub(crate) fn deliver_a2a_message(
         &mut self,
         conversation: &str,
         wire: &str,
         message: &Value,
         principal: Option<&str>,
-    ) -> u64 {
+        trace: Option<&crate::obs::trace::TraceContext>,
+    ) -> Vec<String> {
         let sender = self.acting_principal(principal);
         let mut hits: Vec<(String, String)> = Vec::new();
         for (rid, run) in &self.runs {
@@ -1183,9 +1191,14 @@ impl Runtime {
             }
             _ => Default::default(),
         };
-        let mut delivered = 0u64;
+        let mut woken = Vec::with_capacity(hits.len());
         for (rid, sid) in hits {
-            delivered += 1;
+            self.run_log(&rid).info(
+                "wait.resolved",
+                json!({"run": rid, "step": sid, "kind": "message",
+                       "conversation": conversation,
+                       "link": trace.map(crate::obs::trace::TraceContext::traceparent)}),
+            );
             self.hand_run(&rid, &carries);
             self.finish_step_pub(
                 &rid,
@@ -1207,8 +1220,9 @@ impl Runtime {
                 None,
                 0,
             );
+            woken.push(rid);
         }
-        delivered
+        woken
     }
 
     /// The sender of a signal sent for principal `id` (`None`: the runtime).
@@ -1226,6 +1240,11 @@ impl Runtime {
     /// `run` named as the target), to `signal` start nodes, and into the
     /// recent-signals view. Returns how many waiting steps were woken. How far
     /// it reaches is the `sender`'s (see [`SignalSender`]).
+    ///
+    /// `trace` is the signal's: a run a signal start fires continues it, and
+    /// a run it wakes keeps its own trace and records it as a `link` on its
+    /// `signal.delivered` line — the waiting run was not caused by the sender,
+    /// only resumed by it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver_signal(
         &mut self,
@@ -1260,6 +1279,12 @@ impl Runtime {
         }
         for (rid, sid) in hits {
             delivered += 1;
+            if let Some(t) = trace {
+                self.run_log(&rid).info(
+                    "signal.delivered",
+                    json!({"run": rid, "step": sid, "signal": name, "link": t.traceparent()}),
+                );
+            }
             // The payload is the sender's text: the run carries what the
             // sender did (`withhold`).
             self.hand_run(&rid, carries);
@@ -1838,7 +1863,7 @@ impl Runtime {
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(30));
-        let (endpoint, auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.send") {
+        let (endpoint, mut auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.send") {
             Ok(v) => v,
             Err(e) => {
                 self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
@@ -1850,7 +1875,11 @@ impl Runtime {
         let (r, st) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
-        self.run_log(run_id).info(
+        // The hop is a span of the run's, named on every request it makes and
+        // on its line: the peer's work is a child of it.
+        let hop = self.run_trace(run_id).map(|t| t.child());
+        auth.trace = hop.clone();
+        self.log.in_trace(hop.as_ref()).info(
             "a2a.send",
             json!({"run": run_id, "step": step_id, "to": peer_name}),
         );
@@ -1934,7 +1963,7 @@ impl Runtime {
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(120));
-        let (endpoint, auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.delegate") {
+        let (endpoint, mut auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.delegate") {
             Ok(v) => v,
             Err(e) => {
                 self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
@@ -1946,7 +1975,11 @@ impl Runtime {
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
             .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
-        self.run_log(run_id).info(
+        // One span for the whole delegation — card, send, polls — under the
+        // run's, logged here: the peer's task is a child of it.
+        let hop = self.run_trace(run_id).map(|t| t.child());
+        auth.trace = hop.clone();
+        self.log.in_trace(hop.as_ref()).info(
             "a2a.delegate",
             json!({"run": run_id, "step": step_id, "peer": peer_name}),
         );

@@ -263,6 +263,11 @@ owner or conversation:
 | `data.event_id`, `data.occurred_at` | the server's id and timestamp |
 | `data.schema_ok` | `false` when the payload failed the type's payload schema; it is appended anyway |
 | `data.server`, `data.event`, `data.subscription` | where it came from |
+| `traceparent`, `tracestate` | the span the server names in the occurrence's `_meta`, or, delivered by webhook, in the request's `traceparent` header; absent when neither names one |
+
+The run a `stream` start fires for the event continues that trace, one span
+below the server's span, so the server's trace reaches every model and MCP
+call the run makes.
 
 In a start's `inputs` the event is `payload`, so the server's data is
 `payload.data.payload.<field>`. A later step reads it as
@@ -531,11 +536,19 @@ workflows:
   sees it as `event.data`.
 - Two workflows are needed: a workflow never fires on events it appended
   itself.
+- A sender's W3C `traceparent` header is a link, not a parent: the appended
+  event starts a trace of its own, which the consuming run continues, and
+  the `webhook.into` line names the sender's span in `links`.
 
 Without `into:`, the webhook start fires a run directly and its output is
 the same `{method, path, headers, body, raw_body}`. That is simpler, and a
 request that arrives while the run cannot be admitted is answered with an
-error the sender must retry. The listener needs the `a2a` build feature,
+error the sender must retry. The run continues the sender's `traceparent`
+when the request carries one. A callback to a `wait {on: webhook}`, and a
+route's `signal:`, resume a run that keeps its own trace and records the
+sender's `traceparent` as the `link` of its `signal.delivered` line. A
+trace header is correlation only: idempotency, rate limits and
+authentication never read it. The listener needs the `a2a` build feature,
 which the release binaries include. [Workflow node reference](node-registry.md)
 lists `respond`, `idempotency`, `rate`, `signal` and the other webhook fields.
 

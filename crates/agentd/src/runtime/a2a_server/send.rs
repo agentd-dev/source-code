@@ -10,6 +10,7 @@ use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::errors::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION};
 use crate::a2a::tasks::{Link, State};
+use crate::obs::trace::TraceContext;
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{PendingKind, Runtime};
 use crate::runtime::surface::{self, Command, Ext};
@@ -106,6 +107,17 @@ fn admitted_command(
 }
 
 impl Runtime {
+    /// The span the request being served names, which the unit of work it
+    /// starts continues: its `traceparent`/`tracestate` headers, else — for a
+    /// caller that cannot set a header — the same keys in the message's
+    /// `metadata`. Correlation only: nothing that decides who the caller is,
+    /// what it may do or how fast reads it.
+    pub(super) fn a2a_upstream(&self, message: &Value) -> Option<TraceContext> {
+        self.a2a_trace
+            .clone()
+            .or_else(|| TraceContext::from_members(&message["metadata"]))
+    }
+
     /// The key of the conversation `principal`'s `contextId` (`wire`, see
     /// [`context_wire`]) names.
     ///
@@ -341,15 +353,22 @@ impl Runtime {
                 PendingKind::Human { addressee, .. } => addressee.clone(),
                 _ => None,
             };
+            // The gate's run or turn keeps its own trace; the request that
+            // answered it, from the caller's, is recorded as a link.
+            let gate = self.target_trace(&self.pending[i].target);
+            let glog = self.log.in_trace(gate.as_ref());
+            let link = self.a2a_upstream(message);
+            let linked = link.as_ref().map(TraceContext::traceparent);
             let mut via = "human";
             if let Some(a) = &addressee
                 && !a.matches(principal)
             {
                 if !principal.is_operator() {
                     let want = a.describe();
-                    self.log.info(
+                    glog.info(
                         "human.answer.not_addressed",
-                        json!({"task": tid, "from": principal.id, "addressee": want}),
+                        json!({"task": tid, "from": principal.id, "addressee": want,
+                               "link": linked}),
                     );
                     self.audit_a2a(
                         "SendMessage",
@@ -358,6 +377,8 @@ impl Runtime {
                         "not_addressed",
                         json!({"task": tid, "addressee": want}),
                         None,
+                        gate.as_ref(),
+                        link.as_ref(),
                     );
                     // The gate stays OPEN and the answerer is told why, rather
                     // than their reply vanishing into the conversation.
@@ -369,10 +390,10 @@ impl Runtime {
                     );
                 }
                 via = "operator_override";
-                self.log.warn(
+                glog.warn(
                     "human.answer.override",
                     json!({"task": tid, "by": principal.id, "sid": principal.session,
-                           "addressee": a.describe()}),
+                           "addressee": a.describe(), "link": linked}),
                 );
             }
             // The answer enters the gate task's history before the gate
@@ -381,16 +402,28 @@ impl Runtime {
             if let Some(t) = self.tasks.get_mut(tid) {
                 t.record_inbound(message);
             }
-            self.human_answer(i, text, via, Some(&principal.clone()));
+            self.human_answer(i, text, via, Some(&principal.clone()), link.as_ref());
             return self.task_reply(tid);
         }
-        let (task_id, ctx_id) = match existing {
+        // The unit this message becomes: a continued task's carries on in the
+        // task's trace, and the caller's span, from another, is its link; a
+        // new one continues the caller's, else starts its own.
+        let upstream = self.a2a_upstream(message);
+        let mut link = None;
+        let (task_id, ctx_id, parent) = match existing {
             Some((tid, ctx)) => {
+                let mut parent = None;
                 if let Some(t) = self.tasks.get_mut(&tid) {
                     t.record_inbound(message);
                     t.transition(State::Working, None);
+                    parent = t.trace.clone();
                 }
-                (tid, ctx)
+                if parent.is_some() {
+                    link = upstream;
+                    (tid, ctx, parent)
+                } else {
+                    (tid, ctx, upstream)
+                }
             }
             None => {
                 let ctx = match self.resolve_context(principal, &context_wire(message)) {
@@ -403,7 +436,7 @@ impl Runtime {
                     Link::Turn { ctx: ctx.clone() },
                     Some(message),
                 );
-                (tid, ctx)
+                (tid, ctx, upstream)
             }
         };
         // Write-ahead the message; the loop turns it into a conversation turn.
@@ -413,16 +446,27 @@ impl Runtime {
         let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
         "role": role_name(principal.role)});
-        match self.accept_event(
-            kinds::A2A_MESSAGE,
-            Some(principal.id.clone()),
-            payload,
-            None,
-        ) {
-            Ok(inbox_id) => {
+        match self
+            .accept_event_store(
+                kinds::A2A_MESSAGE,
+                Some(principal.id.clone()),
+                payload,
+                parent.as_ref(),
+            )
+            .map_err(|e| format!("inbox: {e}"))
+        {
+            Ok((inbox_id, trace)) => {
+                if let Some(l) = &link {
+                    self.log.in_trace(Some(&trace)).info(
+                        "a2a.task.continued",
+                        json!({"task": task_id, "inbox_event": inbox_id,
+                               "link": l.traceparent()}),
+                    );
+                }
                 self.event_to_task.insert(inbox_id, task_id.clone());
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.transition(State::Working, None);
+                    t.set_trace(trace);
                 }
                 // The prompt is already in the task's history — durably, so a
                 // continuation's message survives a restart with the task —

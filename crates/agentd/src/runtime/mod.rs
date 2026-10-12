@@ -673,6 +673,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         #[cfg(feature = "a2a")]
         a2a_active: surface::Active::NONE,
         #[cfg(feature = "a2a")]
+        a2a_trace: None,
+        #[cfg(feature = "a2a")]
         a2a_sink: None,
         #[cfg(feature = "a2a")]
         a2a_serving: None,
@@ -808,6 +810,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             request_id: None,
             sid: None,
             trace: None,
+            link: None,
         });
     }
 

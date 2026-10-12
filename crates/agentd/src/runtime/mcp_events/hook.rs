@@ -84,6 +84,10 @@ pub struct Arrival {
     pub key: String,
     pub webhook_id: String,
     pub body: Value,
+    /// The span the delivery's `traceparent`/`tracestate` headers named: the
+    /// occurrence's, unless its own `_meta` names one. Read after the
+    /// signature verified, and by no check.
+    pub trace: Option<crate::obs::trace::TraceContext>,
     pub reply: SyncSender<Answer>,
 }
 
@@ -249,11 +253,19 @@ pub fn serve(
         return respond(Answer::retry(503, RETRY_AFTER_S, "not armed yet"));
     }
     let webhook_id = signed.id.unwrap_or_default().to_string();
+    let all = |name: &'static str| {
+        req.headers
+            .iter()
+            .filter(move |(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let trace = crate::obs::trace::inbound(all("traceparent"), all("tracestate"));
     let (tx, rx) = sync_channel(1);
     let arrival = Arrival {
         key,
         webhook_id,
         body: Value::Object(body),
+        trace,
         reply: tx,
     };
     if events.send(Event::McpEventHook(Box::new(arrival))).is_err() {
@@ -327,11 +339,17 @@ impl Runtime {
 
     /// A delivery from the listener, answered.
     pub(crate) fn events_hook_delivery(&mut self, d: Arrival) {
-        let answer = self.events_hook_answer(&d.key, &d.webhook_id, d.body);
+        let answer = self.events_hook_answer(&d.key, &d.webhook_id, d.body, d.trace.as_ref());
         let _ = d.reply.send(answer);
     }
 
-    fn events_hook_answer(&mut self, key: &str, webhook_id: &str, body: Value) -> Answer {
+    fn events_hook_answer(
+        &mut self,
+        key: &str,
+        webhook_id: &str,
+        body: Value,
+        trace: Option<&crate::obs::trace::TraceContext>,
+    ) -> Answer {
         let now = now_ms();
         let Some(b) = self.mcp_events.bindings.get(key) else {
             return Answer::gone("no MCP Events binding at this path");
@@ -364,7 +382,7 @@ impl Runtime {
             .and_then(Value::as_str)
             .filter(|c| c.len() <= super::bridge::MAX_CURSOR_BYTES)
             .map(str::to_string);
-        match self.events_take(key, &body, "webhook", now) {
+        match self.events_take(key, &body, "webhook", now, trace) {
             super::Taken::Rejected("oversize") => Answer::too_large(),
             super::Taken::Rejected(_) => Answer::gone("malformed occurrence"),
             super::Taken::Rate => {

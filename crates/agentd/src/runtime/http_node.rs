@@ -154,6 +154,22 @@ impl crate::runtime::reactor::Runtime {
                 }
             }
         }
+        // The call is a span of the run's, named to the API it reaches in
+        // `traceparent` and `tracestate` — ahead of the signature — and on
+        // the step's `http.request` line. A step whose `headers` set either
+        // owns the trace context: agentd adds neither, and the line is the
+        // run's, since no span of agentd's went out.
+        let authored = headers.iter().any(|(k, _)| {
+            k.eq_ignore_ascii_case("traceparent") || k.eq_ignore_ascii_case("tracestate")
+        });
+        let hop = if authored {
+            None
+        } else {
+            self.run_trace(run_id).map(|t| t.child())
+        };
+        if let Some(t) = &hop {
+            headers.extend(t.headers());
+        }
         // Body: `json` (serialized + Content-Type) takes precedence over `body`.
         let body: Vec<u8> = if let Some(j) = spec.get("json").filter(|v| !v.is_null()) {
             if !headers
@@ -219,7 +235,11 @@ impl crate::runtime::reactor::Runtime {
             .map(|a| a.iter().filter_map(Value::as_u64).collect())
             .unwrap_or_default();
 
-        self.run_log(run_id).info(
+        let line = match &hop {
+            Some(h) => self.log.in_trace(Some(h)),
+            None => self.run_log(run_id),
+        };
+        line.info(
             "http.request",
             json!({"run": run_id, "step": step_id, "method": method, "url": url}),
         );

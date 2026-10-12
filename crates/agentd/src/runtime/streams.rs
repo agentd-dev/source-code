@@ -18,6 +18,7 @@
 //! (count-based eagerly, age-based amortized). Appends are admissions: the
 //! pressure system gates them like every other way of creating durable work.
 
+use crate::obs::trace::TraceContext;
 use crate::state::{Kind, kill_point, now_ms};
 use crate::store::StoreError;
 use serde_json::{Value, json};
@@ -70,7 +71,9 @@ impl std::fmt::Display for AppendError {
 
 impl super::reactor::Runtime {
     /// Append one event. Fail-closed on an undeclared stream; sheds under
-    /// pressure like every admission.
+    /// pressure like every admission. `trace` is the span the event was
+    /// produced in ([`Runtime::append_carrying`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_event(
         &mut self,
         stream: &str,
@@ -79,11 +82,13 @@ impl super::reactor::Runtime {
         data: Value,
         id: &str,
         source: &str,
+        trace: Option<&TraceContext>,
     ) -> Result<u64, String> {
-        self.append(stream, subject, correlation, data, id, source)
+        self.append(stream, subject, correlation, data, id, source, trace)
             .map_err(|e| e.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append(
         &mut self,
         stream: &str,
@@ -92,14 +97,22 @@ impl super::reactor::Runtime {
         data: Value,
         id: &str,
         source: &str,
+        trace: Option<&TraceContext>,
     ) -> Result<u64, AppendError> {
-        self.append_carrying(stream, subject, correlation, data, id, source, None)
+        self.append_carrying(stream, subject, correlation, data, id, source, None, trace)
     }
 
     /// [`Runtime::append`], recording on the event what the run that emits
     /// it carries (`withhold`): its consumers take it on — the runs a
     /// `stream`, `batch` or `correlate` start fires, the run a `wait {on:
     /// event}` resumes — as a signal's receiver takes on its sender's.
+    ///
+    /// `trace` is the span the event was produced in — an `emit` step's, an
+    /// MCP server's occurrence, a delivery's own — written on the envelope as
+    /// the CloudEvents distributed-tracing attributes `traceparent` and
+    /// `tracestate`, beside `carries` and never inside `data`, so it is
+    /// durable with the event: a `stream` start's run continues it, and a
+    /// `batch` or `correlate` run links to it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_carrying(
         &mut self,
@@ -110,6 +123,7 @@ impl super::reactor::Runtime {
         id: &str,
         source: &str,
         carries: Option<&super::withhold::Carries>,
+        trace: Option<&TraceContext>,
     ) -> Result<u64, AppendError> {
         let Some(cfg) = self.settings.streams.get(stream).cloned() else {
             return Err(AppendError::Refused(format!(
@@ -147,6 +161,12 @@ impl super::reactor::Runtime {
             });
             if let Some(c) = carries.filter(|c| !c.is_empty()) {
                 event["carries"] = serde_json::to_value(c).unwrap_or(Value::Null);
+            }
+            if let Some(t) = trace {
+                event["traceparent"] = json!(t.traceparent());
+                if let Some(ts) = &t.tracestate {
+                    event["tracestate"] = json!(ts);
+                }
             }
             let created = self
                 .durable
@@ -252,6 +272,7 @@ impl super::reactor::Runtime {
     /// cannot be saved is a refused append: the sender retries, and the copy
     /// it appends carries the same id, which consumers deduplicate.
     #[cfg(feature = "a2a")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_event_acked(
         &mut self,
         stream: &str,
@@ -260,8 +281,9 @@ impl super::reactor::Runtime {
         data: Value,
         id: &str,
         source: &str,
+        trace: Option<&TraceContext>,
     ) -> Result<u64, AppendError> {
-        let seq = self.append(stream, subject, correlation, data, id, source)?;
+        let seq = self.append(stream, subject, correlation, data, id, source, trace)?;
         self.durable.flush(true).map_err(|e| {
             AppendError::Refused(format!(
                 "stream {stream:?} append: the stream head was not saved: {e}"
@@ -314,7 +336,7 @@ impl super::reactor::Runtime {
                 .unwrap_or("_runtime")
                 .to_string();
             let id = crate::state::ulid::new();
-            match self.append_event(&ev.stream, &ev.subject, None, ev.data, &id, &source) {
+            match self.append_event(&ev.stream, &ev.subject, None, ev.data, &id, &source, None) {
                 Ok(_) => appended += 1,
                 Err(_) => refused += 1,
             }
@@ -722,6 +744,9 @@ pub(crate) struct Forwarded<'a> {
     pub seq: u64,
     pub run_id: &'a str,
     pub step_id: &'a str,
+    /// The span the event was emitted in. Each forward is a span of its own
+    /// under it, sent as `traceparent`/`tracestate` on the push.
+    pub trace: Option<&'a TraceContext>,
 }
 
 /// One `forward:` push counted in flight for the whole life of its thread.
@@ -773,9 +798,10 @@ impl crate::runtime::reactor::Runtime {
             seq,
             run_id,
             step_id,
+            trace,
         } = *ev;
         let timeout = std::time::Duration::from_secs(30);
-        let (endpoint, auth) = match self.a2a_peer_conn_pub(peer, timeout, "stream forward") {
+        let (endpoint, mut auth) = match self.a2a_peer_conn_pub(peer, timeout, "stream forward") {
             Ok(v) => v,
             Err(e) => {
                 self.run_log(run_id).warn(
@@ -793,7 +819,10 @@ impl crate::runtime::reactor::Runtime {
             "op": "stream.forwarded",
             "stream": stream, "subject": subject, "id": id, "seq": seq, "data": data,
         }}}]);
-        let log = self.log.clone();
+        // The push is a span of the event's: the peer's message continues it.
+        let hop = trace.map(TraceContext::child);
+        auth.trace = hop.clone();
+        let log = self.log.in_trace(hop.as_ref());
         let (st, sub, peer_name) = (stream.to_string(), subject.to_string(), peer.to_string());
         let msg_id = id.to_string();
         let in_flight = ForwardInFlight::start(self);
@@ -841,6 +870,7 @@ impl crate::runtime::reactor::Runtime {
             seq,
             run_id,
             step_id,
+            trace,
         } = *ev;
         use crate::config::settings;
         if let Err(e) = settings::egress_allows(
@@ -859,14 +889,19 @@ impl crate::runtime::reactor::Runtime {
             "id": id, "stream": stream, "subject": subject, "seq": seq,
         });
         let body = serde_json::to_vec(&event).unwrap_or_default();
-        let headers = vec![
+        let mut headers = vec![
             ("content-type".to_string(), "application/json".to_string()),
             (
                 "user-agent".to_string(),
                 format!("agentd/{}", crate::VERSION),
             ),
         ];
-        let log = self.log.clone();
+        // The push is a span of the event's, named to the receiver.
+        let hop = trace.map(TraceContext::child);
+        if let Some(t) = &hop {
+            headers.extend(t.headers());
+        }
+        let log = self.log.in_trace(hop.as_ref());
         let (url, st, sub) = (url.to_string(), stream.to_string(), subject.to_string());
         let in_flight = ForwardInFlight::start(self);
         std::thread::Builder::new()

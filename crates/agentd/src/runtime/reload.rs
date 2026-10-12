@@ -62,6 +62,7 @@ impl Runtime {
             request_id: None,
             sid: None,
             trace: None,
+            link: None,
         });
         match outcome {
             Ok(changed) => {

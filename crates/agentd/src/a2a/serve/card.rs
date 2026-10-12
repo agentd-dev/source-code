@@ -46,6 +46,7 @@ pub(super) async fn card(State(app): State<Arc<App>>, headers: HeaderMap) -> Res
                 json!({}),
                 Principal::anonymous(),
                 Active::NONE,
+                None,
             )
         }),
     )

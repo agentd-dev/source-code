@@ -209,6 +209,9 @@ workflow emitted.
 - `batch: {size: 2..1000, window?}` makes one run per group. `full: false`
   means the window elapsed first. `batch` and `rate` together are refused.
 - A workflow never fires on its own emits.
+- The run continues the trace of the event's `traceparent`, the span it was
+  emitted in. A `batch` run starts a trace of its own, and its `start.fired`
+  line names each member's `traceparent` in `links`.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -235,6 +238,8 @@ joins events the way `depends_on` joins steps.
   new correlation values are refused and logged.
 - It reads the stream from its earliest retained event when it first arms,
   because half of a pair may already be there.
+- The run starts a trace of its own; its `start.fired` line names each
+  event's `traceparent` in `links`.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -260,7 +265,9 @@ Fires when a principal sends a message carrying a declared command.
 - `schema` is the payload's contract: a non-conforming command is refused
   at the listener, naming the mismatch. `roles` narrows who may fire it.
 - `into: {stream, subject}` appends the message to a stream instead of
-  starting a run, after the principal and roles checks.
+  starting a run, after the principal and roles checks. The event starts a
+  trace of its own, linked to the message's span.
+- The run continues the trace the request's `traceparent` header names.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -297,6 +304,9 @@ Fires on an inbound HTTP request.
   of starting a run, after verification, filtering and rate limiting;
   it answers `202 {"status":"appended"}`, or `503` when the append is
   refused. It cannot be combined with `respond: sync`.
+- The run continues the trace the request's `traceparent` header names. An
+  `into:` event starts a trace of its own, linked to it, and a `signal:`
+  records it as a link on each run it wakes.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -631,7 +641,9 @@ Notes per form:
   used, or `"*"` for any; unset, the run's own. `from` names whose message
   counts, in the addressee syntax of a `human` gate's `to`; unset, only the
   run's principal, an operator or the runtime wakes it. `from` with any
-  other `on` is a load error.
+  other `on` is a load error. The run keeps its trace; the `wait.resolved`
+  line names the span the message was accepted in as `link`, as it does for
+  `a2a.wait`.
 - **`webhook`**: opens a one-shot callback route on the webhook listener,
   at a fixed `path` or a generated one. The URL is built on `webhooks.url`
   (else the listener's bind), and `emit_url_to` writes it to a run variable
@@ -983,6 +995,9 @@ One outbound HTTP request.
   default header `X-Signature`, prefix `sha256=`.
 - `idempotency: {header}` or `{query}` sends the step's key there;
   `value` replaces the derived key.
+- The request carries the step's span as `traceparent` and `tracestate`,
+  unless `headers` sets either: then it carries what `headers` set and
+  nothing of agentd's.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -1006,6 +1021,8 @@ Sends a message to a peer and continues: a notification.
 - `to` names an `a2a.peers` entry. `command` with `args` sends the typed
   payload a peer's `a2a` start matches. `idempotency: true` pins the message
   id across retries so the peer can deduplicate. `timeout` defaults to 30 s.
+- The request carries the send's span as `traceparent` and `tracestate`; an
+  agentd peer continues it.
 - Needs the `a2a` build feature.
 
 ```yaml
@@ -1024,6 +1041,9 @@ response.
 - With `command` and `args`, the payload is typed and checked against the
   command's schema at the peer, and the step returns that command's run
   output. `timeout` defaults to 120 s.
+- Every request of the delegation — the card read, the send, each poll —
+  carries one span of the run's as `traceparent` and `tracestate`; an
+  agentd peer's task and run continue it.
 - Needs the `a2a` build feature.
 
 ```yaml
@@ -1051,6 +1071,9 @@ Publishes an event to a stream, or writes a note or an audit record.
   pushes the event out as it is appended. The durable copy is the source of
   truth, so a failed forward is logged and does not fail the step. A peer
   receives it as a `stream.forwarded` command. One destination, not both.
+- The event records the span it was emitted in as `traceparent` and
+  `tracestate`, which a consuming run continues; a forward sends a span of
+  it as HTTP headers, on the webhook POST or the peer's A2A request.
 - Without `stream`: `note` writes to the root conversation's transcript,
   `audit` logs an `audit.emit` record, and `value` becomes the output.
 

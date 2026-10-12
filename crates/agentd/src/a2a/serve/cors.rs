@@ -22,25 +22,33 @@ use crate::config::settings::parse_origin;
 /// The request headers a browser client may send, answered on the preflight.
 ///
 /// None of them is CORS-safelisted, so each one missing here is a call a
-/// browser refuses to make: `a2a-version` rides on every A2A 1.0 request, and
-/// without `a2a-extensions` a browser client could never activate one.
+/// browser refuses to make: `a2a-version` rides on every A2A 1.0 request,
+/// without `a2a-extensions` a browser client could never activate one, and
+/// without `traceparent`/`tracestate` a page's tracing could never reach the
+/// work it asks for.
 pub(super) const CORS_REQUEST_HEADERS: &[&str] = &[
     "content-type",
     "authorization",
     "last-event-id",
     "a2a-extensions",
     "a2a-version",
+    "traceparent",
+    "tracestate",
 ];
 
 /// The response headers page script may read, on every actual response.
 ///
 /// A browser reads exposure from the response itself, never from the
 /// preflight, so these ride on the 200s and on the refusals alike: the
-/// activated extensions, how long a 429 asks it to wait, and the challenge a
+/// activated extensions, how long a 429 asks it to wait, the challenge a
 /// 401 or 403 carries — without which a page cannot tell "sign in" from
-/// "not allowed".
-pub(super) const CORS_EXPOSED_HEADERS: &[&str] =
-    &["a2a-extensions", "retry-after", "www-authenticate"];
+/// "not allowed" — and the span a task's work was done in.
+pub(super) const CORS_EXPOSED_HEADERS: &[&str] = &[
+    "a2a-extensions",
+    "retry-after",
+    "www-authenticate",
+    "traceparent",
+];
 
 /// The origin a request names, if it names one this listener could read.
 pub(super) fn origin_of(headers: &HeaderMap) -> Option<&str> {
@@ -293,7 +301,10 @@ mod tests {
         );
         assert_eq!(
             header_of(&resp, "access-control-allow-headers"),
-            Some("content-type, authorization, last-event-id, a2a-extensions, a2a-version")
+            Some(
+                "content-type, authorization, last-event-id, a2a-extensions, a2a-version, \
+                 traceparent, tracestate"
+            )
         );
         assert_eq!(
             header_of(&resp, "access-control-allow-methods"),
@@ -377,7 +388,7 @@ mod tests {
             );
             assert_eq!(
                 header_of(&resp, "access-control-expose-headers"),
-                Some("a2a-extensions, retry-after, www-authenticate"),
+                Some("a2a-extensions, retry-after, www-authenticate, traceparent"),
                 "{status}"
             );
             assert!(varies_on_origin(&resp), "{status}");

@@ -1721,8 +1721,10 @@ impl Runtime {
                         .map(|r| r.workflow.clone())
                         .unwrap_or_default();
                     // What this run carries goes on the event, for whatever
-                    // consumes it.
+                    // consumes it — and so does the span it was emitted in, a
+                    // child of the run's: a `stream` start's run continues it.
                     let carries = self.run_carries(run_id);
+                    let emitted = self.run_trace(run_id).map(|t| t.child());
                     match self
                         .append_carrying(
                             &stream,
@@ -1732,11 +1734,12 @@ impl Runtime {
                             &id,
                             &source,
                             Some(&carries),
+                            emitted.as_ref(),
                         )
                         .map_err(|e| e.to_string())
                     {
                         Ok(seq) => {
-                            self.run_log(run_id).info(
+                            self.log.in_trace(emitted.as_ref()).info(
                                 "stream.emit",
                                 json!({"run": run_id, "step": step_id, "stream": stream,
                                        "subject": subject, "seq": seq}),
@@ -1755,6 +1758,7 @@ impl Runtime {
                                 seq,
                                 run_id,
                                 step_id,
+                                trace: emitted.as_ref(),
                             };
                             if let Some(url) = spec
                                 .get("forward")

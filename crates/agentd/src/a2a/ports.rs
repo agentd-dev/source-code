@@ -89,8 +89,8 @@ impl RuntimePorts {
     /// refusal, and reading it as a result would hand a caller whatever else
     /// happened to be in the object.
     async fn call(&self, method: &str, params: Value, who: &Principal) -> Result<Value, A2AError> {
-        let active = serving().map_or(Active::NONE, |s| s.active);
-        let v = round_trip(&self.bridge, method, params, who, active).await?;
+        let (active, trace) = serving().map_or((Active::NONE, None), |s| (s.active, s.trace));
+        let v = round_trip(&self.bridge, method, params, who, active, trace).await?;
         match error_of(&v) {
             Some(e) => {
                 record_error(e);
@@ -137,6 +137,7 @@ impl RuntimePorts {
         }
         let mut v = self.call("SendMessage", params, who).await?;
         let seq = take_seq(&mut v);
+        take_span(&mut v);
         if let Some(m) = v.get("message") {
             let m = message_from_wire(m).map_err(A2AError::internal)?;
             return Ok((SendMessageResponse::Message(m), seq));
@@ -264,8 +265,9 @@ impl RequestHandler for RuntimePorts {
     ) -> Result<WireTask, A2AError> {
         let who = caller();
         let history = history_of(req.history_length)?;
-        let v = self.call("GetTask", json!({"id": req.id}), &who).await?;
-        let task = same_task(&req.id, task_from(v)?)?;
+        // Read attached, for the span the task's work is done in: the
+        // listener names it in the answer's `traceparent` header.
+        let (task, _) = self.read_task(&req.id, &who).await?;
         Ok(with_history(task, history))
     }
 
@@ -436,6 +438,7 @@ impl RuntimePorts {
                             json!({"id": w.id, "_attach": true}),
                             &w.who,
                             w.active,
+                            None,
                         )
                         .await
                         .and_then(|v| match error_of(&v) {
@@ -482,11 +485,12 @@ async fn round_trip(
     params: Value,
     who: &Principal,
     active: Active,
+    trace: Option<crate::obs::trace::TraceContext>,
 ) -> Result<Value, A2AError> {
     let bridge = Arc::clone(bridge);
     let method = method.to_string();
     let who = who.clone();
-    tokio::task::spawn_blocking(move || bridge.call(&method, params, who, active))
+    tokio::task::spawn_blocking(move || bridge.call(&method, params, who, active, trace))
         .await
         .map_err(|e| A2AError::internal(format!("the runtime call did not complete: {e}")))
 }
@@ -503,6 +507,7 @@ fn take_seq(v: &mut Value) -> u64 {
 /// A task read with its stream position, which must be the task asked for.
 fn attached(mut v: Value, id: &str) -> Result<(WireTask, u64), A2AError> {
     let seq = take_seq(&mut v);
+    take_span(&mut v);
     Ok((same_task(id, task_from(v)?)?, seq))
 }
 
@@ -541,6 +546,13 @@ pub struct RequestScope {
     /// call carries it, which projects a task's annotations only while
     /// task-annotations is in it.
     pub active: Active,
+    /// The span the request's `traceparent`/`tracestate` headers named, which
+    /// the work it starts continues. Every runtime call carries it.
+    pub trace: Option<crate::obs::trace::TraceContext>,
+    /// The `traceparent` of the span the runtime did the request's work in —
+    /// the task's, read from the first answer that names one — which the
+    /// listener sends back as a response header.
+    pub span: Arc<Mutex<Option<String>>>,
 }
 
 impl RequestScope {
@@ -552,7 +564,15 @@ impl RequestScope {
             via,
             error: Arc::default(),
             active,
+            trace: None,
+            span: Arc::default(),
         }
+    }
+
+    /// This scope, for a request whose W3C headers named `trace`.
+    pub fn in_trace(mut self, trace: Option<crate::obs::trace::TraceContext>) -> RequestScope {
+        self.trace = trace;
+        self
     }
 }
 
@@ -592,6 +612,26 @@ pub(crate) fn record_error(error: &Value) {
             && kept.is_none()
         {
             *kept = Some(error.clone());
+        }
+    });
+}
+
+/// Keep the span a runtime reply names (`_trace`, the traceparent of the
+/// task it answers with) as the request's, taking it out of the reply. The
+/// first wins: every later answer to the same request names the same task.
+fn take_span(v: &mut Value) {
+    let Some(tp) = v
+        .as_object_mut()
+        .and_then(|o| o.remove("_trace"))
+        .and_then(|t| t.as_str().map(str::to_string))
+    else {
+        return;
+    };
+    let _ = SCOPE.try_with(|s| {
+        if let Ok(mut kept) = s.span.lock()
+            && kept.is_none()
+        {
+            *kept = Some(tp);
         }
     });
 }
@@ -849,17 +889,19 @@ impl StreamSink {
     ///
     /// Best-effort and off the reactor: a webhook that is down, slow, or now
     /// pointing somewhere it should not must not affect the task it is
-    /// reporting on. Each delivery is one blocking POST on the blocking pool.
+    /// reporting on. Each delivery is one blocking POST on the blocking pool,
+    /// and a span of the task's of its own.
     pub fn push(&self, task: &crate::a2a::tasks::Task, allow_private: bool) {
         let event = crate::a2a::wire::push_body(task);
         for target in &task.push {
             let target = target.clone();
             let event = event.clone();
             let task_id = task.id.clone();
-            let log = self.log.clone();
+            let span = task.trace.as_ref().map(|t| t.child());
+            let log = self.log.in_trace(span.as_ref());
             self.handle.spawn(async move {
                 let outcome = tokio::task::spawn_blocking(move || {
-                    crate::a2a::push::deliver(&target, &event, allow_private)
+                    crate::a2a::push::deliver(&target, &event, allow_private, span.as_ref())
                 })
                 .await;
                 if let Ok(Err(e)) = outcome {

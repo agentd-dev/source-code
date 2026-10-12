@@ -63,6 +63,8 @@ may call none. The public card is not a method; it is the document at
 | `Origin` | request | a browser request; must name an origin in `a2a.cors.origins` |
 | `WWW-Authenticate` | response | on `401` and on a bearer caller's `403` |
 | `Retry-After` | response | on `429`, and on the card's `503` |
+| `traceparent`, `tracestate` | request | W3C Trace Context: the work the request starts continues this trace, one span below it. One `traceparent` at most; a malformed one is ignored. Correlation only: never read by authentication, authorization, rate limits or deduplication |
+| `traceparent` | response | on an answer that names a task (`SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`): the span the task's work is done in |
 
 The card, the `OPTIONS` preflights and the `/oauth2/*` endpoints take no
 `A2A-Version`: they are not JSON-RPC.
@@ -73,8 +75,9 @@ compared as an origin (scheme, host, port with its default). Anything else,
 `Origin: null` included, is `403` with no CORS headers, before the body is
 read. A listed origin has its own origin echoed in
 `Access-Control-Allow-Origin`, and the response exposes `A2A-Extensions`,
-`Retry-After` and `WWW-Authenticate`. The preflight allows `Content-Type`,
-`Authorization`, `Last-Event-ID`, `A2A-Extensions` and `A2A-Version`. The one
+`Retry-After`, `WWW-Authenticate` and `traceparent`. The preflight allows
+`Content-Type`, `Authorization`, `Last-Event-ID`, `A2A-Extensions`,
+`A2A-Version`, `traceparent` and `tracestate`. The one
 origin admitted unlisted is the web UI page `agentd ui` launches, for that
 process only.
 
@@ -299,6 +302,7 @@ conversation with `GetTask`.
 |---|---|
 | `Authorization: <scheme> <credentials>` | the registration's `authentication`; reads echo the scheme only |
 | `X-A2A-Notification-Token` | the registration's `token`; an interop header the official a2a-python receiver reads |
+| `traceparent`, `tracestate` | the task's trace: a span of its own per delivery, under the span the task's work is done in |
 
 Delivery is best effort: a delivery has 10 seconds, a webhook that is down
 does not fail the task, and a failed delivery is logged as `a2a.push.failed`

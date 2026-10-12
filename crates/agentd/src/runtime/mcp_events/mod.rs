@@ -1363,7 +1363,7 @@ impl Runtime {
         // appends the rest and nothing twice.
         let mut stopped: Option<Stop> = None;
         for raw in &page.events {
-            match self.events_take(key, raw, "poll", now) {
+            match self.events_take(key, raw, "poll", now, None) {
                 Taken::Appended => {
                     appended += 1;
                     fresh += 1;
@@ -1477,7 +1477,20 @@ impl Runtime {
     /// (§5.4), deduplicated, held to the binding's `rate`, appended. What was
     /// appended is in the dedup set and has spent a token; the caller flushes
     /// the stream before anything says it is kept.
-    fn events_take(&mut self, key: &str, raw: &Value, mode: &'static str, now: u64) -> Taken {
+    ///
+    /// The event is appended in the span the server produced the occurrence
+    /// in — its `_meta.traceparent`/`tracestate`, else `delivery`, the span
+    /// the webhook delivery's headers named — so the run a `stream` start
+    /// fires for it continues the server's trace. Correlation only: the dedup
+    /// key, the rate and the checks never read it.
+    fn events_take(
+        &mut self,
+        key: &str,
+        raw: &Value,
+        mode: &'static str,
+        now: u64,
+        delivery: Option<&crate::obs::trace::TraceContext>,
+    ) -> Taken {
         let Some(b) = self.mcp_events.bindings.get(key) else {
             return Taken::Rejected("malformed");
         };
@@ -1538,7 +1551,19 @@ impl Runtime {
             }
             return Taken::Appended;
         };
-        match self.append(&stream, &subject, None, data, &id, &bridge::source(&server)) {
+        let produced = raw
+            .get("_meta")
+            .and_then(crate::obs::trace::TraceContext::from_members)
+            .or_else(|| delivery.cloned());
+        match self.append(
+            &stream,
+            &subject,
+            None,
+            data,
+            &id,
+            &bridge::source(&server),
+            produced.as_ref(),
+        ) {
             Ok(_) => {
                 crate::obs::metrics::record_mcp_event(
                     &server,
@@ -1907,6 +1932,7 @@ impl Runtime {
             request_id: None,
             sid: None,
             trace: None,
+            link: None,
         });
         self.log.info(event, line);
     }

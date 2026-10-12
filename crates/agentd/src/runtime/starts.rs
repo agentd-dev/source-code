@@ -471,7 +471,16 @@ impl Runtime {
         parent: Option<&TraceContext>,
     ) -> Admission {
         self.admit_start(
-            workflow, node, spec, payload, kind, run_id, None, None, parent,
+            workflow,
+            node,
+            spec,
+            payload,
+            kind,
+            run_id,
+            None,
+            None,
+            parent,
+            &[],
         )
     }
 
@@ -500,6 +509,7 @@ impl Runtime {
             None,
             Some(carries),
             parent,
+            &[],
         )
     }
 
@@ -512,6 +522,11 @@ impl Runtime {
     /// The caller moves its offset only when the outcome is
     /// [`Admission::consumed`]; anything else is offered again on a later pass,
     /// so a refusal here is a delay, never a loss.
+    ///
+    /// One event's run continues the span the event was produced in. A run of
+    /// several — a `batch`, a `correlate` set — has several causes and no one
+    /// parent: it starts a trace of its own and names each event's span as a
+    /// link on its `start.fired` line.
     pub(crate) fn fire_stream_start(
         &mut self,
         workflow: &str,
@@ -523,6 +538,17 @@ impl Runtime {
     ) -> Admission {
         // What the events carried, the run carries.
         let carries = event_carries(&payload);
+        let (parent, links) = match payload.get("events").and_then(Value::as_array) {
+            Some(events) => (
+                None,
+                events
+                    .iter()
+                    .filter_map(TraceContext::from_members)
+                    .map(|t| t.traceparent())
+                    .collect(),
+            ),
+            None => (TraceContext::from_members(&payload), Vec::new()),
+        };
         self.admit_start(
             workflow,
             node,
@@ -532,7 +558,8 @@ impl Runtime {
             None,
             Some(origin),
             (!carries.is_empty()).then_some(&carries),
-            None,
+            parent.as_ref(),
+            &links,
         )
     }
 
@@ -548,6 +575,7 @@ impl Runtime {
         origin: Option<Value>,
         carries: Option<&super::withhold::Carries>,
         parent: Option<&TraceContext>,
+        links: &[String],
     ) -> Admission {
         // Every line about this firing carries the same identity, plus the
         // stream position when a consumer is offering an event.
@@ -699,9 +727,14 @@ impl Runtime {
             }
         };
         self.start_held.remove(&Self::start_key(workflow, node));
+        let fired = if links.is_empty() {
+            json!({})
+        } else {
+            json!({"links": links})
+        };
         self.log
             .in_trace(Some(&trace))
-            .info("start.fired", fields(json!({})));
+            .info("start.fired", fields(fired));
         crate::obs::metrics::record_reaction();
         let mut st = self.start_state(workflow, node);
         st["last_fired"] = json!(now_ms());

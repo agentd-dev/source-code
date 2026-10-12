@@ -60,40 +60,28 @@ pub fn inprocess(script: &str) -> Result<String, String> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static SERVERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    let map = SERVERS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(addr) = map.lock().expect("mock servers").get(script) {
+    let mut servers = SERVERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("mock servers");
+    if let Some(addr) = servers.get(script) {
         return Ok(addr.clone());
     }
-    let addr_file = std::env::temp_dir().join(format!(
-        "agentd-mockintel-{}-{}.addr",
-        std::process::id(),
-        crate::sha::sha256_hex(script.as_bytes())
-            .chars()
-            .take(12)
-            .collect::<String>()
-    ));
-    let _ = std::fs::remove_file(&addr_file);
-    let (af, sc) = (addr_file.to_string_lossy().to_string(), script.to_string());
+    // Bound here, so the address is known without a file to announce it
+    // through: an image built `FROM scratch` has no temporary directory.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("mock intelligence: bind 127.0.0.1:0: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("mock intelligence: {e}"))?
+        .to_string();
+    let sc = script.to_string();
     std::thread::Builder::new()
         .name("mock-intel".into())
-        .spawn(move || run(&af, &sc))
+        .spawn(move || serve(listener, &sc))
         .map_err(|e| format!("mock intelligence: spawn: {e}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(addr) = std::fs::read_to_string(&addr_file) {
-            let addr = addr.trim().to_string();
-            if !addr.is_empty() {
-                map.lock()
-                    .expect("mock servers")
-                    .insert(script.to_string(), addr.clone());
-                return Ok(addr);
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            return Err("mock intelligence: server never announced its address".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    servers.insert(script.to_string(), addr.clone());
+    Ok(addr)
 }
 
 /// Serve the mock LLM until the process is killed, announcing the bound
@@ -110,17 +98,21 @@ pub fn run(addr_file: &str, script: &str) -> i32 {
         eprintln!("mock-llm: write {addr_file}: {e}");
         return crate::exit::GENERIC;
     }
-    // One request per connection, since the intel client sends
-    // `Connection: close`. Each is handled on its OWN thread so that a
-    // `slow`/`hang` script sleeps only its own request: a sequential accept loop
-    // would serialize every caller behind the slowest in-flight one, coupling
-    // concurrent tests' timing and queueing two runs that share one mock behind
-    // a 12s hang.
+    serve(listener, script);
+    0
+}
+
+/// Answer every connection on `listener`. One request per connection, since
+/// the intel client sends `Connection: close`. Each is handled on its OWN
+/// thread so that a `slow`/`hang` script sleeps only its own request: a
+/// sequential accept loop would serialize every caller behind the slowest
+/// in-flight one, coupling concurrent tests' timing and queueing two runs that
+/// share one mock behind a 12s hang.
+fn serve(listener: TcpListener, script: &str) {
     for stream in listener.incoming().flatten() {
         let script = script.to_string();
         std::thread::spawn(move || handle(stream, &script));
     }
-    0
 }
 
 fn handle(mut stream: TcpStream, script: &str) {

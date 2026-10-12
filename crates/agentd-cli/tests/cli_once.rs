@@ -128,6 +128,38 @@ fn a_once_job_exits_4_on_unreachable_intel() {
     );
 }
 
+/// The built-in mock model runs where there is no temporary directory: the
+/// image is built `FROM scratch` and has none. It announced its address
+/// through a file there, so in the image every turn on it failed with exit 4.
+#[test]
+fn a_mock_model_needs_no_temporary_directory() {
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args([
+            "--instruction",
+            "say hi",
+            "--intelligence",
+            "mock:final",
+            "--agent.preflight",
+            "never",
+            "--log-level",
+            "error",
+        ])
+        .env("TMPDIR", "/nonexistent/agentd-no-tmp")
+        .output()
+        .expect("run agentd");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("mock-llm done"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// A `--prompt` one-shot is a turn, not a `once` run, and its turn's outcome
 /// is the job's exit code: an unreachable model is exit 4 here too, where it
 /// used to end the job 0 with nothing on stdout.

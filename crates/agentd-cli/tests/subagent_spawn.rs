@@ -184,6 +184,37 @@ fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
     // Dropping `sub` kills + reaps the (already-exiting) subagent group.
 }
 
+/// A child gives up at start only when the process that spawned it is gone:
+/// its parent is compared with the pid the spawner named, not with 1, so a
+/// supervisor that is PID 1 — a container's entrypoint, a pod's — keeps its
+/// children; every turn there exited 1 before it began. Here the test is the
+/// parent. An empty stdin is not a spawn payload, so a child that stayed says
+/// so and exits 2; one that finds another parent than it was told exits 1 at
+/// once. (PID 1 itself is the unit test in `supervisor::reap`.)
+#[test]
+fn a_child_stays_while_the_pid_its_spawner_named_is_its_parent() {
+    let run = |parent: String| {
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .env(agentd::subagent::protocol::SUBAGENT_ENV, "1")
+            .env(agentd::supervisor::reap::PARENT_PID_ENV, parent)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run the child");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        (out.status.code(), err)
+    };
+    let (code, err) = run(std::process::id().to_string());
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("bad spawn payload"), "{err}");
+    // Told a parent it does not have (above any pid Linux hands out): it was
+    // reparented, so it exits.
+    let (code, err) = run(i32::MAX.to_string());
+    assert_eq!(code, Some(1), "{err}");
+    assert!(!err.contains("bad spawn payload"), "{err}");
+}
+
 #[test]
 fn subagent_round_trips_ready_then_failed() {
     let exe = env!("CARGO_BIN_EXE_agentd");

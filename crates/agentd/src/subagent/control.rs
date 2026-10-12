@@ -126,10 +126,10 @@ impl SelfHandler for NoSelfTools {
 /// The subagent entry point. Returns the process exit code.
 pub fn run() -> i32 {
     install_pdeathsig();
-    // If the supervisor already died in the fork/exec window, bail (we'd be
-    // reparented to init / the subreaper).
-    #[cfg(unix)]
-    if unsafe { libc::getppid() } == 1 {
+    // If the supervisor already died in the fork/exec window, bail: we were
+    // reparented to init or a subreaper. Compared with the pid the supervisor
+    // named, so a supervisor that is PID 1 is not taken for init.
+    if crate::supervisor::reap::spawner_gone() {
         return crate::exit::GENERIC;
     }
 

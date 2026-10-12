@@ -60,6 +60,10 @@ pub type FrameSink = std::sync::Arc<dyn Fn(NodeId, AgentMsg) -> bool + Send + Sy
 fn subagent_command(exe: &Path, limits: &Limits) -> Command {
     let mut cmd = Command::new(exe);
     cmd.env(SUBAGENT_ENV, "1")
+        .env(
+            crate::supervisor::reap::PARENT_PID_ENV,
+            std::process::id().to_string(),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Child telemetry (JSON to its stderr) is inherited into ours; the
@@ -286,5 +290,18 @@ mod tests {
         cleanup(&exe);
         assert!(fds.contains("pipe:["), "the listing ran: {fds}");
         assert!(!stray.held_in(&fds), "the subagent holds the stray: {fds}");
+    }
+
+    /// The child's check for a supervisor that died during the spawn compares
+    /// with the pid written here; without it the check is off.
+    #[test]
+    fn a_subagent_is_told_which_process_spawned_it() {
+        let cmd = subagent_command(Path::new("agentd"), &limits());
+        let mark = cmd
+            .get_envs()
+            .find(|(k, _)| *k == crate::supervisor::reap::PARENT_PID_ENV)
+            .and_then(|(_, v)| v);
+        let me = std::process::id().to_string();
+        assert_eq!(mark, Some(std::ffi::OsStr::new(&me)));
     }
 }

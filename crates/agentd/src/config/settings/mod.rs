@@ -13636,10 +13636,11 @@ mod tests {
             "LLM_KEY",
             "AGENT_MODEL",
             "MODEL",
-            // The parent→instance-child markers are internal: no path and no
+            // The parent→child markers are internal: no path and no
             // alias names them, so the ENV layer never reads them as config.
             crate::supervisor::reap::INSTANCE_CHILD_ENV,
             crate::supervisor::reap::INSTANCE_DELIVERED_ENV,
+            crate::supervisor::reap::PARENT_PID_ENV,
         ] {
             assert!(one(ignored).is_empty(), "{ignored} is not the loader's");
         }

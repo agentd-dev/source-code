@@ -69,11 +69,12 @@ flowchart TB
 ```
 
 So when a turn worker calls `subagent.run`, it asks the reactor for a
-sibling, not a descendant: the caller does not own the child process. Each
-of these children sets `PR_SET_PDEATHSIG(SIGKILL)` as its first act, and one
-whose parent died during the fork notices (`getppid() == 1`) and exits, so a
-dead daemon takes its children with it. A child's stdout is a binary control
-channel to the reactor, and its stderr is inherited into the daemon's log.
+sibling, not a descendant: the caller does not own the child process. Each of
+these children sets `PR_SET_PDEATHSIG(SIGKILL)` as its first act, and one
+whose parent died during the fork notices (its parent is no longer the pid
+that spawned it) and exits, so a dead daemon takes its children with it. A
+child's stdout is a binary control channel to the reactor, and its stderr is
+inherited into the daemon's log.
 
 ## What the child is handed
 

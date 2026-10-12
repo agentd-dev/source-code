@@ -129,6 +129,40 @@ pub const INSTANCE_CHILD_ENV: &str = "AGENTD_INSTANCE_CHILD";
 /// sibling — not a config key, and no `AGENTD_` path or alias names it.
 pub const INSTANCE_DELIVERED_ENV: &str = "AGENTD_INSTANCE_DELIVERED";
 
+/// Set by the spawning parent on a subagent and on an instance-tier child: the
+/// parent's own pid, so the child can tell whether the process that started it
+/// is still its parent ([`spawner_gone`]). Internal, like its siblings — not a
+/// config key, and no `AGENTD_` path or alias names it.
+pub const PARENT_PID_ENV: &str = "AGENTD_PARENT_PID";
+
+/// Whether the process that spawned this one died before the child installed
+/// its death signal — PDEATHSIG fires only on deaths after it is set. The
+/// child's parent is compared with the pid the parent wrote
+/// ([`PARENT_PID_ENV`]), not with 1: a supervisor that is itself PID 1 — a
+/// container's entrypoint, a pod's — is a live parent whose pid is 1, and an
+/// orphan adopted by a subreaper does not have parent 1. With no mark (a
+/// harness that starts children itself) there is nothing to compare, and the
+/// answer is no.
+pub fn spawner_gone() -> bool {
+    #[cfg(unix)]
+    {
+        orphaned(std::env::var(PARENT_PID_ENV).ok().as_deref(), unsafe {
+            libc::getppid()
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// [`spawner_gone`] over its inputs, so the rule is testable without a parent
+/// that dies.
+fn orphaned(mark: Option<&str>, ppid: i32) -> bool {
+    mark.and_then(|m| m.parse::<i32>().ok())
+        .is_some_and(|parent| parent != ppid)
+}
+
 /// PDEATHSIG(SIGTERM) for an instance-tier child — set post-exec by the child
 /// itself (the pre-exec value would not survive the execve), mirroring the
 /// subagent's SIGKILL install in `subagent::control`. SIGTERM, not SIGKILL:
@@ -139,7 +173,7 @@ pub fn install_instance_pdeathsig() {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
         // The parent may have died in the fork/exec window: PDEATHSIG only
         // fires on deaths AFTER it is installed.
-        if libc::getppid() == 1 {
+        if spawner_gone() {
             libc::raise(libc::SIGTERM);
         }
     }
@@ -152,6 +186,20 @@ pub(in crate::supervisor) use imp::reap_pending;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_is_orphaned_only_when_its_parent_is_not_the_one_that_spawned_it() {
+        // A supervisor that is PID 1 (a container's entrypoint) is a live
+        // parent: its child's parent is 1 and the mark says 1.
+        assert!(!orphaned(Some("1"), 1));
+        assert!(!orphaned(Some("4242"), 4242));
+        // Reparented — to init, or to a subreaper that is not 1.
+        assert!(orphaned(Some("4242"), 1));
+        assert!(orphaned(Some("4242"), 77));
+        // No mark, or one that is not a pid: nothing to compare with.
+        assert!(!orphaned(None, 1));
+        assert!(!orphaned(Some("1x"), 1));
+    }
 
     // Construct raw statuses in the Linux/glibc encoding the libc macros
     // decode: a normal exit puts the code in the high byte; a signal death

@@ -140,9 +140,10 @@ for three reasons, in order:
 Spawning is one atomic block, held under a process-wide lock so the reaper
 can never collect a child that is not yet registered:
 
-1. Start the binary with `AGENTD_SUBAGENT=1`, stdin and stdout piped, stderr
-   inherited: the child's JSON telemetry joins the parent's stream, and
-   stdout is left for binary frames.
+1. Start the binary with `AGENTD_SUBAGENT=1` and the supervisor's own pid in
+   `AGENTD_PARENT_PID`, stdin and stdout piped, stderr inherited: the child's
+   JSON telemetry joins the parent's stream, and stdout is left for binary
+   frames.
 2. Before `exec`, make the child its own process-group leader, so `killpg`
    can take out its subtree.
 3. Spawn, retrying a transient `EAGAIN` up to 10 times with a growing
@@ -155,8 +156,10 @@ can never collect a child that is not yet registered:
 
 The child's first act is to ask the kernel to `SIGKILL` it when the
 supervisor dies (`PR_SET_PDEATHSIG`, which `exec` clears, so it cannot be
-set by the parent). If it finds it has already been reparented, the
-supervisor died during the spawn and the child exits at once. An
+set by the parent). If its parent is no longer the pid in
+`AGENTD_PARENT_PID`, the supervisor died during the spawn and the child
+exits at once. The comparison is with that pid, not with 1, so a supervisor
+that is itself PID 1 — a container's entrypoint — keeps its children. An
 instance-tier daemon asks for `SIGTERM` instead, so it drains.
 
 ### The wire

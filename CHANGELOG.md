@@ -5,6 +5,23 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Fixed.**
+
+- A daemon that is PID 1 — the image's entrypoint under `docker run` or in a
+  Kubernetes pod — runs its agent turns and its instance children. A child
+  that found its parent was PID 1 took itself for an orphan: every turn
+  exited 1 before it began, and an instance child stopped itself and was
+  reported `crashed`. A child now compares its parent with the pid that
+  spawned it, so one whose spawner died during the spawn also exits when a
+  subreaper other than init adopts it — a subagent of an instance daemon,
+  say — where it stayed.
+- The built-in mock model (`mock:final`, `mock:file:<playbook>`) runs in the
+  image. It announced its address through a file in the temporary
+  directory, which an image built `FROM scratch` does not have, so a turn on
+  it failed with exit 4.
+
 ## v1.19.0 — product documentation, and configuration that means what it says
 
 The documentation is rewritten as product documentation, for everyone who

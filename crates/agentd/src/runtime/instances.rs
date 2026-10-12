@@ -1082,6 +1082,10 @@ fn instance_command(
     }
     cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
     cmd.env(
+        crate::supervisor::reap::PARENT_PID_ENV,
+        std::process::id().to_string(),
+    );
+    cmd.env(
         crate::supervisor::reap::INSTANCE_DELIVERED_ENV,
         instruction_core::digest(delivered.as_bytes()),
     );
@@ -1550,5 +1554,26 @@ mod tests {
         cleanup(&exe);
         assert!(fds.contains("-> /dev/null"), "the listing ran: {fds}");
         assert!(!stray.held_in(&fds), "the instance holds the stray: {fds}");
+    }
+
+    /// The child's check for a parent that died during the spawn compares with
+    /// the pid written here; without it the check is off.
+    #[test]
+    fn an_instance_is_told_which_process_spawned_it() {
+        let log = std::fs::File::open("/dev/null").unwrap();
+        let cmd = instance_command(
+            std::path::Path::new("agentd"),
+            std::path::Path::new("unused.yaml"),
+            log,
+            &None,
+            "",
+        )
+        .expect("the command builds");
+        let mark = cmd
+            .get_envs()
+            .find(|(k, _)| *k == crate::supervisor::reap::PARENT_PID_ENV)
+            .and_then(|(_, v)| v);
+        let me = std::process::id().to_string();
+        assert_eq!(mark, Some(std::ffi::OsStr::new(&me)));
     }
 }

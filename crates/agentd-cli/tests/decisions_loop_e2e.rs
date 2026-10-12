@@ -213,15 +213,16 @@ fn no_judge_answers_a_gate_whose_run_carries_outside_input() {
                 );
                 let mut out = String::new();
                 let _ = s.read_to_string(&mut out);
-                return;
+                return out;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        String::from("(never connected)")
     });
     let (_, log) = run_until(&cfg, 20, |l| !events(l, "run.done").is_empty());
-    let _ = poster.join();
+    let answer = poster.join().unwrap_or_default();
     let withheld = events(&log, "human.judge.withheld");
-    assert_eq!(withheld.len(), 1, "{log}");
+    assert_eq!(withheld.len(), 1, "the webhook answered {answer:?}\n{log}");
     let done = events(&log, "run.done");
     assert_eq!(done.len(), 1, "{log}");
     assert_eq!(done[0]["status"], "failed", "{log}");

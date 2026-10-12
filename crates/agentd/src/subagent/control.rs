@@ -126,6 +126,8 @@ impl SelfHandler for NoSelfTools {
 /// The subagent entry point. Returns the process exit code.
 pub fn run() -> i32 {
     install_pdeathsig();
+    // This process has no `/metrics`: what it counts goes up with its frames.
+    crate::obs::metrics::report_upward();
     // If the supervisor already died in the fork/exec window, bail: we were
     // reparented to init or a subreaper. Compared with the pid the supervisor
     // named, so a supervisor that is PID 1 is not taken for init.
@@ -813,6 +815,11 @@ fn build_logger(payload: &SpawnPayload) -> Logger {
 
 pub(crate) fn send_up(up: &Up, msg: &AgentMsg) {
     if let Ok(mut out) = up.lock() {
+        // What this process counted since its last frame goes first, under
+        // the same lock, so the terminal frame never leaves a count behind.
+        if let Some(m) = crate::obs::metrics::take_child_metrics() {
+            let _ = frame::write_frame(&mut *out, &AgentMsg::Metrics(m));
+        }
         // Best-effort: a dead parent means our writes fail; we don't crash.
         let _ = frame::write_frame(&mut *out, msg);
     }

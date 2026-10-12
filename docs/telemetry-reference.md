@@ -791,16 +791,18 @@ read-only and unauthenticated; `:9090` binds every IPv4 interface and logs
 `metrics.bound_all_interfaces`.
 
 Metric names and label keys are a stable contract: series are added, never
-renamed. Labels carry bounded values only. A run id, agent path or URI never
+renamed, and a series is rendered with a value only where something writes
+it. Labels carry bounded values only. A run id, agent path or URI never
 appears in a label; label values outside a closed domain count under
 `other`.
 
 The **Status** column says what a scrape shows:
 
-- **live**: the supervisor process writes it.
-- **process-local**: written only for work done inside the scraped process.
-  Model calls run in turn-worker child processes, so these miss most calls.
-- **always 0**: rendered with a value, but nothing writes it.
+- **live**: written by the supervisor, the process that serves `/metrics`.
+  Turn workers and subagents run in child processes with no `/metrics` of
+  their own; what they count (model calls and their errors, what the last
+  call found of its endpoint, loop steps) goes up the control channel with
+  their next frame, and the supervisor adds it to its own.
 - **marker**: only the `# HELP` and `# TYPE` lines, with no sample.
 
 Use the log events for anything a series below does not cover.
@@ -813,11 +815,9 @@ Use the log events for anything a series below does not cover.
 | `agent_ready` | gauge | | live | `1` unless draining or every model endpoint is reported down; the same verdict as `/readyz` |
 | `agent_paused` | gauge | | live | `1` while an instance-wide `admin.pause` holds |
 | `agent_drains_total` | counter | `phase`: `started`, `completed`, `forced`, `other` | live | Drain transitions. An abandoned drain also counts `completed`; `forced` is never written. |
-| `agent_config_reload_total` | counter | `result`: `applied`, `rejected`, `other` | live | Reloads. A refused reload counts under `other`; `rejected` is never written. |
+| `agent_config_reload_total` | counter | `result`: `applied`, `rejected`, `other` | live | Reloads: `applied`, or `rejected` when the reload was refused (`config.reload.invalid`, `config.reload.restart_required`) and the running configuration stands |
 | `agent_config_generation` | gauge | | live | Applied reloads since start, the number also stamped into the durable manifest |
-| `agent_restarts_total` | counter | | always 0 | Reserved for supervisor restarts |
-| `agent_reactor_stalls_total` | counter | | always 0 | Reserved; a stalled supervisor shows as a `/healthz` 503 |
-| `agent_restarts_tripped_total` | counter | | always 0 | Reserved for restart-breaker trips |
+| `agent_reactor_stalls_total` | counter | | live | Times the supervisor loop went 5 s or more without a tick, which `/healthz` answers `503` for; counted when the loop ticks again. A slow start before the loop runs is not counted. |
 
 ### Runs, steps and turns
 
@@ -827,14 +827,14 @@ Use the log events for anything a series below does not cover.
 | `agent_runs_completed_total` | counter | | live | Runs that ended `completed` |
 | `agent_runs_failed_total` | counter | | live | Runs that ended in any status but `completed` or `cancelled` |
 | `agent_runs_killed_total` | counter | | live | Runs that ended `cancelled` |
-| `agent_runs_total` | counter | `status`: `completed`, `refused`, `exhausted_steps`, `exhausted_tokens`, `deadline`, `stalled`, `loop_detected`, `cancelled`, `crashed`, `other` | live | Runs by terminal status. Each finished run is counted twice in this family; use the three counters above for exact counts. |
+| `agent_runs_total` | counter | `status`: `completed`, `failed`, `refused`, `cancelled`, `stalled`, `other` | live | Runs by terminal status, one count per run |
 | `agent_runs_active` | gauge | | live | Workflow runs not yet terminal |
-| `agent_steps_total` | counter | `status`: `done`, `failed`, `skipped`, `other` | live | Workflow steps by terminal status: the throughput signal |
-| `agent_turns_total` | counter | `kind`: `root`, `preflight`, `compaction`, `knowledge`, `other` | live | Conversation turns dispatched. Only `root` is written. |
+| `agent_steps_total` | counter | `status`: `done`, `failed`, `other` (timed out) | live | Workflow steps that ran, by how each attempt ended: the throughput signal. A retried step counts each attempt; a step that never ran (skipped, or on a branch not taken) is not counted. |
+| `agent_turns_total` | counter | `kind`: `root`, `step`, `think`, `decide`, `preflight`, `compaction`, `other` | live | Turn workers started: `root` for a conversation turn, `step` for a workflow `agent`, `think` or `decide` step, `think` and `decide` for those tools, `preflight` and `compaction` for those thinks |
 | `agent_turns_queued` | gauge | | live | Conversation turns waiting for a dispatch slot |
 | `agent_inbox_pending` | gauge | | live | Events in the durable inbox not yet processed, A2A messages included: the backlog |
-| `agent_reactions_total` | counter | | always 0 | Reserved |
-| `agent_loop_steps_total` | counter | | process-local | Subagent loop steps; counted in the child, so the supervisor reads 0 |
+| `agent_reactions_total` | counter | | live | Start nodes fired (`start.fired`): a schedule, loop, subscription, webhook, A2A message, stream, `correlate` join, event or goal had its event accepted into the inbox. It counts when the event is accepted, so an event still waiting there behind a busy workflow is counted. A `once` start and a `workflow.run` call are not counted. |
+| `agent_loop_steps_total` | counter | | live | Model rounds of turn workers and subagents, counted in the child and reported up |
 | `agent_run_duration_ms` | histogram | | marker | Reserved; derive durations from `run.start` and `run.done` |
 
 ### Tokens and models
@@ -845,11 +845,11 @@ Use the log events for anything a series below does not cover.
 | `agent_tokens_input_total` | counter | | live | Input tokens reported by direct children |
 | `agent_tokens_output_total` | counter | | live | Output tokens reported by direct children |
 | `agent_context_tokens` | gauge | | live | Estimated tokens of the largest live conversation context |
-| `agent_budget_tokens_remaining` | gauge | | always 0 | Reserved for the lifetime budget balance; watch `budget.lifetime_exhausted` instead |
-| `agent_intel_calls_total` | counter | | process-local | Model calls made by the scraped process |
-| `agent_intel_up` | gauge | | process-local | `1` when the scraped process's last model call found its endpoint up |
-| `agent_intel_errors_total` | counter | `reason`: `unreachable`, `auth`, `timeout`, `5xx`, `other` | process-local | Model-call errors in the scraped process |
-| `agent_intel_all_down` | gauge | | always 0 | Reserved; read `agent_ready` or the `intel.health` event |
+| `agent_budget_tokens_remaining` | gauge | | live | Tokens left under `intelligence.budget.lifetime_tokens`; absent without one |
+| `agent_intel_calls_total` | counter | | live | Model calls: the supervisor's own (a decision, a judge) and those its children report |
+| `agent_intel_up` | gauge | | live | `1` when the last model call, in whichever process made it, found its endpoint up and not every endpoint down |
+| `agent_intel_errors_total` | counter | `reason`: `unreachable`, `auth`, `timeout`, `5xx`, `other` | live | Model calls whose sweep of the endpoints failed, by reason. A call that backs off and sweeps again counts each failed sweep. |
+| `agent_intel_all_down` | gauge | | live | `1` while the last report from a child said every model endpoint is down: the condition `/readyz` and `agent_ready` read |
 | `agent_intel_call_duration_ms` | histogram | | marker | Reserved |
 
 ### Store, pressure and memory
@@ -868,14 +868,14 @@ Use the log events for anything a series below does not cover.
 | Metric | Type | Labels | Status | Meaning |
 |---|---|---|---|---|
 | `agent_subagents_spawned_total` | counter | | live | Child processes started: turn workers and subagents |
-| `agent_subagents_exited_total` | counter | `status`: same domain as `agent_runs_total` | live | Child exits: `completed` (exit 0), `crashed` (non-zero), `cancelled` (signal) |
-| `agent_active_subagents` | gauge | | always 0 | Reserved |
-| `agent_tree_depth` | gauge | | always 0 | Reserved |
-| `agent_tree_breadth` | gauge | | always 0 | Reserved |
-| `agent_subagent_restarts_total` | counter | `reason`: `crashed`, `stuck`, `rate`, `other` | always 0 | Reserved |
-| `agent_subagent_stuck_kills_total` | counter | `signal`: `term`, `kill`, `other` | always 0 | Reserved |
-| `agent_refusals_total` | counter | `reason`: `trifecta`, `rate`, `budget`, `depth`, `mcp`, `other` | always 0 | Reserved |
-| `agent_limit_exceeded_total` | counter | `limit`: `steps`, `tokens`, `deadline`, `depth`, `tree_tokens`, `tokens_lifetime`, `restart_storm`, `spawn_rate`, `other` | always 0 | Reserved |
+| `agent_subagents_exited_total` | counter | `status`: `completed`, `crashed`, `cancelled`, `other` | live | Child exits: `completed` (exit 0), `crashed` (another exit code), `cancelled` (a signal) |
+| `agent_active_subagents` | gauge | | live | Subagents not yet ended, instance children included |
+| `agent_tree_depth` | gauge | | live | Depth of the deepest of them: `1` for a subagent a turn or step spawned, `2` for one that subagent spawned |
+| `agent_tree_breadth` | gauge | | live | The most of them that share a parent: a subagent, or the instance for those a turn or step spawned |
+| `agent_subagent_restarts_total` | counter | `reason`: `restored`, `other` | live | Subagents spawned again: `restored` when a restarted supervisor finds one unfinished in its store (`subagent.respawn`, `instance.respawn`) |
+| `agent_subagent_stuck_kills_total` | counter | `signal`: `kill`, `other` | live | Children the liveness check killed (`child.unhealthy`: stuck, or past their deadline), with `SIGKILL` |
+| `agent_refusals_total` | counter | `reason`: `budget`, `policy`, `trifecta`, `depth`, `breadth`, `total`, `rate`, `other` | live | Refusals, by the guard that refused: `budget` a token budget refused a turn, a step or a model call; `policy` a `security.policies` rule refused a tool call (`tool.policy.refused`, `tool.policy.error`); `trifecta` a subagent's servers formed a lethal trifecta, or a read-back was withheld (`readback.withheld`); `depth`, `breadth`, `total` and `rate` a subagent spawn refused by that `limits.subagents` cap |
+| `agent_limit_exceeded_total` | counter | `limit`: `steps`, `tokens`, `deadline`, `tokens_lifetime`, `other` | live | Work a bound stopped: a turn or subagent that ended `exhausted_steps`, `exhausted_tokens` or `deadline`, and the lifetime budget spent (once per process, with `budget.lifetime_exhausted`) |
 
 ### MCP, tools and reactive backlog
 
@@ -884,17 +884,16 @@ Use the log events for anything a series below does not cover.
 | `agent_mcp_connect_failures_total` | counter | `server` (up to 15 names, then `other`) | live | Connect failures of the supervisor's MCP connections |
 | `agent_tool_calls_total` | counter | | marker | Reserved; count `tool.result` lines |
 | `agent_tool_call_duration_ms` | histogram | | marker | Reserved; use the `ms` field of `tool.result` |
-| `agent_subscriptions_active` | gauge | none, or `kind="event"`, `mode` | see note | The unlabelled series is always 0. The `kind="event"` series counts active MCP Events bindings by `mode` (`poll`, `webhook`) and is live. |
-| `agent_pending_events` | gauge | | always 0 | Reserved |
-| `agent_inflight_reactions` | gauge | | always 0 | Reserved |
-| `agent_reaction_lag_ms` | gauge | | always 0 | Reserved |
+| `agent_subscriptions_active` | gauge | `kind="resource"`; or `kind="event"` and `mode` | live | `kind="resource"`: the MCP resource subscriptions the connections hold (`subscribe` starts, resource waits, a resource instruction). `kind="event"`: active MCP Events bindings by `mode` (`poll`, `webhook`). |
+| `agent_inflight_reactions` | gauge | | live | Work executing now: runs in `running`, not parked on a timer, gate or budget, however they started (a run from a `once` start or `workflow.run` counts too), and conversation turns in flight |
+| `agent_reaction_lag_ms` | gauge | | live | Age of the oldest event waiting in the inbox; `0` when none waits. It rises while events queue behind a busy workflow. |
 
 ### Streams and MCP Events
 
 | Metric | Type | Labels | Status | Meaning |
 |---|---|---|---|---|
 | `agent_stream_lag` | gauge | `stream`, `consumer` (`<workflow>/<node>`) | live | Events on a stream its consumer has not consumed. Up to 32 consumers per start kind by name; the rest fold into one `other` series carrying the largest lag. No sample when no consumer is armed. |
-| `agent_mcp_events_total` | counter | `server`, `event`, `mode`, `outcome` | live | Occurrences by outcome: `appended`, `schema_mismatch`, `duplicate`, `rejected`, `refused_pressure`, and `unauthenticated` for a webhook |
+| `agent_mcp_events_total` | counter | `server`, `event`, `mode`, `outcome` | live | Occurrences by outcome: `appended`, `schema_mismatch`, `duplicate`, `rejected`, `refused_pressure`, `followed` (an event type only the instruction follows: taken, kept in no stream, and the instruction read again), and `unauthenticated` for a webhook |
 | `agent_mcp_events_requests_total` | counter | `server`, `method`, `outcome` | live | `events/list`, `events/poll`, `events/subscribe` and `events/unsubscribe` requests: `ok`, `refused`, `failed` |
 | `agent_mcp_event_gaps_total` | counter | `server`, `event`, `cause` | live | Gaps: `truncated`, `no_replay`, `schema_changed` |
 | `agent_mcp_events_dedup_evicted_total` | counter | `server`, `event` | live | Dedup entries dropped to stay under the 4096 cap |

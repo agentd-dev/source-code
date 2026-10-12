@@ -30,7 +30,7 @@
 use crate::obs::log::rfc3339_millis;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -71,9 +71,40 @@ const _: () = assert!(
     "management call timeout must be well under the liveness staleness window"
 );
 
-/// Last time a supervisor loop proved progress (ms since epoch). Bumped from
-/// every hot loop; read by the writer thread. Cheap (one relaxed store).
-static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+/// The supervisor heartbeat: when a supervisor loop last proved progress, and
+/// whether the reactor loop has started.
+struct Heartbeat {
+    /// Last tick (ms since epoch); 0 before the first. Bumped from every hot
+    /// loop; read by the writer thread. Cheap (one relaxed store).
+    last_ms: AtomicU64,
+    /// Set once the reactor loop starts ([`loop_started`]).
+    looping: AtomicBool,
+}
+
+impl Heartbeat {
+    const fn new() -> Heartbeat {
+        Heartbeat {
+            last_ms: AtomicU64::new(0),
+            looping: AtomicBool::new(false),
+        }
+    }
+
+    /// A tick at `now`; whether it ends a stall. Only the loop's gaps are
+    /// stalls: a boot step that ticks before the loop starts never counts.
+    fn tick_at(&self, now: u64) -> bool {
+        let last = self.last_ms.swap(now, Ordering::Relaxed);
+        self.looping.load(Ordering::Relaxed) && stalled(last, now)
+    }
+
+    /// The reactor loop starts at `now`: the gap since boot's last tick is not
+    /// the loop's.
+    fn loop_started_at(&self, now: u64) {
+        self.last_ms.store(now, Ordering::Relaxed);
+        self.looping.store(true, Ordering::Relaxed);
+    }
+}
+
+static HEARTBEAT: Heartbeat = Heartbeat::new();
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -83,15 +114,36 @@ fn now_ms() -> u64 {
 }
 
 /// Record supervisor progress. Call from each supervisor hot loop.
+///
+/// Once the reactor loop has started, a tick that comes after a gap past
+/// [`LIVENESS_STALE_AFTER_MS`] ends a stall `/healthz` reported (or would
+/// have): it counts one in `agent_reactor_stalls_total`.
 pub fn tick() {
-    LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
+    if HEARTBEAT.tick_at(now_ms()) {
+        crate::obs::metrics::record_reactor_stall();
+    }
+}
+
+/// The reactor loop starts. Boot ticks as it goes (an instruction or a start
+/// subscribed), and the work between those ticks (skills read with the
+/// data-path timeout, subagents spawned again) may take longer than the
+/// `/healthz` window, which is not served until just before the loop. That is
+/// a slow boot, not a stall: stalls count from here.
+pub fn loop_started() {
+    HEARTBEAT.loop_started_at(now_ms());
+}
+
+/// Whether the gap between two ticks is one `/healthz` reads as wedged. The
+/// first tick has no gap.
+fn stalled(last: u64, now: u64) -> bool {
+    last != 0 && now.saturating_sub(last) >= LIVENESS_STALE_AFTER_MS
 }
 
 /// Age of the last tick (ms). Large ⇒ the supervisor reactor loop is wedged.
 /// This is the sole input to the `/healthz` liveness verdict; no per-subagent
 /// state feeds it.
 pub fn tick_age_ms() -> u64 {
-    now_ms().saturating_sub(LAST_TICK_MS.load(Ordering::Relaxed))
+    now_ms().saturating_sub(HEARTBEAT.last_ms.load(Ordering::Relaxed))
 }
 
 /// Test-only seam: stamp the heartbeat at `ms_ago` in the past, so a test can
@@ -99,11 +151,13 @@ pub fn tick_age_ms() -> u64 {
 /// without sleeping. Saturates at the epoch. Not compiled into release builds.
 #[cfg(test)]
 pub(crate) fn set_tick_age_for_test(ms_ago: u64) {
-    LAST_TICK_MS.store(now_ms().saturating_sub(ms_ago), Ordering::Relaxed);
+    HEARTBEAT
+        .last_ms
+        .store(now_ms().saturating_sub(ms_ago), Ordering::Relaxed);
 }
 
 /// Test-only serialization for the process-global heartbeat. Any test that
-/// *mutates* `LAST_TICK_MS` (via [`tick`] or [`set_tick_age_for_test`]) and then
+/// *mutates* the heartbeat (via [`tick`] or [`set_tick_age_for_test`]) and then
 /// asserts on the age must hold this lock, so a concurrent test's `tick()` can't
 /// race a wedged-path assertion. Mirrors `obs::log`'s `STDERR_LOCK` pattern.
 #[cfg(test)]
@@ -173,6 +227,35 @@ mod tests {
             "seam should age the tick: {age}"
         );
         tick(); // restore a fresh heartbeat for any sibling reader
+    }
+
+    #[test]
+    fn a_gap_past_the_window_is_a_stall() {
+        // The gap `/healthz` answers 503 for is the one counted; a shorter
+        // one, and the very first tick, are not.
+        let t = 1_800_000_000_000;
+        assert!(!stalled(0, t), "the first tick has no gap");
+        assert!(!stalled(t, t + 200));
+        assert!(!stalled(t, t + LIVENESS_STALE_AFTER_MS - 1));
+        assert!(stalled(t, t + LIVENESS_STALE_AFTER_MS));
+        assert!(stalled(t, t + 60_000));
+        // A clock stepped back is no stall.
+        assert!(!stalled(t, t - 60_000));
+    }
+
+    #[test]
+    fn a_slow_boot_is_no_stall() {
+        // Boot ticks, then works past the window before it ticks again and
+        // before the loop starts; neither gap is the loop's.
+        let hb = Heartbeat::new();
+        let t = 1_800_000_000_000;
+        assert!(!hb.tick_at(t));
+        assert!(!hb.tick_at(t + 6_000), "a gap during boot");
+        hb.loop_started_at(t + 12_000);
+        assert!(!hb.tick_at(t + 12_200), "the loop's first tick");
+        // The loop's own gap is a stall.
+        assert!(hb.tick_at(t + 12_200 + LIVENESS_STALE_AFTER_MS));
+        assert!(!hb.tick_at(t + 12_400 + LIVENESS_STALE_AFTER_MS));
     }
 
     #[test]

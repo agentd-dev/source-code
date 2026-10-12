@@ -470,6 +470,9 @@ pub struct Runtime {
     /// Steps executing on executor threads (`run/step` → started).
     pub(crate) executing: BTreeMap<String, Instant>,
     pub(crate) last_manifest_flush: Instant,
+    /// When [`Runtime::shape_gauges`] last walked the live state.
+    #[cfg(feature = "metrics")]
+    pub(crate) shape_at: Option<Instant>,
     /// Unix-ms a goal LLM judge was dispatched (so overlapping checks don't spawn
     /// duplicate judges); `None` = none in flight.
     pub(crate) goal_judge_at: Option<u64>,
@@ -586,6 +589,9 @@ impl Runtime {
 
     /// Run until exit. Returns the process exit code.
     pub fn run_loop(&mut self) -> i32 {
+        // A slow boot is not a stall: stalls count from here, and once
+        // `proc.ready` is said they do.
+        crate::obs::health::loop_started();
         self.log.info("proc.ready", json!({"instance": self.instance, "job_shape": self.job_shape, "workflows": self.workflows.len(), "runs": self.runs.len(), "inbox_pending": self.inbox_queue.len()}));
         loop {
             crate::obs::health::tick();
@@ -725,6 +731,8 @@ impl Runtime {
                     self.turn_queue.len() as u64,
                 );
             }
+            #[cfg(feature = "metrics")]
+            self.shape_gauges();
             // 10.5. The observation feed's section diff: publish
             // run/conversation/subagent/child/status deltas to attached display
             // clients. A no-op unless `a2a.events.enabled`; rate-limited inside.
@@ -746,6 +754,56 @@ impl Runtime {
                 Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
             }
         }
+    }
+
+    /// The point-in-time gauges that need a walk over the live state: the
+    /// subagent tree's shape, the reactive backlog, and the lifetime budget.
+    ///
+    /// The loop comes round after every batch of events, and the walk covers
+    /// the whole inbox, every run and every subagent: under a backlog that is
+    /// many walks a second on the one reactor thread. Once a tick is as fine
+    /// as a gauge needs.
+    #[cfg(feature = "metrics")]
+    fn shape_gauges(&mut self) {
+        if self.shape_at.is_some_and(|t| t.elapsed() < TICK) {
+            return;
+        }
+        self.shape_at = Some(Instant::now());
+        // A subagent's depth is its requester's plus one (a turn or a step
+        // is 0), and its parent is the subagent that asked, if one did.
+        let mut depth = 0;
+        let mut siblings: BTreeMap<Option<&str>, u64> = BTreeMap::new();
+        let live: Vec<&SubagentRecord> = self
+            .subagents
+            .values()
+            .filter(|s| !is_terminal_status(&s.status))
+            .collect();
+        for s in &live {
+            let by = s.requested_by.as_ref();
+            depth = depth.max(by.and_then(|b| b["depth"].as_u64()).unwrap_or(0) + 1);
+            *siblings
+                .entry(by.and_then(|b| b["subagent"].as_str()))
+                .or_default() += 1;
+        }
+        let breadth = siblings.values().copied().max().unwrap_or(0);
+        crate::obs::metrics::set_tree_shape(live.len() as u64, depth, breadth);
+        let running = self
+            .runs
+            .values()
+            .filter(|r| r.status == RunStatus::Running)
+            .count();
+        let turns = self
+            .children
+            .count_kind(|k| matches!(k, ChildKind::RootTurn { .. }));
+        let lag = self
+            .inbox_queue
+            .iter()
+            .map(|e| e.ts)
+            .min()
+            .map_or(0, |ts| now_ms().saturating_sub(ts));
+        let resources: usize = self.mcp.values().map(|c| c.subscribed().len()).sum();
+        crate::obs::metrics::set_reactive_backlog((running + turns) as u64, lag, resources as u64);
+        crate::obs::metrics::set_budget_tokens_remaining(self.governor.lifetime_remaining());
     }
 
     fn on_event(&mut self, ev: Event) {
@@ -1122,6 +1180,9 @@ impl Runtime {
             | AgentMsg::Pong { .. }
             | AgentMsg::Gate { .. }
             | AgentMsg::GateClosed { .. } => {}
+            // What the child counted — its model calls, their errors, its
+            // loop steps — is this process's to serve on `/metrics`.
+            AgentMsg::Metrics(m) => crate::obs::metrics::record_child(&m),
             // Coarse progress from the child: what this unit is doing right
             // now, for the display clients' working row.
             AgentMsg::Event { event, fields } => self.on_child_progress(node, &event, &fields),
@@ -1142,9 +1203,18 @@ impl Runtime {
             }
             AgentMsg::ToolRequest { id, name, args } => self.on_tool_request(node, id, &name, args),
             AgentMsg::BudgetRequest { id, estimate } => self.on_budget_request(node, id, estimate),
-            AgentMsg::TurnDone { turn } => self.on_turn_done(node, *turn),
-            AgentMsg::Turn { outcome } => self.on_subagent_turn(node, outcome),
-            AgentMsg::Result { outcome } => self.on_subagent_result(node, Ok(outcome)),
+            AgentMsg::TurnDone { turn } => {
+                crate::obs::metrics::record_unit_end(&turn.status);
+                self.on_turn_done(node, *turn)
+            }
+            AgentMsg::Turn { outcome } => {
+                crate::obs::metrics::record_unit_end(outcome.status.as_str());
+                self.on_subagent_turn(node, outcome)
+            }
+            AgentMsg::Result { outcome } => {
+                crate::obs::metrics::record_unit_end(outcome.status.as_str());
+                self.on_subagent_result(node, Ok(outcome))
+            }
             AgentMsg::Failed { error } => {
                 let kind = self.children.get(node).map(|c| c.kind.clone());
                 match kind {
@@ -1293,6 +1363,7 @@ impl Runtime {
         if started.elapsed() > Duration::from_secs(1)
             && let Some(pid) = self.children.kill(node)
         {
+            crate::obs::metrics::record_subagent_stuck_kill("kill");
             // The kill reaps the child itself, so the reaper never reports
             // the exit. Settled as a reap: otherwise its entry stayed in the
             // table (idle exit never came, a drain ran out its timeout) and
@@ -1329,6 +1400,7 @@ impl Runtime {
             return;
         }
         self.lifetime_spent = true;
+        crate::obs::metrics::record_limit_exceeded("tokens_lifetime");
         self.log.warn(
             "budget.lifetime_exhausted",
             json!({"reason": reason, "policy": format!("{policy:?}").to_lowercase()}),

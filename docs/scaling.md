@@ -297,7 +297,9 @@ scaler acts on:
 | Metric | Type | Use |
 |---|---|---|
 | `agent_inbox_pending` | gauge | The backlog: events accepted but not yet processed, A2A messages included. The primary scale-out signal. |
+| `agent_reaction_lag_ms` | gauge | How long the oldest waiting event has waited: the backlog as latency |
 | `agent_runs_active` | gauge | Runs in progress, the utilisation of `limits.max_runs` |
+| `agent_inflight_reactions` | gauge | Work executing now: runs in `running`, not parked on a timer, gate or budget, however they started, and conversation turns in flight |
 | `agent_turns_queued` | gauge | Conversation turns waiting for a slot |
 | `agent_runs_started_total` | counter | Arrival rate |
 | `agent_steps_total` | counter, by `status` | Throughput |
@@ -311,13 +313,6 @@ depth when the queue exposes one. Scale in on a backlog that stays empty,
 and let the drain contract make it safe: on `SIGTERM` a replica stops
 admitting work, keeps its waiting runs in the store and exits 0 within
 `lifecycle.drain_timeout`.
-
-> **Warning.** Some series are rendered but never move, among them
-> `agent_pending_events`, `agent_inflight_reactions`, `agent_reaction_lag_ms`,
-> the unlabelled `agent_subscriptions_active`, `agent_active_subagents`,
-> `agent_tree_depth` and `agent_tree_breadth`. A scaler that targets one sees
-> a flat zero. The [Events and metrics reference](telemetry-reference.md#metrics)
-> marks every such series.
 
 ## Grow or shrink the fleet
 

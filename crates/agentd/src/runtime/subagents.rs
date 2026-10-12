@@ -212,12 +212,14 @@ impl Runtime {
             .count() as u32;
         let breadth = self.settings.limits.subagents.breadth.unwrap_or(8);
         if live >= breadth {
+            crate::obs::metrics::record_refusal("breadth");
             return err(format!(
                 "subagent.run refused: {live} subagents live (limits.subagents.breadth = {breadth})"
             ));
         }
         let total = self.settings.limits.subagents.total.unwrap_or(64) as usize;
         if self.subagents.len() >= total {
+            crate::obs::metrics::record_refusal("total");
             return err(format!(
                 "subagent.run refused: {} subagents spawned (limits.subagents.total = {total})",
                 self.subagents.len()
@@ -237,11 +239,13 @@ impl Runtime {
             .unwrap_or(0);
         let max_depth = self.settings.limits.subagents.depth.unwrap_or(3);
         if depth >= max_depth {
+            crate::obs::metrics::record_refusal("depth");
             return err(format!(
                 "subagent.run refused: delegation depth {depth} reaches limits.subagents.depth = {max_depth}"
             ));
         }
         if !self.spawn_bucket_take() {
+            crate::obs::metrics::record_refusal("rate");
             return err("subagent.run refused: spawn rate exceeded (limits.subagents.rate)".into());
         }
         if self.pressure.shedding() {
@@ -278,6 +282,7 @@ impl Runtime {
         )
         .is_refused()
         {
+            crate::obs::metrics::record_refusal("trifecta");
             return err("subagent.run refused: the requested MCP servers form a lethal trifecta (untrusted input + sensitive + egress); set security.allow_trifecta to override".into());
         }
         let handle = self.next_id("sub");
@@ -914,6 +919,7 @@ impl Runtime {
                         s.status = "running".into();
                         s.dirty = true;
                     }
+                    crate::obs::metrics::record_subagent_restart("restored");
                     self.log.info(
                         "subagent.respawn",
                         json!({"handle": handle, "node": node.0}),

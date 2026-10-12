@@ -423,6 +423,9 @@ guess from the wire model's name: a name containing `claude` 200,000;
 | `agent_intel_all_down` | gauge |
 | `agent_tokens_total{type}` | counter |
 
+They count every model call of the instance: a turn worker or a subagent
+reports its calls, their errors and what the last one found of its endpoint
+to the supervisor, whose `/metrics` serves them.
 `agent_intel_call_duration_ms` is reserved: a scrape shows only its `# HELP`
 and `# TYPE` lines. The full catalog
 is in the [Events and metrics reference](telemetry-reference.md).

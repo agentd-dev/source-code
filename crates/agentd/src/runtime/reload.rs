@@ -96,14 +96,14 @@ impl Runtime {
                         json!({"trigger": trigger, "error": e}),
                     );
                 }
-                crate::obs::metrics::record_config_reload("invalid");
+                crate::obs::metrics::record_config_reload("rejected");
             }
             Err(ReloadRefused::RestartRequired(paths)) => {
                 self.log.warn(
                     "config.reload.restart_required",
                     json!({"trigger": trigger, "paths": paths}),
                 );
-                crate::obs::metrics::record_config_reload("restart_required");
+                crate::obs::metrics::record_config_reload("rejected");
             }
         }
     }

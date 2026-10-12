@@ -2545,10 +2545,12 @@ impl Runtime {
             }
             Admission::Exhausted { reason } => {
                 self.apply_lifetime_exhausted(&reason);
+                crate::obs::metrics::record_refusal("budget");
                 self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(reason), 0);
                 return;
             }
             Admission::Refuse { reason } | Admission::Fail { reason } => {
+                crate::obs::metrics::record_refusal("budget");
                 self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(reason), 0);
                 return;
             }
@@ -3325,12 +3327,7 @@ impl Runtime {
             );
         }
         self.counters.runs_finished += 1;
-        crate::obs::metrics::record_run(match status {
-            RunStatus::Completed => crate::obs::metrics::RunOutcome::Completed,
-            RunStatus::Cancelled => crate::obs::metrics::RunOutcome::Killed,
-            _ => crate::obs::metrics::RunOutcome::Failed,
-        });
-        crate::obs::metrics::record_run_status(status.as_str());
+        crate::obs::metrics::record_run(status.as_str());
         self.log.info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
         self.governor.drop_scope(&format!("run:{run_id}"));
         // What the table says the run carries now goes on its record before

@@ -275,6 +275,7 @@ impl Runtime {
     }
 
     pub(crate) fn log_withheld(&self, reader: &Reader, source: Source, marker: &str, via: &str) {
+        crate::obs::metrics::record_refusal("trifecta");
         let (key, id) = match source {
             Source::Run(id) => ("run", id),
             Source::Child(h) => ("subagent", h),

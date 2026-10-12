@@ -5,6 +5,69 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Fixed.**
+
+- `/metrics` counts the work of the supervisor's children. A turn worker or
+  a subagent runs in a process of its own, with no `/metrics`, so its model
+  calls, their errors, what the last call found of its endpoint and its
+  loop steps never reached the scrape: `agent_intel_up` read `0` after a
+  run whose calls all succeeded. A child now sends what it counted up the
+  control channel ahead of each frame, and the supervisor adds it to its
+  own.
+- A finished run counts once in `agent_runs_total`. It counted twice, once
+  under a coarse status and once under its own, and the label now holds a
+  run's statuses: `completed`, `failed`, `refused`, `cancelled`, `stalled`.
+- A refused reload counts `rejected` in `agent_config_reload_total`, where
+  it counted `other`.
+- Series rendered with a value nothing wrote are written:
+  `agent_turns_total` for every kind of turn worker (`root`, `step`,
+  `think`, `decide`, `preflight`, `compaction`); `agent_limit_exceeded_total`
+  when a turn or a subagent ends on its step, token or time bound, and when
+  the lifetime budget is spent; `agent_refusals_total` when a budget, a
+  policy, the trifecta check or a subagent cap refuses;
+  `agent_subagent_stuck_kills_total` when the liveness check kills a child;
+  `agent_subagent_restarts_total` when a restarted supervisor spawns an
+  unfinished subagent again; `agent_reactor_stalls_total` when the loop
+  comes back from a gap `/healthz` answered `503` for (a slow start before
+  the loop runs is not one); `agent_reactions_total` for each start fired;
+  `agent_intel_all_down`; `agent_budget_tokens_remaining`, absent without a
+  lifetime budget; `agent_active_subagents`, `agent_tree_depth` and
+  `agent_tree_breadth`; `agent_inflight_reactions` and
+  `agent_reaction_lag_ms`; and `agent_subscriptions_active{kind="resource"}`.
+- `agent_mcp_events_total` counts a webhook delivery that fails its check
+  as `unauthenticated`, as the reference said, and an occurrence that only
+  the instruction follows as `followed`. Both counted `other`.
+- The help text of `agent_intel_errors_total` says what it counts: failed
+  sweeps of the model endpoints, so a call that backs off and sweeps again
+  counts each. It said failed calls.
+
+**Removed.**
+
+- `agent_restarts_total`, `agent_restarts_tripped_total` and
+  `agent_pending_events`: nothing restarts a supervisor in place or trips a
+  restart breaker, and the inbox backlog is `agent_inbox_pending`. The
+  unlabelled `agent_subscriptions_active` sample: the resource
+  subscriptions are `agent_subscriptions_active{kind="resource"}`.
+- Label values nothing wrote:
+  - `agent_runs_total{status}`: `exhausted_steps`, `exhausted_tokens`,
+    `deadline`, `loop_detected` and `crashed`. A run ends `completed`,
+    `failed`, `refused`, `cancelled` or `stalled`.
+  - `agent_subagents_exited_total{status}`: `refused`, `exhausted_steps`,
+    `exhausted_tokens`, `deadline`, `stalled` and `loop_detected`. The
+    label says how the process ended: `completed`, `crashed`, `cancelled`.
+  - `agent_subagent_stuck_kills_total{signal}`: `term`.
+  - `agent_subagent_restarts_total{reason}`: `crashed`, `stuck` and `rate`.
+    The one reason is `restored`.
+  - `agent_refusals_total{reason}`: `mcp`.
+  - `agent_limit_exceeded_total{limit}`: `depth`, `tree_tokens`,
+    `restart_storm` and `spawn_rate`. A subagent cap counts in
+    `agent_refusals_total`.
+  - `agent_turns_total{kind}`: `knowledge`.
+  - `agent_steps_total{status}`: `skipped`. The family counts the steps that
+    ran; a skipped step never did.
+
 ## v1.19.1 — agent turns where agentd is PID 1
 
 **Fixed.**

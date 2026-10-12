@@ -296,9 +296,12 @@ records which model spent the tokens and leaves the money to you. Event and
 metric fields are in the
 [Events and metrics reference](telemetry-reference.md).
 
-> **Limit.** agentd exports an `agent_budget_tokens_remaining` gauge but
-> does not set it, so it reads `0`. Read the remaining balance from the
-> status `budget` section.
+On `/metrics`, `agent_budget_tokens_remaining` is the balance left under
+`lifetime_tokens` (absent without one), every turn, step or model call a
+budget refuses counts in `agent_refusals_total{reason="budget"}`, and the
+lifetime ceiling being reached counts once in
+`agent_limit_exceeded_total{limit="tokens_lifetime"}`. The status `budget`
+section has the windows' balances too.
 
 ## Traps
 

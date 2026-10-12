@@ -46,6 +46,7 @@ impl Runtime {
         let il = &self.settings.limits.subagents.instances;
         let breadth = il.breadth.unwrap_or(2);
         if live >= breadth {
+            crate::obs::metrics::record_refusal("breadth");
             return err(format!(
                 "subagent.run refused: {live} instance children live (limits.subagents.instances.breadth = {breadth})"
             ));
@@ -57,11 +58,13 @@ impl Runtime {
             .filter(|s| s.tier.as_deref() == Some("instance"))
             .count();
         if lifetime >= total {
+            crate::obs::metrics::record_refusal("total");
             return err(format!(
                 "subagent.run refused: {lifetime} instance children spawned (limits.subagents.instances.total = {total})"
             ));
         }
         if !self.instance_bucket_take() {
+            crate::obs::metrics::record_refusal("rate");
             return err(
                 "subagent.run refused: instance spawn rate exceeded (limits.subagents.instances.rate)"
                     .into(),
@@ -705,6 +708,7 @@ impl Runtime {
                         s.attempt += 1;
                         s.retiring_since = None;
                     }
+                    crate::obs::metrics::record_subagent_restart("restored");
                     self.log
                         .info("instance.respawn", json!({"handle": handle, "pid": pid}));
                     self.persist_subagent(&handle);

@@ -519,6 +519,12 @@ impl Governor {
         self.instance.lifetime_used
     }
 
+    /// Tokens left under the instance's lifetime ceiling; `None` without one.
+    pub fn lifetime_remaining(&self) -> Option<u64> {
+        let cap = self.instance.lifetime_cap;
+        (cap > 0).then(|| cap.saturating_sub(self.instance.lifetime_used))
+    }
+
     /// The earliest moment any exhausted instance window opens again.
     pub fn next_reset_ms(&self, now_ms: u64) -> Option<u64> {
         self.instance
@@ -678,9 +684,11 @@ mod tests {
             matches!(g.admit(30, &[], now), Admission::Exhausted { reason } if reason.contains("lifetime"))
         );
         assert_eq!(g.lifetime_used(), 30);
-        // No budget configured ⇒ always ok.
+        assert_eq!(g.lifetime_remaining(), Some(20));
+        // No budget configured ⇒ always ok, and no lifetime balance to report.
         let mut g = Governor::new(&budget(json!({})));
         assert!(!g.is_active());
+        assert_eq!(g.lifetime_remaining(), None);
         assert!(matches!(g.admit(1_000_000, &[], now), Admission::Ok { .. }));
     }
 

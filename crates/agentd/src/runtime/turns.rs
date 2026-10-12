@@ -401,6 +401,7 @@ impl Runtime {
             }
             Admission::Exhausted { reason } => {
                 self.apply_lifetime_exhausted(&reason);
+                crate::obs::metrics::record_refusal("budget");
                 self.log
                     .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
                 if ctx_id == crate::context::ROOT {
@@ -415,6 +416,7 @@ impl Runtime {
                 return Err(TurnDefer::Dropped);
             }
             Admission::Refuse { reason } | Admission::Fail { reason } => {
+                crate::obs::metrics::record_refusal("budget");
                 self.log
                     .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
                 if ctx_id == crate::context::ROOT {
@@ -501,7 +503,6 @@ impl Runtime {
         match self.spawn_turn(launch) {
             Ok(node) => {
                 self.counters.turns += 1;
-                crate::obs::metrics::record_turn("root");
                 if let Some(c) = self.contexts.get_mut(&ctx_id) {
                     c.turns += 1;
                 }
@@ -1262,13 +1263,17 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             "turn.model",
             json!({"agent_path": launch.agent_path, "role": launch.role.as_str(), "model": payload.intelligence.model, "provider": payload.intelligence.provider}),
         );
-        self.children
+        let kind = turn_kind(&launch.kind);
+        let node = self
+            .children
             .spawn(
                 &payload,
                 launch.kind,
                 Duration::from_millis(launch.deadline_ms),
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        crate::obs::metrics::record_turn(kind);
+        Ok(node)
     }
 
     // ---- budget requests -------------------------------------------------------
@@ -1311,13 +1316,16 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             }
             Admission::Exhausted { reason }
             | Admission::Refuse { reason }
-            | Admission::Fail { reason } => ControlMsg::BudgetGrant {
-                id,
-                ok: false,
-                wait_ms: 0,
-                degrade: None,
-                reason: Some(reason),
-            },
+            | Admission::Fail { reason } => {
+                crate::obs::metrics::record_refusal("budget");
+                ControlMsg::BudgetGrant {
+                    id,
+                    ok: false,
+                    wait_ms: 0,
+                    degrade: None,
+                    reason: Some(reason),
+                }
+            }
         };
         self.children.send(node, &reply);
     }
@@ -1777,6 +1785,24 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
     }
 }
 
+/// What a turn worker is started for, as `agent_turns_total` counts it: a
+/// conversation turn, a workflow step, or the think a tool, preflight or
+/// compaction asked for.
+fn turn_kind(kind: &ChildKind) -> &'static str {
+    match kind {
+        ChildKind::RootTurn { .. } => "root",
+        ChildKind::StepTurn { .. } => "step",
+        ChildKind::Think { purpose, .. } => match purpose.as_str() {
+            "tool" => "think",
+            "decide" => "decide",
+            "preflight" => "preflight",
+            "compaction" => "compaction",
+            _ => "other",
+        },
+        ChildKind::Subagent { .. } => "other",
+    }
+}
+
 /// Render `knowledge.search` hits as a labelled system block with sources.
 pub fn render_knowledge_block(v: &Value, max_bytes: usize) -> Option<String> {
     let hits = v.get("hits").and_then(Value::as_array)?;
@@ -1909,6 +1935,37 @@ fn preflight_questions(
 mod tests {
     use super::*;
     use crate::wire::decision::{MAX_QUESTIONS, Question};
+
+    /// Every turn worker the runtime starts is counted under its own kind:
+    /// a step's turn, the `think` and `decide` tools, preflight and
+    /// compaction each have one, and none of them is a conversation turn.
+    #[test]
+    fn each_turn_worker_counts_under_its_kind() {
+        let think = |purpose: &str| ChildKind::Think {
+            purpose: purpose.into(),
+            ctx: None,
+            reply_to: None,
+            extra: Value::Null,
+            reservation: None,
+        };
+        let root = ChildKind::RootTurn {
+            ctx: "root".into(),
+            event: None,
+            reservation: None,
+            msg_depth: 0,
+        };
+        let step = ChildKind::StepTurn {
+            run: "r".into(),
+            step: "s".into(),
+            reservation: None,
+        };
+        assert_eq!(turn_kind(&root), "root");
+        assert_eq!(turn_kind(&step), "step");
+        assert_eq!(turn_kind(&think("tool")), "think");
+        assert_eq!(turn_kind(&think("decide")), "decide");
+        assert_eq!(turn_kind(&think("preflight")), "preflight");
+        assert_eq!(turn_kind(&think("compaction")), "compaction");
+    }
 
     fn routes() -> BTreeMap<String, String> {
         BTreeMap::from([

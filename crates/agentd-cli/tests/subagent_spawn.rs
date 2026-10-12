@@ -117,6 +117,7 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
                     AgentMsg::ToolRequest { .. } => "tool_request",
                     AgentMsg::BudgetRequest { .. } => "budget_request",
                     AgentMsg::TurnDone { .. } => "turn_done",
+                    AgentMsg::Metrics(_) => "metrics",
                 };
                 if m == kind {
                     return true;

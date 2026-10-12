@@ -353,6 +353,7 @@ pub fn run_turn(
             }
         };
         result.rounds += 1;
+        crate::obs::metrics::record_loop_step();
         // The model was unavailable and its fallback answered — or it is
         // back. Said when it changes, not every round.
         if resp.fallback != serving {
@@ -712,6 +713,7 @@ fn run_decision(
         Err(e) => return fail(result, format!("intel: {e}")),
     };
     result.rounds = 1;
+    crate::obs::metrics::record_loop_step();
     result.usage.input_tokens += resp.usage.input_tokens;
     result.usage.output_tokens += resp.usage.output_tokens;
     let mut served = resp.fallback.clone().unwrap_or_else(|| model.clone());

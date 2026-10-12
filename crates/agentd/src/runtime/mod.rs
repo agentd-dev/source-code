@@ -644,6 +644,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         job_runs: Vec::new(),
         executing: BTreeMap::new(),
         last_manifest_flush: Instant::now(),
+        #[cfg(feature = "metrics")]
+        shape_at: None,
         goal_judge_at: None,
         freshness_deadline_ms: None,
         freshness_frozen: false,

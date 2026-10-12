@@ -66,7 +66,7 @@ mod imp {
     // state. The child therefore reports its reachability UPWARD (an edge-triggered
     // `AgentMsg::IntelHealth` at the breaker/failover seam — on entering all-down
     // and on recovering); the supervisor latches it HERE so the readiness probe
-    // and the `agentd_intel_all_down` gauge read ONE truth without a feature
+    // and the `agent_intel_all_down` gauge read ONE truth without a feature
     // dependency (it rides here, not in a feature-gated module, exactly like
     // LAME_DUCK/PAUSED).
     //
@@ -694,7 +694,7 @@ pub fn set_paused(on: bool) {
 /// Is the intelligence channel all-endpoints-down? The latched,
 /// EVENTUALLY-CONSISTENT last-child-experience truth a child reports up via
 /// `AgentMsg::IntelHealth` — read by `/readyz` (flips NotReady) and the
-/// `agentd_intel_all_down` gauge. NOT a live supervisor-side probe (there is no model loop in the
+/// `agent_intel_all_down` gauge. NOT a live supervisor-side probe (there is no model loop in the
 /// supervisor): it reflects whichever child last exercised the endpoints.
 pub fn intel_all_down() -> bool {
     imp::intel_all_down()

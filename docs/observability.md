@@ -228,10 +228,10 @@ scrape_configs:
       - targets: ["agent-triage.internal:9090"]
 ```
 
-The metrics describe the supervisor process. Model calls happen in child
-processes, so token counts arrive as each child reports them, while the
-per-call model metrics (`agent_intel_*`) count only the few calls the
-supervisor makes itself. Several series are reserved and never move; the
+The metrics are the supervisor's. Model calls and agent loops run in child
+processes, which report what they count (tokens, model calls and their
+errors, loop steps) up to the supervisor as they go, so its scrape covers
+the whole instance. A few series are reserved markers with no sample; the
 reference marks each one. The ones worth a dashboard:
 
 | Question | Series |
@@ -239,8 +239,9 @@ reference marks each one. The ones worth a dashboard:
 | Is it up and taking work? | `agent_up`, `agent_ready`, `agent_paused` |
 | Is it falling behind? | `agent_inbox_pending`, `agent_turns_queued`, `agent_runs_active`, `agent_stream_lag` |
 | How much work is it doing? | `rate(agent_runs_started_total[5m])`, `rate(agent_steps_total[5m])` |
-| How is the work ending? | `agent_runs_completed_total`, `agent_runs_failed_total`, `agent_runs_killed_total` |
-| What does it cost? | `rate(agent_tokens_total[1h])` by `type` |
+| How is the work ending? | `agent_runs_total` by `status`, `agent_limit_exceeded_total` by `limit`, `agent_refusals_total` by `reason` |
+| What does it cost? | `rate(agent_tokens_total[1h])` by `type`, `agent_budget_tokens_remaining` |
+| Can it reach its model? | `agent_intel_up`, `agent_intel_all_down`, `rate(agent_intel_errors_total[5m])` by `reason` |
 | Is the disk safe? | `agent_pressure_level`, `agent_disk_free_bytes` |
 | Is the store healthy? | `agent_store_ops_total` by `result` |
 | Did my change land? | `agent_config_generation`, `agent_config_reload_total` |
@@ -283,9 +284,13 @@ groups:
         annotations:
           summary: "workflow runs are failing on {{ $labels.instance }}"
       - alert: AgentdReloadRefused
-        expr: increase(agent_config_reload_total{result="other"}[15m]) > 0
+        expr: increase(agent_config_reload_total{result="rejected"}[15m]) > 0
         annotations:
           summary: "a configuration reload was refused on {{ $labels.instance }}"
+      - alert: AgentdLifetimeBudgetSpent
+        expr: increase(agent_limit_exceeded_total{limit="tokens_lifetime"}[15m]) > 0
+        annotations:
+          summary: "the lifetime token budget of {{ $labels.instance }} is spent"
       - alert: AgentdConsumerLagging
         expr: agent_stream_lag > 1000
         for: 10m
@@ -299,7 +304,6 @@ store:
 | Event | Means |
 |---|---|
 | `drain.abandon` | A drain overran its budget and children were killed |
-| `budget.lifetime_exhausted` | The instance's lifetime token budget is spent |
 | `instruction.unavailable` | The instruction source stopped answering |
 | `start.subscribe.unsupported` | A `subscribe` start can never fire |
 | `wait.resubscribe.fail` at error | A suspended wait can never be woken |

@@ -922,6 +922,7 @@ impl Runtime {
             Ok(Some(v)) => v,
             Err(rule) => {
                 // Fail closed and say which rule could not be judged.
+                crate::obs::metrics::record_refusal("policy");
                 self.log.error(
                     "tool.policy.error",
                     json!({"tool": name, "rule": rule, "caller": caller.label()}),
@@ -938,6 +939,7 @@ impl Runtime {
             PolicyAction::Allow => None,
             PolicyAction::Deny | PolicyAction::Shadow => {
                 let held = verdict.action == PolicyAction::Shadow;
+                crate::obs::metrics::record_refusal("policy");
                 self.log.info(
                     "tool.policy.refused",
                     json!({"tool": name, "rule": verdict.rule, "caller": caller.label(),

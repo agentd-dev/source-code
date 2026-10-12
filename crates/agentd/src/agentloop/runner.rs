@@ -395,6 +395,7 @@ impl<'a> Session<'a> {
             };
             budget.record_usage(resp.usage);
             budget.record_step();
+            crate::obs::metrics::record_loop_step();
             tok_in += resp.usage.input_tokens;
             tok_out += resp.usage.output_tokens;
             run_span.record_chat(

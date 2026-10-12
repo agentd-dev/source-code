@@ -344,8 +344,8 @@ reload.
 | Outcome | Log | Metric |
 |---|---|---|
 | Applied | `config.reloaded` with `trigger` (`sighup` or `watch`) and `changed` | `agent_config_reload_total{result="applied"}`; `agent_config_generation` goes up by one |
-| Invalid | `config.reload.invalid` with `error` | `agent_config_reload_total{result="other"}` |
-| Needs a restart | `config.reload.restart_required` with `paths` | `agent_config_reload_total{result="other"}` |
+| Invalid | `config.reload.invalid` with `error` | `agent_config_reload_total{result="rejected"}` |
+| Needs a restart | `config.reload.restart_required` with `paths` | `agent_config_reload_total{result="rejected"}` |
 
 `changed` lists what moved, from this set: `intelligence`,
 `intelligence.routes`, `intelligence.budget`, `agent.instruction`,

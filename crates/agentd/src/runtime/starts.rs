@@ -688,6 +688,7 @@ impl Runtime {
         }
         self.start_held.remove(&Self::start_key(workflow, node));
         self.log.info("start.fired", fields(json!({})));
+        crate::obs::metrics::record_reaction();
         let mut st = self.start_state(workflow, node);
         st["last_fired"] = json!(now_ms());
         if kind == "loop" {

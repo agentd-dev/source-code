@@ -355,12 +355,12 @@ timestamp within 5 minutes, and the HMAC over the raw body.
 | Metric | Type | Labels |
 |---|---|---|
 | `agent_mcp_connect_failures_total` | counter | `server` |
-| `agent_mcp_events_total` | counter | `server`, `event`, `mode`, `outcome` (`appended`, `duplicate`, `rejected`, `schema_mismatch`, `refused_pressure`) |
+| `agent_mcp_events_total` | counter | `server`, `event`, `mode`, `outcome` (`appended`, `duplicate`, `rejected`, `schema_mismatch`, `refused_pressure`, `followed`, `unauthenticated`) |
 | `agent_mcp_events_requests_total` | counter | `server`, `method`, `outcome` (`ok`, `refused`, `failed`) |
 | `agent_mcp_event_gaps_total` | counter | `server`, `event`, `cause` |
 | `agent_mcp_events_dedup_evicted_total` | counter | `server`, `event` |
 | `agent_mcp_event_lag_ms` | gauge | `server`, `event`: append time minus the server's timestamp |
-| `agent_subscriptions_active` | gauge | the `kind="event"` series, by `mode` |
+| `agent_subscriptions_active` | gauge | `kind="resource"`: the resource subscriptions the connections hold; `kind="event"`: MCP Events bindings, by `mode` |
 
 [Events and metrics reference](telemetry-reference.md) lists every metric.
 

@@ -259,18 +259,18 @@ mod tests {
     }
 
     // The `/healthz` reactor-heartbeat contract. One test drives the whole
-    // fresh→wedged→fresh transition sequentially: `LAST_TICK_MS` is a
-    // single process-global the supervisor heartbeat shares, so the stale and
-    // fresh phases must not be split across two `#[test]`s that the harness may
-    // interleave in the same process (one's stale-stamp would race the other's
-    // fresh-tick). The verdict consults *only* the reactor heartbeat — never any
-    // per-subagent stuck state — so a healthy tree with one wedged leaf stays
-    // live and keeps its pod; only the reactor itself wedging flips liveness.
+    // fresh→wedged→fresh transition sequentially: the supervisor heartbeat
+    // is a single process-global, so the stale and fresh phases must not be
+    // split across two `#[test]`s that the harness may interleave in the same
+    // process (one's stale-stamp would race the other's fresh-tick). The
+    // verdict consults *only* the reactor heartbeat — never any per-subagent
+    // stuck state — so a healthy tree with one wedged leaf stays live and
+    // keeps its pod; only the reactor itself wedging flips liveness.
     #[test]
     fn healthz_reflects_only_the_reactor_heartbeat() {
         let _sig = crate::signals::test_guard();
         // Hold the heartbeat lock so a concurrent test's `tick()` cannot race the
-        // wedged-path assertion (the shared `LAST_TICK_MS` is process-global).
+        // wedged-path assertion (the shared heartbeat is process-global).
         let _g = crate::obs::health::HEARTBEAT_TEST_LOCK.lock().unwrap();
         crate::signals::set_lame_duck(false); // unrelated to liveness, but a shared latch
         if crate::signals::draining() {

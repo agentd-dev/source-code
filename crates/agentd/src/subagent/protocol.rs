@@ -152,7 +152,7 @@ pub enum AgentMsg {
     /// channel. The supervisor has no LLM of its own and no live view of a
     /// child's breaker state, so the child is the only party that can report
     /// this; the supervisor latches it into the `intel_all_down` process-global
-    /// that the readiness probe and the `agentd_intel_all_down` gauge read — one
+    /// that the readiness probe and the `agent_intel_all_down` gauge read — one
     /// latched truth, eventually consistent (see
     /// [`crate::signals::set_intel_all_down`]). `active` is best-effort transport
     /// and index ONLY — never a URL or a credential.
@@ -174,6 +174,11 @@ pub enum AgentMsg {
     /// A `Role::Turn` worker finished its turn — terminal for that worker.
     /// Carries the transcript delta, the usage, and the outcome.
     TurnDone { turn: Box<TurnResult> },
+    /// What the child counted since its last frame — model calls and their
+    /// errors, the endpoint's reachability, loop steps — sent ahead of the
+    /// next frame, since a child has no `/metrics` of its own
+    /// ([`crate::obs::metrics::take_child_metrics`]).
+    Metrics(crate::obs::metrics::ChildMetrics),
 }
 
 /// Which endpoint is serving the child's intelligence, for
@@ -873,6 +878,34 @@ mod tests {
                 assert_eq!(a.transport, "https");
             }
             other => panic!("expected intel_health, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_childs_counts_ride_one_frame() {
+        // The child's counts go up as one tagged frame, the counts it has
+        // flat beside the tag, and come back as written.
+        let mut m = crate::obs::metrics::ChildMetrics {
+            intel_calls: 2,
+            intel_up: Some(true),
+            loop_steps: 3,
+            ..Default::default()
+        };
+        m.intel_errors.insert("timeout".into(), 1);
+        let mut buf = Vec::new();
+        frame::write_frame(&mut buf, &AgentMsg::Metrics(m.clone())).unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&buf[4..]).expect("one JSON frame after the length");
+        assert_eq!(
+            wire,
+            json!({"type": "metrics", "intel_calls": 2, "intel_errors": {"timeout": 1},
+                   "intel_up": true, "loop_steps": 3})
+        );
+        let bytes = frame::read_frame(&mut Cursor::new(buf)).unwrap().unwrap();
+        let back: AgentMsg = serde_json::from_slice(&bytes).unwrap();
+        match back {
+            AgentMsg::Metrics(got) => assert_eq!(got, m),
+            other => panic!("expected metrics, got {other:?}"),
         }
     }
 

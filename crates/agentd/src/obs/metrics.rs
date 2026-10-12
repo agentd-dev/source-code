@@ -7,22 +7,25 @@
 //! stream — that is the default story). With the feature, a tiny dependency-free
 //! atomic registry backs an opt-in HTTP `/metrics` scrape surface (`obs::serve`).
 //!
-//! Counters are **per supervisor process**. The long-lived root daemon's surface
-//! reflects the runs it supervises — every one-shot, reaction, and scheduled
-//! fire flows through the reactor's run-start path (`runtime::steps`) — plus
-//! the tokens its *direct* children report up the control channel. Nested
-//! subagents keep their own (process-local) counters, still visible in their
-//! logs; cross-process metric rollup is a deliberate non-goal (the same process
-//! boundary the tree token ceiling draws).
+//! The surface is the **supervisor's**: the process that serves `/metrics`.
+//! Its children — turn workers and subagents, re-exec'd from the same binary —
+//! have no surface of their own, so what they count (model calls and errors,
+//! endpoint reachability, loop steps) goes up the control channel: a child
+//! process calls [`report_upward`] at start, and every frame it sends is
+//! preceded by an `AgentMsg::Metrics` carrying what it counted since the last
+//! one ([`take_child_metrics`]), which the supervisor adds to its own
+//! ([`record_child`]). An instance-tier child is a daemon with a surface of
+//! its own, and reports nothing up.
 //!
 //! ## The metric contract
 //!
 //! The metric **names** and label **keys** below are a public API that a
 //! control plane (agentctl) authors dashboards, alerts and scalers against.
 //! Exposition is hand-written Prometheus 0.0.4 text — no `prometheus`/`metrics`
-//! crate. The enumerated set *is* the contract: series and label values are
-//! added, never removed or renamed — a metric whose meaning changes takes a
-//! new name.
+//! crate. Every series rendered with a value is one something writes, at the
+//! event its help text names: a series nothing can write is not rendered, and
+//! a label value nothing writes is not in its domain. A metric whose meaning
+//! changes takes a new name.
 //!
 //! **Cardinality is binding:** `/metrics` is unauthenticated and may be bound on
 //! all interfaces. Labels carry **bounded** values only (`status`, `model`,
@@ -37,14 +40,6 @@
 //! Telemetry never crashes the agent: every fn here is a plain atomic add/store
 //! that cannot fail; `render` only ever reads.
 
-/// Terminal disposition of one supervised run.
-#[derive(Debug, Clone, Copy)]
-pub enum RunOutcome {
-    Completed,
-    Failed,
-    Killed,
-}
-
 /// A supervised run began (the reactor's run-start path,
 /// `runtime::steps::on_start_event`).
 pub fn record_run_started() {
@@ -52,37 +47,23 @@ pub fn record_run_started() {
     imp::REGISTRY.runs_started.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A supervised run reached a terminal disposition.
-///
-/// Also increments the frozen `agent_runs_total{status}` under a **coarse**
-/// status projection of the three `RunOutcome` variants this call site carries
-/// (`completed` / `crashed` / `cancelled`). The precise terminal-status string is
-/// available at the loop boundary but not at this supervisor hook, so a caller
-/// holding a `TerminalStatus` should use [`record_run_status`] instead to get the
-/// full closed-vocabulary label domain.
-pub fn record_run(outcome: RunOutcome) {
+/// A workflow run reached its terminal `status`
+/// ([`crate::engine::RunStatus::as_str`]): one count in
+/// `agent_runs_total{status}`, and one in whichever of the bare
+/// `agent_runs_{completed,failed,killed}_total` it falls under. Called once
+/// per run, where the run ends; a status outside the run vocabulary counts
+/// under `other`.
+pub fn record_run(status: &str) {
     #[cfg(feature = "metrics")]
-    imp::REGISTRY.record_run(outcome);
-    #[cfg(not(feature = "metrics"))]
-    let _ = outcome;
-}
-
-/// A supervised run reached a terminal status — the **frozen**, precise form.
-///
-/// `status` MUST be a closed-vocabulary terminal-status string
-/// ([`crate::agentloop::stop::TerminalStatus::as_str`]); an out-of-vocabulary
-/// value is bucketed under `other` so the label domain stays closed and the
-/// cardinality bounded. This is the precise driver for `agent_runs_total{status}`
-/// and is called where the `TerminalStatus` is known — not from a supervisor
-/// hook, which only holds the coarse `RunOutcome`.
-pub fn record_run_status(status: &str) {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY.record_run_status(status);
+    imp::REGISTRY.record_run(status);
     #[cfg(not(feature = "metrics"))]
     let _ = status;
 }
 
-/// A reactive trigger fired (one reaction).
+/// A start node fired (`start.fired`): a schedule, a loop, a subscription, a
+/// webhook, an A2A message, a stream or a join, an event or a goal had its
+/// event accepted into the inbox. The run it asks for may still wait there.
+/// A `once` start and a `workflow.run` call are not reactions.
 pub fn record_reaction() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.reactions.fetch_add(1, Ordering::Relaxed);
@@ -102,37 +83,20 @@ pub fn record_tokens(input: u64, output: u64) {
     let _ = (input, output);
 }
 
-/// The restart governor's circuit breaker tripped.
-pub fn record_restart_tripped() {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY
-        .restarts_tripped
-        .fetch_add(1, Ordering::Relaxed);
-}
-
-/// One loop step executed (`loop.step`). Drives `agent_loop_steps_total`.
-///
-/// **Process-local / unwired:** `loop.step` is emitted inside the re-exec'd child
-/// agentic loop, a different process from the supervisor that `/metrics` scrapes,
-/// so calling this would only bump the child's own registry — there is no
-/// cross-process rollup. It is therefore intentionally NOT called from the loop;
-/// the series renders the supervisor's own process only and agentctl derives step
-/// counts from `loop.step` log lines.
+/// One agent-loop step ran: a model round of a turn worker or a subagent.
+/// Counted in the child the loop runs in and carried up
+/// ([`take_child_metrics`]); drives `agent_loop_steps_total`.
 pub fn record_loop_step() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.loop_steps.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A refusal / guard trip by reason (drives `agent_refusals_total`).
-///
-/// `reason` is the closed domain (`trifecta`/`rate`/`budget`/`depth`/`mcp`); an
-/// unknown value buckets under `other`.
-///
-/// **Process-local / unwired:** refusals trip inside the re-exec'd child loop
-/// (the orchestrator self-tool / scope checks), so a bump here would only reach
-/// the child's process-local registry, never the supervisor scrape — there is no
-/// cross-process rollup. Intentionally not called; the headline safety signal is
-/// the refusal / `scope.trifecta_refused` log line.
+/// A guard refused something, by `reason` (`agent_refusals_total`):
+/// `budget` (a token budget refused a turn, a step or a model call), `policy`
+/// (a `security.policies` rule refused a tool call), `trifecta` (a subagent's
+/// servers formed a lethal trifecta, or a read-back was withheld), and
+/// `depth` / `breadth` / `total` / `rate` (a subagent spawn refused by that
+/// `limits.subagents` cap). Any other value counts under `other`.
 pub fn record_refusal(reason: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_refusal(reason);
@@ -140,22 +104,34 @@ pub fn record_refusal(reason: &str) {
     let _ = reason;
 }
 
-/// A hard bound trip (`limit.exceeded`).
-///
-/// `limit` is the closed domain (`steps`/`tokens`/`deadline`/`depth`/
-/// `tree_tokens`/`restart_storm`/`spawn_rate`); an unknown value buckets under
-/// `other`.
-///
-/// **Partially wired:** the `tree_tokens` leg is the supervisor's own tree-ceiling
-/// trip (`supervisor::reactor`, this process), so it is live and reaches the
-/// scrape. The `steps`/`tokens`/`deadline`/`depth` legs trip inside the re-exec'd
-/// child loop and are therefore process-local (not called from the child for the
-/// scrape — derive those from `limit.exceeded` log lines).
+/// A hard bound stopped work, by `limit` (`agent_limit_exceeded_total`):
+/// `steps` / `tokens` / `deadline` (see [`record_unit_end`]) and
+/// `tokens_lifetime` (the instance's lifetime token budget was spent). Any
+/// other value counts under `other`.
 pub fn record_limit_exceeded(limit: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_limit_exceeded(limit);
     #[cfg(not(feature = "metrics"))]
     let _ = limit;
+}
+
+/// A turn worker or a subagent ended with terminal `status`. One that a bound
+/// stopped counts under `agent_limit_exceeded_total`: `exhausted_steps` as
+/// `steps`, `exhausted_tokens` as `tokens`, `deadline` as `deadline`.
+pub fn record_unit_end(status: &str) {
+    if let Some(limit) = bound_of(status) {
+        record_limit_exceeded(limit);
+    }
+}
+
+/// The bound a terminal status says stopped a turn or a subagent.
+fn bound_of(status: &str) -> Option<&'static str> {
+    match status {
+        "exhausted_steps" => Some("steps"),
+        "exhausted_tokens" => Some("tokens"),
+        "deadline" => Some("deadline"),
+        _ => None,
+    }
 }
 
 /// A subagent was spawned (`subagent.spawn`).
@@ -166,8 +142,9 @@ pub fn record_subagent_spawned() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// A subagent exited with a terminal `status` (`subagent.exit`). Drives
-/// `agent_subagents_exited_total{status}` over the closed status vocabulary.
+/// A child process exited (`child.exit`). Drives
+/// `agent_subagents_exited_total{status}`: `completed` (exit 0), `crashed`
+/// (any other exit code), `cancelled` (a signal).
 pub fn record_subagent_exited(status: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_subagent_exited(status);
@@ -175,8 +152,9 @@ pub fn record_subagent_exited(status: &str) {
     let _ = status;
 }
 
-/// A subagent was restarted by the governor (`subagent.restart`). Drives
-/// `agent_subagent_restarts_total{reason}`.
+/// A subagent was spawned again (`subagent.respawn`, `instance.respawn`). Drives
+/// `agent_subagent_restarts_total{reason}`; `restored` is a subagent a
+/// restarted supervisor found unfinished in its store.
 pub fn record_subagent_restart(reason: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_subagent_restart(reason);
@@ -184,9 +162,10 @@ pub fn record_subagent_restart(reason: &str) {
     let _ = reason;
 }
 
-/// A wedged/stuck subagent was killed (`subagent.stuck` — the reliability
-/// headline). Drives `agent_subagent_stuck_kills_total{signal}`; `signal` ∈
-/// `term`\|`kill` (an unknown value buckets `other`).
+/// The supervisor killed a child its liveness check gave up on
+/// (`child.unhealthy`: stuck, or past its deadline). Drives
+/// `agent_subagent_stuck_kills_total{signal}`; the kill is `SIGKILL` to the
+/// child's process group, so `signal` is `kill`.
 pub fn record_subagent_stuck_kill(signal: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_subagent_stuck_kill(signal);
@@ -194,16 +173,16 @@ pub fn record_subagent_stuck_kill(signal: &str) {
     let _ = signal;
 }
 
-/// An intelligence call was made (`intel.call`). Drives
-/// `agent_intel_calls_total`.
+/// A model call began. Drives `agent_intel_calls_total`; a child's are
+/// carried up ([`take_child_metrics`]).
 pub fn record_intel_call() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.intel_calls.fetch_add(1, Ordering::Relaxed);
 }
 
-/// An intelligence-endpoint error by reason. Drives
+/// A model call's sweep of the endpoints failed, by reason. Drives
 /// `agent_intel_errors_total`. `reason` ∈ `unreachable`\|`auth`\|`timeout`\|
-/// `5xx` (an unknown value buckets `other`).
+/// `5xx` (an unknown value buckets `other`); a child's are carried up.
 pub fn record_intel_error(reason: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_intel_error(reason);
@@ -231,41 +210,21 @@ pub fn record_drain(phase: &str) {
     let _ = phase;
 }
 
-/// A supervisor process restart was observed (rebuild + reconcile). Drives
-/// `agent_restarts_total` — distinct from the breaker-trip counter
-/// [`record_restart_tripped`].
-///
-/// **Reserved / unwired:** there is no in-process
-/// rebuild+reconcile restart path to call it from, because a pod restart is a
-/// fresh process with a zeroed registry — an orchestrator counts those, not the
-/// binary. The series renders (always 0) so the frozen contract stays
-/// discoverable; this fn is the hook a reconcile path would call.
-pub fn record_supervisor_restart() {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY
-        .supervisor_restarts
-        .fetch_add(1, Ordering::Relaxed);
-}
-
-/// A wedged-reactor liveness trip. Drives `agent_reactor_stalls_total`.
-///
-/// **Reserved / unwired:** a wedged reactor is surfaced as a
-/// `/healthz` 503 (a per-scrape read of the heartbeat age in `obs::serve`), not as
-/// a one-shot in-process event, so there is no clean site to bump this exactly
-/// once. The series renders (always 0) for discoverability; the live alerting
-/// signal is the 503 itself.
+/// The supervisor loop went longer than the `/healthz` window without a tick:
+/// counted by [`crate::obs::health::tick`] when it ticks again. Drives
+/// `agent_reactor_stalls_total`. A loop that never comes back is not counted;
+/// the `/healthz` 503 is what reports that one. Nor is a slow boot, before the
+/// loop starts ([`crate::obs::health::loop_started`]).
 pub fn record_reactor_stall() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.reactor_stalls.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Point-in-time set of the intelligence-endpoint reachability gauge
-/// (`agent_intel_up`).
+/// What the last model call found of its endpoint (`agent_intel_up`): up,
+/// and not every endpoint down. A child's goes up with its next frame.
 pub fn set_intel_up(up: bool) {
     #[cfg(feature = "metrics")]
-    imp::REGISTRY
-        .intel_up
-        .store(u64::from(up), Ordering::Relaxed);
+    imp::REGISTRY.set_intel_up(up);
     #[cfg(not(feature = "metrics"))]
     let _ = up;
 }
@@ -280,24 +239,10 @@ pub fn set_paused(on: bool) {
     let _ = on;
 }
 
-/// Point-in-time set of the intelligence all-endpoints-down gauge
-/// (`agent_intel_all_down`) — 1 while every model
-/// endpoint is down (the latched, eventually-consistent last-child-experience
-/// truth a subagent reports up via `AgentMsg::IntelHealth`; the same flag flips
-/// `/readyz` NotReady). 0 once any endpoint is usable again. Distinct from
-/// `agent_intel_up` (the active endpoint's reachability): all-down is the
-/// fleet-routing signal (no endpoint usable at all). No-op-safe / metrics-gated.
-pub fn set_intel_all_down(on: bool) {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY
-        .intel_all_down
-        .store(u64::from(on), Ordering::Relaxed);
-    #[cfg(not(feature = "metrics"))]
-    let _ = on;
-}
-
-/// Point-in-time set of the subagent-tree shape gauges
-/// (`agent_active_subagents` / `agent_tree_depth` / `agent_tree_breadth`).
+/// Point-in-time set of the subagent-tree shape gauges: subagents not yet
+/// ended (`agent_active_subagents`), the deepest of them (`agent_tree_depth`,
+/// 1 for one a turn or a step spawned), and the most of them one parent has
+/// (`agent_tree_breadth`).
 pub fn set_tree_shape(active: u64, depth: u64, breadth: u64) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.set_tree_shape(active, depth, breadth);
@@ -305,14 +250,16 @@ pub fn set_tree_shape(active: u64, depth: u64, breadth: u64) {
     let _ = (active, depth, breadth);
 }
 
-/// Point-in-time set of the reactive backlog gauges — the scaling signal set an
-/// autoscaler reads (`agent_pending_events` / `agent_inflight_reactions` /
-/// `agent_subscriptions_active` / `agent_reaction_lag_ms`).
-pub fn set_reactive_backlog(pending: u64, inflight: u64, subscriptions: u64, lag_ms: u64) {
+/// Point-in-time set of the reactive gauges: the work executing now, runs
+/// however they started and conversation turns (`agent_inflight_reactions`),
+/// the age of the oldest event waiting in the inbox (`agent_reaction_lag_ms`,
+/// 0 when none waits), and the MCP resource subscriptions the connections
+/// hold (`agent_subscriptions_active{kind="resource"}`).
+pub fn set_reactive_backlog(inflight: u64, lag_ms: u64, resource_subscriptions: u64) {
     #[cfg(feature = "metrics")]
-    imp::REGISTRY.set_reactive_backlog(pending, inflight, subscriptions, lag_ms);
+    imp::REGISTRY.set_reactive_backlog(inflight, lag_ms, resource_subscriptions);
     #[cfg(not(feature = "metrics"))]
-    let _ = (pending, inflight, subscriptions, lag_ms);
+    let _ = (inflight, lag_ms, resource_subscriptions);
 }
 
 /// A config hot reload reached a terminal disposition. Drives
@@ -327,7 +274,9 @@ pub fn record_config_reload(result: &str) {
     let _ = result;
 }
 
-/// A turn worker ran (`agent_turns_total{kind}`, agentd).
+/// A turn worker was started, by `kind` (`agent_turns_total{kind}`): `root`
+/// (a conversation turn), `step` (a workflow `agent`/`think`/`decide` step),
+/// `think` and `decide` (those tools), `preflight`, `compaction`.
 pub fn record_turn(kind: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_turn(kind);
@@ -335,7 +284,9 @@ pub fn record_turn(kind: &str) {
     let _ = kind;
 }
 
-/// A workflow step reached a terminal status (`agent_steps_total{status}`).
+/// An attempt at a workflow step ended (`agent_steps_total{status}`):
+/// `done`, `failed`, or `other` (timed out). A step that never ran is not
+/// one.
 pub fn record_step(status: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_step(status);
@@ -383,17 +334,14 @@ pub fn set_config_generation(generation: u64) {
 }
 
 /// Point-in-time set of the lifetime-budget balance gauge
-/// (`agent_budget_tokens_remaining`): tokens left before the
-/// per-instance cumulative cap is reached — the alerting/scaling hook for the
-/// threshold event. Only ever set when a budget is installed (absent = the
-/// gauge stays at its 0 default, which a scraper reads together with the fact
-/// that no budget metric transitions occurred; unbounded instances simply never
-/// call this).
-pub fn set_budget_tokens_remaining(remaining: u64) {
+/// (`agent_budget_tokens_remaining`): tokens left under
+/// `intelligence.budget.lifetime_tokens`. `None` = no lifetime budget — the
+/// gauge is then not emitted, since a 0 would read as a spent one.
+pub fn set_budget_tokens_remaining(remaining: Option<u64>) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY
         .budget_tokens_remaining
-        .store(remaining, Ordering::Relaxed);
+        .store(remaining.unwrap_or(u64::MAX), Ordering::Relaxed);
     #[cfg(not(feature = "metrics"))]
     let _ = remaining;
 }
@@ -458,30 +406,23 @@ pub const EVENT_SERIES_SLOTS: usize = 512;
 
 /// What became of one MCP Events occurrence
 /// (`agent_mcp_events_total{server,event,mode,outcome}`). `outcome` ∈
-/// `appended`\|`duplicate`\|`rejected`\|`schema_mismatch`\|`refused_pressure`
-/// (an unknown value buckets `other`). `server` and `event` come from the
+/// `appended`\|`duplicate`\|`rejected`\|`schema_mismatch`\|`refused_pressure`\|
+/// `followed` (taken for the instruction to read again, kept in no
+/// stream)\|`unauthenticated` (a webhook delivery that failed its check); an
+/// unknown value buckets `other`. `server` and `event` come from the
 /// operator's bindings, at most 256 of them.
 pub fn record_mcp_event(server: &str, event: &str, mode: &str, outcome: &str) {
     #[cfg(feature = "metrics")]
-    {
-        const OUTCOMES: &[&str] = &[
-            "appended",
-            "duplicate",
-            "rejected",
-            "schema_mismatch",
-            "refused_pressure",
-        ];
-        let outcome = if OUTCOMES.contains(&outcome) {
-            outcome
-        } else {
-            "other"
-        };
-        imp::REGISTRY.event_add(
-            "agent_mcp_events_total",
-            vec![server.into(), event.into(), mode.into(), outcome.into()],
-            1,
-        );
-    }
+    imp::REGISTRY.event_add(
+        "agent_mcp_events_total",
+        vec![
+            server.into(),
+            event.into(),
+            mode.into(),
+            imp::event_outcome(outcome).into(),
+        ],
+        1,
+    );
     #[cfg(not(feature = "metrics"))]
     let _ = (server, event, mode, outcome);
 }
@@ -557,6 +498,57 @@ pub fn set_event_subscriptions(by_mode: Vec<(String, u64)>) {
     let _ = by_mode;
 }
 
+/// What a child process counted since its last frame, carried up the control
+/// channel as `AgentMsg::Metrics` so the supervisor's surface counts the work
+/// its children do. Each count is a delta; `intel_up` is what the child's
+/// last model call found, when it made one since.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildMetrics {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub intel_calls: u64,
+    /// By `agent_intel_errors_total` reason.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub intel_errors: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intel_up: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub loop_steps: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Whether this process is a child that reports its counts upward.
+#[cfg(feature = "metrics")]
+static REPORTS_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process a child whose counts go up to its supervisor
+/// ([`take_child_metrics`]). Called once, as the child starts.
+pub fn report_upward() {
+    #[cfg(feature = "metrics")]
+    REPORTS_UP.store(true, Ordering::Relaxed);
+}
+
+/// What this process counted since the last call, taken: the counts it
+/// carries start again from zero. `None` when nothing was counted, and in a
+/// process that does not report upward — the supervisor keeps its own.
+pub fn take_child_metrics() -> Option<ChildMetrics> {
+    #[cfg(feature = "metrics")]
+    if REPORTS_UP.load(Ordering::Relaxed) {
+        return imp::REGISTRY.take_child();
+    }
+    None
+}
+
+/// Add what a child reported (`AgentMsg::Metrics`) to this process's counts.
+pub fn record_child(m: &ChildMetrics) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.record_child(m);
+    #[cfg(not(feature = "metrics"))]
+    let _ = m;
+}
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -570,7 +562,6 @@ use std::sync::atomic::Ordering;
 
 #[cfg(feature = "metrics")]
 mod imp {
-    use super::RunOutcome;
     use std::fmt::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -582,44 +573,35 @@ mod imp {
     // arrays ARE the cardinality bound — there is no map, no allocation, no
     // unbounded label key path.
 
-    /// `agent_runs_total{status}` / `agent_subagents_exited_total{status}`
-    /// label domain: the closed terminal-status vocabulary (verbatim from
-    /// `TerminalStatus::as_str`), plus `other`.
-    const STATUS_LABELS: &[&str] = &[
+    /// `agent_runs_total{status}` label domain: the terminal run statuses
+    /// (verbatim from `RunStatus::as_str`), plus `other`.
+    const RUN_STATUS: &[&str] = &[
         "completed",
+        "failed",
         "refused",
-        "exhausted_steps",
-        "exhausted_tokens",
-        "deadline",
-        "stalled",
-        "loop_detected",
         "cancelled",
-        "crashed",
+        "stalled",
         "other",
     ];
 
-    /// `agent_refusals_total{reason}` label domain.
-    const REFUSAL_REASONS: &[&str] = &["trifecta", "rate", "budget", "depth", "mcp", "other"];
+    /// `agent_subagents_exited_total{status}` label domain: how a child
+    /// process ended — exit 0, another exit code, a signal — plus `other`.
+    const EXIT_STATUS: &[&str] = &["completed", "crashed", "cancelled", "other"];
 
-    /// `agent_limit_exceeded_total{limit}` label domain; mirrors the
-    /// `limit.exceeded` event's `limit` field.
-    const LIMIT_LABELS: &[&str] = &[
-        "steps",
-        "tokens",
-        "deadline",
-        "depth",
-        "tree_tokens",
-        "tokens_lifetime",
-        "restart_storm",
-        "spawn_rate",
-        "other",
+    /// `agent_refusals_total{reason}` label domain (see `record_refusal`).
+    const REFUSAL_REASONS: &[&str] = &[
+        "budget", "policy", "trifecta", "depth", "breadth", "total", "rate", "other",
     ];
+
+    /// `agent_limit_exceeded_total{limit}` label domain (see
+    /// `record_limit_exceeded`).
+    const LIMIT_LABELS: &[&str] = &["steps", "tokens", "deadline", "tokens_lifetime", "other"];
 
     /// `agent_subagent_restarts_total{reason}` label domain.
-    const RESTART_REASONS: &[&str] = &["crashed", "stuck", "rate", "other"];
+    const RESTART_REASONS: &[&str] = &["restored", "other"];
 
     /// `agent_subagent_stuck_kills_total{signal}` label domain.
-    const SIGNAL_LABELS: &[&str] = &["term", "kill", "other"];
+    const SIGNAL_LABELS: &[&str] = &["kill", "other"];
 
     /// `agent_intel_errors_total{reason}` label domain.
     const INTEL_ERROR_REASONS: &[&str] = &["unreachable", "auth", "timeout", "5xx", "other"];
@@ -636,14 +618,44 @@ mod imp {
     /// that keeps the series bounded.
     const RELOAD_RESULTS: &[&str] = &["applied", "rejected", "other"];
 
-    /// `agent_turns_total{kind}` label domain: a turn worker's context kind — a
-    /// `root`/conversation turn, a `preflight` think, a `compaction` think —
-    /// plus `other`.
-    const TURN_KINDS: &[&str] = &["root", "preflight", "compaction", "knowledge", "other"];
+    /// `agent_turns_total{kind}` label domain: what a turn worker was started
+    /// for (see `record_turn`), plus `other`.
+    const TURN_KINDS: &[&str] = &[
+        "root",
+        "step",
+        "think",
+        "decide",
+        "preflight",
+        "compaction",
+        "other",
+    ];
 
-    /// `agent_steps_total{status}` label domain: a workflow step's terminal
-    /// status — `done` / `failed` / `skipped` — plus `other`.
-    const STEP_STATUS: &[&str] = &["done", "failed", "skipped", "other"];
+    /// `agent_mcp_events_total{outcome}` label domain: what became of an MCP
+    /// Events occurrence ([`super::record_mcp_event`]).
+    const EVENT_OUTCOMES: &[&str] = &[
+        "appended",
+        "duplicate",
+        "rejected",
+        "schema_mismatch",
+        "refused_pressure",
+        "followed",
+        "unauthenticated",
+    ];
+
+    /// An MCP Events outcome as its label: itself when in the domain, else
+    /// `other`.
+    pub(super) fn event_outcome(outcome: &str) -> &str {
+        if EVENT_OUTCOMES.contains(&outcome) {
+            outcome
+        } else {
+            "other"
+        }
+    }
+
+    /// `agent_steps_total{status}` label domain: how a step that ran ended —
+    /// `done` / `failed` — plus `other` (timed out). A step that never ran
+    /// (skipped, or on a branch not taken) is not counted.
+    const STEP_STATUS: &[&str] = &["done", "failed", "other"];
 
     /// `agent_store_ops_total{result}` label domain: a remote-store op outcome —
     /// `ok` / `conflict` (a CAS mismatch) / `error` — plus `other`.
@@ -666,8 +678,13 @@ mod imp {
         /// Increment the slot for `value`; an unknown value lands in the last
         /// (`other`) slot. `domain` MUST have length `N`.
         fn inc(&self, domain: &[&str], value: &str) {
+            self.add(domain, value, 1);
+        }
+
+        /// Add `n` to the slot for `value`, as [`Self::inc`] does one.
+        fn add(&self, domain: &[&str], value: &str, n: u64) {
             let idx = domain.iter().position(|&l| l == value).unwrap_or(N - 1);
-            self.slots[idx].fetch_add(1, Ordering::Relaxed);
+            self.slots[idx].fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -680,32 +697,32 @@ mod imp {
         pub(super) reactions: AtomicU64,
         tokens_input: AtomicU64,
         tokens_output: AtomicU64,
-        pub(super) restarts_tripped: AtomicU64,
 
-        // --- frozen: run lifecycle & terminal-status -------------------------
-        runs_total: LabelCounter<{ STATUS_LABELS.len() }>,
+        // --- run lifecycle & terminal-status ---------------------------------
+        runs_total: LabelCounter<{ RUN_STATUS.len() }>,
         pub(super) loop_steps: AtomicU64,
 
-        // --- frozen: refusal / bound counters --------------------------------
+        // --- refusal / bound counters ----------------------------------------
         refusals: LabelCounter<{ REFUSAL_REASONS.len() }>,
         limit_exceeded: LabelCounter<{ LIMIT_LABELS.len() }>,
 
-        // --- frozen: subagent-tree gauges + counters -------------------------
+        // --- subagent-tree gauges + counters ---------------------------------
         active_subagents: AtomicU64,
         tree_depth: AtomicU64,
         tree_breadth: AtomicU64,
         pub(super) subagents_spawned: AtomicU64,
-        subagents_exited: LabelCounter<{ STATUS_LABELS.len() }>,
+        subagents_exited: LabelCounter<{ EXIT_STATUS.len() }>,
         subagent_restarts: LabelCounter<{ RESTART_REASONS.len() }>,
         subagent_stuck_kills: LabelCounter<{ SIGNAL_LABELS.len() }>,
 
-        // --- frozen: intelligence health -------------------------------------
+        // --- intelligence health ---------------------------------------------
+        // `agent_intel_all_down` has no field: it is rendered from the
+        // `signals` latch `/readyz` reads, so the two never disagree.
         pub(super) intel_calls: AtomicU64,
         pub(super) intel_up: AtomicU64,
-        // 1 while ALL model endpoints are down (the latched,
-        // eventually-consistent last-child-experience truth that also flips
-        // `/readyz`). Distinct from `intel_up` (the active endpoint's reachability).
-        pub(super) intel_all_down: AtomicU64,
+        /// What `set_intel_up` stored that no child report carried up yet:
+        /// 0 nothing, 1 down, 2 up.
+        intel_up_unsent: AtomicU64,
         intel_errors: LabelCounter<{ INTEL_ERROR_REASONS.len() }>,
 
         // --- tree-pause gauge (0/1) ------------------------------------------
@@ -717,23 +734,22 @@ mod imp {
 
         // --- frozen: lifecycle events ----------------------------------------
         drains: LabelCounter<{ DRAIN_PHASES.len() }>,
-        pub(super) supervisor_restarts: AtomicU64,
         pub(super) reactor_stalls: AtomicU64,
 
         // --- frozen: token accounting (typed) --------------------------------
         tokens_typed: LabelCounter<{ TOKEN_TYPES.len() }>,
 
-        // --- frozen: reactive backlog (the autoscaler's signal set) ----------
-        pending_events: AtomicU64,
+        // --- reactive gauges (the autoscaler's signal set) -------------------
         inflight_reactions: AtomicU64,
-        subscriptions_active: AtomicU64,
         reaction_lag_ms: AtomicU64,
+        resource_subscriptions: AtomicU64,
 
         // --- hot-reload outcome counter + generation gauge -------------------
         config_reloads: LabelCounter<{ RELOAD_RESULTS.len() }>,
         pub(super) config_generation: AtomicU64,
 
         // --- per-instance lifetime-budget balance gauge ----------------------
+        /// `u64::MAX` = no lifetime budget; then the gauge is not emitted.
         pub(super) budget_tokens_remaining: AtomicU64,
         pub(super) pressure_level: AtomicU64,
         /// `u64::MAX` = unknown/no file store; then the gauge is not emitted.
@@ -833,7 +849,6 @@ mod imp {
                 reactions: AtomicU64::new(0),
                 tokens_input: AtomicU64::new(0),
                 tokens_output: AtomicU64::new(0),
-                restarts_tripped: AtomicU64::new(0),
                 runs_total: LabelCounter::new(),
                 loop_steps: AtomicU64::new(0),
                 refusals: LabelCounter::new(),
@@ -847,21 +862,19 @@ mod imp {
                 subagent_stuck_kills: LabelCounter::new(),
                 intel_calls: AtomicU64::new(0),
                 intel_up: AtomicU64::new(0),
-                intel_all_down: AtomicU64::new(0),
+                intel_up_unsent: AtomicU64::new(0),
                 intel_errors: LabelCounter::new(),
                 paused: AtomicU64::new(0),
                 mcp_connect_failures: LabelCounter::new(),
                 drains: LabelCounter::new(),
-                supervisor_restarts: AtomicU64::new(0),
                 reactor_stalls: AtomicU64::new(0),
                 tokens_typed: LabelCounter::new(),
-                pending_events: AtomicU64::new(0),
                 inflight_reactions: AtomicU64::new(0),
-                subscriptions_active: AtomicU64::new(0),
                 reaction_lag_ms: AtomicU64::new(0),
+                resource_subscriptions: AtomicU64::new(0),
                 config_reloads: LabelCounter::new(),
                 config_generation: AtomicU64::new(0),
-                budget_tokens_remaining: AtomicU64::new(0),
+                budget_tokens_remaining: AtomicU64::new(u64::MAX),
                 pressure_level: AtomicU64::new(0),
                 disk_free_bytes: AtomicU64::new(u64::MAX),
                 runs_active: AtomicU64::new(0),
@@ -934,27 +947,14 @@ mod imp {
             table.insert(kind, StreamLag { named: lags, other });
         }
 
-        pub(super) fn record_run(&self, outcome: RunOutcome) {
-            // The bare, unlabelled counters.
-            let c = match outcome {
-                RunOutcome::Completed => &self.runs_completed,
-                RunOutcome::Failed => &self.runs_failed,
-                RunOutcome::Killed => &self.runs_killed,
+        pub(super) fn record_run(&self, status: &str) {
+            let bare = match status {
+                "completed" => &self.runs_completed,
+                "cancelled" => &self.runs_killed,
+                _ => &self.runs_failed,
             };
-            c.fetch_add(1, Ordering::Relaxed);
-            // Frozen `agent_runs_total{status}` — a COARSE projection of the three
-            // `RunOutcome` variants this hook carries onto the closed status
-            // domain. A precise status comes in through `record_run_status`.
-            let status = match outcome {
-                RunOutcome::Completed => "completed",
-                RunOutcome::Failed => "crashed",
-                RunOutcome::Killed => "cancelled",
-            };
-            self.runs_total.inc(STATUS_LABELS, status);
-        }
-
-        pub(super) fn record_run_status(&self, status: &str) {
-            self.runs_total.inc(STATUS_LABELS, status);
+            bare.fetch_add(1, Ordering::Relaxed);
+            self.runs_total.inc(RUN_STATUS, status);
         }
 
         pub(super) fn record_tokens(&self, input: u64, output: u64) {
@@ -975,7 +975,7 @@ mod imp {
         }
 
         pub(super) fn record_subagent_exited(&self, status: &str) {
-            self.subagents_exited.inc(STATUS_LABELS, status);
+            self.subagents_exited.inc(EXIT_STATUS, status);
         }
 
         pub(super) fn record_subagent_restart(&self, reason: &str) {
@@ -988,6 +988,46 @@ mod imp {
 
         pub(super) fn record_intel_error(&self, reason: &str) {
             self.intel_errors.inc(INTEL_ERROR_REASONS, reason);
+        }
+
+        pub(super) fn set_intel_up(&self, up: bool) {
+            self.intel_up.store(u64::from(up), Ordering::Relaxed);
+            self.intel_up_unsent
+                .store(if up { 2 } else { 1 }, Ordering::Relaxed);
+        }
+
+        /// Take what a child counted since the last take: each count swapped
+        /// for zero, so a count lands in exactly one report however the
+        /// frames that carry them interleave.
+        pub(super) fn take_child(&self) -> Option<super::ChildMetrics> {
+            let mut m = super::ChildMetrics {
+                intel_calls: self.intel_calls.swap(0, Ordering::Relaxed),
+                intel_up: match self.intel_up_unsent.swap(0, Ordering::Relaxed) {
+                    1 => Some(false),
+                    2 => Some(true),
+                    _ => None,
+                },
+                loop_steps: self.loop_steps.swap(0, Ordering::Relaxed),
+                ..Default::default()
+            };
+            for (slot, reason) in self.intel_errors.slots.iter().zip(INTEL_ERROR_REASONS) {
+                let n = slot.swap(0, Ordering::Relaxed);
+                if n > 0 {
+                    m.intel_errors.insert(reason.to_string(), n);
+                }
+            }
+            (m != super::ChildMetrics::default()).then_some(m)
+        }
+
+        pub(super) fn record_child(&self, m: &super::ChildMetrics) {
+            self.intel_calls.fetch_add(m.intel_calls, Ordering::Relaxed);
+            self.loop_steps.fetch_add(m.loop_steps, Ordering::Relaxed);
+            for (reason, n) in &m.intel_errors {
+                self.intel_errors.add(INTEL_ERROR_REASONS, reason, *n);
+            }
+            if let Some(up) = m.intel_up {
+                self.intel_up.store(u64::from(up), Ordering::Relaxed);
+            }
         }
 
         pub(super) fn record_mcp_connect_failure(&self, server: &str) {
@@ -1030,18 +1070,11 @@ mod imp {
             self.tree_breadth.store(breadth, Ordering::Relaxed);
         }
 
-        pub(super) fn set_reactive_backlog(
-            &self,
-            pending: u64,
-            inflight: u64,
-            subscriptions: u64,
-            lag_ms: u64,
-        ) {
-            self.pending_events.store(pending, Ordering::Relaxed);
+        pub(super) fn set_reactive_backlog(&self, inflight: u64, lag_ms: u64, resources: u64) {
             self.inflight_reactions.store(inflight, Ordering::Relaxed);
-            self.subscriptions_active
-                .store(subscriptions, Ordering::Relaxed);
             self.reaction_lag_ms.store(lag_ms, Ordering::Relaxed);
+            self.resource_subscriptions
+                .store(resources, Ordering::Relaxed);
         }
 
         pub(super) fn render(&self) -> String {
@@ -1081,24 +1114,17 @@ mod imp {
             labelled_counter(
                 &mut s,
                 "agent_runs_total",
-                "Runs by terminal status.",
+                "Workflow runs by terminal status.",
                 "status",
-                STATUS_LABELS,
+                RUN_STATUS,
                 &self.runs_total,
             );
-            // `agent_loop_steps_total` is driven by `loop.step`, which is emitted
-            // INSIDE the re-exec'd child agentic loop — a different process from the
-            // supervisor this scrape reflects. `record_loop_step` is intentionally
-            // left unwired here: bumping it would only touch the child's own
-            // process-local registry, never this supervisor's. The series is
-            // rendered (so the frozen contract stays discoverable) but reads the
-            // supervisor's own process only; there is no cross-process rollup.
-            // agentctl derives per-run step counts from `loop.step` log lines,
-            // not from this counter.
+            // Counted where the loop runs — a turn worker or a subagent, never
+            // this process — and carried up with the child's frames.
             counter(
                 &mut s,
                 "agent_loop_steps_total",
-                "Agentic loop steps (process-local; emitted in the child loop, so the supervisor scrape reflects its own process only — there is no cross-process rollup).",
+                "Agent loop steps: model rounds of turn workers and subagents.",
                 g(&self.loop_steps),
             );
 
@@ -1118,46 +1144,28 @@ mod imp {
                 TOKEN_TYPES,
                 &self.tokens_typed,
             );
-            // `agent_intel_calls_total`: same `model`-label deferral as tokens
-            // (the `record_intel_call` site carries no model id). Additionally
-            // process-local — `IntelClient::complete` runs in the re-exec'd child
-            // (the supervisor makes no LLM calls), so this reflects only the
-            // scraped process. Derive per-model call counts from `intel.call` logs.
+            // Model calls: this process's own (a decision, a judge) and those
+            // its children report up. No `model` label, as for tokens.
             counter(
                 &mut s,
                 "agent_intel_calls_total",
-                "Intelligence calls made (process-local — the LLM client runs in the child; the frozen `model` label is deferred, never faked).",
+                "Model calls, by this process and the children it supervises.",
                 g(&self.intel_calls),
             );
 
             // --- refusal / bound counters ------------------------------------
-            // `agent_refusals_total` is driven by the model/loop refusing or a
-            // guard tripping — all INSIDE the re-exec'd child loop (orchestrator
-            // self-tool / scope checks), so `record_refusal` is left unwired: it
-            // would only bump the child's process-local registry. Rendered for
-            // contract discoverability but process-local — the supervisor scrape
-            // reflects its own process and nothing rolls up across processes.
-            // agentctl derives refusals from the refusal/`scope.trifecta_refused`
-            // log lines.
             labelled_counter(
                 &mut s,
                 "agent_refusals_total",
-                "Refusals/guard trips by reason (process-local; tripped in the child loop, so the supervisor scrape reflects its own process only).",
+                "Refusals by the guard that refused: a budget, a policy, the trifecta, a subagent cap.",
                 "reason",
                 REFUSAL_REASONS,
                 &self.refusals,
             );
-            // `agent_limit_exceeded_total{limit}` is PARTIALLY wired: the
-            // `tree_tokens` leg is the supervisor's own tree-ceiling trip
-            // (`supervisor::reactor`, this process → reaches the scrape), so it is
-            // live. The `steps`/`tokens`/`deadline`/`depth` legs trip inside the
-            // re-exec'd child loop and are therefore process-local (unwired here;
-            // derived from `limit.exceeded` log lines). Same cross-process boundary
-            // as the rest of this module.
             labelled_counter(
                 &mut s,
                 "agent_limit_exceeded_total",
-                "Hard-bound trips by limit (the `tree_tokens` leg is supervisor-live; the steps/tokens/deadline/depth legs trip in the child loop and are process-local).",
+                "Work a hard bound stopped: a turn or subagent out of steps, tokens or time, or the lifetime budget spent.",
                 "limit",
                 LIMIT_LABELS,
                 &self.limit_exceeded,
@@ -1167,39 +1175,39 @@ mod imp {
             gauge(
                 &mut s,
                 "agent_active_subagents",
-                "Subagents currently alive in the tree.",
+                "Subagents not yet ended.",
                 g(&self.active_subagents),
             );
             gauge(
                 &mut s,
                 "agent_tree_depth",
-                "Current max subagent-tree depth.",
+                "Depth of the deepest subagent not yet ended (1 for one a turn or step spawned).",
                 g(&self.tree_depth),
             );
             gauge(
                 &mut s,
                 "agent_tree_breadth",
-                "Current max siblings at any tree node.",
+                "Most subagents not yet ended that one parent spawned.",
                 g(&self.tree_breadth),
             );
             counter(
                 &mut s,
                 "agent_subagents_spawned_total",
-                "Subagents spawned.",
+                "Child processes started: turn workers and subagents.",
                 g(&self.subagents_spawned),
             );
             labelled_counter(
                 &mut s,
                 "agent_subagents_exited_total",
-                "Subagents exited by terminal status.",
+                "Child processes exited: exit 0, another exit code, a signal.",
                 "status",
-                STATUS_LABELS,
+                EXIT_STATUS,
                 &self.subagents_exited,
             );
             labelled_counter(
                 &mut s,
                 "agent_subagent_restarts_total",
-                "Subagent restarts by reason.",
+                "Subagents spawned again, by reason.",
                 "reason",
                 RESTART_REASONS,
                 &self.subagent_restarts,
@@ -1207,7 +1215,7 @@ mod imp {
             labelled_counter(
                 &mut s,
                 "agent_subagent_stuck_kills_total",
-                "Wedged-subagent kills by signal.",
+                "Children killed by the liveness check (stuck, or past their deadline), by signal.",
                 "signal",
                 SIGNAL_LABELS,
                 &self.subagent_stuck_kills,
@@ -1217,21 +1225,21 @@ mod imp {
             gauge(
                 &mut s,
                 "agent_intel_up",
-                "1 when the intelligence endpoint is reachable.",
+                "1 when the last model call found its endpoint up.",
                 g(&self.intel_up),
             );
             // `agent_intel_all_down`: 1 while EVERY model endpoint is down — the
-            // fleet-routing signal (the same latch that flips /readyz).
+            // fleet-routing signal, read from the latch that flips /readyz.
             gauge(
                 &mut s,
                 "agent_intel_all_down",
                 "1 while all intelligence endpoints are down.",
-                g(&self.intel_all_down),
+                u64::from(crate::signals::intel_all_down()),
             );
             labelled_counter(
                 &mut s,
                 "agent_intel_errors_total",
-                "Intelligence-endpoint errors by reason.",
+                "Failed sweeps of the model endpoints, by reason; a call that backs off and sweeps again counts each.",
                 "reason",
                 INTEL_ERROR_REASONS,
                 &self.intel_errors,
@@ -1245,27 +1253,23 @@ mod imp {
             // daemon's supervisor-process connect path (initial + hot-reload add,
             // `triggers::mode`) calls `record_mcp_connect_failure(server)`, so a
             // failing declared server shows up here labelled by `server`. (A
-            // child-side connect failure is process-local and does not reach this
-            // supervisor scrape — the same process boundary as everything else
-            // in this module.)
+            // child dials connections of its own; one that fails fails the
+            // child, and is not counted here.)
             mcp_servers().render_connect_failures(&mut s, &self.mcp_connect_failures);
 
             // --- tool-call accounting — RESERVED ------------------------------
             // `agent_tool_calls_total{server,tool,ok}` is keyed off `tool.result`,
             // whose boundary (`McpClient::call_tool`) runs predominantly INSIDE the
-            // re-exec'd child loop (the subagent's tool use); the only supervisor-
-            // process call sites are the reactor's own management/lease calls
-            // (`cluster` claim gate), not the agent's tool use the dashboard wants.
-            // A scrape-side counter would therefore be process-local and misleading
-            // (it would NOT reflect the children's tool calls), so the series is
-            // RESERVED here — rendered as a HELP/TYPE marker, no fabricated 0 — and
-            // agentctl reads tool calls from `tool.result` log lines. This mirrors
-            // the `agent_mcp_up` honest-absence shape.
+            // children (a turn's or a subagent's tool use). Nothing counts it
+            // yet, so the series is RESERVED here — rendered as a HELP/TYPE
+            // marker, no fabricated 0 — and agentctl reads tool calls from
+            // `tool.result` log lines. This mirrors the `agent_mcp_up`
+            // honest-absence shape.
             reserved(
                 &mut s,
                 "agent_tool_calls_total",
                 "counter",
-                "Tool calls by server/tool/ok — reserved; the tool-call boundary runs in the child loop, so a supervisor scrape can't reflect it (derive from tool.result log lines).",
+                "Tool calls by server/tool/ok — reserved; nothing counts them yet (derive from tool.result log lines).",
             );
             // `agent_tool_call_duration_ms` / `agent_intel_call_duration_ms` /
             // `agent_run_duration_ms` are frozen HISTOGRAMS. This crate has no
@@ -1306,31 +1310,13 @@ mod imp {
                 DRAIN_PHASES,
                 &self.drains,
             );
-            // `agent_restarts_total` is RESERVED: it counts a supervisor process
-            // *restart* (rebuild + reconcile), and there is no such in-process
-            // restart path to emit it from — a pod restart is a
-            // fresh process with a zeroed registry, so an orchestrator counts
-            // those, not the binary. Rendered (always 0) so the frozen series
-            // stays discoverable; `record_supervisor_restart` is the hook a
-            // reconcile path would call but is deliberately unwired.
-            counter(
-                &mut s,
-                "agent_restarts_total",
-                "Supervisor process restarts observed — reserved; no in-process restart/reconcile emit site.",
-                g(&self.supervisor_restarts),
-            );
-            // `agent_reactor_stalls_total` is RESERVED: a wedged reactor is
-            // surfaced as a `/healthz` 503 (a derived read of the heartbeat age in
-            // `obs::serve`, evaluated per scrape), not as a one-shot in-process
-            // event, so there is no clean emit site to bump a counter exactly
-            // once. Rendered (always 0) for discoverability;
-            // `record_reactor_stall` stays unwired until a dedicated
-            // stall-detection edge exists. The liveness signal an operator
-            // alerts on is the 503 itself, not this counter.
+            // Counted when the loop ticks again after a gap past the `/healthz`
+            // window (`obs::health::tick`); one that never comes back is the
+            // 503's to report.
             counter(
                 &mut s,
                 "agent_reactor_stalls_total",
-                "Wedged-reactor liveness trips — reserved; the live signal is the /healthz 503, there is no one-shot in-process emit site.",
+                "Times the supervisor loop went longer than the /healthz window without a tick, counted when it came back.",
                 g(&self.reactor_stalls),
             );
 
@@ -1354,16 +1340,16 @@ mod imp {
             );
 
             // --- lifetime budget balance --------------------------------------
-            // Tokens remaining before the per-instance cumulative cap; the
-            // alerting/scaling hook. 0 both when unbounded (never set) and when
-            // exhausted — a scraper distinguishes them via the budget event/limit
-            // metric, so unbounded instances read as "no budget in play".
-            gauge(
-                &mut s,
-                "agent_budget_tokens_remaining",
-                "Tokens left before the per-instance lifetime budget; 0 when unbounded or exhausted.",
-                g(&self.budget_tokens_remaining),
-            );
+            // Absent without a lifetime budget: a 0 there would read as spent.
+            let remaining = g(&self.budget_tokens_remaining);
+            if remaining != u64::MAX {
+                gauge(
+                    &mut s,
+                    "agent_budget_tokens_remaining",
+                    "Tokens left under intelligence.budget.lifetime_tokens (absent without one).",
+                    remaining,
+                );
+            }
 
             // --- resource pressure + work in progress -------------------------
             gauge(
@@ -1394,27 +1380,34 @@ mod imp {
                 g(&self.turns_queued),
             );
 
-            // --- reactive backlog — the autoscaler's signal set ----------------
-            gauge(
-                &mut s,
-                "agent_pending_events",
-                "Reactive events received but not yet routed.",
-                g(&self.pending_events),
-            );
+            // --- reactive gauges — the autoscaler's signal set ----------------
             gauge(
                 &mut s,
                 "agent_inflight_reactions",
-                "Reactions currently executing.",
+                "Work executing now: runs in `running`, however they started, and conversation turns in flight.",
                 g(&self.inflight_reactions),
             );
             gauge(
                 &mut s,
-                "agent_subscriptions_active",
-                "Reconciled declared subscriptions.",
-                g(&self.subscriptions_active),
+                "agent_reaction_lag_ms",
+                "Age of the oldest event waiting in the inbox (ms); 0 when none waits.",
+                g(&self.reaction_lag_ms),
             );
-            // The same family's labelled series: MCP Events subscriptions by
-            // delivery mode (RFC 0045 §5.12).
+            // One family, two kinds: the MCP resource subscriptions the
+            // connections hold, and the MCP Events subscriptions by delivery
+            // mode (RFC 0045 §5.12).
+            let _ = writeln!(
+                s,
+                "# HELP agent_subscriptions_active Active subscriptions: MCP resources (kind=\"resource\") and MCP Events bindings by mode (kind=\"event\")."
+            );
+            let _ = writeln!(s, "# TYPE agent_subscriptions_active gauge");
+            series_line(
+                &mut s,
+                "agent_subscriptions_active",
+                &["kind"],
+                &["resource".to_string()],
+                g(&self.resource_subscriptions),
+            );
             for (values, n) in self.event_family("agent_subscriptions_active") {
                 series_line(
                     &mut s,
@@ -1424,12 +1417,6 @@ mod imp {
                     n,
                 );
             }
-            gauge(
-                &mut s,
-                "agent_reaction_lag_ms",
-                "Age of the oldest un-routed pending event (ms).",
-                g(&self.reaction_lag_ms),
-            );
 
             // --- bare, unlabelled series --------------------------------------
             counter(
@@ -1447,19 +1434,19 @@ mod imp {
             counter(
                 &mut s,
                 "agent_runs_failed_total",
-                "Supervised runs that failed on infra",
+                "Supervised runs that ended in any status but completed or cancelled",
                 g(&self.runs_failed),
             );
             counter(
                 &mut s,
                 "agent_runs_killed_total",
-                "Supervised runs torn down by the supervisor",
+                "Supervised runs that ended cancelled",
                 g(&self.runs_killed),
             );
             counter(
                 &mut s,
                 "agent_reactions_total",
-                "Reactive triggers fired",
+                "Start nodes fired: a schedule, loop, subscription, webhook, A2A message, stream, join, event or goal had its event accepted into the inbox",
                 g(&self.reactions),
             );
             counter(
@@ -1474,18 +1461,12 @@ mod imp {
                 "Output tokens reported by direct children",
                 g(&self.tokens_output),
             );
-            counter(
-                &mut s,
-                "agent_restarts_tripped_total",
-                "Restart-governor breaker trips",
-                g(&self.restarts_tripped),
-            );
 
             // --- runtime series: turns, workflow steps, store, inbox, context -
             labelled_counter(
                 &mut s,
                 "agent_turns_total",
-                "Turn-worker runs by context kind.",
+                "Turn workers started, by kind.",
                 "kind",
                 TURN_KINDS,
                 &self.turns_total,
@@ -1493,7 +1474,7 @@ mod imp {
             labelled_counter(
                 &mut s,
                 "agent_steps_total",
-                "Workflow steps by terminal status.",
+                "Workflow steps that ran, by how each attempt ended.",
                 "status",
                 STEP_STATUS,
                 &self.steps_total,
@@ -1709,12 +1690,19 @@ mod imp {
     mod tests {
         use super::*;
 
+        /// Whether `out` has exactly the sample `line`. A gauge whose help
+        /// text starts with "1 while…" has `name 1` inside its `# HELP` line
+        /// too, so a substring check passes whatever the value.
+        fn has(out: &str, line: &str) -> bool {
+            out.lines().any(|l| l == line)
+        }
+
         #[test]
         fn render_is_valid_prometheus_text() {
             let r = Registry::new();
             r.runs_started.fetch_add(3, Ordering::Relaxed);
-            r.record_run(RunOutcome::Completed);
-            r.record_run(RunOutcome::Failed);
+            r.record_run("completed");
+            r.record_run("failed");
             r.record_tokens(100, 50);
             let out = r.render();
             assert!(out.contains("# TYPE agent_runs_started_total counter"));
@@ -1753,7 +1741,7 @@ mod imp {
             let out = r.render();
             // The liveness/readiness gauges are label-free.
             assert!(out.contains("# TYPE agent_up gauge"));
-            assert!(out.contains("agent_up 1"));
+            assert!(has(&out, "agent_up 1"));
             assert!(out.contains("# TYPE agent_ready gauge"));
             // ready is 0/1; in a bare test process (no drain) it is 1.
             assert!(out.contains("agent_ready "));
@@ -1765,39 +1753,71 @@ mod imp {
             let r = Registry::new();
             let out = r.render();
             assert!(out.contains("# TYPE agent_paused gauge"));
-            assert!(out.contains("agent_paused 0"));
+            assert!(has(&out, "agent_paused 0"));
             // Set via the same atomic `set_paused` writes; renders 1.
             r.paused.store(1, Ordering::Relaxed);
-            assert!(r.render().contains("agent_paused 1"));
+            assert!(has(&r.render(), "agent_paused 1"));
         }
 
         #[test]
-        fn intel_all_down_gauge_renders_zero_then_one() {
-            // `agent_intel_all_down` is a 0/1 gauge, default 0, set from the
-            // latched all-down flag (the same one /readyz reads).
+        fn intel_all_down_gauge_reads_the_readiness_latch() {
+            // `agent_intel_all_down` is the latch a child's `IntelHealth`
+            // report sets and `/readyz` reads, rendered as 0/1: the gauge and
+            // the probe cannot disagree.
+            let _g = crate::signals::test_guard();
             let r = Registry::new();
+            crate::signals::set_intel_all_down(false);
+            assert!(has(&r.render(), "agent_intel_all_down 0"));
+            crate::signals::set_intel_all_down(true);
             let out = r.render();
+            crate::signals::set_intel_all_down(false);
             assert!(out.contains("# TYPE agent_intel_all_down gauge"));
-            assert!(out.contains("agent_intel_all_down 0"));
-            // Set via the same atomic `set_intel_all_down` writes; renders 1.
-            r.intel_all_down.store(1, Ordering::Relaxed);
-            assert!(r.render().contains("agent_intel_all_down 1"));
+            assert!(has(&out, "agent_intel_all_down 1"), "{out}");
         }
 
         #[test]
-        fn runs_total_uses_the_closed_status_domain() {
+        fn a_finished_run_counts_once() {
+            // The run's end is one count in the labelled family and one in the
+            // bare counter it falls under; nothing else is counted for it.
             let r = Registry::new();
-            r.record_run_status("completed");
-            r.record_run_status("refused");
-            r.record_run_status("refused");
+            r.record_run("completed");
+            let out = r.render();
+            assert!(
+                out.contains("agent_runs_total{status=\"completed\"} 1"),
+                "{out}"
+            );
+            assert!(out.contains("agent_runs_completed_total 1"));
+            let total: u64 = out
+                .lines()
+                .filter(|l| l.starts_with("agent_runs_total{"))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum();
+            assert_eq!(total, 1, "{out}");
+        }
+
+        #[test]
+        fn runs_total_uses_the_run_status_domain() {
+            let r = Registry::new();
+            r.record_run("completed");
+            r.record_run("failed");
+            r.record_run("refused");
+            r.record_run("refused");
+            r.record_run("cancelled");
             // an out-of-vocabulary status buckets under `other`, never a new label
-            r.record_run_status("totally_made_up");
+            r.record_run("totally_made_up");
             let out = r.render();
             assert!(out.contains("agent_runs_total{status=\"completed\"} 1"));
+            assert!(out.contains("agent_runs_total{status=\"failed\"} 1"));
             assert!(out.contains("agent_runs_total{status=\"refused\"} 2"));
             assert!(out.contains("agent_runs_total{status=\"other\"} 1"));
             // every closed-domain value is present (zero-valued series included)
-            assert!(out.contains("agent_runs_total{status=\"loop_detected\"} 0"));
+            assert!(out.contains("agent_runs_total{status=\"stalled\"} 0"));
+            // a loop's statuses are not a run's
+            assert!(!out.contains("status=\"loop_detected\""));
+            // the bare counters split the same ends three ways
+            assert!(out.contains("agent_runs_completed_total 1"));
+            assert!(out.contains("agent_runs_killed_total 1"));
+            assert!(out.contains("agent_runs_failed_total 4"));
             // exactly one HELP/TYPE header for the family
             assert_eq!(out.matches("# TYPE agent_runs_total counter").count(), 1);
         }
@@ -1818,11 +1838,13 @@ mod imp {
             r.record_refusal("trifecta");
             r.record_refusal("depth");
             r.record_refusal("depth");
-            r.record_limit_exceeded("spawn_rate");
+            r.record_refusal("policy");
+            r.record_limit_exceeded("tokens_lifetime");
             let out = r.render();
             assert!(out.contains("agent_refusals_total{reason=\"trifecta\"} 1"));
             assert!(out.contains("agent_refusals_total{reason=\"depth\"} 2"));
-            assert!(out.contains("agent_limit_exceeded_total{limit=\"spawn_rate\"} 1"));
+            assert!(out.contains("agent_refusals_total{reason=\"policy\"} 1"));
+            assert!(out.contains("agent_limit_exceeded_total{limit=\"tokens_lifetime\"} 1"));
             // closed domains: a stray reason never widens the label set
             r.record_refusal("nope");
             assert!(
@@ -1832,18 +1854,110 @@ mod imp {
         }
 
         #[test]
+        fn a_units_end_names_the_bound_that_stopped_it() {
+            // The terminal statuses a turn or a subagent ends on name the bound
+            // that stopped it; any other end is no bound's.
+            use super::super::bound_of;
+            assert_eq!(bound_of("exhausted_steps"), Some("steps"));
+            assert_eq!(bound_of("exhausted_tokens"), Some("tokens"));
+            assert_eq!(bound_of("deadline"), Some("deadline"));
+            for other in [
+                "completed",
+                "failed",
+                "cancelled",
+                "loop_detected",
+                "refused",
+            ] {
+                assert_eq!(bound_of(other), None, "{other}");
+            }
+            // Every bound it names is in the family's domain.
+            for b in ["steps", "tokens", "deadline"] {
+                assert!(LIMIT_LABELS.contains(&b));
+            }
+        }
+
+        #[test]
         fn tree_and_backlog_gauges_are_settable() {
             let r = Registry::new();
             r.set_tree_shape(4, 2, 3);
-            r.set_reactive_backlog(7, 1, 9, 250);
+            r.set_reactive_backlog(1, 250, 9);
             let out = r.render();
             assert!(out.contains("agent_active_subagents 4"));
             assert!(out.contains("agent_tree_depth 2"));
             assert!(out.contains("agent_tree_breadth 3"));
-            assert!(out.contains("agent_pending_events 7"));
             assert!(out.contains("agent_inflight_reactions 1"));
-            assert!(out.contains("agent_subscriptions_active 9"));
+            assert!(out.contains("agent_subscriptions_active{kind=\"resource\"} 9"));
             assert!(out.contains("agent_reaction_lag_ms 250"));
+            // The inbox backlog is `agent_inbox_pending`'s, and only its.
+            assert!(!out.contains("agent_pending_events"));
+        }
+
+        #[test]
+        fn a_childs_counts_reach_the_supervisor_once() {
+            // A child counts into its own registry; what it took goes up as one
+            // report, and the supervisor adds it to its own counts. A second
+            // take carries only what was counted since.
+            let child = Registry::new();
+            let sup = Registry::new();
+            assert_eq!(child.take_child(), None, "nothing counted, nothing sent");
+            child.intel_calls.fetch_add(2, Ordering::Relaxed);
+            child.record_intel_error("timeout");
+            child.set_intel_up(true);
+            child.loop_steps.fetch_add(3, Ordering::Relaxed);
+            let report = child.take_child().expect("a report");
+            assert_eq!(report.intel_calls, 2);
+            assert_eq!(report.intel_errors.get("timeout"), Some(&1));
+            assert_eq!(report.intel_up, Some(true));
+            assert_eq!(report.loop_steps, 3);
+            assert_eq!(child.take_child(), None, "taken counts are not sent twice");
+            sup.record_child(&report);
+            // It survives the wire as it was written.
+            let wire: super::super::ChildMetrics =
+                serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+            sup.record_child(&wire);
+            let out = sup.render();
+            assert!(out.contains("agent_intel_calls_total 4"), "{out}");
+            assert!(out.contains("agent_intel_errors_total{reason=\"timeout\"} 2"));
+            assert!(has(&out, "agent_intel_up 1"), "{out}");
+            assert!(out.contains("agent_loop_steps_total 6"));
+            // The child's last word on reachability is the gauge's.
+            child.set_intel_up(false);
+            sup.record_child(&child.take_child().expect("a report"));
+            assert!(has(&sup.render(), "agent_intel_up 0"));
+        }
+
+        #[test]
+        fn steps_count_how_an_attempt_ended() {
+            // Only a step that ran ends through the counter: one skipped, or
+            // on a branch not taken, never reaches it, so no `skipped` series
+            // reads as "nothing was skipped".
+            let r = Registry::new();
+            r.record_step("done");
+            r.record_step("failed");
+            r.record_step("other");
+            let out = r.render();
+            for status in ["done", "failed", "other"] {
+                assert!(
+                    has(&out, &format!("agent_steps_total{{status=\"{status}\"}} 1")),
+                    "{out}"
+                );
+            }
+            assert!(
+                !out.contains("agent_steps_total{status=\"skipped\"}"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn mcp_event_outcomes_keep_their_names() {
+            // A webhook delivery that failed its check, and an occurrence only
+            // the instruction follows, count by name, not as `other`.
+            assert_eq!(event_outcome("unauthenticated"), "unauthenticated");
+            assert_eq!(event_outcome("followed"), "followed");
+            for o in EVENT_OUTCOMES {
+                assert_eq!(event_outcome(o), *o);
+            }
+            assert_eq!(event_outcome("anything else"), "other");
         }
 
         #[test]
@@ -2020,20 +2134,16 @@ mod imp {
         }
 
         #[test]
-        fn budget_gauge_and_lifetime_limit_render() {
-            // The balance gauge (present at 0 by default) plus the
-            // `tokens_lifetime` value of the closed `agent_limit_exceeded_total`
-            // domain.
+        fn budget_gauge_is_absent_without_a_lifetime_budget() {
+            // No lifetime budget, no gauge: a 0 would read as a spent one.
             let r = Registry::new();
+            assert!(!r.render().contains("agent_budget_tokens_remaining"));
+            r.budget_tokens_remaining.store(1500, Ordering::Relaxed);
             let out = r.render();
             assert!(out.contains("# TYPE agent_budget_tokens_remaining gauge"));
-            assert!(out.contains("agent_budget_tokens_remaining 0"));
-
-            r.budget_tokens_remaining.store(1500, Ordering::Relaxed);
-            r.record_limit_exceeded("tokens_lifetime");
-            let out = r.render();
             assert!(out.contains("agent_budget_tokens_remaining 1500"));
-            assert!(out.contains("agent_limit_exceeded_total{limit=\"tokens_lifetime\"} 1"));
+            r.budget_tokens_remaining.store(0, Ordering::Relaxed);
+            assert!(r.render().contains("agent_budget_tokens_remaining 0"));
         }
 
         #[test]
@@ -2041,7 +2151,7 @@ mod imp {
             // Cardinality: render must never contain a run_id/agent_path-style
             // label key. We assert the only label keys present are the bounded set.
             let r = Registry::new();
-            r.record_run_status("completed");
+            r.record_run("completed");
             r.record_tokens(1, 1);
             r.record_refusal("trifecta");
             r.record_mcp_connect_failure("github");
@@ -2119,17 +2229,31 @@ mod imp {
                 "agent_tool_call_duration_ms", // reserved (histogram)
                 // lifecycle events
                 "agent_drains_total",
-                "agent_restarts_total",       // reserved (no emit site)
-                "agent_reactor_stalls_total", // reserved (no emit site)
-                // reactive backlog
-                "agent_pending_events",
+                "agent_reactor_stalls_total",
+                // reactive gauges
                 "agent_inflight_reactions",
                 "agent_subscriptions_active",
                 "agent_reaction_lag_ms",
+                // bare series
+                "agent_reactions_total",
+                "agent_turns_total",
             ] {
                 assert!(
                     out.contains(&format!("# TYPE {name} ")),
                     "frozen series missing from render: {name}"
+                );
+            }
+            // What nothing in agentd can write is not on the surface: no
+            // restart governor, no in-process supervisor restart, and the inbox
+            // backlog is `agent_inbox_pending`'s alone.
+            for gone in [
+                "agent_restarts_total",
+                "agent_restarts_tripped_total",
+                "agent_pending_events",
+            ] {
+                assert!(
+                    !out.contains(&format!("# TYPE {gone} ")),
+                    "{gone} is rendered"
                 );
             }
             // The three histograms + the deferred tool-call counter are RESERVED:
@@ -2167,52 +2291,37 @@ mod imp {
             // `supervisor::reactor` / `triggers::mode`; here we exercise the
             // registry contract those call sites depend on.)
             let r = Registry::new();
-            // subagent spawn/exit (reactor.rs).
+            // child spawn/exit (`runtime::children`).
             r.subagents_spawned.fetch_add(1, Ordering::Relaxed);
             r.record_subagent_exited("completed");
             r.record_subagent_exited("cancelled");
-            // stuck-kill ladder (reactor.rs drive_drain Term/Kill).
-            r.record_subagent_stuck_kill("term");
+            // the liveness check's kill (`Runtime::on_unhealthy_child`).
             r.record_subagent_stuck_kill("kill");
             // drain phases (reactor.rs begin_drain/Done/timeout + mode.rs daemon).
             r.record_drain("started");
             r.record_drain("completed");
             r.record_drain("forced");
-            // restart governor respawn (mode.rs Backoff branch).
-            r.record_subagent_restart("crashed");
+            // a restored subagent spawned again (`respawn_restored_subagents`).
+            r.record_subagent_restart("restored");
             // mcp connect failure (mode.rs connect + hot-reload add).
             r.record_mcp_connect_failure("github");
-            // tree-token bound trip (reactor.rs Usage handler).
-            r.record_limit_exceeded("tree_tokens");
+            // the reactor coming back from a stall (`obs::health::tick`).
+            r.reactor_stalls.fetch_add(1, Ordering::Relaxed);
             let out = r.render();
             assert!(out.contains("agent_subagents_spawned_total 1"));
             assert!(out.contains("agent_subagents_exited_total{status=\"completed\"} 1"));
             assert!(out.contains("agent_subagents_exited_total{status=\"cancelled\"} 1"));
-            assert!(out.contains("agent_subagent_stuck_kills_total{signal=\"term\"} 1"));
             assert!(out.contains("agent_subagent_stuck_kills_total{signal=\"kill\"} 1"));
             assert!(out.contains("agent_drains_total{phase=\"started\"} 1"));
             assert!(out.contains("agent_drains_total{phase=\"completed\"} 1"));
             assert!(out.contains("agent_drains_total{phase=\"forced\"} 1"));
-            assert!(out.contains("agent_subagent_restarts_total{reason=\"crashed\"} 1"));
+            assert!(out.contains("agent_subagent_restarts_total{reason=\"restored\"} 1"));
             assert!(out.contains("agent_mcp_connect_failures_total{server=\"github\"} 1"));
-            assert!(out.contains("agent_limit_exceeded_total{limit=\"tree_tokens\"} 1"));
-        }
-
-        #[test]
-        fn reserved_no_emit_counters_render_zero() {
-            // `agent_restarts_total` (supervisor restart) and
-            // `agent_reactor_stalls_total` have no in-process emit site; they
-            // render reserved-but-present at 0 so the contract stays discoverable
-            // without falsely claiming a non-zero value.
-            let r = Registry::new();
-            let out = r.render();
-            assert!(out.contains("# TYPE agent_restarts_total counter"));
-            assert!(out.contains("agent_restarts_total 0"));
-            assert!(out.contains("# TYPE agent_reactor_stalls_total counter"));
-            assert!(out.contains("agent_reactor_stalls_total 0"));
-            // Their HELP marks them reserved (not silently permanent-0). Both
-            // reserved-counter HELP lines carry the marker phrase.
-            assert!(out.matches("reserved").count() >= 2);
+            assert!(out.contains("agent_reactor_stalls_total 1"));
+            // The label domains hold what is written: a child's exit is not a
+            // run's status, and nothing sends a stuck child SIGTERM.
+            assert!(!out.contains("agent_subagents_exited_total{status=\"exhausted_steps\"}"));
+            assert!(!out.contains("signal=\"term\""));
         }
     }
 }

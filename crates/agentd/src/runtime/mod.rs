@@ -1242,7 +1242,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             .clone()
             .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
     {
-        crate::obs::otel::arm_logs(&ep, "agentd", crate::VERSION);
+        crate::obs::otel::arm_logs(&log, &ep, "agentd", crate::VERSION);
         log.info("otel.logs.armed", json!({"endpoint": ep}));
     }
     // `--prompt`: the task, delivered as a MESSAGE into the agent's root

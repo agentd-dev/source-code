@@ -70,7 +70,7 @@ see when the feature is missing.
 
 | Configuration | Feature | Without the feature |
 |---|---|---|
-| an `https://` endpoint, listener or peer; `security.tls_ca` | `tls` | an `https://` model endpoint passes validation and fails at the dial as unsupported |
+| an `https://` endpoint, listener or peer; `security.tls_ca` | `tls` | an `https://` model endpoint passes validation and fails at the dial as unsupported; an `https://` OTLP collector is refused at load: `an https:// observability.otel.endpoint needs the tls build feature, …` |
 | `a2a.listen`, `a2a.peers`, `webhooks.listen`, and so every `webhook` node and A2A start | `a2a` | refused at load: `a2a.listen needs the a2a build feature, which this binary was built without — …` |
 | a `schedule` start with `cron:` | `cron` | refused at load: `cron schedules require the 'cron' build feature` |
 | any CEL expression | `cel` | refused at load: `… uses an expression, which needs the 'cel' build feature (bare paths work without it)` |

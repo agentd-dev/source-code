@@ -103,7 +103,7 @@ these names, and anything else is refused at load.
 | `message` | The message-depth guard |
 | `metrics` | The probe and scrape listener |
 | `nested` | Fan-out bodies |
-| `otel` | OTLP log export |
+| `otel` | OTLP export |
 | `plan` | Plan updates |
 | `preflight` | Preflight triage |
 | `pressure` | Resource pressure |
@@ -475,6 +475,8 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
+| `otel.export.failed` | warn | `endpoint`, `err`, `failures`, `signal` | A batch of `signal` (`traces`, `logs`) did not reach the collector and was dropped. Written when exports start failing, then at most once a minute while they keep failing; `failures` counts the batches lost since the signal's last `otel.export.recovered`. |
+| `otel.export.recovered` | info | `endpoint`, `failures`, `signal` | The collector took a batch after `failures` were lost. Written at most once a minute: after a failure inside that minute, which is logged at once, the next one waits for the first batch taken once the minute is up. |
 | `otel.logs.armed` | info | `endpoint` | OTLP log export is on. |
 
 ### plan
@@ -941,9 +943,15 @@ The file is not removed when the process exits, so a reader must check that
 The `otel` build feature exports over OTLP/HTTP with JSON bodies. The
 collector is `observability.otel.endpoint`, else the
 `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. agentd appends
-`/v1/traces` or `/v1/logs` unless the URL already ends with it. Only a
-plain `http://` collector is supported; an `https://` endpoint exports
-nothing.
+`/v1/traces` or `/v1/logs` unless the URL already ends with it. An
+`observability.otel.endpoint` that is not an `http://` or `https://` URL,
+such as a bare `host:port` or `grpc://`, is refused at load. An
+`https://` collector is dialled over TLS and its certificate checked
+against the bundled public roots plus `security.tls_ca`. A binary built
+without the `tls` feature refuses an `https://`
+`observability.otel.endpoint` at load; an `https://`
+`OTEL_EXPORTER_OTLP_ENDPOINT`, read only at export, fails each export
+instead.
 
 **Traces.** With a collector configured, each turn worker and subagent loop
 exports one batch when it finishes: an `invoke_agent` span with a `chat`
@@ -957,8 +965,22 @@ the instance's `trace_id`. The resource carries `service.name: agentd` and
 | `chat` | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
 | `execute_tool` | `gen_ai.operation.name`, `gen_ai.tool.name` |
 
-A span's status is OK or ERROR. Export is best effort: a failure is dropped
-and never fails the turn.
+A span's status is OK or ERROR. Export is best effort and never fails the
+turn: each step of a send (connect, write, read) gives up after 5 s, and a
+batch that fails is dropped, not retried.
+
+**Failures.** A failed export is logged as `otel.export.failed` (warn),
+naming the signal (`traces` or `logs`), the endpoint and the error, when
+exports start failing, then at most once a minute while they keep failing.
+The first batch the collector takes after that is logged as
+`otel.export.recovered` (info), also at most once a minute: if exports fail
+again within a minute of that line, the failure is logged at once, and the
+next `otel.export.recovered` waits for the first batch taken after that
+minute. So a collector that drops every other batch gets one line of each
+a minute. `failures` counts the batches lost since the signal's last
+`otel.export.recovered`. Each process counts on its own: a turn worker
+exports one trace, so each turn whose trace fails logs one line, while the
+supervisor's log export keeps one count for as long as it runs.
 
 **Logs.** `observability.otel.logs: true` mirrors the supervisor process's
 log lines to the collector every 5 s. Each record's body is the event name,

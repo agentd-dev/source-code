@@ -244,7 +244,7 @@ pub fn run_turn(
     // consumes the span) can be `take`n from the return-macro without a move
     // across the loop.
     let mut run_span = Some(crate::obs::otel::run_begin(
-        log.ctx().trace_id.as_deref(),
+        log,
         crate::obs::otel::now_unix_nanos(),
     ));
 

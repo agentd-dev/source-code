@@ -331,10 +331,22 @@ otel:
   names. Setting the endpoint is enough.
 - **Logs.** `logs: true` mirrors the supervisor's log lines every 5 s.
 
-The endpoint must be plain `http://`; an `https://` collector exports
-nothing. Without `endpoint`, agentd reads `OTEL_EXPORTER_OTLP_ENDPOINT`.
-Export is best effort and never slows or fails a turn. The endpoint is
-restart-only.
+The endpoint is `http://` or `https://`; a bare `host:port` or a
+`grpc://` URL is refused at load. An `https://` collector's
+certificate is checked against the bundled public roots plus
+`security.tls_ca`, as every outbound connection's is. Without `endpoint`,
+agentd reads `OTEL_EXPORTER_OTLP_ENDPOINT`. The endpoint is restart-only.
+
+Export is best effort and never fails a turn. A turn sends its trace as it
+ends, and each step of the send (connect, write, read) gives up after 5 s;
+logs go from a background thread. A batch that fails is dropped, not
+retried, and logged: `otel.export.failed` (warn) names the signal, the
+endpoint and the error when exports start failing, then at most once a
+minute while the collector keeps failing, and `otel.export.recovered`
+(info) says when it takes a batch again, also at most once a minute, so
+a collector that drops every other batch gets one line of each a minute,
+not one every batch. Each process counts on its own, so every turn whose
+trace fails logs its own line.
 
 ## Correlate with other services
 

@@ -4,7 +4,9 @@
 //! Hand-rolled OTLP-over-HTTP/**JSON** — no `opentelemetry` crate, no protobuf.
 //! It reuses what agentd already has: the W3C trace/span ids on every run
 //! ([`crate::obs::trace`]), `serde_json`, and the hand-rolled HTTP client
-//! ([`crate::net::http`]). So `--features otel` stays dependency-free.
+//! ([`crate::net::http`]), over the same TLS dial as every other outbound
+//! client for an `https://` collector (`net::tls`, with `security.tls_ca`
+//! added to the bundled roots). So `--features otel` stays dependency-free.
 //!
 //! Off the default path: [`RunSpan`] is a **no-op handle unless built
 //! `--features otel`** (so loop call sites stay clean and the default build pays
@@ -12,9 +14,16 @@
 //! `execute_tool` span per tool call, then flushes the whole trace — the
 //! `invoke_agent` run span (GenAI semconv) plus those children, one OTLP batch —
 //! to `observability.otel.endpoint` (else `OTEL_EXPORTER_OTLP_ENDPOINT`) when
-//! it finishes. Best-effort: an export failure is logged-and-dropped;
-//! telemetry never fails a run.
+//! it finishes. Best-effort: telemetry never fails a run, and a batch that
+//! fails is dropped, not retried. The failure is logged: `otel.export.failed`
+//! names the signal, the endpoint and the error when exports start failing,
+//! then at most once a minute while the collector keeps failing, and
+//! `otel.export.recovered` says when it takes a batch again, also at most
+//! once a minute, so a collector that drops every other batch gets one line
+//! of each a minute, not one every batch. Each process keeps its own count,
+//! so a turn worker, which exports once, says it once.
 
+use crate::obs::log::Logger;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,18 +68,18 @@ pub struct RunSpan {
     inner: Option<imp::RunSpan>,
 }
 
-/// Begin the run span. `trace_id` is the run's W3C trace id; `start_unix_nanos`
-/// stamps the `invoke_agent` span start.
-pub fn run_begin(trace_id: Option<&str>, start_unix_nanos: u128) -> RunSpan {
+/// Begin the run span under `log`'s W3C trace id; a failed export is logged
+/// to `log`. `start_unix_nanos` stamps the `invoke_agent` span start.
+pub fn run_begin(log: &Logger, start_unix_nanos: u128) -> RunSpan {
     #[cfg(feature = "otel")]
     {
         RunSpan {
-            inner: imp::RunSpan::begin(trace_id, start_unix_nanos),
+            inner: imp::RunSpan::begin(log, start_unix_nanos),
         }
     }
     #[cfg(not(feature = "otel"))]
     {
-        let _ = (trace_id, start_unix_nanos);
+        let _ = (log, start_unix_nanos);
         RunSpan {}
     }
 }
@@ -125,19 +134,22 @@ pub fn capture_log(unix_nanos: u128, level: &str, event: &str, fields: &serde_js
 }
 
 /// Arm the OTLP **logs** exporter: a bounded buffer drained by a background
-/// thread to `<endpoint>/v1/logs`. Idempotent; a no-op without `otel`.
-pub fn arm_logs(endpoint: &str, service: &str, version: &str) {
+/// thread to `<endpoint>/v1/logs`, which logs a failed export to `log`.
+/// Idempotent; a no-op without `otel`.
+pub fn arm_logs(log: &Logger, endpoint: &str, service: &str, version: &str) {
     #[cfg(feature = "otel")]
-    imp::arm_logs(endpoint, service, version);
+    imp::arm_logs(log, endpoint, service, version);
     #[cfg(not(feature = "otel"))]
-    let _ = (endpoint, service, version);
+    let _ = (log, endpoint, service, version);
 }
 
 #[cfg(feature = "otel")]
 mod imp {
     use crate::net::http::{self, Url};
+    use crate::obs::log::Logger;
     use serde_json::{Value, json};
-    use std::time::Duration;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     /// A finished span, ready to encode as OTLP. Times are unix nanoseconds.
     pub(super) struct Span {
@@ -152,13 +164,15 @@ mod imp {
     }
 
     /// The live recorder for one run: the `invoke_agent` span identity + the
-    /// child spans collected so far + where to ship them.
+    /// child spans collected so far + where to ship them, and the log a
+    /// failed shipment is told to.
     pub(super) struct RunSpan {
         trace_id: String,
         span_id: String,
         start_unix_nanos: u128,
         endpoint: String,
         children: Vec<Span>,
+        log: Logger,
     }
 
     /// OTLP `AnyValue` for a string.
@@ -173,15 +187,16 @@ mod imp {
 
     impl RunSpan {
         /// Begin a run span, or `None` if there's no endpoint / trace to anchor it.
-        pub(super) fn begin(trace_id: Option<&str>, start_unix_nanos: u128) -> Option<RunSpan> {
+        pub(super) fn begin(log: &Logger, start_unix_nanos: u128) -> Option<RunSpan> {
             let endpoint = super::endpoint()?;
-            let trace_id = trace_id?.to_string();
+            let trace_id = log.ctx().trace_id.clone()?;
             Some(RunSpan {
                 span_id: crate::obs::trace::new_span_id(),
                 trace_id,
                 start_unix_nanos,
                 endpoint,
                 children: Vec::new(),
+                log: log.clone(),
             })
         }
 
@@ -251,8 +266,10 @@ mod imp {
             };
             self.children.push(run);
             // Best-effort: telemetry export must never fail the run.
-            let _ = export(
+            export_and_report(
+                &self.log,
                 &self.endpoint,
+                "traces",
                 &to_otlp_json(&self.children, "agentd", crate::VERSION),
             );
         }
@@ -294,44 +311,165 @@ mod imp {
         span
     }
 
-    /// POST the OTLP body to `<endpoint>/v1/traces` (OTLP/HTTP, JSON). `http://`
-    /// only in the default build; an `https://` collector needs `--features tls`.
-    fn export(endpoint: &str, body: &Value) -> Result<(), String> {
+    /// The bound on each step of one export: the dial, each write, each read.
+    const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// POST an OTLP body to `<endpoint>/v1/<signal>` (`traces` | `logs`),
+    /// over TLS for an `https://` endpoint.
+    fn export(endpoint: &str, signal: &str, body: &Value) -> Result<(), String> {
         let base = endpoint.trim_end_matches('/');
-        let target = if base.ends_with("/v1/traces") {
+        let suffix = format!("/v1/{signal}");
+        let target = if base.ends_with(&suffix) {
             base.to_string()
         } else {
-            format!("{base}/v1/traces")
+            format!("{base}{suffix}")
         };
-        let url = Url::parse(&target).map_err(|e| format!("otel: bad endpoint '{target}': {e}"))?;
-        if url.is_tls() {
-            return Err("otel: https OTLP endpoints need --features tls".into());
-        }
+        let url = Url::parse(&target).map_err(|e| format!("bad endpoint {target}: {e}"))?;
         let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-        let mut stream = http::connect_tcp(&url.host, url.port, Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
+        let mut stream = connect(&url)?;
         let headers = [("content-type", "application/json")];
         let resp = http::send(
-            &mut stream,
+            stream.as_mut(),
             &url.host_header(),
             "POST",
             &url.path,
             &headers,
             &bytes,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("POST {target}: {e}"))?;
         if resp.is_success() {
             Ok(())
         } else {
-            Err(format!("otel: collector returned HTTP {}", resp.status))
+            Err(format!("POST {target}: HTTP {}", resp.status))
+        }
+    }
+
+    /// Dial the collector: plain TCP for `http://`, TLS for `https://` with
+    /// the trust every outbound client has (the bundled roots, plus
+    /// `security.tls_ca`). The handshake runs with the request's first write.
+    fn connect(url: &Url) -> Result<Box<dyn http::Stream>, String> {
+        #[cfg(not(feature = "tls"))]
+        if url.is_tls() {
+            return Err("an https:// collector needs the tls build feature".into());
+        }
+        let tcp = http::connect_tcp(&url.host, url.port, EXPORT_TIMEOUT)
+            .map_err(|e| format!("connect {}: {e}", url.host_header()))?;
+        #[cfg(feature = "tls")]
+        if url.is_tls() {
+            let tls = crate::net::tls::connect(tcp, &url.host, None)
+                .map_err(|e| format!("tls {}: {e}", url.host))?;
+            return Ok(Box::new(tls));
+        }
+        Ok(Box::new(tcp))
+    }
+
+    // ---- export failures ---------------------------------------------------
+    // A batch that fails is dropped; the log says so without repeating itself
+    // every batch while a collector stays down or keeps failing some batches.
+
+    /// How long the log goes without repeating a line about one signal: a
+    /// second `otel.export.failed` while exports keep failing, or a second
+    /// `otel.export.recovered` after a collector that fails again.
+    const FAILURE_QUIET: Duration = Duration::from_secs(60);
+
+    /// What the log has been told about one signal's exports.
+    struct Health {
+        /// Batches lost since the last `otel.export.recovered` line.
+        lost: u64,
+        /// When the last `otel.export.failed` line was written; `None` while
+        /// the log's last word on the signal is that its exports work.
+        warned_at: Option<Instant>,
+        /// When the last `otel.export.recovered` line was written.
+        recovered_at: Option<Instant>,
+    }
+
+    /// What one export's outcome has the log say. `failures` counts the
+    /// batches lost since the last `Recovered`, this one included for `Failed`.
+    #[derive(Debug, PartialEq)]
+    enum Say {
+        Nothing,
+        Failed { failures: u64 },
+        Recovered { failures: u64 },
+    }
+
+    impl Health {
+        const fn new() -> Health {
+            Health {
+                lost: 0,
+                warned_at: None,
+                recovered_at: None,
+            }
+        }
+
+        /// Record one export's outcome at `now`. A failure is said at once
+        /// when the log last said exports work, and otherwise once
+        /// [`FAILURE_QUIET`] has passed since the last failure line. A success
+        /// after a failure line is said once, but not within [`FAILURE_QUIET`]
+        /// of the last recovery line: a collector that fails every other batch
+        /// gets one line of each a minute, and the log keeps saying it fails
+        /// until a success comes after that minute.
+        fn record(&mut self, ok: bool, now: Instant) -> Say {
+            let quiet =
+                |at: Option<Instant>| at.is_some_and(|at| now.duration_since(at) < FAILURE_QUIET);
+            if ok {
+                if self.warned_at.is_none() || quiet(self.recovered_at) {
+                    return Say::Nothing;
+                }
+                self.warned_at = None;
+                self.recovered_at = Some(now);
+                return Say::Recovered {
+                    failures: std::mem::take(&mut self.lost),
+                };
+            }
+            self.lost += 1;
+            if quiet(self.warned_at) {
+                return Say::Nothing;
+            }
+            self.warned_at = Some(now);
+            Say::Failed {
+                failures: self.lost,
+            }
+        }
+    }
+
+    static TRACES_HEALTH: Mutex<Health> = Mutex::new(Health::new());
+    static LOGS_HEALTH: Mutex<Health> = Mutex::new(Health::new());
+
+    /// Export one batch of `signal` and log what its outcome calls for.
+    fn export_and_report(log: &Logger, endpoint: &str, signal: &str, body: &Value) {
+        let outcome = export(endpoint, signal, body);
+        let health = if signal == "logs" {
+            &LOGS_HEALTH
+        } else {
+            &TRACES_HEALTH
+        };
+        // The verdict is taken under the lock and said after it, so a log
+        // line (which the logs exporter buffers) never runs under it.
+        let say = health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(outcome.is_ok(), Instant::now());
+        match say {
+            Say::Nothing => {}
+            Say::Failed { failures } => log.warn(
+                "otel.export.failed",
+                json!({
+                    "signal": signal,
+                    "endpoint": endpoint,
+                    "err": outcome.err().unwrap_or_default(),
+                    "failures": failures,
+                }),
+            ),
+            Say::Recovered { failures } => log.info(
+                "otel.export.recovered",
+                json!({"signal": signal, "endpoint": endpoint, "failures": failures}),
+            ),
         }
     }
 
     // ---- OTLP logs (optional) ----------------------------------------------
     // A bounded buffer drained by a background thread to `<endpoint>/v1/logs`.
     // The JSON-lines log surface is the primary one; this is the OTLP mirror.
-
-    use std::sync::{Mutex, OnceLock};
 
     static LOGS: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
 
@@ -353,11 +491,12 @@ mod imp {
 
     /// Arm the OTLP logs exporter: install the buffer + spawn a background flush
     /// thread. Idempotent (a second call no-ops).
-    pub(super) fn arm_logs(endpoint: &str, service: &str, version: &str) {
+    pub(super) fn arm_logs(log: &Logger, endpoint: &str, service: &str, version: &str) {
         if LOGS.set(Mutex::new(Vec::new())).is_err() {
             return; // already armed
         }
-        let (endpoint, service, version) = (
+        let (log, endpoint, service, version) = (
+            log.clone(),
             endpoint.to_string(),
             service.to_string(),
             version.to_string(),
@@ -379,7 +518,7 @@ mod imp {
                         continue;
                     }
                     let body = to_otlp_logs_json(&batch, &service, &version);
-                    let _ = export_signal(&endpoint, "logs", &body);
+                    export_and_report(&log, &endpoint, "logs", &body);
                 }
             })
             .ok();
@@ -397,42 +536,25 @@ mod imp {
         })
     }
 
-    /// POST an OTLP body to `<endpoint>/v1/<signal>` (`traces` | `logs`).
-    fn export_signal(endpoint: &str, signal: &str, body: &Value) -> Result<(), String> {
-        let base = endpoint.trim_end_matches('/');
-        let suffix = format!("/v1/{signal}");
-        let target = if base.ends_with(&suffix) {
-            base.to_string()
-        } else {
-            format!("{base}{suffix}")
-        };
-        let url = Url::parse(&target).map_err(|e| format!("otel: bad endpoint '{target}': {e}"))?;
-        if url.is_tls() {
-            return Err("otel: https OTLP endpoints need --features tls".into());
-        }
-        let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-        let mut stream = http::connect_tcp(&url.host, url.port, Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
-        let headers = [("content-type", "application/json")];
-        let resp = http::send(
-            &mut stream,
-            &url.host_header(),
-            "POST",
-            &url.path,
-            &headers,
-            &bytes,
-        )
-        .map_err(|e| e.to_string())?;
-        if resp.is_success() {
-            Ok(())
-        } else {
-            Err(format!("otel: collector returned HTTP {}", resp.status))
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::obs::log::{Comp, Level, LogCtx};
+
+        /// A logger that writes nothing (below `error`).
+        fn quiet_log() -> Logger {
+            Logger::new(
+                LogCtx {
+                    run_id: "t".into(),
+                    agent_id: "0".into(),
+                    agent_path: "0".into(),
+                    comp: Comp::Agent,
+                    pid: 0,
+                    trace_id: None,
+                },
+                Level::Error,
+            )
+        }
 
         fn span() -> Span {
             Span {
@@ -486,6 +608,7 @@ mod imp {
                 start_unix_nanos: 1_700_000_000_000_000_000,
                 endpoint: "http://127.0.0.1:4318".into(),
                 children: Vec::new(),
+                log: quiet_log(),
             };
             run.record_chat("m", 10, 20, true, 1_700_000_000_000_000_000);
             run.record_tool("resource.read", true, 1_700_000_000_500_000_000);
@@ -539,6 +662,76 @@ mod imp {
             assert_eq!(lr["body"]["stringValue"], "turn.start");
             assert_eq!(lr["severityText"], "INFO");
             assert_eq!(lr["timeUnixNano"], "1700000000000000000");
+        }
+
+        #[test]
+        fn a_failing_collector_is_named_once_a_minute_and_its_recovery_once() {
+            let t0 = Instant::now();
+            let mut h = Health::new();
+            assert_eq!(h.record(true, t0), Say::Nothing, "a success says nothing");
+            assert_eq!(h.record(false, t0), Say::Failed { failures: 1 });
+            // Every batch inside the quiet minute fails silently…
+            for s in 1..60 {
+                let at = t0 + Duration::from_secs(s);
+                assert_eq!(h.record(false, at), Say::Nothing, "{s}s");
+            }
+            // …and the minute after the last line, the run is named again.
+            assert_eq!(
+                h.record(false, t0 + FAILURE_QUIET),
+                Say::Failed { failures: 61 }
+            );
+            assert_eq!(
+                h.record(false, t0 + FAILURE_QUIET + Duration::from_secs(1)),
+                Say::Nothing
+            );
+            let back = t0 + FAILURE_QUIET + Duration::from_secs(2);
+            assert_eq!(h.record(true, back), Say::Recovered { failures: 62 });
+            assert_eq!(h.record(true, back), Say::Nothing);
+            // A new run of failures is named at once, counted from one.
+            assert_eq!(h.record(false, back), Say::Failed { failures: 1 });
+        }
+
+        #[test]
+        fn a_collector_that_fails_every_other_batch_is_named_once_a_minute() {
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let mut h = Health::new();
+            assert_eq!(h.record(false, at(0)), Say::Failed { failures: 1 });
+            assert_eq!(h.record(true, at(5)), Say::Recovered { failures: 1 });
+            // Failing again after the log said it works is said at once…
+            assert_eq!(h.record(false, at(10)), Say::Failed { failures: 1 });
+            // …and then, within the minute, neither line repeats.
+            for s in (15..65).step_by(10) {
+                assert_eq!(h.record(true, at(s)), Say::Nothing, "{s}s");
+                assert_eq!(h.record(false, at(s + 5)), Say::Nothing, "{}s", s + 5);
+            }
+            // The first success a minute after the last recovery line says
+            // it, counting every batch lost since then.
+            assert_eq!(h.record(true, at(65)), Say::Recovered { failures: 6 });
+
+            // Over an hour of it: one line of each a minute, give or take one.
+            let mut lines = 0;
+            for s in (70..3670).step_by(5) {
+                if h.record(s % 10 == 5, at(s)) != Say::Nothing {
+                    lines += 1;
+                }
+            }
+            assert!((119..=121).contains(&lines), "{lines} lines in an hour");
+        }
+
+        #[cfg(feature = "tls")]
+        #[test]
+        fn an_export_failure_names_where_it_went() {
+            // Nothing listens on a port just released.
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let err =
+                export(&format!("https://127.0.0.1:{port}"), "traces", &json!({})).unwrap_err();
+            assert!(err.contains(&format!("127.0.0.1:{port}")), "{err}");
+            let err = export("collector:4318", "logs", &json!({})).unwrap_err();
+            assert!(err.contains("collector:4318/v1/logs"), "{err}");
         }
     }
 }

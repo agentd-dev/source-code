@@ -8319,6 +8319,16 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             s.observability.otel.endpoint.is_some() || s.observability.otel.logs == Some(true),
             "otel",
         ),
+        #[cfg(all(feature = "otel", not(feature = "tls")))]
+        (
+            "an https:// observability.otel.endpoint",
+            s.observability
+                .otel
+                .endpoint
+                .as_deref()
+                .is_some_and(|e| crate::net::http::Url::parse(e).is_ok_and(|u| u.is_tls())),
+            "tls",
+        ),
         #[cfg(not(feature = "aauth"))]
         ("security.aauth", s.security.aauth.is_some(), "aauth"),
         #[cfg(not(feature = "aauth"))]
@@ -8746,6 +8756,19 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         err(
             &mut d,
             format!("observability.log_level: {l:?} (want trace|debug|info|warn|error)"),
+        );
+    }
+    // The exporter POSTs to `<endpoint>/v1/<signal>`; an endpoint it cannot
+    // parse (no scheme, or OTLP/gRPC's `grpc://`) would load and send nothing.
+    #[cfg(feature = "otel")]
+    if let Some(ep) = &s.observability.otel.endpoint
+        && let Err(e) = crate::net::http::Url::parse(ep)
+    {
+        err(
+            &mut d,
+            format!(
+                "observability.otel.endpoint: {e} (want the collector's OTLP/HTTP base URL, http:// or https://)"
+            ),
         );
     }
     // A key that could never be written would publish nothing, forever, and
@@ -12876,6 +12899,50 @@ mod tests {
             let e = load_errors(yaml);
             assert!(e.contains(says), "{yaml} → {e}");
         }
+    }
+
+    /// An `https://` collector is dialled over TLS, so a build without `tls`
+    /// refuses it at load rather than exporting nothing; an `http://`
+    /// collector loads.
+    #[cfg(all(feature = "otel", not(feature = "tls")))]
+    #[test]
+    fn a_build_without_tls_refuses_an_https_otel_endpoint() {
+        let e = load_errors(
+            "observability: {otel: {endpoint: \"https://collector.example:4318\", logs: true}}\n",
+        );
+        assert!(
+            e.contains(
+                "an https:// observability.otel.endpoint needs the tls build feature, which this binary was built without"
+            ),
+            "{e}"
+        );
+        let e = load_errors("observability: {otel: {endpoint: \"http://127.0.0.1:4318\"}}\n");
+        assert!(!e.contains("observability.otel"), "{e}");
+    }
+
+    /// An OTLP endpoint the exporter cannot POST to — a bare `host:port`, or
+    /// the OTLP/gRPC `grpc://` form — is refused at load rather than loaded
+    /// to export nothing.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn an_otel_endpoint_that_is_not_an_http_url_is_refused() {
+        for (endpoint, says) in [
+            (
+                "otel-collector:4318",
+                "observability.otel.endpoint: not an absolute URL: otel-collector:4318",
+            ),
+            (
+                "grpc://otel-collector:4317",
+                "observability.otel.endpoint: unsupported scheme: grpc",
+            ),
+        ] {
+            let e = load_errors(&format!(
+                "observability: {{otel: {{endpoint: \"{endpoint}\", logs: true}}}}\n"
+            ));
+            assert!(e.contains(says), "{endpoint} → {e}");
+        }
+        let e = load_errors("observability: {otel: {endpoint: \"http://otel-collector:4318\"}}\n");
+        assert!(!e.contains("observability.otel"), "{e}");
     }
 
     /// One credential per MCP server: `auth` beside `oauth` is refused, rather

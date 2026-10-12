@@ -51,6 +51,7 @@ effective configuration shows which layer set each value.
 | `a2a.listen binds a wildcard host … set a2a.url` | set `a2a.url` to the origin callers use |
 | `a2a.cors.origins: "…/": an origin has no path` | write origins as `scheme://host[:port]`, no trailing slash |
 | `a \`webhook\` node … is used but webhooks.listen is not set` | configure `webhooks.listen` |
+| `observability.otel.endpoint: not an absolute URL: …`, or `… unsupported scheme: grpc` | give the collector's OTLP/HTTP base URL, `http://host:4318` or `https://…`; agentd does not speak OTLP/gRPC |
 
 Validation also refuses:
 
@@ -234,6 +235,25 @@ the revisions agentd speaks.
 
 [Connect model providers](connect-models.md) covers endpoints, dialects and
 credentials.
+
+## Telemetry export problems
+
+A trace or log batch the OTLP collector does not take is dropped and
+logged as `otel.export.failed`, with the signal, the endpoint and the
+error: once when exports start failing, then at most once a minute. Each
+process counts on its own, so each turn whose trace fails says so once.
+
+| `err` in `otel.export.failed` | Cause and fix |
+|---|---|
+| `connect …: Connection refused`, or a timeout | the collector is not listening at `observability.otel.endpoint`; check the host and port (OTLP/HTTP is usually `4318`) |
+| `invalid peer certificate: UnknownIssuer` | the collector's certificate is from a private CA; set `security.tls_ca` to that CA |
+| `HTTP 404` | the endpoint has a path the collector does not serve. Give the base URL; agentd appends `/v1/traces` and `/v1/logs` |
+
+`otel.export.recovered` says when the collector takes a batch again, at
+most once a minute too. A collector that drops some batches and takes
+others, such as one of two load-balanced collectors being down, gets one
+line of each a minute; `failures` counts the batches lost since the last
+`otel.export.recovered`.
 
 ## Browser UI connection problems
 

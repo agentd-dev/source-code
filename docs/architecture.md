@@ -254,7 +254,7 @@ SigV4, mTLS identities, refreshed OAuth tokens — apply under both SDKs.
 | A2A, outbound | out | to declared peers over `https://` or `unix://` |
 | Webhooks | in | HTTPS (loopback `http://`), one route per `webhook` start or wait, authenticated per route |
 | Probes | in | `/metrics`, `/healthz`, `/readyz` on `observability.metrics_addr`; read-only and off by default |
-| OTLP | out | HTTP/JSON spans, and logs under `observability.otel.logs`, to `observability.otel.endpoint` (else `OTEL_EXPORTER_OTLP_ENDPOINT`); each worker exports its own spans |
+| OTLP | out | HTTP/JSON spans, and logs under `observability.otel.logs`, to `observability.otel.endpoint` (else `OTEL_EXPORTER_OTLP_ENDPOINT`) over `https://` or `http://`; each worker exports its own spans |
 
 There is no database protocol and no message-bus client. The operator edge
 is the same listener as the peer edge: the TUI and web UI are thin display

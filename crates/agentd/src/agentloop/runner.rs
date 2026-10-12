@@ -316,7 +316,7 @@ impl<'a> Session<'a> {
         // call and an `execute_tool` child per tool call. No-op without
         // `--features otel`, so the wiring carries no `cfg`. One trace per turn.
         let run_start = crate::obs::otel::now_unix_nanos();
-        let mut run_span = crate::obs::otel::run_begin(log.ctx().trace_id.as_deref(), run_start);
+        let mut run_span = crate::obs::otel::run_begin(log, run_start);
         let (mut tok_in, mut tok_out) = (0u64, 0u64);
 
         log.info(

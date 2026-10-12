@@ -42,6 +42,22 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - The help text of `agent_intel_errors_total` says what it counts: failed
   sweeps of the model endpoints, so a call that backs off and sweeps again
   counts each. It said failed calls.
+- OTLP export reaches an `https://` collector. Every export refused an
+  `https://` endpoint, the release builds' included, and the refusal was
+  discarded, so no trace and no log line arrived and nothing said so. The
+  collector is dialled over TLS and its certificate checked against the
+  bundled roots plus `security.tls_ca`, as every outbound connection's is;
+  a binary built without the `tls` feature refuses an `https://`
+  `observability.otel.endpoint` at load.
+- A failed OTLP export is logged, where it was dropped without a word:
+  `otel.export.failed` names the signal, the endpoint and the error when
+  exports start failing, then at most once a minute while they keep
+  failing, and `otel.export.recovered` says when the collector takes a
+  batch again, also at most once a minute, so a collector that drops
+  every other batch gets one line of each a minute.
+- An `observability.otel.endpoint` the exporter cannot POST to, such as a
+  bare `host:port` or a `grpc://` URL, is refused at load. It loaded, and
+  every export failed.
 
 **Removed.**
 

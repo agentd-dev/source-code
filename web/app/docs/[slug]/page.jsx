@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import tuiFrames from "../../../lib/tui-frames.json";
 import remarkGfm from "remark-gfm";
 import { DOCS, GROUPS, readDoc, readingOrder, sectionsOf, slugForFile } from "../../../lib/docs";
+import { codePlugins } from "../../../lib/highlight";
 import Mermaid from "../../components/Mermaid";
 
 export function generateStaticParams() {
@@ -382,7 +383,11 @@ export default async function DocPage({ params }) {
         </header>
 
         <div className="prose prose-agent max-w-none">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeTableLabels]} components={MD}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            rehypePlugins={[...codePlugins, rehypeTableLabels]}
+            components={MD}
+          >
             {stripTitle(doc.raw)}
           </ReactMarkdown>
         </div>

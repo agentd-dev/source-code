@@ -6,10 +6,11 @@ import InstallTabs from "./components/InstallTabs";
 // served at — generated from the binary (scripts/gen-schemas.sh), so the
 // landing page cannot link a URI agentd does not declare, nor miss one it does.
 import extensions from "../lib/extensions.json";
+import { highlight } from "../lib/highlight";
 
 /* ── page furniture ──────────────────────────────────────────────── */
 
-function Term({ title = "shell", children }) {
+function Term({ title = "shell", lang, children }) {
   return (
     <div className="term">
       <div className="panel-title">
@@ -20,7 +21,7 @@ function Term({ title = "shell", children }) {
         </span>
         <span className="ml-1">{title}</span>
       </div>
-      <pre>{children}</pre>
+      <pre>{lang ? highlight(children, lang) : children}</pre>
     </div>
   );
 }
@@ -390,7 +391,9 @@ export default function Home() {
             </Card>
           </div>
           <div>
-            <Term title="a subscribe-triggered daemon, in one config">{WORKFLOW_YAML}</Term>
+            <Term title="a subscribe-triggered daemon, in one config" lang="yaml">
+              {WORKFLOW_YAML}
+            </Term>
             <div className="mt-4 flex flex-wrap gap-3">
               <Link href="/docs/workflows/" className="btn">
                 Workflow guide

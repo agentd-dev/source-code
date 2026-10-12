@@ -13,6 +13,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import extensions from "../../lib/extensions.json";
 import { slugForFile } from "../../lib/docs";
+import { codePlugins } from "../../lib/highlight";
 
 const ROOT = path.join(process.cwd(), "..");
 const nameOf = (entry) => entry.path.split("/").pop();
@@ -123,6 +124,7 @@ export default function SpecPage({ entry }) {
       <article className="prose prose-agent max-w-none">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          rehypePlugins={codePlugins}
           components={{ a: linkFor(entry), h2: H(2), h3: H(3) }}
         >
           {body}

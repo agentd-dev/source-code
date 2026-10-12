@@ -49,6 +49,17 @@
   --term-fg: #d4d4d8;
   --term-line: #24242a;
 
+  /* Syntax colours for fenced code: the TUI frames' ANSI palette, so a YAML
+     sample and a captured terminal read as one system. Code sits on --term-bg
+     in both themes, so these are defined once; each clears 4.5:1 on it. */
+  --syn-key: #82aaff; /* blue — mapping keys, JSON/INI names */
+  --syn-string: #3ddc84; /* green — strings, the brand accent */
+  --syn-literal: #e0c060; /* yellow — numbers, true/false/null */
+  --syn-template: #c792ea; /* magenta — {{ … }} expressions, shell $VARS */
+  --syn-structure: #56c8ff; /* cyan — `- ` bullets, `---`, keywords */
+  --syn-title: #e8ecef; /* white — function names, headings */
+  --syn-comment: #7a8592; /* the TUI's dim gray, lifted to 5.2:1 */
+
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo,
     Consolas, monospace;
   --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter,
@@ -781,6 +792,47 @@ details.doc-nav-group[open] > summary::before {
   font-family: var(--mono);
   font-size: 0.82rem;
   line-height: 1.7;
+}
+/* ── syntax highlighting ────────────────────────────────────────────────────
+   The `hljs-*` spans lib/highlight.js emits at build time, in the docs' code
+   fences and the landing page's terminals. Scoped to `pre`, so inline code
+   keeps its quiet chip. Tuned for YAML first: a key, a value, a scalar, a
+   template and the list structure each read at a glance. Unlisted token kinds
+   keep --term-fg. */
+:is(.prose-agent pre, .term pre) :is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-type, .hljs-link) {
+  color: var(--syn-key);
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-string, .hljs-regexp, .hljs-code, .hljs-addition) {
+  color: var(--syn-string);
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-number, .hljs-literal, .hljs-symbol, .hljs-char) {
+  color: var(--syn-literal);
+}
+/* JSON wraps true/false/null in a keyword span inside the literal one; keep
+   them the literal's yellow, as in YAML, not the keyword's cyan. */
+:is(.prose-agent pre, .term pre) .hljs-literal .hljs-keyword {
+  color: inherit;
+}
+/* Magenta is agentd's template syntax, and a shell's $VARS beside it; a
+   program's variables (Rust bindings, JS `console`) keep the plain colour. */
+:is(.prose-agent pre, .term pre) :is(.hljs-template-variable, .hljs-subst),
+:is(.prose-agent pre, .term pre) :is(.language-bash, .language-sh, .language-shell, .language-console) .hljs-variable {
+  color: var(--syn-template);
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-bullet, .hljs-meta, .hljs-keyword, .hljs-built_in) {
+  color: var(--syn-structure);
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-title, .hljs-section) {
+  color: var(--syn-title);
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-section, .hljs-strong) {
+  font-weight: 600;
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-comment, .hljs-quote, .hljs-emphasis) {
+  font-style: italic;
+}
+:is(.prose-agent pre, .term pre) :is(.hljs-comment, .hljs-quote) {
+  color: var(--syn-comment);
 }
 .prose-agent :where(a) {
   text-underline-offset: 3px;

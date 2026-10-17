@@ -251,7 +251,7 @@ WantedBy=multi-user.target
 ## Use the container image
 
 The published image is `ghcr.io/agentd-dev/agentd`, tagged by release
-(`1.19.1`, `1.19`, `1`, `latest`) for amd64 and arm64. It holds one static
+(`1.20.0`, `1.20`, `1`, `latest`) for amd64 and arm64. It holds one static
 musl binary on `scratch`: no shell, no libc, no package manager. It runs as
 uid 65532 with `/agentd` as its entrypoint, and it carries the release
 feature set, including the A2A listener, `/metrics` and the probes, cron,
@@ -262,7 +262,7 @@ The image is signed with cosign in the release workflow. Verify it before
 you deploy:
 
 ```bash
-cosign verify ghcr.io/agentd-dev/agentd:1.19.1 --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/agentd-dev/'
+cosign verify ghcr.io/agentd-dev/agentd:1.20.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/agentd-dev/'
 ```
 
 agentd is its own init. It sets itself as the child subreaper and reaps
@@ -276,7 +276,7 @@ set is a build argument:
 ```bash
 docker build -t agentd:local .
 docker build --build-arg FEATURES=a2a,metrics,cron,otel,hot-reload,config-watch -t agentd:narrow .
-docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/agentd:1.19.1 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/agentd:1.20.0 --push .
 ```
 
 [examples/docker](../examples/docker/) has a variant on
@@ -389,7 +389,7 @@ spec:
         runAsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.19.1
+          image: ghcr.io/agentd-dev/agentd:1.20.0
           args:
             - --instruction.file
             - /etc/agentd/task.md
@@ -454,7 +454,7 @@ spec:
           terminationGracePeriodSeconds: 35
           containers:
             - name: agent
-              image: ghcr.io/agentd-dev/agentd:1.19.1
+              image: ghcr.io/agentd-dev/agentd:1.20.0
               args:
                 - --instruction.file
                 - /etc/agentd/task.md
@@ -508,7 +508,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.19.1
+          image: ghcr.io/agentd-dev/agentd:1.20.0
           args: ["--config", "/etc/agentd/agentd.yaml"]
           env:
             - name: OPENAI_API_KEY
@@ -621,7 +621,7 @@ spec:
         runAsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.19.1
+          image: ghcr.io/agentd-dev/agentd:1.20.0
           args: ["--config", "/etc/agentd/worker.yaml"]
           env:
             - name: AGENTD_POD_NAME

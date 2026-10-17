@@ -261,7 +261,7 @@ curl -sN http://127.0.0.1:8420/ \
 ```
 
 ```
-data: {"id":7,"jsonrpc":"2.0","result":{"hello":{"introspection":false,"resume":0,"resync":false,"seq":22,"version":"1.19.1"}}}
+data: {"id":7,"jsonrpc":"2.0","result":{"hello":{"introspection":false,"resume":0,"resync":false,"seq":22,"version":"1.20.0"}}}
 
 data: {"id":7,"jsonrpc":"2.0","result":{"event":{"data":{…},"kind":"run","seq":1,"ts":1791744042168}}}
 ```

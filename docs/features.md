@@ -113,13 +113,13 @@ The workspace publishes five crates to crates.io. A sixth, the conformance
 suite, is not published and links none of the others: it drives the binary
 from outside.
 
-| Crate | Library name | Version (v1.19.1) | Licence | Owns |
+| Crate | Library name | Version (v1.20.0) | Licence | Owns |
 |---|---|---|---|---|
 | `agentd-net` | `net` | 2.0.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
-| `agentd-mcp` | `mcp` | 3.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
+| `agentd-mcp` | `mcp` | 4.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
 | `agentd-instruction` | `instruction_core` | 0.3.0 | MIT OR Apache-2.0 | The reference implementation of the Instruction Specification: parser, validator, delivery, resolution manifest, signature verification. |
-| `agentd-core` | `agentd` | 1.19.1 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
-| `agentd-cli` | binary `agentd` | 1.19.1 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
+| `agentd-core` | `agentd` | 1.20.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
+| `agentd-cli` | binary `agentd` | 1.20.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
 | `agentd-conformance` | `agentd_conformance` | 1.7.0 | AGPL-3.0-only | A black-box conformance suite. Not published. |
 
 Each crate's features map onto `agentd-core`'s: `agentd-cli`'s `a2a` turns on
@@ -166,7 +166,7 @@ unique package names from `cargo tree -p agentd-cli -e normal --prefix none`
 The right-hand column leaves out the five workspace crates the command lists.
 `a2a` and `cel` overlap in five crates; the other twelve release features add
 none. Measured with cargo 1.98.0 against the committed `Cargo.lock` of the
-v1.19.1 release. The same count holds for the
+v1.20.0 release. The same count holds for the
 `x86_64-unknown-linux-musl` target that ships.
 
 ## Footprint

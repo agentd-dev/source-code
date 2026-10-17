@@ -33,9 +33,9 @@ flowchart TD
 
 | Package | Lib name | Version | License | What it is |
 |---|---|---|---|---|
-| `agentd-core` | `agentd` | 1.19.1 | AGPL-3.0-only | the engine: the agent loop, the supervisor, workflows, the A2A listener, code-registered tools |
-| `agentd-cli` | (binary) | 1.19.1 | AGPL-3.0-only | the stock `agentd` command, including the `tui` and `ui` launcher |
-| `agentd-mcp` | `mcp` | 3.0.0 | AGPL-3.0-only | a blocking MCP client over the official `rmcp` SDK, on agentd's credentialed Streamable HTTP socket, plus a raw HTTP listener for embedders that serve plain HTTP; it serves no MCP |
+| `agentd-core` | `agentd` | 1.20.0 | AGPL-3.0-only | the engine: the agent loop, the supervisor, workflows, the A2A listener, code-registered tools |
+| `agentd-cli` | (binary) | 1.20.0 | AGPL-3.0-only | the stock `agentd` command, including the `tui` and `ui` launcher |
+| `agentd-mcp` | `mcp` | 4.0.0 | AGPL-3.0-only | a blocking MCP client over the official `rmcp` SDK, on agentd's credentialed Streamable HTTP socket, plus a raw HTTP listener for embedders that serve plain HTTP; it serves no MCP |
 | `agentd-net` | `net` | 2.0.0 | AGPL-3.0-only | a blocking HTTP/1.1 and SSE client, unix-socket and TLS connects, and the SSRF egress classifier |
 | `agentd-instruction` | `instruction_core` | 0.3.0 | MIT OR Apache-2.0 | the Instruction Specification's reference parser, validator and delivery pipeline |
 
@@ -63,7 +63,7 @@ edition = "2024"
 
 [dependencies]
 # The library name is `agentd`, so code reads `use agentd::…`.
-agentd = { package = "agentd-core", version = "1.19" }
+agentd = { package = "agentd-core", version = "1.20" }
 serde_json = "1"
 ```
 
@@ -376,7 +376,7 @@ to run a workflow, hand it to the full runtime.
 
 ```toml
 # fragment: under [dependencies] in Cargo.toml
-agentd = { package = "agentd-core", version = "1.19", features = ["a2a", "metrics"] }
+agentd = { package = "agentd-core", version = "1.20", features = ["a2a", "metrics"] }
 ```
 
 The default build enables `tls` only. The features are the same ones the

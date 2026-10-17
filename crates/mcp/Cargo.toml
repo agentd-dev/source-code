@@ -6,7 +6,7 @@
 # agentd's own `net` transport — plus serde/serde_json.
 [package]
 name = "agentd-mcp"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Blocking MCP client over the official rmcp SDK on a credentialed Streamable-HTTP socket, plus a raw HTTP listener"

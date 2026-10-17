@@ -5,7 +5,27 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
+
+Each unit of work — a workflow run, an A2A task, a webhook delivery, a
+stream event's run — is its own W3C trace. It continues the caller's
+`traceparent` from A2A, webhooks, stream events and MCP Events, is kept
+with the work across a restart, goes out on every MCP request, model call,
+A2A call, push, `http` step and forward, and is named by every log line,
+reply and status about it; with OTLP on, the exported spans form one tree.
+A drain lets running work finish and parks what it has to stop, for the
+next life to resume. Every series `/metrics` renders is one something
+writes, and OTLP export reaches an `https://` collector. `agentd-mcp` is
+4.0.0: its resource, prompt and completion calls take request metadata.
+
+**Security.**
+
+- rustls 0.23.46, for RUSTSEC-2026-0346 to 0349, published after v1.19.1:
+  client session `Debug` output printed TLS secrets, buffered application
+  data reached the outer server after an ECH rejection, Brotli certificate
+  decompression could allocate up to 1 GiB before the peer was
+  authenticated, and an unauthenticated ServerHello could downgrade later
+  connections to classical key exchange.
 
 **Fixed.**
 

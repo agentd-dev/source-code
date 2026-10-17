@@ -39,7 +39,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 
 | Term | Meaning |
 |---|---|
-| **daemon** | A long-lived instance: it has a listener, a goal, or a long-lived start node, and exits only when told to. It gets a durable store by default. See [Jobs, daemons and triggers](modes-and-triggers.md). |
+| **daemon** | A long-lived instance that exits only when told to: it has an A2A listener or a long-lived start node, or `lifecycle.run_until: drained`. A listener, a goal or a long-lived start gets it the file store by default; `drained` alone does not change the store. Its instruction is the policy for the messages it takes: it runs nothing at startup unless it has `agent.prompt` or a `once` start. See [Jobs, daemons and triggers](modes-and-triggers.md). |
 | **decide call** | A call that asks typed questions about a state — a `choice`, a `noul` or a `score` — instead of asking for text. See [Models, providers and roles](intelligence.md). |
 | **decision guard** | A step's `when:` written as a statement for a model to decide (`{noul: "…"}`) rather than as CEL. The step runs only when the statement holds and the answer is sure. See [Workflows: how runs work](workflows.md). |
 | **decision model** | A model of kind `decision`: it answers decide calls natively, with probabilities, and writes no text. It is reached on a provider with `dialect: decisions`. See [Models, providers and roles](intelligence.md). |

@@ -13,7 +13,8 @@ running agentd from a scheduler and running it as a service.
 |---|---|---|
 | Exits | when nothing is left to do | only when told to: a signal, a `finish` with `exit: true`, or another stop condition |
 | Exit code | the outcome of its work | 0 after a clean drain |
-| Woken by | its startup work: a `once` start, `--instruction`, `--prompt` | triggers that keep firing, and an A2A listener |
+| Woken by | its startup work: a `once` start, `--instruction`, `--prompt` | triggers that keep firing, an A2A listener, and `agent.prompt` at startup |
+| The instruction | the task, when no workflow or prompt is given | the policy each message is answered under |
 | Durable state | none unless you set a store: a crash re-runs it | the local `file` store unless you set one |
 
 Both shapes share the reactor, the turn workers, the tool registry and the
@@ -46,6 +47,10 @@ question is asked of the **live** workflow set, not only the configured one:
 a job whose prompt tells the agent to create a schedule (`workflow.create`)
 becomes a daemon, rather than idling out from under the work it was asked to
 set up.
+
+A webhook listener or a `goal` gets an instance the durable store by default,
+but does not make it a daemon: under `auto` it stays a job, and a goal
+watches the job's own work.
 
 A job with no long-lived start exits as soon as it is idle. When an
 instance is forced to `idle` while it still has long-lived starts,
@@ -81,10 +86,39 @@ exits with its work's code — 3 for a run left unfinished — not 0.
 [Supervision and containment](harness.md#the-kill-ladder) describes how
 children are stopped.
 
-The quickstart is a job. `agentd --instruction "…"` expands to a workflow
-named `main` — a `once` start, one `agent` step, a `finish` — runs one turn
-and exits. `agentd --prompt "…"` instead delivers a message into the root
-conversation, where the agent has its full tool surface.
+## A job's task, a daemon's policy
+
+The shape also decides what the instruction is when nothing else gives the
+agent work: no workflow and no prompt.
+
+- **In a job, the instruction is the task.** `agentd --instruction "…"`
+  expands to a workflow named `main` — a `once` start, one `agent` step, a
+  `finish` — that runs one turn and exits with that run's code.
+  `--effective-config` shows the workflow, attributed to `generated (the
+  one-shot sugar workflow)`.
+- **In a daemon, the instruction is the policy.** A daemon with no workflow
+  runs nothing when it starts. It waits for messages and answers each one
+  under the instruction, which every conversation turn is given.
+
+A daemon with work to do as soon as it starts says so:
+
+- `agent.prompt` (`--prompt`) delivers a message into the root conversation
+  at every start, where the agent has its full tool surface: it can answer,
+  or set up recurring work with `workflow.create`. In a job, the prompt is
+  the job.
+- A workflow with a `once` start runs at boot: once per state with
+  `policy: ensure`, the default, or on every boot with `policy: always`.
+
+`lifecycle.run_until: drained` on an instance that nothing can give work to
+— no `a2a.listen`, no workflow and no `agent.prompt` — is refused at load,
+exit 2: it would wait for ever. A webhook listener or a `goal` does not count
+on its own, since each only starts workflows, and nor does a workflow the
+agent created at runtime and the store restores: the load cannot see it, so
+declare in `workflows` the work such an instance waits for.
+
+The shape is settled when the process starts. A reload that changes
+`lifecycle.run_until`, from the configuration or from the instruction's own
+`:::!config`, is refused with `config.reload.restart_required`.
 
 ## Triggers
 

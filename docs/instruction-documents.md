@@ -208,9 +208,10 @@ mock-llm done
 ```
 
 When a document declares a workflow, as this one does, agentd adds no
-generated workflow of its own. A document with no workflow, in a
-configuration with none and no `--prompt`, runs as a single agent turn and
-exits.
+generated workflow of its own. A document with no workflow, in a job with
+none and no `--prompt`, runs as a single agent turn and exits. In a daemon,
+one with an A2A listener or `lifecycle.run_until: drained`, nothing runs
+when it starts: the document is the policy each message is answered under.
 
 ## Split a long document into a folder
 

@@ -154,11 +154,11 @@ and how do I run its tests?" The agent calls `exec` with commands like `ls`,
 `cat` and `git log`, and answers. While it works, the status row shows the
 current phase and tool, the time spent and the tokens used.
 
-> **Note.** This configuration declares no workflow, so agentd also runs the
-> instruction once, as a task, the first time the daemon starts: expect one
-> orientation run in the log before your first message. With the file store
-> it never runs again. Adding any workflow, as in
-> [step 7](#step-7-add-a-chore-that-runs-on-its-own), turns it off.
+> **Note.** The daemon does nothing before your first message: with no
+> workflow, its instruction is the policy each message is answered under,
+> not a task it runs at startup. Work that should start without you, such
+> as the chore in [step 7](#step-7-add-a-chore-that-runs-on-its-own), is a
+> workflow.
 
 To keep the agent working when you close the UI, run the daemon and the
 client apart, in two terminals:

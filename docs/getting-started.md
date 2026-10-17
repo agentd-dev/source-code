@@ -2,7 +2,7 @@
 
 In about ten minutes you run a first agent against a real model, give it a
 tool from a public MCP server, read its result and exit code, and then run
-the same instruction as a long-lived daemon you talk to from a terminal UI.
+the agent as a long-lived daemon you talk to from a terminal UI.
 This tutorial is for developers trying agentd for the first time. You need
 agentd installed and an API key for OpenAI or Anthropic.
 
@@ -264,18 +264,20 @@ sequenceDiagram
 
 [Architecture](architecture.md) explains the split and what it buys.
 
-## Step 5: Run the same instruction as a daemon
+## Step 5: Run it as a daemon
 
 A one-shot exits when its job is done. A daemon stays up, and you work with
-it: send it messages, answer its questions, watch what it does. The same
-settings go in a file. Save this as `quickstart.yaml`:
+it: send it messages, answer its questions, watch what it does. In a daemon
+the instruction is no longer the task. It is the standing policy every
+conversation follows, and the work arrives as your messages. The settings
+go in a file. Save this as `quickstart.yaml`:
 
 ```yaml
 agent:
   instruction: >-
-    Use DeepWiki to list the documentation topics of the
-    modelcontextprotocol/rust-sdk repository, then name the three a
-    newcomer should read first.
+    You answer questions about GitHub repositories. Look the repository
+    up with DeepWiki before you answer, and say which of its
+    documentation topics the answer comes from.
 
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions
@@ -345,18 +347,24 @@ agentd tui: endpoint http://127.0.0.1:8420 · daemon logs → /run/user/1000/age
 ```
 
 The launcher signs the client in with a single-use code and sends the
-daemon's log to the file it names. Type a follow-up, such as "Which of those
-topics covers the Streamable HTTP transport?", and the agent answers in the
-conversation. Type `/quit` to leave; the launcher stops the daemon with the
-client.
+daemon's log to the file it names. Ask the question from step 4: "List the
+documentation topics of the modelcontextprotocol/rust-sdk repository, then
+name the three a newcomer should read first." The agent looks the
+repository up with DeepWiki and answers in the conversation. Follow up with
+"Which of those topics covers the Streamable HTTP transport?" and it answers
+in the same conversation. Type `/quit` to leave; the launcher stops the
+daemon with the client.
 
 Two things happen differently from step 4:
 
-- **The instruction runs once, at the first start.** The file declares no
-  workflow, so agentd makes the instruction a one-step workflow, as it did for
-  the one-shot, and runs it when the daemon first starts. With the file store
-  it never runs again: a restart finds the run already done. After that run,
-  the instruction stays the agent's standing policy for every conversation.
+- **Nothing runs until you ask.** The one-shot made its instruction a
+  one-step job and ran it. The daemon runs nothing when it starts: it waits
+  for a message and answers each one under the instruction. A daemon that
+  should do something as soon as it starts says so, with `agent.prompt` (a
+  message delivered into its conversation at every start) or a workflow with
+  a `once` start. [Jobs, daemons and
+  triggers](modes-and-triggers.md#a-jobs-task-a-daemons-policy) explains
+  both.
 - **The daemon owns the session, not the client.** To keep the agent working
   after you close the UI, run the two apart, in two terminals:
 

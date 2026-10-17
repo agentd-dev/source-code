@@ -3122,7 +3122,7 @@
         "prompt": {
           "oneOf": [
             {
-              "description": "short form: a one-shot task (--prompt) — the text itself, a FILE path, a DIRECTORY, or an https:// document, classified exactly as `instruction` is. With no workflows configured the generated run executes it, while `instruction` stays the standing policy (the run's system prompt).",
+              "description": "short form: a task (--prompt), delivered as a message into the root conversation at every start — the text itself, a FILE path, a DIRECTORY, or an https:// document, classified exactly as `instruction` is. A job's prompt is the job, and a daemon's what it does as soon as it starts; `instruction` stays the standing policy every turn is given.",
               "type": "string"
             },
             {

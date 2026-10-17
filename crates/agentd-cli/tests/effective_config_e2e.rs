@@ -169,5 +169,23 @@ fn the_report_shows_what_the_document_declared_and_what_was_generated() {
     );
     assert_eq!(v["config"]["workflows"][0]["name"], "main");
 
+    // A daemon runs no such workflow, so the report shows none: its
+    // instruction is the policy for the messages it takes.
+    std::fs::write(
+        work.join("agentd.yml"),
+        "agent: { name: doc, instruction: ./agent.md, preflight: never }\n\
+         intelligence: { endpoints: [\"https://intel.example/v1\"], model: m }\n\
+         store: { kind: memory }\n\
+         a2a: { listen: \"http://127.0.0.1:8420\" }\n",
+    )
+    .unwrap();
+    let (code, stdout, _) = run_in(&work, &home, &["--effective-config"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        v["config"].get("workflows").is_none() && v["provenance"].get("workflows").is_none(),
+        "a daemon's report generates no workflow: {stdout}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }

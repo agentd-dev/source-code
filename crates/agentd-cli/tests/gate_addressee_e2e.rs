@@ -304,6 +304,8 @@ fn a_reload_that_addresses_a_gate_to_anyone_but_an_operator_is_refused() {
     use std::io::{BufRead, BufReader};
     use std::time::{Duration, Instant};
 
+    // A manual workflow keeps the daemon loadable: one that nothing can give
+    // work to is refused.
     let cfg_for = |to: &str, instruction: &str| {
         policy(to)
             .replace(
@@ -314,6 +316,7 @@ fn a_reload_that_addresses_a_gate_to_anyone_but_an_operator_is_refused() {
                 "run_until: idle, idle_grace: 1s",
                 "run_until: drained, drain_timeout: 5s",
             )
+            + "workflows:\n  - name: idle\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s]}\n"
     };
     let dir = common::unique_path("gate-addressee-reload", "d");
     std::fs::create_dir_all(&dir).unwrap();

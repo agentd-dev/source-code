@@ -218,14 +218,15 @@ fn a_stuck_goal_self_corrects_by_firing_the_recovery_workflow() {
 fn an_llm_judge_decides_the_goal_is_achieved_and_finishes() {
     // No CEL condition ⇒ `check.via: agent` forces the LLM judge. The mock returns
     // an "achieved" verdict when it sees the judge prompt (which contains "GOAL:"),
-    // so the watchdog finishes the daemon (drains → exit 0).
+    // so the watchdog finishes the daemon (drains → exit 0). The daemon's work
+    // is its prompt: a daemon's instruction is its policy, not a task it runs.
     let llm = spawn_mock_llm(&json!({
         "turns": [{"content": "unused"}],
         "match": [{"when_contains": "GOAL:", "content": "{\"achieved\": true, \"stuck\": false, \"reason\": \"the task is complete\"}"}]
     }));
     let cfg = write_config(&format!(
         "\
-         agent:\n  name: gj\n  instruction: You do the work.\n  preflight: never\n\
+         agent:\n  name: gj\n  instruction: You do the work.\n  prompt: Do the work.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
          goal:\n  statement: the task is complete\n  check: {{every: 1s, via: agent}}\n  on_achieved: finish\n\

@@ -709,6 +709,11 @@ a second spawn is refused while it lives.
 > listener is up, so the first command can fail with "cannot reach peer
 > socket". Give it a `retry`, as `brief` does.
 
+The child's prose is its policy, not a task: a template whose machinery
+declares no workflow runs nothing until it is sent a message, so give it a
+`:::!workflow` with a `once` start for work at spawn, or send it a first
+message as `brief` does.
+
 What the instance tier needs and offers:
 
 | Field | What it does | Notes |

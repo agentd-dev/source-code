@@ -303,8 +303,8 @@ behaves.
 |---|---|---|---|---|
 | `agent.name` | string | `$AGENTD_POD_NAME`, else `$HOSTNAME`, else `agentd` | restart · doc | The instance identity. The durable store keys every record by it, so renaming the agent starts a different instance. |
 | `agent.description` | string | a generic sentence | live · op | The public Agent Card's description, readable without signing in. |
-| `agent.instruction` | string or object | unset | live · op | The standing instruction. See [The instruction source](#the-instruction-source). |
-| `agent.prompt` | string or object | unset | live · op | A one-shot task, delivered as a message into the root conversation at startup. Takes the `text`, `file`, `dir`, `url` and `oci` sources of the instruction, classified the same way; no `mcp`. A prompt also suppresses the generated `main` workflow a bare `--instruction` gets. |
+| `agent.instruction` | string or object | unset | live · op | The standing instruction, given to every turn. In a job with no workflow and no prompt it is also the task: agentd generates the workflow `main` (`once → agent → finish`) to run it. A daemon runs nothing for it at startup. See [The instruction source](#the-instruction-source). |
+| `agent.prompt` | string or object | unset | live · op | A task, delivered as a message into the root conversation at every start: a job's whole work, or what a daemon does as soon as it starts. Takes the `text`, `file`, `dir`, `url` and `oci` sources of the instruction, classified the same way; no `mcp`. A prompt also suppresses the generated `main` workflow a bare `--instruction` job gets. |
 | `agent.preflight` | `never \| auto \| always` | `auto` | live · doc | Triage of an inbound message before its turn, on `intelligence.roles.preflight`. `intelligence.routes` needs `auto` or `always`. |
 | `agent.wake_on` | list of `a2a_message \| human_reply \| subagent_result \| workflow_finished \| workflow_failed \| instruction_updated \| budget_resumed` | `[a2a_message, human_reply, workflow_failed]` | live · doc | The events that wake the root conversation or leave it a note. `subagent_result` notes each child's result. |
 | `agent.on_workflow_finished` | `ignore \| note \| think` | `ignore` | live · doc | What a finished run leaves in the root transcript, for the runs `wake_on` names: nothing, a note, or a note that starts a turn. Withheld when the run may carry outside input and the root holds `sensitive` and `egress`. |
@@ -1007,7 +1007,7 @@ deadline exits 124; [cli.md](cli.md) has the full table.
 
 | Path | Type | Default | Class | What it does |
 |---|---|---|---|---|
-| `lifecycle.run_until` | `auto \| idle \| drained` | `auto` | restart · doc | `idle`: a job that exits once no work remains. `drained`: a daemon that exits only on a signal. `auto`: a daemon when the instance is long-lived (a listener, a `goal`, or a long-lived start node), otherwise a job. |
+| `lifecycle.run_until` | `auto \| idle \| drained` | `auto` | restart · doc | `idle`: a job that exits once no work remains. `drained`: a daemon that exits only on a signal; refused when nothing can give it work (no `a2a.listen`, workflow or `agent.prompt`; a webhook listener or a `goal` only starts workflows). `auto`: a daemon when the instance has an A2A listener or a long-lived start node, otherwise a job. |
 | `lifecycle.idle_grace` | duration | `5s` | live · doc | How long an idle job waits before exiting. |
 | `lifecycle.until_signal` | string | — | live · doc | A signal whose delivery begins a graceful shutdown. |
 | `lifecycle.drain_timeout` | duration | `25s` | restart · op | The graceful drain budget on `SIGTERM`: how long work already running may finish before the drain stops it and leaves it for the next start. Keep it below the pod's `terminationGracePeriodSeconds`. |
@@ -1145,7 +1145,8 @@ namespace an `assign` step writes. Values are not secrets: credentials stay
 A running daemon reloads on `SIGHUP` (the `hot-reload` feature) or a watched
 file change. The reload validates the new document with the startup pipeline,
 stages every change, and applies it whole or not at all. A change to any of
-these paths refuses the reload with `config.reload.restart_required`:
+these paths, by the configuration or by the instruction's own `:::!config`,
+refuses the reload with `config.reload.restart_required`:
 
 - `agent.name`, `agent.document_capabilities`, `agent.instruction.trust`
 - `store.kind`, `store.prefix`, `store.mcp`, `store.http`, `store.file`,

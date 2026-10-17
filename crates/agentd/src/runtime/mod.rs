@@ -1020,14 +1020,11 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // `lifecycle.run_until` decides whether this process is a job or a daemon:
     // `idle` is the job shape, `drained` is a daemon, and `auto` infers the job
     // shape when nothing can bring in outside work — no A2A listener and no
-    // long-lived start node.
-    rt.job_shape = match rt.settings.lifecycle.run_until {
-        crate::config::settings::RunUntil::Drained => false,
-        crate::config::settings::RunUntil::Idle => true,
-        crate::config::settings::RunUntil::Auto => {
-            rt.settings.a2a.listen.is_none() && !rt.workflows.values().any(|w| w.is_long_lived())
-        }
-    };
+    // long-lived start node. The load asked the same question when it decided
+    // whether the instruction is a task to run once.
+    rt.job_shape = !rt
+        .settings
+        .is_daemon(rt.workflows.values().any(|w| w.is_long_lived()));
     // Restored `once` runs of a job count toward its exit code.
     for r in rt.runs.values() {
         if rt.job_shape

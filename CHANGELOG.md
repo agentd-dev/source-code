@@ -18,6 +18,27 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   each logged as `subagent.kill.escalated`; one that stops on the cancel is
   never signalled. The record stays `cancelled`, with the kill's reason as
   its error, however the child ends.
+- A daemon's instruction is its policy, not a task it runs at startup. With
+  no workflow and no prompt, an instruction became the workflow `main`
+  (`once → agent → finish`) whatever the instance, so a daemon — one with an
+  A2A listener, as `agentd tui` and `agentd ui` need, or with
+  `lifecycle.run_until: drained` — ran it when it started: a model turn
+  nobody asked for, which spent tokens, could call tools and left a run in
+  status, on every start with a memory store and once per state directory
+  with a file store. A job keeps that workflow. A daemon runs nothing until
+  work reaches it, and `--effective-config` shows it no generated workflow.
+  Work at startup is said: `agent.prompt`, delivered into the root
+  conversation at every start, or a workflow with a `once` start. An
+  instance-tier subagent child is a daemon too, since its parent gives it an
+  A2A listener: a template whose machinery declares no workflow no longer
+  runs its prose when the child spawns. The prose is the child's policy, and
+  work at spawn is a `:::!workflow` with a `once` start, or a first message,
+  such as `subagent.send` or an `a2a.send` step.
+- `lifecycle.run_until: drained` on an instance nothing can give work to —
+  no `a2a.listen`, no workflow and no `agent.prompt` — is refused at load.
+  It loaded and waited for ever. A webhook listener or a `goal` does not
+  count on its own, since each only starts workflows, and nor does a
+  workflow the agent created at runtime: the load cannot see the store.
 
 **Fixed.**
 
@@ -29,6 +50,14 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `agent_tokens_total` and from the child's record. A child that died
   without a result also recorded `0` tokens in `subagent.result` and its
   record, whatever it had reported.
+- A reload refuses a change to a restart-only setting that the
+  instruction's own `:::!config` makes — `lifecycle.run_until`,
+  `store.kind`, `store.prefix`, `store.max_value_bytes` or `agent.name` — as
+  it refuses the same change in a config file. It applied the change to a
+  process built at startup on the old value: a document that set
+  `run_until: idle` turned a listening daemon into one that exited as soon
+  as it was idle, and with the change above it would also have generated
+  the instruction's one-shot workflow and run it, unprompted.
 
 ## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
 

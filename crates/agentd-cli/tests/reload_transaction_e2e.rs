@@ -148,8 +148,13 @@ const TICK: &str = "  - name: tick\n    steps:\n      s: {kind: schedule, every:
 /// server to tick on alive.
 const QUIET_TICK: &str = "  - name: tick\n    steps:\n      s: {kind: schedule, every: 300ms}\n      f: {kind: finish, depends_on: [s], status: completed, output: tick}\n";
 
+/// A manual workflow, for a config with no other: a daemon nothing can give
+/// work to is refused at load, and a reload is a load.
+const IDLE: &str = "  - name: idle\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s]}\n";
+
 /// A long-lived config: `servers` as (name, endpoint), each namespaced by its
-/// name; `workflows` as YAML list items; `extra` any further sections.
+/// name; `workflows` as YAML list items, [`IDLE`] when there are none;
+/// `extra` any further sections.
 fn config(instruction: &str, servers: &[(&str, &str)], workflows: &[&str], extra: &str) -> String {
     let mut out = format!(
         "agent:\n  name: tx\n  instruction: {instruction}\n\
@@ -165,11 +170,12 @@ fn config(instruction: &str, servers: &[(&str, &str)], workflows: &[&str], extra
             ));
         }
     }
-    if !workflows.is_empty() {
-        out.push_str("workflows:\n");
-        for w in workflows {
-            out.push_str(w);
-        }
+    out.push_str("workflows:\n");
+    for w in workflows {
+        out.push_str(w);
+    }
+    if workflows.is_empty() {
+        out.push_str(IDLE);
     }
     out.push_str(extra);
     out

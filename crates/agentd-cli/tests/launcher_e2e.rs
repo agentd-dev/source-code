@@ -561,6 +561,41 @@ fn the_launcher_forces_no_configuration() {
     );
 }
 
+/// What a launcher starts is a daemon, so its instruction is the policy for
+/// what the client sends, not a task: the daemon runs nothing before the
+/// client asks — here, while the client is up and asks nothing.
+#[test]
+fn the_launched_daemon_runs_nothing_until_the_client_asks() {
+    let s = Scratch::new();
+    let cfg = s.write("agentd.yaml", &config(free_port(), "", ""));
+    let stub = s.holding_stub();
+    let log = s.path("daemon.log");
+    let run = start(
+        &s,
+        &[
+            "tui",
+            "--daemon-log",
+            log.to_str().unwrap(),
+            "--config",
+            &cfg,
+        ],
+        &[("AGENTD_TUI_BIN", &stub)],
+        false,
+    );
+    s.wait_file("recorded", Duration::from_secs(20));
+    // The client starts once the listener answers; give a boot run the time
+    // it would have had to start and to dial the model.
+    std::thread::sleep(Duration::from_millis(1500));
+    let (status, err) = run.finish(&s);
+    assert!(status.success(), "{status:?}: {err}");
+    let dlog = std::fs::read_to_string(&log).unwrap();
+    assert!(dlog.contains("\"event\":\"proc.ready\""), "{dlog}");
+    assert!(
+        !dlog.contains("\"event\":\"run.start\""),
+        "the launched daemon ran its instruction as a task:\n{dlog}"
+    );
+}
+
 // ---- the launch code, from the client's side ---------------------------------
 
 /// The launch grant, form-encoded.

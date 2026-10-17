@@ -321,6 +321,66 @@ fn an_instance_template_whose_delivered_text_does_not_reread_spawns() {
     }
 }
 
+/// A template whose machinery is configuration alone, with no workflow,
+/// spawns a child daemon like any other instance, and a daemon's
+/// instruction is its policy: the child runs nothing when it starts, and a
+/// message it is sent is answered under its prose.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_config_only_instance_child_runs_nothing_until_it_is_asked() {
+    let state = common::unique_path("tpl-policy", "state");
+    let (code, log) = run_cfg_in(
+        &state,
+        "agent: { name: parent }\nstore: { kind: memory }\n\
+         intelligence: { endpoints: \"mock:echo-system\", model: mock }\n\
+         lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
+         observability: { log_level: info, log_content: true }\n\
+         subagents:\n\
+        \x20 templates:\n\
+        \x20   scout:\n\
+        \x20     instruction: |\n\
+        \x20       You scout {{params.topic}} for the desk.\n\
+        \x20       :::!config\n\
+        \x20       agent: { preflight: never }\n\
+        \x20       :::\n\
+        \x20     params: { topic: { type: string, required: true } }\n\
+        \x20     ttl: 4s\n\
+         workflows:\n  - name: caller\n    steps:\n\
+        \x20     s:     { kind: once }\n\
+        \x20     spawn: { kind: subagent, template: scout, params: { topic: tides }, depends_on: [s] }\n\
+        \x20     nap:   { kind: sleep, depends_on: [spawn], duration: 1500ms }\n\
+        \x20     ask:   { kind: a2a.delegate, depends_on: [nap], peer: \"{{steps.spawn.output.peer}}\", objective: \"What do you watch?\", timeout: 30s, retry: { max: 6, backoff: 1s } }\n\
+        \x20     f:     { kind: finish, depends_on: [ask], status: completed, output: \"{{steps.ask.output}}\" }\n",
+    );
+    assert_eq!(code, Some(0), "{log}");
+    let spawned = events(&log, "instance.spawn");
+    assert_eq!(spawned.len(), 1, "{log}");
+    let child = std::fs::read_to_string(format!(
+        "{state}/subagents/{}/log",
+        spawned[0]["handle"].as_str().unwrap()
+    ))
+    .unwrap_or_default();
+    assert!(!events(&child, "proc.ready").is_empty(), "{child}");
+    assert!(
+        events(&child, "run.start").is_empty(),
+        "the child ran its prose as a task:\n{child}"
+    );
+    let done: Vec<Value> = events(&log, "run.done")
+        .into_iter()
+        .filter(|e| e["workflow"] == "caller")
+        .collect();
+    assert_eq!(done.len(), 1, "{log}");
+    // The child's model's system prompt, echoed: the prose, params folded.
+    assert!(
+        done[0]["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("You scout tides for the desk."),
+        "{log}\n{child}"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
 #[cfg(feature = "a2a")]
 #[test]
 fn a_singleton_instance_refuses_a_second_live_spawn() {

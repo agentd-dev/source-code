@@ -67,9 +67,20 @@ intelligence:
 limits:
   run: { steps: 50, tokens: 200000, deadline: 10m }
 
+a2a:
+  listen: http://127.0.0.1:8420   # messages, and the TUI or web UI, arrive here
+
 lifecycle:
-  run_until: drained         # stay up as a daemon; omit for one-shot-and-exit
+  run_until: drained         # stay up until stopped (a listener alone already does)
 ```
+
+With a listener this is a daemon: the instruction is the policy each message
+is answered under, and nothing runs until a message arrives — work for its
+first moments is `agent.prompt` or a `once` workflow. Without `a2a` and
+`run_until` the same file is a one-shot: the instruction is the task, run
+once, and the exit code is its outcome. `run_until: drained` with nothing that
+can bring work in (no `a2a.listen`, workflow or `agent.prompt`) is refused at
+load.
 
 Every config path is also a flag and an env var, with
 `built-in < file < env < flag` precedence:

@@ -5113,6 +5113,33 @@ impl Settings {
             || self.goal.is_some()
             || self.workflows.iter().any(workflow_is_long_lived)
     }
+
+    /// Whether this instance runs as a DAEMON — it waits for work and exits
+    /// only when told to — rather than a job that exits once its work is
+    /// done: what `lifecycle.run_until` decides. `drained` is a daemon and
+    /// `idle` a job; `auto` is a daemon when outside work can reach it, an A2A
+    /// listener or a long-lived start node (`long_lived_start`).
+    ///
+    /// The caller says whether there is a long-lived start because the two
+    /// callers judge different sets: [`load`] the configured workflows, when it
+    /// decides whether an instruction is a task to run or a policy to keep,
+    /// and the runtime its live set, restored and agent-written definitions
+    /// included. The rest of the answer is this one, so over the configured
+    /// set the load never generates a boot run for an instance the runtime
+    /// keeps waiting, nor withholds one from an instance that idles out at
+    /// once. A definition the agent wrote in an earlier life is the
+    /// runtime's alone: the load cannot see the store.
+    ///
+    /// Narrower than [`Settings::is_long_lived`]: a goal or a webhook listener
+    /// makes an instance durable by default without making it a daemon, so a
+    /// job watched by a goal still ends with its work's exit code.
+    pub fn is_daemon(&self, long_lived_start: bool) -> bool {
+        match self.lifecycle.run_until {
+            RunUntil::Drained => true,
+            RunUntil::Idle => false,
+            RunUntil::Auto => self.a2a.listen.is_some() || long_lived_start,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5824,7 +5851,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         t.record("${…} environment substitution", &doc);
     }
     let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
-    // --- sugar: `agentd --instruction X` with no workflows ---
+    // --- sugar: `agentd --instruction X` with no workflows, in a job ---
     //
     // Decided HERE, on the TYPED settings, not on the raw document: only after
     // typing is the instruction actually resolved (a file read, a folder
@@ -5833,6 +5860,8 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // form got no sugar at all (an object is not a non-blank string), and a
     // path-valued short form got sugar *on top of* the workflows its own
     // document declared — a model loop nobody asked for, dialing intelligence.
+    // The same goes for the shape: a `run_until` set by a `:::!config`
+    // fragment is only in the typed settings.
     // …and `--effective-config` too: a report that omitted the workflow a run
     // would synthesize would describe a config nobody runs.
     if ask == Ask::Run || ask == Ask::Validate || ask == Ask::EffectiveConfig {
@@ -6407,8 +6436,8 @@ fn apply_default_folders(doc: &mut Value, dirs: &[PathBuf], warnings: &mut Vec<S
     }
 }
 
-/// `agentd --instruction X` (or `agent.instruction` alone) with no workflows ⇒
-/// the one-node workflow `once → agent → finish`.
+/// `agentd --instruction X` (or `agent.instruction` alone) with no workflows,
+/// in a job ⇒ the one-node workflow `once → agent → finish`.
 ///
 /// A `--prompt` deliberately does NOT come here: a prompt is a **message to
 /// the agent**, delivered into its root context at startup, not a canned
@@ -6416,6 +6445,12 @@ fn apply_default_folders(doc: &mut Value, dirs: &[PathBuf], warnings: &mut Vec<S
 /// tools are root-scoped, so a prompt running as a step could never define the
 /// loop/schedule it was asked for (`Caller::Workflow` vs `Caller::Root` in
 /// the registry).
+///
+/// Nor does a daemon. Its instruction is the standing policy for the
+/// messages it takes, and run as a task it was an unprompted turn at every
+/// start — tokens spent, tools called, a run in status — that nobody asked
+/// for. A daemon with work to do at boot says so: `agent.prompt`, or a
+/// `once` workflow.
 fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
     let nonblank = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
     // Any workflow at all — declared in the config, loaded from a
@@ -6425,9 +6460,15 @@ fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
     //
     // A prompt likewise: it runs as a root turn, so an instruction+prompt pair
     // needs no workflow — the prompt IS the job.
+    //
+    // With no workflow there is no long-lived start, so the shape is the
+    // listener's and `run_until`'s — read off the typed settings, where every
+    // layer already is: file, environment, flag and the instruction's own
+    // `:::!config`, and so what `agentd tui`/`ui` loads too.
     if !settings.workflows.is_empty()
         || !nonblank(&settings.agent.instruction)
         || nonblank(&settings.agent.prompt)
+        || settings.is_daemon(false)
     {
         return;
     }
@@ -8298,6 +8339,28 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             "lifecycle.watch_config requires a config file (--config / AGENTD_CONFIG)".into(),
         );
     }
+    // A daemon with no workflow runs nothing when it starts: its instruction
+    // is the policy for the work that reaches it. Told to stay up with no A2A
+    // listener, no workflow and no prompt, no work ever could — it would
+    // load, wait and do nothing until it was stopped. A webhook listener or a
+    // goal is no way in on its own: a webhook route and a goal's disposition
+    // start a workflow, a callback resumes one, and an MCP Events delivery
+    // lands in a stream that only a workflow reads. The configured set is
+    // what is judged; a definition the agent wrote in an earlier life is
+    // restored only once the store is open, and the load cannot count it.
+    if s.lifecycle.run_until == RunUntil::Drained
+        && s.a2a.listen.is_none()
+        && s.workflows.is_empty()
+        && s.agent
+            .prompt
+            .as_deref()
+            .is_none_or(|p| p.trim().is_empty())
+    {
+        err(
+            &mut d,
+            "lifecycle.run_until is drained, but nothing can bring this instance work: it has no a2a.listen, no workflow and no agent.prompt, and a webhook listener or a goal only starts workflows — set agent.prompt or a `once` workflow for work at startup, a2a.listen to take messages, or declare in workflows the work it waits for (one the agent created at runtime is not counted); without run_until: drained an instruction alone runs once, as a job".into(),
+        );
+    }
 
     // Settings that only a build feature reads. A binary built without it
     // would load each one and do nothing — serve nothing, dial nobody, send
@@ -9741,6 +9804,20 @@ pub const RELOADABLE_PATHS: &[&str] = &[
 /// ones nested this way are the ones somebody meant.
 pub const RESTART_ONLY_WITHIN_RELOADABLE: &[&str] = &["agent.instruction.trust"];
 
+/// `doc` with the instruction's own `:::!config` under it, the operator's
+/// value standing where both set a path — the layers `settings` was typed
+/// from. The load folds that fragment into the settings and never writes it
+/// back into the document, so a restart-only check over the document alone
+/// would let an instruction move `lifecycle.run_until` or `store.kind` under
+/// a running process.
+pub fn with_document_config(doc: &Value, settings: &Settings) -> Value {
+    let mut out = doc.clone();
+    if let Some(o) = out.as_object_mut() {
+        crate::config::idoc::merge_missing(o, settings.agent.document_config.clone());
+    }
+    out
+}
+
 /// The restart-only paths whose values differ between two effective documents.
 pub fn restart_only_diff(running: &Value, candidate: &Value) -> Vec<String> {
     RESTART_ONLY_PATHS
@@ -10489,6 +10566,136 @@ mod tests {
             "{:?}",
             l.warnings
         );
+    }
+
+    /// The run shape decides what an instruction is. In a job it is the task,
+    /// so it gets the one-shot workflow; in a daemon it is the policy for the
+    /// messages the daemon takes, and nothing is generated to run at startup —
+    /// whichever layer made it a daemon.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_daemons_instruction_is_its_policy_not_a_generated_workflow() {
+        let generated = |a: &[&str]| {
+            let (l, _) = load(&args(a), &base_env()).unwrap();
+            assert!(l.settings.agent.instruction.is_some());
+            !l.settings.workflows.is_empty()
+        };
+        // `run_until: drained` makes a daemon too. With no A2A listener and
+        // nothing generated, nothing is left that can give it work, and the
+        // load refuses it: a generated workflow would have been work.
+        let refused = |a: &[&str]| {
+            load(&args(a), &base_env())
+                .is_err_and(|e| format!("{e}").contains("nothing can bring this instance work"))
+        };
+        let listen = ["--a2a.listen", "http://127.0.0.1:8443"];
+        assert!(!generated(
+            &[&["--instruction", "triage"][..], &listen].concat()
+        ));
+        assert!(refused(&[
+            "--instruction",
+            "triage",
+            "--lifecycle.run_until",
+            "drained",
+        ]));
+        // `idle` is a job, listener or not: there the instruction is the task.
+        assert!(generated(
+            &[
+                &["--instruction", "triage", "--lifecycle.run_until", "idle"][..],
+                &listen,
+            ]
+            .concat()
+        ));
+        // A webhook listener or a goal under `auto` leaves a job a job: the
+        // goal watches the run, and the exit code is still the run's.
+        assert!(generated(&[
+            "--instruction",
+            "triage",
+            "--webhooks.listen",
+            "http://127.0.0.1:8444",
+        ]));
+        assert!(generated(&[
+            "--instruction",
+            "triage",
+            "--goal.statement",
+            "the queue is empty",
+        ]));
+        // The shape a document's own `:::!config` states counts like any
+        // other layer's.
+        let md = write_tmp(
+            "You triage.\n\n:::!config\nlifecycle: { run_until: drained }\n:::\n",
+            "md",
+        );
+        assert!(refused(&[
+            "--instruction.file",
+            md.path().to_str().unwrap()
+        ]));
+        // …and a config file's.
+        let f = write_tmp(
+            "agent: { instruction: triage }\na2a: { listen: \"http://127.0.0.1:8443\" }\n",
+            "yaml",
+        );
+        assert!(!generated(&["--config", f.path().to_str().unwrap()]));
+        let f = write_tmp(
+            "agent: { instruction: triage }\nlifecycle: { run_until: drained }\n",
+            "yaml",
+        );
+        assert!(refused(&["--config", f.path().to_str().unwrap()]));
+    }
+
+    /// Told to stay up with nothing that can bring it work, a daemon would
+    /// load and never do anything: refused, as other configuration that does
+    /// nothing is. A webhook listener or a goal only starts workflows, so
+    /// with none it is no way in; any one real way in lifts the refusal.
+    #[test]
+    fn a_daemon_nothing_can_reach_is_refused() {
+        let drained = ["--lifecycle.run_until", "drained"];
+        let mut alone: Vec<&[&str]> = vec![
+            &["--instruction", "triage"],
+            // Not the instruction's doing: without one it does nothing too.
+            &[],
+            &[
+                "--instruction",
+                "triage",
+                "--goal.statement",
+                "the queue is empty",
+            ],
+        ];
+        if cfg!(feature = "a2a") {
+            alone.push(&[
+                "--instruction",
+                "triage",
+                "--webhooks.listen",
+                "http://127.0.0.1:8444",
+            ]);
+        }
+        for a in alone {
+            let e = load(&args(&[a, &drained].concat()), &base_env()).unwrap_err();
+            assert!(
+                format!("{e}").contains("nothing can bring this instance work"),
+                "{a:?}: {e}"
+            );
+        }
+        let mut ways: Vec<&[&str]> = vec![&["--prompt", "start with the oldest ticket"]];
+        if cfg!(feature = "a2a") {
+            ways.push(&["--a2a.listen", "http://127.0.0.1:8443"]);
+        }
+        for way in ways {
+            load(
+                &args(&[&["--instruction", "triage"][..], &drained, way].concat()),
+                &base_env(),
+            )
+            .unwrap_or_else(|e| panic!("{way:?} brings it work: {e}"));
+        }
+        let f = write_tmp(
+            "agent: { instruction: triage }\nlifecycle: { run_until: drained }\n\
+             workflows:\n  - name: w\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s]}\n",
+            "yaml",
+        );
+        load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .expect("a workflow is work it can be given");
     }
 
     #[cfg(feature = "a2a")]
@@ -13915,6 +14122,36 @@ mod tests {
         assert!(
             restart_only_diff(&a, &c).is_empty(),
             "instruction is reloadable"
+        );
+    }
+
+    /// A restart-only path the instruction's own `:::!config` sets is held to
+    /// the operator's rule: a reload that moves it is refused. Where the
+    /// operator's value stands over the document's, the document moves
+    /// nothing.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn restart_only_diff_reads_the_instructions_own_config() {
+        let effective = |md: &str, extra: &[&str]| {
+            let f = write_tmp(md, "md");
+            let base = [
+                "--instruction.file",
+                f.path().to_str().unwrap(),
+                "--a2a.listen",
+                "http://127.0.0.1:8443",
+            ];
+            let (l, _) = load(&args(&[&base[..], extra].concat()), &base_env()).unwrap();
+            with_document_config(&l.doc, &l.settings)
+        };
+        let plain = "You triage.\n";
+        let idle = "You triage.\n\n:::!config\nlifecycle: { run_until: idle }\n:::\n";
+        assert_eq!(
+            restart_only_diff(&effective(plain, &[]), &effective(idle, &[])),
+            ["lifecycle.run_until"]
+        );
+        let pinned = ["--lifecycle.run_until", "drained"];
+        assert!(
+            restart_only_diff(&effective(plain, &pinned), &effective(idle, &pinned)).is_empty()
         );
     }
 

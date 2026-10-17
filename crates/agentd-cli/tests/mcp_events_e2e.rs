@@ -338,8 +338,12 @@ fn every_refusal_is_said_once_with_its_reason() {
         binding("mock.tick", "{topic: forbidden}"),
     ]
     .concat();
+    // The manual workflow is what the daemon can be given: one with nothing
+    // that brings it work is refused at load.
     let cfg = format!(
-        "agent:\n  name: refusals\nstore:\n  kind: memory\nstreams:\n  ticks: {{}}\nmcp:\n  servers:\n{}{}{}lifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n",
+        "agent:\n  name: refusals\nstore:\n  kind: memory\nstreams:\n  ticks: {{}}\nmcp:\n  servers:\n{}{}{}\
+         workflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
+         lifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n",
         server("modern", &modern.uri(), &modern_list),
         server("bare", &bare.uri(), &binding("mock.tick", "{}")),
         server("legacy", &legacy.uri(), &binding("mock.tick", "{}")),

@@ -336,6 +336,10 @@ credentials reach the child through the environment, never the file. The
 child is wired back to the parent as a peer named `parent`, and the parent
 can address the child by its handle (`inst-<n>`) at once.
 
+The child is a daemon, so its prose is its policy: it runs nothing when it
+spawns, and work at spawn is a `:::!workflow` with a `once` start or a first
+message, such as `subagent.send` or an `a2a.send` step.
+
 ```mermaid
 flowchart LR
     P["parent agentd"] -- "composes config,<br/>spawns under the reaper" --> C["child agentd<br/>inst-N"]

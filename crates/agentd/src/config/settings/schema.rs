@@ -107,7 +107,7 @@ fn top_level_properties(
                             "passphrase": { "type": "string", "description": "for age scrypt envelopes — a {{secret:…}} reference" } } } } }
                 ] },
                     "prompt": { "oneOf": [
-                    { "type": "string", "description": "short form: a one-shot task (--prompt) — the text itself, a FILE path, a DIRECTORY, or an https:// document, classified exactly as `instruction` is. With no workflows configured the generated run executes it, while `instruction` stays the standing policy (the run's system prompt)." },
+                    { "type": "string", "description": "short form: a task (--prompt), delivered as a message into the root conversation at every start — the text itself, a FILE path, a DIRECTORY, or an https:// document, classified exactly as `instruction` is. A job's prompt is the job, and a daemon's what it does as soon as it starts; `instruction` stays the standing policy every turn is given." },
                     { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly", "properties": {
                         "text": { "type": "string", "description": "the task itself, never read as a path or URI" },
                         "file": { "type": "string", "description": "a path on disk" },

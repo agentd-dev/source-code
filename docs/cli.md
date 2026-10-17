@@ -23,9 +23,12 @@ agentd <ask>
   armed. The turn's outcome is the exit code, as a run's is: `4` when the
   model cannot be reached, `7` when a budget refuses or ends the turn, `124`
   past the deadline.
-- `--instruction` without a workflow is the one-shot sugar: agentd generates
-  a `once → agent → finish` workflow named `main`. With nothing long-lived
-  configured, the process exits when that run ends.
+- `--instruction` without a workflow or a prompt is the one-shot sugar:
+  agentd generates a `once → agent → finish` workflow named `main`, and the
+  process exits when that run ends, with its code. A daemon (an A2A
+  listener, or `lifecycle.run_until: drained`) gets no such workflow: there
+  the instruction is the policy for the messages it takes, and it runs
+  nothing at startup unless it has `--prompt` or a `once` start.
 - `tui` and `ui` run the daemon plus a display client. See
   [Subcommands](#subcommands).
 - An *ask* prints something and exits without starting the runtime. See

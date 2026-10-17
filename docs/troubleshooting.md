@@ -51,6 +51,7 @@ effective configuration shows which layer set each value.
 | `a2a.listen binds a wildcard host … set a2a.url` | set `a2a.url` to the origin callers use |
 | `a2a.cors.origins: "…/": an origin has no path` | write origins as `scheme://host[:port]`, no trailing slash |
 | `a \`webhook\` node … is used but webhooks.listen is not set` | configure `webhooks.listen` |
+| `lifecycle.run_until is drained, but nothing can bring this instance work` | a daemon with no `a2a.listen`, workflow or `agent.prompt` would wait for ever; a webhook listener or a `goal` only starts workflows, and a workflow the agent created at runtime is not counted. Give it `agent.prompt` or a `once` workflow for work at startup, `a2a.listen` to take messages, or the workflow it waits for in `workflows`; or remove `run_until: drained` to run the instruction once, as a job |
 | `observability.otel.endpoint: not an absolute URL: …`, or `… unsupported scheme: grpc` | give the collector's OTLP/HTTP base URL, `http://host:4318` or `https://…`; agentd does not speak OTLP/gRPC |
 
 Validation also refuses:
@@ -179,6 +180,12 @@ after the restart.
 
 These behave as designed, and surprise people anyway:
 
+- **A daemon's instruction does not run when it starts.** With an A2A
+  listener or `run_until: drained` and no workflow, the instruction is the
+  policy each message is answered under, and nothing runs until a message
+  arrives. Work for the first moments of a daemon's life is `agent.prompt`
+  or a `once` start. See [Jobs, daemons and
+  triggers](modes-and-triggers.md#a-jobs-task-a-daemons-policy).
 - **Read outputs at `steps.<id>.output`.** `{{ hook.body.id }}` reads
   nothing; `{{ steps.hook.output.body.id }}` does. A step id the workflow
   does not have is refused at load, but what follows it is read at run

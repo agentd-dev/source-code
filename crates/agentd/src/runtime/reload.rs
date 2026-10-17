@@ -113,7 +113,14 @@ impl Runtime {
     fn reload_inner(&mut self) -> Result<Vec<&'static str>, ReloadRefused> {
         let (loaded, _ask) = cfg::load(&self.args, &self.env)
             .map_err(|e| ReloadRefused::Invalid(vec![e.to_string()]))?;
-        let restart = cfg::restart_only_diff(&self.settings_doc, &loaded.doc);
+        // Over every layer, the instruction's `:::!config` included: a
+        // document that changes `lifecycle.run_until` would otherwise reload
+        // into a process whose job shape was settled at startup — and with it
+        // generate, or retire, the workflow its instruction runs as a job.
+        let restart = cfg::restart_only_diff(
+            &cfg::with_document_config(&self.settings_doc, &self.settings),
+            &cfg::with_document_config(&loaded.doc, &loaded.settings),
+        );
         if !restart.is_empty() {
             return Err(ReloadRefused::RestartRequired(restart));
         }

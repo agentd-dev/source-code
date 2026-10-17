@@ -90,8 +90,12 @@ lifecycle:
   watch_config: true     # reload on SIGHUP / file change (feature-gated)
 ```
 
-A bare run without `run_until` finishes and exits — correct for one-shots, wrong
-for anything a UI attaches to.
+A bare run without `run_until` or a listener finishes and exits — correct for
+one-shots, wrong for anything a UI attaches to. A daemon runs nothing for its
+instruction at startup: there the instruction is policy, and work at boot is
+`agent.prompt` or a `once` workflow. `drained` with nothing that can bring work
+in (no `a2a.listen`, workflow or `agent.prompt`) is refused at load; a webhook
+listener or a `goal` only starts workflows.
 
 ## store — durability
 

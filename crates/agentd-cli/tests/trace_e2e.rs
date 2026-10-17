@@ -497,7 +497,7 @@ fn an_instance_child_continues_the_spawning_units_trace() {
     let state = common::unique_path("trace-instance", "state");
     let _ = std::fs::remove_dir_all(&state);
     let cfg = write_config(
-        "agent: { name: parent }\nstore: { kind: memory }\n\
+        "agent: { name: parent }\nstore: { kind: file }\n\
          lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
          observability: { log_level: info }\n\
          subagents:\n\
@@ -538,13 +538,14 @@ fn an_instance_child_continues_the_spawning_units_trace() {
     assert_eq!(spawned.len(), 1, "{log}");
     assert_eq!(spawned[0]["trace_id"], caller["trace_id"], "{log}");
     // The child's own log, under the parent's state root.
-    let child_logs: Vec<String> = std::fs::read_dir(format!("{state}/subagents"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path().join("log"))
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .collect();
+    let child_logs: Vec<String> =
+        std::fs::read_dir(format!("{state}/subagents/file/agentd/parent"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("log"))
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
     assert_eq!(child_logs.len(), 1, "one instance child, one log");
     let child = &child_logs[0];
     let proc = events(child, "proc.start");

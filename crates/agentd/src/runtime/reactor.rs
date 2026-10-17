@@ -482,6 +482,10 @@ pub struct Runtime {
     /// its force has killed each since. One that then exits is parked for the
     /// next life rather than closed.
     pub(crate) drain_instances: BTreeMap<String, bool>,
+    /// The directory of this process's own that its non-durable instance
+    /// children live in, made at the first of them and removed with the
+    /// runtime (`runtime::instances`).
+    pub(crate) private_instances: Option<super::instances::PrivateDir>,
     /// What the drain stopped and left for the next life.
     pub(crate) drain_left: super::drain::Left,
     pub(crate) idle_since: Option<Instant>,

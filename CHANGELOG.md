@@ -177,6 +177,41 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   that does not parse, refuses the start, exit 2. A provider that does not
   answer, or answers with a server error, is not verified, and nothing is
   enrolled with it or signed under it until it answers.
+- An instance-tier child's directory — its composed config, socket, log and
+  store — belongs to the parent that spawned it. It was
+  `subagents/<handle>/` under the file store's root, which a parent with a
+  `memory`, `none`, `mcp` or `http` store resolved to the default state
+  directory, so every such parent of a user shared one `inst-1`: a new
+  parent's `inst-1` restored the runs of every earlier `inst-1` and replayed
+  the commands they had been sent, and two parents running at once shared
+  one socket path and one store, so one parent's child could not start, or
+  the parent reached the other's. Two file-store agents that used one state
+  root in turn shared their children the same way. A durable child's
+  directory is now `subagents/<store>/<prefix>/<instance>/<handle>/`, with
+  `<prefix>` and `<instance>` each one percent-encoded path segment: under
+  the file store's root with `<store>` `file`, or, for an `mcp` or `http`
+  store, under the default state directory with `<store>` the kind and a
+  digest of the store's address. A parent with a `memory` or `none` store
+  runs every child non-durable, on a memory store, whatever `durable` says.
+  A non-durable child's directory is in a directory of the parent process's
+  own, `agentd-<id>/` (mode 0700), under `$XDG_RUNTIME_DIR` when that is a
+  directory the user owns with mode 0700, else under the system temporary
+  directory. The child's directory is removed when it exits, unless it
+  failed or crashed: then it stays, its log in it, until the parent exits.
+  The parent's is removed when the parent exits. A socket path too long for
+  a unix socket falls back to a name in the temporary directory derived
+  from the child's directory, not `agentd-<handle>.sock`.
+- A parent's `instance.exited` event for a child that failed carries the
+  `cause` the child logged as it exited, such as the listener's bind error.
+  Before, the parent's log said only `status: failed`.
+- An instance child whose directory was 85 to 91 bytes long could not bind
+  its socket on a host with seven-digit pids, and exited 2: its listener
+  binds the socket in a staging directory, at a path 23 bytes longer than
+  the child's directory, and only the socket's own path was checked against
+  a 100-byte limit. The parent now checks the path the listener binds
+  against the size of a unix socket address, and refuses a spawn for which
+  neither the child's directory nor the temporary directory gives a path
+  short enough, naming `TMPDIR`.
 
 ## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
 

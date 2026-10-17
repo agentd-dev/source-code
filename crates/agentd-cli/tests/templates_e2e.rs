@@ -331,7 +331,7 @@ fn a_config_only_instance_child_runs_nothing_until_it_is_asked() {
     let state = common::unique_path("tpl-policy", "state");
     let (code, log) = run_cfg_in(
         &state,
-        "agent: { name: parent }\nstore: { kind: memory }\n\
+        "agent: { name: parent }\nstore: { kind: file }\n\
          intelligence: { endpoints: \"mock:echo-system\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -355,8 +355,9 @@ fn a_config_only_instance_child_runs_nothing_until_it_is_asked() {
     assert_eq!(code, Some(0), "{log}");
     let spawned = events(&log, "instance.spawn");
     assert_eq!(spawned.len(), 1, "{log}");
+    // A durable parent keeps its child's directory, log and all.
     let child = std::fs::read_to_string(format!(
-        "{state}/subagents/{}/log",
+        "{state}/subagents/file/agentd/parent/{}/log",
         spawned[0]["handle"].as_str().unwrap()
     ))
     .unwrap_or_default();
@@ -430,7 +431,7 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
     let state = common::unique_path("tpl-gate", "state");
     let (code, log) = run_cfg_in(
         &state,
-        "agent: { name: parent }\nstore: { kind: memory }\n\
+        "agent: { name: parent }\nstore: { kind: file }\n\
          lifecycle: { run_until: idle, idle_grace: 2500ms }\n\
          observability: { log_level: info, log_content: true }\n\
          intelligence: { models: { fast: { model: claude-haiku-4-5 } }, roles: { turn: fast } }\n\
@@ -474,8 +475,8 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         "the instance child spawned:\n{log}"
     );
     // The child's composed configuration carries the channel its parent
-    // read off the template's `::!human`.
-    let children = std::fs::read_dir(format!("{state}/subagents")).unwrap();
+    // read off the template's `::!human`. A durable parent keeps it.
+    let children = std::fs::read_dir(format!("{state}/subagents/file/agentd/parent")).unwrap();
     let configs: Vec<Value> = children
         .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("config.json")).ok())
         .filter_map(|t| serde_json::from_str(&t).ok())

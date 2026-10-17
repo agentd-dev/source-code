@@ -262,16 +262,13 @@ pub fn spawn(
             // lands, and the rename publishes an already-correct inode
             // atomically.
             let sock = std::path::Path::new(path);
-            let stage = sock
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join(format!(".agentd-sock-{}", std::process::id()));
+            let stage = crate::a2a::socket::stage_dir(sock, std::process::id());
             let _ = std::fs::remove_dir_all(&stage);
             std::fs::create_dir(&stage)
                 .map_err(|e| format!("a2a stage {}: {e}", stage.display()))?;
             std::fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700))
                 .map_err(|e| format!("a2a stage perms: {e}"))?;
-            let staged = stage.join("s");
+            let staged = crate::a2a::socket::staged(sock, std::process::id());
             let bound_listener = {
                 let _guard = runtime.enter();
                 tokio::net::UnixListener::bind(&staged)

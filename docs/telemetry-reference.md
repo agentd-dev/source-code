@@ -340,7 +340,7 @@ case.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `instance.drain` | info | `handle`, `pid` | The parent's drain sent the child `SIGTERM`, so it drains itself. |
-| `instance.exited` | info | `handle`, `pid`, `status` | `status` is `parked` for a child that drained at its parent's drain; the next start spawns it again. A `sync` child a stopped turn waited on is `cancelled` instead: the turn's replay spawns it again. |
+| `instance.exited` | info | `handle`, `pid`, `status`, `cause` | `cause`, for a child that failed, is the `err` its last `proc.exit` logged. `status` is `parked` for a child that drained at its parent's drain; the next start spawns it again. A `sync` child a stopped turn waited on is `cancelled` instead: the turn's replay spawns it again. |
 | `instance.kill` | warn | `handle`, `note`, `pid` |  |
 | `instance.metered` | info | `delta_tokens`, `handle`, `total_tokens` |  |
 | `instance.mirror` | info | `handle`, `link`, `seq`, `stream` | `link`: the span of the child's report. |

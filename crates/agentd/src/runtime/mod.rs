@@ -647,6 +647,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_reason: String::new(),
         drain_forced: false,
         drain_instances: Default::default(),
+        private_instances: None,
         drain_left: Default::default(),
         idle_since: None,
         intel,

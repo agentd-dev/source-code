@@ -277,7 +277,7 @@ fn restrict_file(f: &fs::File) {
 
 /// Percent-encode everything outside an unreserved set. `.`/`..`/`/` become
 /// unrepresentable, which is what closes traversal.
-fn encode(seg: &str) -> String {
+pub(crate) fn encode(seg: &str) -> String {
     let mut out = String::with_capacity(seg.len());
     for b in seg.bytes() {
         let safe = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');

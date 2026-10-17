@@ -957,7 +957,7 @@ paths are live · op.
 | `subagents.templates.<name>.ttl` | duration | — | Instance tier: retire gracefully after this long. |
 | `subagents.templates.<name>.until` | string | — | Instance tier: a signal name whose delivery in the child retires it. |
 | `subagents.templates.<name>.singleton` | bool | `false` | One live child; its peer alias is the template name. |
-| `subagents.templates.<name>.durable` | bool | `store.durability.work` | `false` keeps the record in memory. |
+| `subagents.templates.<name>.durable` | bool | `store.durability.work` | `false` keeps the record in memory. A parent with a `memory` or `none` store runs every instance child non-durable. |
 | `subagents.templates.<name>.result.workflow` | string | — | Instance tier, `mode: sync`: resolve the spawn when the child's named workflow first completes. Needs a parent A2A listener. |
 | `subagents.templates.<name>.mirror_streams` | list | — | Instance tier: child streams forwarded into the parent's same-named streams. Needs a parent A2A listener. |
 

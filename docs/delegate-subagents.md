@@ -725,7 +725,7 @@ What the instance tier needs and offers:
 | `model`, `budget` | The child's turn model and its own token budget | The child gets the parent's intelligence section without its budget or routes |
 | `limits` | `memory` and `cpu` only | Token ceilings belong in `budget` |
 | `ttl`, `until` | Retire after a duration, or when the named signal is delivered in the child | `until` must use a parameter unless `singleton: true` |
-| `durable` | `false` runs the child on a memory store, unmetered and not restarted | Default follows `store.durability.work` |
+| `durable` | `false` runs the child on a memory store, unmetered and not restarted | Default follows `store.durability.work`; a parent with a `memory` or `none` store runs every child this way |
 
 `servers` and `tools` are refused on an instance template: its own
 `:::!mcp` blocks declare its servers. A child's MCP servers are checked
@@ -739,26 +739,55 @@ workflows addressed `@human/<name>` to one of the template's `::!human`
 declarations keeps its channel: the parent writes it into the child's
 `agent.gate_channels` ([Human in the loop](human-in-the-loop.md)).
 
-The child lives under the parent's state directory, in
-`<store.file.path>/subagents/<handle>/`: its composed `config.json` (mode
-0600), its `log`, its `state/` and its `a2a.sock`. A socket path longer than
-100 bytes falls back to the system temporary directory. The parent must be
-reachable for the child's reports: on a unix listener the kernel identifies
-the child, and on a TCP listener with authentication `a2a.bearer` must be a
-`{{secret:…}}` reference, or the spawn is refused.
+Each child has a directory of its own, mode 0700: its composed
+`config.json` (mode 0600), its `log`, its `a2a.sock` and, for a durable
+child, its store in `state/`. The directory belongs to the parent that
+spawned the child, and no other agent is given it:
+
+- A durable child's directory is kept with the parent's durable state, by
+  the parent's `store.prefix` and instance name, the way its store keys that
+  state, so the parent finds it again when it restarts. With a file store it
+  is `subagents/file/<prefix>/<instance>/<handle>/` under the store's root.
+  With an `mcp` or `http` store it is
+  `subagents/<kind>-<digest>/<prefix>/<instance>/<handle>/` under the default
+  state directory, where the digest stands for the store's address.
+  `<prefix>` and `<instance>` are each one percent-encoded path segment: the
+  children of an agent named `desk/room` are in `desk%2Froom/`.
+- A non-durable child's directory is `<handle>/` in a directory of the
+  parent process's own, `agentd-<id>/`. That is under `$XDG_RUNTIME_DIR` when
+  it is a directory the user owns with mode 0700, as the XDG specification
+  requires, and under the system temporary directory otherwise. A child of a
+  parent whose store is `memory` or `none` is always non-durable. The
+  child's directory is removed when it exits, unless it failed or crashed:
+  then it stays, its log in it, until the parent exits. The parent's
+  directory is removed when the parent exits. A parent that does not exit
+  normally, because it was killed with SIGKILL or crashed, leaves its
+  directory behind, and no later process uses it.
+
+The child's listener binds its socket in a staging directory beside
+`a2a.sock`, at a path up to 23 bytes longer than the child's directory, and
+a unix socket address holds 107 bytes on Linux (103 on macOS). When that
+path would not fit, the socket is in the system temporary directory
+instead, under a name derived from the child's directory. A spawn for which neither
+fits is refused, naming `TMPDIR`. When a child fails, the parent's
+`instance.exited` event carries the `cause` the child logged as it exited.
+
+The parent must be reachable for the child's reports: on a unix listener
+the kernel identifies the child, and on a TCP listener with authentication
+`a2a.bearer` must be a `{{secret:…}}` reference, or the spawn is refused.
 
 `subagent.retire {handle}`, `ttl` and `until` retire a child: it receives
 SIGTERM, drains its runs, checkpoints and exits. The parent kills it only if
 it is still running five seconds after the parent's
-`lifecycle.drain_timeout`. Its record closes as `retired` and its directory
-stays on disk.
+`lifecycle.drain_timeout`. Its record closes as `retired`, and a durable
+child's directory stays on disk.
 
 The parent's own drain stops a child the same way but does not retire it:
 the child receives SIGTERM as the drain begins and drains itself, and the
 parent waits for it within its own `drain_timeout`, killing it only if it is
-still running then. Its record says `parked`, and it starts again from its
-composed configuration when the parent restarts, as every live instance
-child does.
+still running then. Its record says `parked`, and a durable child starts
+again from its composed configuration when the parent restarts, as every
+live durable instance child does.
 
 > **Warning.** The parent's load checks a template's tier rules and its
 > boundary, but not the steps of its workflows. Those are validated when a

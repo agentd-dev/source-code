@@ -332,8 +332,8 @@ parent composes. The parent writes the template's machinery, the delivered
 prose with its parameters, its own intelligence section (without its budget,
 its routes or any inline token, and with the template's `model` and
 `budget`), its service catalogue, egress posture and TLS trust, its AAuth
-provider and key file, a store under its own state directory, and an A2A
-listener on a unix socket. Model credentials reach the child through the
+provider and key file, a store, and an A2A listener on a unix socket in the
+child's own directory. Model credentials reach the child through the
 environment, never the file, and the child loads the AAuth key without ever
 creating one and fetches its own agent token for it when it starts. The
 child is wired back to the parent as a peer named `parent`, and the parent
@@ -368,21 +368,41 @@ Four mechanisms ride that wiring:
   knowing which child wrote them.
 - **Budget metering.** A durable child's token use is charged against the
   parent's budget: the parent reads the child's lifetime total from its
-  manifest every five seconds and charges the difference. A `durable: false`
+  manifest every five seconds and charges the difference. A non-durable
   child has no manifest, so its use is not metered.
 - **Retirement.** `ttl` elapsing, the `until` signal arriving in the child,
   `subagent.retire`, or the parent's own shutdown all take one path: the
   child receives SIGTERM (a parent's death reaches it the same way), stops
   admitting work, drains its runs, checkpoints and exits. The parent kills
   it only if it is still running five seconds after the parent's drain
-  timeout. The record closes as `retired`, and the child's directory stays
-  on disk as the audit trail. A child that exits on its own closes as
-  `completed`, `failed` or `crashed`.
+  timeout. The record closes as `retired`, and a durable child's directory
+  stays on disk as the audit trail. A child that exits on its own closes as
+  `completed`, `failed` or `crashed`; for one that failed, the parent's
+  `instance.exited` event carries the `cause` the child logged as it exited.
 
 Across a parent restart, live instance children are started again from their
 composed configuration. Their state is durable and the handle is their
 identity, so a child picks up where it stopped. A non-durable child runs on a
 memory store and is not restarted.
+
+A child's state belongs to the parent that spawned it. A durable child's
+directory is kept with the parent's durable state: under the file store's
+root, or, for an `mcp` or `http` store, under the default state directory in
+a directory named for that store. Both are keyed by `store.prefix` and the
+instance name, as the store keys the parent's state, so the same parent
+finds its children in every life and no other parent is given them. A
+parent whose store is `memory` or `none` keeps nothing across its own
+restart, so its children are non-durable whatever `durable` says. A
+non-durable child's directory is in a directory of the parent process's own
+(mode 0700), under `$XDG_RUNTIME_DIR` when that is the user's own 0700
+directory, else under the system temporary directory. The child's directory
+is removed when the child exits, unless it failed or crashed: then it stays,
+its log in it, until the parent exits. The parent's is removed when the
+parent exits; a parent that does not exit normally leaves it behind, and no
+later process uses it. Two parents never share a child's directory, socket
+or store, and a new parent's `inst-1` never starts on an earlier parent's
+state. [Run a child daemon](delegate-subagents.md#run-a-child-daemon) lists
+the paths.
 
 The template's machinery faces the same boundary as any served document: a
 fragment that writes operator-only configuration is refused, and so are a

@@ -247,7 +247,8 @@ variables.
 | `HOSTNAME` | The instance name when neither `agent.name` nor `AGENTD_POD_NAME` is set; the last fallback is `agentd` |
 | `AGENTD_POD_UID`, `AGENTD_POD_NAMESPACE`, `AGENTD_NODE_NAME` | Descriptive pod identity, never required |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | The OTLP collector when `observability.otel.endpoint` is unset |
-| `XDG_RUNTIME_DIR` | Where `tui`/`ui` put the daemon log by default |
+| `XDG_RUNTIME_DIR` | Where `tui`/`ui` put the daemon log by default, and, when it is a directory the user owns with mode 0700, where a parent keeps its non-durable instance children |
+| `TMPDIR` | The temporary directory: a parent's non-durable instance children when `XDG_RUNTIME_DIR` is not the user's own, and an instance child's socket when its own directory is too deep for one |
 | `AGENTD_TUI_BIN`, `AGENTD_UI_BIN` | The display client binary the launcher starts |
 | `DOCKER_CONFIG` | Registry credentials for `oci://` instruction pulls |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE` | AWS SigV4 credentials for an endpoint whose `auth.source` reads them |

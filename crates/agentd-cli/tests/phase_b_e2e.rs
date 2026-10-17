@@ -184,6 +184,10 @@ fn an_instance_report_into_a_stream_its_template_does_not_mirror_is_refused() {
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log_path).unwrap())
         .env("AGENTD_STATE_DIR", format!("{dir}/state"))
+        // Killed below, the parent leaves its children's private directory
+        // behind: in `dir`, which the test removes.
+        .env("TMPDIR", &dir)
+        .env_remove("XDG_RUNTIME_DIR")
         .spawn()
         .expect("spawn agentd");
     let addr = common::wait_a2a_bound(&log_path);

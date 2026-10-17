@@ -139,8 +139,34 @@ impl Runtime {
             );
             return err(format!("subagent.run refused: {why}"));
         }
+        // Durability class (call site > template > store.durability.work):
+        // non-durable ⇒ memory-only record, child on a memory store in this
+        // process's private directory, no restore-respawn — the throwaway
+        // war-room shape. A parent whose store does not outlive it has only
+        // non-durable children: nothing would respawn a durable one, or read
+        // its state, again.
+        let root = durable_instances_root(&self.settings, &self.instance);
+        let durable = root.is_some()
+            && args
+                .get("durable")
+                .and_then(Value::as_bool)
+                .or(t.spec.durable)
+                .unwrap_or_else(|| self.work_durable_default());
         let handle = self.next_id("inst");
-        let dir = self.instance_dir(&handle);
+        let dir = match self.instance_dir(&handle, root.filter(|_| durable)) {
+            Ok(d) => d,
+            Err(e) => return err(format!("subagent.run: {e}")),
+        };
+        let socket = match instance_socket_path(&dir, &std::env::temp_dir()) {
+            Ok(s) => s,
+            Err(why) => {
+                self.log.warn(
+                    "instance.spawn.refused",
+                    json!({"template": tname, "reason": why}),
+                );
+                return err(format!("subagent.run refused: {why}"));
+            }
+        };
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return err(format!("subagent.run: create {}: {e}", dir.display()));
         }
@@ -149,21 +175,12 @@ impl Runtime {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
-        let socket = instance_socket_path(&dir, &handle);
         let until = t
             .spec
             .until
             .as_ref()
             .map(|u| fold_params(u, &params))
             .filter(|u| !u.trim().is_empty());
-        // Durability class (call site > template > store.durability.work):
-        // non-durable ⇒ memory-only record, child on a memory store, no
-        // restore-respawn — the throwaway war-room shape.
-        let durable = args
-            .get("durable")
-            .and_then(Value::as_bool)
-            .or(t.spec.durable)
-            .unwrap_or_else(|| self.work_durable_default());
         // `mode: sync` resolves the spawn when the child's declared result
         // workflow first completes — the composed reporter dials home.
         // `detached` returns as soon as the daemon is up.
@@ -206,14 +223,14 @@ impl Runtime {
         ) {
             Ok(d) => d,
             Err(e) => {
-                forget_instance_key(&dir);
+                self.release_instance_dir(&dir, Some(&socket), false);
                 return err(format!("subagent.run: template '{tname}': {e}"));
             }
         };
         // The composed document must be a bootable config NOW — a child that
         // exits 2 on its first breath is a refusal we can make synchronously.
         if let Err(e) = validate_composed(&doc, &prose) {
-            forget_instance_key(&dir);
+            self.release_instance_dir(&dir, Some(&socket), false);
             return err(format!(
                 "subagent.run: template '{tname}' composes an invalid config: {e}"
             ));
@@ -221,7 +238,7 @@ impl Runtime {
         let config_path = dir.join("config.json");
         let rendered = serde_json::to_string_pretty(&doc).unwrap_or_default();
         if let Err(e) = std::fs::write(&config_path, rendered) {
-            forget_instance_key(&dir);
+            self.release_instance_dir(&dir, Some(&socket), false);
             return err(format!(
                 "subagent.run: write {}: {e}",
                 config_path.display()
@@ -288,7 +305,7 @@ impl Runtime {
                 }
             }
             Err(e) => {
-                forget_instance_key(&dir);
+                self.release_instance_dir(&dir, Some(&socket), false);
                 record.status = "failed".into();
                 record.error = Some(format!("spawn: {e}"));
                 self.subagents.insert(handle.clone(), record);
@@ -752,16 +769,9 @@ impl Runtime {
         else {
             return false;
         };
-        // The child has read its key; a respawn is composed it again.
-        if let Some(dir) = self.subagents[&handle]
-            .config_path
-            .as_deref()
-            .and_then(|c| std::path::Path::new(c).parent())
-        {
-            forget_instance_key(dir);
-        }
         // One the drain asked to drain itself is left for the next life.
         if self.park_drained_instance(&handle, r) {
+            self.release_reaped_instance(&handle, false);
             self.persist_subagent(&handle);
             return true;
         }
@@ -775,6 +785,12 @@ impl Runtime {
                 ("crashed", Some(format!("signal {sig}")))
             }
         };
+        let failed = error.is_some();
+        let cause = self
+            .instance_dir_of(&handle)
+            .filter(|_| failed)
+            .and_then(|d| exit_cause(&d.join("log")));
+        self.release_reaped_instance(&handle, failed);
         if let Some(s) = self.subagents.get_mut(&handle) {
             s.status = status.into();
             s.error = error;
@@ -783,12 +799,32 @@ impl Runtime {
             s.updated = now_ms();
             s.dirty = true;
         }
-        self.subagent_log(&handle).info(
-            "instance.exited",
-            json!({"handle": handle, "pid": r.pid, "status": status}),
-        );
+        // A child that failed said why in its own log; the parent's says it
+        // too, where it outlives the child's directory.
+        let mut exited = json!({"handle": handle, "pid": r.pid, "status": status});
+        if let Some(cause) = cause {
+            exited["cause"] = Value::String(cause);
+        }
+        self.subagent_log(&handle).info("instance.exited", exited);
         self.persist_subagent(&handle);
         true
+    }
+
+    /// The directory the child `handle` was composed in, from its record.
+    fn instance_dir_of(&self, handle: &str) -> Option<PathBuf> {
+        let config = self.subagents.get(handle)?.config_path.as_deref()?;
+        std::path::Path::new(config).parent().map(PathBuf::from)
+    }
+
+    /// [`Runtime::release_instance_dir`] for the reaped child `handle`: the
+    /// child has read its key, and a respawn is composed it again. A
+    /// non-durable child's directory goes with it, unless it `failed`: its log
+    /// says why, so the directory stays until this process exits.
+    fn release_reaped_instance(&self, handle: &str, failed: bool) {
+        if let Some(dir) = self.instance_dir_of(handle) {
+            let socket = self.subagents.get(handle).and_then(|s| s.socket.as_deref());
+            self.release_instance_dir(&dir, socket, failed);
+        }
     }
 
     /// Restore-time respawn: live instance records whose composed config still
@@ -1194,10 +1230,63 @@ impl Runtime {
         g.as_mut().map(|b| b.try_take()).unwrap_or(true)
     }
 
-    fn instance_dir(&self, handle: &str) -> PathBuf {
-        crate::config::settings::file_store_root(&self.settings.store)
-            .join("subagents")
-            .join(handle)
+    /// The directory the child `handle` is composed in: its `config.json`,
+    /// `log`, `a2a.sock` and, when durable, its own file store in `state/`. A
+    /// durable child's is under `root`, this parent's
+    /// [`durable_instances_root`], where the parent finds it again in its next
+    /// life. A non-durable child's (no `root`) is in this process's private
+    /// directory, so no other parent ever reads it and none of it outlives
+    /// this process.
+    fn instance_dir(&mut self, handle: &str, root: Option<PathBuf>) -> Result<PathBuf, String> {
+        match root {
+            Some(root) => Ok(root.join(handle)),
+            None => self.private_instances_dir().map(|d| d.join(handle)),
+        }
+    }
+
+    /// This process's private directory for its non-durable instance
+    /// children, made at the first of them: `agentd-<process nonce>` under
+    /// this user's runtime directory ([`user_runtime_dir`]), else the system
+    /// temp directory, mode 0700. A directory already at that path is refused
+    /// rather than used, so it holds no other process's children; it is
+    /// removed when the runtime ends.
+    fn private_instances_dir(&mut self) -> Result<PathBuf, String> {
+        if let Some(d) = &self.private_instances {
+            return Ok(d.0.clone());
+        }
+        let base = user_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR"))
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("agentd-{}", self.process_nonce));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        self.private_instances = Some(PrivateDir(dir.clone()));
+        Ok(dir)
+    }
+
+    /// Let go of the directory `dir` a child was composed in, once the child
+    /// has exited or was never started: the key copy it was composed is
+    /// removed ([`forget_instance_key`]), and so are a non-durable child's
+    /// `socket` and, unless asked to `keep` it, its whole directory, since
+    /// nothing reads them again. A kept one goes with this process's private
+    /// directory.
+    fn release_instance_dir(&self, dir: &std::path::Path, socket: Option<&str>, keep: bool) {
+        forget_instance_key(dir);
+        if self
+            .private_instances
+            .as_ref()
+            .is_some_and(|p| dir.starts_with(&p.0))
+        {
+            if let Some(s) = socket {
+                let _ = std::fs::remove_file(s);
+            }
+            if !keep {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
     }
 
     fn persist_subagent(&mut self, handle: &str) {
@@ -1345,18 +1434,129 @@ fn read_child_lifetime_tokens(state_root: &std::path::Path) -> Option<u64> {
     None
 }
 
-/// The unix-socket path — kept under the sun path limit (~108 bytes) by
-/// falling back to the temp dir for deep state roots.
-fn instance_socket_path(dir: &std::path::Path, handle: &str) -> String {
-    let p = dir.join("a2a.sock");
-    let s = p.display().to_string();
-    if s.len() <= 100 {
-        s
-    } else {
-        std::env::temp_dir()
-            .join(format!("agentd-{handle}.sock"))
-            .display()
-            .to_string()
+/// How much of a failed child's log [`exit_cause`] reads, from its end.
+const EXIT_CAUSE_TAIL: u64 = 16 * 1024;
+
+/// What a child that failed logged it failed of: the `err` of the last
+/// `proc.exit` in its `log`.
+fn exit_cause(log: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(EXIT_CAUSE_TAIL)))
+        .ok()?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["event"] == "proc.exit")
+        .and_then(|v| v.get("err")?.as_str().map(str::to_string))
+}
+
+/// The child's unix-socket path: `a2a.sock` in its directory `dir`, or,
+/// where the child's listener could not bind that
+/// ([`crate::a2a::socket::fits`]), a name in the temp directory `tmp` derived
+/// from `dir` — that is its parent's and its handle's alone, and the same in
+/// each of a durable parent's lives. `Err` when neither fits.
+fn instance_socket_path(dir: &std::path::Path, tmp: &std::path::Path) -> Result<String, String> {
+    use crate::a2a::socket::fits;
+    let own = dir.join("a2a.sock");
+    if fits(&own) {
+        return Ok(own.display().to_string());
+    }
+    let id = crate::sha::sha256_hex(dir.as_os_str().as_encoded_bytes());
+    let fallback = tmp.join(format!("agentd-{}.sock", &id[..16]));
+    if fits(&fallback) {
+        return Ok(fallback.display().to_string());
+    }
+    Err(format!(
+        "no socket path for the child is short enough to bind: {} and {} are both too long; a shorter TMPDIR makes room",
+        own.display(),
+        fallback.display()
+    ))
+}
+
+/// Where a durable parent keeps its instance children, one directory per
+/// handle — `<state>/subagents/<store>/<prefix>/<instance>` — or `None` when
+/// its store does not outlive its process (`memory`, `none`).
+///
+/// A durable parent is the state its store keeps under `<prefix>/<instance>`
+/// ([`crate::store::key`]), so the same daemon finds its children here in
+/// every life and no other daemon is handed them; `<store>` says which store
+/// that state is in. A file store's directory is under the store's own root,
+/// which one daemon holds at a time, so it is `file`. An mcp or http store is
+/// a fleet's, so its parent's children are under the default state
+/// directory, and `<store>` is the kind and a digest of the store's address:
+/// two parents of one name and prefix on two stores are two daemons.
+fn durable_instances_root(
+    settings: &crate::config::settings::Settings,
+    instance: &str,
+) -> Option<PathBuf> {
+    use crate::config::settings::{Store, StoreKind, file_store_root};
+    let store = &settings.store;
+    let fleet = |kind: &str, address: &str| {
+        let id = crate::sha::sha256_hex(address.as_bytes());
+        (
+            file_store_root(&Store::default()),
+            format!("{kind}-{}", &id[..12]),
+        )
+    };
+    let (base, which) = match store.kind {
+        StoreKind::Memory | StoreKind::None => return None,
+        StoreKind::File => (file_store_root(store), "file".to_string()),
+        StoreKind::Mcp => {
+            let server = store.mcp.as_ref().map_or("", |m| m.server.as_str());
+            let address = settings
+                .mcp
+                .servers
+                .iter()
+                .find(|s| s.name == server)
+                .map_or(server, |s| s.endpoint.as_str());
+            fleet("mcp", address)
+        }
+        StoreKind::Http => fleet(
+            "http",
+            store.http.as_ref().map_or("", |h| h.base_url.as_str()),
+        ),
+    };
+    let segment = crate::store::file::encode;
+    Some(
+        base.join("subagents")
+            .join(which)
+            .join(segment(store.prefix()))
+            .join(segment(instance)),
+    )
+}
+
+/// `$XDG_RUNTIME_DIR` (`var`) when it is what the XDG base directory
+/// specification says it is: a directory this process's user owns that no
+/// other user can use (mode 0700). One this user was handed by another —
+/// `sudo -E` keeps root's `/run/user/0` — or any other directory is not.
+fn user_runtime_dir(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(var?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(&dir).ok()?;
+        let me = unsafe { libc::geteuid() };
+        (m.is_dir() && m.uid() == me && m.mode() & 0o077 == 0).then_some(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        dir.is_dir().then_some(dir)
+    }
+}
+
+/// A directory of this process's own for its non-durable instance children
+/// ([`Runtime::private_instances_dir`]), removed with everything in it when
+/// the runtime that made it ends.
+pub(crate) struct PrivateDir(PathBuf);
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1685,6 +1885,161 @@ mod tests {
         assert_eq!(published, consumed);
         for name in published {
             assert_eq!(InstanceOp::of(name).map(InstanceOp::name), Some(name));
+        }
+    }
+
+    /// A socket the child's listener could not bind in its directory falls
+    /// back to the temp directory under a name of the child's directory:
+    /// each parent's `inst-1` gets one of its own, the same one in every life
+    /// of a durable parent, and the name stays short. What decides is the
+    /// address the listener stages the bind at, not the socket's own path;
+    /// and a spawn with no path that fits is refused.
+    #[test]
+    fn a_long_socket_path_falls_back_to_a_name_of_its_parents_own() {
+        use crate::a2a::socket::{fits, staged};
+        let tmp = std::path::Path::new("/tmp");
+        let deep = |parent: &str| {
+            std::path::PathBuf::from(format!("/{}/{parent}/inst-1", "d".repeat(100)))
+        };
+        let at = |dir: &std::path::Path| instance_socket_path(dir, tmp).unwrap();
+        let (a, b) = (at(&deep("a")), at(&deep("b")));
+        assert_ne!(a, b, "two parents' inst-1 share a socket");
+        assert_eq!(
+            a,
+            at(&deep("a")),
+            "a durable child's socket moves between its parent's lives"
+        );
+        let path = std::path::Path::new(&a);
+        assert_eq!(path.parent(), Some(tmp), "{a}");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(!name.contains("inst-1"), "{name}");
+        assert_eq!(name.len(), "agentd-.sock".len() + 16, "{name}");
+        // One that fits stays in the child's directory.
+        assert_eq!(at(std::path::Path::new("/s/inst-1")), "/s/inst-1/a2a.sock");
+        // Where `a2a.sock` itself is short enough but the address the child
+        // binds it at is not, the socket falls back too.
+        let edge = |len: usize| std::path::PathBuf::from(format!("/{}", "e".repeat(len - 1)));
+        let deepest = (1..200)
+            .take_while(|&n| fits(&edge(n).join("a2a.sock")))
+            .last()
+            .unwrap();
+        assert_eq!(
+            at(&edge(deepest)),
+            format!("{}/a2a.sock", edge(deepest).display())
+        );
+        let over = edge(deepest + 1);
+        assert!(over.join("a2a.sock").as_os_str().len() < 100, "{over:?}");
+        assert!(
+            staged(&over.join("a2a.sock"), 4_194_304).as_os_str().len() >= 108,
+            "a seven-digit pid could not bind it"
+        );
+        assert_eq!(std::path::Path::new(&at(&over)).parent(), Some(tmp));
+        // A temp directory too deep for the fallback either is refused.
+        let tmp_deep = std::path::PathBuf::from(format!("/{}", "t".repeat(90)));
+        let e = instance_socket_path(&deep("a"), &tmp_deep).expect_err("refused");
+        assert!(e.contains("TMPDIR"), "{e}");
+    }
+
+    /// The runtime directory is this user's own only when the XDG
+    /// specification's rule holds: a directory the user owns, mode 0700. One
+    /// another user owns, one others can enter, and a file are not.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_runtime_dir_of_this_users_own_is_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+        let of = |p: &std::path::Path| user_runtime_dir(Some(p.as_os_str().to_owned()));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(of(&dir), Some(dir.clone()));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(of(&dir), None, "a runtime directory others can enter");
+        assert_eq!(of(std::path::Path::new("/proc")), None);
+        let file = root.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(of(&file), None);
+        assert_eq!(of(&root.path().join("gone")), None);
+        assert_eq!(user_runtime_dir(None), None);
+        // Root can hand a directory to another user and see it refused.
+        if unsafe { libc::geteuid() } == 0 {
+            let theirs = root.path().join("theirs");
+            std::fs::create_dir(&theirs).unwrap();
+            std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::os::unix::fs::chown(&theirs, Some(4_000_000), None).unwrap();
+            assert_eq!(of(&theirs), None, "another user's runtime directory");
+        }
+    }
+
+    /// A failed child's cause is the `err` of the last `proc.exit` its log
+    /// has, however much it logged before it; a log without one has none.
+    #[test]
+    fn a_failed_childs_cause_is_its_last_exit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let mut text = String::new();
+        text.push_str(r#"{"event":"proc.exit","err":"an earlier life"}"#);
+        text.push('\n');
+        for i in 0..2_000 {
+            text.push_str(&format!("{{\"event\":\"tick\",\"n\":{i}}}\n"));
+        }
+        text.push_str("not json\n");
+        text.push_str(r#"{"event":"proc.exit","code":2,"err":"a2a bind: too long"}"#);
+        text.push_str("\nthread 'main' panicked\n");
+        std::fs::write(&log, &text).unwrap();
+        assert_eq!(exit_cause(&log).as_deref(), Some("a2a bind: too long"));
+        std::fs::write(&log, r#"{"event":"proc.exit","code":0}"#).unwrap();
+        assert_eq!(exit_cause(&log), None);
+        assert_eq!(exit_cause(&dir.path().join("gone")), None);
+    }
+
+    /// A durable parent's children are kept under the identity its state is
+    /// kept under — its file store's root, or the default state directory
+    /// and the fleet store's address — with its prefix and instance name,
+    /// each one path segment. A parent whose store does not outlive it has
+    /// no such place.
+    #[test]
+    fn a_durable_parents_children_are_kept_under_its_own_identity() {
+        let root = |store: Value| {
+            let doc = json!({
+                "agent": {"instruction": "x"},
+                "store": store,
+                "mcp": {"servers": [
+                    {"name": "a", "endpoint": "https://a.example/mcp"},
+                    {"name": "b", "endpoint": "https://b.example/mcp"},
+                ]},
+            });
+            let s = crate::config::settings::Settings::from_document(doc, "t").unwrap();
+            durable_instances_root(&s, "desk/room")
+        };
+        assert_eq!(
+            root(json!({"kind": "file", "file": {"path": "/var/lib/agentd"}})),
+            Some(std::path::PathBuf::from(
+                "/var/lib/agentd/subagents/file/agentd/desk%2Froom"
+            ))
+        );
+        assert_eq!(
+            root(json!({"kind": "file", "prefix": "acme/x", "file": {"path": "/s"}})),
+            Some(std::path::PathBuf::from(
+                "/s/subagents/file/acme%2Fx/desk%2Froom"
+            ))
+        );
+        let mcp = |server: &str| root(json!({"kind": "mcp", "mcp": {"server": server}})).unwrap();
+        let http = root(json!({"kind": "http", "http": {"base_url": "https://a.example/mcp"}}));
+        let defaulted = crate::config::settings::file_store_root(&Default::default());
+        for fleet in [mcp("a"), mcp("b"), http.clone().unwrap()] {
+            assert!(fleet.starts_with(defaulted.join("subagents")), "{fleet:?}");
+            assert!(fleet.ends_with("agentd/desk%2Froom"), "{fleet:?}");
+        }
+        assert_eq!(mcp("a"), mcp("a"));
+        assert_ne!(
+            mcp("a"),
+            mcp("b"),
+            "two fleet stores share a parent's children"
+        );
+        assert_ne!(Some(mcp("a")), http, "an mcp and an http store share them");
+        for kind in ["memory", "none"] {
+            assert_eq!(root(json!({"kind": kind})), None, "{kind}");
         }
     }
 

@@ -1183,8 +1183,11 @@ fn a_shutdown_run_a_forced_drain_cuts_short_is_cancelled_not_run_next_life() {
     assert_eq!(deregistrations(&calls), 0, "{}", tail(&log));
 
     // The next life finishes the job, and does not run the last one's
-    // shutdown at its boot.
+    // shutdown at its boot. Its own shutdown run is meant to finish, so its
+    // drain is not the 2 s that forced the first one: on a loaded runner the
+    // run's turn alone can take longer.
     write(0);
+    std::fs::write(&cfg, deinit_config(&dir, &play, port, "60s", hold, "")).unwrap();
     let mut life = Life::start(&cfg, &[]);
     let log = life.wait_for("the run to complete in the second life", |log| {
         events(log, "run.done").iter().any(|e| {

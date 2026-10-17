@@ -509,6 +509,7 @@ mod imp {
     use super::{Attr, Kind};
     use crate::net::http::{self, Url};
     use crate::obs::log::Logger;
+    use crate::obs::quiet::{Health, Say};
     use crate::obs::trace::TraceContext;
     use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -837,72 +838,8 @@ mod imp {
 
     // ---- export failures ---------------------------------------------------
     // A batch that fails is dropped; the log says so without repeating itself
-    // every batch while a collector stays down or keeps failing some batches.
-
-    /// How long the log goes without repeating a line about one signal: a
-    /// second `otel.export.failed` while exports keep failing, or a second
-    /// `otel.export.recovered` after a collector that fails again.
-    const FAILURE_QUIET: Duration = Duration::from_secs(60);
-
-    /// What the log has been told about one signal's exports.
-    struct Health {
-        /// Batches lost since the last `otel.export.recovered` line.
-        lost: u64,
-        /// When the last `otel.export.failed` line was written; `None` while
-        /// the log's last word on the signal is that its exports work.
-        warned_at: Option<Instant>,
-        /// When the last `otel.export.recovered` line was written.
-        recovered_at: Option<Instant>,
-    }
-
-    /// What one export's outcome has the log say. `failures` counts the
-    /// batches lost since the last `Recovered`, this one included for `Failed`.
-    #[derive(Debug, PartialEq)]
-    enum Say {
-        Nothing,
-        Failed { failures: u64 },
-        Recovered { failures: u64 },
-    }
-
-    impl Health {
-        const fn new() -> Health {
-            Health {
-                lost: 0,
-                warned_at: None,
-                recovered_at: None,
-            }
-        }
-
-        /// Record one export's outcome at `now`. A failure is said at once
-        /// when the log last said exports work, and otherwise once
-        /// [`FAILURE_QUIET`] has passed since the last failure line. A success
-        /// after a failure line is said once, but not within [`FAILURE_QUIET`]
-        /// of the last recovery line: a collector that fails every other batch
-        /// gets one line of each a minute, and the log keeps saying it fails
-        /// until a success comes after that minute.
-        fn record(&mut self, ok: bool, now: Instant) -> Say {
-            let quiet =
-                |at: Option<Instant>| at.is_some_and(|at| now.duration_since(at) < FAILURE_QUIET);
-            if ok {
-                if self.warned_at.is_none() || quiet(self.recovered_at) {
-                    return Say::Nothing;
-                }
-                self.warned_at = None;
-                self.recovered_at = Some(now);
-                return Say::Recovered {
-                    failures: std::mem::take(&mut self.lost),
-                };
-            }
-            self.lost += 1;
-            if quiet(self.warned_at) {
-                return Say::Nothing;
-            }
-            self.warned_at = Some(now);
-            Say::Failed {
-                failures: self.lost,
-            }
-        }
-    }
+    // every batch while a collector stays down or keeps failing some batches
+    // (`obs::quiet`: one line of each a minute, per signal).
 
     static TRACES_HEALTH: Mutex<Health> = Mutex::new(Health::new());
     static LOGS_HEALTH: Mutex<Health> = Mutex::new(Health::new());
@@ -1211,61 +1148,6 @@ mod imp {
             // A line in no trace names none.
             let bare = log_record(0, "info", "x", &json!({}));
             assert!(bare.get("traceId").is_none() && bare.get("spanId").is_none());
-        }
-
-        #[test]
-        fn a_failing_collector_is_named_once_a_minute_and_its_recovery_once() {
-            let t0 = Instant::now();
-            let mut h = Health::new();
-            assert_eq!(h.record(true, t0), Say::Nothing, "a success says nothing");
-            assert_eq!(h.record(false, t0), Say::Failed { failures: 1 });
-            // Every batch inside the quiet minute fails silently…
-            for s in 1..60 {
-                let at = t0 + Duration::from_secs(s);
-                assert_eq!(h.record(false, at), Say::Nothing, "{s}s");
-            }
-            // …and the minute after the last line, the run is named again.
-            assert_eq!(
-                h.record(false, t0 + FAILURE_QUIET),
-                Say::Failed { failures: 61 }
-            );
-            assert_eq!(
-                h.record(false, t0 + FAILURE_QUIET + Duration::from_secs(1)),
-                Say::Nothing
-            );
-            let back = t0 + FAILURE_QUIET + Duration::from_secs(2);
-            assert_eq!(h.record(true, back), Say::Recovered { failures: 62 });
-            assert_eq!(h.record(true, back), Say::Nothing);
-            // A new run of failures is named at once, counted from one.
-            assert_eq!(h.record(false, back), Say::Failed { failures: 1 });
-        }
-
-        #[test]
-        fn a_collector_that_fails_every_other_batch_is_named_once_a_minute() {
-            let t0 = Instant::now();
-            let at = |s: u64| t0 + Duration::from_secs(s);
-            let mut h = Health::new();
-            assert_eq!(h.record(false, at(0)), Say::Failed { failures: 1 });
-            assert_eq!(h.record(true, at(5)), Say::Recovered { failures: 1 });
-            // Failing again after the log said it works is said at once…
-            assert_eq!(h.record(false, at(10)), Say::Failed { failures: 1 });
-            // …and then, within the minute, neither line repeats.
-            for s in (15..65).step_by(10) {
-                assert_eq!(h.record(true, at(s)), Say::Nothing, "{s}s");
-                assert_eq!(h.record(false, at(s + 5)), Say::Nothing, "{}s", s + 5);
-            }
-            // The first success a minute after the last recovery line says
-            // it, counting every batch lost since then.
-            assert_eq!(h.record(true, at(65)), Say::Recovered { failures: 6 });
-
-            // Over an hour of it: one line of each a minute, give or take one.
-            let mut lines = 0;
-            for s in (70..3670).step_by(5) {
-                if h.record(s % 10 == 5, at(s)) != Say::Nothing {
-                    lines += 1;
-                }
-            }
-            assert!((119..=121).contains(&lines), "{lines} lines in an hour");
         }
 
         /// An exit waits on a collector that takes the connection and never

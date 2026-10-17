@@ -6,11 +6,14 @@
 //! the `static` and `aauth` providers. This module owns the rest: the
 //! [`Kind::Cred`](crate::state::Kind::Cred)-backed [`cache`], the OAuth 2.1 /
 //! OIDC [`oauth2`] flows (device grant, browser + PKCE, refresh, discovery)
-//! behind `agentd login`, and the AWS SigV4 / IAM Identity Center providers.
-//! Everything but the cache is gated on the `oauth` cargo feature, so a build
+//! behind `agentd --login`, the AWS SigV4 / IAM Identity Center providers, and
+//! the [`report`] of credentials that cannot be produced. Everything but the
+//! cache and that report is gated on the `oauth` cargo feature, so a build
 //! without it carries no interactive-login code at all.
 
 pub mod cache;
+
+pub mod report;
 
 #[cfg(feature = "oauth")]
 pub mod oauth2;

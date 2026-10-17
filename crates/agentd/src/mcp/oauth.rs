@@ -146,18 +146,25 @@ impl OAuthClient {
 
 /// Adapts an [`OAuthClient`] (client-credentials) to the transport's
 /// [`::mcp::http::RequestSigner`] seam: injects a refreshing
-/// `Authorization: Bearer …` on every request. A token-fetch failure yields no
-/// header at all, so the request rides unauthenticated and the server answers
-/// `401`. That is deliberate: a visible auth failure at the call site beats
-/// blocking the caller inside the signer while a broken token endpoint hangs.
+/// `Authorization: Bearer …` on every request. A token it cannot fetch fails
+/// the request unsent, with the token endpoint's error, and the next request
+/// fetches again.
 pub struct OAuthBearerSigner {
+    /// What a failure is reported under (`mcp:<name>`).
+    target: String,
     client: OAuthClient,
 }
 
 impl OAuthBearerSigner {
-    /// Build from the runtime spec (`crate::config::McpOauthSpec`).
-    pub fn new(spec: crate::config::McpOauthSpec, timeout: Duration) -> OAuthBearerSigner {
+    /// Build from the runtime spec (`crate::config::McpOauthSpec`); `target`
+    /// names the endpoint in a failure.
+    pub fn new(
+        target: &str,
+        spec: crate::config::McpOauthSpec,
+        timeout: Duration,
+    ) -> OAuthBearerSigner {
         OAuthBearerSigner {
+            target: target.to_string(),
             client: OAuthClient::new(
                 OAuthConfig {
                     token_url: spec.token_url,
@@ -178,11 +185,9 @@ impl ::mcp::http::RequestSigner for OAuthBearerSigner {
         _authority: &str,
         _path: &str,
         _body: &[u8],
-    ) -> Vec<(String, String)> {
-        match self.client.bearer() {
-            Ok(tok) => vec![("Authorization".to_string(), format!("Bearer {tok}"))],
-            Err(_) => Vec::new(),
-        }
+    ) -> Result<Vec<(String, String)>, String> {
+        let tok = crate::auth::report::outcome(&self.target, self.client.bearer())?;
+        Ok(vec![("Authorization".to_string(), format!("Bearer {tok}"))])
     }
 }
 

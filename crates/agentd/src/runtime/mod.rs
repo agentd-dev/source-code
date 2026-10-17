@@ -255,6 +255,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // Consumer presence (RFC-0028 §3.3): every MCP session this process opens
     // announces which workload it is, alongside name/version.
     crate::mcp::set_workload_label(&instance);
+    // A credential that cannot be produced is said on this log.
+    crate::auth::report::set_logger(&log);
 
     // The reference preflight, phase 1: every `{{secret:…}}` / `{{secret-file:…}}`
     // visible in the assembled document, checked BEFORE anything dials out —
@@ -1426,10 +1428,11 @@ pub fn capabilities(loaded: &Loaded) -> Value {
     })
 }
 
-/// The bearer for one dial, in precedence order: the credential provider's
-/// refreshing token, then a mounted token FILE read AT THIS INSTANT, then the
-/// static `intelligence.token`. Returns the read error rather than logging, so
-/// it is a pure function with a test that can fail.
+/// The static bearer for one dial of `target`'s connection: a mounted token
+/// FILE read AT THIS INSTANT, else the resolved `token`. A file that cannot be
+/// read is the error — never the static value it was configured to replace,
+/// nor no credential at all — reported as a credential that cannot be
+/// produced ([`crate::auth::report`]).
 ///
 /// The file is deliberately not cached. A Kubernetes projected service-account
 /// token is rewritten in place about hourly, and the SPIFFE JWT-SVID an
@@ -1439,20 +1442,17 @@ pub fn capabilities(loaded: &Loaded) -> Value {
 /// same "copied once, never rebuilt" defect the reload guardrails exist for.
 /// One `open(2)` per dial buys it back.
 pub(crate) fn bearer_now(
-    refreshing: Option<String>,
+    target: &str,
     token_file: Option<&str>,
     static_token: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    if let Some(t) = refreshing {
-        return (Some(t), None);
+) -> Result<Option<String>, String> {
+    match token_file {
+        Some(path) => {
+            crate::auth::report::outcome(target, crate::sec::secret::read_token_file(path))
+                .map(Some)
+        }
+        None => Ok(static_token.map(str::to_string)),
     }
-    if let Some(path) = token_file {
-        return match crate::sec::secret::read_token_file(path) {
-            Ok(t) => (Some(t), None),
-            Err(e) => (None, Some(e)),
-        };
-    }
-    (static_token.map(str::to_string), None)
 }
 
 /// A resource instruction read, verified and folded through one server, not
@@ -2669,41 +2669,41 @@ mod bearer_tests {
         std::fs::write(&path, "first\n").unwrap();
         let p = path.to_string_lossy().to_string();
 
-        let (b, err) = bearer_now(None, Some(&p), Some("static"));
+        let b = bearer_now("intelligence", Some(&p), Some("static")).unwrap();
         assert_eq!(b.as_deref(), Some("first"), "trailing newline trimmed");
-        assert!(err.is_none());
 
         // The kubelet rewrites the projected token in place.
         std::fs::write(&path, "second\n").unwrap();
-        let (b, _) = bearer_now(None, Some(&p), Some("static"));
+        let b = bearer_now("intelligence", Some(&p), Some("static")).unwrap();
         assert_eq!(b.as_deref(), Some("second"), "re-read, not cached");
     }
 
     #[test]
-    fn precedence_is_refreshing_then_file_then_static() {
+    fn precedence_is_file_then_static() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
         std::fs::write(&path, "from-file").unwrap();
         let p = path.to_string_lossy().to_string();
 
-        let (b, _) = bearer_now(Some("oauth".into()), Some(&p), Some("static"));
-        assert_eq!(b.as_deref(), Some("oauth"), "a refreshing provider wins");
-        let (b, _) = bearer_now(None, Some(&p), Some("static"));
+        let b = bearer_now("intelligence", Some(&p), Some("static")).unwrap();
         assert_eq!(b.as_deref(), Some("from-file"), "a file beats the static");
-        let (b, _) = bearer_now(None, None, Some("static"));
+        let b = bearer_now("intelligence", None, Some("static")).unwrap();
         assert_eq!(b.as_deref(), Some("static"));
-        let (b, _) = bearer_now(None, None, None);
+        let b = bearer_now("intelligence", None, None).unwrap();
         assert_eq!(b, None, "no credential configured");
     }
 
-    /// An unreadable file mid-rotation is reported, not fatal, and never
-    /// falls back to a stale static value it was configured to replace.
+    /// An unreadable file mid-rotation is the dial's error, under its
+    /// target, and never falls back to a stale static value it was
+    /// configured to replace.
     #[test]
-    fn an_unreadable_token_file_reports_and_yields_nothing() {
-        let (b, err) = bearer_now(None, Some("/no/such/token"), Some("static"));
-        assert_eq!(b, None);
-        let err = err.expect("an error is reported");
-        assert!(err.contains("/no/such/token"), "{err}");
+    fn an_unreadable_token_file_is_the_dials_error() {
+        let err = bearer_now("intelligence:file", Some("/no/such/token"), Some("static"))
+            .expect_err("an error is reported");
+        assert!(
+            err.starts_with("intelligence:file: ") && err.contains("/no/such/token"),
+            "{err}"
+        );
         assert!(
             !err.contains("static"),
             "an error never carries a credential"

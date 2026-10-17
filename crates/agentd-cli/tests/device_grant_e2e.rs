@@ -807,7 +807,7 @@ fn wildcard_listener_has_no_loopback_operator() {
     assert!(daemon.alive(), "{}", daemon.stderr());
 }
 
-/// agentd's own OAuth client — the one `agentd login` drives against other
+/// agentd's own OAuth client — the one `agentd --login` drives against other
 /// authorization servers — signs in against agentd's device server: RFC 8414
 /// discovery, the device authorization (with a parameter this server does
 /// not know, which it ignores), and the poll.

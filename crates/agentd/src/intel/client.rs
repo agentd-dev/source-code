@@ -93,6 +93,11 @@ pub enum IntelError {
     /// same fatal-infrastructure class as `Transport`, so a `once` run exits 4;
     /// a loop or reactive daemon backs off and retries rather than crashing.
     AllEndpointsDown(Option<Box<IntelError>>),
+    /// The credential the connection is configured to present could not be
+    /// produced — no login cached, a source that does not answer — so the
+    /// request was not sent. An auth failure: the same on every endpoint, no
+    /// failover, no fallback model, no backoff; the next call tries again.
+    Credential(String),
 }
 
 impl fmt::Display for IntelError {
@@ -106,6 +111,7 @@ impl fmt::Display for IntelError {
                 Some(e) => write!(f, "all intelligence endpoints down (last error: {e})"),
                 None => write!(f, "all intelligence endpoints down"),
             },
+            IntelError::Credential(m) => write!(f, "intelligence request not sent: {m}"),
         }
     }
 }
@@ -167,6 +173,10 @@ pub struct IntelClient {
     /// This model's reasoning controls, when it is a reasoning model: set on
     /// every request it is asked, and on no other link's.
     reasoning: Option<crate::wire::intel::ReasoningAsk>,
+    /// Why this connection's credential could not be produced when the
+    /// client was built: every call on it then fails with
+    /// [`IntelError::Credential`], unsent.
+    credential_error: Option<String>,
 }
 
 /// The next link of a fallback chain: its client and the wire model it sends.
@@ -249,7 +259,15 @@ impl IntelClient {
             last_all_down: std::cell::Cell::new(false),
             fallback: None,
             reasoning: None,
+            credential_error: None,
         }
+    }
+
+    /// Fail every call on this client, unsent, with `cause`: the credential
+    /// its connection presents could not be produced. `None` leaves it be.
+    pub fn with_credential_error(mut self, cause: Option<String>) -> IntelClient {
+        self.credential_error = cause;
+        self
     }
 
     /// Ask every request on this model with these reasoning controls.
@@ -534,6 +552,11 @@ impl IntelClient {
         };
         // One model call. A no-op when metrics are not enabled.
         crate::obs::metrics::record_intel_call();
+        if let Some(cause) = &self.credential_error {
+            let e = IntelError::Credential(cause.clone());
+            crate::obs::metrics::record_intel_error(error_reason(&e));
+            return Err(e);
+        }
 
         let mut attempt: u32 = 0;
         loop {
@@ -647,7 +670,7 @@ fn error_reason(e: &IntelError) -> &'static str {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "timeout",
             _ => "unreachable",
         },
-        IntelError::Http(401 | 403, _) => "auth",
+        IntelError::Http(401 | 403, _) | IntelError::Credential(_) => "auth",
         IntelError::Http(c, _) if (500..600).contains(c) => "5xx",
         IntelError::Http(_, _) => "other",
         IntelError::Parse(_) | IntelError::Unsupported(_) => "other",
@@ -838,6 +861,70 @@ mod tests {
             "unreachable"
         );
         assert_eq!(error_reason(&IntelError::Http(401, "x".into())), "auth");
+    }
+
+    /// A credential that cannot be produced fails the call before any dial,
+    /// as an auth failure: the endpoint is never reached, its breaker is not
+    /// charged, and no fallback model is asked in its place.
+    #[test]
+    fn a_call_whose_credential_cannot_be_produced_is_not_sent() {
+        struct NoCredential;
+        impl ::mcp::http::RequestSigner for NoCredential {
+            fn sign(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &[u8],
+            ) -> Result<Vec<(String, String)>, String> {
+                Err("intelligence: aws: AWS_ACCESS_KEY_ID is not set".into())
+            }
+        }
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}", l.local_addr().unwrap());
+        let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&dials);
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(c);
+            }
+        });
+        let req = Request {
+            model: "m".into(),
+            messages: vec![crate::wire::intel::Message::User("hi".into())],
+            tools: vec![],
+            max_tokens: 16,
+            temperature: Some(0.0),
+            decision: None,
+            reasoning: None,
+            output_schema: None,
+        };
+        let backup = IntelClient::from_parts("mock:final", None).unwrap();
+        let signed = IntelClient::from_parts(&uri, None)
+            .unwrap()
+            .with_signer(Some(std::sync::Arc::new(NoCredential)))
+            .with_fallback(backup, "m-backup".into());
+        let carried = IntelClient::from_parts(&uri, None)
+            .unwrap()
+            .with_credential_error(Some(
+                "intelligence: no cached credential — run `agentd --login intelligence`".into(),
+            ));
+        for (client, cause) in [
+            (&signed, "AWS_ACCESS_KEY_ID is not set"),
+            (&carried, "run `agentd --login intelligence`"),
+        ] {
+            for _ in 0..3 {
+                let e = client.complete(&req).unwrap_err();
+                assert!(matches!(&e, IntelError::Credential(_)), "{e:?}");
+                assert!(e.to_string().contains(cause), "{e}");
+                assert!(failover::is_auth(&e) && !unavailable(&e));
+                assert_eq!(error_reason(&e), "auth");
+            }
+            assert!(!client.list.borrow().all_down(), "no breaker is charged");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// A model whose connection is gone while its fallback answers is not an

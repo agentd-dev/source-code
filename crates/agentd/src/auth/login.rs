@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `agentd login <target>` — the interactive login flow. Resolves a configured
+//! `agentd --login <target>` — the interactive login flow. Resolves a configured
 //! endpoint's `auth:` block, runs the RFC 8628 device grant (print a URL and a
 //! short code, poll until the human authorizes), and writes the obtained token
 //! to the per-user file cache the daemon reads at startup.

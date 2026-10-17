@@ -78,7 +78,7 @@ these names, and anything else is refused at load.
 | `admin` | `admin.set` |
 | `agent` | An instance-wide pause |
 | `audit` | Audit records written to the log, and audit write failures |
-| `auth` | Display-client launch codes and sign-in sessions |
+| `auth` | Display-client launch codes and sign-in sessions; outbound credentials that cannot be produced |
 | `breaker` | Step circuit breakers |
 | `budget` | Token budgets: windows, degrade, the lifetime cap |
 | `cgroup` | cgroup v2 placement of children |
@@ -191,7 +191,9 @@ case.
 | `auth.launch.approved` | info | `client_id` |  |
 | `auth.launch.exchanged` | info | `bind`, `client_id`, `sid`, `via` |  |
 | `auth.launch.requested` | info | `client_id` |  |
+| `auth.recovered` | info | `failures`, `target` | A request for `target` had its credential again after `failures` could not. Written at most once a minute, as `otel.export.recovered` is. |
 | `auth.session.revoked` | info | — |  |
+| `auth.unavailable` | warn | `err`, `failures`, `target` | The credential `target`'s `auth` (or `token_file`) presents could not be produced — no login, an expired token with no refresh token, an issuer, token endpoint or AWS source that does not answer, a secret file that cannot be read — so the requests that need it fail without being sent. Written when they start failing, then at most once a minute while they keep failing; `failures` counts the requests failed since the target's last `auth.recovered`. `target` is the credential's target: `intelligence`, `intelligence:<provider>`, `mcp:<name>`, `service:<entry>`, or `a2a:<peer>` for a peer's own `auth`. The supervisor writes it for the whole process tree: a turn worker or subagent hands its credential outcomes up, so a failure every turn meets is one line a minute. |
 
 ### breaker
 
@@ -385,7 +387,6 @@ case.
 | `intel.swap.reject` | warn | `err` | A pending swap was refused at the turn boundary. |
 | `intel.swap.restart_turn` | info | `discarded_turn` |  |
 | `intel.swap.sent` | info | `policy`, `subagents` | A reload's model change was sent to running subagents. |
-| `intel.token_file.error` | warn | `err`, `provider` | A provider's token file could not be read. |
 
 ### knowledge
 

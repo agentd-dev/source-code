@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Interactive entry for missing secrets (`--prompt-missing`).
 //!
-//! The shape mirrors `agentd login`: a deployment that is missing credentials
+//! The shape mirrors `agentd --login`: a deployment that is missing credentials
 //! stops and asks the person in front of it, one value at a time, instead of
 //! failing once per missing value across repeated restarts.
 //!

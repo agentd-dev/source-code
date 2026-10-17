@@ -434,7 +434,10 @@ signs with `auth`.
   through `headers` instead.
 - **Log in before you start.** agentd does not prompt for a login while it
   runs. Run `agentd --login intelligence` (or `intelligence:<provider>`)
-  first; the token is cached and refreshed in memory.
+  first; the token is cached and refreshed in memory. Until there is a login,
+  every model call on the connection fails without being sent, naming the
+  `--login` to run, and `auth.unavailable` says so once a minute; a login made
+  while agentd runs is used by the next call.
 
 The [Outbound credentials](authentication.md) guide covers every `auth`
 field, the login cache and the other endpoints that take an `auth` block.
@@ -510,7 +513,8 @@ on the new one.
 | `… is not set in the environment` at validation | a `{{secret:NAME}}` with no variable | export the variable |
 | `intelligence.token carries an inline credential` | a key written in the file | use `"{{secret:NAME}}"` |
 | `dialect: bedrock requires intelligence.auth.kind = aws (SigV4)` | Bedrock with no `aws` block | add `auth: {kind: aws, …}` |
-| `intelligence HTTP 401` at the first call, exit 4 | a wrong or missing key, or no login yet | check the key; run `agentd --login …` |
+| `intelligence HTTP 401` at the first call, exit 4 | a wrong or missing key | check the key the connection names |
+| `intelligence request not sent: … no cached credential`, exit 4 | no login yet, or one that expired with no refresh token | run the `agentd --login` the error names |
 | every turn ends after one answer, no tools called | the model or server ignores `tools` | enable tool calling, or use a model that has it |
 
 ## Next steps

@@ -149,9 +149,10 @@ impl McpClient {
         Self::connect_signed(name, endpoint, headers, timeout, None)
     }
 
-    /// [`Self::connect`] with an optional per-request AAuth signer — every
-    /// outbound request to this server is then signed, including the long-lived
-    /// notification stream. `None` = unsigned (the `connect` default).
+    /// [`Self::connect`] with an optional per-request signer — every outbound
+    /// request to this server is then signed, including the long-lived
+    /// notification stream, and a request whose credential the signer cannot
+    /// produce is not sent. `None` = unsigned (the `connect` default).
     pub fn connect_signed(
         name: &str,
         endpoint: &str,

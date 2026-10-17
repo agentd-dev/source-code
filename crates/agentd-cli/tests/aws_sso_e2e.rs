@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `agentd login` for **AWS IAM Identity Center (SSO)**, end to end:
+//! `agentd --login` for **AWS IAM Identity Center (SSO)**, end to end:
 //! the binary runs the SSO-OIDC device flow against a mock (register → device →
 //! poll pending/authorized → exchange for temporary AWS credentials) and caches
 //! the temp keys the SigV4 signer will use. Proves the "enterprise login for
@@ -156,7 +156,7 @@ fn agentd_login_aws_sso_caches_temporary_credentials() {
     };
     let signer =
         agentd::auth::aws::SigV4Signer::from_spec(&authspec, "mcp:bedrock").expect("signer");
-    let h = signer.sign("GET", "gateway.example", "/mcp", b"");
+    let h = signer.sign("GET", "gateway.example", "/mcp", b"").unwrap();
     let auth_h = &h.iter().find(|(k, _)| k == "Authorization").unwrap().1;
     assert!(
         auth_h.contains("Credential=ASIAEXAMPLE/"),

@@ -93,8 +93,8 @@ impl RequestSigner for StubSigner {
         authority: &str,
         path: &str,
         body: &[u8],
-    ) -> Vec<(String, String)> {
-        vec![
+    ) -> Result<Vec<(String, String)>, String> {
+        Ok(vec![
             (
                 "Signature-Input".to_string(),
                 "sig1=(\"@method\" \"@authority\" \"@path\")".to_string(),
@@ -103,7 +103,7 @@ impl RequestSigner for StubSigner {
                 "Signature".to_string(),
                 format!("sig1=:{method} {authority} {path} {}:", body.len()),
             ),
-        ]
+        ])
     }
     fn capabilities(&self) -> Option<String> {
         Some("interaction".to_string())
@@ -174,6 +174,73 @@ fn the_notification_stream_dial_carries_the_request_signature() {
         Some("interaction"),
         "the capabilities advert rides the dial too: {headers:?}"
     );
+}
+
+/// A signer whose credential cannot be produced: no login, a source that does
+/// not answer.
+struct NoCredential;
+impl RequestSigner for NoCredential {
+    fn sign(&self, _: &str, _: &str, _: &str, _: &[u8]) -> Result<Vec<(String, String)>, String> {
+        Err("mcp:x: no cached credential".to_string())
+    }
+}
+
+/// A listener that counts every connection made to it, whether or not a
+/// request ever arrives on it.
+fn spawn_counting() -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let dials = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&dials);
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            *counted.lock().unwrap() += 1;
+            drop(conn);
+        }
+    });
+    (format!("http://{addr}/mcp"), dials)
+}
+
+/// A signer that cannot produce its credential fails the request before any
+/// dial: a POST and the notification `GET` alike reach no server, and the
+/// error carries the signer's cause.
+#[test]
+fn a_request_whose_credential_cannot_be_produced_is_not_sent() {
+    let (ep, dials) = spawn_counting();
+    let signer: Arc<dyn RequestSigner> = Arc::new(NoCredential);
+    let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]).with_signer(Some(signer));
+
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let posted = t.send(Some(1), body, Duration::from_secs(2), &[], |_| {});
+    match posted {
+        Err(mcp::http::HttpError::Credential(cause)) => {
+            assert_eq!(cause, "mcp:x: no cached credential")
+        }
+        other => panic!("a POST with no credential must not be sent: {other:?}"),
+    }
+    let opened = t.open_events(Duration::from_secs(2), &[]);
+    assert!(
+        matches!(opened, Err(mcp::http::HttpError::Credential(_))),
+        "the notification stream with no credential must not be dialed"
+    );
+    let err = mcp::http::HttpError::Credential("mcp:x: no cached credential".into());
+    assert!(
+        err.to_string().contains("not sent") && err.to_string().contains("mcp:x"),
+        "{err}"
+    );
+
+    // The handshake is refused the same way, naming the cause.
+    let refused = RmcpBuilder::new("x", &ep, vec![], Duration::from_secs(2))
+        .with_http(Arc::new(
+            HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![])
+                .with_signer(Some(Arc::new(NoCredential))),
+        ))
+        .connect();
+    let e = refused.err().expect("a handshake with no credential fails");
+    assert!(e.to_string().contains("no cached credential"), "{e}");
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(*dials.lock().unwrap(), 0, "nothing may reach the server");
 }
 
 // -------------------------- 2. an interleaved server→client request is answered

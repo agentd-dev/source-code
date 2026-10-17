@@ -9,7 +9,7 @@
 //! | 1    | generic/unspecified failure                         | retriable      |
 //! | 2    | config / usage error (validation)                   | non-retriable  |
 //! | 3    | partial result (a job's work left unfinished too)   | policy         |
-//! | 4    | intelligence unreachable / auth after retries       | retriable      |
+//! | 4    | model unreachable / credential refused or missing   | retriable      |
 //! | 5    | semantic — task cannot be done / refused            | non-retriable  |
 //! | 6    | required MCP server failed to connect/handshake/die | retriable      |
 //! | 7    | budget exceeded (steps/tokens/subagent tree)        | policy         |

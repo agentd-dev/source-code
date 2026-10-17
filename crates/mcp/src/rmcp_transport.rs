@@ -210,7 +210,8 @@ pub(crate) enum BootstrapFailure {
     /// The server answered with this status and no JSON-RPC body.
     Status(u16),
     /// The request never reached a server: the TCP dial (or the name lookup)
-    /// failed, or this build cannot speak the endpoint's scheme. A TLS
+    /// failed, this build cannot speak the endpoint's scheme, or the signer
+    /// could not produce the credential it presents. A TLS
     /// failure is not this: the handshake runs on the first read, so it
     /// surfaces as `NoAnswer`, the fallback meets the same failure, and the
     /// error names both.
@@ -224,7 +225,9 @@ impl BootstrapFailure {
     fn of(e: &HttpError) -> BootstrapFailure {
         match e {
             HttpError::Status(s) => BootstrapFailure::Status(*s),
-            HttpError::Connect(_) | HttpError::Unsupported(_) => BootstrapFailure::Unreached,
+            HttpError::Connect(_) | HttpError::Unsupported(_) | HttpError::Credential(_) => {
+                BootstrapFailure::Unreached
+            }
             HttpError::Http(_) | HttpError::NoResponse | HttpError::NoEventStream => {
                 BootstrapFailure::NoAnswer
             }

@@ -91,7 +91,7 @@ common codes:
 |---|---|---|
 | 2 | configuration or usage error | the `config.invalid` lines |
 | 3 | partial: a run stalled, or a drain cut the job short | `run.stalled` and the step that never became ready; `drain.interrupted` |
-| 4 | the model was unreachable, or refused the credential, after retries | the `run.done` error, `intel` in its text |
+| 4 | the model was unreachable, refused the credential, or its credential could not be produced | the `run.done` error, `intel` in its text; `auth.unavailable` |
 | 6 | a required MCP server is down, or the durable store did not open | `mcp.connect.fail`, `proc.exit` |
 | 7 | a budget was exhausted: steps or tokens | the run's limits |
 | 124 | the run's deadline passed | `limits.deadline`, `--deadline` |
@@ -237,7 +237,8 @@ and joins when it answers (`mcp.joined`).
 
 | Symptom | Cause and fix |
 |---|---|
-| `mcp.connect.fail` naming `401` | the server wants a credential. For an OAuth server, run `agentd --login mcp:<name>` once to cache a token; otherwise set the server's `auth` |
+| `mcp.connect.fail` naming `401` | the server wants a credential, or refused the one sent; set or fix the server's `auth` |
+| `mcp.connect.fail` naming `not sent, no credential` | the server's `auth` could not produce its credential, so nothing was sent. The error names the target and the cause: run the `agentd --login <target>` it names, or fix what it names (an issuer that does not answer, a secret file that cannot be read). The connect is retried, and the next one uses a login made meanwhile |
 | `mcp.connect.fail` naming `-32020` or `-32021` | a 2026-07-28 server refused agentd's request itself; the message names the reason |
 | a refused probe followed by a working connection | normal: a server on an MCP revision before 2026-07-28 does not know `server/discover`, and is reached through the `initialize` handshake |
 | `start.subscribe.unsupported`, or a resource wait failing with a missing capability | the server does not advertise resource subscriptions, so nothing fires |
@@ -253,6 +254,7 @@ the revisions agentd speaks.
 |---|---|
 | `intelligence HTTP 404` | the endpoint path is wrong. A URL with a path is posted to exactly as written, so an OpenAI-compatible endpoint must be the full path, such as `https://api.openai.com/v1/chat/completions`, not `…/v1`. Anthropic is `https://api.anthropic.com` with `dialect: anthropic` |
 | `intelligence HTTP 401` or `403` | the token is wrong or lacks access; check the secret the connection names |
+| `intelligence request not sent` | the connection's `auth` could not produce its credential, so the call was not sent; the error names the target and the cause, such as a login to run (`agentd --login intelligence`) or `AWS_ACCESS_KEY_ID is not set`. `auth.unavailable` names it once a minute while it lasts, and `auth.recovered` when a call works again |
 | `no model is named for the agent's turns` at load | set `intelligence.model` (`--model`) or `intelligence.roles.turn` |
 | `model "fsat" is not a declared model (known: smart)` at load | a step's or role's `model:` names no model under `intelligence.models`; the message lists the ones that exist |
 | exit `4` after retries | the endpoint was unreachable or kept failing; the run's error carries the last response |

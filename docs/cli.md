@@ -297,7 +297,7 @@ into.
 | `1` | Generic failure. A run failed for a reason with no code of its own, or was cancelled. | retriable |
 | `2` | Configuration or usage error. Validation failed, a flag is unknown, a `file`, `url` or `oci` instruction could not be read at load, TLS material is unreadable, a listener could not bind, or the tool registry or workflow set does not build. Retrying reproduces it. | terminal |
 | `3` | Partial result. The run stalled, a loop was detected, the result was flagged partial, or the job ended with a run unfinished — a job a drain cut short among them. | policy |
-| `4` | Model unreachable. Every model endpoint failed, or refused its credentials, after retries. | retriable |
+| `4` | Model unreachable. Every model endpoint failed, or refused its credentials, after retries, or the credential a model connection's `auth` presents could not be produced (no login, a source that does not answer), so its calls were not sent. | retriable |
 | `5` | Refused. The task cannot be done, or was refused. | terminal |
 | `6` | A required MCP server is down: something agentd cannot run without failed. The durable store did not open or restore, or the MCP resource the instruction names could not be read at startup. Also the instruction source becoming unreachable under `agent.instruction.unavailable: exit`. | retriable |
 | `7` | A budget was exhausted: the run's steps or tokens, a subagent-tree budget, or the instance's lifetime token budget under `lifetime_exhausted: exit`. | policy |

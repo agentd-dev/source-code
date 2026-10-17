@@ -1625,7 +1625,7 @@ pub struct Intelligence {
     pub headers: BTreeMap<String, String>,
     /// A unified credential provider for the LLM endpoint — e.g. `oauth2`
     /// device-login for an enterprise gateway. Obtained via
-    /// `agentd login intelligence`; the resolved bearer overrides `token`.
+    /// `agentd --login intelligence`; the resolved bearer overrides `token`.
     pub auth: Option<Auth>,
     pub swap_policy: Option<String>,
     /// How the top-level connection asks for an answer that has a schema:
@@ -1687,7 +1687,7 @@ pub struct Provider {
     pub structured_output: StructuredOutput,
 }
 
-/// One connection as validation, the runtime and `agentd login` read it: the
+/// One connection as validation, the runtime and `agentd --login` read it: the
 /// top-level one (`name: None`) or a named provider. A view, so the two are
 /// checked and dialed by the same code and cannot drift apart.
 #[derive(Debug, Clone, Copy)]
@@ -2551,7 +2551,7 @@ pub struct McpServer {
     pub oauth: Option<McpOauth>,
     /// A unified credential provider — `static` / `oauth2` (device login,
     /// refresh) / `aws` / `spiffe`. Interactive providers obtain their token
-    /// via `agentd login mcp:<name>` and the daemon only reads the cached
+    /// via `agentd --login mcp:<name>` and the daemon only reads the cached
     /// token, so an unattended process never has to run a browser flow.
     /// Coexists with the narrower `oauth` client-credentials shortcut.
     #[serde(default)]
@@ -2682,7 +2682,7 @@ pub struct Auth {
     #[serde(default)]
     pub source: Option<String>,
     /// aws `source: sso` — the IAM Identity Center portal start URL, the account,
-    /// and the permission-set role to assume (via `agentd login`).
+    /// and the permission-set role to assume (via `agentd --login`).
     #[serde(default)]
     pub sso_start_url: Option<String>,
     #[serde(default)]
@@ -8413,6 +8413,12 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 .any(|m| m.auth.is_some() || m.oauth.is_some()),
             "oauth",
         ),
+        #[cfg(all(feature = "a2a", not(feature = "oauth")))]
+        (
+            "a2a.peers[].auth",
+            s.a2a.peers.iter().any(|p| p.auth.is_some()),
+            "oauth",
+        ),
         #[cfg(not(all(unix, feature = "config-watch")))]
         (
             "lifecycle.watch_config",
@@ -8694,6 +8700,21 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     &mut d,
                     format!(
                         "a2a peer '{}': auth kind `aws` is not accepted for peers — use static, oauth2 or spiffe",
+                        p.name
+                    ),
+                );
+            }
+            // A device or authorization-code grant waits for a login, and
+            // `agentd --login` makes one for a peer only through the service
+            // catalog: a peer's own block would never have a credential.
+            if auth.kind == AuthKind::Oauth2
+                && p.service.is_none()
+                && auth.grant.unwrap_or(OAuthGrant::Device) != OAuthGrant::ClientCredentials
+            {
+                err(
+                    &mut d,
+                    format!(
+                        "a2a peer '{}': an oauth2 device or authorization_code grant needs a login, which `agentd --login` makes for a peer only through the service catalog — move the `auth:` to a `kind: peer` entry under `services:`, reference it with `service:` and run `agentd --login service:<entry>`",
                         p.name
                     ),
                 );
@@ -13093,6 +13114,11 @@ mod tests {
                 "mcp: {servers: [{name: s, endpoint: \"https://s.example/mcp\", auth: {kind: static, token: \"{{secret:MCP_TEST_TOKEN}}\"}}]}\n",
                 "mcp.servers[].auth needs the oauth build feature",
             ),
+            #[cfg(all(feature = "a2a", not(feature = "oauth")))]
+            (
+                "a2a: {peers: [{name: p, endpoint: \"https://p.example\", auth: {kind: static, token: \"{{secret:MCP_TEST_TOKEN}}\"}}]}\n",
+                "a2a.peers[].auth needs the oauth build feature",
+            ),
             #[cfg(not(feature = "aauth"))]
             (
                 "mcp: {servers: [{name: s, endpoint: \"https://s.example/mcp\", aauth: true}]}\n",
@@ -14642,8 +14668,16 @@ mod tests {
     fn peer_references_resolve_and_all_four_kinds_gate_closed_egress() {
         // A `kind: peer` entry feeds a2a.peers[].service, and closed mode
         // covers intelligence endpoints, peers and http-step literals too.
+        // A peer's `auth` needs the oauth build feature and is refused
+        // without it, so there the entry has none to inherit.
+        let auth = if cfg!(feature = "oauth") {
+            ", auth: {kind: static, token: \"{{secret:PEER}}\"}"
+        } else {
+            ""
+        };
         let f = write_tmp(
-            "store: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\", auth: {kind: static, token: \"{{secret:PEER}}\"}}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
+            &"store: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\"AUTH}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n"
+                .replace("AUTH", auth),
             "yaml",
         );
         let (loaded, _) = load(
@@ -14653,7 +14687,11 @@ mod tests {
         .expect("all surfaces catalogued ⇒ closed mode admits the config");
         let p = &loaded.settings.a2a.peers[0];
         assert_eq!(p.endpoint, "https://peer.example", "peer inherited");
-        assert!(p.auth.is_some(), "peer inherited auth");
+        assert_eq!(
+            p.auth.is_some(),
+            cfg!(feature = "oauth"),
+            "peer inherited auth"
+        );
 
         let bad = write_tmp(
             "store: {kind: memory}\nsecurity: {egress: closed}\na2a:\n  peers:\n    - {name: rogue, endpoint: \"https://rogue.example\"}\n",
@@ -14678,6 +14716,65 @@ mod tests {
             format!("{e}").contains("kind: intelligence"),
             "an uncatalogued intelligence endpoint is refused: {e}"
         );
+    }
+
+    /// A peer's own oauth2 block with a grant that takes a login could never
+    /// have a credential — `agentd --login` takes no `a2a:<peer>` target — so
+    /// it is refused at load, naming the way that works. The same block on a
+    /// `kind: peer` entry loads, and so does a client-credentials grant on
+    /// the peer itself.
+    #[cfg(all(feature = "a2a", feature = "oauth"))]
+    #[test]
+    fn a_peers_own_oauth2_login_is_refused_at_load() {
+        let peer = |auth: &str, services: &str| {
+            let f = write_tmp(
+                &format!(
+                    "store: {{kind: memory}}\n{services}a2a:\n  peers:\n    - {{name: pal, {auth}}}\n"
+                ),
+                "yaml",
+            );
+            load(
+                &args(&["--config", f.path().to_str().unwrap()]),
+                &base_env(),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+        let oauth2 = |grant: &str| {
+            format!(
+                "{{kind: oauth2, {grant}client_id: c, issuer: \"https://id.example\", client_secret: \"{{{{secret:PEER}}}}\"}}"
+            )
+        };
+        for grant in ["grant: device, ", "grant: authorization_code, ", ""] {
+            let e = peer(
+                &format!(
+                    "endpoint: \"https://peer.example\", auth: {}",
+                    oauth2(grant)
+                ),
+                "",
+            )
+            .expect_err(grant);
+            assert!(
+                e.contains("a2a peer 'pal'") && e.contains("`agentd --login service:<entry>`"),
+                "{grant}: {e}"
+            );
+        }
+        peer(
+            &format!(
+                "endpoint: \"https://peer.example\", auth: {}",
+                oauth2("grant: client_credentials, ")
+            ),
+            "",
+        )
+        .expect("a client-credentials grant needs no login");
+        peer(
+            "service: buddy",
+            &format!(
+                "services:\n  buddy: {{kind: peer, endpoint: \"https://peer.example\", auth: {}}}\n",
+                oauth2("grant: device, ")
+            ),
+        )
+        .expect("a login through the service entry");
     }
 
     #[test]

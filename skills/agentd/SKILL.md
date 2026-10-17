@@ -130,8 +130,8 @@ service ONCE in `services:` (endpoint, one shared credential, authoritative
 trifecta tags, a tool ceiling) and reference it: `mcp.servers: [{name: money,
 service: billing, allow: [charge_lookup]}]`. Consumers may only narrow;
 catalog tags apply to any matching endpoint even inline (no tag-laundering);
-`security.egress: closed` refuses any uncatalogued dial. One `agentd login
-service:billing` serves every consumer.
+`security.egress: closed` refuses any uncatalogued dial. One
+`agentd --login service:billing` serves every consumer.
 
 **Subagent templates** — declare what a worker looks like in
 `subagents.templates` (the model instantiates by name and fills declared,

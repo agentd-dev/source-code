@@ -175,8 +175,12 @@ authorization endpoints from `<issuer>/.well-known/openid-configuration`, or
 device grant also needs `issuer` or `device_authorization_url`, and the
 browser grant `issuer` or `authorization_url`. The load checks each of these.
 
-Discovery runs when the connection is built: at startup and at each reload.
-Pin the endpoints if the authorization server may be unreachable then.
+The daemon discovers them at the first request that needs them — the first
+token fetch of a `client_credentials` grant, the first refresh of a login —
+not when the connection is built, and again at each later request until
+discovery succeeds. While the issuer does not answer, those requests fail
+without being sent; an issuer that is down at startup does not stop the
+start. Pin the endpoints to depend on no discovery at all.
 
 **The MCP shortcut.** `mcp.servers[].oauth` is a client-credentials grant
 with a pinned token endpoint, and nothing else:
@@ -228,8 +232,9 @@ never printed.
 
 An A2A peer can be logged into only through a service entry: give the peer
 `service: <entry>` with a `kind: peer` catalog entry, and log into
-`service:<entry>`. A peer's own `auth` block caches under a name `--login`
-does not accept.
+`service:<entry>`. `--login` takes no target for a peer's own `auth` block,
+so an oauth2 `device` or `authorization_code` grant there, or one with no
+`grant`, is refused at load.
 
 `agentd --logout <target>` removes a cached credential.
 
@@ -250,7 +255,7 @@ sequenceDiagram
   L->>AS: polls the token endpoint
   AS-->>L: access and refresh tokens
   L->>C: writes them, mode 0600
-  D->>C: reads them when the connection is built
+  D->>C: reads them when it has no usable token
   D->>E: request with the bearer token
   D->>AS: refreshes before the token expires
 ```
@@ -259,9 +264,11 @@ sequenceDiagram
 `$XDG_STATE_HOME/agentd/creds`, else `~/.local/state/agentd/creds`. Log in as
 the user the daemon runs as, or point both at the same `AGENTD_CRED_DIR`. The
 daemon refreshes a token in memory a minute before it expires, using the
-refresh token; a refreshed token is not written back to the cache. A restart
-reads the cache again, so after a restart the daemon refreshes from the
-refresh token the login stored. If your authorization server issues
+refresh token; a refreshed token is not written back to the cache. Whenever
+the daemon holds no usable token it reads the cache again, so a login made
+while it runs is used by the next request, with no reload or restart. A
+restart reads the cache again too, so after a restart the daemon refreshes
+from the refresh token the login stored. If your authorization server issues
 single-use refresh tokens, plan on logging in again after a restart.
 
 ## AWS SigV4
@@ -282,7 +289,7 @@ auth:
 
 | `source` | Credentials | Login |
 |---|---|---|
-| `env` (the default) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, read when the connection is built | none |
+| `env` (the default) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, read at each request | none |
 | `static` | the same as `env` | none |
 | `imds` | the EC2 instance role, through IMDSv2, refreshed a minute before expiry | none |
 | `irsa` | the EKS pod's web identity (`AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`) exchanged with STS, refreshed a minute before expiry | none |
@@ -359,22 +366,42 @@ The load catches what it can see, and exits 2 before any side effect:
 - an `auth:` block missing the fields its kind and grant need;
 - an inline `token`, `value` or `client_secret` in any `auth:` block, and an
   inline `intelligence.token`, provider `token` or `oauth.client_secret` in a
-  config file.
+  config file;
+- an `auth:` block on a model connection, an MCP server or an A2A peer in a
+  binary built without the `oauth` feature, which could not present it.
 
-An interactive credential that was never logged in, or has expired with no
-way to refresh, is not caught at load. The request goes out without the
-credential and the endpoint refuses it: an MCP server fails to connect
-(`mcp.connect.fail`), and a model call fails as an authentication error,
-which is not retried and fails the run. In a one-shot job, the run's
-`run.done` line carries the error:
+What depends on the world is not caught at load: an interactive credential
+that was never logged in, or has expired with no refresh token; an `issuer`
+or a token endpoint that does not answer; an `aws` source with no
+credentials; a `{{secret-file:…}}` or `token_file` that cannot be read when a
+request needs it. agentd never sends a request without the credential it is
+configured to present. The request is not sent, and it fails with an error
+that names the target and the cause:
+
+- an MCP server's connect fails (`mcp.connect.fail`) and is dialed again in
+  the background, or, on a live connection, the tool call fails;
+- a model call fails as an authentication error: it is not failed over to
+  another endpoint or model, and it fails the turn, step or run;
+- an A2A peer call fails.
+
+The log says so once, not once a call: `auth.unavailable` (warn) names the
+target and the cause when its requests start failing, and again at most
+once a minute while they keep failing; `auth.recovered` (info) says when one
+succeeds again. The supervisor writes them for the whole process tree: a
+turn worker or subagent hands what its credentials do up to it, so a
+credential every turn fails on is one line a minute, not one a turn. Every
+later request tries again, so logging
+in with `agentd --login <target>`, as the user the daemon runs as, takes
+effect on the next request. In a one-shot job, the run's `run.done` line
+carries the error:
 
 ```text
-{…,"err":"step \"work\" failed: turn failed: intel: intelligence HTTP 401: {\"error\":{\"message\":\"unauthorized\"}}","event":"run.done",…,"status":"failed",…}
+{…,"err":"step \"work\" failed: turn failed: intel: intelligence request not sent: intelligence: no cached credential — run `agentd --login intelligence`","event":"run.done",…,"status":"failed",…}
 ```
 
-The job then exits 4. If you see a `401` from an endpoint whose `auth`
-needs a login, run `agentd --login` for its target as the user the daemon
-runs as. The [CLI reference](cli.md) has every exit code.
+The job then exits 4. A `401` from an endpoint means the credential was sent
+and refused: a token that is wrong, revoked or short of the access the
+endpoint needs. The [CLI reference](cli.md) has every exit code.
 
 ## Field reference
 

@@ -171,12 +171,16 @@ A frame is capped at 16 MiB.
 | Direction | Messages |
 |---|---|
 | Down, supervisor to child | `Spawn`, `Ping`, `Pause`, `Resume`, `Cancel`, `Inject`, `SwapIntel`, `ToolResult`, `BudgetGrant` |
-| Up, child to supervisor | `Ready`, `Pong`, `Event` (progress), `Usage`, `ToolRequest`, `BudgetRequest`, `TurnDone`, `Turn`, `Result`, `Failed`, `Gate`, `GateClosed`, `IntelHealth` |
+| Up, child to supervisor | `Ready`, `Pong`, `Event` (progress), `Usage`, `ToolRequest`, `BudgetRequest`, `TurnDone`, `Turn`, `Result`, `Failed`, `Gate`, `GateClosed`, `IntelHealth`, `Credential` |
 
 `SwapIntel` is how a reload reaches a running child: the child rebuilds its
 model client at its next turn boundary under `intelligence.swap_policy`.
 `IntelHealth` reports, on a transition only, that every model endpoint the
 child can reach is down or has recovered; the readiness probe reads it.
+`Credential` carries what one of the child's credentials did: every failure
+to produce one, and a success that follows a failure or is the target's
+first. The supervisor keeps one record per target for the tree and logs
+`auth.unavailable` and `auth.recovered` from it.
 
 Inside the child the control reader runs on its own thread. `Ping` and
 `Cancel` keep flowing while the agent loop is blocked in a long model call,

@@ -66,16 +66,23 @@ pub fn classify(err: &IntelError) -> FailoverClass {
         IntelError::Unsupported(_) => FailoverClass::Fatal,
         // All-endpoints-down is already terminal — not re-classified.
         IntelError::AllEndpointsDown(_) => FailoverClass::Fatal,
+        // A credential that cannot be produced is the caller's, not the
+        // endpoint's: every endpoint would meet it, and none is to blame.
+        IntelError::Credential(_) => FailoverClass::Fatal,
     }
 }
 
-/// Is this a fatal **auth** failure (401/403)? The all-down backoff needs to
+/// Is this a fatal **auth** failure (401/403, or a credential that could not
+/// be produced)? The all-down backoff needs to
 /// distinguish the two: an auth failure on every endpoint is a misconfiguration
 /// and exits 4 immediately rather than entering the backoff loop. Retrying a
 /// credential error would mask it as a transient outage and leave the operator
 /// with a daemon that looks alive but never works.
 pub fn is_auth(err: &IntelError) -> bool {
-    matches!(err, IntelError::Http(401 | 403, _))
+    matches!(
+        err,
+        IntelError::Http(401 | 403, _) | IntelError::Credential(_)
+    )
 }
 
 /// HTTP statuses a **same-endpoint** retry may clear: a 429 rate-limit or an

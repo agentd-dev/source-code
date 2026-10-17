@@ -75,16 +75,16 @@ pub fn store(durable: &Durable, target: &str, cred: &CachedCred) -> Result<(), S
         .map_err(|e| format!("{e}"))
 }
 
-/// Evict the credential for `target` (`agentd logout`).
+/// Evict the credential for `target` (`agentd --logout`).
 pub fn evict(durable: &Durable, target: &str) -> Result<(), String> {
     durable
         .delete(Kind::Cred, &cred_id(target))
         .map_err(|e| format!("{e}"))
 }
 
-// --- file-backed cache (the interactive `agentd login` handoff) --------------
+// --- file-backed cache (the interactive `agentd --login` handoff) ------------
 //
-// `agentd login` runs on a human's machine, where the configured durable store
+// `agentd --login` runs on a human's machine, where the configured durable store
 // may be a remote backend the login has no business opening a connection to.
 // The obtained token is cached in a per-user file (0600), the same path the
 // daemon reads at startup to seed a provider — the pattern `aws`, `gcloud` and
@@ -138,7 +138,7 @@ pub fn store_file(dir: &std::path::Path, target: &str, cred: &CachedCred) -> Res
     Ok(())
 }
 
-/// Evict a credential from the file cache (`agentd logout`). Absent = success.
+/// Evict a credential from the file cache (`agentd --logout`). Absent = success.
 pub fn evict_file(dir: &std::path::Path, target: &str) -> Result<(), String> {
     match std::fs::remove_file(file_path(dir, target)) {
         Ok(()) => Ok(()),

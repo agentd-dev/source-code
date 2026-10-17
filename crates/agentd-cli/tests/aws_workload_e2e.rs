@@ -87,7 +87,9 @@ fn irsa_and_imds_credentials_sign_requests() {
             format!("http://127.0.0.1:{sts_port}"),
         );
     }
-    let h = signer("irsa").sign("GET", "api.example", "/x", b"");
+    let h = signer("irsa")
+        .sign("GET", "api.example", "/x", b"")
+        .unwrap();
     let auth = &h.iter().find(|(k, _)| k == "Authorization").unwrap().1;
     assert!(auth.contains("Credential=ASIAIRSA/"), "IRSA SigV4: {auth}");
     assert!(
@@ -116,7 +118,9 @@ fn irsa_and_imds_credentials_sign_requests() {
             format!("http://127.0.0.1:{imds_port}"),
         );
     }
-    let h = signer("imds").sign("GET", "api.example", "/x", b"");
+    let h = signer("imds")
+        .sign("GET", "api.example", "/x", b"")
+        .unwrap();
     let auth = &h.iter().find(|(k, _)| k == "Authorization").unwrap().1;
     assert!(auth.contains("Credential=ASIAIMDS/"), "IMDS SigV4: {auth}");
     assert!(

@@ -283,11 +283,13 @@ it is.
 | `429` | 2 retries | yes | yes | `other` |
 | `5xx` | 2 retries | yes | yes | `5xx` |
 | `401`, `403` | no | no | no | `auth` |
+| the credential could not be produced; nothing was sent | no | no | no | `auth` |
 | other `4xx` | no | no | no | `other` |
 | malformed response body | no | no | no | `other` |
 
 The `reason` label is on `agent_intel_errors_total`. A one-shot job whose
-model cannot be reached, or refuses the credential, exits `4`.
+model cannot be reached, refuses the credential, or cannot be sent one,
+exits `4`.
 
 | Constant | Value |
 |---|---|
@@ -313,7 +315,13 @@ model has a fallback, which is asked at once instead.
 
 - An `aws` `auth` block signs every request of every endpoint instead.
 - `token_file` and the `auth` bearer are read each time a turn, step or
-  judge starts; a SigV4 signature is computed per request.
+  judge starts; a SigV4 signature is computed per request. One that cannot
+  be produced then — no login, a token file that cannot be read, an `aws`
+  source with no credentials — fails the call without sending it, as an
+  authentication error: no failover to another endpoint, no fallback model.
+  The error names the target (`intelligence`, `intelligence:<provider>`) and
+  the cause, `auth.unavailable` says so once a minute while it lasts, and the
+  next call tries again.
 - A `token_file` that cannot be read stops the start, or the reload, that
   would use it. An `AGENTD_INTELLIGENCE_TOKEN_<N>_FILE` is read when a worker
   builds its client, so an unreadable one fails the turn or step that uses
@@ -413,7 +421,7 @@ guess from the wire model's name: a name containing `claude` 200,000;
 | `intel.health` | `all_down` |
 | `intel.swap` | `kind`, `model_from`, `model_to`, `endpoint_change`, `policy` |
 | `intel.swap.sent` | `subagents`, `policy` |
-| `intel.token_file.error` | `provider`, `err` |
+| `auth.unavailable`, `auth.recovered` | `target`, `err`, `failures`: a connection's credential could not be produced, and when it is again |
 | `preflight.route_unsure`, `preflight.skills_capped` | the route's choice and confidence; `asked`, `catalogued` |
 
 | Metric | Type |

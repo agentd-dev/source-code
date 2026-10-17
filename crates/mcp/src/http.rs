@@ -96,6 +96,10 @@ pub enum HttpError {
     /// The server answered the notification `GET` with something other than an
     /// event stream: it offers no push channel.
     NoEventStream,
+    /// The request signer could not produce the credential the endpoint is
+    /// configured to present ([`RequestSigner::sign`] failed), so the request
+    /// was not sent. Carries the signer's cause.
+    Credential(String),
 }
 
 impl std::fmt::Display for HttpError {
@@ -109,6 +113,7 @@ impl std::fmt::Display for HttpError {
             HttpError::NoEventStream => {
                 write!(f, "mcp-http: server has no GET SSE notification stream")
             }
+            HttpError::Credential(m) => write!(f, "mcp-http: not sent, no credential: {m}"),
         }
     }
 }
@@ -249,21 +254,30 @@ pub struct AuthResponse {
     pub error: Option<String>,
 }
 
-/// A per-request AAuth signer. The transport calls [`sign`] just before each
-/// POST (the returned `(name, value)` pairs become request headers — the
-/// RFC 9421 `Signature-Input`/`Signature`/`Signature-Key`), and [`on_response`]
-/// after, to react to the server's `AAuth-Requirement` (adopt an access token,
-/// run the Person-Server flow) and re-sign+retry. Deliberately a trait, not an
-/// implementation: the crypto lives in the caller, so this crate stays free of
-/// any crypto dependency.
+/// A per-request signer: AAuth, or a credential the caller presents (a
+/// bearer, a SigV4 signature). The transport calls [`sign`] just before each
+/// dial (the returned `(name, value)` pairs become request headers — the
+/// RFC 9421 `Signature-Input`/`Signature`/`Signature-Key`, an `Authorization`),
+/// and [`on_response`] after, to react to the server's `AAuth-Requirement`
+/// (adopt an access token, run the Person-Server flow) and re-sign+retry.
+/// Deliberately a trait, not an implementation: the crypto lives in the
+/// caller, so this crate stays free of any crypto dependency.
 pub trait RequestSigner: Send + Sync {
     /// Sign one request. `authority` is the `Host` value (host[:port]); `path`
     /// is the request-target. `body` is the JSON-RPC bytes (for a
-    /// `content-digest` cover when the server requires it). Returns headers to
-    /// add; an empty vec = send unsigned (let the server answer with its
-    /// requirement).
-    fn sign(&self, method: &str, authority: &str, path: &str, body: &[u8])
-    -> Vec<(String, String)>;
+    /// `content-digest` cover when the server requires it). Returns the
+    /// headers to add: an empty vec sends the request unsigned on purpose (the
+    /// server answers with its requirement). `Err` is a credential the signer
+    /// cannot produce — none cached, expired with nothing to renew it, a
+    /// source that does not answer — and the request is not sent: the
+    /// transport fails it with [`HttpError::Credential`], carrying the cause.
+    fn sign(
+        &self,
+        method: &str,
+        authority: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<(String, String)>, String>;
     /// React to a response: adopt an `AAuth-Access` token, satisfy
     /// an `AAuth-Requirement` (e.g. run the Person-Server exchange), and return
     /// `true` iff the request should be RE-SIGNED and retried (a requirement was
@@ -309,8 +323,9 @@ pub struct HttpTransport {
     /// back — on a fresh socket, see [`Self::redial_copy`]. Never cleared: the
     /// session it describes never comes back.
     session_lost: AtomicBool,
-    /// An optional per-request AAuth signer. `None` = the endpoint is called
-    /// unsigned (the default; static-bearer/mTLS auth is unaffected).
+    /// An optional per-request signer (AAuth, or a credential the caller
+    /// presents). `None` = the endpoint is called unsigned (the default;
+    /// static-header/mTLS auth is unaffected).
     signer: Option<std::sync::Arc<dyn RequestSigner>>,
     /// The host's `_meta` for every request; see [`RequestMeta`].
     request_meta: Option<RequestMeta>,
@@ -373,7 +388,7 @@ impl HttpTransport {
         }
     }
 
-    /// Install a per-request signer (AAuth). Builder-style; call before use.
+    /// Install a per-request signer. Builder-style; call before use.
     pub fn with_signer(mut self, signer: Option<std::sync::Arc<dyn RequestSigner>>) -> Self {
         self.signer = signer;
         self
@@ -452,26 +467,30 @@ impl HttpTransport {
         }
     }
 
-    /// The AAuth headers for ONE dial: the signature over
+    /// The signer's headers for ONE dial: the signature over
     /// `@method`/`@authority`/`@path` (over `body` too when the server requires a
     /// content-digest cover), plus the optional `AAuth-Capabilities` advert.
-    /// Empty without a signer — the endpoint is then called unsigned.
+    /// Empty without a signer — the endpoint is then called unsigned. A signer
+    /// that cannot produce its credential is [`HttpError::Credential`], taken
+    /// before the dial opens, so nothing reaches the server.
     ///
     /// Every dial goes through here, not just the request POST: a signed server
     /// answers an unsigned dial with a challenge, and on the long-lived
     /// notification stream that failure is silent in the worst way — the daemon
     /// keeps answering requests and simply never wakes.
-    fn auth_headers(&self, method: &str, body: &[u8]) -> Vec<(String, String)> {
+    fn auth_headers(&self, method: &str, body: &[u8]) -> Result<Vec<(String, String)>, HttpError> {
         match &self.signer {
             Some(s) => {
                 let authority = self.endpoint.host_header();
-                let mut sig = s.sign(method, authority, self.endpoint.http_path(), body);
+                let mut sig = s
+                    .sign(method, authority, self.endpoint.http_path(), body)
+                    .map_err(HttpError::Credential)?;
                 if let Some(caps) = s.capabilities() {
                     sig.push(("AAuth-Capabilities".into(), caps));
                 }
-                sig
+                Ok(sig)
             }
-            None => Vec::new(),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -609,6 +628,10 @@ impl HttpTransport {
         on_notification: &mut F,
         hangup: &Hangup,
     ) -> Result<SendOutcome, HttpError> {
+        // Signed before the dial: a credential the signer cannot produce
+        // fails the request here, unsent. The owned strings must outlive the
+        // borrowed header slice, so `signed` stays in scope until it is sent.
+        let signed = self.auth_headers("POST", body)?;
         let (mut stream, raw) = self.connect(timeout)?;
         if !hangup.arm(raw) {
             // Hung up before this connection carried anything: the caller no
@@ -635,9 +658,6 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
-        // AAuth request signing. The owned strings must outlive the borrowed
-        // header slice, so `signed` stays in scope until the request is sent.
-        let signed = self.auth_headers("POST", body);
         for (k, v) in &signed {
             headers.push((k.as_str(), v.as_str()));
         }
@@ -777,6 +797,14 @@ impl HttpTransport {
         read_timeout: Duration,
         extra_headers: &[(&str, &str)],
     ) -> Result<EventStream, HttpError> {
+        // The push channel is signed exactly like the request path — an
+        // `auth:`-configured server rejects an unsigned GET, and losing this
+        // stream costs the daemon its whole reactivity story. The
+        // challenge/re-sign loop stays on the POST path: this dial only ever
+        // happens post-initialize, so the signer has already satisfied whatever
+        // the server required and signs from what it learned there. Signed
+        // before the dial, as a POST is.
+        let signed = self.auth_headers("GET", b"")?;
         // The raw handle goes unused: this stream ends when its reader stops.
         let (stream, _) = self.connect(read_timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];
@@ -792,13 +820,6 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
-        // The push channel is signed exactly like the request path — an
-        // `auth:`-configured server rejects an unsigned GET, and losing this
-        // stream costs the daemon its whole reactivity story. The
-        // challenge/re-sign loop stays on the POST path: this dial only ever
-        // happens post-initialize, so the signer has already satisfied whatever
-        // the server required and signs from what it learned there.
-        let signed = self.auth_headers("GET", b"");
         for (k, v) in &signed {
             headers.push((k.as_str(), v.as_str()));
         }

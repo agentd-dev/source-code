@@ -179,6 +179,18 @@ pub enum AgentMsg {
     /// next frame, since a child has no `/metrics` of its own
     /// ([`crate::obs::metrics::take_child_metrics`]).
     Metrics(crate::obs::metrics::ChildMetrics),
+    /// A credential the child presents to login target `target` could not
+    /// be produced (`err` is the cause) or was produced again: every failure,
+    /// and a success that is news — the target's first in this child, or its
+    /// first since a failure. The supervisor keeps the one record per target
+    /// for the tree and says it (`auth.unavailable`, `auth.recovered`), so a
+    /// failure every turn worker meets is one line a minute, not one a turn.
+    /// `err` names references, files and status codes, never a secret.
+    Credential {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        err: Option<String>,
+    },
 }
 
 /// Which endpoint is serving the child's intelligence, for
@@ -540,7 +552,7 @@ pub struct IntelConfig {
     pub dialect: Option<String>,
     /// The provider this connection is (`intelligence.providers.<name>`);
     /// `None` is the top-level connection. Names the credential cache an
-    /// `agentd login` filled: `intelligence:<name>`.
+    /// `agentd --login` filled: `intelligence:<name>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// The ceiling on one model call (`timeout`); `None` is the default.
@@ -566,6 +578,12 @@ pub struct IntelConfig {
     /// dialect and the schema allow.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub structured_prompt: bool,
+    /// Why the credential this connection presents could not be produced
+    /// when this was resolved — no login cached, a token endpoint that did
+    /// not answer, a token file that could not be read. Every call on it
+    /// fails with this, unsent; the next resolution tries again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_error: Option<String>,
 }
 
 impl IntelConfig {
@@ -607,24 +625,32 @@ impl IntelConfig {
                 crate::intel::client::IntelClient::from_provider(&self.uri, self.token.clone())
             }
         };
-        #[allow(unused_mut)]
-        let mut c = base?
+        let c = base?
             .with_headers(self.headers.clone())
             .with_dialect(self.dialect.as_deref())
             .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis))
             .with_reasoning(self.reasoning)
-            .with_structured_prompt(self.structured_prompt);
+            .with_structured_prompt(self.structured_prompt)
+            .with_credential_error(self.credential_error.clone());
         // `auth: {kind: aws}` SigV4-signs the dial, with credentials fetched
-        // at dial time; `source: sso` reads the cache its login filled.
+        // at dial time; `source: sso` reads the cache its login filled. A
+        // signer that cannot be built fails the calls, never sends them
+        // unsigned.
+        let Some(aws) = &self.aws_auth else {
+            return Ok(c);
+        };
         #[cfg(feature = "oauth")]
-        if let Some(aws) = &self.aws_auth
-            && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, &self.login_target())
-        {
-            c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
-        }
+        let signed = crate::auth::aws::SigV4Signer::from_spec(aws, &self.login_target())
+            .map(|s| s as std::sync::Arc<dyn ::mcp::http::RequestSigner>);
         #[cfg(not(feature = "oauth"))]
-        let _ = self.login_target();
-        Ok(c)
+        let signed: Result<std::sync::Arc<dyn ::mcp::http::RequestSigner>, String> = {
+            let _ = aws;
+            Err("auth: kind aws needs a build with --features oauth".to_string())
+        };
+        Ok(match signed {
+            Ok(s) => c.with_signer(Some(s)),
+            Err(e) => c.with_credential_error(Some(format!("{}: {e}", self.login_target()))),
+        })
     }
 }
 
@@ -902,6 +928,29 @@ mod tests {
                 assert_eq!(a.transport, "https");
             }
             other => panic!("expected intel_health, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_credential_outcome_rides_one_frame() {
+        // A failure carries its cause; a success is the target alone.
+        let failed = AgentMsg::Credential {
+            target: "intelligence".into(),
+            err: Some("AWS_ACCESS_KEY_ID is not set".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            json!({"type": "credential", "target": "intelligence",
+                   "err": "AWS_ACCESS_KEY_ID is not set"})
+        );
+        let back: AgentMsg =
+            serde_json::from_str(r#"{"type":"credential","target":"mcp:s"}"#).unwrap();
+        match back {
+            AgentMsg::Credential { target, err } => {
+                assert_eq!(target, "mcp:s");
+                assert_eq!(err, None);
+            }
+            other => panic!("expected credential, got {other:?}"),
         }
     }
 

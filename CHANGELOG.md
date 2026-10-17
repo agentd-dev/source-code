@@ -39,6 +39,36 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   It loaded and waited for ever. A webhook listener or a `goal` does not
   count on its own, since each only starts workflows, and nor does a
   workflow the agent created at runtime: the load cannot see the store.
+- `agentd-mcp`: `http::RequestSigner::sign` returns
+  `Result<Vec<(String, String)>, String>`. An empty vec still sends the
+  request unsigned on purpose, as AAuth does to learn a server's
+  requirement; an `Err` is a credential the signer cannot produce, and the
+  transport fails the request without sending it, with the new
+  `HttpError::Credential` carrying the cause. Every signer had only "send
+  nothing" to say when its credential failed. A breaking change to the
+  crate's public API.
+- `agentd-core`: `auth::device::TokenSource::new` takes the endpoints (an
+  `auth::device::Endpoints`, discovered at the first request that needs
+  them), the login target and the cache directory;
+  `mcp::oauth::OAuthBearerSigner::new` takes the target it reports under;
+  `intel::client::IntelError` has `Credential`, `IntelClient` has
+  `with_credential_error`, `subagent::protocol::IntelConfig` has
+  `credential_error`, and `subagent::protocol::AgentMsg` has `Credential`.
+- A credential that cannot be produced is logged once, not once a request:
+  `auth.unavailable` (warn) names the target and the cause when its requests
+  start failing, then at most once a minute while they keep failing, and
+  `auth.recovered` (info) says when one succeeds again, as
+  `otel.export.failed` and `otel.export.recovered` do for a collector. The
+  supervisor writes them for the whole process tree: a turn worker or
+  subagent hands what its credentials do up to it, so a credential every
+  turn fails on is one line a minute, not one a turn. An unreadable
+  `intelligence.token_file` is one: `intel.token_file.error`, which was
+  written on every call and let the call go out with no token, is gone.
+- An `issuer` is asked for its endpoints by the first request that needs
+  them, and by each later one until it answers, not when the connection is
+  built; an `aws` `source: env` reads its keys at each request. A login made
+  while the daemon runs is read at the next request that has no usable
+  token.
 
 **Fixed.**
 
@@ -58,6 +88,32 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `run_until: idle` turned a listening daemon into one that exited as soon
   as it was idle, and with the change above it would also have generated
   the instruction's one-shot workflow and run it, unprompted.
+- Nothing configured to authenticate is sent without its credential. A
+  device or authorization-code login that was never made or expired with no
+  refresh token, a client-credentials or refresh call that failed, an issuer
+  that did not answer when the connection was built, an AWS source with no
+  credentials, a `{{secret:…}}` or `{{secret-file:…}}` that did not resolve
+  at the request: each signer then added no header, and the request went out
+  without one. For a model connection the `auth:` bearer was dropped
+  silently and the call dialed with whatever else was configured, or with
+  nothing, until a reload, and nothing was logged; a turn worker or
+  subagent whose SigV4 signer could not be built dialed its model unsigned.
+  Each request that needs the credential now fails unsent, with an error
+  naming the target and the cause — a model call as an authentication error
+  (no failover, no fallback model; a one-shot job exits 4), an MCP call or
+  connect, an A2A peer call — and the next request tries again.
+- An A2A peer's `auth:` in a binary built with `a2a` but without `oauth` is
+  refused at load, naming the feature. It loaded, and the peer was called
+  with no credential.
+- An A2A peer's own `auth:` with an oauth2 `device` or `authorization_code`
+  grant, or with no `grant`, is refused at load, naming the way that works:
+  the block on a `kind: peer` service entry, the peer's `service:` naming
+  it, and `agentd --login service:<entry>`. It loaded and could never have a
+  credential, since `--login` takes no target for a peer's own block, so the
+  peer was called without one.
+- The error for a missing login names the command that makes it,
+  `agentd --login <target>`, with the target filled in; it said
+  `agentd login`, a command that does not exist.
 
 ## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
 

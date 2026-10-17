@@ -1512,6 +1512,11 @@ impl Runtime {
                     self.log.warn("intel.health", json!({"all_down": all_down}));
                 }
             }
+            // A child's credential outcome joins this process's record, which
+            // says it once for the whole tree.
+            AgentMsg::Credential { target, err } => {
+                crate::auth::report::heard(&target, err.as_deref())
+            }
             // A child a drain or a kill is stopping starts nothing more: its
             // wait for the answer ends on the cancel it was sent.
             AgentMsg::ToolRequest { .. } | AgentMsg::BudgetRequest { .. }

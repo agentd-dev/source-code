@@ -364,7 +364,11 @@ to run a workflow, hand it to the full runtime.
 
 ### Individual crates
 
-- `agentd-mcp`: agentd's MCP client, without the agent.
+- `agentd-mcp`: agentd's MCP client, without the agent. A credential plugs
+  into its socket as an `http::RequestSigner`: `sign` returns the headers a
+  request carries (none, to send it unsigned), or an error when the
+  credential cannot be produced, and then the request is not sent and fails
+  with `HttpError::Credential`.
 - `agentd-net`: the blocking HTTP/1.1 and SSE client, unix and TLS connects,
   and the SSRF guard.
 - `agentd::intel::client::IntelClient`: the model client, with endpoint-list

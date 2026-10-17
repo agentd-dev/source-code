@@ -227,13 +227,15 @@ logged in to mcp:tickets — token cached in /home/you/.local/state/agentd/creds
 - `--login` needs the `oauth` build feature, which the release binaries and
   the published image include.
 
-A server whose login is missing gets requests with no `Authorization`
-header. It answers `401`, the connection fails with `mcp.connect.fail`, and
-the rest of the instance runs without that server's tools. A server that
-failed at startup is dialed again in the background, and each dial reads
-the cache afresh, so logging in while the daemon runs is enough for it to
-join. A live connection reads the cache once, when it is dialed: if its
-token expires and no refresh token was issued, log in again and restart.
+A server whose login is missing is sent nothing: the connection fails with
+`mcp.connect.fail`, naming the target and the `agentd --login` that fixes
+it, `auth.unavailable` says so once, and the rest of the instance runs
+without that server's tools. A server that failed at startup is dialed again
+in the background. A live connection whose token expires with no refresh
+token, or whose issuer does not answer when the token needs renewing, fails
+its tool calls, unsent, until it can present a token again. The cache is
+read afresh whenever there is no usable token, so logging in while the
+daemon runs is enough, with no restart.
 
 ## Choose which tools the agent sees
 

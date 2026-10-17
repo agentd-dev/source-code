@@ -190,9 +190,12 @@ impl ::mcp::http::RequestSigner for AAuthClient {
         authority: &str,
         path: &str,
         body: &[u8],
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, String> {
+        // No agent token (the Agent Provider did not answer): the request goes
+        // unsigned on purpose, and a server that requires AAuth answers with
+        // its requirement, which the response hook reacts to.
         let Ok(agent_token) = self.apd.token() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Case C: if we hold a user-scoped auth token for this authority, present
@@ -216,7 +219,7 @@ impl ::mcp::http::RequestSigner for AAuthClient {
         if let Some(a) = access {
             headers.push(("Authorization".into(), format!("AAuth {a}")));
         }
-        headers
+        Ok(headers)
     }
 
     fn on_response(&self, resp: &::mcp::http::AuthResponse, authority: &str) -> bool {

@@ -1803,7 +1803,7 @@ impl Runtime {
             let aspec = a.to_spec();
             // A peer that names a catalog `service:` caches its credential
             // under `service:<entry>`, shared with every other consumer of that
-            // entry, so one `agentd login service:<entry>` serves them all.
+            // entry, so one `agentd --login service:<entry>` serves them all.
             // Without one the cache is private to this peer's name.
             let target = match &peer.service {
                 Some(svc) => format!("service:{svc}"),
@@ -1816,9 +1816,11 @@ impl Runtime {
             } else if let Some(signer) = crate::auth::device::signer_for(&aspec, &target, timeout)
                 .map_err(|e| format!("{what}: peer auth: {e}"))?
             {
-                for (k, v) in signer.sign("POST", &peer.endpoint, "/", &[]) {
-                    headers.push((k, v));
-                }
+                // A credential it cannot produce fails this dial, unsent.
+                let signed = signer
+                    .sign("POST", &peer.endpoint, "/", &[])
+                    .map_err(|e| format!("{what}: peer auth: {e}"))?;
+                headers.extend(signed);
             }
         }
         #[allow(unused_mut)]

@@ -192,6 +192,19 @@ pub fn run() -> i32 {
     crate::obs::trace::set_process(trace.clone());
     let up: Up = Arc::new(Mutex::new(io::stdout()));
     let log = build_logger(&payload, &trace);
+    // What this child's credentials do is the supervisor's to say: it keeps
+    // one record for the tree, so a failure every turn worker meets is said
+    // once a minute, not once a turn.
+    let to = Arc::clone(&up);
+    crate::auth::report::hand_up(move |target, err| {
+        send_up(
+            &to,
+            &AgentMsg::Credential {
+                target: target.to_string(),
+                err: err.map(str::to_string),
+            },
+        )
+    });
     let cancel = Arc::new(AtomicBool::new(false));
     // Turn-boundary suspension: the control thread sets this on `Pause` and
     // clears it on `Resume`; the loop waits between turns while it is set.

@@ -529,33 +529,42 @@ impl HttpConn {
     /// framing headers ([`PeerAuth::headers`]) and the mTLS identity ride
     /// separately; this covers only the signatures that depend on the request,
     /// which is why it must be recomputed per request rather than cached. Empty
-    /// when neither AAuth nor SigV4 is configured, so no extra headers ride.
-    fn signature_headers(&self, method: &str, path: &str, body: &[u8]) -> Vec<(String, String)> {
+    /// when neither AAuth nor SigV4 is configured, so no extra headers ride; an
+    /// `Err` is a signature whose credential cannot be produced, and the
+    /// request is not sent.
+    fn signature_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<(String, String)>, String> {
         let mut out = Vec::new();
         // AAuth: sign the outbound A2A dial so the peer can attest the agent by
         // signature — additive, identity-cover only (like the intel dial).
         #[cfg(feature = "aauth")]
         if let Some(signer) = crate::aauth::signer() {
-            out.extend(signer.sign(method, &self.ep.host_header, path, body));
+            out.extend(signer.sign(method, &self.ep.host_header, path, body)?);
         }
         // SigV4: an AWS-IAM-gated peer, signed over the exact body.
         if let Some(signer) = &self.auth.signer {
-            out.extend(signer.sign(method, &self.ep.host_header, path, body));
+            out.extend(signer.sign(method, &self.ep.host_header, path, body)?);
         }
-        out
+        Ok(out)
     }
 
     /// The headers every request carries: the protocol version, the
     /// extensions it activates (those the peer requires, plus `marked` — the
     /// ones the message itself is marked with), the hop's W3C trace context,
-    /// the peer credential, and the signatures over this exact request.
+    /// the peer credential, and the signatures over this exact request. Taken
+    /// before the dial: a signature whose credential cannot be produced fails
+    /// the request unsent.
     fn request_headers(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
         marked: &[String],
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, String> {
         let mut out = vec![("A2A-Version".to_string(), A2A_PROTOCOL_VERSION.to_string())];
         let mut active: Vec<&str> = self.required.iter().map(String::as_str).collect();
         for uri in marked {
@@ -570,8 +579,11 @@ impl HttpConn {
             out.extend(t.headers());
         }
         out.extend(self.auth.headers.iter().cloned());
-        out.extend(self.signature_headers(method, path, body));
-        out
+        out.extend(
+            self.signature_headers(method, path, body)
+                .map_err(|e| format!("a2a: not sent, no credential: {e}"))?,
+        );
+        Ok(out)
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
@@ -670,8 +682,8 @@ impl HttpConn {
     /// signatures every request carries: an IAM-gated peer gates its card too.
     fn fetch_card(&self, deadline: Instant) -> Option<(PeerCard, Duration)> {
         let timeout = request_timeout(deadline).min(CARD_TIMEOUT);
+        let owned = self.request_headers("GET", CARD_PATH, &[], &[]).ok()?;
         let mut stream = self.connect(timeout).ok()?;
-        let owned = self.request_headers("GET", CARD_PATH, &[], &[]);
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];
         headers.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let resp = crate::net::http::send(
@@ -739,8 +751,8 @@ impl HttpConn {
         let timeout = remaining
             .min(Duration::from_secs(45))
             .max(Duration::from_millis(1));
+        let owned = self.request_headers("POST", &self.ep.path, &body, &marked)?;
         let stream = self.connect(timeout)?;
-        let owned = self.request_headers("POST", &self.ep.path, &body, &marked);
         let mut headers: Vec<(&str, &str)> = vec![
             ("Content-Type", "application/json"),
             ("Accept", "text/event-stream"),
@@ -987,8 +999,8 @@ impl Caller for HttpConn {
         let marked = a2a::extensions_of(&params);
         let req = Request::new(Id::Num(id), method, Some(params));
         let body = serde_json::to_vec(&req).map_err(|e| format!("a2a: encode {method}: {e}"))?;
+        let owned = self.request_headers("POST", &self.ep.path, &body, &marked)?;
         let mut stream = self.connect(timeout)?;
-        let owned = self.request_headers("POST", &self.ep.path, &body, &marked);
         let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
         headers.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let resp = crate::net::http::send(

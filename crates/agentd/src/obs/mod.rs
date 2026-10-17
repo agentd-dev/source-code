@@ -29,3 +29,7 @@ pub mod serve;
 // OTLP encoder + HTTP export are gated) — clean call sites, zero default
 // cost. Hand-rolled, dep-free.
 pub mod otel;
+
+// One line a minute about something that keeps failing: the OTLP exporter's
+// per-signal record, and the credentials' per-target one.
+pub(crate) mod quiet;

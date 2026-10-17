@@ -116,9 +116,9 @@ fn oauth_bearer_signer_injects_a_refreshing_authorization_header() {
         client_secret: "{{secret:MCP_OAUTH_SIGNER_SECRET}}".into(),
         scope: None,
     };
-    let signer = agentd::mcp::oauth::OAuthBearerSigner::new(spec, Duration::from_secs(5));
+    let signer = agentd::mcp::oauth::OAuthBearerSigner::new("mcp:x", spec, Duration::from_secs(5));
 
-    let headers = signer.sign("POST", "mcp.example", "/mcp", b"{}");
+    let headers = signer.sign("POST", "mcp.example", "/mcp", b"{}").unwrap();
     assert_eq!(headers.len(), 1, "exactly the Authorization header");
     assert_eq!(headers[0].0, "Authorization");
     assert_eq!(headers[0].1, "Bearer tok-1");
@@ -127,4 +127,28 @@ fn oauth_bearer_signer_injects_a_refreshing_authorization_header() {
     assert_eq!(bodies.lock().unwrap().len(), 1, "the bearer is cached");
 
     unsafe { std::env::remove_var("MCP_OAUTH_SIGNER_SECRET") };
+}
+
+#[test]
+fn oauth_bearer_signer_fails_the_request_when_no_token_can_be_fetched() {
+    // A token endpoint that does not answer: the request is refused with the
+    // fetch error, under the server's name — it never goes out with no
+    // `Authorization` header.
+    use agentd::mcp::http::RequestSigner;
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let token_url = format!("http://{}/token", dead.local_addr().unwrap());
+    drop(dead);
+    let spec = agentd::config::McpOauthSpec {
+        token_url,
+        client_id: "agentd".into(),
+        client_secret: "{{secret:MCP_OAUTH_DEAD_SECRET}}".into(),
+        scope: None,
+    };
+    unsafe { std::env::set_var("MCP_OAUTH_DEAD_SECRET", "sec") };
+    let signer = agentd::mcp::oauth::OAuthBearerSigner::new("mcp:x", spec, Duration::from_secs(2));
+    let e = signer
+        .sign("POST", "mcp.example", "/mcp", b"{}")
+        .expect_err("no token, no request");
+    assert!(e.starts_with("mcp:x: oauth: connect"), "{e}");
+    unsafe { std::env::remove_var("MCP_OAUTH_DEAD_SECRET") };
 }

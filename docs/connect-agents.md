@@ -449,7 +449,11 @@ a2a:
 
 A peer that references a catalog entry inherits its endpoint and credential
 and does not restate them. [Outbound credentials](authentication.md) covers
-every `auth` kind; `kind: aws` is not accepted for peers. For a one-off run,
+every `auth` kind; `kind: aws` is not accepted for peers. A credential a
+person logs in for, an oauth2 `device` or `authorization_code` grant, goes
+on a `kind: peer` service entry, logged into with
+`agentd --login service:<entry>`: on the peer itself it is refused at load.
+For a one-off run,
 `--a2a-peer reviewer=https://reviewer.example.com:8443` adds a peer from the
 command line.
 

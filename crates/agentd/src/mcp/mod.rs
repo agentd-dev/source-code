@@ -165,10 +165,11 @@ pub fn from_spec(
         };
         crate::auth::device::signer_for(a, &target, timeout).map_err(McpError::Transport)?
     } else if let Some(o) = &spec.oauth {
-        Some(
-            std::sync::Arc::new(oauth::OAuthBearerSigner::new(o.clone(), timeout))
-                as std::sync::Arc<dyn ::mcp::http::RequestSigner>,
-        )
+        Some(std::sync::Arc::new(oauth::OAuthBearerSigner::new(
+            &format!("mcp:{}", spec.name),
+            o.clone(),
+            timeout,
+        )) as std::sync::Arc<dyn ::mcp::http::RequestSigner>)
     } else {
         aauth_signer
     };

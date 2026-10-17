@@ -20,7 +20,7 @@ use crate::auth::cache::{self, CachedCred};
 use crate::auth::login::DevicePrompt;
 use crate::net::http::{self, Url};
 
-/// The `agentd login` disposition for an `aws source: sso` block.
+/// The `agentd --login` disposition for an `aws source: sso` block.
 pub struct SsoParams {
     pub region: String,
     pub start_url: String,

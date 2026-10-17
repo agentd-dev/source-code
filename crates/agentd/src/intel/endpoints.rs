@@ -342,15 +342,27 @@ impl Endpoint {
     /// `--features aauth` or with no identity configured, so an unsigned dial is
     /// the no-identity default rather than a failure.
     #[cfg(feature = "aauth")]
-    fn aauth_headers(&self, method: &str, path: &str, body: &[u8]) -> Vec<(String, String)> {
+    fn aauth_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<(String, String)>, IntelError> {
         match crate::aauth::signer() {
-            Some(signer) => signer.sign(method, &self.host_header, path, body),
-            None => Vec::new(),
+            Some(signer) => signer
+                .sign(method, &self.host_header, path, body)
+                .map_err(IntelError::Credential),
+            None => Ok(Vec::new()),
         }
     }
     #[cfg(not(feature = "aauth"))]
-    fn aauth_headers(&self, _method: &str, _path: &str, _body: &[u8]) -> Vec<(String, String)> {
-        Vec::new()
+    fn aauth_headers(
+        &self,
+        _method: &str,
+        _path: &str,
+        _body: &[u8],
+    ) -> Result<Vec<(String, String)>, IntelError> {
+        Ok(Vec::new())
     }
 
     /// Build the request body and headers for this endpoint's dialect, then dial
@@ -568,17 +580,19 @@ impl Endpoint {
         }
         // AAuth: sign the dial over the exact body bytes (content-digest cover
         // applies when discovery flagged it) before we borrow `headers`.
-        for (k, v) in self.aauth_headers("POST", &path, &body) {
+        for (k, v) in self.aauth_headers("POST", &path, &body)? {
             headers.push((k, v));
         }
         // An AWS SigV4 signature over the exact body, present when an `aws`
         // intelligence auth is configured — native Bedrock, or a Bedrock or
         // API-Gateway-fronted endpoint. Signed over `path`, so the dynamic
         // Bedrock target is inside the signature rather than appended after it.
+        // Credentials it cannot find fail the call here, before any dial.
         if let Some(signer) = &self.signer {
-            for (k, v) in signer.sign("POST", &self.host_header, &path, &body) {
-                headers.push((k, v));
-            }
+            let signed = signer
+                .sign("POST", &self.host_header, &path, &body)
+                .map_err(IntelError::Credential)?;
+            headers.extend(signed);
         }
         let header_refs: Vec<(&str, &str)> = headers
             .iter()

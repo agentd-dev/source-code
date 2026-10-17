@@ -169,8 +169,11 @@ fn uri_encode(s: &str, keep_slash: bool) -> String {
 
 /// Where a signer's credentials come from.
 enum CredProvider {
-    /// Long-term keys from the environment (`env`/`static`).
+    /// Keys the signer was built with.
     Fixed(AwsCreds),
+    /// Long-term keys from the environment (`env`/`static`), read at each
+    /// request.
+    Env,
     /// SSO temporary creds, reloaded from the login cache under this target.
     Sso(String),
     /// EC2 instance metadata (IMDSv2) — fetched + cached until near expiry.
@@ -182,12 +185,15 @@ enum CredProvider {
 /// A transport signer that SigV4-signs each request. Temporary credentials
 /// (SSO / IMDS / IRSA) are reloaded or refetched as they near expiry, so a
 /// long-lived daemon keeps signing with live keys instead of failing hours
-/// into a run when the original credential lapses.
+/// into a run when the original credential lapses. A request whose
+/// credentials cannot be had fails unsent, and the next request looks again.
 pub struct SigV4Signer {
     provider: CredProvider,
     region: String,
     service: String,
     timeout: Duration,
+    /// What a failure is reported under: the endpoint's login target.
+    target: String,
 }
 
 impl SigV4Signer {
@@ -197,13 +203,16 @@ impl SigV4Signer {
             region,
             service,
             timeout: Duration::from_secs(10),
+            target: "aws".into(),
         }
     }
 
     /// Build from an `AuthSpec` (`kind: aws`). `target` is the credential-cache
-    /// key for `source: sso`. Sources: `env`/`static` (the `AWS_*` env), `sso`
-    /// (temporary creds from `agentd login`), `imds` (EC2 instance role), `irsa`
-    /// (EKS web identity).
+    /// key for `source: sso`, and what a failure is reported under. Sources:
+    /// `env`/`static` (the `AWS_*` env), `sso` (temporary creds from
+    /// `agentd --login`), `imds` (EC2 instance role), `irsa` (EKS web
+    /// identity). Building reads nothing but the block: credentials are looked
+    /// for at each request.
     pub fn from_spec(
         auth: &crate::config::AuthSpec,
         target: &str,
@@ -214,7 +223,7 @@ impl SigV4Signer {
             .clone()
             .ok_or("aws: `service` is required (e.g. bedrock, execute-api)")?;
         let provider = match auth.source.as_deref().unwrap_or("env") {
-            "env" | "static" => CredProvider::Fixed(creds_from_env()?),
+            "env" | "static" => CredProvider::Env,
             "sso" => CredProvider::Sso(target.to_string()),
             "imds" => CredProvider::Imds(Mutex::new(None)),
             "irsa" => CredProvider::Irsa(Mutex::new(None)),
@@ -229,17 +238,21 @@ impl SigV4Signer {
             region,
             service,
             timeout: Duration::from_secs(10),
+            target: target.to_string(),
         }))
     }
 
-    /// The credentials to sign with right now: the fixed pair, the SSO record
-    /// re-read from the login cache on every call (so a fresh login is picked
-    /// up without a restart), or the IMDS/IRSA pair held in memory until it is
-    /// within a minute of expiry.
-    fn current_creds(&self) -> Option<AwsCreds> {
+    /// The credentials to sign with right now: the fixed pair, the
+    /// environment's, the SSO record re-read from the login cache on every
+    /// call (so a fresh login is picked up without a restart), or the
+    /// IMDS/IRSA pair held in memory until it is within a minute of expiry.
+    fn current_creds(&self) -> Result<AwsCreds, String> {
         match &self.provider {
-            CredProvider::Fixed(c) => Some(c.clone()),
-            CredProvider::Sso(t) => crate::auth::aws_sso::cached_creds(t),
+            CredProvider::Fixed(c) => Ok(c.clone()),
+            CredProvider::Env => creds_from_env(),
+            CredProvider::Sso(t) => crate::auth::aws_sso::cached_creds(t).ok_or_else(|| {
+                format!("aws: no cached SSO credentials — run `agentd --login {t}`")
+            }),
             CredProvider::Imds(cache) => self.cached_or_fetch(cache, || fetch_imds(self.timeout)),
             CredProvider::Irsa(cache) => {
                 self.cached_or_fetch(cache, || fetch_irsa(&self.region, self.timeout))
@@ -251,29 +264,25 @@ impl SigV4Signer {
     /// minute of expiry — the headroom covers the round-trip so a request never
     /// rides a credential that expires in flight. An expiry of `0` means
     /// "unknown" and is treated as non-expiring. Fail-closed: a fetch error
-    /// yields `None`, and the caller then signs nothing rather than signing
-    /// with a credential it knows to be stale.
+    /// is the caller's error, and nothing is signed with a credential known
+    /// to be stale.
     fn cached_or_fetch(
         &self,
         cache: &Mutex<Option<(AwsCreds, u64)>>,
         fetch: impl FnOnce() -> Result<(AwsCreds, u64), String>,
-    ) -> Option<AwsCreds> {
+    ) -> Result<AwsCreds, String> {
         let now = crate::auth::cache::now_ms();
         {
             let g = cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((c, exp)) = g.as_ref()
                 && (*exp == 0 || now + 60_000 < *exp)
             {
-                return Some(c.clone());
+                return Ok(c.clone());
             }
         }
-        match fetch() {
-            Ok((c, exp)) => {
-                *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((c.clone(), exp));
-                Some(c)
-            }
-            Err(_) => None,
-        }
+        let (c, exp) = fetch()?;
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((c.clone(), exp));
+        Ok(c)
     }
 }
 
@@ -435,15 +444,13 @@ impl ::mcp::http::RequestSigner for SigV4Signer {
         authority: &str,
         path: &str,
         body: &[u8],
-    ) -> Vec<(String, String)> {
-        // Fail-closed: with no credentials (an SSO session never started or
-        // long expired) the request goes out unsigned and AWS answers 403,
-        // which names the problem, rather than the daemon blocking here.
-        let Some(creds) = self.current_creds() else {
-            return Vec::new();
-        };
+    ) -> Result<Vec<(String, String)>, String> {
+        // Fail-closed: with no credentials (an SSO session never started, an
+        // unset environment, an instance role that does not answer) the
+        // request is not sent, and the error says which.
+        let creds = crate::auth::report::outcome(&self.target, self.current_creds())?;
         let (amz_date, date_stamp) = timestamps(SystemTime::now());
-        sigv4_headers(
+        Ok(sigv4_headers(
             &creds,
             &self.region,
             &self.service,
@@ -453,13 +460,38 @@ impl ::mcp::http::RequestSigner for SigV4Signer {
             body,
             &amz_date,
             &date_stamp,
-        )
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::mcp::http::RequestSigner;
+
+    /// A source with no credentials builds, and fails each request with the
+    /// reason, under the endpoint's target — it never signs nothing.
+    #[test]
+    fn a_source_with_no_credentials_fails_the_request() {
+        let spec = |source: &str| crate::config::AuthSpec {
+            kind: "aws".into(),
+            source: Some(source.into()),
+            region: Some("us-east-1".into()),
+            service: Some("bedrock".into()),
+            ..Default::default()
+        };
+        let sso = SigV4Signer::from_spec(&spec("sso"), "intelligence:aws-test-unlogged").unwrap();
+        let e = sso.sign("POST", "h", "/x", b"{}").unwrap_err();
+        assert_eq!(
+            e,
+            "intelligence:aws-test-unlogged: aws: no cached SSO credentials — run `agentd --login intelligence:aws-test-unlogged`"
+        );
+        if std::env::var_os("AWS_ACCESS_KEY_ID").is_none() {
+            let env = SigV4Signer::from_spec(&spec("env"), "intelligence").unwrap();
+            let e = env.sign("POST", "h", "/x", b"{}").unwrap_err();
+            assert!(e.contains("AWS_ACCESS_KEY_ID is not set"), "{e}");
+        }
+    }
 
     #[test]
     fn sigv4_matches_the_aws_get_vanilla_vector() {

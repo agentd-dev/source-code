@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `agentd login`, end to end: the binary runs the OAuth 2.1
+//! `agentd --login`, end to end: the binary runs the OAuth 2.1
 //! **device-authorization** flow against a mock authorization server — device
 //! request → poll (pending, then authorized) → cache the token in a per-user
 //! file the daemon would read. Proves the interactive login UX works headlessly.
@@ -167,7 +167,7 @@ fn agentd_login_completes_the_device_flow_and_caches_the_token() {
     let signer = agentd::auth::device::signer_for(&authspec, "mcp:test", Duration::from_secs(5))
         .expect("signer_for ok")
         .expect("a signer is built for an oauth2 auth block");
-    let headers = signer.sign("POST", "mcp.example", "/mcp", b"{}");
+    let headers = signer.sign("POST", "mcp.example", "/mcp", b"{}").unwrap();
     assert_eq!(
         headers,
         vec![("Authorization".to_string(), "Bearer at-xyz".to_string())],

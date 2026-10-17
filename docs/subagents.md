@@ -185,7 +185,7 @@ sequenceDiagram
     R->>S: fork and exec, then the payload on stdin
     R->>D: record, status running
     S-->>R: Ready
-    S-->>R: Usage, charged to the budget
+    S-->>R: Usage after each model call, charged to the budget
     S-->>R: Result
     R->>R: distil, record status, result, tokens
     R->>W: handle, status, result, error
@@ -232,8 +232,9 @@ flowchart LR
 Every status a child ends with is final, its budget's included. A child
 that dies without reporting (killed by a signal, out of memory, torn down
 by the supervisor as stuck or past its deadline) ends `failed` with the
-reason "exited without a result". The child's deadline bounds a model call
-in flight, so it ends `deadline` when the deadline passes.
+reason "exited without a result", unless `subagent.kill` stopped it. The
+child's deadline bounds a model call in flight, so it ends `deadline` when
+the deadline passes.
 
 **Liveness is probed, not assumed.** The reactor pings each child, and the
 child's control thread answers separately from its agent loop. A child that
@@ -243,11 +244,21 @@ reports events is healthy; one that is silent but answers pings is busy (a
 Every child also has a hard deadline: its own deadline plus 60 seconds, armed
 once at spawn.
 
-**`subagent.kill` is graceful.** It marks the record `cancelled` at once and
-sends a cancel frame, which the child's loop reads before its next step. A
-child inside a long call keeps running, and spending, until that call
-returns or liveness declares it unhealthy, at which point the reactor kills
-its process group.
+**`subagent.kill` ends a child within about 7 seconds.** It marks the
+record `cancelled`, with the kill's reason as its error, and sends the child
+a cancel frame, both at once. A child between steps (waiting for the
+supervisor to answer a tool call, or a warm child waiting for its next
+message) reads the frame and exits, and is never signalled. A child inside a
+model call or an MCP tool call cannot read it until that call returns, so
+the kill puts it on the kill ladder: 5 seconds after the kill, if it is
+still running, its process group gets `SIGTERM`, and 2 seconds later
+`SIGKILL`. Each signal is logged as `subagent.kill.escalated`. What the
+child does after the kill does not change its record: a result it reports
+in those seconds, or its death by a signal, leaves it `cancelled`, and the
+next start does not spawn it again. Whatever waits on the child is answered
+`cancelled` when the kill lands. The calls the child finished are charged,
+since it reports each as it returns; the one a signal cuts off reports
+nothing.
 
 **A drain lets a child finish.** A `sync`, `async` or `detached` child runs
 on through a drain and records its result as usual; only one still running

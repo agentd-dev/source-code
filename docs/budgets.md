@@ -225,7 +225,7 @@ sub-budgets of the work it ran for:
 | the `think` and `decide` tools | yes | instance, conversation |
 | preflight, compaction | no | instance, conversation |
 | the goal check, the approve judge | no | instance |
-| a subagent | no, its usage is charged as it reports | instance |
+| a subagent | no, each model call is charged as it returns | instance |
 
 Admission works on an estimate, and the charge on what the provider
 reports. The estimate for a turn or step is its context, its system prompt
@@ -312,7 +312,8 @@ section has the windows' balances too.
 - **A unit that dies is not charged.** A worker that is killed before it
   reports its usage has its reservation released, so what it spent never
   reaches the windows. A turn that merely fails still reports and is
-  charged.
+  charged. A subagent reports each model call as it returns, so one that
+  dies or is killed is charged for every call but the one it was inside.
 - **Reservations live in memory.** The durable counters carry settled
   usage only. If a window reads exhausted while recorded use is low, look at
   the `reserved` figure in status.

@@ -251,6 +251,14 @@ the children it stops, each on a clock of its own:
 - every child still running when `lifecycle.drain_timeout` passes or a
   second signal arrives, straight to `SIGKILL`.
 
+`subagent.kill` puts one subagent on the same ladder outside a drain:
+`Cancel` when it is killed, `SIGTERM` 5 seconds later, `SIGKILL` 2 seconds
+after that, each signal logged as `subagent.kill.escalated`. A child that
+exits inside the grace is never signalled. The child is recorded
+`cancelled`, never `parked`. A drain that begins while it climbs leaves it
+on its own ladder until the drain is forced, which sends it `SIGKILL` at
+once, also logged as `subagent.kill.escalated`.
+
 The signalling refuses any process group of 1 or less, so the supervisor can
 never signal init or itself.
 

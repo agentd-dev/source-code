@@ -279,6 +279,12 @@ pub struct SubagentRecord {
     pub durable: bool,
     #[serde(skip)]
     pub node: Option<NodeId>,
+    /// `subagent.kill` closed this record while its process ran: it stays
+    /// `cancelled` with the kill's reason, whatever the process reports or
+    /// however it exits after. Not stored: a restart finds the record
+    /// terminal.
+    #[serde(skip)]
+    pub killed: bool,
     #[serde(skip)]
     pub dirty: bool,
 }
@@ -742,6 +748,12 @@ impl Runtime {
             // 9. Children maintenance.
             for (node, health) in self.children.tick() {
                 self.on_unhealthy_child(node, health);
+            }
+            // 9a. The kill ladder of each child a `subagent.kill` stopped. A
+            // drain climbs every ladder itself, its force included.
+            if !self.draining {
+                let signalled = self.children.drive_stops(false);
+                self.log_kill_escalations(&signalled);
             }
             // 9b. Instance-tier children: ttl retirement, plus the
             // SIGTERM→SIGKILL escalation for children that ignored the drain.
@@ -1500,8 +1512,8 @@ impl Runtime {
                     self.log.warn("intel.health", json!({"all_down": all_down}));
                 }
             }
-            // A child the drain is stopping starts nothing more: its wait for
-            // the answer ends on the cancel it was sent.
+            // A child a drain or a kill is stopping starts nothing more: its
+            // wait for the answer ends on the cancel it was sent.
             AgentMsg::ToolRequest { .. } | AgentMsg::BudgetRequest { .. }
                 if self.children.get(node).is_some_and(|c| c.stop.is_some()) => {}
             AgentMsg::ToolRequest { id, name, args } => self.on_tool_request(node, id, &name, args),
@@ -1644,12 +1656,14 @@ impl Runtime {
                     );
                 }
             }
+            // A killed child's record is closed already, but its end is still
+            // folded in once, here when it reported none. The child has left
+            // the table, so the record takes the tokens it reported first.
             ChildKind::Subagent { ref handle } => {
-                if self
-                    .subagents
-                    .get(handle)
-                    .is_some_and(|s| !is_terminal_status(&s.status))
+                if let Some(s) = self.subagents.get_mut(handle)
+                    && (!is_terminal_status(&s.status) || (s.killed && s.node == Some(node)))
                 {
+                    s.tokens = child.tokens;
                     self.on_subagent_result(
                         node,
                         Err(format!(
@@ -1674,6 +1688,24 @@ impl Runtime {
                 Value::String("think worker exited without a result".into()),
                 true,
             );
+        }
+    }
+
+    /// One line for each signal the ladder of a child `subagent.kill` stopped
+    /// sent it, in the subagent's trace: a kill the child's cancel did not
+    /// end. A child the drain stopped gets none.
+    pub(crate) fn log_kill_escalations(&self, signalled: &[(NodeId, &'static str)]) {
+        for (node, signal) in signalled {
+            let Some(ChildKind::Subagent { handle }) = self.children.get(*node).map(|c| &c.kind)
+            else {
+                continue;
+            };
+            if self.subagents.get(handle).is_some_and(|s| s.killed) {
+                self.subagent_log(handle).info(
+                    "subagent.kill.escalated",
+                    json!({"handle": handle, "signal": signal}),
+                );
+            }
         }
     }
 

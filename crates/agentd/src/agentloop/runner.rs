@@ -290,8 +290,9 @@ impl<'a> Session<'a> {
     /// conversation.
     ///
     /// Returns the turn's [`Outcome`] together with the turn's token [`Usage`] —
-    /// the sum of every model call in this turn. The control layer rolls this
-    /// DELTA up to the supervisor as
+    /// the sum of every model call in this turn. Each call's usage is also
+    /// handed to [`SelfHandler::on_usage`] as the call returns; the control
+    /// layer rolls each up to the supervisor as
     /// [`crate::subagent::protocol::AgentMsg::Usage`], which is what makes
     /// hierarchical token accounting (`agentd_tokens_total`) add up. The loop
     /// itself never touches the control channel: the `up` handle stays in
@@ -421,6 +422,7 @@ impl<'a> Session<'a> {
             crate::obs::metrics::record_loop_step();
             tok_in += resp.usage.input_tokens;
             tok_out += resp.usage.output_tokens;
+            self_handler.on_usage(resp.usage);
             crate::obs::otel::chat_span(
                 call.as_ref(),
                 &self.model,
@@ -558,10 +560,10 @@ impl<'a> Session<'a> {
 /// [`Session`] directly across many turns.
 ///
 /// Returns the run's [`Outcome`] together with the run's total token [`Usage`].
-/// A one-shot run is exactly one turn, so the run total IS that turn's usage,
-/// and the control layer emits it once per run as a single
-/// [`crate::subagent::protocol::AgentMsg::Usage`]. Emitting both a cumulative
-/// and a per-turn figure would double-count against the tree's token ceiling.
+/// A one-shot run is exactly one turn, so the run total IS that turn's usage.
+/// A subagent's control layer charges each call as `on_usage` hands it over
+/// and does not send this total too, which would count every call twice
+/// against the tree's token ceiling.
 pub fn run_loop(
     intel: &IntelClient,
     servers: &[McpClient],
@@ -1148,12 +1150,13 @@ mod tests {
 
     // ---- the run_turn / run_loop token-usage producer ----
     //
-    // `run_turn` and `run_loop` return the turn's / run's `Usage` so `control.rs`
-    // can roll it up to the supervisor as `AgentMsg::Usage`: they are the
-    // producer end of the producer → consumer → `agentd_tokens_total` chain, and
-    // a zero here silently zeroes the whole chain. These tests drive the *real*
-    // loop against the built-in mock LLM and assert the returned `Usage` carries
-    // the model's reported tokens. The consumer half is covered by the
+    // `run_turn` and `run_loop` return the turn's / run's `Usage`, and hand
+    // each call's to `SelfHandler::on_usage`, which `control.rs` rolls up to the
+    // supervisor as `AgentMsg::Usage`: they are the producer end of the
+    // producer → consumer → `agentd_tokens_total` chain, and a zero here
+    // silently zeroes the whole chain. These tests drive the *real* loop
+    // against the built-in mock LLM and assert the `Usage` carries the model's
+    // reported tokens. The consumer half is covered by the
     // `obs::metrics` `record_tokens` tests. In production that function has one
     // call site — the reactor's usage rollup on `AgentMsg::Usage`
     // (`runtime::reactor`) — so the producer proven here is the only thing that
@@ -1286,6 +1289,45 @@ mod tests {
                 usage.output_tokens, 12,
                 "summed output over both model calls"
             );
+        }
+
+        /// A SelfHandler that keeps each call's usage `on_usage` hands it.
+        #[derive(Default)]
+        struct UsageHandler(Vec<Usage>);
+        impl SelfHandler for UsageHandler {
+            fn tools(&self) -> Vec<ToolDef> {
+                Vec::new()
+            }
+            fn handle(&mut self, _name: &str, _args: &Value) -> Option<(String, bool)> {
+                None
+            }
+            fn on_usage(&mut self, usage: Usage) {
+                self.0.push(usage);
+            }
+        }
+
+        #[test]
+        fn each_model_call_hands_its_usage_over_as_it_returns() {
+            // What a subagent sends up: one Usage per call, which add up to the
+            // run's total, so a child signalled mid-run has already reported
+            // every call it finished.
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("llm.addr");
+            let url = start_mock_llm(&sock, "read");
+
+            let intel = IntelClient::from_parts(&url, None).unwrap();
+            let inp = input("read the resource");
+            let mut handler = UsageHandler::default();
+
+            let (_, usage) =
+                run_loop(&intel, &[], &inp, &mut handler, &test_log()).expect("one-shot run");
+
+            let call = |i, o| Usage {
+                input_tokens: i,
+                output_tokens: o,
+            };
+            assert_eq!(handler.0, vec![call(11, 7), call(11, 5)]);
+            assert_eq!(usage, call(22, 12));
         }
     }
 }

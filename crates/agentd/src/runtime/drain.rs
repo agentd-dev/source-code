@@ -259,7 +259,8 @@ impl Runtime {
                 self.drain_instances.insert(handle, true);
             }
         }
-        self.children.drive_stops(force);
+        let signalled = self.children.drive_stops(force);
+        self.log_kill_escalations(&signalled);
         let gone = self.children.is_empty() && self.instances_draining().is_empty();
         // Unless forced, the drain waits for its `lifecycle.shutdown` runs,
         // and, letting work run, for what has no process of its own: a call

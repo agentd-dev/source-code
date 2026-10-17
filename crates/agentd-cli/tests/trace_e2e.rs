@@ -284,15 +284,15 @@ fn a_step_the_restore_skips_or_fails_is_said_in_its_runs_trace() {
 
 /// A subagent a run kills is killed in the trace it was spawned in: the
 /// run's, not the process's. The child's call outlasts the kill step, so the
-/// child is running when it is killed; `subagent.kill` is graceful, so a child
-/// that started late and is already inside that call finishes it before it
-/// stops — the call is short enough for the daemon to exit inside the wait.
+/// child is running when it is killed; one already inside that call is ended
+/// by the kill's ladder at its grace, long before the call would return, and
+/// the signal is said in the run's trace too.
 #[test]
 fn a_subagent_a_run_kills_is_killed_in_the_runs_trace() {
     let play = common::unique_path("trace-kill", "json");
     std::fs::write(
         &play,
-        json!({"match": [{"when_contains": "SUB-TASK", "delay_ms": 8000, "content": "late"}]})
+        json!({"match": [{"when_contains": "SUB-TASK", "delay_ms": 60000, "content": "late"}]})
             .to_string(),
     )
     .unwrap();
@@ -320,6 +320,9 @@ fn a_subagent_a_run_kills_is_killed_in_the_runs_trace() {
     let killed = events(&log, "subagent.kill");
     assert_eq!(killed.len(), 1, "{log}");
     assert_eq!(killed[0]["trace_id"], run, "{}", killed[0]);
+    for escalated in events(&log, "subagent.kill.escalated") {
+        assert_eq!(escalated["trace_id"], run, "{escalated}");
+    }
 }
 
 /// A run another run starts — as a child workflow, or by a signal it sends —

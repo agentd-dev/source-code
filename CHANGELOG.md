@@ -5,6 +5,31 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Changed.**
+
+- `subagent.kill` ends a child inside a model call or an MCP tool call,
+  within about 7 seconds. The kill only sent a cancel, which a child reads
+  before its next step: one in a long call ran on, and spent, until the call
+  returned, and a result it reported then completed the record it had been
+  killed in. A child the cancel has not stopped 5 seconds after the kill is
+  now sent `SIGTERM` to its process group, and `SIGKILL` 2 seconds later,
+  each logged as `subagent.kill.escalated`; one that stops on the cancel is
+  never signalled. The record stays `cancelled`, with the kill's reason as
+  its error, however the child ends.
+
+**Fixed.**
+
+- A subagent's tokens are charged call by call, as each model call
+  returns. They went up once, when the child's run or warm turn ended, so
+  the calls of a run that never ended (a child killed by a signal, or one
+  whose model failed partway) and of a warm turn that was cancelled or re-run
+  on a swapped model were missing from the budget, from
+  `agent_tokens_total` and from the child's record. A child that died
+  without a result also recorded `0` tokens in `subagent.result` and its
+  record, whatever it had reported.
+
 ## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
 
 Each unit of work — a workflow run, an A2A task, a webhook delivery, a

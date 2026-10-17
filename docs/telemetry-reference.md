@@ -684,9 +684,10 @@ case.
 | `subagent.cancel` | info | `reason` |  |
 | `subagent.inject` | info | `bytes` |  |
 | `subagent.kill` | info | `handle` | A subagent was stopped. |
+| `subagent.kill.escalated` | info | `handle`, `signal` | A killed subagent had not stopped at its grace, and its process group was sent `signal`: `SIGTERM` 5 s after the kill, `SIGKILL` 2 s later. |
 | `subagent.respawn` | info | `handle`, `node` |  |
 | `subagent.restore.bad_payload` | warn | `handle` |  |
-| `subagent.result` | info | `err`, `handle`, `status`, `tokens` | A subagent reported its result. `cancelled` for a `sync` one a drain stopped with the turn waiting on it, which asks for it again when it replays. |
+| `subagent.result` | info | `err`, `handle`, `status`, `tokens` | A subagent reported its result. `cancelled` for a `sync` one a drain stopped with the turn waiting on it, which asks for it again when it replays, and for one `subagent.kill` stopped, with the kill's reason as `err`, however it ended. |
 | `subagent.spawn` | info | `cpu_seconds`, `depth`, `handle`, `memory_bytes`, `mode`, `node`, `pid`, `priority`, `servers` | A subagent process started. |
 | `subagent.swap_intel` | info | `endpoint_change` |  |
 | `subagent.turn` | info | `handle`, `status` |  |

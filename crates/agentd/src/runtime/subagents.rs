@@ -115,10 +115,15 @@ impl Runtime {
                 let Some(node) = self.subagents.get(&handle).and_then(|s| s.node) else {
                     return err(format!("subagent {handle:?} is not running"));
                 };
-                self.children.cancel(node, &reason);
+                // `Cancel` now, which a child between steps stops on; the kill
+                // ladder after, for one inside a model or MCP tool call, which
+                // cannot read it: `SIGTERM` to its process group at the grace,
+                // `SIGKILL` after the kill grace (`supervisor::kill`).
+                self.children.stop_for_good(node, &reason);
                 if let Some(s) = self.subagents.get_mut(&handle) {
                     s.status = "cancelled".into();
                     s.error = Some(reason);
+                    s.killed = true;
                     s.updated = now_ms();
                     s.dirty = true;
                 }
@@ -513,6 +518,7 @@ impl Runtime {
                 .and_then(Value::as_bool)
                 .unwrap_or_else(|| self.work_durable_default()),
             node: None,
+            killed: false,
             dirty: true,
         };
         record.principal = self.spawn_principal(&record);
@@ -694,6 +700,11 @@ impl Runtime {
         else {
             return;
         };
+        // A turn a killed child finishes in its grace is not taken: the kill
+        // closed the record.
+        if self.subagents.get(&handle).is_some_and(|s| s.killed) {
+            return;
+        }
         if let Some(s) = self.subagents.get_mut(&handle) {
             s.result = Some(distill(&outcome.result));
             s.updated = now_ms();
@@ -740,13 +751,19 @@ impl Runtime {
             .map(|c| c.tokens)
             .or_else(|| self.subagents.get(&handle).map(|s| s.tokens))
             .unwrap_or(0);
-        let (status, result, error) = match &outcome {
-            Ok(o) => (
+        let (status, result, error) = match (&outcome, self.subagents.get(&handle)) {
+            // A child `subagent.kill` stopped ends as the kill recorded it: a
+            // result it reports in its grace, or its reap by the ladder's
+            // signal, does not complete, fail or crash it.
+            (_, Some(s)) if s.killed => {
+                ("cancelled".to_string(), s.result.clone(), s.error.clone())
+            }
+            (Ok(o), _) => (
                 o.status.as_str().to_string(),
                 Some(distill(&o.result)),
                 None,
             ),
-            Err(e) => ("failed".to_string(), None, Some(e.clone())),
+            (Err(e), _) => ("failed".to_string(), None, Some(e.clone())),
         };
         if let Some(s) = self.subagents.get_mut(&handle) {
             s.status = status.clone();

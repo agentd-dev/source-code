@@ -433,14 +433,33 @@ Three edges to plan for:
 
 ## Stop a child
 
-`subagent.kill {handle, reason}` marks the record `cancelled` at once and
-asks the child to stop. The child reads the request before its next step, so
-one inside a long model call finishes that call first; a child that does not
-stop is killed when liveness declares it unhealthy. On shutdown a child runs
-on until `lifecycle.drain_timeout` and is killed only if it is still running
-then; a warm child is cancelled at once, then sent SIGTERM at 5 seconds and
-SIGKILL at 7. A child the drain stops is recorded `parked`, not `cancelled`,
-unless it is a `sync` child a stopped turn was waiting on.
+`subagent.kill {handle, reason}` ends a flat child within about 7 seconds,
+wherever it is:
+
+1. At once, the record becomes `cancelled`, with `reason` as its error, and
+   the child is sent a cancel. Whatever waits on the child, such as
+   `subagent.await`, a `wait {on: subagent}` step or the turn that ran it
+   `sync`, is answered `cancelled` then.
+2. A child between steps, waiting for the supervisor to answer a tool call
+   or (warm) for its next message, reads the cancel and exits. It is never
+   signalled.
+3. A child inside a model call or an MCP tool call cannot read the cancel
+   until that call returns. If it is still running 5 seconds after the kill,
+   its process group is sent `SIGTERM`, and 2 seconds after that `SIGKILL`.
+   Each signal is logged as `subagent.kill.escalated`, with the `signal`.
+
+The record stays `cancelled` whatever the child does in those seconds: a
+result it reports, or its death by a signal, does not change it, and the
+next start does not spawn it again. The child reports each model call's
+tokens as the call returns, so a child the signal ends is charged, and its
+record counts, every call it finished; the call it was inside reports
+nothing, though the provider may bill it.
+
+On shutdown a child runs on until `lifecycle.drain_timeout` and is killed
+only if it is still running then; a warm child is cancelled at once, then
+sent SIGTERM at 5 seconds and SIGKILL at 7. A child the drain stops is
+recorded `parked`, not `cancelled`, unless it is a `sync` child a stopped
+turn was waiting on. A child already killed stays `cancelled`.
 `subagent.kill` works on flat children only; retire an instance child with
 `subagent.retire`.
 
@@ -793,6 +812,7 @@ Each child logs to the daemon's log. The events to watch:
 | `subagent.turn` | A warm child finished a turn |
 | `subagent.result` | A flat child finished: `handle`, `status`, `tokens`, `err` |
 | `subagent.kill`, `subagent.respawn` | A kill request; a re-spawn after restart |
+| `subagent.kill.escalated` | A killed child had not stopped at its grace and was signalled: `handle`, `signal` (`SIGTERM`, then `SIGKILL`) |
 | `child.unhealthy` | Liveness tore a child down: `node`, `health` |
 | `intel.swap.sent` | A reload handed running children their model again |
 | `instance.spawn`, `instance.retire`, `instance.exited`, `instance.respawn` | An instance child's lifecycle |

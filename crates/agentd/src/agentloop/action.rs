@@ -91,4 +91,10 @@ pub trait SelfHandler {
     fn take_subscriptions(&mut self) -> Vec<crate::agentloop::stop::SubscriptionRequest> {
         Vec::new()
     }
+
+    /// One model call's token usage, as the call returns. Default: nothing;
+    /// the loop also returns the turn's total when the turn ends. A
+    /// subagent reports each call here, so the calls it finished are charged
+    /// even when a signal ends it before its turn does.
+    fn on_usage(&mut self, _usage: crate::wire::intel::Usage) {}
 }

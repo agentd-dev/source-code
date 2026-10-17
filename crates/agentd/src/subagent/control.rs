@@ -74,13 +74,14 @@ const GATED_TOOL_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 struct NoSelfTools {
     /// Tool names to route up rather than call directly.
     gated: Vec<String>,
+    /// The upward channel: gated calls and each model call's usage.
+    up: Up,
     /// The round-trip channel, when there is anything to route.
     bridge: Option<GatedBridge>,
 }
 
-/// The pieces needed to send a `ToolRequest` and wait for its answer.
+/// The pieces needed to wait for a `ToolRequest`'s answer.
 struct GatedBridge {
-    up: Up,
     replies: Arc<crate::subagent::replies::Replies>,
     cancel: Arc<AtomicBool>,
     timeout: Duration,
@@ -97,7 +98,7 @@ impl SelfHandler for NoSelfTools {
         let b = self.bridge.as_ref()?;
         let id = b.replies.next_id();
         send_up(
-            &b.up,
+            &self.up,
             &AgentMsg::ToolRequest {
                 id,
                 name: name.to_string(),
@@ -120,6 +121,12 @@ impl SelfHandler for NoSelfTools {
                 true,
             )),
         }
+    }
+
+    // Each call goes up as it returns, so a call the child finished is
+    // charged even when a signal ends it before its run or turn does.
+    fn on_usage(&mut self, usage: crate::wire::intel::Usage) {
+        send_up(&self.up, &AgentMsg::Usage(usage));
     }
 }
 
@@ -326,8 +333,8 @@ pub fn run() -> i32 {
     // timeout is generous because a gate may be waiting on a person.
     let mut orch = NoSelfTools {
         gated: payload.gated_tools.clone(),
+        up: Arc::clone(&up),
         bridge: (!payload.gated_tools.is_empty()).then(|| GatedBridge {
-            up: Arc::clone(&up),
             replies: Arc::clone(&replies),
             cancel: Arc::clone(&cancel),
             timeout: GATED_TOOL_TIMEOUT,
@@ -366,13 +373,10 @@ pub fn run() -> i32 {
     // one-shot has no next turn, so `restart-turn` cannot apply to it.
     apply_pending_swap(&pending_swap, &mut intel, &mut input.model, &up, &log);
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
-        Ok((outcome, usage)) => {
+        // The run's tokens went up call by call (`on_usage`), all before
+        // this Result, so the total is not sent again.
+        Ok((outcome, _)) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
-            // Roll the run's total tokens up to the supervisor BEFORE the terminal
-            // Result, so hierarchical accounting (`agentd_tokens_total`) sees them.
-            // One Usage per run (a one-shot is a single turn) — never cumulative
-            // AND per-turn, so `record_tokens`' fetch_add can't double-count.
-            send_up(&up, &AgentMsg::Usage(usage));
             send_up(&up, &AgentMsg::Result { outcome });
             code
         }
@@ -455,8 +459,7 @@ fn run_warm(
         // budget (a new deadline each turn, so the session isn't globally capped).
         let deadline = Instant::now() + Duration::from_millis(limits.deadline_ms.max(1));
         let mut budget = Budget::new(limits.max_steps, limits.max_tokens, deadline);
-        let (outcome, usage) = match session.run_turn(&intel, orch, log, &mut budget, Some(cancel))
-        {
+        let (outcome, _) = match session.run_turn(&intel, orch, log, &mut budget, Some(cancel)) {
             Ok(ou) => ou,
             Err(LoopAbort::Intel(m)) => {
                 return fail(
@@ -492,14 +495,9 @@ fn run_warm(
             );
             continue;
         }
-        // Roll this turn's tokens up to the supervisor BEFORE the Turn event, so
-        // hierarchical accounting (`agentd_tokens_total`) sees each warm turn's
-        // usage. This `usage` is exactly ONE turn's delta (`run_turn` accumulates
-        // per-turn `tok_in`/`tok_out` against a fresh per-event budget), and
-        // `record_tokens` fetch_adds — so one Usage per emitted turn never
-        // double-counts (a cancelled or restart-discarded turn emits no Turn and
-        // no Usage here).
-        send_up(up, &AgentMsg::Usage(usage));
+        // The turn's tokens went up call by call (`on_usage`), before this
+        // Turn event; a cancelled or restart-discarded turn's calls were
+        // charged too, since the provider billed them.
         send_up(up, &AgentMsg::Turn { outcome });
         if cancel.load(Ordering::Relaxed) {
             break;

@@ -847,7 +847,7 @@
               "const": "subagent.kill"
             },
             "reason": {
-              "description": "Why",
+              "description": "Why; kept as the cancelled record's error",
               "type": "string"
             }
           },
@@ -2325,7 +2325,7 @@
               "type": "string"
             },
             "reason": {
-              "description": "Why",
+              "description": "Why; kept as the cancelled record's error",
               "type": "string"
             }
           },

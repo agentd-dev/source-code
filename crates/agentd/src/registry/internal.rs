@@ -189,9 +189,9 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "subagent.kill",
         "subagent",
-        "Cancel and stop a subagent.",
+        "Stop a subagent: it is cancelled at once, and one still running 5 s later (inside a model or tool call) gets SIGTERM, then SIGKILL.",
         obj(
-            json!({"handle": s("The subagent handle"), "reason": s("Why")}),
+            json!({"handle": s("The subagent handle"), "reason": s("Why; kept as the cancelled record's error")}),
             &["handle"],
         ),
         open_obj(

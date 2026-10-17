@@ -235,6 +235,7 @@ impl Runtime {
             retiring_since: None,
             durable,
             node: None,
+            killed: false,
             dirty: true,
         };
         record.principal = self.spawn_principal(&record);

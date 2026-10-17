@@ -4,7 +4,8 @@
 //! exactly one process that can orphan work and exactly one place that reaps.
 //! Children are spawned through `supervisor::spawn` (the reaper + PDEATHSIG +
 //! process groups), tracked here with their purpose, liveness and
-//! cancellation, and torn down by the kill ladder when a drain stops them.
+//! cancellation, and torn down by the kill ladder when a drain or a
+//! `subagent.kill` stops them.
 
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::kill::{Ladder, LadderAction, kill_group, term_group};
@@ -70,10 +71,10 @@ pub struct Child {
     /// [`Children::is_settled`]): the child's mere presence cannot give it,
     /// because a settled worker also stays in the table until it is reaped.
     pub settled: bool,
-    /// The kill ladder a drain stopped this child with: `Cancel` when it was
-    /// stopped, `SIGTERM` to its group after a grace, `SIGKILL` after another
-    /// — or `SIGKILL` at once when the drain is forced. `None` while the
-    /// child is let run.
+    /// The kill ladder a drain or a `subagent.kill` stopped this child with:
+    /// `Cancel` when it was stopped, `SIGTERM` to its group after a grace,
+    /// `SIGKILL` after another — or `SIGKILL` at once when the drain is
+    /// forced. `None` while the child is let run.
     pub stop: Option<Ladder>,
     /// The drain stopped this child while it had work of its own, so what it
     /// owed — a step's result, a turn's reply, a subagent's outcome — is left
@@ -100,6 +101,9 @@ pub struct Children {
     /// enough because the reactor drains reaps one at a time and finishes with
     /// a node before taking the next.
     last_reaped: Option<(NodeId, ChildKind, bool)>,
+    /// How many children have a kill ladder armed, so a tick with none
+    /// climbs nothing.
+    stopping: usize,
 }
 
 impl Children {
@@ -119,6 +123,7 @@ impl Children {
             last_ping: Instant::now(),
             ping_seq: 0,
             last_reaped: None,
+            stopping: 0,
         }
     }
 
@@ -262,6 +267,9 @@ impl Children {
     pub fn on_reaped(&mut self, r: &Reaped) -> Option<(NodeId, Child)> {
         let node = self.pid_to_node.remove(&r.pid)?;
         let mut c = self.map.remove(&node)?;
+        if c.stop.is_some() {
+            self.stopping -= 1;
+        }
         c.sub.mark_reaped();
         c.liveness.on_eof();
         self.last_reaped = Some((node, c.kind.clone(), c.settled));
@@ -335,6 +343,29 @@ impl Children {
         c.parked = !c.cancelled;
         c.cancelled = true;
         c.stop = Some(Ladder::with_defaults(Instant::now()));
+        self.stopping += 1;
+        let _ = c.sub.send(&ControlMsg::Cancel {
+            reason: reason.to_string(),
+        });
+        true
+    }
+
+    /// Stop `node` for good, as `subagent.kill` does: `Cancel` it now and
+    /// start its kill ladder, which the reactor climbs on every tick. Unlike
+    /// the drain's [`stop`](Self::stop), nothing is parked: what a killed
+    /// child owed is not left for the next life, even when the drain had
+    /// stopped it first. A child already on a ladder keeps its clock, so a
+    /// second kill does not put its signal off. Whether it was live.
+    pub fn stop_for_good(&mut self, node: NodeId, reason: &str) -> bool {
+        let Some(c) = self.map.get_mut(&node) else {
+            return false;
+        };
+        c.parked = false;
+        c.cancelled = true;
+        if c.stop.is_none() {
+            c.stop = Some(Ladder::with_defaults(Instant::now()));
+            self.stopping += 1;
+        }
         let _ = c.sub.send(&ControlMsg::Cancel {
             reason: reason.to_string(),
         });
@@ -342,19 +373,31 @@ impl Children {
     }
 
     /// Climb each stopped child's ladder; `force` collapses every one to
-    /// `SIGKILL`. A child the drain lets run is not touched.
-    pub fn drive_stops(&mut self, force: bool) {
+    /// `SIGKILL`. A child let run is not touched. Returns each child a rung
+    /// signalled, with the signal.
+    pub fn drive_stops(&mut self, force: bool) -> Vec<(NodeId, &'static str)> {
+        let mut signalled = Vec::new();
+        if self.stopping == 0 {
+            return signalled;
+        }
         let now = Instant::now();
-        for c in self.map.values_mut() {
+        for (node, c) in self.map.iter_mut() {
             let Some(ladder) = c.stop.as_mut() else {
                 continue;
             };
             match ladder.poll(now, false, force) {
-                LadderAction::Term => term_group(c.sub.pgid()),
-                LadderAction::Kill => kill_group(c.sub.pgid()),
+                LadderAction::Term => {
+                    term_group(c.sub.pgid());
+                    signalled.push((*node, "SIGTERM"));
+                }
+                LadderAction::Kill => {
+                    kill_group(c.sub.pgid());
+                    signalled.push((*node, "SIGKILL"));
+                }
                 LadderAction::Wait | LadderAction::Done => {}
             }
         }
+        signalled
     }
 
     /// Kill and forget every remaining child: a drain past its abandon grace,
@@ -379,6 +422,7 @@ impl Children {
             })
             .collect();
         self.pid_to_node.clear();
+        self.stopping = 0;
         gone
     }
 

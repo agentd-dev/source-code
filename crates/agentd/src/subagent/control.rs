@@ -168,18 +168,6 @@ pub fn run() -> i32 {
         return crate::exit::USAGE;
     }
 
-    // Install the SAME agent identity the root has, so this child signs its MCP
-    // requests under one tree-wide identity. The key file is a shared-fs path
-    // resolved here, because the re-exec crossed the process boundary; a bad
-    // key or secret is a startup failure (exit 2) rather than an unsigned run.
-    #[cfg(feature = "aauth")]
-    if let Some(settings) = &payload.aauth
-        && let Err(e) = crate::aauth::setup(settings, std::time::Duration::from_secs(30))
-    {
-        eprintln!("agentd subagent: aauth: {e}");
-        return crate::exit::USAGE;
-    }
-
     // This process is one span of the unit of work that spawned it: under the
     // span the supervisor handed down, or a trace of its own when it was handed
     // none. Everything it does is that unit's, so it is the process trace too —
@@ -205,6 +193,22 @@ pub fn run() -> i32 {
             },
         )
     });
+    // A token this child earns from a server, or the Person Server, is the
+    // tree's: the supervisor hands it to the children it spawns after.
+    #[cfg(feature = "aauth")]
+    {
+        let to = Arc::clone(&up);
+        crate::aauth::hand_up(move |authority, access, auth_token| {
+            send_up(
+                &to,
+                &AgentMsg::AAuthToken {
+                    authority: authority.to_string(),
+                    access: access.map(str::to_string),
+                    auth_token: auth_token.map(str::to_string),
+                },
+            )
+        });
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     // Turn-boundary suspension: the control thread sets this on `Pause` and
     // clears it on `Resume`; the loop waits between turns while it is set.
@@ -248,6 +252,18 @@ pub fn run() -> i32 {
         "loop.start",
         serde_json::json!({"depth": payload.depth, "warm": payload.warm}),
     );
+
+    // The supervisor's AAuth identity, adopted before anything is dialed, so
+    // this child's MCP, model and A2A requests sign as the supervisor's do —
+    // with its key and the agent token it holds — and the provider is asked
+    // for nothing until that token is due. A key it cannot load fails the
+    // child before its first request, rather than every request after.
+    #[cfg(feature = "aauth")]
+    if let Some(handed) = &payload.aauth
+        && let Err(e) = crate::aauth::adopt(handed, Duration::from_secs(30))
+    {
+        return fail(&up, &log, e, crate::exit::USAGE);
+    }
 
     // The model's connection — headers, dialect, signer, timeout — and its
     // fallback chain, each link on its own connection.

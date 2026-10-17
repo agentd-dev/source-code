@@ -91,6 +91,7 @@ control frame on the child's stdin, never in argv (readable by anyone through
 | An output contract | `output_contract` prose, or `output_schema` folded into that prose as text |
 | A model | The template's `model`, else `subagents.defaults.model`, else the agent's turn model, resolved to a connection with a live credential |
 | Budgets | Steps, tokens and a deadline, plus optional memory and CPU limits and a priority |
+| The agent's identity | With `security.aauth`, the daemon's: the key file's path, the agent token the daemon holds and the tokens the tree holds for each server, so the child signs its MCP, model and A2A requests with the daemon's key and asks the Agent Provider for nothing until that token is due a refresh; a token the child earns from a server is handed back for the children after it ([AAuth agent identity](aauth.md#what-agentd-signs)) |
 
 The tool grant can only narrow. A caller cannot forge or widen it through
 `context`, because the supervisor's mint replaces any grant already in the
@@ -104,11 +105,11 @@ What the child does not get matters as much:
   `resource.read` when those servers expose resources. It has no
   `subagent.*`, `workflow.*`, `memory.*` or `a2a.*` tools, so it cannot
   delegate onward.
-- **No A2A peers and no agent identity.** Both are empty on spawn, so a child
-  cannot reach another agent and does not sign requests under the AAuth
-  identity.
+- **No A2A peers.** The list is empty on spawn, so a child cannot reach
+  another agent.
 - **No stored credential.** The durable record keeps the model reference, not
-  the resolved connection; a restore resolves the model again.
+  the resolved connection, and no AAuth identity; a restore resolves the
+  model again and hands the child the running daemon's identity.
 
 The child connects to its servers itself, and offers exactly the MCP tools
 the agent's registry offers a subagent on them, under the registry's names:
@@ -330,11 +331,14 @@ An instance child is the same binary started with a configuration file the
 parent composes. The parent writes the template's machinery, the delivered
 prose with its parameters, its own intelligence section (without its budget,
 its routes or any inline token, and with the template's `model` and
-`budget`), its service catalogue, egress posture and TLS trust, a store under
-its own state directory, and an A2A listener on a unix socket. Model
-credentials reach the child through the environment, never the file. The
+`budget`), its service catalogue, egress posture and TLS trust, its AAuth
+provider and key file, a store under its own state directory, and an A2A
+listener on a unix socket. Model credentials reach the child through the
+environment, never the file, and the child loads the AAuth key without ever
+creating one and fetches its own agent token for it when it starts. The
 child is wired back to the parent as a peer named `parent`, and the parent
-can address the child by its handle (`inst-<n>`) at once.
+can address the child by its handle (`inst-<n>`) at once; neither link is
+AAuth-signed, so neither waits on the Agent Provider.
 
 The child is a daemon, so its prose is its policy: it runs nothing when it
 spawns, and work at spawn is a `:::!workflow` with a `once` start or a first

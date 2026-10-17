@@ -469,7 +469,8 @@ read:
 - a subagent that had not finished, and was not detached, is spawned again
   from its stored payload with `attempt + 1`, and its model and credential
   are resolved afresh — the stored record carries neither a token nor
-  resolved headers, so it cannot reproduce a run offline;
+  resolved headers, so it cannot reproduce a run offline — and it is handed
+  this life's AAuth identity, which the record does not keep either;
 - detached and finished subagents are not spawned again;
 - turn workers are never spawned again: their inbox event replays instead;
 - timers are re-armed from absolute deadlines, and undone inbox events are

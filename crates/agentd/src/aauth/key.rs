@@ -9,7 +9,8 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::Path;
 
 /// An Ed25519 signing key. Cheap to hold; `sign` is the hot path (every MCP
-/// request). The seed never leaves this struct except back to its own file.
+/// request). The seed leaves this struct only for its own file, or, for a key
+/// that has none, over a child's private spawn pipe.
 pub struct AgentKey {
     pair: Ed25519KeyPair,
     seed: [u8; 32],
@@ -50,15 +51,42 @@ impl AgentKey {
     /// seed; created 0600.
     pub fn load_or_create(path: &Path) -> Result<AgentKey, String> {
         if path.exists() {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("aauth: read key {}: {e}", path.display()))?;
-            let seed = b64::url_decode(text.trim())
-                .map_err(|e| format!("aauth: key file {}: {e}", path.display()))?;
-            return AgentKey::from_seed(&seed);
+            return AgentKey::load(path);
         }
         let key = AgentKey::generate()?;
         key.persist(path)?;
         Ok(key)
+    }
+
+    /// Load the key at `path`. A missing file is an error, never a new key: a
+    /// child that made one would sign as a stranger to the tree it is in.
+    pub fn load(path: &Path) -> Result<AgentKey, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("aauth: read key {}: {e}", path.display()))?;
+        let seed = b64::url_decode(text.trim())
+            .map_err(|e| format!("aauth: key file {}: {e}", path.display()))?;
+        AgentKey::from_seed(&seed)
+    }
+
+    /// The seed, base64url: what a child is handed for a key with no file.
+    pub(super) fn seed_b64(&self) -> String {
+        b64::url_nopad(&self.seed)
+    }
+
+    /// Write the key to `path` as [`Self::persist`] does, replacing a file
+    /// already there, and created `0600` rather than narrowed after the write.
+    pub(super) fn write_over(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        open.open(path)
+            .and_then(|mut f| f.write_all(self.seed_b64().as_bytes()))
+            .map_err(|e| format!("aauth: write key {}: {e}", path.display()))
     }
 
     /// Write the seed (base64url) to `path` with 0600 perms (best-effort on

@@ -758,6 +758,10 @@ impl Runtime {
             // 9b. Instance-tier children: ttl retirement, plus the
             // SIGTERM→SIGKILL escalation for children that ignored the drain.
             self.instances_tick();
+            // 9c. The AAuth agent token every child is handed, refreshed in
+            // the background before it stops being good.
+            #[cfg(feature = "aauth")]
+            crate::aauth::keep_fresh();
             // 10. Checkpoints + the point-in-time observability gauges.
             self.checkpoint(false);
             crate::obs::metrics::set_inbox_pending(self.inbox_queue.len() as u64);
@@ -1517,6 +1521,16 @@ impl Runtime {
             AgentMsg::Credential { target, err } => {
                 crate::auth::report::heard(&target, err.as_deref())
             }
+            // A token a child earned joins this process's identity, and the
+            // children spawned after it are handed it.
+            #[cfg(feature = "aauth")]
+            AgentMsg::AAuthToken {
+                authority,
+                access,
+                auth_token,
+            } => crate::aauth::heard_token(&authority, access.as_deref(), auth_token.as_deref()),
+            #[cfg(not(feature = "aauth"))]
+            AgentMsg::AAuthToken { .. } => {}
             // A child a drain or a kill is stopping starts nothing more: its
             // wait for the answer ends on the cancel it was sent.
             AgentMsg::ToolRequest { .. } | AgentMsg::BudgetRequest { .. }

@@ -278,8 +278,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         );
         return crate::exit::USAGE;
     }
-    // AAuth identity — signs outbound MCP requests tree-wide. Set up before
-    // any server is dialed, so no request can leave unsigned.
+    // The AAuth identity, set up — the provider's metadata verified, the first
+    // agent token fetched — before anything is dialed. It signs this
+    // process's MCP, model and A2A requests; each turn worker and subagent is
+    // handed it with its spawn (`aauth::handoff`) and an instance child is
+    // composed it — its parent's key, which it loads and never makes — so the
+    // whole tree signs as one agent.
     #[cfg(feature = "aauth")]
     if let Some(a) = &settings.security.aauth {
         let aauth = crate::config::AAuthSettings {
@@ -288,15 +292,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                 .key_file
                 .clone()
                 .unwrap_or_else(|| "/var/lib/agentd/aauth-key".into()),
+            create_key: std::env::var_os(crate::supervisor::reap::INSTANCE_CHILD_ENV).is_none(),
             enrollment_token: a.enroll_token.as_ref().map(|s| s.0.clone()),
             enroll_assertion_file: a.enroll_assertion_file.clone(),
             person_server: a.person_server.clone(),
         };
         if let Err(e) = crate::aauth::setup(&aauth, Duration::from_secs(30)) {
-            log.error(
-                "proc.exit",
-                json!({"code": crate::exit::USAGE, "err": format!("aauth: {e}")}),
-            );
+            log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
             return crate::exit::USAGE;
         }
     }

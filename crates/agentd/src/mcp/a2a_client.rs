@@ -348,8 +348,16 @@ pub struct PeerAuth {
     /// [`PeerAuth::headers`], its signature covers the exact request body, so it
     /// must be re-run on every request. `None` means no SigV4 (bearer, mTLS and
     /// AAuth still apply). Alongside it, an ambient process AAuth identity signs
-    /// every outbound A2A dial when one is configured.
+    /// every outbound A2A dial when one is configured, unless the peer is
+    /// [`PeerAuth::tree`].
     pub signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
+    /// The peer is a process of this agent's own tree: the parent an instance
+    /// child reports to, or an instance child its parent dials. The link is
+    /// authenticated by the socket's peer credential or the bearer the parent
+    /// composed, and agentd's listener checks no AAuth signature, so the AAuth
+    /// identity is not presented on it: the tree's own links do not wait on
+    /// the Agent Provider.
+    pub tree: bool,
     /// The span this hop is, when a unit of work makes it: sent as
     /// `traceparent` and `tracestate` on every request of the hop — the card
     /// read, the send, each poll — ahead of the signatures, so an agentd peer
@@ -540,9 +548,12 @@ impl HttpConn {
     ) -> Result<Vec<(String, String)>, String> {
         let mut out = Vec::new();
         // AAuth: sign the outbound A2A dial so the peer can attest the agent by
-        // signature — additive, identity-cover only (like the intel dial).
+        // signature. With AAuth configured the dial is not sent without it, as
+        // the intel dial is not — except on the tree's own links.
         #[cfg(feature = "aauth")]
-        if let Some(signer) = crate::aauth::signer() {
+        if !self.auth.tree
+            && let Some(signer) = crate::aauth::signer()
+        {
             out.extend(signer.sign(method, &self.ep.host_header, path, body)?);
         }
         // SigV4: an AWS-IAM-gated peer, signed over the exact body.

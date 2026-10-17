@@ -440,7 +440,7 @@ impl Runtime {
             mcp_servers: servers.iter().filter_map(|s| self.spawn_spec(s)).collect(),
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
-            aauth: None,
+            aauth: aauth_handoff(),
             limits: Limits {
                 max_steps: steps,
                 max_tokens: tokens,
@@ -936,6 +936,8 @@ impl Runtime {
             // live settings: its connection and credential may have moved
             // since, and a stored one is never replayed.
             payload.intelligence = self.intel_config(payload.intelligence.reference.as_deref());
+            // And it signs as this life's agent: the record kept no identity.
+            payload.aauth = aauth_handoff();
             // It carries on in the trace it was spawned in, as the
             // supervisor's lines about it do.
             let trace = self.subagents.get(&handle).and_then(|s| s.trace.clone());
@@ -1023,9 +1025,25 @@ fn apply_spawn_defaults(
     }
 }
 
+/// The AAuth identity this process signs with, as a turn worker or a
+/// subagent is handed it; `None` with no identity configured, or in a build
+/// without `aauth`.
+pub(crate) fn aauth_handoff() -> Option<crate::subagent::protocol::AAuthHandoff> {
+    #[cfg(feature = "aauth")]
+    {
+        crate::aauth::handoff()
+    }
+    #[cfg(not(feature = "aauth"))]
+    {
+        None
+    }
+}
+
 /// The payload as stored: of the intelligence, only the model REFERENCE —
 /// a restore resolves it again ([`Runtime::intel_config`]). The connection
-/// is not stored: its token and its headers, resolved, are credentials.
+/// is not stored: its token and its headers, resolved, are credentials. Nor
+/// is the AAuth identity, whose agent token is one: a restore hands the
+/// child the live one ([`aauth_handoff`]).
 fn secret_free_payload(p: &SpawnPayload) -> Value {
     let mut clean = p.clone();
     clean.intelligence = IntelConfig {
@@ -1033,6 +1051,7 @@ fn secret_free_payload(p: &SpawnPayload) -> Value {
         reference: p.intelligence.reference.clone(),
         ..Default::default()
     };
+    clean.aauth = None;
     let mut v = serde_json::to_value(&clean).unwrap_or(Value::Null);
     // The record keeps surfacing the narrowed grant for audits/`subagent.status`
     // — read back OFF THE PAYLOAD that actually carries it, so the record can
@@ -1092,5 +1111,30 @@ mod tests {
                 .ends_with("[truncated]")
         );
         assert!(distill_text(&json!({"k": "v"})).contains("\"k\""));
+    }
+
+    /// The stored payload keeps no AAuth identity: its agent token is a
+    /// credential, and a restore hands the child the live one.
+    #[test]
+    fn the_stored_payload_keeps_no_identity() {
+        let payload: SpawnPayload = serde_json::from_value(json!({
+            "instruction": "work",
+            "intelligence": {"uri": "https://intel.example", "token": "sk-1", "model": "m"},
+            "aauth": {"provider": "https://apd.example", "key": {"seed": "c2VlZA"},
+                      "thumbprint": "t", "enrollment_token": "enroll-1",
+                      "token": {"token": "agent-tok", "good_until_ms": 1}},
+            "limits": {"max_steps": 1, "max_tokens": 1, "deadline_ms": 1000, "max_depth": 1},
+            "telemetry": {"run_id": "r", "instance": "i", "agent_id": "a", "agent_path": "a",
+                          "log_level": "info"},
+            "depth": 1
+        }))
+        .unwrap();
+        assert!(payload.aauth.is_some());
+        let stored = secret_free_payload(&payload).to_string();
+        for secret in ["sk-1", "c2VlZA", "enroll-1", "agent-tok"] {
+            assert!(!stored.contains(secret), "{secret} stored: {stored}");
+        }
+        let back: SpawnPayload = serde_json::from_str(&stored).unwrap();
+        assert!(back.aauth.is_none());
     }
 }

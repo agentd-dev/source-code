@@ -336,11 +336,11 @@ fn wire_tool_name(name: &str) -> String {
 impl Endpoint {
     /// When a process AAuth identity is installed, sign the intelligence dial
     /// with an RFC 9421 HTTP message signature so the gateway can attest the agent by
-    /// signature rather than by source IP. The headers only add identity cover:
-    /// a gateway that does not understand them ignores them, and the bearer
-    /// token, if any, still rides alongside. Returns empty without
-    /// `--features aauth` or with no identity configured, so an unsigned dial is
-    /// the no-identity default rather than a failure.
+    /// signature rather than by source IP. A gateway that does not understand
+    /// the headers ignores them, and the bearer token, if any, still rides
+    /// alongside; but a signature that cannot be produced is the `Err`, and the
+    /// dial is not sent. Returns empty without `--features aauth` or with no
+    /// identity configured, so an unsigned dial is the no-identity default.
     #[cfg(feature = "aauth")]
     fn aauth_headers(
         &self,

@@ -374,9 +374,11 @@ What depends on the world is not caught at load: an interactive credential
 that was never logged in, or has expired with no refresh token; an `issuer`
 or a token endpoint that does not answer; an `aws` source with no
 credentials; a `{{secret-file:…}}` or `token_file` that cannot be read when a
-request needs it. agentd never sends a request without the credential it is
-configured to present. The request is not sent, and it fails with an error
-that names the target and the cause:
+request needs it; an AAuth Agent Provider that does not answer, or will not
+enroll the key or issue an agent token (target `aauth`; see
+[AAuth agent identity](aauth.md#turn-it-on)). agentd never sends a request
+without the credential it is configured to present. The request is not sent,
+and it fails with an error that names the target and the cause:
 
 - an MCP server's connect fails (`mcp.connect.fail`) and is dialed again in
   the background, or, on a live connection, the tool call fails;

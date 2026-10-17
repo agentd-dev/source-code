@@ -27,7 +27,8 @@ Do not delegate in these cases:
   branches is a [workflow](author-workflows.md), which is durable and
   resumable. A subagent is one bounded agent loop.
 - **The child must delegate onward or act as the agent.** A child has no
-  `subagent.*` tools, no A2A peers and no AAuth identity.
+  `subagent.*` tools and no A2A peers. It does sign as the agent: with
+  `security.aauth` it carries the daemon's AAuth identity.
 
 ## Try it locally
 

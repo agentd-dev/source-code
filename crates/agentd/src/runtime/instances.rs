@@ -26,6 +26,27 @@ use std::path::PathBuf;
 /// Extra grace past the child's own drain window before SIGKILL.
 const KILL_GRACE_MS: u64 = 5_000;
 
+/// The peer an instance child reports home over, which its parent composes.
+const PARENT_PEER: &str = "parent";
+
+/// Whether the configured peer `name` is this process's parent: its `parent`
+/// peer, in an instance child. A child's whole `a2a` section is its parent's
+/// composition, so that peer is the parent's own listener.
+#[cfg(feature = "a2a")]
+pub(crate) fn is_parent_link(name: &str) -> bool {
+    name == PARENT_PEER && std::env::var_os(crate::supervisor::reap::INSTANCE_CHILD_ENV).is_some()
+}
+
+/// Remove the copy of a key held only in memory composed into the instance
+/// directory `dir` ([`crate::aauth::forget_instance_key`]), once the child it
+/// was for has exited or was never started.
+fn forget_instance_key(dir: &std::path::Path) {
+    #[cfg(feature = "aauth")]
+    crate::aauth::forget_instance_key(dir);
+    #[cfg(not(feature = "aauth"))]
+    let _ = dir;
+}
+
 impl Runtime {
     /// `subagent.run` with an instance-tier template: spawn a full daemon.
     pub(crate) fn instance_run(
@@ -184,11 +205,15 @@ impl Runtime {
             &trace,
         ) {
             Ok(d) => d,
-            Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
+            Err(e) => {
+                forget_instance_key(&dir);
+                return err(format!("subagent.run: template '{tname}': {e}"));
+            }
         };
         // The composed document must be a bootable config NOW — a child that
         // exits 2 on its first breath is a refusal we can make synchronously.
         if let Err(e) = validate_composed(&doc, &prose) {
+            forget_instance_key(&dir);
             return err(format!(
                 "subagent.run: template '{tname}' composes an invalid config: {e}"
             ));
@@ -196,6 +221,7 @@ impl Runtime {
         let config_path = dir.join("config.json");
         let rendered = serde_json::to_string_pretty(&doc).unwrap_or_default();
         if let Err(e) = std::fs::write(&config_path, rendered) {
+            forget_instance_key(&dir);
             return err(format!(
                 "subagent.run: write {}: {e}",
                 config_path.display()
@@ -262,6 +288,7 @@ impl Runtime {
                 }
             }
             Err(e) => {
+                forget_instance_key(&dir);
                 record.status = "failed".into();
                 record.error = Some(format!("spawn: {e}"));
                 self.subagents.insert(handle.clone(), record);
@@ -350,7 +377,7 @@ impl Runtime {
                                  "cases": {rw: "get"}, "on_no_match": "skip"},
                         "get":  {"kind": "workflow.wait", "depends_on": ["pick"],
                                  "run": "{{steps.ev.output.payload.run}}", "timeout": "30s"},
-                        "send": {"kind": "a2a.send", "depends_on": ["get"], "to": "parent",
+                        "send": {"kind": "a2a.send", "depends_on": ["get"], "to": PARENT_PEER,
                                  "command": "_instance.result",
                                  "args": {"handle": handle,
                                           "status": "{{steps.get.output.status}}",
@@ -368,7 +395,7 @@ impl Runtime {
                 a.push(json!({
                     "name": crate::config::templates::mirror_workflow(m), "steps": {
                         "ev":   {"kind": "stream", "stream": m, "from": "new"},
-                        "send": {"kind": "a2a.send", "depends_on": ["ev"], "to": "parent",
+                        "send": {"kind": "a2a.send", "depends_on": ["ev"], "to": PARENT_PEER,
                                  "command": "_instance.emit",
                                  "args": {"handle": handle, "stream": m,
                                           "event": "{{steps.ev.output}}"},
@@ -429,6 +456,10 @@ impl Runtime {
         }
         if let Some(ca) = &self.settings.security.tls_ca {
             security["tls_ca"] = json!(ca);
+        }
+        // And it signs as this agent: one identity for the tree.
+        if let Some(aauth) = self.instance_identity(dir)? {
+            security["aauth"] = aauth;
         }
         if security.as_object().is_some_and(|o| !o.is_empty()) {
             doc["security"] = security;
@@ -495,6 +526,62 @@ impl Runtime {
         Ok(doc)
     }
 
+    /// The `security.aauth` a child in `dir` is composed: this process's AAuth
+    /// identity (`aauth::instance_settings`), or none.
+    fn instance_identity(&self, dir: &std::path::Path) -> Result<Option<Value>, String> {
+        #[cfg(feature = "aauth")]
+        {
+            let enroll_token = self
+                .settings
+                .security
+                .aauth
+                .as_ref()
+                .and_then(|a| a.enroll_token.as_ref())
+                .map(|s| s.0.as_str());
+            crate::aauth::instance_settings(dir, enroll_token)
+        }
+        #[cfg(not(feature = "aauth"))]
+        {
+            let _ = dir;
+            Ok(None)
+        }
+    }
+
+    /// A restored child's composed config, given this life's AAuth identity
+    /// in place of the one its first life composed: the operator's
+    /// `security.aauth` may have changed across the restart, and a child
+    /// signs as the agent that is running.
+    fn recompose_identity(&self, config: &std::path::Path) -> Result<(), String> {
+        let dir = config.parent().unwrap_or(std::path::Path::new("."));
+        let mut doc: Value = std::fs::read(config)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+            .map_err(|e| format!("read {}: {e}", config.display()))?;
+        let identity = self.instance_identity(dir)?;
+        let Some(root) = doc.as_object_mut() else {
+            return Err(format!("{} is not a composed config", config.display()));
+        };
+        let security = root.entry("security").or_insert_with(|| json!({}));
+        match (identity, security.as_object_mut()) {
+            (Some(aauth), Some(s)) => {
+                s.insert("aauth".into(), aauth);
+            }
+            (None, Some(s)) => {
+                s.remove("aauth");
+            }
+            (_, None) => return Err(format!("{}: `security` is not a map", config.display())),
+        }
+        if root
+            .get("security")
+            .and_then(Value::as_object)
+            .is_some_and(|s| s.is_empty())
+        {
+            root.remove("security");
+        }
+        let rendered = serde_json::to_string_pretty(&doc).unwrap_or_default();
+        std::fs::write(config, rendered).map_err(|e| format!("write {}: {e}", config.display()))
+    }
+
     /// The child's `parent` peer entry — only when the parent has a listener,
     /// and never carrying an inline credential into a file on disk.
     fn parent_peer_entry(&self) -> Option<Value> {
@@ -510,7 +597,7 @@ impl Runtime {
                 .replace("0.0.0.0", "127.0.0.1")
                 .replace("[::]", "[::1]")
         };
-        let mut peer = json!({"name": "parent", "endpoint": endpoint});
+        let mut peer = json!({"name": PARENT_PEER, "endpoint": endpoint});
         if let Some(bearer) = &self.settings.a2a.bearer {
             if crate::sec::secret::has_secret_ref(&bearer.0) {
                 peer["headers"] = json!({"Authorization": format!("Bearer {}", bearer.0)});
@@ -665,6 +752,14 @@ impl Runtime {
         else {
             return false;
         };
+        // The child has read its key; a respawn is composed it again.
+        if let Some(dir) = self.subagents[&handle]
+            .config_path
+            .as_deref()
+            .and_then(|c| std::path::Path::new(c).parent())
+        {
+            forget_instance_key(dir);
+        }
         // One the drain asked to drain itself is left for the next life.
         if self.park_drained_instance(&handle, r) {
             self.persist_subagent(&handle);
@@ -725,6 +820,16 @@ impl Runtime {
                 self.persist_subagent(&handle);
                 continue;
             };
+            // It signs as this life's agent.
+            if let Err(e) = self.recompose_identity(&path) {
+                forget_instance_key(&dir);
+                if let Some(s) = self.subagents.get_mut(&handle) {
+                    s.status = "failed".into();
+                    s.error = Some(format!("respawn: {e}"));
+                }
+                self.persist_subagent(&handle);
+                continue;
+            }
             match self.spawn_instance_process(&path, &dir, &limits, &delivered) {
                 Ok(pid) => {
                     if let Some(s) = self.subagents.get_mut(&handle) {
@@ -739,6 +844,7 @@ impl Runtime {
                     self.persist_subagent(&handle);
                 }
                 Err(e) => {
+                    forget_instance_key(&dir);
                     if let Some(s) = self.subagents.get_mut(&handle) {
                         s.status = "failed".into();
                         s.error = Some(format!("respawn: {e}"));
@@ -785,6 +891,7 @@ impl Runtime {
             let log = self.log.in_trace(hop.as_ref());
             let auth = crate::mcp::a2a_client::PeerAuth {
                 trace: hop.clone(),
+                tree: true,
                 ..Default::default()
             };
             let h = handle.to_string();

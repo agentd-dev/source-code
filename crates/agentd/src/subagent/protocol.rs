@@ -191,6 +191,20 @@ pub enum AgentMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         err: Option<String>,
     },
+    /// A token the child earned for `authority`: the `AAuth-Access` token the
+    /// server issued (Case B), or the user-scoped auth token the Person
+    /// Server issued for it (Case C). The supervisor keeps it, and hands it
+    /// to the children it spawns after, so the tree earns each token once. A
+    /// credential, carried on the wire like [`SpawnPayload`]'s and never
+    /// logged.
+    #[serde(rename = "aauth_token")]
+    AAuthToken {
+        authority: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
 }
 
 /// Which endpoint is serving the child's intelligence, for
@@ -246,14 +260,15 @@ pub struct SpawnPayload {
     /// frame that omits it parses as "no extra anchor".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
-    /// AAuth agent-identity settings, inherited by every subagent so the whole
-    /// process tree signs MCP requests under ONE identity — a peer sees the tree
-    /// as a single agent rather than a crowd of anonymous processes. The key file
-    /// is a shared-fs path, like `tls_ca`, and no secret rides here: the
-    /// enrollment token stays a `{{secret:…}}` template resolved in the child.
-    /// `#[serde(default)]` so a frame that omits it parses as "no identity".
+    /// The supervisor's AAuth identity, handed to every turn worker and
+    /// subagent so the whole process tree signs under ONE identity — a peer
+    /// sees the tree as a single agent rather than a crowd of anonymous
+    /// processes. Carries the agent token the supervisor holds, so a child
+    /// asks the provider for nothing until that token is due a refresh. A
+    /// credential: the durable record never keeps it. `#[serde(default)]` so a
+    /// frame that omits it parses as "no identity".
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aauth: Option<crate::config::AAuthSettings>,
+    pub aauth: Option<AAuthHandoff>,
     /// Tool names this child must NOT call directly, routing them up to the
     /// supervisor instead.
     ///
@@ -301,6 +316,81 @@ pub struct SpawnPayload {
     /// The turn worker's input (`role: turn`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<Box<TurnSpec>>,
+}
+
+/// The supervisor's AAuth identity as a child is handed it: the same key and
+/// provider, and the agent token the supervisor holds now, so the child signs
+/// as the supervisor does without asking the provider for anything. A child
+/// asks the provider only when the token it was handed is due a refresh, or it
+/// was handed none, and only once the provider's metadata is verified — by
+/// the supervisor, or by the child itself when the supervisor could not. It
+/// rides the private spawn pipe, never the environment or argv.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AAuthHandoff {
+    /// The Agent Provider base URL.
+    pub provider: String,
+    /// Where the signing key is.
+    pub key: AAuthKey,
+    /// The key's RFC 7638 thumbprint. A child refuses a key file that no
+    /// longer holds this key rather than sign as someone else.
+    pub thumbprint: String,
+    /// The enrollment token, resolved, for a child that enrolls because the
+    /// supervisor has not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token: Option<String>,
+    /// The enrollment-assertion file, read fresh at each enroll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_assertion_file: Option<String>,
+    /// The Person Server for user-scoped access (Case C).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_server: Option<String>,
+    /// The supervisor verified the provider's metadata.
+    #[serde(default)]
+    pub verified: bool,
+    /// The identity the supervisor enrolled as, so the child does not enroll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The supervisor's agent token and when it stops being good (unix ms,
+    /// a minute before it expires), when it holds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<HandedToken>,
+    /// What the tree has learned of each server it signs for, by authority,
+    /// so a child neither asks a server's discovery document again nor earns
+    /// a token the tree already holds.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub servers: std::collections::BTreeMap<String, HandedServer>,
+}
+
+/// What the tree holds for one server: the `AAuth-Access` token it issued
+/// (Case B), the user-scoped auth token the Person Server issued for it
+/// (Case C), and whether it requires a `content-digest` cover — `None` when
+/// it was not discovered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandedServer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<bool>,
+}
+
+/// Where a child finds the AAuth signing key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AAuthKey {
+    /// The key file the supervisor loaded it from. The child reads it and
+    /// never creates one.
+    File(String),
+    /// The base64url seed of a key that has no file.
+    Seed(String),
+}
+
+/// An agent token a child is handed, and when it stops being good.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandedToken {
+    pub token: String,
+    pub good_until_ms: u64,
 }
 
 /// The reserved [`SeedMessage::role`] that carries a child's **tool allow-list**

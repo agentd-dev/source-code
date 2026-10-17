@@ -120,6 +120,7 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
                     AgentMsg::TurnDone { .. } => "turn_done",
                     AgentMsg::Metrics(_) => "metrics",
                     AgentMsg::Credential { .. } => "credential",
+                    AgentMsg::AAuthToken { .. } => "aauth_token",
                 };
                 if m == kind {
                     return true;

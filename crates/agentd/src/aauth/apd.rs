@@ -12,12 +12,17 @@ use crate::b64;
 use crate::net::http::{self, Url};
 use serde::Deserialize;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Refresh this early before the advertised expiry so an in-flight signed
 /// request never rides a token that expires mid-call.
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
 const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+/// A held token is refreshed ahead of the instant it stops being good, by
+/// this much — or by half its life, for a token that lives less than twice
+/// this — so the token a child is handed outlives the child.
+const REFRESH_AHEAD: Duration = Duration::from_secs(300);
 
 /// Static config for reaching an Agent Provider.
 #[derive(Debug, Clone)]
@@ -57,17 +62,37 @@ struct TokenResp {
 struct Cached {
     token: String,
     good_until: Instant,
+    fetched: Instant,
+}
+
+impl Cached {
+    /// Due a refresh ahead of [`Cached::good_until`] ([`REFRESH_AHEAD`]).
+    fn due(&self, now: Instant) -> bool {
+        let life = self.good_until.saturating_duration_since(self.fetched);
+        self.good_until.saturating_duration_since(now) < REFRESH_AHEAD.min(life / 2)
+    }
 }
 
 /// A caching Agent-Provider token source. Holds the agent identity + a live
-/// agent token; `token()` returns a valid one, enrolling/refreshing under the
-/// hood. `Send + Sync`, cheap to share (one per agent process).
+/// agent token; `token()` returns a valid one, verifying the provider and
+/// enrolling/refreshing under the hood. `Send + Sync`, cheap to share (one per
+/// agent process).
 pub struct ApdClient {
     config: ApdConfig,
     key: AgentKey,
     timeout: Duration,
+    /// The provider's metadata was read and accepted: nothing is enrolled or
+    /// fetched from it, and no token of its is presented, before.
+    verified: AtomicBool,
     agent_id: Mutex<Option<String>>,
     cached: Mutex<Option<Cached>>,
+    /// Held while a token is fetched: callers that find the token due at
+    /// once share one fetch rather than each asking the provider.
+    fetching: Mutex<()>,
+    /// When the last fetch failed, and why: a caller that waited on it takes
+    /// its failure rather than ask again, so a provider that does not answer
+    /// costs the callers waiting one timeout, not one each.
+    failed: Mutex<Option<(Instant, String)>>,
 }
 
 impl ApdClient {
@@ -76,9 +101,61 @@ impl ApdClient {
             config,
             key,
             timeout,
+            verified: AtomicBool::new(false),
             agent_id: Mutex::new(None),
             cached: Mutex::new(None),
+            fetching: Mutex::new(()),
+            failed: Mutex::new(None),
         }
+    }
+
+    /// Start from what another process of the tree already holds: whether it
+    /// verified the provider, the identity it enrolled, and its agent token
+    /// with the instant it stops being good. Nothing is asked of the provider.
+    pub(super) fn seeded(
+        self,
+        verified: bool,
+        agent: Option<String>,
+        token: Option<(String, Instant)>,
+    ) -> ApdClient {
+        self.verified.store(verified, Ordering::Release);
+        *self.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = agent;
+        let fetched = Instant::now();
+        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) =
+            token.map(|(token, good_until)| Cached {
+                token,
+                good_until,
+                fetched,
+            });
+        self
+    }
+
+    /// The provider this client reaches, and how it enrolls.
+    pub(super) fn config(&self) -> &ApdConfig {
+        &self.config
+    }
+
+    /// Whether the provider's metadata has been verified.
+    pub(super) fn verified(&self) -> bool {
+        self.verified.load(Ordering::Acquire)
+    }
+
+    /// The agent token held now and the instant it stops being good, without
+    /// asking the provider: `None` when there is none, or it is no longer
+    /// good.
+    pub(super) fn held_token(&self) -> Option<(String, Instant)> {
+        let cache = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .as_ref()
+            .filter(|c| Instant::now() < c.good_until)
+            .map(|c| (c.token.clone(), c.good_until))
+    }
+
+    /// Whether the agent token is due a refresh: none is held, or the one
+    /// held is near the instant it stops being good ([`REFRESH_AHEAD`]).
+    pub(super) fn due(&self) -> bool {
+        let cache = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        cache.as_ref().is_none_or(|c| c.due(Instant::now()))
     }
 
     /// The resolved agent identity (`aauth:local@domain`), once enrolled.
@@ -97,8 +174,9 @@ impl ApdClient {
     }
 
     /// A currently-valid agent token, refreshing when the cached one is within
-    /// [`REFRESH_SKEW`] of expiry (or absent). Enrolls first if needed. This is
-    /// the whole "fully automatic, the user is never involved" refresh path.
+    /// [`REFRESH_SKEW`] of expiry (or absent). Verifies the provider's
+    /// metadata and enrolls first, until each has succeeded once. This is the
+    /// whole "fully automatic, the user is never involved" refresh path.
     ///
     /// The cache is **in-memory by design**: the agent *key* is durable and
     /// `/enroll` is idempotent, so a restart costs only one cheap signed
@@ -106,19 +184,57 @@ impl ApdClient {
     /// secret-at-rest surface to save a round-trip that is usually already
     /// inside [`REFRESH_SKEW`] on the next start.
     pub fn token(&self) -> Result<String, String> {
+        match self.held_token() {
+            Some((token, _)) => Ok(token),
+            None => self.fetch(false),
+        }
+    }
+
+    /// A token fetched ahead of the held one's refresh, when it is
+    /// [`Self::due`]; else the one held.
+    pub(super) fn refresh(&self) -> Result<String, String> {
+        self.fetch(true)
+    }
+
+    /// Fetch a token unless the one held is still good — and, `ahead`, not
+    /// due a refresh — once the lock is taken: a caller that waited on another's
+    /// fetch takes what it fetched, or how it failed.
+    fn fetch(&self, ahead: bool) -> Result<String, String> {
+        let asked = Instant::now();
+        let _one = self.fetching.lock().unwrap_or_else(|e| e.into_inner());
         {
+            let now = Instant::now();
             let cache = self.cached.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = cache.as_ref()
-                && Instant::now() < c.good_until
+                && now < c.good_until
+                && !(ahead && c.due(now))
             {
                 return Ok(c.token.clone());
             }
         }
-        self.enroll_if_needed()?;
-        let fresh = self.fetch_token()?;
-        let token = fresh.token.clone();
-        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
-        Ok(token)
+        if let Some((at, e)) = &*self.failed.lock().unwrap_or_else(|e| e.into_inner())
+            && *at > asked
+        {
+            return Err(e.clone());
+        }
+        let fetched = self
+            .verify_provider_metadata()
+            .map_err(|e| e.to_string())
+            .and_then(|()| self.enroll_if_needed())
+            .and_then(|()| self.fetch_token());
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        match fetched {
+            Ok(fresh) => {
+                *failed = None;
+                let token = fresh.token.clone();
+                *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
+                Ok(token)
+            }
+            Err(e) => {
+                *failed = Some((Instant::now(), e.clone()));
+                Err(e)
+            }
+        }
     }
 
     /// Enroll the durable key for an identity, once (idempotent — a second call
@@ -157,9 +273,15 @@ impl ApdClient {
     /// `/.well-known/aauth-agent.json`, its `issuer` MUST match the configured
     /// provider (§12.10 anti-host-poisoning). An absent document is fine (the
     /// enroll/token endpoints are bootstrap conventions, not advertised); a
-    /// contradicting one is fatal. Called once at prime.
-    pub(super) fn verify_provider_metadata(&self) -> Result<(), String> {
-        super::discover::fetch_agent_provider(&self.config.base_url, self.timeout).map(|_| ())
+    /// contradicting or unparseable one is refused, and one that could not be
+    /// read leaves the provider unverified. Asked until it succeeds once.
+    pub(super) fn verify_provider_metadata(&self) -> Result<(), super::discover::MetadataError> {
+        if self.verified() {
+            return Ok(());
+        }
+        super::discover::fetch_agent_provider(&self.config.base_url, self.timeout)?;
+        self.verified.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn fetch_token(&self) -> Result<Cached, String> {
@@ -184,9 +306,11 @@ impl ApdClient {
             .map(|e| Duration::from_secs(e.saturating_sub(sig::now_secs())))
             .or_else(|| resp.expires_in.map(Duration::from_secs))
             .unwrap_or(DEFAULT_TTL);
+        let fetched = Instant::now();
         Ok(Cached {
             token: resp.agent_token,
-            good_until: Instant::now() + ttl.saturating_sub(REFRESH_SKEW),
+            good_until: fetched + ttl.saturating_sub(REFRESH_SKEW),
+            fetched,
         })
     }
 
@@ -281,15 +405,8 @@ fn inspect_agent_token(
     expected_iss: Option<&str>,
     expected_ps: Option<&str>,
 ) -> Result<Option<u64>, String> {
-    // JWT = header.payload.signature; read only the payload segment.
-    let Some(payload_b64) = token.split('.').nth(1) else {
+    let Some(claims) = claims_of(token) else {
         return Ok(None); // not JWT-shaped → opaque token; nothing local to check
-    };
-    let Ok(bytes) = b64::url_decode(payload_b64) else {
-        return Ok(None);
-    };
-    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Ok(None);
     };
     // iss: the token must come from the provider we enrolled with — a token
     // issued by some other AP is not one we should present.
@@ -322,6 +439,20 @@ fn inspect_agent_token(
         }
     }
     Ok(claims.get("exp").and_then(|e| e.as_u64()))
+}
+
+/// The claims of a JWT-shaped token (header.payload.signature: the payload
+/// segment, unverified); `None` for an opaque token or one that does not
+/// parse.
+fn claims_of(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    serde_json::from_slice(&b64::url_decode(payload).ok()?).ok()
+}
+
+/// A JWT-shaped token's `exp` (unix seconds); `None` for an opaque token, or
+/// one that carries none.
+pub(super) fn exp_of(token: &str) -> Option<u64> {
+    claims_of(token)?.get("exp")?.as_u64()
 }
 
 #[cfg(test)]

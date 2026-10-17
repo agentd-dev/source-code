@@ -1756,18 +1756,26 @@ impl Runtime {
         // Live instance children are dialable as peers too — by handle, or by
         // template name when that template has a single instance. A configured
         // peer wins the name, so an operator can always override the lookup.
-        let peer = match configured {
-            Some(p) => p,
+        // Either way round, a link of the tree's own is `tree`: the parent an
+        // instance child reports to, or an instance child its parent dials.
+        let (peer, tree) = match configured {
+            Some(p) => {
+                let parent = super::instances::is_parent_link(&p.name);
+                (p, parent)
+            }
             None => match self.instance_peer_endpoint(peer_name) {
-                Some(endpoint) => crate::config::settings::A2aPeer {
-                    name: peer_name.to_string(),
-                    endpoint,
-                    service: None,
-                    headers: std::collections::BTreeMap::new(),
-                    client_cert: None,
-                    client_key: None,
-                    auth: None,
-                },
+                Some(endpoint) => (
+                    crate::config::settings::A2aPeer {
+                        name: peer_name.to_string(),
+                        endpoint,
+                        service: None,
+                        headers: std::collections::BTreeMap::new(),
+                        client_cert: None,
+                        client_key: None,
+                        auth: None,
+                    },
+                    true,
+                ),
                 None => {
                     return Err(format!(
                         "{what}: no such peer {peer_name:?} (a2a.peers or a live instance child)"
@@ -1826,6 +1834,7 @@ impl Runtime {
         #[allow(unused_mut)]
         let mut auth = crate::mcp::a2a_client::PeerAuth {
             headers,
+            tree,
             ..Default::default()
         };
         #[cfg(feature = "oauth")]

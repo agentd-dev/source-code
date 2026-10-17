@@ -41,11 +41,10 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   workflow the agent created at runtime: the load cannot see the store.
 - `agentd-mcp`: `http::RequestSigner::sign` returns
   `Result<Vec<(String, String)>, String>`. An empty vec still sends the
-  request unsigned on purpose, as AAuth does to learn a server's
-  requirement; an `Err` is a credential the signer cannot produce, and the
-  transport fails the request without sending it, with the new
-  `HttpError::Credential` carrying the cause. Every signer had only "send
-  nothing" to say when its credential failed. A breaking change to the
+  request unsigned on purpose; an `Err` is a credential the signer cannot
+  produce, and the transport fails the request without sending it, with the
+  new `HttpError::Credential` carrying the cause. Every signer had only
+  "send nothing" to say when its credential failed. A breaking change to the
   crate's public API.
 - `agentd-core`: `auth::device::TokenSource::new` takes the endpoints (an
   `auth::device::Endpoints`, discovered at the first request that needs
@@ -69,6 +68,40 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   built; an `aws` `source: env` reads its keys at each request. A login made
   while the daemon runs is read at the next request that has no usable
   token.
+- An AAuth-signed request whose agent token cannot be produced fails
+  unsent, as a request with any other credential does: the Agent Provider
+  does not answer or its metadata is not verified, or it will not enroll the
+  key or issue a token. It went out unsigned. The failure is logged as
+  `auth.unavailable` and `auth.recovered` under the target `aauth`. Model
+  calls and A2A calls are signed whenever an identity is configured, so with
+  no agent token held they fail too, and a model call that fails this way is
+  not failed over. A request that presents a user-scoped auth token (Case C)
+  needs no agent token, and is still signed while the provider is down. The
+  A2A links between a parent and its instance child are not signed at all:
+  an instance child's reports to its `parent` peer, and the parent's
+  `subagent.send` and `a2a.send` to the child. agentd's listener checks no
+  AAuth signature, and the socket's peer credential or the composed bearer
+  names the caller, so a sync instance spawn does not wait on the provider.
+- The daemon refreshes its agent token in the background before it is due:
+  five minutes before, or half-way through the life of a token that lives
+  less than ten minutes. A refresh that fails is tried again 30 seconds
+  later. Requests that find no token at once share one fetch, and its
+  failure.
+- The daemon verifies its Agent Provider, enrolls the key and fetches the
+  first agent token when it starts, before it dials anything else.
+  Enrollment waited for the first signed request. A provider that does not
+  answer does not stop the start: the requests that need it fail, unsent,
+  until it answers, and each asks it again.
+- `agentd-core`: `subagent::protocol::SpawnPayload::aauth` is an
+  `AAuthHandoff` (with `AAuthKey`, `HandedToken` and `HandedServer`), not
+  `config::AAuthSettings`, which no longer derives `Serialize` or
+  `Deserialize` and has a `create_key` field. `AgentMsg::AAuthToken` hands a
+  token a child earned up to the supervisor, and
+  `mcp::a2a_client::PeerAuth::tree` marks a link of the tree's own.
+  `aauth::ApdClient::token` verifies the provider's metadata before its
+  first enrollment; `aauth::AgentKey::load` reads a key without creating
+  one, `aauth::AAuthClient::with_key_file` names the file a key came from,
+  and `aauth::MetadataError` says why metadata was not accepted.
 
 **Fixed.**
 
@@ -114,6 +147,36 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - The error for a missing login names the command that makes it,
   `agentd --login <target>`, with the target filled in; it said
   `agentd login`, a command that does not exist.
+- Turn workers, subagents and instance-tier children sign as the agent.
+  Only the daemon process held the AAuth identity, so the model calls and
+  MCP calls of every turn, and everything a subagent or an instance child
+  did, went out unsigned, and an AAuth-protected server refused them. A turn
+  worker and a subagent, warm and restored ones included, are handed the
+  daemon's key file and the agent token it holds with their spawn, on the
+  child's private stdin pipe, and sign with them; a child asks the provider
+  for nothing until that token is due a refresh, so one enrollment and one
+  token serve the whole tree. They are handed what the tree knows of each
+  server too: the access token a server issued (Case B), the user-scoped
+  token the Person Server issued for it (Case C), unless it expires within a
+  minute, and whether it wants a `Content-Digest`, so a child neither earns
+  them again nor reads a discovery document the daemon read. A token a child
+  earns is handed up to the daemon, and the children spawned after it are
+  handed it. A child refuses a key file that no longer holds the daemon's key
+  and never creates one. An instance child is composed the daemon's provider
+  and key file, again when it is restored, loads that key without ever
+  creating one, and fetches its own token for that key when it starts; a
+  spawn whose key file no longer holds the daemon's key is refused. A key an
+  embedder holds only in memory is written for an instance child to its
+  `0700` directory, `0600`, and removed when the child exits or fails to
+  start. The durable subagent record keeps none of it.
+- The daemon checks the Agent Provider's metadata
+  (`/.well-known/aauth-agent.json`) before it enrolls the key, fetches a
+  token or presents one. Only `AAuthClient::prime` checked it, and nothing
+  in the daemon called that, so a host serving metadata that names another
+  provider was enrolled with. Metadata naming another issuer, or a document
+  that does not parse, refuses the start, exit 2. A provider that does not
+  answer, or answers with a server error, is not verified, and nothing is
+  enrolled with it or signed under it until it answers.
 
 ## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
 

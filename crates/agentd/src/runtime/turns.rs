@@ -1267,7 +1267,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             mcp_servers: servers,
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
-            aauth: None,
+            aauth: super::subagents::aauth_handoff(),
             limits: Limits {
                 max_steps: launch.max_steps,
                 max_tokens: launch.max_tokens,

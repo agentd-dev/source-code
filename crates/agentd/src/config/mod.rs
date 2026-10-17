@@ -490,33 +490,33 @@ pub struct AuthSpec {
     pub key_file: Option<String>,
 }
 
-/// AAuth agent-identity settings. Serde-serializable so it rides the spawn
-/// payload verbatim, giving one identity per process tree. The struct is always
-/// defined rather than feature-gated, so the payload plumbing compiles the same
-/// either way; the CLI flags that populate it require `--features aauth` at
-/// validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// AAuth agent-identity settings, which the root's `aauth::setup` reads. The
+/// struct is always defined rather than feature-gated; the CLI flags that
+/// populate it require `--features aauth` at validation. A child is handed the
+/// identity the root set up (`subagent::protocol::AAuthHandoff`), not these.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AAuthSettings {
     /// The Agent Provider base URL (`https://apd.example`) — enroll + agent-token.
     pub provider: String,
-    /// The durable Ed25519 key file (created 0600 if absent). A SHARED-FS path,
-    /// like `--tls-ca`, so a re-exec'd subagent resolves the same identity.
+    /// The durable Ed25519 key file (created 0600 if absent, when
+    /// `create_key`). A child is handed this path and reads the same key from
+    /// it.
     pub key_file: String,
+    /// Whether a missing `key_file` is created. Not in an instance child: it
+    /// signs with the key its parent named, and never makes one of its own.
+    pub create_key: bool,
     /// A one-time enrollment token template (`{{secret:…}}`), if the provider is
     /// in `token` mode. Secret-free (a reference, never an inline secret).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrollment_token: Option<String>,
     /// Path to an **enrollment assertion** file the provider federates against
     /// — e.g. a Kubernetes projected ServiceAccount token whose audience is the
     /// provider. Re-read fresh on every enroll (projected tokens rotate), so this
-    /// is a PATH, not the assertion itself; it rides the spawn payload like
-    /// `key_file`. Presented in the `/enroll` body; never logged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// is a PATH, not the assertion itself. Presented in the `/enroll` body;
+    /// never logged.
     pub enroll_assertion_file: Option<String>,
     /// The user's Person Server (`ps` claim), which scopes the identity to a
     /// user. It is carried through enrollment; agentd does not run the
     /// interactive consent flow itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_server: Option<String>,
 }
 

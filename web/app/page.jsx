@@ -6,6 +6,12 @@ import InstallTabs from "./components/InstallTabs";
 // served at — generated from the binary (scripts/gen-schemas.sh), so the
 // landing page cannot link a URI agentd does not declare, nor miss one it does.
 import extensions from "../lib/extensions.json";
+// The protocols and specifications the strip below the hero names: those
+// docs/interoperability.md says agentd supports, each with the docs page or
+// section that covers it. tools/check-standards.mjs (npm's postbuild) fails
+// the build when a link's page is not in the registry or its anchor is not
+// one of that page's headings.
+import standards from "../lib/standards.json";
 import { highlight } from "../lib/highlight";
 
 /* ── page furniture ──────────────────────────────────────────────── */
@@ -51,6 +57,59 @@ function Card({ tag, title, children }) {
       <h3 className="text-[15px] font-semibold text-[var(--fg-strong)]">{title}</h3>
       <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">{children}</p>
     </div>
+  );
+}
+
+/* The standards strip: a "speaks these" row in the spirit of a logo bar, but
+   typographic — every entry is the standard's name (and version) set in the
+   site's own type and colour tokens, uniform and monochrome. No third-party
+   logo or artwork: the names are stated as facts, and the Personal Agent
+   Protocol's licence leaves its name and logo out of its grant. A mark says
+   what is not settled: `preview` is not in a release binary, `draft` is a
+   specification still in draft. */
+function Standard({ s }) {
+  return (
+    <li>
+      {/* The spaces between the parts are the accessible name's ("MCP
+          2026-07-28"); a flex container lays out none of them. */}
+      <Link href={s.href} title={s.full} className="standard">
+        <span className="standard-name">{s.name}</span>
+        {s.version && <> <span className="standard-version">{s.version}</span></>}
+        {s.mark && <> <span className="standard-mark">{s.mark}</span></>}
+      </Link>
+    </li>
+  );
+}
+
+function Standards() {
+  const tier = (n) => standards.filter((s) => s.tier === n);
+  return (
+    <section aria-labelledby="standards-title" className="mx-auto max-w-[82rem] px-4 pt-6 pb-2 sm:pt-10">
+      <div className="standards">
+        <h2 id="standards-title" className="standards-title">
+          Speaks the open standards
+        </h2>
+        <ul role="list" className="standards-row standards-primary">
+          {tier(1).map((s) => (
+            <Standard key={s.name} s={s} />
+          ))}
+        </ul>
+        <ul role="list" className="standards-row standards-secondary">
+          {tier(2).map((s) => (
+            <Standard key={s.name} s={s} />
+          ))}
+          <li>
+            <Link
+              href="/docs/interoperability/"
+              aria-label="And more: everything agentd works with"
+              className="standard standards-more"
+            >
+              and more →
+            </Link>
+          </li>
+        </ul>
+      </div>
+    </section>
   );
 }
 
@@ -218,6 +277,9 @@ export default function Home() {
           <InstallTabs />
         </div>
       </section>
+
+      {/* ── the standards it speaks ──────────────────────────── */}
+      <Standards />
 
       {/* ── the shape of a run ───────────────────────────────── */}
       <Section

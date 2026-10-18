@@ -1,0 +1,135 @@
+[
+  {
+    "name": "MCP",
+    "version": "2026-07-28",
+    "full": "Model Context Protocol",
+    "href": "/docs/interoperability/#model-context-protocol-mcp",
+    "tier": 1
+  },
+  {
+    "name": "A2A",
+    "version": "1.0",
+    "full": "Agent2Agent protocol",
+    "href": "/docs/interoperability/#agent2agent-a2a",
+    "tier": 1
+  },
+  {
+    "name": "Personal Agent Protocol",
+    "version": "0.1",
+    "mark": "preview",
+    "full": "Personal Agent Protocol, draft 0.1: a build-from-source preview",
+    "href": "/docs/act-at-companies/",
+    "tier": 1
+  },
+  {
+    "name": "OAuth",
+    "version": "2.1",
+    "full": "OAuth 2.1 outbound credentials",
+    "href": "/docs/authentication/#oauth-20",
+    "tier": 1
+  },
+  {
+    "name": "OpenTelemetry",
+    "version": "OTLP",
+    "full": "OpenTelemetry traces and logs over OTLP/HTTP",
+    "href": "/docs/observability/#export-traces-and-logs-over-otlp",
+    "tier": 1
+  },
+  {
+    "name": "W3C Trace Context",
+    "full": "W3C Trace Context: a trace per unit of work",
+    "href": "/docs/observability/#correlate-with-other-services",
+    "tier": 1
+  },
+  {
+    "name": "Instruction Specification",
+    "version": "1",
+    "full": "Instruction Specification version 1",
+    "href": "/docs/instruction-documents/",
+    "tier": 1
+  },
+  {
+    "name": "MCP Events",
+    "version": "SEP-3415",
+    "mark": "draft",
+    "full": "MCP Events, a draft MCP extension",
+    "href": "/docs/react-to-events/#react-to-upstream-events-with-mcp-events",
+    "tier": 2
+  },
+  {
+    "name": "DPoP",
+    "version": "RFC 9449",
+    "mark": "preview",
+    "full": "DPoP-bound tokens at companies: a build-from-source preview",
+    "href": "/docs/interoperability/#personal-agent-protocol",
+    "tier": 2
+  },
+  {
+    "name": "AWS SigV4",
+    "full": "AWS Signature Version 4",
+    "href": "/docs/authentication/#aws-sigv4",
+    "tier": 2
+  },
+  {
+    "name": "SPIFFE",
+    "full": "SPIFFE workload identity",
+    "href": "/docs/authentication/#spiffe-workload-identity",
+    "tier": 2
+  },
+  {
+    "name": "mTLS",
+    "full": "Mutual TLS client certificates",
+    "href": "/docs/authentication/#mutual-tls-and-private-cas",
+    "tier": 2
+  },
+  {
+    "name": "AAuth",
+    "mark": "draft",
+    "full": "AAuth agent identity, a draft",
+    "href": "/docs/aauth/",
+    "tier": 2
+  },
+  {
+    "name": "HTTP Message Signatures",
+    "version": "RFC 9421",
+    "full": "RFC 9421 HTTP Message Signatures, on every request agentd signs with AAuth",
+    "href": "/docs/aauth/#on-the-wire",
+    "tier": 2
+  },
+  {
+    "name": "Prometheus",
+    "full": "Prometheus text exposition metrics",
+    "href": "/docs/observability/#scrape-prometheus-metrics",
+    "tier": 2
+  },
+  {
+    "name": "JSON Lines",
+    "full": "JSON Lines logs",
+    "href": "/docs/telemetry-reference/#log-line-format",
+    "tier": 2
+  },
+  {
+    "name": "OCI · cosign",
+    "full": "OCI distribution and cosign signatures",
+    "href": "/docs/instruction-documents/#verify-an-oci-artifact-with-cosign",
+    "tier": 2
+  },
+  {
+    "name": "age · JWE",
+    "full": "age v1 and JWE Compact encryption",
+    "href": "/docs/instruction-documents/#encrypt-the-document",
+    "tier": 2
+  },
+  {
+    "name": "Standard Webhooks",
+    "full": "Standard Webhooks signatures",
+    "href": "/docs/react-to-events/#deliver-by-webhook-instead-of-polling",
+    "tier": 2
+  },
+  {
+    "name": "CEL",
+    "full": "Common Expression Language",
+    "href": "/docs/workflow-language/#cel",
+    "tier": 2
+  }
+]

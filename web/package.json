@@ -5,6 +5,7 @@
     "dev": "next dev",
     "prebuild": "cp ../skills/agentd/SKILL.md public/SKILL.md && mkdir -p public/reference && cp ../skills/agentd/reference/*.md public/reference/",
     "build": "next build",
+    "postbuild": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tools/check-standards.mjs",
     "start": "next start"
   },
   "dependencies": {

@@ -2263,6 +2263,14 @@ fn cursor_expired_reads_again_from_the_start_and_says_part_is_missing() {
         .as_str()
         .unwrap()
         .to_string();
+    // The reader holds a place from before the gap only once it has handed
+    // on an event: one that first reads after it has nothing missing.
+    until("the reply on the stream", || {
+        got.lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.data.to_string().contains("You said: hello"))
+    });
     a.sup.read(&shop(&a), &cid, 0, None).unwrap();
     f.control(json!({"expire_events": true}));
     a.sup

@@ -1505,8 +1505,10 @@ fn a_retry_after_holds_every_request_until_it_passes() {
         }
     });
     let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]);
-    let started = Instant::now();
     let got = t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {});
+    // The wait runs from when the 429 arrived, which is before now: a slow
+    // first answer must not make the test's clock start ahead of it.
+    let answered = Instant::now();
     assert!(
         matches!(
             got,
@@ -1540,7 +1542,7 @@ fn a_retry_after_holds_every_request_until_it_passes() {
         1,
         "nothing was sent during the wait"
     );
-    while started.elapsed() < Duration::from_millis(1050) {
+    while answered.elapsed() < Duration::from_millis(1050) {
         std::thread::sleep(Duration::from_millis(20));
     }
     t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {})

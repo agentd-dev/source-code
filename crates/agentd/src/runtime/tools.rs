@@ -1275,6 +1275,19 @@ impl Runtime {
         }
     }
 
+    /// For a Company's operation tool, the `company.api` call `args` make of
+    /// it now — what a gate holding the call asks about, and what the call
+    /// must still make when it is approved ([`super::reactor::PolicyCall::judged`]).
+    pub(crate) fn judged_call(&self, name: &str, args: &Value) -> Option<Value> {
+        #[cfg(feature = "companies")]
+        return self.operation_view(name, args).and_then(Result::ok);
+        #[cfg(not(feature = "companies"))]
+        {
+            let _ = (name, args);
+            None
+        }
+    }
+
     /// An `action: ask` verdict: put it to a person. `None` means proceed —
     /// only when nobody can be asked and the rule's `on_timeout` is `allow`.
     ///
@@ -1355,6 +1368,7 @@ impl Runtime {
                     on_timeout: verdict.on_timeout,
                     company: None,
                     passed,
+                    judged: self.judged_call(name, args),
                 };
                 let question = format!(
                     "{question}\n\nAnswer `{}` to run this call or `{}` to refuse it.",
@@ -1459,6 +1473,16 @@ impl Runtime {
     /// Run the call an approved gate held, past that gate and those it had
     /// passed already, and hand the asker its outcome.
     fn run_approved(&mut self, target: &Target, call: &super::reactor::PolicyCall) {
+        if let Some(judged) = &call.judged
+            && self.judged_call(&call.tool, &call.args).as_ref() != Some(judged)
+        {
+            let msg = format!(
+                "{}: the Company changed this operation while the call waited for approval, so it would no longer send the request approved — it was NOT executed; call it again to be asked about the request it sends now",
+                call.tool
+            );
+            self.reply(target, Value::String(msg), true);
+            return;
+        }
         let passed = call.passed.and(call);
         match target {
             Target::Child(node, req) => {

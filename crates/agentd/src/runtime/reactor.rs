@@ -137,6 +137,11 @@ pub struct PolicyCall {
     /// The gates the call passed before this one asked: an approval runs it
     /// past them and this one, and every other check again.
     pub passed: Passed,
+    /// For a Company's operation tool, the `company.api` call the gate asked
+    /// about: the approved call is sent only while its arguments still make
+    /// that call, so a description changed during the wait cannot send
+    /// another request than the one approved.
+    pub judged: Option<Value>,
 }
 
 /// What a Company gate asks about.

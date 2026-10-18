@@ -1217,6 +1217,7 @@ fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
             policy: flag("policy"),
             company: flag("company"),
         },
+        judged: v.get("judged").cloned(),
     })
 }
 
@@ -1239,6 +1240,9 @@ pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
     }
     if call.passed != super::reactor::Passed::default() {
         v["passed"] = json!({"policy": call.passed.policy, "company": call.passed.company});
+    }
+    if let Some(judged) = &call.judged {
+        v["judged"] = judged.clone();
     }
     v
 }
@@ -1518,6 +1522,7 @@ impl Runtime {
                     on_timeout: crate::config::settings::PolicyAction::Deny,
                     company: Some(ask),
                     passed,
+                    judged: self.judged_call(tool, args),
                 };
                 let to = self.company_user();
                 return self.human_gate(
@@ -1635,5 +1640,35 @@ mod decision_tests {
         assert_eq!(judged_answer(r#"{"answer": "deny"}"#), "deny");
         assert_eq!(judged_answer("approve"), "approve");
         assert_eq!(judged_answer("true"), "true");
+    }
+
+    /// A held call reads back from its durable wait record as it was held —
+    /// the `company.api` call a gate asked about with it, so a restart
+    /// during the wait still sends only the request approved.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_held_call_reads_back_with_the_call_it_was_asked_about() {
+        let call = super::super::reactor::PolicyCall {
+            tool: "shop.get_orders_order_id".into(),
+            args: json!({"order_id": "ord_1"}),
+            rule: 2,
+            on_timeout: crate::config::settings::PolicyAction::Deny,
+            company: None,
+            passed: super::super::reactor::Passed::default(),
+            judged: Some(json!({"company": "shop", "method": "GET", "path": "/orders/ord_1"})),
+        };
+        let back = policy_call_of(&policy_call_json(&call)).unwrap();
+        assert_eq!(back.judged, call.judged);
+        assert_eq!(
+            (&back.tool, &back.args, back.rule),
+            (&call.tool, &call.args, 2)
+        );
+        let none = super::super::reactor::PolicyCall {
+            judged: None,
+            ..back
+        };
+        let v = policy_call_json(&none);
+        assert!(v.get("judged").is_none(), "{v}");
+        assert_eq!(policy_call_of(&v).unwrap().judged, None);
     }
 }

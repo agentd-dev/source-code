@@ -678,6 +678,77 @@ fn a_policy_on_company_api_holds_the_operation_tools() {
     );
 }
 
+/// A Company that stops listing the OpenAPI API its operation tools came
+/// from has them withdrawn — not left offered to refuse every call — once a
+/// refetch of its documents sees it, and offered again when it lists the API
+/// once more, with no restart.
+#[test]
+fn operation_tools_leave_with_their_api_and_come_back_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    const FLOW: &str = "workflows:\n  - name: a\n    steps:\n      s: {kind: loop, interval: 300ms, max_iterations: 400}\n      a: {kind: tool, name: shop.get_session, args: {}, depends_on: [s]}\n      f: {kind: finish, depends_on: [a], status: completed}\n";
+    let s = setup_with(
+        &h,
+        "",
+        "",
+        &shop_entry(
+            &f.origin,
+            ", interfaces: [openapi], api_allow: [\"GET /session\"]",
+        ),
+        FLOW,
+    );
+    let d = start(
+        &s,
+        "withdrawn",
+        &[("AGENTD_TEST_COMPANY_MAX_AGE_MS", "500")],
+    );
+    let reached = |l: &str| {
+        events(l, "step.done")
+            .iter()
+            .any(|e| e["step"] == "a" && e["status"] == "done")
+    };
+    wait_for(&d.log, "a call of the operation tool", reached);
+    f.control(json!({"no_openapi": true}));
+    let l = wait_for(&d.log, "the tools withdrawn", |l| {
+        events(l, "company.api.changed")
+            .iter()
+            .any(|e| e["removed"] == json!(["get_session"]))
+    });
+    let gone = l.rfind("\"event\":\"company.api.changed\"").unwrap();
+    let before = f
+        .record()
+        .iter()
+        .filter(|r| r["path"] == "/api/session")
+        .count();
+    wait_for(&d.log, "a call refused while they are gone", |l| {
+        events(&l[gone..], "step.done")
+            .iter()
+            .any(|e| e["step"] == "a" && e["status"] == "failed")
+    });
+    assert_eq!(
+        f.record()
+            .iter()
+            .filter(|r| r["path"] == "/api/session")
+            .count(),
+        before,
+        "nothing sent while the API is not listed"
+    );
+    f.control(json!({"no_openapi": false}));
+    let l = wait_for(&d.log, "the tools back", |l| {
+        events(&l[gone..], "company.api.changed")
+            .iter()
+            .any(|e| e["added"] == json!(["get_session"]))
+    });
+    let back = gone
+        + l[gone..]
+            .rfind("\"event\":\"company.api.changed\"")
+            .unwrap();
+    wait_for(&d.log, "a call after they came back", |l| {
+        reached(&l[back..])
+    });
+}
+
 /// A reload that builds the tool registry again keeps the operation tools
 /// the Company's description gave — they are not read again — so a step
 /// calling one goes on reaching the Company.

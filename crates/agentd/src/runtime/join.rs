@@ -63,6 +63,9 @@ pub(crate) struct Operations {
     pub tools: Vec<::mcp::wire::Tool>,
     #[cfg(feature = "companies")]
     pub shapes: BTreeMap<String, crate::companies::api::Shape>,
+    /// The Company verified and lists no API the server stands for: none
+    /// are offered, and it is listed again on the backoff until it does.
+    pub withheld: bool,
 }
 
 impl Joining {
@@ -95,6 +98,21 @@ impl Joining {
         }
         for (server, o) in &self.offered {
             if o.url == url && !self.again.contains(server) {
+                self.stale.insert(server.clone());
+            }
+        }
+    }
+
+    /// The APIs a Company lists changed: the operation tools of each of
+    /// `servers` are listed again — after the listing out now, for one being
+    /// listed — so they follow an API that moved, and are withdrawn from one
+    /// no longer listed.
+    #[cfg(feature = "companies")]
+    pub(crate) fn apis_changed(&mut self, servers: &[String]) {
+        for server in servers {
+            if self.probes.get(server).is_some_and(|p| p.out) {
+                self.again.insert(server.clone());
+            } else if self.offered.contains_key(server) {
                 self.stale.insert(server.clone());
             }
         }
@@ -200,6 +218,7 @@ impl Runtime {
                                         url: o.url,
                                         tools: o.tools,
                                         shapes: o.shapes,
+                                        withheld: o.withheld.is_some(),
                                     })
                                 }),
                             None,
@@ -272,6 +291,20 @@ impl Runtime {
         }
         let adopted = match found {
             Some(Found::Mcp(client, tools)) => self.join_adopt(&server, *client, tools),
+            // The Company lists no API the server stands for: tools it
+            // offered are withdrawn, and it is listed again on the backoff —
+            // a listing reads discovery again once its copy expires — until
+            // the Company lists one.
+            Some(Found::Operations(o)) if o.withheld => {
+                probe.failures += 1;
+                probe.due_at = now + backoff(probe.failures);
+                if !self.joining.offers(&server) {
+                    return;
+                }
+                let withdrawn = self.adopt_operations(&server, o);
+                self.joining.stale.insert(server.clone());
+                withdrawn
+            }
             Some(Found::Operations(o)) => self.adopt_operations(&server, o),
             None => {
                 probe.failures += 1;

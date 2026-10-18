@@ -103,7 +103,9 @@
 //! conversation requests `401 invalid_token`, whatever they carry;
 //! `"extension_required": "<name>"` has the MCP servers refuse every request
 //! from then on with `403 extension_required`; `"extra_mcp": true` lists a
-//! second MCP API, at `/mcp/orders`, from then on; `"end_sessions": true`
+//! second MCP API, at `/mcp/orders`, from then on; `"no_openapi": true`
+//! lists no OpenAPI API from then on, and `false` lists it again;
+//! `"end_sessions": true`
 //! ends every Session, so its next renewal is `invalid_session`;
 //! `"stall": {"method": m, "times": n, "ms": t}` holds the next `n` MCP
 //! requests of method `m` `t` ms before answering them (a Personal Agent
@@ -985,6 +987,8 @@ struct Company {
     state: Mutex<State>,
     /// A second MCP API listed from now on (`"extra_mcp"` in the control).
     extra_mcp: AtomicBool,
+    /// No OpenAPI API listed from now on (`"no_openapi"` in the control).
+    no_openapi: AtomicBool,
     /// When the fake started, which every record's `at_ms` counts from.
     started: Instant,
 }
@@ -1036,6 +1040,7 @@ impl Company {
                 openapi: OpenapiControl::default(),
             }),
             extra_mcp: AtomicBool::new(false),
+            no_openapi: AtomicBool::new(false),
             started: Instant::now(),
         }
     }
@@ -1267,7 +1272,9 @@ impl Company {
             .into_iter()
             .map(|url| json!({"type": wire::API_MCP, "url": url, "description": "Product search and order status"}))
             .collect();
-        apis.push(json!({"type": wire::API_OPENAPI, "url": self.api_url(), "description": "Orders, exchanges, notes, and the Session a token belongs to"}));
+        if !self.no_openapi.load(Ordering::SeqCst) {
+            apis.push(json!({"type": wire::API_OPENAPI, "url": self.api_url(), "description": "Orders, exchanges, notes, and the Session a token belongs to"}));
+        }
         let doc = json!({
             "protocol_version": wire::PROTOCOL_VERSION,
             "organization": {"name": "Fake Company", "domain": DOMAIN},
@@ -3855,6 +3862,9 @@ impl Company {
         }
         if body["extra_mcp"] == true {
             self.extra_mcp.store(true, Ordering::SeqCst);
+        }
+        if let Some(none) = body["no_openapi"].as_bool() {
+            self.no_openapi.store(none, Ordering::SeqCst);
         }
         if body["end_sessions"] == true {
             st.sessions.clear();

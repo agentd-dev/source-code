@@ -560,6 +560,10 @@ pub struct Offered {
     pub tools: Vec<::mcp::wire::Tool>,
     /// Each tool's [`Shape`], by its name within its server.
     pub shapes: BTreeMap<String, Shape>,
+    /// Why none are offered, when the Company verified and lists no API the
+    /// server stands for: its tools are withdrawn rather than left to
+    /// refuse every call, and offered again once it lists one.
+    pub withheld: Option<String>,
 }
 
 /// The operation an operation tool stands for, as the listing that made the
@@ -934,11 +938,15 @@ impl Supervisor {
     pub fn operation_tools(&self, server: &str) -> Result<Offered, String> {
         let offered = self.list_operations(server);
         let mut failed = self.api_failed.lock().unwrap_or_else(|e| e.into_inner());
-        match &offered {
-            Ok(_) => {
+        let why = match &offered {
+            Ok(o) => o.withheld.as_ref(),
+            Err(e) => Some(e),
+        };
+        match why {
+            None => {
                 failed.remove(server);
             }
-            Err(e) if failed.get(server) != Some(e) => {
+            Some(e) if failed.get(server) != Some(e) => {
                 self.log().warn(
                     "company.api.unavailable",
                     json!({"company": self.company_of_server(server).map(|c| c.name.clone()),
@@ -946,7 +954,7 @@ impl Supervisor {
                 );
                 failed.insert(server.to_string(), e.clone());
             }
-            Err(_) => {}
+            Some(_) => {}
         }
         offered
     }
@@ -955,9 +963,18 @@ impl Supervisor {
         let company = self
             .company_of_server(server)
             .ok_or_else(|| format!("{server} is no Company's server"))?;
-        let listed = self
-            .api_of_server(&company, server)
-            .map_err(|e| e.to_string())?;
+        let listed = match self.api_of_server(&company, server) {
+            Ok(listed) => listed,
+            Err(e) if self.verified(&company).is_ok() => {
+                return Ok(Offered {
+                    url: String::new(),
+                    tools: Vec::new(),
+                    shapes: BTreeMap::new(),
+                    withheld: Some(e.to_string()),
+                });
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         let desc = self
             .description(&company, &listed)
             .map_err(|e| e.to_string())?;
@@ -1016,6 +1033,7 @@ impl Supervisor {
             url: listed.url,
             tools,
             shapes,
+            withheld: None,
         })
     }
 

@@ -1130,6 +1130,23 @@ impl Runtime {
             crate::companies::Notice::DescriptionChanged(url) => {
                 self.joining.description_changed(&url)
             }
+            crate::companies::Notice::ApisChanged(entry) => {
+                let servers: Vec<String> = self
+                    .settings
+                    .mcp
+                    .servers
+                    .iter()
+                    .filter(|s| {
+                        s.company.as_ref().is_some_and(|c| c.entry == entry)
+                            && crate::config::settings::companies::is_api_server(
+                                &self.settings,
+                                &s.name,
+                            )
+                    })
+                    .map(|s| s.name.clone())
+                    .collect();
+                self.joining.apis_changed(&servers)
+            }
         }
     }
 

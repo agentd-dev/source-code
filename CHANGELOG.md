@@ -681,7 +681,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   matching either deciding, and `tools.disabled`, `tools.narrow` and
   `agent.tools` for `company.api` apply to them. A fetch that finds the
   description changed lists the tools again, and those that changed replace
-  the old ones in the registry (`company.api.changed`). A key of the entry's
+  the old ones in the registry (`company.api.changed`); so does a refetch
+  that finds the OpenAPI APIs the company lists changed, withdrawing the
+  tools of an API it no longer lists until it lists it again. A call a policy
+  held for approval is sent only while its arguments still make the request
+  the gate asked about. An entry that uses `mcp` and `openapi` names its
+  operation tools under `<entry>_api` unless `api_names` names them. A key of the entry's
   `tags` other than `*` that names operation tools sets their tags, with
   `*`'s; one no such key names carries every tag the entry lists, as
   `company.api` does. The tools reach turn workers and subagents as a

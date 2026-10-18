@@ -500,7 +500,15 @@ that names an operation tool the entry does not make.
   read, every boot included, and for a company down at boot once it comes
   up (`company.api.joined`). A later fetch that finds the description
   changed lists them again, and the tools that changed replace the old ones
-  (`company.api.changed`). An allowed operation the description does not
+  (`company.api.changed`). So does a refetch of the company's documents that
+  finds the OpenAPI APIs it lists changed: tools follow an API that moved,
+  and an API the company no longer lists has its tools withdrawn — logged
+  `company.api.changed` with all of them `removed`, and
+  `company.api.unavailable` saying why — until it lists the API again. A call
+  a `security.policies` rule held for approval is sent only while its
+  arguments still make the request the gate asked about: one the description
+  changed during the wait is refused unsent, to be called again. An allowed
+  operation the description does not
   declare has no tool, nor has one whose schemas do not resolve within
   agentd's bounds or make an input schema over 16 KiB; each is logged once
   (`company.api.not_offered`).
@@ -516,10 +524,10 @@ that names an operation tool the entry does not make.
   calls come back to the supervisor.
 
 An entry that also uses `mcp` has an MCP server named after the entry, so
-name one of the two apart, as the example above does: `api_names` names the
-server of each OpenAPI API by the URL the company lists it at, as
-`mcp_names` does for its MCP APIs. A company that lists several OpenAPI APIs
-needs it too. With the example's `api_names`, reading an order is the tool
+its operation tools are named under `<entry>_api` — `shop_api.get_orders_order_id`
+— unless `api_names` names the server of each OpenAPI API by the URL the
+company lists it at, as `mcp_names` does for its MCP APIs and as the example
+above does. A company that lists several OpenAPI APIs needs it. With the example's `api_names`, reading an order is the tool
 `orders.get_orders_order_id`, beside the MCP tools `shop.*`.
 
 ### Calls that may have run
@@ -707,7 +715,7 @@ gap.
 | `company.sign_in.failed` | `cancelled`, `denied`, `expired`, `account_mismatch`, `interrupted` or `failed` | start the sign-in again; after `account_mismatch`, the User signed in to another account than before: ask with `new_account: true` to switch, which suspends the company's standing permissions until a restart |
 | `company.account_token.dropped` | the company refused the Account Token: a disconnect, a revocation, an expiry | sign in again |
 | `company.issuer_changed` or `company.apis_changed` | the company changed its documents | restart to use them |
-| `` the server its operation tools are named under "shop" has the name of another of its own servers `` at load | the entry uses `mcp` and `openapi`, and both its servers would be named after it | name one apart with `api_names` (or `mcp_names`) |
+| `` the server its operation tools are named under "shop" has the name of another of its own servers `` at load | `api_names` or `mcp_names` gives two of the entry's servers one name | name them apart |
 | `company.api.not_offered` (warn) | an operation `api_allow` lists has no tool: the description does not declare it, or its schemas cannot be offered | check the operation at the company; a `company.api` call of it is held to the same description |
 | `company.api.unavailable` (warn) | the operation tools could not be made: the company or its description could not be read, or it lists several OpenAPI APIs and `api_names` does not name them | nothing, if the company is down: agentd tries again with backoff; otherwise name the APIs with `api_names` |
 | the trifecta check refuses startup | a company and a `sensitive` server in one instance | split them over [two instances](#what-stays-with-the-supervisor) |

@@ -273,6 +273,11 @@ mod supervisor {
         /// A fetch of the OpenAPI description at this URL found it changed: the
         /// operation tools made from it are listed again.
         DescriptionChanged(String),
+        /// A discovery refetch found the OpenAPI APIs the company entry's
+        /// Company lists changed: the operation tools of each are listed
+        /// again, so they follow an API that moved and are withdrawn from one
+        /// no longer listed.
+        ApisChanged(String),
     }
 
     /// Where notices go: the runtime's loop.
@@ -863,6 +868,16 @@ mod supervisor {
                     "company.apis_changed",
                     json!({"company": company, "added": added, "removed": removed}),
                 ),
+                Note::OpenapiChanged => {
+                    let sink = self
+                        .notify
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(sink) = sink {
+                        sink(Notice::ApisChanged(company.to_string()));
+                    }
+                }
             }
         }
 

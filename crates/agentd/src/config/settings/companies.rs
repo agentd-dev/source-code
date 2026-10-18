@@ -543,8 +543,9 @@ pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<Str
 
 /// The servers a company entry's operation tools are named under, by name,
 /// with the OpenAPI API `url` each one is when `api_names` names them: one
-/// named after the entry, or one per `api_names` value — none unless the
-/// entry uses `openapi` and `api_allow` lists an operation.
+/// named after the entry — `<entry>_api` when the entry's own MCP server has
+/// that name — or one per `api_names` value; none unless the entry uses
+/// `openapi` and `api_allow` lists an operation.
 pub fn api_server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<String>)> {
     if !interfaces_of(svc).contains(&Interface::Openapi)
         || svc.api_allow.as_ref().is_none_or(Vec::is_empty)
@@ -552,7 +553,15 @@ pub fn api_server_names(name: &str, svc: &super::Service) -> Vec<(String, Option
         return Vec::new();
     }
     if svc.api_names.is_empty() {
-        return vec![(name.to_string(), None)];
+        let taken = server_names(name, svc).iter().any(|(n, _)| n == name);
+        return vec![(
+            if taken {
+                format!("{name}_api")
+            } else {
+                name.to_string()
+            },
+            None,
+        )];
     }
     svc.api_names
         .iter()
@@ -2299,7 +2308,15 @@ mod tests {
             api_tool_names(&s, "shop"),
             ["shop.get_orders_order_id", "shop.post_notes"]
         );
-        // With an MCP server of its own, one of them is named apart.
+        // With an MCP server of its own named after the entry, its operation
+        // tools are named under `<entry>_api`, unless api_names names it.
+        let both = ", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"]";
+        let s = load(&company(both)).unwrap();
+        assert!(!is_api_server(&s, "shop") && is_api_server(&s, "shop_api"));
+        assert_eq!(api_tool_names(&s, "shop_api"), ["shop_api.post_notes"]);
+        let both = ", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"], api_names: {\"https://example.com/openapi.json\": orders}";
+        let s = load(&company(both)).unwrap();
+        assert!(is_api_server(&s, "orders") && !is_api_server(&s, "shop_api"));
         let both = ", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"], api_names: {\"https://example.com/openapi.json\": shop_api}";
         let s = load(&company(both)).unwrap();
         assert!(!is_api_server(&s, "shop") && is_api_server(&s, "shop_api"));
@@ -2406,7 +2423,9 @@ mod tests {
             ))
         };
         refused(
-            &company(", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"]"),
+            &company(
+                ", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"], api_names: {\"https://example.com/openapi.json\": shop}",
+            ),
             "services.shop: the server its operation tools are named under \"shop\" has the name of another of its own servers — name them apart with api_names or mcp_names",
         );
         refused(

@@ -617,7 +617,7 @@ All `services` paths are live · op.
 | `services.<name>.sign_in` | list of `device \| direct` | `[]` | `kind: company` only: the sign-in types agentd may start with the User, the first the Company offers taken. `direct` needs `security.companies.client.serve`. `mediated` is refused: the User's password would pass through a gate, whose answer agentd keeps in the task's history and hands to the model. Needs `security.companies.seal_key` and `scopes`. |
 | `services.<name>.scopes` | list of scopes | `[]` | `kind: company` only: the most account scopes agentd asks the User for there. A sign-in asks for what is needed within these and what its type grants; a held Account Token is used for no more, and one that grants none of these — or any, once the entry lists no `sign_in` — is not used: requests there are signed out, and the token is kept until the User signs out. |
 | `services.<name>.api_allow` | list of `METHOD /path-template` | none | `kind: company` only: the OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, named from its entry ([operation tools](#a-companys-operation-tools)). An operation listed twice, or two entries that make one tool name, are refused. Needs `openapi` in `interfaces`. |
-| `services.<name>.api_names` | map of an OpenAPI API `url` to a server name | — | `kind: company` only: names the server a Company's operation tools are named under, by the URL its OpenAPI API is listed at. Without it the server is named after the entry, which needs the Company to list one OpenAPI API and the entry's name to be free — an entry that also uses `mcp` names one of its servers apart with it or `mcp_names`. Needs `openapi` in `interfaces` and an operation in `api_allow`. |
+| `services.<name>.api_names` | map of an OpenAPI API `url` to a server name | — | `kind: company` only: names the server a Company's operation tools are named under, by the URL its OpenAPI API is listed at. Without it the server is named after the entry, or `<entry>_api` when the entry's own MCP server has that name, which needs the Company to list one OpenAPI API. Needs `openapi` in `interfaces` and an operation in `api_allow`. |
 | `services.<name>.context` | `{locale, time_zone, share_availability}` | inherits | `kind: company` only: what this Company's conversations share of the User's situation, each field over `security.companies.context`. Needs `agent` in `interfaces`. |
 
 With `security.egress: closed`, every MCP dial, intelligence endpoint
@@ -813,8 +813,8 @@ tools are offered once its server joins.
 - **Its name** is the operator's: its `api_allow` entry in lower case, each
   run of characters other than `a-z` and `0-9` one `_`, none at either end, at
   most 64 characters — `GET /orders/{order_id}` is `get_orders_order_id` —
-  under the server named after the entry, or the one `api_names` gives the
-  API: `shop.get_orders_order_id`. The `operationId`, summary and
+  under the server named after the entry (`<entry>_api` when the entry's MCP
+  server has its name), or the one `api_names` gives the API: `shop.get_orders_order_id`. The `operationId`, summary and
   description go into the tool's description, never its name. So the names
   are known at load, and load refuses a tag key, a `security.policies` rule's
   `match.tool` or a workflow's `tool` step that names an operation tool the

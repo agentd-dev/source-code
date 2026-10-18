@@ -651,6 +651,10 @@ pub enum Note {
         added: Vec<String>,
         removed: Vec<String>,
     },
+    /// The OpenAPI APIs it lists are not the ones it listed: read afresh at
+    /// every verification, unlike its MCP APIs, so the operation tools made
+    /// from them are listed again.
+    OpenapiChanged,
 }
 
 impl Discovery {
@@ -753,6 +757,10 @@ impl Discovery {
                             .cloned()
                             .collect(),
                     });
+                }
+                let urls = |l: &[Listed]| l.iter().map(|a| a.url.clone()).collect::<Vec<_>>();
+                if urls(&v.openapi) != urls(&old.openapi) {
+                    notes.push(Note::OpenapiChanged);
                 }
                 v.mcp = old.mcp.clone();
                 v.mcp_urls = old.mcp_urls.clone();

@@ -5,18 +5,36 @@
 //! Static headers (`mcp::auth`) and the AAuth request-signer (`aauth`) supply
 //! the `static` and `aauth` providers. This module owns the rest: the
 //! [`Kind::Cred`](crate::state::Kind::Cred)-backed [`cache`], the OAuth 2.1 /
-//! OIDC [`oauth2`] flows (device grant, browser + PKCE, refresh, discovery)
-//! behind `agentd --login`, the AWS SigV4 / IAM Identity Center providers, and
-//! the [`report`] of credentials that cannot be produced. Everything but the
-//! cache and that report is gated on the `oauth` cargo feature, so a build
-//! without it carries no interactive-login code at all.
+//! OIDC [`oauth2`] flows (device grant, browser + PKCE, refresh, discovery,
+//! revocation) behind `agentd --login` and `--logout`, over the one
+//! [`http`] helper; the `private_key_jwt` [`client_assertion`] signer, its
+//! [`jwk`], and the [`seal`] for secrets at rest; the AWS SigV4 / IAM Identity
+//! Center providers; and the [`report`] of credentials that cannot be
+//! produced. Everything but the cache and that report is gated on the
+//! `oauth` cargo feature, so a build without it carries no interactive-login
+//! code at all.
 
 pub mod cache;
 
 pub mod report;
 
 #[cfg(feature = "oauth")]
+pub mod http;
+
+#[cfg(feature = "oauth")]
 pub mod oauth2;
+
+#[cfg(feature = "oauth")]
+pub mod revoke;
+
+#[cfg(feature = "oauth")]
+pub mod client_assertion;
+
+#[cfg(feature = "oauth")]
+pub mod jwk;
+
+#[cfg(feature = "oauth")]
+pub mod seal;
 
 #[cfg(feature = "oauth")]
 pub mod challenge;

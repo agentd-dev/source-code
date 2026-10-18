@@ -452,6 +452,10 @@ pub struct AuthSpec {
     /// A `{{secret:…}}` template for a confidential client (never inline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+    /// oauth2: how the client authenticates at the token and revocation
+    /// endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<ClientAuthSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -488,6 +492,21 @@ pub struct AuthSpec {
     pub svid_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<String>,
+}
+
+/// The runtime shape of an `oauth2` block's `client_auth`. `key` stays a
+/// `{{secret:…}}` template, resolved at each token request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ClientAuthSpec {
+    /// `private_key_jwt`, `client_secret_basic` or `client_secret_post`.
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+    /// `issuer`, or unset for the token endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion_aud: Option<String>,
 }
 
 /// AAuth agent-identity settings, which the root's `aauth::setup` reads. The

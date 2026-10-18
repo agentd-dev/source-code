@@ -510,11 +510,11 @@ named by `auth.kind`.
 | Mechanism | Required fields | Optional fields |
 |---|---|---|
 | `static` | `token` (a bearer), or `header` + `value` | — |
-| `oauth2` | `client_id`; `token_url` or `issuer`; for `grant: device`, `device_authorization_url` or `issuer`; for `grant: client_credentials`, `client_secret` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `authorization_url` |
+| `oauth2` | `client_id`; `token_url` or `issuer`; for `grant: device`, `device_authorization_url` or `issuer`; for `grant: client_credentials`, `client_secret` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; not with `client_credentials`) |
 | `aws` | `region`, `service` (for example `bedrock`); for `source: sso`, `sso_start_url`, `account_id`, `role_name` | `source` (`env` default, `static`, `imds`, `irsa`, `sso`) |
 | `spiffe` | for `svid: jwt` (the default), `jwt_svid_file`; for `svid: x509`, `svid_file` + `key_file` | `audience` |
 
-`token`, `value` and `client_secret` must be references in a file. Interactive
+`token`, `value`, `client_secret` and `client_auth.key` must be references in a file. Interactive
 grants are completed with `agentd --login <target>`, where the target is
 `intelligence`, `intelligence:<provider>`, `mcp:<name>` or `service:<name>`.
 `kind: oauth2`, and any `auth` block on an MCP server, need the `oauth`
@@ -1230,7 +1230,7 @@ inline.
 | `mcp.servers[].oauth.client_secret` | `config file: mcp server '<name>' oauth.client_secret carries an inline credential; …` |
 | `a2a.principals[].match.bearer_ref` | `config file: a2a.principals[0].match.bearer_ref carries an inline credential; …` |
 | a webhook verifier's `bearer`, `header.equals` and `hmac.secret`: `webhooks.default_auth`, and the `auth` of every `webhook` start and webhook wait | `config file: workflows[0].steps.hook.auth.hmac.secret carries an inline credential; …` |
-| every `auth.token`, `auth.client_secret`, `auth.value` | `<where>: auth.token carries an inline credential; use a {{secret:…}} reference` |
+| every `auth.token`, `auth.client_secret`, `auth.value`, `auth.client_auth.key` | `<where>: auth.token carries an inline credential; use a {{secret:…}} reference` |
 | a credential-shaped header (`Authorization` and similar) in `intelligence.headers`, a provider's, an MCP server's, a peer's or `store.http.headers` | `intelligence.headers['authorization'] looks like a credential but has an inline value; …` |
 
 Credential values never reach the logs; `--effective-config` shows them as

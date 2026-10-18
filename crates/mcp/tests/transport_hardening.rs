@@ -1345,3 +1345,182 @@ fn a_list_stream_that_ends_unanswered_answers_with_the_reason() {
         "{frames:?}"
     );
 }
+
+// ------------------------------- a refusal that says why, and a server's wait
+
+/// A signer that presents a fixed bearer and records every response it is
+/// shown; it asks for a retry on the first `403`, as one renewing its
+/// credential would, when `renews` is set.
+struct Watching {
+    seen: Mutex<Vec<(u16, Option<String>)>>,
+    renews: bool,
+}
+impl RequestSigner for Watching {
+    fn sign(&self, _: &str, _: &str, _: &str, _: &[u8]) -> Result<Vec<(String, String)>, String> {
+        Ok(vec![("Authorization".into(), "Bearer t".into())])
+    }
+    fn on_response(&self, resp: &mcp::http::AuthResponse, _: &str) -> bool {
+        let mut seen = self.seen.lock().unwrap();
+        seen.push((resp.status, resp.www_authenticate.clone()));
+        self.renews && resp.status == 403 && seen.len() == 1
+    }
+}
+
+fn watched(ep: &str, renews: bool) -> (HttpTransport, Arc<Watching>) {
+    let w = Arc::new(Watching {
+        seen: Mutex::new(Vec::new()),
+        renews,
+    });
+    let signer: Arc<dyn RequestSigner> = w.clone();
+    let t = HttpTransport::new(McpEndpoint::parse(ep).unwrap(), vec![]).with_signer(Some(signer));
+    (t, w)
+}
+
+const LIST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+/// A `403` with an RFC 6750 challenge reaches the signer, which may renew
+/// and retry; one it cannot do anything about is a typed error naming the
+/// code and the scopes, not a bare status.
+#[test]
+fn a_403_challenge_reaches_the_signer_and_is_a_typed_error() {
+    for (code, header) in [
+        (
+            "insufficient_scope",
+            r#"WWW-Authenticate: Bearer error="insufficient_scope", scope="files:write""#,
+        ),
+        (
+            "sign_in_required",
+            "WWW-Authenticate: Bearer error=sign_in_required",
+        ),
+    ] {
+        let ep = spawn_scripted(move |_| raw("403 Forbidden", &[header], ""));
+        let (t, w) = watched(&ep, false);
+        let got = t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {});
+        let Err(mcp::http::HttpError::Refused(c)) = got else {
+            panic!("{code}: a refusal that says why is typed: {got:?}");
+        };
+        assert_eq!((c.status, c.error.as_deref()), (403, Some(code)));
+        let shown = w.seen.lock().unwrap().clone();
+        assert_eq!(shown.len(), 1, "the signer is shown the 403");
+        assert!(
+            shown[0].1.as_deref().is_some_and(|h| h.contains(code)),
+            "{shown:?}"
+        );
+        if code == "insufficient_scope" {
+            assert_eq!(c.scope.as_deref(), Some("files:write"));
+            let e = mcp::http::HttpError::Refused(c).to_string();
+            assert!(e.contains("HTTP 403") && e.contains("files:write"), "{e}");
+        }
+    }
+
+    // A signer that renews on the 403 gets its retry, and the retry's answer.
+    let calls = Arc::new(Mutex::new(0usize));
+    let n = Arc::clone(&calls);
+    let ep = spawn_scripted(move |msg| {
+        let mut n = n.lock().unwrap();
+        *n += 1;
+        if *n == 1 {
+            raw(
+                "403 Forbidden",
+                &["WWW-Authenticate: Bearer error=sign_in_required"],
+                "",
+            )
+        } else {
+            json_body(
+                "200 OK",
+                &json!({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": []}}),
+            )
+        }
+    });
+    let (t, _) = watched(&ep, true);
+    let got = t
+        .send(Some(1), LIST, Duration::from_secs(5), &[], |_| {})
+        .expect("the renewed retry is answered")
+        .expect("an answer");
+    assert_eq!(got["result"]["tools"], json!([]), "{got}");
+    assert_eq!(*calls.lock().unwrap(), 2);
+}
+
+/// A handshake whose probe draws a `429` with `Retry-After` sends no
+/// fallback `initialize` during the wait: the connect fails, having sent the
+/// server one request.
+#[test]
+fn a_connect_told_to_wait_sends_nothing_more() {
+    let calls = Arc::new(Mutex::new(0usize));
+    let n = Arc::clone(&calls);
+    let ep = spawn_scripted(move |_| {
+        *n.lock().unwrap() += 1;
+        raw("429 Too Many Requests", &["Retry-After: 30"], "")
+    });
+    let e = RmcpBuilder::new("x", &ep, vec![], Duration::from_secs(5))
+        .connect()
+        .err()
+        .expect("a server that asked for a wait is not handshaken")
+        .to_string();
+    assert!(e.contains("429"), "{e}");
+    assert_eq!(*calls.lock().unwrap(), 1, "{e}");
+}
+
+/// A `429` with `Retry-After` is said as the wait it asked for, and nothing
+/// more is sent to that server — a POST, the notification stream, a re-dial
+/// — until the wait has passed.
+#[test]
+fn a_retry_after_holds_every_request_until_it_passes() {
+    let calls = Arc::new(Mutex::new(0usize));
+    let n = Arc::clone(&calls);
+    let ep = spawn_scripted(move |msg| {
+        let mut n = n.lock().unwrap();
+        *n += 1;
+        if *n == 1 {
+            raw("429 Too Many Requests", &["Retry-After: 1"], "")
+        } else {
+            json_body(
+                "200 OK",
+                &json!({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": []}}),
+            )
+        }
+    });
+    let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]);
+    let started = Instant::now();
+    let got = t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {});
+    assert!(
+        matches!(
+            got,
+            Err(mcp::http::HttpError::RetryAfter {
+                status: 429,
+                sent: true,
+                wait
+            }) if wait == Duration::from_secs(1)
+        ),
+        "{got:?}"
+    );
+    let again = t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {});
+    let Err(e @ mcp::http::HttpError::RetryAfter { sent: false, .. }) = again else {
+        panic!("a request during the wait is not sent: {again:?}");
+    };
+    assert!(e.to_string().contains("not sent"), "{e}");
+    assert!(matches!(
+        t.open_events(Duration::from_secs(1), &[]),
+        Err(mcp::http::HttpError::RetryAfter { sent: false, .. })
+    ));
+    assert!(
+        matches!(
+            t.redial_copy()
+                .send(Some(1), LIST, Duration::from_secs(5), &[], |_| {}),
+            Err(mcp::http::HttpError::RetryAfter { sent: false, .. })
+        ),
+        "a re-dial keeps the server's wait"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "nothing was sent during the wait"
+    );
+    while started.elapsed() < Duration::from_millis(1050) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {})
+        .expect("after the wait the request goes")
+        .expect("an answer");
+    assert_eq!(*calls.lock().unwrap(), 2);
+}

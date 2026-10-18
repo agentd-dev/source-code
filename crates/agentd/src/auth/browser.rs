@@ -8,14 +8,18 @@
 //! environment, which this binary never does. It runs a one-shot loopback
 //! callback server to capture the redirect, verifies the `state` (a mismatch
 //! means the callback did not come from the request we started, so the code is
-//! discarded), and exchanges the code plus the PKCE `code_verifier` for tokens.
-//! Randomness comes from `/dev/urandom`.
+//! discarded) and the RFC 9207 `iss` (a response from another authorization
+//! server is a mix-up, and its code is discarded too), and exchanges the code
+//! plus the PKCE `code_verifier` for tokens. The `state` and the verifier come
+//! from the kernel CSPRNG (`sec::random`), with no fallback: a host that
+//! cannot read it fails the login rather than send a `state` an attacker
+//! could guess.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
-use crate::auth::cache::{self, CachedCred};
+use crate::auth::cache::CachedCred;
 use crate::auth::oauth2::{self, OAuth2Params};
 use crate::sha::sha256;
 
@@ -31,10 +35,15 @@ pub fn browser_login(
         .as_deref()
         .ok_or("oauth: authorization_url is required for the browser flow (or set issuer)")?;
 
-    // PKCE (RFC 7636): a high-entropy verifier and its S256 challenge.
-    let verifier = rand_b64url(32);
+    // PKCE (RFC 7636): a high-entropy verifier (32 bytes, 43 characters) and
+    // its S256 challenge; and the CSRF `state`.
+    let random = |n| {
+        crate::sec::random::b64url_token(n)
+            .map_err(|e| format!("oauth: no OS randomness for the login: {e}"))
+    };
+    let verifier = random(32)?;
     let challenge = crate::b64::url_nopad(&sha256(verifier.as_bytes()));
-    let state = rand_b64url(16);
+    let state = random(16)?;
 
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("oauth: loopback: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -51,19 +60,46 @@ pub fn browser_login(
     );
     on_url(&url);
 
-    let (code, got_state) = wait_for_callback(&listener, timeout)?;
-    if got_state != state {
+    let back = wait_for_callback(&listener, timeout)?;
+    if back.state != state {
         return Err("oauth: state mismatch on the callback (possible CSRF) — aborted".into());
     }
-    let tokens = oauth2::exchange_code(params, &code, &verifier, &redirect, timeout)?;
+    check_iss(
+        back.iss.as_deref(),
+        params.issuer.as_deref(),
+        params.iss_supported,
+    )?;
+    let tokens = oauth2::exchange_code(params, &back.code, &verifier, &redirect, timeout)?;
     Ok(crate::auth::login::tokens_to_cred(&tokens))
 }
 
-/// Accept one loopback callback, parse `?code=…&state=…`, and reply with a page.
-fn wait_for_callback(
-    listener: &TcpListener,
-    timeout: Duration,
-) -> Result<(String, String), String> {
+/// RFC 9207 §2.4: an authorization response's `iss` must be the issuer the
+/// request went to, byte for byte, and one without it is refused when the
+/// server's metadata declares it always sends one. With endpoints pinned and
+/// no `issuer` configured there is nothing to compare an `iss` with.
+fn check_iss(got: Option<&str>, issuer: Option<&str>, declared: bool) -> Result<(), String> {
+    match (got, issuer) {
+        (Some(got), Some(want)) if got != want => Err(format!(
+            "oauth: the authorization response names the issuer {got:?}, not {want:?} (a mix-up, RFC 9207) — aborted"
+        )),
+        (None, _) if declared => Err(
+            "oauth: the authorization response carries no `iss`, which this server's metadata says it always sends (RFC 9207) — aborted"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// What the authorization server's redirect carried.
+struct Callback {
+    code: String,
+    state: String,
+    iss: Option<String>,
+}
+
+/// Accept one loopback callback, parse `?code=…&state=…&iss=…`, and reply
+/// with a page.
+fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<Callback, String> {
     let (stream, _) = listener
         .accept()
         .map_err(|e| format!("oauth: callback accept: {e}"))?;
@@ -81,13 +117,14 @@ fn wait_for_callback(
     // `GET /callback?code=…&state=… HTTP/1.1`
     let target = line.split_whitespace().nth(1).unwrap_or("");
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-    let (mut code, mut state, mut err) = (None, None, None);
+    let (mut code, mut state, mut iss, mut err) = (None, None, None, None);
     for kv in query.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
             let val = pct_decode(v);
             match k {
                 "code" => code = Some(val),
                 "state" => state = Some(val),
+                "iss" => iss = Some(val),
                 "error" => err = Some(val),
                 _ => {}
             }
@@ -105,36 +142,14 @@ fn wait_for_callback(
     if let Some(e) = err {
         return Err(format!("oauth: authorization denied: {e}"));
     }
-    Ok((
-        code.ok_or("oauth: no `code` in the callback")?,
-        state.unwrap_or_default(),
-    ))
+    Ok(Callback {
+        code: code.ok_or("oauth: no `code` in the callback")?,
+        state: state.unwrap_or_default(),
+        iss,
+    })
 }
 
 // --- encoders (dependency-free) --------------------------------------------
-
-/// `n` random bytes from `/dev/urandom`, base64url-encoded without padding.
-/// Both callers depend on unpredictability — the PKCE verifier and the CSRF
-/// `state` — so the `/dev/urandom` path is the one that matters. The splitmix
-/// over clock and pid is only a last resort for a host with no `/dev/urandom`
-/// to open: it keeps the flow working, but it is guessable, not secure.
-fn rand_b64url(n: usize) -> String {
-    let mut buf = vec![0u8; n];
-    let ok = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !ok {
-        let mut z = cache::now_ms() ^ (std::process::id() as u64).rotate_left(32);
-        for b in buf.iter_mut() {
-            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut x = z;
-            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            *b = (x >> 24) as u8;
-        }
-    }
-    crate::b64::url_nopad(&buf)
-}
 
 /// Percent-encode a query component (unreserved set passes through).
 fn pct(s: &str) -> String {
@@ -205,11 +220,29 @@ mod tests {
         assert_eq!(pct_decode("x+y"), "x y");
     }
 
+    /// Every RFC 9207 row: `iss` present or absent, the metadata declaring
+    /// support or not, and a present `iss` matching the issuer or not.
     #[test]
-    fn rand_b64url_is_high_entropy_and_distinct() {
-        let a = rand_b64url(32);
-        let b = rand_b64url(32);
-        assert!(a.len() >= 43, "43+ chars for 32 bytes: {}", a.len());
-        assert_ne!(a, b);
+    fn every_iss_row_is_decided_as_rfc_9207_says() {
+        let want = Some("https://as.example");
+        let other = "https://evil.example";
+        for declared in [false, true] {
+            // Present and equal: accepted, declared or not.
+            assert!(check_iss(want, want, declared).is_ok(), "{declared}");
+            // Present and different: a mix-up, declared or not.
+            let e = check_iss(Some(other), want, declared).unwrap_err();
+            assert!(e.contains("mix-up") && e.contains(other), "{e}");
+            // Equal only byte for byte: a trailing slash is another issuer.
+            assert!(check_iss(Some("https://as.example/"), want, declared).is_err());
+        }
+        // Absent: refused only when the server says it always sends one —
+        // whatever it would have named.
+        for issuer in [want, Some(other)] {
+            assert!(check_iss(None, issuer, false).is_ok());
+            let e = check_iss(None, issuer, true).unwrap_err();
+            assert!(e.contains("carries no `iss`"), "{e}");
+        }
+        // No issuer known (endpoints pinned): nothing to compare with.
+        assert!(check_iss(Some(other), None, false).is_ok());
     }
 }

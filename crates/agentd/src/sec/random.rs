@@ -84,6 +84,15 @@ pub fn hex_token(n_bytes: usize) -> io::Result<String> {
     Ok(crate::sha::to_hex(&buf))
 }
 
+/// `n_bytes` of OS randomness, base64url without padding: an OAuth `state`,
+/// a PKCE `code_verifier`, a JWT `jti`. An error, never a weaker value, when
+/// the entropy source cannot be read, as for [`hex_token`].
+pub fn b64url_token(n_bytes: usize) -> io::Result<String> {
+    let mut buf = vec![0u8; n_bytes];
+    fill(&mut buf)?;
+    Ok(crate::b64::url_nopad(&buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,11 +53,14 @@ a2a = [
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
-# OAuth 2.1 client-credentials (M2M) auth for remote intelligence/MCP endpoints:
-# fetch+cache a bearer token from a token endpoint, refresh on expiry. Dependency-free — reuses the hand-rolled HTTP client + serde_json + the
-# sec::secret resolver; the form encoder is hand-rolled (no url/form_urlencoded
-# crate). Rides `tls` for an https token endpoint (the common case).
-oauth = []
+# OAuth 2.1 / OIDC for remote intelligence/MCP endpoints: the device and
+# browser logins, refresh, discovery and RFC 7009 revocation, over the
+# hand-rolled HTTP client + serde_json + the sec::secret resolver; the form
+# encoder is hand-rolled (no url/form_urlencoded crate). `private_key_jwt`
+# (ES256) and sealing secrets at rest (AES-256-GCM) are the `ring` rustls
+# already resolves — a direct edge, not a new crate. Rides `tls` for an https
+# token endpoint (the common case).
+oauth = ["dep:ring"]
 # The GUARDED local command runner behind the `exec` tool.
 # Default-OFF and cuts against the "no local execution" posture, so it
 # is opt-in at BUILD time (this feature) AND at RUN time (security.exec.enabled)

@@ -23,7 +23,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Response body cap. LLM responses can be large; 8 MiB is generous without
 /// being an unbounded allocation from a hostile peer.
@@ -123,6 +123,111 @@ impl Response {
     pub fn body_str(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.body)
     }
+
+    /// How long the server asked the client to wait (`Retry-After`), from
+    /// now. See [`parse_retry_after`].
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.header("retry-after")
+            .and_then(|v| parse_retry_after(v, SystemTime::now()))
+    }
+}
+
+/// The longest agentd takes a server's `Retry-After` at its word: a longer
+/// wait is cut to this, so a server whose clock or arithmetic is off cannot
+/// take itself out of a long-lived daemon until it restarts.
+pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(300);
+
+/// Read a `Retry-After` value (RFC 9110 §10.2.3) as a wait from `now`: either
+/// delay-seconds, or an HTTP-date in any of the three formats a recipient
+/// must accept (§5.6.7) — IMF-fixdate, the obsolete RFC 850 form and asctime.
+/// A date already past is no wait at all. `None` for anything else, which a
+/// caller treats as a response without the header. The wait is the server's
+/// word, unbounded here: each caller caps it to what it is willing to wait.
+pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let v = value.trim();
+    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+        // Digits only, so the one failure left is overflow: a wait longer
+        // than u64 seconds is as good as for ever.
+        return Some(Duration::from_secs(v.parse().unwrap_or(u64::MAX)));
+    }
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    let at = http_date(v, now)?;
+    Some(Duration::from_secs(at.saturating_sub(now).max(0) as u64))
+}
+
+/// An HTTP-date as seconds since the Unix epoch; `now` (the same) places an
+/// RFC 850 two-digit year.
+fn http_date(v: &str, now: i64) -> Option<i64> {
+    let month = |m: &str| {
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+        .iter()
+        .position(|n| *n == m)
+        .map(|i| i as i64 + 1)
+    };
+    let clock = |t: &str| -> Option<i64> {
+        let mut it = t.split(':');
+        let (h, m, s) = (it.next()?, it.next()?, it.next()?);
+        if it.next().is_some() || [h, m, s].iter().any(|p| p.len() != 2) {
+            return None;
+        }
+        let (h, m, s): (i64, i64, i64) = (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?);
+        (h < 24 && m < 60 && s < 61).then_some(h * 3600 + m * 60 + s)
+    };
+    let parts: Vec<&str> = v.split_ascii_whitespace().collect();
+    let (year, mon, day, secs) = match parts.as_slice() {
+        // IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`.
+        [wd, d, m, y, t, "GMT"] if wd.ends_with(',') && wd.len() == 4 && y.len() == 4 => {
+            (y.parse().ok()?, month(m)?, d.parse().ok()?, clock(t)?)
+        }
+        // RFC 850: `Sunday, 06-Nov-94 08:49:37 GMT`. A two-digit year more
+        // than 50 years ahead is the century before (RFC 9110 §5.6.7).
+        [wd, dmy, t, "GMT"] if wd.ends_with(',') => {
+            let mut it = dmy.split('-');
+            let (d, m, y) = (it.next()?, it.next()?, it.next()?);
+            if it.next().is_some() || y.len() != 2 {
+                return None;
+            }
+            let yy: i64 = y.parse().ok()?;
+            let this = year_of(now.div_euclid(86_400));
+            let mut year = this - this % 100 + yy;
+            if year > this + 50 {
+                year -= 100;
+            }
+            (year, month(m)?, d.parse().ok()?, clock(t)?)
+        }
+        // asctime: `Sun Nov  6 08:49:37 1994`.
+        [_, m, d, t, y] if y.len() == 4 => (y.parse().ok()?, month(m)?, d.parse().ok()?, clock(t)?),
+        _ => return None,
+    };
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, mon, day) * 86_400 + secs)
+}
+
+/// The proleptic Gregorian year of a day since 1970-01-01 (the year half of
+/// H. Hinnant's `civil_from_days`).
+fn year_of(days: i64) -> i64 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    yoe + era * 400 + i64::from(mp >= 10)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Whether `host` names the local loopback — the dev/test carve-out for
@@ -372,6 +477,11 @@ impl<S: Read + Write> StreamingResponse<S> {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
+    /// How long the server asked the client to wait; see [`parse_retry_after`].
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.header("retry-after")
+            .and_then(|v| parse_retry_after(v, SystemTime::now()))
+    }
     /// The lowercased `Content-Type` (media type only, params stripped).
     pub fn content_type(&self) -> Option<&str> {
         self.header("content-type")
@@ -536,6 +646,76 @@ impl<R: BufRead> SseReader<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// `Retry-After` as delay-seconds and as each HTTP-date format, against
+    /// a fixed clock: RFC 9110's own example date, 1994-11-06 08:49:37 GMT.
+    #[test]
+    fn retry_after_reads_seconds_and_every_http_date_form() {
+        let at = UNIX_EPOCH + Duration::from_secs(784_111_777);
+        let now = at - Duration::from_secs(120);
+        let wait = |v| parse_retry_after(v, now);
+        assert_eq!(wait("120"), Some(Duration::from_secs(120)));
+        assert_eq!(wait(" 0 "), Some(Duration::ZERO));
+        assert_eq!(
+            wait("99999999999999999999999"),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        assert_eq!(
+            wait("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            wait("Sun Nov  6 08:49:37 1994"),
+            Some(Duration::from_secs(120))
+        );
+        // A date already past is no wait.
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", at + Duration::from_secs(9)),
+            Some(Duration::ZERO)
+        );
+        // Neither form: no header at all, as far as a caller is concerned.
+        for bad in [
+            "",
+            "-5",
+            "1.5",
+            "soon",
+            "Sun, 06 Nov 1994 08:49:37 PST",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 8:49:37 GMT",
+        ] {
+            assert_eq!(wait(bad), None, "{bad:?}");
+        }
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    }
+
+    /// The obsolete RFC 850 form's two-digit year is read in the window RFC
+    /// 9110 sets: no more than 50 years ahead of today.
+    #[test]
+    fn retry_after_reads_the_rfc_850_form() {
+        // 2026-10-17 00:00:00 GMT.
+        let now = UNIX_EPOCH + Duration::from_secs(1_792_195_200);
+        assert_eq!(year_of(1_792_195_200 / 86_400), 2026);
+        assert_eq!(year_of(-1), 1969);
+        assert_eq!(
+            parse_retry_after("Saturday, 17-Oct-26 00:02:00 GMT", now),
+            Some(Duration::from_secs(120))
+        );
+        // `76` is 2076, fifty years ahead; `77` would be more, so it is 1977.
+        assert!(
+            parse_retry_after("Saturday, 17-Oct-76 00:00:00 GMT", now).unwrap() > Duration::ZERO
+        );
+        assert_eq!(
+            parse_retry_after("Monday, 17-Oct-77 00:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        let r = Response {
+            status: 429,
+            headers: vec![("retry-after".into(), "7".into())],
+            body: vec![],
+        };
+        assert_eq!(r.retry_after(), Some(Duration::from_secs(7)));
+    }
 
     #[test]
     fn url_parse_https_default_port() {

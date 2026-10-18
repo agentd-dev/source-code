@@ -104,6 +104,7 @@ fn spawn_issuer(down: Arc<AtomicBool>) -> String {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     let token_url = format!("{base}/token");
+    let issuer = base.clone();
     std::thread::spawn(move || {
         for mut c in l.incoming().flatten() {
             let Some(req) = read_request(&c) else {
@@ -115,7 +116,10 @@ fn spawn_issuer(down: Arc<AtomicBool>) -> String {
                 if down.load(Ordering::SeqCst) {
                     ("503 Service Unavailable", String::new())
                 } else {
-                    ("200 OK", format!(r#"{{"token_endpoint":"{token_url}"}}"#))
+                    (
+                        "200 OK",
+                        format!(r#"{{"issuer":"{issuer}","token_endpoint":"{token_url}"}}"#),
+                    )
                 }
             } else {
                 (

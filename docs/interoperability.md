@@ -137,7 +137,7 @@ connection cannot apply is refused when the configuration loads.
 |---|---|---|---|
 | Static bearer token | yes | yes | yes |
 | Static custom header in an `auth:` block | — (use `headers`, below) | yes | yes |
-| OAuth 2.1: device code, authorization code with PKCE, client credentials; RFC 8414 and OIDC discovery | yes | yes | yes |
+| OAuth 2.1: device code, authorization code with PKCE and RFC 9207 `iss`, client credentials; RFC 8414 then OIDC discovery with an exact `issuer`; `private_key_jwt` (RFC 7523) and `client_secret_basic`; RFC 7009 revocation on `--logout` | yes | yes | yes |
 | AWS SigV4: environment, IAM Identity Center (SSO), EC2 instance role, EKS IRSA | yes, and required by `dialect: bedrock` | yes | yes |
 | SPIFFE JWT-SVID as a bearer | yes | yes | yes |
 | SPIFFE X.509-SVID or a client certificate (mTLS) | — | yes | yes |

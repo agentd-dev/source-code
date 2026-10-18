@@ -368,9 +368,13 @@ to run a workflow, hand it to the full runtime.
   into its socket as an `http::RequestSigner`: `sign` returns the headers a
   request carries (none, to send it unsigned), or an error when the
   credential cannot be produced, and then the request is not sent and fails
-  with `HttpError::Credential`.
+  with `HttpError::Credential`. Its `on_response` is shown every `401`,
+  `403` and `202`, with the `WWW-Authenticate`, `DPoP-Nonce` and
+  `Retry-After` the server sent, and may ask for a retry; a refusal it does
+  not retry is `HttpError::Refused`, carrying the challenge's error code and
+  scope, and a `429` or `503` with `Retry-After` is `HttpError::RetryAfter`.
 - `agentd-net`: the blocking HTTP/1.1 and SSE client, unix and TLS connects,
-  and the SSRF guard.
+  the SSRF guard, and `Retry-After` parsing (`http::parse_retry_after`).
 - `agentd::intel::client::IntelClient`: the model client, with endpoint-list
   failover and circuit breakers. It speaks the OpenAI-compatible, Anthropic,
   Bedrock and decision-model dialects; `from_parts` starts on the

@@ -827,11 +827,9 @@ fn agentd_oauth_client_interoperates_with_its_own_device_server() {
     let params = OAuth2Params {
         token_url: found.token_endpoint.expect("a token endpoint"),
         device_authorization_url: found.device_authorization_endpoint,
-        authorization_url: None,
         client_id: "agentd-cli".into(),
-        client_secret: None,
-        scopes: vec![],
         audience: Some("https://elsewhere.example".into()),
+        ..Default::default()
     };
     let device = start_device(&params, t).expect("a code");
     assert_eq!(device.interval, 5);

@@ -3,22 +3,31 @@
 //! `browser_login` prints the authorization URL, runs a loopback callback server,
 //! verifies `state`, and exchanges the code (+ PKCE verifier) at the token
 //! endpoint. The test plays the browser — it reads the printed URL, extracts the
-//! redirect + state, and hits the callback. [feature: oauth]
+//! redirect + state, and hits the callback. The callback's RFC 9207 `iss` is
+//! checked before the code is exchanged. [feature: oauth]
 #![cfg(all(unix, feature = "oauth"))]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-/// A mock token endpoint that returns a bearer for the authorization-code grant.
-fn spawn_token_endpoint() -> u16 {
+use agentd::auth::cache::CachedCred;
+use agentd::auth::oauth2::OAuth2Params;
+
+/// A mock token endpoint that returns a bearer for the authorization-code
+/// grant, counting the exchanges that reach it.
+fn spawn_token_endpoint() -> (u16, Arc<AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&exchanges);
     std::thread::spawn(move || {
         for c in l.incoming().take(4).flatten() {
             let mut s = c;
             drain_request(&mut s);
+            counted.fetch_add(1, Ordering::SeqCst);
             let body = r#"{"access_token":"at-browser","token_type":"Bearer","expires_in":3600,"refresh_token":"rt-browser"}"#;
             let _ = s.write_all(
                 format!(
@@ -29,7 +38,7 @@ fn spawn_token_endpoint() -> u16 {
             );
         }
     });
-    port
+    (port, exchanges)
 }
 
 fn drain_request(s: &mut TcpStream) {
@@ -84,18 +93,90 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-#[test]
-fn browser_authorization_code_pkce_flow() {
-    let token_port = spawn_token_endpoint();
-    let params = agentd::auth::oauth2::OAuth2Params {
-        token_url: format!("http://127.0.0.1:{token_port}/token"),
-        device_authorization_url: None,
+/// The params of a login against the mock token endpoint on `port`.
+fn params(port: u16) -> OAuth2Params {
+    OAuth2Params {
+        token_url: format!("http://127.0.0.1:{port}/token"),
         authorization_url: Some("https://as.example/authorize".into()),
         client_id: "agentd".into(),
-        client_secret: None,
         scopes: vec!["profile".into()],
-        audience: None,
-    };
+        ..Default::default()
+    }
+}
+
+/// Run the login and play the browser: follow the printed URL back to the
+/// callback with a code, the echoed state, and `extra` query parameters.
+fn play(params: OAuth2Params, extra: &str) -> Result<CachedCred, String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        agentd::auth::browser::browser_login(
+            &params,
+            |url| tx.send(url.to_string()).unwrap(),
+            Duration::from_secs(10),
+        )
+    });
+    let url = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("auth URL printed");
+    let redirect = query_param(&url, "redirect_uri").expect("redirect_uri");
+    let state = query_param(&url, "state").expect("state");
+    let port: u16 = redirect
+        .rsplit(':')
+        .next()
+        .and_then(|hp| hp.split('/').next())
+        .and_then(|p| p.parse().ok())
+        .expect("callback port");
+    let mut cb = TcpStream::connect(("127.0.0.1", port)).expect("connect callback");
+    let req = format!(
+        "GET /callback?code=test-code&state={state}{extra} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    );
+    cb.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    cb.read_to_string(&mut resp).ok();
+    handle.join().unwrap()
+}
+
+/// RFC 9207 on the callback: an `iss` equal to the issuer is exchanged; one
+/// naming another server is a mix-up; none, where the metadata declares the
+/// server always sends one, is refused too — and a refused callback's code
+/// never reaches the token endpoint.
+#[test]
+fn the_callbacks_iss_is_checked_before_the_code_is_exchanged() {
+    let issuer = "https://as.example";
+    let cases = [
+        // (iss on the callback, metadata declares it, accepted)
+        (Some(issuer), false, true),
+        (Some(issuer), true, true),
+        (Some("https://evil.example"), false, false),
+        (Some("https://evil.example"), true, false),
+        (None, false, true),
+        (None, true, false),
+    ];
+    for (iss, declared, accepted) in cases {
+        let (port, exchanges) = spawn_token_endpoint();
+        let mut p = params(port);
+        p.issuer = Some(issuer.into());
+        p.iss_supported = declared;
+        let extra = iss
+            .map(|i| format!("&iss={}", i.replace(':', "%3A").replace('/', "%2F")))
+            .unwrap_or_default();
+        let got = play(p, &extra);
+        let row = format!("iss {iss:?}, declared {declared}");
+        if accepted {
+            assert_eq!(got.expect(&row).access_token, "at-browser", "{row}");
+            assert_eq!(exchanges.load(Ordering::SeqCst), 1, "{row}");
+        } else {
+            let e = got.expect_err(&row);
+            assert!(e.contains("RFC 9207"), "{row}: {e}");
+            assert_eq!(exchanges.load(Ordering::SeqCst), 0, "{row}: no exchange");
+        }
+    }
+}
+
+#[test]
+fn browser_authorization_code_pkce_flow() {
+    let (token_port, _) = spawn_token_endpoint();
+    let params = params(token_port);
 
     // Run the flow on a thread; capture the printed URL via a channel.
     let (tx, rx) = mpsc::channel::<String>();
@@ -119,6 +200,8 @@ fn browser_authorization_code_pkce_flow() {
     assert!(url.contains("code_challenge_method=S256"), "{url}");
     let redirect = query_param(&url, "redirect_uri").expect("redirect_uri");
     let state = query_param(&url, "state").expect("state");
+    // 128 bits of state, base64url.
+    assert_eq!(state.len(), 22, "{state}");
     let port: u16 = redirect
         .rsplit(':')
         .next()

@@ -42,7 +42,7 @@ Two features are never in a release binary:
 | `tls` | yes | yes | `rustls` (with the `ring` provider), `webpki-roots` | Direct `https://` to models, MCP servers and peers; an `https://` listener; mTLS client identities; `security.tls_ca`. The bundled roots mean a `scratch` image trusts public CAs with no system bundle. |
 | `a2a` | no | yes | the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`), `tokio`, `axum`, `hyper`, `hyper-util`, `tokio-rustls`, `tower`, `chrono`, `async-trait`, `tokio-stream`, `futures-util` | The A2A listener and everything served on it, outbound A2A peers, and the webhook listener. Implies `tls`. |
 | `cron` | no | yes | none | Five-field UTC cron expressions on `schedule` start nodes. |
-| `oauth` | no | yes | none | OAuth 2.1 credentials (device, authorization code with PKCE, client credentials, refresh, OIDC discovery) for models, MCP servers and peers; `agentd --login`. |
+| `oauth` | no | yes | none new (reuses `ring`) | OAuth 2.1 credentials (device, authorization code with PKCE, client credentials, refresh, RFC 8414 and OIDC discovery, `private_key_jwt`) for models, MCP servers and peers; `agentd --login`, and RFC 7009 revocation on `agentd --logout`. |
 | `metrics` | no | yes | none | `/metrics` (Prometheus text), `/healthz` and `/readyz` on `observability.metrics_addr`. |
 | `otel` | no | yes | none | OTLP over HTTP/JSON: run traces with GenAI attributes, and log export. |
 | `hot-reload` | no | yes | none | Reload on `SIGHUP`: validate, stage, apply whole or refuse. |

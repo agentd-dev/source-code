@@ -74,6 +74,33 @@
         "authorization_url": {
           "type": "string"
         },
+        "client_auth": {
+          "additionalProperties": false,
+          "description": "how the client authenticates at the token and revocation endpoints",
+          "properties": {
+            "assertion_aud": {
+              "enum": [
+                "token_endpoint",
+                "issuer"
+              ]
+            },
+            "key": {
+              "description": "a secret — from a file it MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference; env/flag values may be inline",
+              "type": "string"
+            },
+            "kid": {
+              "type": "string"
+            },
+            "method": {
+              "enum": [
+                "private_key_jwt",
+                "client_secret_basic",
+                "client_secret_post"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "client_id": {
           "type": "string"
         },

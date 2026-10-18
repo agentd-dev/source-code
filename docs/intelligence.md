@@ -167,7 +167,7 @@ Three mechanisms keep the agent answering, each at its own level:
 
 | Mechanism | Covers | Moves to |
 |---|---|---|
-| retry | a blip on one endpoint: `429` or `5xx` | the same endpoint, twice, after 250 ms and 500 ms |
+| retry | a blip on one endpoint: `429` or `5xx` | the same endpoint, twice, after 250 ms and 500 ms, or after its `Retry-After` when that is longer; a `Retry-After` over 30 s takes the endpoint out of rotation until it passes |
 | failover | an endpoint that is down | the next endpoint of the same connection |
 | fallback | a model whose every endpoint is down | the model's fallback, on its own connection |
 

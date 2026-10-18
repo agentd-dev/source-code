@@ -502,6 +502,11 @@ fn defs_properties(
                 "issuer": { "type": "string" }, "token_url": { "type": "string" },
                 "device_authorization_url": { "type": "string" }, "authorization_url": { "type": "string" },
                 "client_id": { "type": "string" }, "client_secret": secret,
+                "client_auth": { "type": "object", "additionalProperties": false,
+                    "description": "how the client authenticates at the token and revocation endpoints", "properties": {
+                    "method": { "enum": ["private_key_jwt", "client_secret_basic", "client_secret_post"] },
+                    "key": secret, "kid": { "type": "string" },
+                    "assertion_aud": { "enum": ["token_endpoint", "issuer"] } } },
                 "grant": { "enum": ["device", "authorization_code", "client_credentials"] },
                 "scopes": { "type": "array", "items": { "type": "string" } }, "audience": { "type": "string" },
                 "token": secret, "header": { "type": "string" }, "value": secret,

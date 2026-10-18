@@ -115,6 +115,7 @@ pub fn params_from_auth(
     let mut device_url = auth.device_authorization_url.clone();
     let mut auth_url = auth.authorization_url.clone();
     let mut issuer = auth.issuer.clone();
+    let (mut revocation_url, mut iss_supported) = (None, false);
     // RFC 9728: with no issuer AND no pinned endpoints, ask the resource — its
     // 401 challenge (or well-known metadata) names the authorization server.
     if issuer.is_none()
@@ -126,13 +127,15 @@ pub fn params_from_auth(
         issuer = Some(found);
     }
     // Discover the endpoints from the issuer if any are missing.
-    if (token_url.is_none() || device_url.is_none() || auth_url.is_none())
+    if !pins_every_endpoint(auth)
         && let Some(issuer) = &issuer
     {
         let d = oauth2::discover(issuer, timeout)?;
         token_url = token_url.or(d.token_endpoint);
         device_url = device_url.or(d.device_authorization_endpoint);
         auth_url = auth_url.or(d.authorization_endpoint);
+        revocation_url = d.revocation_endpoint;
+        iss_supported = d.authorization_response_iss_parameter_supported;
     }
 
     Ok(OAuth2Params {
@@ -140,11 +143,23 @@ pub fn params_from_auth(
             .ok_or("auth.token_url is required (or set auth.issuer for discovery)")?,
         device_authorization_url: device_url,
         authorization_url: auth_url,
+        revocation_url,
+        issuer,
+        iss_supported,
         client_id,
         client_secret: auth.client_secret.as_ref().map(|s| s.0.clone()),
+        client_auth: oauth2::ClientAuth::of(auth.to_spec().client_auth.as_ref())?,
         scopes: auth.scopes.clone(),
         audience: auth.audience.clone(),
     })
+}
+
+/// Whether `auth` pins the token, device and authorization endpoints, so
+/// [`params_from_auth`] asks no issuer for its metadata.
+pub(crate) fn pins_every_endpoint(auth: &Auth) -> bool {
+    auth.token_url.is_some()
+        && auth.device_authorization_url.is_some()
+        && auth.authorization_url.is_some()
 }
 
 /// Run the device-authorization flow: print the prompt, then poll to a token.
@@ -167,16 +182,38 @@ pub fn device_login(
     let deadline =
         Instant::now() + Duration::from_secs(da.expires_in.unwrap_or(900).clamp(30, 1800));
     loop {
+        // A `Retry-After` the token endpoint gave holds the next poll back at
+        // least that long, for this poll only, and five minutes at most.
+        let mut wait = interval;
         match oauth2::poll_device_once(params, &da.device_code, timeout)? {
             PollOutcome::Token(t) => return Ok(tokens_to_cred(&t)),
             PollOutcome::Pending => {}
-            PollOutcome::SlowDown => interval += Duration::from_secs(5),
+            PollOutcome::SlowDown => {
+                interval = interval.saturating_add(Duration::from_secs(5));
+                wait = interval;
+            }
+            PollOutcome::Wait(asked) => {
+                wait = wait.max(asked.min(crate::net::http::RETRY_AFTER_MAX));
+            }
         }
-        if Instant::now() + interval >= deadline {
+        // Compared, not added to an instant: a server's wait can be any size.
+        if wait >= deadline.saturating_duration_since(Instant::now()) {
             return Err("device code expired before authorization".into());
         }
-        sleep(interval);
+        sleep(wait);
     }
+}
+
+/// The cache record of a refresh: the response's tokens, and — when it
+/// carries no `refresh_token` — the one `presented`, which stays good (RFC
+/// 6749 §6). Without that, a server that does not rotate would leave the
+/// record with nothing to renew from once its access token expired.
+pub fn refreshed_cred(t: &oauth2::Tokens, presented: &str) -> CachedCred {
+    let mut cred = tokens_to_cred(t);
+    if cred.refresh_token.is_none() {
+        cred.refresh_token = Some(presented.to_string());
+    }
+    cred
 }
 
 /// Turn a token response into a cache record, stamping the absolute expiry.
@@ -229,28 +266,14 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
             std::thread::sleep,
         )?;
         let dir = cache::default_dir();
+        let _held = cache::lock_file(&dir, target, timeout)?;
         cache::store_file(&dir, target, &cred)?;
         return Ok(format!(
             "logged in to {target} (AWS SSO) — temporary credentials cached in {}",
             dir.display()
         ));
     }
-    // The resource being logged into (RFC 9728 issuer discovery when no issuer
-    // is configured): the MCP server's endpoint, or the primary intel endpoint.
-    let resource: Option<String> = if let Some(c) = intelligence_connection(settings, target)? {
-        c.endpoints.first().cloned()
-    } else if let Some(name) = target.strip_prefix("mcp:") {
-        settings
-            .mcp
-            .servers
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.endpoint.clone())
-    } else if let Some(name) = target.strip_prefix("service:") {
-        settings.services.get(name).map(|e| e.endpoint.clone())
-    } else {
-        None
-    };
+    let resource = resource_of(settings, target)?;
     let params = params_from_auth(auth, resource.as_deref(), timeout)?;
     // `grant: authorization_code` → the browser + PKCE loopback flow; otherwise
     // the device grant (the default).
@@ -269,11 +292,34 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
         )?
     };
     let dir = cache::default_dir();
+    let _held = cache::lock_file(&dir, target, timeout)?;
     cache::store_file(&dir, target, &cred)?;
     Ok(format!(
         "logged in to {target} — token cached in {}",
         dir.display()
     ))
+}
+
+/// The resource a target logs into, for RFC 9728 issuer discovery when no
+/// issuer is configured: the MCP server's endpoint, the catalog entry's, or
+/// the primary intelligence endpoint.
+pub fn resource_of(settings: &Settings, target: &str) -> Result<Option<String>, String> {
+    Ok(
+        if let Some(c) = intelligence_connection(settings, target)? {
+            c.endpoints.first().cloned()
+        } else if let Some(name) = target.strip_prefix("mcp:") {
+            settings
+                .mcp
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.endpoint.clone())
+        } else if let Some(name) = target.strip_prefix("service:") {
+            settings.services.get(name).map(|e| e.endpoint.clone())
+        } else {
+            None
+        },
+    )
 }
 
 /// Print the browser-flow prompt to stderr (the authorization URL to open).
@@ -314,6 +360,7 @@ mod tests {
             authorization_url: None,
             client_id: Some("agentd".into()),
             client_secret: None,
+            client_auth: None,
             grant: Some(OAuthGrant::Device),
             scopes: vec!["mcp:read".into()],
             audience: None,
@@ -331,6 +378,90 @@ mod tests {
             svid_file: None,
             key_file: None,
         }
+    }
+
+    /// A device login whose device code asks for polls `interval` seconds
+    /// apart, and whose first poll the token endpoint answers `429` with
+    /// `Retry-After: retry_after`: the waits it slept between polls, or how
+    /// it failed.
+    fn device_login_told_to_wait(
+        interval: &'static str,
+        retry_after: &'static str,
+    ) -> Result<Vec<Duration>, String> {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (i, c) in l.incoming().flatten().enumerate() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let (status, extra, body) = match i {
+                    0 => (
+                        "200 OK",
+                        "",
+                        format!(
+                            r#"{{"device_code":"d","user_code":"U","verification_uri":"https://as/device","interval":{interval}}}"#
+                        ),
+                    ),
+                    1 => ("429 Too Many Requests", retry_after, String::new()),
+                    _ => ("200 OK", "", r#"{"access_token":"at"}"#.to_string()),
+                };
+                let extra = match extra {
+                    "" => String::new(),
+                    v => format!("Retry-After: {v}\r\n"),
+                };
+                let mut w = c;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let params = OAuth2Params {
+            token_url: format!("{base}/token"),
+            device_authorization_url: Some(format!("{base}/device")),
+            client_id: "c".into(),
+            ..Default::default()
+        };
+        let slept = std::sync::Mutex::new(Vec::new());
+        let cred = device_login(
+            &params,
+            Duration::from_secs(5),
+            |_| {},
+            |d| slept.lock().unwrap().push(d),
+        )?;
+        assert_eq!(cred.access_token, "at");
+        Ok(slept.into_inner().unwrap())
+    }
+
+    /// A device poll the token endpoint answers `429` with `Retry-After` is
+    /// followed by the next poll no sooner than the wait it asked for, where
+    /// the interval alone is a second — and no later than five minutes, the
+    /// most any server's wait is taken for, however large the one it sent.
+    /// An interval that outlasts the device code ends the login, as the
+    /// code's expiry does.
+    #[test]
+    fn a_device_poll_waits_out_a_retry_after() {
+        let max = crate::net::http::RETRY_AFTER_MAX;
+        assert_eq!(
+            device_login_told_to_wait("1", "7"),
+            Ok(vec![Duration::from_secs(7)])
+        );
+        assert_eq!(device_login_told_to_wait("1", "600"), Ok(vec![max]));
+        assert_eq!(
+            device_login_told_to_wait("1", "99999999999999999999"),
+            Ok(vec![max])
+        );
+        assert_eq!(
+            device_login_told_to_wait("18446744073709551615", "1"),
+            Err("device code expired before authorization".to_string())
+        );
     }
 
     #[test]
@@ -353,6 +484,29 @@ mod tests {
         let mut a = oauth_block();
         a.grant = Some(OAuthGrant::ClientCredentials);
         assert!(params_from_auth(&a, None, Duration::from_secs(1)).is_err());
+    }
+
+    /// A refresh that rotates replaces the refresh token; one that does not
+    /// keeps the token it presented.
+    #[test]
+    fn a_refresh_without_a_refresh_token_keeps_the_one_presented() {
+        let mut t = oauth2::Tokens {
+            access_token: "at-2".into(),
+            refresh_token: Some("rt-2".into()),
+            expires_in: Some(60),
+            token_type: None,
+            scope: None,
+        };
+        assert_eq!(
+            refreshed_cred(&t, "rt-1").refresh_token.as_deref(),
+            Some("rt-2")
+        );
+        t.refresh_token = None;
+        let c = refreshed_cred(&t, "rt-1");
+        assert_eq!(
+            (c.access_token.as_str(), c.refresh_token.as_deref()),
+            ("at-2", Some("rt-1"))
+        );
     }
 
     #[test]

@@ -7,6 +7,40 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+**Added.**
+
+- `private_key_jwt` client authentication for an `oauth2` block (RFC 7523):
+  `auth.client_auth: {method: private_key_jwt, key, kid, assertion_aud}`
+  sends no secret, and each token and revocation request carries a fresh
+  ES256 assertion signed with `key`, a PKCS#8 P-256 key given as a secret
+  reference: `iss` and `sub` the `client_id`, `aud` the token endpoint (or,
+  with `assertion_aud: issuer`, the `issuer`), a minute's life and a random
+  128-bit `jti`. Its `kid` is the key's RFC 7638 thumbprint unless `kid`
+  names one. `method: client_secret_basic` sends the `client_secret` in an
+  `Authorization: Basic` header instead of the form body. `client_auth`
+  applies to the `device` and `authorization_code` grants; with
+  `client_credentials` it is refused at load, as is an inline `key`.
+- `agentd-core`: `auth::http`, the one helper OAuth requests go through —
+  status, headers and body returned, no redirect followed, a server-chosen
+  URL dialled HTTPS-only through the SSRF guard (`Dial::Vetted`);
+  `auth::client_assertion::ClientKey` (ES256 signing on `ring`, a PKCS#8
+  key loaded or created `0600`, `client_assertion`, `sign_jwt`);
+  `auth::jwk` (`p256_public`, `thumbprint`); `auth::seal::SealKey`
+  (AES-256-GCM `seal` and `open` with associated data, and
+  `associated_data`); `auth::revoke`; `auth::cache::{lock_file, FileLock,
+  take_file}`; `sec::random::b64url_token`;
+  `oauth2::{discovery_urls, revoke, ClientAuth, AssertionAud, TokenError}`
+  and `PollOutcome::Wait`; `login::{refreshed_cred, resource_of}`;
+  `config::ClientAuthSpec` and `AuthSpec::client_auth`. `OAuth2Params` has
+  `issuer`, `iss_supported`, `revocation_url` and `client_auth`, and
+  derives `Default`; `oauth2::refresh` returns a `TokenError`, which carries
+  the server's `Retry-After`. The `oauth` feature carries `ring`, already in
+  the graph through rustls: no new crate.
+- `agentd-net`: `http::parse_retry_after` reads `Retry-After` as
+  delay-seconds or an HTTP-date in each of the three forms RFC 9110 has a
+  recipient accept; `Response::retry_after`, `StreamingResponse::retry_after`
+  and `RETRY_AFTER_MAX`, the five minutes a server's wait is cut to.
+
 **Changed.**
 
 - `subagent.kill` ends a child inside a model call or an MCP tool call,
@@ -102,6 +136,75 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   first enrollment; `aauth::AgentKey::load` reads a key without creating
   one, `aauth::AAuthClient::with_key_file` names the file a key came from,
   and `aauth::MetadataError` says why metadata was not accepted.
+- Authorization-server discovery asks for the RFC 8414 document before the
+  OpenID Connect one, with the well-known suffix inserted before the
+  issuer's path (`https://sso.example/.well-known/oauth-authorization-server/tenant`),
+  then OIDC's inserted and appended forms. It asked for OIDC's appended form
+  first and RFC 8414's appended form second, so an issuer with a path was
+  looked up at the wrong RFC 8414 URL. The document's `issuer` must equal
+  the configured `issuer` byte for byte: an authorization server whose
+  metadata names another issuer, or none, is refused until it is fixed or
+  its endpoints are pinned. Metadata that does not match was never safe to
+  use; it is how a mix-up points a client at another server's endpoints.
+- RFC 9728 protected-resource discovery asks the path-inserted URL
+  (`https://mcp.example/.well-known/oauth-protected-resource/mcp`) before
+  the root one. It asked only the root.
+- A refreshed token is written to the login cache before it is used, the
+  rotated refresh token with it, and a refresh response that carries no
+  refresh token keeps the old one. A refresh was kept in memory only, and
+  one without a refresh token dropped it, so a restart lost a rotated token
+  and renewed with a spent one, and a server that does not rotate left
+  nothing to renew from once the access token expired. Every process of the
+  tree renews from the token the cache holds, under a lock on the target's
+  entry there (an advisory `flock` on a `.lock` file beside it), so the
+  processes and connections that find the token due at once renew it once:
+  the rest wait and take what the first wrote back, where each presenting
+  the same refresh token would have a server that rotates refuse all but
+  one, or end the grant as stolen. `--login` and `--logout` take the same
+  lock. The file is replaced whole, through a `0600` temp file renamed over
+  it, so a reader never sees part of one and a crash or a full disk
+  mid-write leaves the old. A write that fails leaves the refresh unused,
+  and requests fail, naming the cause, until it succeeds. A process whose
+  login `--logout` removed stops at its next renewal: it fails its
+  requests, naming the login, and writes nothing back. It renewed in memory
+  from the refresh token it held, so a running daemon outlived a logout.
+- `agentd --logout <target>` deletes the cached credential here and then
+  revokes it at the authorization server when its metadata lists a
+  `revocation_endpoint` (RFC 7009) — the refresh token, else the access
+  token. It only deleted the local file, and the token kept working at the
+  server. The delete comes first, so a logout cut short by a server that
+  does not answer, or by Ctrl-C, has still removed it. A revocation that
+  fails is reported, and the logout exits 2 saying the token stays good at
+  the server until it expires.
+- A browser login checks the redirect's `iss` (RFC 9207): one naming
+  another issuer than the one the request went to is refused as a mix-up,
+  and one with none is refused when the server's metadata declares
+  `authorization_response_iss_parameter_supported`. The code of a refused
+  redirect is never exchanged.
+- A browser login's `state` and PKCE verifier come from the kernel's random
+  source with no fallback: a host that cannot read it fails the login. They
+  fell back to a mix of the clock and the pid, which an attacker can guess.
+- The MCP transport shows the request signer every `403`, as it does a
+  `401` and a `202`, with the `WWW-Authenticate`, `DPoP-Nonce` and
+  `Retry-After` the server sent, and the signer may renew and retry. A
+  `401` or `403` whose challenge names an error is a typed error that says
+  it: `HTTP 403: insufficient_scope (needs scope "…")`, `sign_in_required`,
+  `invalid_token`. It was `HTTP 403`, and the signer never saw a `403`.
+- agentd honours `Retry-After` where it is the client. An MCP server that
+  answers `429` or `503` with one is sent nothing more — no call, no
+  handshake, no notification stream, no re-dial — until the wait is over;
+  a request in that time fails at once, unsent. A model endpoint's wait of
+  up to 30 seconds is waited out before the in-place retry (it retried after
+  250 and 500 ms), and a longer one ends the retry and takes the endpoint
+  out of rotation for it, so another serves meanwhile; a run's deadline
+  still bounds every wait. A token endpoint's stops further refreshes until
+  it passes, and a device login's next poll waits it out. A server's wait
+  is cut to five minutes, so a wrong one cannot take a server out of a
+  long-lived daemon.
+- `agentd-mcp`: `http::AuthResponse` has `www_authenticate`, `dpop_nonce`
+  and `retry_after`; `http::HttpError` has `Refused(http::Challenge)` and
+  `RetryAfter { status, wait, sent }`; `http::Challenge::parse` reads a
+  `WWW-Authenticate` value. A breaking change to the crate's public API.
 
 **Fixed.**
 

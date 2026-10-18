@@ -47,6 +47,7 @@ the next step:
 | a `-32022` listing nothing | sends `initialize` at 2025-11-25 |
 | a `-32020` or `-32021` (a modern server refusing agentd's request), a `401`, a server never reached, or a version list with nothing agentd can offer | fails the connect, naming the refusal |
 | nothing: the server's `auth` could not produce its credential, so the probe was not sent | fails the connect, naming the target and the cause; the connect is retried like any other |
+| a `429` or `503` with `Retry-After` | fails the connect and sends the server nothing more — no `initialize` — until the wait is over (five minutes at most); the connect is retried like any other |
 | anything else: `-32601`, a `403`, another `4xx` or `5xx` with or without a body, `{}`, a `202`, silence until the connection's timeout | sends `initialize` at 2025-11-25 |
 
 - The probe is bounded by the connection's timeout. A fallback that is

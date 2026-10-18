@@ -225,9 +225,14 @@ impl BootstrapFailure {
     fn of(e: &HttpError) -> BootstrapFailure {
         match e {
             HttpError::Status(s) => BootstrapFailure::Status(*s),
-            HttpError::Connect(_) | HttpError::Unsupported(_) | HttpError::Credential(_) => {
-                BootstrapFailure::Unreached
-            }
+            HttpError::Refused(c) => BootstrapFailure::Status(c.status),
+            HttpError::RetryAfter {
+                status, sent: true, ..
+            } => BootstrapFailure::Status(*status),
+            HttpError::Connect(_)
+            | HttpError::Unsupported(_)
+            | HttpError::Credential(_)
+            | HttpError::RetryAfter { sent: false, .. } => BootstrapFailure::Unreached,
             HttpError::Http(_) | HttpError::NoResponse | HttpError::NoEventStream => {
                 BootstrapFailure::NoAnswer
             }

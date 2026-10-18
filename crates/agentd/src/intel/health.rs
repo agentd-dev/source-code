@@ -123,6 +123,9 @@ pub struct HealthRecord {
     /// How many times the breaker has consecutively opened (the cooldown
     /// backoff multiplier; reset on a re-close).
     open_count: AtomicU32,
+    /// Until when the endpoint asked for no request (`429`/`503` with
+    /// `Retry-After`), ms since the epoch; `0` = no wait.
+    not_before_unix_ms: AtomicU64,
 }
 
 impl Default for HealthRecord {
@@ -144,7 +147,15 @@ impl HealthRecord {
             last_err_kind: AtomicU8::new(ErrKind::None as u8),
             opened_unix_ms: AtomicU64::new(0),
             open_count: AtomicU32::new(0),
+            not_before_unix_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Keep the endpoint out of rotation for `wait`: the provider's own
+    /// `Retry-After`, which no request to it is sent before.
+    pub fn hold_for(&self, wait: Duration) {
+        let until = now_unix_ms().saturating_add(wait.as_millis() as u64);
+        self.not_before_unix_ms.store(until, Ordering::Relaxed);
     }
 
     pub fn state(&self) -> BreakerState {
@@ -214,11 +225,15 @@ impl HealthRecord {
     }
 
     /// True if this endpoint is currently usable, i.e. not OPEN and still
-    /// cooling. Called by `attempt_order()`. **This is not a pure read**: an
+    /// cooling, and not inside a wait it asked for ([`hold_for`](Self::hold_for)).
+    /// Called by `attempt_order()`. **This is not a pure read**: an
     /// endpoint whose cooldown has elapsed is promoted to HALF-OPEN here, so the
     /// next call probes it. Use [`is_up`](Self::is_up) where a side-effect-free
     /// answer is required.
     pub fn available(&self, cfg: &BreakerConfig) -> bool {
+        if now_unix_ms() < self.not_before_unix_ms.load(Ordering::Relaxed) {
+            return false;
+        }
         match self.state() {
             BreakerState::Closed | BreakerState::HalfOpen => true,
             BreakerState::Open => {

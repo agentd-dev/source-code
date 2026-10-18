@@ -164,16 +164,63 @@ auth:
 | Grant | When | How the token arrives |
 |---|---|---|
 | `device` (the default) | a person authorizes once, from any terminal, over SSH included | `agentd --login` prints a URL and a short code and polls until the person approves |
-| `authorization_code` | a person with a desktop browser | `agentd --login` prints the authorization URL, catches the redirect on a one-time `127.0.0.1` listener, checks `state`, and exchanges the code with PKCE |
+| `authorization_code` | a person with a desktop browser | `agentd --login` prints the authorization URL, catches the redirect on a one-time `127.0.0.1` listener, checks `state` and `iss`, and exchanges the code with PKCE |
 | `client_credentials` | machine to machine | the daemon fetches the token with `client_secret` and refetches it before it expires; no login |
 
-**Endpoints.** With `issuer`, agentd discovers the token, device and
-authorization endpoints from `<issuer>/.well-known/openid-configuration`, or
-`<issuer>/.well-known/oauth-authorization-server`. Pin `token_url`,
+**Endpoints.** With `issuer`, agentd discovers the token, device,
+authorization and revocation endpoints from the server's metadata. It asks
+for the RFC 8414 document first, then the OpenID Connect one, in the order
+MCP's authorization spec gives: for `https://sso.example/tenant`,
+`https://sso.example/.well-known/oauth-authorization-server/tenant`, then
+`https://sso.example/.well-known/openid-configuration/tenant`, then
+`https://sso.example/tenant/.well-known/openid-configuration`; for an issuer
+with no path, the first two at the root. The first document that answers is
+used only if its `issuer` is the configured `issuer`, byte for byte: one that
+names another issuer, or none, is refused (`oauth: discovery: … names the
+issuer …`), because metadata that does not match is how a mix-up attack
+points a client at another server's endpoints. Write `issuer` exactly as the
+server's metadata does, trailing slash included or not. Pin `token_url`,
 `device_authorization_url` or `authorization_url` to skip discovery. An
 `oauth2` block needs `client_id` and either `issuer` or `token_url`; the
 device grant also needs `issuer` or `device_authorization_url`, and the
 browser grant `issuer` or `authorization_url`. The load checks each of these.
+
+With no `issuer` and no pinned endpoint, `agentd --login` asks the MCP
+server itself (RFC 9728): the `resource_metadata` URL its `401` challenge
+names, else the protected-resource metadata with the well-known suffix
+inserted before the server's path
+(`https://mcp.example/.well-known/oauth-protected-resource/mcp`), else the
+one at the root.
+
+**The browser grant's checks.** The redirect's `state` must be the one the
+login sent, and its `iss` (RFC 9207) the issuer the request went to, byte
+for byte; a redirect without `iss` is refused when the server's metadata
+declares `authorization_response_iss_parameter_supported`. With endpoints
+pinned and no `issuer` there is nothing to compare `iss` with, and it is not
+checked. The `state` and the PKCE verifier are drawn from the kernel's
+random source with no fallback: a host that cannot read it fails the login.
+
+**Client authentication.** At the token and revocation endpoints a
+confidential client sends its `client_secret` in the form body. Set
+`client_auth` to change how:
+
+```yaml
+# fragment: under mcp.servers[].auth (kind: oauth2):
+client_auth:
+  method: private_key_jwt          # private_key_jwt (default) | client_secret_basic | client_secret_post
+  key: "{{secret-file:/run/secrets/agentd-client.pem}}"   # PKCS#8 P-256 key; private_key_jwt only
+  kid: agentd-2026-10              # optional; default the key's RFC 7638 thumbprint
+  assertion_aud: token_endpoint    # token_endpoint (default) | issuer
+```
+
+`private_key_jwt` (RFC 7523) sends no secret: each token request carries a
+fresh ES256 assertion signed with `key`, good for 60 seconds, with `iss` and
+`sub` the `client_id`, `aud` the token endpoint (or the `issuer`), and a
+random `jti`. Register the key's public half with the authorization server.
+`client_secret_basic` sends the `client_secret` in an `Authorization: Basic`
+header instead of the body. `client_auth` applies to the `device` and
+`authorization_code` grants; a `client_credentials` grant sends its
+`client_secret` in the body and refuses `client_auth` at load.
 
 The daemon discovers them at the first request that needs them — the first
 token fetch of a `client_credentials` grant, the first refresh of a login —
@@ -236,7 +283,19 @@ An A2A peer can be logged into only through a service entry: give the peer
 so an oauth2 `device` or `authorization_code` grant there, or one with no
 `grant`, is refused at load.
 
-`agentd --logout <target>` removes a cached credential.
+`agentd --logout <target>` deletes the cached credential from the cache,
+then revokes it at the authorization server that issued it, when that
+server's metadata lists a `revocation_endpoint` (RFC 7009) — the refresh
+token when there is one, which at most servers ends the access tokens it
+issued too. The delete comes first, so a logout cut short — a server that
+does not answer, a Ctrl-C — has still removed it. The server is the
+block's `issuer`, or the one RFC 9728 finds for the resource; with neither,
+or no revocation endpoint, the logout is local only. A revocation that
+fails is reported, and the logout exits 2 saying the token stays good at
+the server until it expires. A build without the `oauth` feature only
+deletes. A daemon running at the time serves the access token it holds
+until it is due, then finds no login: it fails its requests, naming the
+`--login` that fixes it, and does not renew.
 
 The device grant, from login to the daemon's refresh:
 
@@ -258,18 +317,36 @@ sequenceDiagram
   D->>C: reads them when it has no usable token
   D->>E: request with the bearer token
   D->>AS: refreshes before the token expires
+  D->>C: writes the renewal back before using it
 ```
 
 **The cache** is one file per target, mode `0600`, in `$AGENTD_CRED_DIR`, else
 `$XDG_STATE_HOME/agentd/creds`, else `~/.local/state/agentd/creds`. Log in as
 the user the daemon runs as, or point both at the same `AGENTD_CRED_DIR`. The
-daemon refreshes a token in memory a minute before it expires, using the
-refresh token; a refreshed token is not written back to the cache. Whenever
-the daemon holds no usable token it reads the cache again, so a login made
-while it runs is used by the next request, with no reload or restart. A
-restart reads the cache again too, so after a restart the daemon refreshes
-from the refresh token the login stored. If your authorization server issues
-single-use refresh tokens, plan on logging in again after a restart.
+daemon refreshes a token a minute before it expires, using the refresh
+token, and writes the result back to the cache before it uses it: a server
+that rotates refresh tokens has its new one kept, and a refresh response
+that carries none keeps the old one. Every process of the daemon renews from
+the refresh token the cache holds, so a restart, or a turn worker, renews
+with the token the server last issued. A renewal holds a lock on the
+target's entry — an advisory `flock` on a `.lock` file beside it — so the
+processes and connections that find the token due at once renew it once:
+the first renews, and the rest wait and take what it wrote back. Each
+presenting the same refresh token would have a server that rotates refuse
+all but one, or end the grant as stolen. `--login` and `--logout` take the
+same lock, so a renewal in flight neither overwrites a new login nor brings
+back one a logout removed. Each write replaces the file whole, through a
+`0600` temp file renamed over it, so a process reading it never sees part
+of one, and a crash mid-write leaves the old. A write that fails leaves the
+refresh unused, and each request fails, naming the cause, until the write
+succeeds. Whenever the daemon holds no usable token it reads the cache
+again, so a login made while it runs is used by the next request, with no
+reload or restart.
+
+**Waits the server asks for.** A token endpoint that answers `429` or `503`
+with `Retry-After` (seconds or an HTTP date) is not asked again before the
+wait is over, five minutes at most: a refresh in that time fails at once,
+naming the wait, and a device-login poll waits it out.
 
 ## AWS SigV4
 
@@ -364,7 +441,7 @@ The load catches what it can see, and exits 2 before any side effect:
 
 - a `{{secret:…}}` or `{{secret-file:…}}` reference that does not resolve;
 - an `auth:` block missing the fields its kind and grant need;
-- an inline `token`, `value` or `client_secret` in any `auth:` block, and an
+- an inline `token`, `value`, `client_secret` or `client_auth.key` in any `auth:` block, and an
   inline `intelligence.token`, provider `token` or `oauth.client_secret` in a
   config file;
 - an `auth:` block on a model connection, an MCP server or an A2A peer in a
@@ -402,8 +479,18 @@ carries the error:
 ```
 
 The job then exits 4. A `401` from an endpoint means the credential was sent
-and refused: a token that is wrong, revoked or short of the access the
-endpoint needs. The [CLI reference](cli.md) has every exit code.
+and refused: a token that is wrong or revoked. A `403` means it was accepted
+and the request is beyond it. An MCP server's challenge says which: a `401`
+or `403` with `WWW-Authenticate: Bearer error="…"` fails the call as
+`HTTP 403: insufficient_scope (needs scope "…")`, `sign_in_required` or
+`invalid_token`, after the credential's signer has been shown it and had
+nothing to retry with. An MCP server that answers `429` or `503` with
+`Retry-After` is sent nothing more — no call, no handshake, no notification
+stream — until the wait is over, five minutes at most; a request in that
+time fails at once, unsent. A model endpoint's `Retry-After` of up to 30
+seconds is waited out before the retry, and a longer one takes the endpoint
+out of rotation for it, so another endpoint serves meanwhile. The
+[CLI reference](cli.md) has every exit code.
 
 ## Field reference
 
@@ -418,6 +505,7 @@ endpoint needs. The [CLI reference](cli.md) has every exit code.
 | `authorization_url` | `oauth2` | authorization endpoint for `grant: authorization_code` |
 | `client_id` | `oauth2` | client id (required) |
 | `client_secret` | `oauth2` | client secret; must be a secret reference; required for `client_credentials` |
+| `client_auth` | `oauth2` | `{method, key, kid, assertion_aud}`: `private_key_jwt` (default) with a PKCS#8 P-256 `key` (a secret reference), `client_secret_basic` or `client_secret_post`; not with `client_credentials` |
 | `grant` | `oauth2` | `device` (default), `authorization_code` or `client_credentials` |
 | `scopes` | `oauth2` | requested scopes |
 | `audience` | `oauth2` | `audience` parameter sent with the device authorization request, for authorization servers that want one |

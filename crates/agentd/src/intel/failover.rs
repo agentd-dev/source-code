@@ -610,4 +610,76 @@ mod tests {
             "4xx must surface on the first dial, not be retried"
         );
     }
+
+    /// Answers each connection in turn with a status and an optional
+    /// `Retry-After`, and records when each request arrived.
+    fn serve_retry_after(
+        answers: Vec<(u16, Option<&'static str>)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Instant>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let at = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for (status, retry_after) in answers {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                at.lock().unwrap().push(Instant::now());
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let body = if status == 200 {
+                    r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#
+                } else {
+                    r#"{"error":{"message":"slow down"}}"#
+                };
+                let extra = retry_after
+                    .map(|v| format!("Retry-After: {v}\r\n"))
+                    .unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    /// A `429` with `Retry-After: 1` is retried in place no sooner than the
+    /// second the provider asked for, where the backoff alone is 250ms.
+    #[test]
+    fn a_retry_after_is_waited_out_before_the_retry() {
+        let (ep, seen) = serve_retry_after(vec![(429, Some("1")), (200, None)]);
+        let mut list = list_of(&[ep]);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(5), None, None);
+        assert!(r.outcome.is_ok(), "{:?}", r.outcome.err());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[1] - seen[0] >= Duration::from_millis(950),
+            "retried after {:?}",
+            seen[1] - seen[0]
+        );
+    }
+
+    /// A wait longer than an in-place retry takes ends the retry: a sibling
+    /// serves, and the endpoint that asked is sent nothing until it passes.
+    #[test]
+    fn a_long_retry_after_keeps_the_endpoint_out_of_rotation() {
+        let (slow, asked) = serve_retry_after(vec![(503, Some("120")), (200, None)]);
+        let good = serve_sequence(vec![200, 200]);
+        let mut list = list_of(&[slow, good]);
+        let started = Instant::now();
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(5), None, None);
+        assert_eq!(r.served_by, Some(1), "{:?}", r.outcome.err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "not waited out in place"
+        );
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(5), None, None);
+        assert_eq!(r.served_by, Some(1));
+        assert_eq!(asked.lock().unwrap().len(), 1, "nothing more sent to it");
+        assert!(!list.ep(0).health.available(list.breaker_config()));
+    }
 }

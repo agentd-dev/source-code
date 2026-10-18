@@ -2652,6 +2652,12 @@ pub struct Auth {
     /// (the device grant needs no secret).
     #[serde(default)]
     pub client_secret: Option<Secret>,
+    /// How the client authenticates at the token and revocation endpoints:
+    /// `private_key_jwt` with an ES256 key, or the `client_secret` in a
+    /// `Basic` header or the form body. Unset, a `client_secret` goes in the
+    /// form body.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuth>,
     /// `device` (default, interactive), `authorization_code`, or
     /// `client_credentials` (headless M2M).
     #[serde(default)]
@@ -2731,6 +2737,20 @@ impl Auth {
             authorization_url: self.authorization_url.clone(),
             client_id: self.client_id.clone(),
             client_secret: self.client_secret.as_ref().map(|s| s.0.clone()),
+            client_auth: self.client_auth.as_ref().map(|c| super::ClientAuthSpec {
+                method: match c.method {
+                    ClientAuthMethod::PrivateKeyJwt => "private_key_jwt",
+                    ClientAuthMethod::ClientSecretBasic => "client_secret_basic",
+                    ClientAuthMethod::ClientSecretPost => "client_secret_post",
+                }
+                .to_string(),
+                key: c.key.as_ref().map(|k| k.0.clone()),
+                kid: c.kid.clone(),
+                assertion_aud: match c.assertion_aud {
+                    AssertionAud::TokenEndpoint => None,
+                    AssertionAud::Issuer => Some("issuer".to_string()),
+                },
+            }),
             scopes: self.scopes.clone(),
             audience: self.audience.clone(),
             token: self.token.as_ref().map(|s| s.0.clone()),
@@ -2762,6 +2782,49 @@ pub enum AuthKind {
     Aws,
     /// SPIFFE/SPIRE workload identity — a JWT-SVID bearer, or X.509-SVID mTLS.
     Spiffe,
+}
+
+/// An `oauth2` block's client authentication (RFC 6749 §2.3, RFC 7523 §2.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAuth {
+    #[serde(default)]
+    pub method: ClientAuthMethod,
+    /// `private_key_jwt`: the PKCS#8 P-256 key, as a secret reference
+    /// (`{{secret-file:…}}`), read at each token request.
+    #[serde(default)]
+    pub key: Option<Secret>,
+    /// `private_key_jwt`: the `kid` the authorization server knows the key
+    /// by; unset, its RFC 7638 thumbprint.
+    #[serde(default)]
+    pub kid: Option<String>,
+    /// `private_key_jwt`: what the assertion's `aud` names.
+    #[serde(default)]
+    pub assertion_aud: AssertionAud,
+}
+
+/// How a client authenticates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMethod {
+    /// A short-lived ES256 JWT signed with the client's own key.
+    #[default]
+    PrivateKeyJwt,
+    /// The `client_secret` in an `Authorization: Basic` header.
+    ClientSecretBasic,
+    /// The `client_secret` in the form body.
+    ClientSecretPost,
+}
+
+/// The `aud` of a `private_key_jwt` assertion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionAud {
+    /// The token endpoint URL.
+    #[default]
+    TokenEndpoint,
+    /// The issuer identifier; needs `issuer`.
+    Issuer,
 }
 
 /// The OAuth 2.1 grant type.
@@ -6596,10 +6659,12 @@ pub struct Diagnostics {
 fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Credential fields must be `{{secret:…}}` references, never inline.
+    let key = auth.client_auth.as_ref().and_then(|c| c.key.clone());
     for (field, s) in [
         ("client_secret", &auth.client_secret),
         ("token", &auth.token),
         ("value", &auth.value),
+        ("client_auth.key", &key),
     ] {
         if let Some(sec) = s
             && !sec.0.trim().is_empty()
@@ -6609,6 +6674,9 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
                 "{ctx}: auth.{field} carries an inline credential; use a {{{{secret:…}}}} reference"
             ));
         }
+    }
+    if let Some(c) = &auth.client_auth {
+        out.extend(validate_client_auth(auth, c, ctx));
     }
     match auth.kind {
         AuthKind::Static => {
@@ -6696,6 +6764,58 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
                         ));
                     }
                 }
+            }
+        }
+    }
+    out
+}
+
+/// An `oauth2` block's `client_auth`: the fields its method needs, and none
+/// it does not.
+fn validate_client_auth(auth: &Auth, c: &ClientAuth, ctx: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if auth.kind != AuthKind::Oauth2 {
+        out.push(format!("{ctx}: auth.client_auth is for auth.kind oauth2"));
+        return out;
+    }
+    if auth.grant == Some(OAuthGrant::ClientCredentials) {
+        out.push(format!(
+            "{ctx}: auth.client_auth applies to the device and authorization_code grants; a client_credentials grant sends its client_secret in the form body"
+        ));
+    }
+    match c.method {
+        ClientAuthMethod::PrivateKeyJwt => {
+            if c.key.is_none() {
+                out.push(format!(
+                    "{ctx}: auth.client_auth private_key_jwt needs `key` (a {{{{secret-file:…}}}} PKCS#8 key)"
+                ));
+            }
+            if auth.client_secret.is_some() {
+                out.push(format!(
+                    "{ctx}: auth.client_auth private_key_jwt sends no client_secret; remove `client_secret`"
+                ));
+            }
+            if c.assertion_aud == AssertionAud::Issuer && auth.issuer.is_none() {
+                out.push(format!(
+                    "{ctx}: auth.client_auth assertion_aud issuer needs `issuer`"
+                ));
+            }
+        }
+        ClientAuthMethod::ClientSecretBasic | ClientAuthMethod::ClientSecretPost => {
+            if auth.client_secret.is_none() {
+                out.push(format!(
+                    "{ctx}: auth.client_auth {} needs `client_secret`",
+                    match c.method {
+                        ClientAuthMethod::ClientSecretBasic => "client_secret_basic",
+                        _ => "client_secret_post",
+                    }
+                ));
+            }
+            if c.key.is_some() || c.kid.is_some() || c.assertion_aud != AssertionAud::TokenEndpoint
+            {
+                out.push(format!(
+                    "{ctx}: auth.client_auth key, kid and assertion_aud are for private_key_jwt"
+                ));
             }
         }
     }
@@ -14715,6 +14835,78 @@ mod tests {
         assert!(
             format!("{e}").contains("kind: intelligence"),
             "an uncatalogued intelligence endpoint is refused: {e}"
+        );
+    }
+
+    /// `client_auth` asks for the fields its method uses and refuses the
+    /// rest; its key is a credential, so a file names it by reference only;
+    /// and it lowers to the runtime spec unchanged.
+    #[test]
+    fn client_auth_takes_what_its_method_needs() {
+        let check = |v: serde_json::Value| {
+            let auth: Auth = serde_json::from_value(v).unwrap();
+            (validate_auth_block(&auth, "mcp server 's'"), auth)
+        };
+        let base = json!({"kind": "oauth2", "issuer": "https://as.example", "client_id": "c"});
+        let with = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let (errs, auth) = check(with(json!({"client_auth": {
+            "key": "{{secret-file:/run/k.pem}}", "kid": "k1", "assertion_aud": "issuer"}})));
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            auth.to_spec().client_auth,
+            Some(super::super::ClientAuthSpec {
+                method: "private_key_jwt".into(),
+                key: Some("{{secret-file:/run/k.pem}}".into()),
+                kid: Some("k1".into()),
+                assertion_aud: Some("issuer".into()),
+            })
+        );
+        for (extra, want) in [
+            (json!({"client_auth": {}}), "needs `key`"),
+            (
+                json!({"client_auth": {"key": "-----BEGIN PRIVATE KEY-----"}}),
+                "auth.client_auth.key carries an inline credential",
+            ),
+            (
+                json!({"client_auth": {"key": "{{secret:K}}"}, "client_secret": "{{secret:S}}"}),
+                "sends no client_secret",
+            ),
+            (
+                json!({"client_auth": {"method": "client_secret_basic"}}),
+                "client_secret_basic needs `client_secret`",
+            ),
+            (
+                json!({"client_auth": {"method": "client_secret_post", "kid": "k"}, "client_secret": "{{secret:S}}"}),
+                "are for private_key_jwt",
+            ),
+            (
+                json!({"client_auth": {"key": "{{secret:K}}"}, "grant": "client_credentials", "client_secret": "{{secret:S}}"}),
+                "client_credentials grant sends its client_secret",
+            ),
+        ] {
+            let (errs, _) = check(with(extra.clone()));
+            assert!(errs.iter().any(|e| e.contains(want)), "{extra}: {errs:?}");
+        }
+        let (errs, _) = check(
+            json!({"kind": "oauth2", "token_url": "https://as.example/t",
+            "client_id": "c", "client_auth": {"key": "{{secret:K}}", "assertion_aud": "issuer"}}),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("assertion_aud issuer needs `issuer`")),
+            "{errs:?}"
+        );
+        let (errs, _) = check(json!({"kind": "static", "token": "{{secret:T}}",
+            "client_auth": {"key": "{{secret:K}}"}}));
+        assert!(
+            errs.iter().any(|e| e.contains("is for auth.kind oauth2")),
+            "{errs:?}"
         );
     }
 

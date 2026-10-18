@@ -221,7 +221,10 @@ logged in to mcp:tickets — token cached in /home/you/.local/state/agentd/creds
   `AGENTD_CRED_DIR`.
 - `grant: authorization_code` prints a URL to open in a browser and catches
   the redirect on a one-shot `127.0.0.1` listener instead of showing a code.
-- `agentd --logout mcp:tickets` removes the cached credential.
+- `agentd --logout mcp:tickets` removes the cached credential, then
+  revokes it at the authorization server, when its metadata lists a
+  revocation endpoint. A daemon running at the time stops at its next
+  renewal.
 - A server that references a catalog entry caches under `service:<entry>`;
   `--login mcp:<name>` for it logs in to that entry.
 - `--login` needs the `oauth` build feature, which the release binaries and

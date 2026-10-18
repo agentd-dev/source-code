@@ -63,7 +63,8 @@ anything else before it spawns a process (exit 2). The client binary is
 ## Asks
 
 An ask answers a question and exits. None of them binds a socket or calls a
-model, and only `--login` dials a server: the token endpoint. Every ask reads
+model, and only `--login` and `--logout` dial a server: the authorization
+server's metadata, token and revocation endpoints. Every ask reads
 the configuration files you name, so a file that does not parse is exit 2 even
 for `--help`. Only `--validate-config`, `--capabilities` and
 `--effective-config` also run validation.
@@ -81,7 +82,7 @@ for `--help`. Only `--validate-config`, `--capabilities` and
 | `--extensions` | Every A2A extension and binding URI agentd publishes, with its spec and schema location | stdout | 0 |
 | `--extension-schema <name>` | The schema bundle of one extension (`command`, `events`, `task-annotations`) | stdout | 0, or 2 for an unknown name |
 | `--login <target>` | Runs an interactive OAuth device login and caches the token. Targets: `intelligence`, `intelligence:<provider>`, `mcp:<name>`, `service:<name>`. Needs the `oauth` feature. | stdout | 0, or 2 on failure |
-| `--logout <target>` | Evicts a cached credential | stdout | 0, or 2 on failure |
+| `--logout <target>` | Evicts a cached credential, then revokes it at its authorization server when the server's metadata lists a revocation endpoint (RFC 7009; needs the `oauth` feature). A revocation that fails exits 2, the credential evicted. | stdout | 0, or 2 on failure |
 
 > **Note.** `--validate-config` writes its verdict to **stderr**. A CI step
 > that captures stdout to check validity sees nothing; branch on the exit

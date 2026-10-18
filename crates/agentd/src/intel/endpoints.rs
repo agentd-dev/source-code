@@ -609,7 +609,13 @@ impl Endpoint {
         // the run deadline. The body and headers, including the AAuth signature
         // over that body, are built once above and unchanged across attempts, so
         // every re-dial sends byte-identical bytes and the signature stays valid.
+        // A `Retry-After` on the 429 or 5xx is the provider's own wait, and no
+        // retry goes sooner: one up to `IN_PLACE_WAIT_MAX` is waited out here,
+        // and a longer one ends the retry and keeps the endpoint out of
+        // rotation until it passes (capped at `RETRY_AFTER_MAX`), so a sibling
+        // serves meanwhile.
         const TRANSIENT_RETRIES: u32 = 2;
+        const IN_PLACE_WAIT_MAX: Duration = Duration::from_secs(30);
         let mut attempt: u32 = 0;
         let (resp, latency) = loop {
             let start = Instant::now();
@@ -629,15 +635,22 @@ impl Endpoint {
             }
             // Short exponential backoff (250ms, 500ms) — enough to ride out a
             // blip, bounded so total added wait stays well under a second, and
-            // never past the run's deadline.
-            let delay = Duration::from_millis(250 * (1u64 << attempt));
-            if super::failover::is_transient_status(resp.status)
+            // never past the run's deadline — or the provider's `Retry-After`.
+            let transient = super::failover::is_transient_status(resp.status);
+            let asked = resp.retry_after().filter(|_| transient);
+            let delay =
+                Duration::from_millis(250 * (1u64 << attempt)).max(asked.unwrap_or_default());
+            if transient
                 && attempt < TRANSIENT_RETRIES
+                && delay <= IN_PLACE_WAIT_MAX
                 && deadline.is_none_or(|d| Instant::now() + delay < d)
             {
                 attempt += 1;
                 std::thread::sleep(delay);
                 continue;
+            }
+            if let Some(wait) = asked {
+                self.health.hold_for(wait.min(http::RETRY_AFTER_MAX));
             }
             let snippet: String = resp.body_str().chars().take(512).collect();
             return Err(IntelError::Http(resp.status, snippet));

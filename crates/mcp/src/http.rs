@@ -100,6 +100,19 @@ pub enum HttpError {
     /// configured to present ([`RequestSigner::sign`] failed), so the request
     /// was not sent. Carries the signer's cause.
     Credential(String),
+    /// The server refused the request's credential (`401`) or what it may do
+    /// (`403`) with a `WWW-Authenticate` challenge naming an error code —
+    /// `invalid_token`, `insufficient_scope`, `sign_in_required` — after the
+    /// signer, consulted, had nothing to retry with.
+    Refused(Challenge),
+    /// The server answered `429` or `503` with a `Retry-After`. Every request
+    /// on this socket fails at once, unsent, until the wait is over: then
+    /// `sent` is `false` and `wait` is what is left of it.
+    RetryAfter {
+        status: u16,
+        wait: Duration,
+        sent: bool,
+    },
 }
 
 impl std::fmt::Display for HttpError {
@@ -114,10 +127,154 @@ impl std::fmt::Display for HttpError {
                 write!(f, "mcp-http: server has no GET SSE notification stream")
             }
             HttpError::Credential(m) => write!(f, "mcp-http: not sent, no credential: {m}"),
+            HttpError::Refused(c) => write!(f, "mcp-http: server returned HTTP {}: {c}", c.status),
+            HttpError::RetryAfter {
+                status,
+                wait,
+                sent: true,
+            } => write!(
+                f,
+                "mcp-http: server returned HTTP {status} and asked for no request for {}s",
+                wait.as_secs()
+            ),
+            HttpError::RetryAfter {
+                status,
+                wait,
+                sent: false,
+            } => write!(
+                f,
+                "mcp-http: not sent: the server asked for no request for {}s more (HTTP {status})",
+                wait.as_secs().max(1)
+            ),
         }
     }
 }
 impl std::error::Error for HttpError {}
+
+/// One `WWW-Authenticate` challenge (RFC 9110 §11.6.1, the RFC 6750 §3
+/// parameters): its scheme and the error code and scope it names. The
+/// `error_description` is not kept: it is the server's prose, and a typed
+/// error carries only what a caller can act on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Challenge {
+    pub status: u16,
+    /// `Bearer`, `DPoP`, … as the server wrote it.
+    pub scheme: String,
+    pub error: Option<String>,
+    /// The scopes the server says the request needs (`insufficient_scope`).
+    pub scope: Option<String>,
+}
+
+impl Challenge {
+    /// The challenge of a `WWW-Authenticate` value that names an `error`:
+    /// the first such one when the header lists several, so a `DPoP` offer
+    /// beside a `Bearer error=…` does not hide the error. `None` when none
+    /// does — a bare `Bearer realm=…` asks for a credential and says nothing
+    /// a retry could change.
+    pub fn parse(status: u16, header: &str) -> Option<Challenge> {
+        challenges(header)
+            .into_iter()
+            .map(|(scheme, params)| {
+                let get = |k: &str| {
+                    params
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(k))
+                        .map(|(_, v)| v.clone())
+                };
+                Challenge {
+                    status,
+                    scheme,
+                    error: get("error"),
+                    scope: get("scope"),
+                }
+            })
+            .find(|c| c.error.is_some())
+    }
+}
+
+impl std::fmt::Display for Challenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error.as_deref().unwrap_or("refused"))?;
+        if let Some(scope) = &self.scope {
+            write!(f, " (needs scope \"{scope}\")")?;
+        }
+        Ok(())
+    }
+}
+
+/// Split a `WWW-Authenticate` value into its challenges: a scheme token,
+/// then `name=value` parameters (a token or a quoted string), commas between
+/// them and between challenges. A `token68` credential is skipped.
+fn challenges(header: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let b = header.as_bytes();
+    let blank = |c: u8| matches!(c, b' ' | b'\t');
+    let token_end = |mut i: usize| {
+        while i < b.len() && !matches!(b[i], b' ' | b'\t' | b',' | b'=' | b'"') {
+            i += 1;
+        }
+        i
+    };
+    let mut out: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if blank(b[i]) || b[i] == b',' {
+            i += 1;
+            continue;
+        }
+        let end = token_end(i);
+        if end == i {
+            // A stray `=` or quote: step over it.
+            i += 1;
+            continue;
+        }
+        let word = header[i..end].to_string();
+        let mut j = end;
+        while j < b.len() && blank(b[j]) {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'=') {
+            // A bare token: the scheme of the next challenge.
+            out.push((word, Vec::new()));
+            i = end;
+            continue;
+        }
+        if out.is_empty() || matches!(b.get(j + 1), Some(b'=') | None) {
+            // `token68=`: a credential, not a parameter.
+            i = j;
+            while i < b.len() && b[i] == b'=' {
+                i += 1;
+            }
+            continue;
+        }
+        // `name=value`: a parameter of the challenge in progress.
+        i = j + 1;
+        while i < b.len() && blank(b[i]) {
+            i += 1;
+        }
+        let value = if b.get(i) == Some(&b'"') {
+            i += 1;
+            let mut v = Vec::new();
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    i += 1;
+                }
+                v.push(b[i]);
+                i += 1;
+            }
+            i += 1;
+            String::from_utf8_lossy(&v).into_owned()
+        } else {
+            let end = token_end(i);
+            let v = header[i..end].to_string();
+            i = end;
+            v
+        };
+        if let Some((_, params)) = out.last_mut() {
+            params.push((word, value));
+        }
+    }
+    out
+}
 
 /// The `Host` authority (host[:port]) of an MCP endpoint URL — the `@authority`
 /// AAuth signs over. Best-effort (a parse failure yields an empty string).
@@ -252,6 +409,13 @@ pub struct AuthResponse {
     pub location: Option<String>,
     /// A `Signature-Error` / `AAuth-Error` detail (diagnostics only).
     pub error: Option<String>,
+    /// The `WWW-Authenticate` value: an RFC 6750 challenge (`error`,
+    /// `scope`, `resource_metadata`) or an RFC 9449 `DPoP` one.
+    pub www_authenticate: Option<String>,
+    /// A `DPoP-Nonce` the server issued (RFC 9449 §8).
+    pub dpop_nonce: Option<String>,
+    /// How long the server asked the client to wait (`Retry-After`).
+    pub retry_after: Option<Duration>,
 }
 
 /// A per-request signer: AAuth, or a credential the caller presents (a
@@ -259,7 +423,8 @@ pub struct AuthResponse {
 /// dial (the returned `(name, value)` pairs become request headers — the
 /// RFC 9421 `Signature-Input`/`Signature`/`Signature-Key`, an `Authorization`),
 /// and [`on_response`] after, to react to the server's `AAuth-Requirement`
-/// (adopt an access token, run the Person-Server flow) and re-sign+retry.
+/// (adopt an access token, run the Person-Server flow) or its `401`/`403`
+/// challenge (renew the credential it refused) and re-sign+retry.
 /// Deliberately a trait, not an implementation: the crypto lives in the
 /// caller, so this crate stays free of any crypto dependency.
 pub trait RequestSigner: Send + Sync {
@@ -278,11 +443,13 @@ pub trait RequestSigner: Send + Sync {
         path: &str,
         body: &[u8],
     ) -> Result<Vec<(String, String)>, String>;
-    /// React to a response: adopt an `AAuth-Access` token, satisfy
-    /// an `AAuth-Requirement` (e.g. run the Person-Server exchange), and return
-    /// `true` iff the request should be RE-SIGNED and retried (a requirement was
-    /// newly satisfied). The default reacts to nothing. May do network I/O
-    /// (the PS token exchange).
+    /// React to a response — every `401`, `403` and `202`, and any carrying an
+    /// AAuth header: adopt an `AAuth-Access` token, satisfy an
+    /// `AAuth-Requirement` (e.g. run the Person-Server exchange), renew a
+    /// credential a `WWW-Authenticate` challenge refused, and return `true`
+    /// iff the request should be RE-SIGNED and retried (something was newly
+    /// satisfied). The default reacts to nothing. May do network I/O (the PS
+    /// token exchange, a token renewal).
     fn on_response(&self, _resp: &AuthResponse, _authority: &str) -> bool {
         false
     }
@@ -329,6 +496,9 @@ pub struct HttpTransport {
     signer: Option<std::sync::Arc<dyn RequestSigner>>,
     /// The host's `_meta` for every request; see [`RequestMeta`].
     request_meta: Option<RequestMeta>,
+    /// The instant before which the server asked for no request (a `429` or
+    /// `503` with `Retry-After`), and the status that asked.
+    not_before: Mutex<Option<(std::time::Instant, u16)>>,
 }
 
 impl HttpTransport {
@@ -342,6 +512,7 @@ impl HttpTransport {
             session_lost: AtomicBool::new(false),
             signer: None,
             request_meta: None,
+            not_before: Mutex::new(None),
         }
     }
 
@@ -361,6 +532,8 @@ impl HttpTransport {
             session_lost: AtomicBool::new(false),
             signer: self.signer.clone(),
             request_meta: self.request_meta.clone(),
+            // The wait is the server's, not the lost session's.
+            not_before: Mutex::new(*self.not_before.lock().unwrap_or_else(|e| e.into_inner())),
         }
     }
 
@@ -386,6 +559,39 @@ impl HttpTransport {
         if status == 404 && carried_session {
             self.session_lost.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// The wait still to run before this socket may send, as the error a
+    /// request gets for asking during it: unsent.
+    fn waiting(&self) -> Result<(), HttpError> {
+        let mut slot = self.not_before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, status)) = *slot {
+            let now = std::time::Instant::now();
+            if now < at {
+                return Err(HttpError::RetryAfter {
+                    status,
+                    wait: at - now,
+                    sent: false,
+                });
+            }
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    /// Keep a `429` or `503`'s `Retry-After` as this socket's wait, cut to
+    /// [`http::RETRY_AFTER_MAX`], and return the error the request that drew
+    /// it gets; `None` for any other answer.
+    fn note_retry_after(&self, status: u16, retry_after: Option<Duration>) -> Option<HttpError> {
+        let wait = retry_after.filter(|_| matches!(status, 429 | 503))?;
+        let wait = wait.min(http::RETRY_AFTER_MAX);
+        *self.not_before.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now() + wait, status));
+        Some(HttpError::RetryAfter {
+            status,
+            wait,
+            sent: true,
+        })
     }
 
     /// Install a per-request signer. Builder-style; call before use.
@@ -504,9 +710,12 @@ impl HttpTransport {
     /// rides: a non-2xx `application/json` body carrying an `error` with an
     /// integer `code` is returned as the response, so the caller sees the
     /// server's own error rather than the bare status. `401` and `403` are the
-    /// exception — they stay [`HttpError::Status`], so an auth failure is never
-    /// taken for an answer. Any other non-2xx is [`HttpError::Status`], and a
-    /// 2xx to a request with an empty body is [`HttpError::NoResponse`].
+    /// exception — an auth failure is never taken for an answer: one whose
+    /// `WWW-Authenticate` names an error is [`HttpError::Refused`], and any
+    /// other [`HttpError::Status`]. A `429` or `503` with `Retry-After` is
+    /// [`HttpError::RetryAfter`], and every request on this socket waits it
+    /// out. Any other non-2xx is [`HttpError::Status`], and a 2xx to a request
+    /// with an empty body is [`HttpError::NoResponse`].
     ///
     /// Echoes `Mcp-Session-Id`, and adopts it only from the answer to an
     /// `initialize` request.
@@ -628,6 +837,8 @@ impl HttpTransport {
         on_notification: &mut F,
         hangup: &Hangup,
     ) -> Result<SendOutcome, HttpError> {
+        // A server that asked for a wait gets nothing until it is over.
+        self.waiting()?;
         // Signed before the dial: a credential the signer cannot produce
         // fails the request here, unsent. The owned strings must outlive the
         // borrowed header slice, so `signed` stays in scope until it is sent.
@@ -684,11 +895,14 @@ impl HttpTransport {
             *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
 
-        // AAuth response reaction: let the signer adopt an access
-        // token / satisfy a requirement. `on_response` returns whether a retry
-        // would now differ. Only consulted when a signer is present AND the
-        // response carries an AAuth signal (a requirement, an access token, or a
-        // 401/202) — a plain success skips it.
+        // The signer's reaction: adopt an AAuth access token, satisfy a
+        // requirement, renew a credential the server refused. `on_response`
+        // returns whether a retry would now differ. Only consulted when a
+        // signer is present AND the response carries an auth signal (an AAuth
+        // requirement, an access token, a 401, 403 or 202) — a plain success
+        // skips it.
+        let www_authenticate = resp.header("www-authenticate").map(str::to_string);
+        let retry_after = resp.retry_after();
         if let Some(signer) = &self.signer {
             let ar = AuthResponse {
                 status: resp.status,
@@ -699,11 +913,13 @@ impl HttpTransport {
                     .header("signature-error")
                     .or_else(|| resp.header("aauth-error"))
                     .map(str::to_string),
+                www_authenticate: www_authenticate.clone(),
+                dpop_nonce: resp.header("dpop-nonce").map(str::to_string),
+                retry_after,
             };
             if ar.requirement.is_some()
                 || ar.access.is_some()
-                || resp.status == 401
-                || resp.status == 202
+                || matches!(resp.status, 401 | 403 | 202)
             {
                 let authority = self.endpoint.host_header().to_string();
                 if signer.on_response(&ar, &authority) {
@@ -716,6 +932,15 @@ impl HttpTransport {
             // First, so a `404` on a session marks it lost whatever the body.
             let status = resp.status;
             self.note_status(status, session.is_some());
+            let throttled = self.note_retry_after(status, retry_after);
+            // A refusal that says why is the error a caller can act on.
+            if matches!(status, 401 | 403)
+                && let Some(c) = www_authenticate
+                    .as_deref()
+                    .and_then(|h| Challenge::parse(status, h))
+            {
+                return Ok(SendOutcome::Error(HttpError::Refused(c)));
+            }
             // A server that refuses a request in JSON-RPC — a version it does
             // not speak, a header that does not match the body — says why in
             // the body, and that is the request's answer: the code is what a
@@ -738,7 +963,9 @@ impl HttpTransport {
             {
                 return Ok(SendOutcome::Result(Some(v)));
             }
-            return Ok(SendOutcome::Error(HttpError::Status(status)));
+            return Ok(SendOutcome::Error(
+                throttled.unwrap_or(HttpError::Status(status)),
+            ));
         }
 
         // A notification POST is acknowledged with an empty body (often 202).
@@ -803,7 +1030,9 @@ impl HttpTransport {
         // challenge/re-sign loop stays on the POST path: this dial only ever
         // happens post-initialize, so the signer has already satisfied whatever
         // the server required and signs from what it learned there. Signed
-        // before the dial, as a POST is.
+        // before the dial, as a POST is — and not dialled at all while the
+        // server's `Retry-After` runs.
+        self.waiting()?;
         let signed = self.auth_headers("GET", b"")?;
         // The raw handle goes unused: this stream ends when its reader stops.
         let (stream, _) = self.connect(read_timeout)?;
@@ -834,7 +1063,8 @@ impl HttpTransport {
         .map_err(HttpError::Http)?;
         if !resp.is_success() {
             self.note_status(resp.status, session.is_some());
-            return Err(HttpError::Status(resp.status));
+            let throttled = self.note_retry_after(resp.status, resp.retry_after());
+            return Err(throttled.unwrap_or(HttpError::Status(resp.status)));
         }
         if !resp.is_event_stream() {
             return Err(HttpError::NoEventStream);
@@ -915,6 +1145,44 @@ mod tests {
     fn parse_rejects_bad_endpoints() {
         assert!(McpEndpoint::parse("ftp://x/").is_err());
         assert!(McpEndpoint::parse("not-a-url").is_err());
+    }
+
+    /// The RFC 6750 §3 examples, a `DPoP` offer beside a `Bearer` error, and
+    /// a header that names no error.
+    #[test]
+    fn a_challenge_names_its_error_and_scope() {
+        let c = Challenge::parse(
+            403,
+            r#"Bearer error="insufficient_scope", scope="files:read files:write", resource_metadata="https://rs/.well-known/oauth-protected-resource""#,
+        )
+        .expect("an error is named");
+        assert_eq!(c.scheme, "Bearer");
+        assert_eq!(c.error.as_deref(), Some("insufficient_scope"));
+        assert_eq!(c.scope.as_deref(), Some("files:read files:write"));
+        assert_eq!(
+            c.to_string(),
+            r#"insufficient_scope (needs scope "files:read files:write")"#
+        );
+        let c = Challenge::parse(
+            401,
+            r#"DPoP algs="ES256 PS256", Bearer realm="x", error="invalid_token", error_description="The access token expired""#,
+        )
+        .expect("the Bearer challenge's error");
+        assert_eq!(
+            (c.scheme.as_str(), c.error.as_deref()),
+            ("Bearer", Some("invalid_token"))
+        );
+        assert_eq!(c.to_string(), "invalid_token");
+        // A token68 credential, a bare token value, an escaped quote.
+        let c = Challenge::parse(
+            403,
+            r#"Negotiate abc==, Bearer error=sign_in_required, scope="x \"y\" z""#,
+        )
+        .unwrap();
+        assert_eq!(c.error.as_deref(), Some("sign_in_required"));
+        assert_eq!(c.scope.as_deref(), Some(r#"x "y" z"#));
+        assert_eq!(Challenge::parse(401, r#"Bearer realm="example""#), None);
+        assert_eq!(Challenge::parse(401, ""), None);
     }
 
     #[test]

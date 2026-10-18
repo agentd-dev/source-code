@@ -293,7 +293,8 @@ exits `4`.
 
 | Constant | Value |
 |---|---|
-| Same-endpoint retries | 2, after 250 ms and 500 ms |
+| Same-endpoint retries | 2, after 250 ms and 500 ms, or the endpoint's `Retry-After` when longer |
+| A `Retry-After` over 30 s | no retry; the endpoint is out of rotation until it passes, at most 5 min |
 | Breaker opens after | 3 consecutive failover-class failures |
 | Breaker cooldown | 5 s, doubling on each consecutive open, at most 60 s |
 | Half-open | one probe after the cooldown; success closes, failure reopens |

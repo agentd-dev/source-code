@@ -6,7 +6,12 @@
 //! An **interactive** (device / authorization-code) token comes from the file
 //! cache written by `agentd --login`; it is held in memory and refreshed with
 //! the cached refresh token when it nears expiry — so a long-lived daemon keeps
-//! a live bearer without re-prompting a human. A **client-credentials**
+//! a live bearer without re-prompting a human. A refresh is written back to
+//! the cache before it is used, the rotated refresh token with it, so a
+//! restart renews from the token the server last issued; it is made under
+//! the cache's lock for the target, so the processes and connections that
+//! share a login renew it once; and a target the cache no longer holds —
+//! logged out — is not renewed. A **client-credentials**
 //! provider reuses the machine-to-machine fetcher; a **static** provider
 //! resolves a `{{secret:…}}` per request.
 //!
@@ -19,7 +24,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::auth::cache::{self, CachedCred};
 use crate::auth::oauth2::{self, OAuth2Params};
@@ -91,6 +96,14 @@ pub struct TokenSource {
     dir: PathBuf,
     timeout: Duration,
     cache: Mutex<Option<CachedCred>>,
+    /// A refresh memory holds that the login cache does not yet: its write
+    /// failed. Every request retries the write before anything else, and
+    /// fails while it does, so a rotated refresh token is never used before
+    /// it is kept.
+    unsaved: Mutex<bool>,
+    /// The instant before which the token endpoint asked for no refresh (a
+    /// `429` or `503` with `Retry-After`).
+    not_before: Mutex<Option<Instant>>,
 }
 
 impl TokenSource {
@@ -104,43 +117,119 @@ impl TokenSource {
             dir,
             timeout,
             cache: Mutex::new(seed),
+            unsaved: Mutex::new(false),
+            not_before: Mutex::new(None),
         }
     }
 
     /// A currently-valid access token. One within [`REFRESH_SKEW_MS`] of
-    /// expiry is refreshed with the refresh token. When memory holds none
-    /// that is usable the login cache is read again first, so a login made
-    /// since the last call is picked up without a reload.
+    /// expiry is refreshed with the refresh token the login cache holds,
+    /// under the cache's lock for the target. When memory holds none that is
+    /// usable the login cache is read again first, so a login made since the
+    /// last call is picked up without a reload. A target the cache holds no
+    /// record for — never logged in, or logged out since — fails the
+    /// request: a logout reaches a running process at its next renewal.
     pub fn bearer(&self) -> Result<String, String> {
-        let now = cache::now_ms();
-        let held = self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(c) = &held
-            && c.valid_at(now, REFRESH_SKEW_MS)
-        {
-            return Ok(c.access_token.clone());
-        }
-        let file = cache::load_file(&self.dir, &self.target);
-        if let Some(c) = file.as_ref().filter(|c| c.valid_at(now, REFRESH_SKEW_MS)) {
-            let access = c.access_token.clone();
-            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = file;
+        self.keep_unsaved()?;
+        if let Some(access) = self.usable(cache::now_ms()) {
             return Ok(access);
         }
         let login = format!("run `agentd --login {}`", self.target);
-        if held.is_none() && file.is_none() {
+        if cache::load_file(&self.dir, &self.target).is_none() {
             return Err(format!("no cached credential — {login}"));
         }
-        // Memory's refresh token first: a refresh made here may have rotated
-        // it past the one the login cache holds.
-        let rt = held
-            .and_then(|c| c.refresh_token)
-            .or_else(|| file.and_then(|c| c.refresh_token))
+        let _held = cache::lock_file(&self.dir, &self.target, self.timeout)?;
+        // Another request, here or in another process, may have renewed it
+        // while this one waited.
+        if let Some(access) = self.usable(cache::now_ms()) {
+            return Ok(access);
+        }
+        // The login cache's refresh token, never memory's: every refresh
+        // writes its rotation back there under this lock before using it, so
+        // the cache holds the newest, and one the cache no longer holds was
+        // logged out of.
+        let Some(file) = cache::load_file(&self.dir, &self.target) else {
+            return Err(format!("no cached credential — {login}"));
+        };
+        let rt = file
+            .refresh_token
             .ok_or_else(|| format!("cached token expired with no refresh token — {login}"))?;
+        if let Some(at) = *self.not_before.lock().unwrap_or_else(|e| e.into_inner()) {
+            let left = at.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                return Err(format!(
+                    "the token endpoint asked for no request for {}s more; the token is renewed after that",
+                    left.as_secs().max(1)
+                ));
+            }
+        }
         let params = self.endpoints.params()?;
-        let toks = oauth2::refresh(&params, &rt, self.timeout)?;
-        let cred = crate::auth::login::tokens_to_cred(&toks);
+        let toks = match oauth2::refresh(&params, &rt, self.timeout) {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(wait) = e.retry_after {
+                    *self.not_before.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Instant::now() + wait.min(crate::net::http::RETRY_AFTER_MAX));
+                }
+                return Err(e.message);
+            }
+        };
+        let cred = crate::auth::login::refreshed_cred(&toks, &rt);
         let access = cred.access_token.clone();
+        // Kept before it is used: a rotated refresh token memory alone held
+        // would die with the process, and the one the cache still names is
+        // spent. A write that fails leaves the refresh in memory, unused,
+        // until a later request keeps it.
+        let kept = cache::store_file(&self.dir, &self.target, &cred);
         *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(cred);
+        if let Err(e) = kept {
+            *self.unsaved.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            return Err(format!(
+                "the renewed token could not be kept in the login cache: {e}"
+            ));
+        }
         Ok(access)
+    }
+
+    /// The access token memory or the login cache holds, if it is good at
+    /// `now` with [`REFRESH_SKEW_MS`] of headroom; a good one in the cache
+    /// is adopted.
+    fn usable(&self, now: u64) -> Option<String> {
+        let mut held = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = held.as_ref().filter(|c| c.valid_at(now, REFRESH_SKEW_MS)) {
+            return Some(c.access_token.clone());
+        }
+        let file = cache::load_file(&self.dir, &self.target)?;
+        if !file.valid_at(now, REFRESH_SKEW_MS) {
+            return None;
+        }
+        let access = file.access_token.clone();
+        *held = Some(file);
+        Some(access)
+    }
+
+    /// Write a refresh memory holds unkept to the login cache, or fail. One
+    /// whose target the cache no longer holds is dropped, not written: a
+    /// logout made since is not undone.
+    fn keep_unsaved(&self) -> Result<(), String> {
+        if !*self.unsaved.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Ok(());
+        }
+        let _held = cache::lock_file(&self.dir, &self.target, self.timeout)?;
+        let mut unsaved = self.unsaved.lock().unwrap_or_else(|e| e.into_inner());
+        if !*unsaved {
+            return Ok(());
+        }
+        let held = self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if cache::load_file(&self.dir, &self.target).is_none() {
+            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        } else if let Some(cred) = held {
+            cache::store_file(&self.dir, &self.target, &cred).map_err(|e| {
+                format!("the renewed token could not be kept in the login cache: {e}")
+            })?;
+        }
+        *unsaved = false;
+        Ok(())
     }
 }
 
@@ -250,19 +339,25 @@ fn params_from_spec(auth: &AuthSpec, timeout: Duration) -> Result<OAuth2Params, 
         .ok_or("auth.client_id is required for oauth2")?;
     let mut token_url = auth.token_url.clone();
     let mut device_url = auth.device_authorization_url.clone();
+    let mut revocation_url = None;
     if token_url.is_none()
         && let Some(issuer) = &auth.issuer
     {
         let d = oauth2::discover(issuer, timeout)?;
         token_url = token_url.or(d.token_endpoint);
         device_url = device_url.or(d.device_authorization_endpoint);
+        revocation_url = d.revocation_endpoint;
     }
     Ok(OAuth2Params {
         token_url: token_url.ok_or("auth.token_url is required (or set auth.issuer)")?,
         device_authorization_url: device_url,
         authorization_url: auth.authorization_url.clone(),
+        revocation_url,
+        issuer: auth.issuer.clone(),
+        iss_supported: false,
         client_id,
         client_secret: auth.client_secret.clone(),
+        client_auth: oauth2::ClientAuth::of(auth.client_auth.as_ref())?,
         scopes: auth.scopes.clone(),
         audience: auth.audience.clone(),
     })
@@ -381,12 +476,8 @@ mod tests {
     fn params() -> OAuth2Params {
         OAuth2Params {
             token_url: "https://as/token".into(),
-            device_authorization_url: None,
-            authorization_url: None,
             client_id: "c".into(),
-            client_secret: None,
-            scopes: vec![],
-            audience: None,
+            ..Default::default()
         }
     }
 
@@ -414,6 +505,7 @@ mod tests {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         let token_url = format!("{base}/token");
+        let issuer = base.clone();
         std::thread::spawn(move || {
             for conn in l.incoming().flatten() {
                 let mut r = BufReader::new(conn.try_clone().unwrap());
@@ -438,7 +530,10 @@ mod tests {
                     if down.load(Ordering::SeqCst) {
                         ("503 Service Unavailable", String::new())
                     } else {
-                        ("200 OK", format!(r#"{{"token_endpoint":"{token_url}"}}"#))
+                        (
+                            "200 OK",
+                            format!(r#"{{"issuer":"{issuer}","token_endpoint":"{token_url}"}}"#),
+                        )
                     }
                 } else {
                     (
@@ -519,6 +614,264 @@ mod tests {
             h,
             vec![("Authorization".to_string(), "Bearer live".to_string())]
         );
+    }
+
+    /// A token endpoint that answers every request `429` with
+    /// `Retry-After: 30`, counting them.
+    fn spawn_throttling() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", l.local_addr().unwrap());
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&n);
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut w = conn;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (url, n)
+    }
+
+    /// A refresh the token endpoint answers `429` with `Retry-After` says the
+    /// wait, and the requests that follow fail at once, naming it, without
+    /// asking the endpoint again before it is over.
+    #[test]
+    fn a_throttled_refresh_is_not_tried_again_before_its_retry_after() {
+        let (token_url, asked) = spawn_throttling();
+        let dir = tempfile::tempdir().unwrap();
+        let expired = CachedCred {
+            access_token: "old".into(),
+            refresh_token: Some("rt".into()),
+            expires_at_ms: 1,
+            ..Default::default()
+        };
+        cache::store_file(dir.path(), "mcp:x", &expired).unwrap();
+        let src = TokenSource::new(
+            Endpoints::pinned(OAuth2Params {
+                token_url,
+                client_id: "c".into(),
+                ..Default::default()
+            }),
+            "mcp:x",
+            dir.path().to_path_buf(),
+            Duration::from_secs(5),
+        );
+        let e = src.bearer().unwrap_err();
+        assert!(
+            e.contains("HTTP 429") && e.contains("retry after 30s"),
+            "{e}"
+        );
+        let e = src.bearer().unwrap_err();
+        assert!(e.contains("asked for no request for"), "{e}");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "not asked again");
+    }
+
+    /// A token endpoint that rotates refresh tokens — `rt-N` is answered
+    /// with `at-N+1` and `rt-N+1`, good for an hour — and refuses a spent
+    /// one with `invalid_grant`, after `delay`, serving requests at once. It
+    /// records each refresh token presented.
+    fn spawn_rotating(delay: Duration) -> (String, Arc<Mutex<Vec<String>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let current = Arc::new(Mutex::new(1u32));
+            for conn in l.incoming().flatten() {
+                let (log, current) = (Arc::clone(&log), Arc::clone(&current));
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(conn.try_clone().unwrap());
+                    let mut len = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    r.read_exact(&mut body).ok();
+                    let form = String::from_utf8_lossy(&body).into_owned();
+                    let rt = form
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("refresh_token="))
+                        .unwrap_or_default()
+                        .to_string();
+                    log.lock().unwrap().push(rt.clone());
+                    std::thread::sleep(delay);
+                    let mut n = current.lock().unwrap();
+                    let (status, payload) = if rt == format!("rt-{n}") {
+                        *n += 1;
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"access_token":"at-{n}","refresh_token":"rt-{n}","expires_in":3600}}"#
+                            ),
+                        )
+                    } else {
+                        (
+                            "400 Bad Request",
+                            r#"{"error":"invalid_grant"}"#.to_string(),
+                        )
+                    };
+                    let mut w = conn;
+                    let _ = write!(
+                        w,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    /// A source for `mcp:x` over the login cache at `dir`, renewed at
+    /// `token_url`; the cache is seeded with a due token and `rt-1`.
+    fn due_source(dir: &std::path::Path, token_url: &str) -> TokenSource {
+        let due = CachedCred {
+            access_token: "at-1".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at_ms: 1,
+            ..Default::default()
+        };
+        if cache::load_file(dir, "mcp:x").is_none() {
+            cache::store_file(dir, "mcp:x", &due).unwrap();
+        }
+        TokenSource::new(
+            Endpoints::pinned(OAuth2Params {
+                token_url: token_url.to_string(),
+                client_id: "c".into(),
+                ..Default::default()
+            }),
+            "mcp:x",
+            dir.to_path_buf(),
+            Duration::from_secs(5),
+        )
+    }
+
+    /// Two sources over one login — two processes of a tree, or two
+    /// connections in one — that find the token due at once renew it once:
+    /// the second waits on the cache's lock and takes the token the first
+    /// wrote back. Each presenting `rt-1` would have had a server that
+    /// rotates refuse the second, or, detecting the reuse, end the grant.
+    #[test]
+    fn two_sources_that_find_the_token_due_renew_it_once() {
+        let (token_url, presented) = spawn_rotating(Duration::from_millis(300));
+        let dir = tempfile::tempdir().unwrap();
+        let sources = [
+            due_source(dir.path(), &token_url),
+            due_source(dir.path(), &token_url),
+        ];
+        let got: Vec<Result<String, String>> = std::thread::scope(|s| {
+            let asks: Vec<_> = sources.iter().map(|src| s.spawn(|| src.bearer())).collect();
+            asks.into_iter().map(|a| a.join().unwrap()).collect()
+        });
+        assert_eq!(got, [Ok("at-2".to_string()), Ok("at-2".to_string())]);
+        assert_eq!(*presented.lock().unwrap(), ["rt-1"]);
+        assert_eq!(
+            cache::load_file(dir.path(), "mcp:x")
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("rt-2")
+        );
+    }
+
+    /// A logout reaches a running process at its next renewal: with its
+    /// login gone from the cache, a source whose token is due fails the
+    /// request, presents nothing and writes no record back, though memory
+    /// still holds the refresh token it was seeded with — whether the
+    /// logout came before the request or while it waited on the lock.
+    #[test]
+    fn a_login_removed_from_the_cache_is_not_renewed() {
+        let (token_url, presented) = spawn_rotating(Duration::ZERO);
+        let logged_out = "no cached credential — run `agentd --login mcp:x`";
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = due_source(dir.path(), &token_url);
+        assert!(
+            cache::take_file(dir.path(), "mcp:x", Duration::from_secs(5))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(src.bearer().unwrap_err(), logged_out);
+        assert!(cache::load_file(dir.path(), "mcp:x").is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = due_source(dir.path(), &token_url);
+        let held = cache::lock_file(dir.path(), "mcp:x", Duration::from_secs(5)).unwrap();
+        let e = std::thread::scope(|s| {
+            let ask = s.spawn(|| src.bearer());
+            std::thread::sleep(Duration::from_millis(100));
+            cache::evict_file(dir.path(), "mcp:x").unwrap();
+            drop(held);
+            ask.join().unwrap()
+        });
+        assert_eq!(e.unwrap_err(), logged_out);
+        assert!(cache::load_file(dir.path(), "mcp:x").is_none());
+        assert!(presented.lock().unwrap().is_empty(), "nothing presented");
+    }
+
+    /// A renewal whose write-back fails is not used, and the next request
+    /// keeps it before serving it — unless the login was removed from the
+    /// cache meanwhile: then it is dropped, and the logout stands.
+    #[test]
+    fn an_unkept_renewal_is_kept_by_the_next_request_unless_logged_out() {
+        for logout in [false, true] {
+            let (token_url, presented) = spawn_rotating(Duration::from_millis(300));
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("creds");
+            std::fs::create_dir(&dir).unwrap();
+            let src = due_source(&dir, &token_url);
+            let aside = root.path().join("aside");
+            let first = std::thread::scope(|s| {
+                let ask = s.spawn(|| src.bearer());
+                while presented.lock().unwrap().is_empty() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // A file where the cache directory was, while the refresh is
+                // in flight: its write-back fails.
+                std::fs::rename(&dir, &aside).unwrap();
+                std::fs::write(&dir, b"").unwrap();
+                ask.join().unwrap()
+            });
+            let e = first.unwrap_err();
+            assert!(e.contains("could not be kept in the login cache"), "{e}");
+            std::fs::remove_file(&dir).unwrap();
+            std::fs::rename(&aside, &dir).unwrap();
+            if logout {
+                cache::evict_file(&dir, "mcp:x").unwrap();
+                assert_eq!(
+                    src.bearer().unwrap_err(),
+                    "no cached credential — run `agentd --login mcp:x`"
+                );
+                assert!(
+                    cache::load_file(&dir, "mcp:x").is_none(),
+                    "not written back"
+                );
+            } else {
+                assert_eq!(src.bearer().unwrap(), "at-2");
+                let kept = cache::load_file(&dir, "mcp:x").unwrap();
+                assert_eq!(kept.refresh_token.as_deref(), Some("rt-2"));
+            }
+            assert_eq!(*presented.lock().unwrap(), ["rt-1"]);
+        }
     }
 
     /// No login: the request fails, naming the target and the flag that

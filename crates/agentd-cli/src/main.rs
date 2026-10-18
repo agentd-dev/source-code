@@ -322,16 +322,29 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
                 exit::USAGE
             }
         }
-        // `--logout <target>`: evict a cached credential (no feature needed).
+        // `--logout <target>`: evict a cached credential (no feature needed),
+        // then revoke it where it was issued (RFC 7009, with `oauth`).
         Ask::Logout(target) => {
+            let dir = agentd::auth::cache::default_dir();
+            #[cfg(feature = "oauth")]
+            let out = agentd::auth::revoke::logout(
+                &loaded.settings,
+                &target,
+                &dir,
+                std::time::Duration::from_secs(30),
+            );
             // A server that references a catalog entry caches its credential
             // under `service:<entry>`, not `mcp:<name>` — canonicalize first, or
             // logout would report success while leaving the real key in place.
-            let target = agentd::auth::canonical_target(&loaded.settings, &target);
-            let dir = agentd::auth::cache::default_dir();
-            match agentd::auth::cache::evict_file(&dir, &target) {
-                Ok(()) => {
-                    println!("logged out of {target}");
+            #[cfg(not(feature = "oauth"))]
+            let out = {
+                let target = agentd::auth::canonical_target(&loaded.settings, &target);
+                agentd::auth::cache::take_file(&dir, &target, std::time::Duration::from_secs(30))
+                    .map(|_| format!("logged out of {target}"))
+            };
+            match out {
+                Ok(msg) => {
+                    println!("{msg}");
                     exit::SUCCESS
                 }
                 Err(e) => {

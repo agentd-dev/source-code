@@ -117,10 +117,13 @@ impl Runtime {
         // document that changes `lifecycle.run_until` would otherwise reload
         // into a process whose job shape was settled at startup — and with it
         // generate, or retire, the workflow its instruction runs as a job.
-        let restart = cfg::restart_only_diff(
+        let mut restart = cfg::restart_only_diff(
             &cfg::with_document_config(&self.settings_doc, &self.settings),
             &cfg::with_document_config(&loaded.doc, &loaded.settings),
         );
+        // A company entry keys the Sessions, the User IDs and the servers
+        // made from it, so adding, removing or changing one is a restart.
+        restart.extend(company_entries_moved(&self.settings, &loaded.settings));
         if !restart.is_empty() {
             return Err(ReloadRefused::RestartRequired(restart));
         }
@@ -325,6 +328,15 @@ impl Runtime {
         let mut fresh = Vec::new();
         for s in &new.mcp.servers {
             let spec = &specs[&s.name];
+            // A Company's server keeps its connection: its entry cannot
+            // change under a reload (`company_entries_moved`), and only the
+            // supervisor's join dials it.
+            if spec.company.is_some() {
+                if let Some(live) = self.mcp.get(&s.name) {
+                    set.insert(s.name.clone(), live.clone());
+                }
+                continue;
+            }
             // Unchanged means everything the dial reads: the endpoint and
             // headers, and also the credential (`auth`, `oauth`, `aauth`),
             // the `service` its cached login is keyed by, its `rate` and its
@@ -1017,6 +1029,27 @@ struct StagedListener {
     routes: Option<super::webhooks::StagedRoutes>,
 }
 
+/// The `services.<name>` paths of the company entries a reload would add,
+/// remove or change.
+fn company_entries_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String> {
+    let companies = |s: &cfg::Settings| -> Vec<(String, cfg::Service)> {
+        s.services
+            .iter()
+            .filter(|(_, v)| v.kind == cfg::ServiceKind::Company)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    let (a, b) = (companies(old), companies(new));
+    let mut moved: Vec<String> = a
+        .iter()
+        .filter(|(k, v)| !b.iter().any(|(k2, v2)| k == k2 && v == v2))
+        .chain(b.iter().filter(|(k, _)| !a.iter().any(|(k2, _)| k == k2)))
+        .map(|(k, _)| format!("services.{k}"))
+        .collect();
+    moved.dedup();
+    moved
+}
+
 /// A spec with its tags cleared: what dialing a server reads.
 fn untagged(spec: &crate::config::McpServerSpec) -> crate::config::McpServerSpec {
     crate::config::McpServerSpec {
@@ -1101,12 +1134,16 @@ pub(crate) fn dial_specs(
     let mut specs = std::collections::BTreeMap::new();
     let mut errs = Vec::new();
     for srv in &s.mcp.servers {
-        if let Err(e) = cfg::egress_allows(
-            &s.services,
-            s.security.egress,
-            cfg::ServiceKind::Mcp,
-            &srv.endpoint,
-        ) {
+        // A Company's server has no endpoint until discovery, and every URL
+        // its documents name is held to the entry's `hosts` instead.
+        if srv.company.is_none()
+            && let Err(e) = cfg::egress_allows(
+                &s.services,
+                s.security.egress,
+                cfg::ServiceKind::Mcp,
+                &srv.endpoint,
+            )
+        {
             errs.push(e);
             continue;
         }
@@ -1152,6 +1189,38 @@ mod dial_tests {
         ))
         .unwrap();
         assert!(specs.contains_key("crm"));
+    }
+
+    /// A reload that adds, removes or changes a company entry is a restart:
+    /// the entry keys the Sessions, the User IDs and the servers made from
+    /// it. Any other entry is the reload's to apply.
+    #[test]
+    fn a_company_entry_moved_by_a_reload_is_named_for_a_restart() {
+        let settings = |services: &str| {
+            cfg::Settings::from_document(
+                crate::config::yaml::parse(&format!("services:\n{services}")).unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        let shop = "  shop: {kind: company, endpoint: \"https://shop.example\"}\n";
+        let crm = "  crm: {kind: mcp, endpoint: \"https://crm.example/mcp\"}\n";
+        let base = settings(&format!("{shop}{crm}"));
+        assert!(company_entries_moved(&base, &base).is_empty());
+        let crm_moved = settings(&format!(
+            "{shop}  crm: {{kind: mcp, endpoint: \"https://crm2.example/mcp\"}}\n"
+        ));
+        assert!(company_entries_moved(&base, &crm_moved).is_empty());
+        let changed = settings(&format!(
+            "  shop: {{kind: company, endpoint: \"https://shop.example\", hosts: [shop.example]}}\n{crm}"
+        ));
+        assert_eq!(company_entries_moved(&base, &changed), ["services.shop"]);
+        let removed = settings(crm);
+        assert_eq!(company_entries_moved(&base, &removed), ["services.shop"]);
+        let added = settings(&format!(
+            "{shop}{crm}  mall: {{kind: company, endpoint: \"https://mall.example\"}}\n"
+        ));
+        assert_eq!(company_entries_moved(&base, &added), ["services.mall"]);
     }
 }
 

@@ -287,6 +287,12 @@ pub struct SpawnPayload {
     /// because the parent evaluates the policy when the request arrives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gated_tools: Vec<String>,
+    /// The definitions of gated tools the child has no connection to list
+    /// itself — a Company's (RFC 0047 §5.6), whose servers no child is given
+    /// — for it to offer its model. Each is in `gated_tools`, so every call
+    /// comes back to the supervisor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supervisor_tools: Vec<crate::wire::intel::ToolDef>,
     /// The MCP tools the child offers, by the names the supervisor's
     /// registry gives them, each with the server and the server's own tool
     /// name: the server's `allow`/`exclude`, its `ns`, a profile server's
@@ -832,6 +838,7 @@ mod tests {
                 content: "prior note".into(),
             }],
             gated_tools: Vec::new(),
+            supervisor_tools: Vec::new(),
             mcp_routes: None,
             intelligence: IntelConfig {
                 uri: "https://intel.example".into(),

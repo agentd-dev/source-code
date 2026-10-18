@@ -20,12 +20,15 @@ pub mod agentloop; // the in-child ReAct loop + terminal-status state machine
 pub mod auth; // endpoint credential providers + durable token cache: OAuth, AWS SigV4, SPIFFE
 pub(crate) mod b64; // base64, std padded + url unpadded — hand-rolled, always compiled
 pub mod cel; // CEL expression seam (feature `cel`; always compiled, fail-closed without it)
-#[cfg(all(
-    feature = "oauth",
-    feature = "tls",
-    any(debug_assertions, feature = "internal-mocks")
+#[cfg(any(
+    feature = "companies",
+    all(
+        feature = "oauth",
+        feature = "tls",
+        any(debug_assertions, feature = "internal-mocks")
+    )
 ))]
-pub mod companies; // the Personal Agent Protocol draft's wire constants + the fake Company (RFC 0047)
+pub mod companies; // agentd as a Personal Agent at Companies, and the fake Company it is tested against (RFC 0047)
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup; config::{file,yaml,paths,watch}
 pub mod context; // durable transcripts, plan, memory, compaction, skills
 pub mod engine; // workflow engine: graph model, templates, durable runs + scheduler

@@ -140,6 +140,13 @@ skip.
 | `companies/fake-keeps-a-session-to-one-account` | a Session once signed in to one account answers a sign-in to another with account_mismatch and issues no tokens |
 | `companies/fake-rate-limits-with-retry-after` | the retry-after variant answers 429 rate_limited with Retry-After, answers 429 to a request sent before the wait is over, and serves one sent after it |
 | `companies/fake-mcp-account-errors` | an MCP tool that needs the account answers a signed-out Bearer token with 403 sign_in_required, and a signed-in one without poppy:read with 403 insufficient_scope naming it |
+| `companies/agent-refuses-a-company-that-fails-discovery` | agentd sends no assertion, no proof and no token request to a Company whose metadata names another issuer, lists no domains, leaves out ES256, names off-host endpoints, or whose discovery document redirects to plain HTTP |
+| `companies/agent-publishes-its-client-id` | the client metadata document agentd prints is the one at its client_id, and the fake fetched it, held it to the kit's schema and accepted agentd's assertions against its key set |
+| `companies/agent-assertions-name-the-issuer` | every client assertion and Session assertion agentd sends has aud the issuer as one string, iss its client_id, a minute's life and a 128-bit jti; the client assertion's sub is the client_id, the Session assertion's a User ID that names nothing about the person |
+| `companies/agent-signs-a-proof-for-every-token-request` | every token request but the Bearer one carries a DPoP Proof the fake validated (htm POST, htu the token endpoint, no ath), each with its own jti |
+| `companies/agent-uses-bearer-only-at-its-mcp-server` | agentd requests the MCP server's token without a proof, with resource the server's url and its session_id, and presents it at that server only, never a superseded one |
+| `companies/agent-supports-nonces` | against the nonce-required variant, agentd's use_dpop_nonce is followed by one retry carrying the nonce, with fresh assertions and a fresh proof |
+| `companies/agent-keeps-the-user-across-restarts` | after a restart agentd presents the same User ID and renews the same session_id, with a new DPoP key |
 
 ## Running it
 
@@ -175,8 +182,11 @@ Personal Agent written in the suite from the draft drives it, and each check
 passes only when the fake does what the draft says and, where a variant is
 built to break that rule, the variant is caught. The fake's record of every
 request it served — what was refused and why, the tokens it issued, and for a
-request carrying a Session Token whether a newer one had replaced it — is what
-later checks of agentd's own Personal Agent count. Every
+request carrying a Session Token whether a newer one had replaced it, and the
+claims of the assertions and proofs a token request carried — is what the
+`companies/agent-*` checks count: they declare the fake as agentd's Company,
+host the identity `agentd --print-company-client` writes, and hold the real
+binary to the draft through the fake's record alone. Every
 check quotes the sentence of the draft it tests, and the suite's unit test
 requires each quote to appear verbatim, in its section, in the vendored
 pages. The fake validates every document it sends against the vendored

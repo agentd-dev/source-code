@@ -9,7 +9,7 @@ regressions instead of agreeing with the implementation's own types; it uses
 cryptography, and writes every protocol message itself.
 
 Each check drives the real binary (built on demand with
-`--features a2a,cron,internal-mocks,oauth`) and asserts one contract. The same checks
+`--features a2a,cron,internal-mocks,oauth,companies`) and asserts one contract. The same checks
 back both the `cargo test` integration tests and the `agentd-conformance` report
 runner.
 
@@ -39,7 +39,7 @@ the environment — so there are no capability-gated checks to skip.
 | `extensions`       | activation by `A2A-Extensions` is the only way in (commands and methods), results are a Task or a Message, and metadata keys are declared extension URIs. |
 | `auth`             | the card's security fields match what the listener enforces, the extended card needs a declared credential, and browsers are admitted only from listed origins. |
 | `mcp-auth-core`    | agentd as an OAuth client: RFC 8414 and RFC 9728 metadata read first at the path-inserted well-known URLs, a mismatched issuer refused, and the refresh token revoked at the server on `--logout`. |
-| `companies`        | the fake Company agentd is tested against under the Personal Agent Protocol draft pinned at `95fcbf2`, driven by a Personal Agent written here from the draft: each check quotes the sentence it tests, passes against the fake, and catches the variant built to break it. |
+| `companies`        | the fake Company agentd is tested against under the Personal Agent Protocol draft pinned at `95fcbf2`, driven by a Personal Agent written here from the draft: each check quotes the sentence it tests, passes against the fake, and catches the variant built to break it; then agentd itself as the Personal Agent, read from the fake's record of what reached it. |
 
 Every check, and what it proves, is listed in the repository's
 [`CONFORMANCE.md`](../../CONFORMANCE.md).

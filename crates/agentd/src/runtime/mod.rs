@@ -18,6 +18,7 @@ pub mod artifacts;
 pub mod audit;
 pub mod breaker;
 pub mod children;
+pub(crate) mod companies; // who reaches a Company's tools, and only through the supervisor (RFC 0047)
 #[cfg(feature = "a2a")]
 pub mod conversations;
 pub(crate) mod decide; // deciding nodes + the decide tool (RFC 0046 P2)
@@ -357,6 +358,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         let Some(spec) = dial.remove(&s.name) else {
             continue;
         };
+        // A Company's server is the supervisor's to dial, after discovery
+        // and a Session: it joins off the loop (`join`), never here.
+        if spec.company.is_some() {
+            mcp_specs.insert(s.name.clone(), spec);
+            continue;
+        }
         let per_timeout = s.timeout.map(|d| d.0).unwrap_or(mcp_timeout);
         match crate::mcp::from_spec(&spec, per_timeout)
             .map(supervisor_client)
@@ -419,13 +426,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             }
         }
     };
-    let durable = Durable::new(
+    let durable = Arc::new(Durable::new(
         store,
         settings.store.prefix(),
         &instance,
         Policy::from_settings(&settings.store),
         Some(log.clone()),
-    );
+    ));
 
     // Restore. A store that cannot be read is fatal: starting with an empty
     // view of state a previous life already wrote would silently re-run
@@ -586,10 +593,25 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         std::sync::Arc::new(pressure::Pressure::new(path, shed))
     };
 
+    // The Personal Agent: its identity loaded (the key created `0600` when
+    // absent) and its Companies registered. Nothing is dialled here: each
+    // Company's MCP servers join off the loop, as a server down at boot does
+    // (`join`), so a Company that does not answer holds nothing up.
+    #[cfg(feature = "companies")]
+    let companies = match crate::companies::Supervisor::build(&settings, Arc::clone(&durable), &log)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+            return crate::exit::USAGE;
+        }
+    };
     let mut rt = Runtime {
         instance: instance.clone(),
         run_id: run_id.clone(),
         durable,
+        #[cfg(feature = "companies")]
+        companies,
         mcp,
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),
@@ -1166,6 +1188,14 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             }
         };
         let write_timeout = rt.settings.lifecycle.drain_timeout();
+        // The client identity, when it is served here rather than hosted.
+        #[cfg(feature = "companies")]
+        let documents = match (&rt.companies, &rt.settings.security.companies.client) {
+            (Some(c), Some(client)) if client.serve => c.identity.documents(),
+            _ => Vec::new(),
+        };
+        #[cfg(not(feature = "companies"))]
+        let documents = Vec::new();
         match a2a_server::spawn_a2a_listener(
             &rt.settings.a2a,
             rt.events_tx.clone(),
@@ -1174,6 +1204,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             write_timeout,
             log.clone(),
             opts.launch.clone(),
+            documents,
         ) {
             Ok(serving) => {
                 rt.a2a_feed = serving.feed.clone();
@@ -2011,13 +2042,25 @@ impl Runtime {
         server: Option<&str>,
         res: &str,
     ) -> Result<FetchedInstruction, String> {
-        // Find the serving client.
+        // Find the serving client: never a Company's server, which is
+        // reached only through its tools (RFC 0047 §5.6).
+        if let Some(s) = server
+            && self.is_company_server(s)
+        {
+            return Err(format!(
+                "mcp server {s:?} is a Company's, and an instruction is never read from one"
+            ));
+        }
         let candidates: Vec<(String, Arc<McpClient>)> = match server {
             Some(s) => mcp
                 .get(s)
                 .map(|c| vec![(s.to_string(), c.clone())])
                 .unwrap_or_default(),
-            None => mcp.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
+            None => mcp
+                .iter()
+                .filter(|(n, _)| !self.is_company_server(n))
+                .map(|(n, c)| (n.clone(), c.clone()))
+                .collect(),
         };
         let mut last_err = String::from("no connected MCP server serves it");
         for (name, c) in candidates {
@@ -2471,9 +2514,14 @@ impl Runtime {
 
     /// The spec a spawned child dials `name` with: the configured one, plus
     /// what reached the server on this process's live connection, so the
-    /// child starts the same way.
+    /// child starts the same way. None for a Company's server: only the
+    /// supervisor holds a Session, so no child is ever handed one to dial,
+    /// whatever servers its step or spawn names (RFC 0047 §5.6).
     pub(crate) fn spawn_spec(&self, name: &str) -> Option<crate::config::McpServerSpec> {
         let mut spec = self.mcp_specs.get(name)?.clone();
+        if spec.company.is_some() {
+            return None;
+        }
         spec.first_request = self.mcp.get(name).and_then(|c| c.first_request());
         Some(spec)
     }

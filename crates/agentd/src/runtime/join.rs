@@ -13,6 +13,13 @@
 //! the connection — `subscribe` starts, resource waits, MCP Events bindings —
 //! is restored on it. No document is read, no start is armed again, nothing
 //! else moves.
+//!
+//! A Company's MCP server (RFC 0047 §5.5.1) joins the same way and only this
+//! way, every boot included: its dial is the Company's discovery, the
+//! supervisor's Session and a Bearer token for the server, then the same
+//! handshake and tool list. A Company that does not answer, or does not
+//! verify, is tried again on the same backoff; one whose server refuses this
+//! agent outright (`extension_required`) is not tried again.
 
 use super::events::Event;
 use super::reactor::Runtime;
@@ -39,10 +46,12 @@ struct Probe {
 }
 
 /// What a dial off the loop came back with: the initialized connection and
-/// its tools, or nothing.
+/// its tools, or nothing — and whether the server refused this agent for
+/// good.
 pub struct Reachable {
     server: String,
     found: Option<(crate::mcp::client::McpClient, Vec<::mcp::wire::Tool>)>,
+    refused: Option<String>,
 }
 
 impl std::fmt::Debug for Reachable {
@@ -95,17 +104,41 @@ impl Runtime {
                 .unwrap_or(std::time::Duration::from_secs(60));
             let tx = self.events_tx.clone();
             let server = name.clone();
+            #[cfg(feature = "companies")]
+            let companies = self.companies.clone();
             let spawned = std::thread::Builder::new()
                 .name("agentd-join".into())
                 .spawn(move || {
                     // The dial boot makes, on its own thread: the loop is
                     // never held by a server that does not answer.
-                    let found = crate::mcp::from_spec(&spec, timeout)
-                        .map(super::supervisor_client)
-                        .and_then(|mut c| c.initialize().map(|()| c))
-                        .and_then(|c| c.list_tools().map(|tools| (c, tools)))
-                        .ok();
-                    let _ = tx.send(Event::McpReachable(Box::new(Reachable { server, found })));
+                    let (found, refused) = match spec.company {
+                        #[cfg(feature = "companies")]
+                        Some(_) => match companies
+                            .as_ref()
+                            .map(|sup| crate::companies::mcp::connect(sup, &server, timeout))
+                        {
+                            Some(Ok(found)) => (Some(found), None),
+                            Some(Err(crate::companies::mcp::Refused::Unusable(e))) => {
+                                (None, Some(e))
+                            }
+                            _ => (None, None),
+                        },
+                        #[cfg(not(feature = "companies"))]
+                        Some(_) => (None, None),
+                        None => (
+                            crate::mcp::from_spec(&spec, timeout)
+                                .map(super::supervisor_client)
+                                .and_then(|mut c| c.initialize().map(|()| c))
+                                .and_then(|c| c.list_tools().map(|tools| (c, tools)))
+                                .ok(),
+                            None,
+                        ),
+                    };
+                    let _ = tx.send(Event::McpReachable(Box::new(Reachable {
+                        server,
+                        found,
+                        refused,
+                    })));
                 });
             if spawned.is_err()
                 && let Some(p) = self.joining.probes.get_mut(&name)
@@ -119,12 +152,26 @@ impl Runtime {
     /// after a backoff.
     pub(crate) fn on_mcp_reachable(&mut self, r: Reachable) {
         let now = now_ms();
-        let Reachable { server, found } = r;
+        let Reachable {
+            server,
+            found,
+            refused,
+        } = r;
         let Some(probe) = self.joining.probes.get_mut(&server) else {
             return; // connected meanwhile (a reload dialed it), or gone
         };
         probe.out = false;
         if self.mcp.contains_key(&server) {
+            return;
+        }
+        // A server that refused this agent outright is not dialled again in
+        // this life.
+        if let Some(e) = refused {
+            probe.due_at = u64::MAX;
+            self.log.warn(
+                "mcp.connect.fail",
+                json!({"server": server, "err": e, "reason": "refused"}),
+            );
             return;
         }
         let Some((client, tools)) = found else {
@@ -179,7 +226,19 @@ impl Runtime {
         if !errs.is_empty() {
             return Err(errs);
         }
-        client.set_tool_meta(crate::mcp::tool_meta(&self.run_id, &self.instance));
+        // A Company under the strict privacy profile is sent no run or
+        // instance (RFC 0047 §5.10).
+        #[cfg(feature = "companies")]
+        let strict = self
+            .companies
+            .as_ref()
+            .and_then(|c| c.company_of_server(server))
+            .is_some_and(|c| c.privacy == crate::config::settings::companies::Privacy::Strict);
+        #[cfg(not(feature = "companies"))]
+        let strict = false;
+        if !strict {
+            client.set_tool_meta(crate::mcp::tool_meta(&self.run_id, &self.instance));
+        }
         super::report_dropped_tools(&self.log, server, &client);
         let count = built.last().map_or(0, |t| t.tools.len());
         let protocol = client.protocol_version();

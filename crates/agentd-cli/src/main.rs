@@ -354,6 +354,34 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             );
             exit::SUCCESS
         }
+        // `--print-company-client <dir>`: the client identity for static
+        // hosting. The key is created when absent; nothing is dialled.
+        Ask::PrintCompanyClient(dir) => {
+            #[cfg(feature = "companies")]
+            {
+                match agentd::companies::print_client(&loaded.settings, std::path::Path::new(&dir))
+                {
+                    Ok(files) => {
+                        for f in files {
+                            println!("{}", f.display());
+                        }
+                        exit::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("agentd: --print-company-client: {e}");
+                        exit::USAGE
+                    }
+                }
+            }
+            #[cfg(not(feature = "companies"))]
+            {
+                let _ = &dir;
+                eprintln!(
+                    "agentd: --print-company-client needs the companies feature (build with --features companies)"
+                );
+                exit::USAGE
+            }
+        }
         Ask::Capabilities => {
             println!(
                 "{}",

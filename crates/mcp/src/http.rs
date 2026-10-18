@@ -499,6 +499,11 @@ pub struct HttpTransport {
     /// The instant before which the server asked for no request (a `429` or
     /// `503` with `Retry-After`), and the status that asked.
     not_before: Mutex<Option<(std::time::Instant, u16)>>,
+    /// Dial through the SSRF guard ([`net::ssrf::connect_vetted`]): the host
+    /// resolved once and only a vetted address connected, loopback, private
+    /// and link-local refused unless the value is `true`. `None` dials by
+    /// name, as an operator-configured endpoint always has.
+    vetted: Option<bool>,
 }
 
 impl HttpTransport {
@@ -513,6 +518,7 @@ impl HttpTransport {
             signer: None,
             request_meta: None,
             not_before: Mutex::new(None),
+            vetted: None,
         }
     }
 
@@ -534,6 +540,7 @@ impl HttpTransport {
             request_meta: self.request_meta.clone(),
             // The wait is the server's, not the lost session's.
             not_before: Mutex::new(*self.not_before.lock().unwrap_or_else(|e| e.into_inner())),
+            vetted: self.vetted,
         }
     }
 
@@ -605,6 +612,12 @@ impl HttpTransport {
         self.request_meta = meta;
     }
 
+    /// Dial every connection through the SSRF guard; `allow_private`
+    /// admits loopback, private and link-local addresses.
+    pub fn set_vetted(&mut self, allow_private: bool) {
+        self.vetted = Some(allow_private);
+    }
+
     /// The request as sent: `body` with the host's [`RequestMeta`] added to
     /// `params._meta`. `None` — `body` goes as it is — for a notification, a
     /// body that is not a JSON-RPC request object, a `_meta` that is not an
@@ -651,7 +664,13 @@ impl HttpTransport {
             McpEndpoint::Tcp {
                 host, port, tls, ..
             } => {
-                let tcp = http::connect_tcp(host, *port, timeout).map_err(HttpError::Connect)?;
+                let tcp = match self.vetted {
+                    Some(allow_private) => {
+                        net::ssrf::connect_vetted(host, *port, timeout, allow_private)
+                    }
+                    None => http::connect_tcp(host, *port, timeout),
+                }
+                .map_err(HttpError::Connect)?;
                 let raw = tcp.try_clone().map_err(HttpError::Connect)?;
                 if *tls {
                     #[cfg(feature = "tls")]

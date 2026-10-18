@@ -27,7 +27,7 @@
 //! | `GET /auth/device/verify` | the User's device page, which approves nothing by itself |
 //! | `GET /auth/authorize` | Direct Sign-In (§4.5), answered by the scripted User |
 //! | `POST /auth/revoke` | RFC 7009 revocation of an Account Token (§4.9) |
-//! | `POST /mcp` | an MCP server taking only Bearer tokens issued for its URL (§6) |
+//! | `POST /mcp` | an MCP server taking only Bearer tokens issued for its URL (§6); its `search` for `coupon` is the tool's own error, worded with the codes a refusal carries |
 //! | `GET /.well-known/oauth-protected-resource/mcp` | its RFC 9728 metadata |
 //! | `GET /api/openapi.json`, `GET /api/session` | an OpenAPI description and its one operation, which takes DPoP Session Tokens (§4.3, §6) |
 //! | `POST /_mock/control`, `GET /_mock/record` | steer the scripted User and token lifetimes; read what the fake saw |
@@ -51,7 +51,15 @@
 //! `acct_1`, granting every scope asked for, after one `authorization_pending`
 //! poll. `POST /_mock/control {"approver": {"decision": "approve|deny|expire",
 //! "account": …, "after_polls": n, "scope": "…"}, "expires_in": n}` changes
-//! what it does next, and how long Session Tokens last.
+//! what it does next, and how long Session Tokens last. The same control
+//! steers what a Personal Agent is tested against mid-run: `"refuse_tokens":
+//! n` answers the next `n` MCP requests `401 invalid_token`;
+//! `"refuse_grants": n` answers the next `n` token requests `401
+//! invalid_client`;
+//! `"extension_required": "<name>"` has the MCP servers refuse every request
+//! from then on with `403 extension_required`; `"extra_mcp": true` lists a
+//! second MCP API, at `/mcp/orders`, from then on; `"end_sessions": true`
+//! ends every Session, so its next renewal is `invalid_session`.
 //!
 //! **Its documents cannot drift from the kit.** Every JSON body it sends is
 //! validated against its vendored schema first ([`kit`], patterns and
@@ -65,13 +73,19 @@
 //! Session Token, `presented` (the first eight characters of the token's
 //! base64url SHA-256) and `superseded` (whether a newer token of its kind
 //! had been issued for its Session, which the Personal Agent was to use
-//! instead, §4.3) — and the same objects are read back at
-//! `GET /_mock/record`: the server side's own account of what reached it,
-//! which a test counts instead of trusting the client.
+//! instead, §4.3); for a token request the claims of each assertion and
+//! proof it carried (`client_assertion`, `assertion`, `proof`, the proof's
+//! key thumbprint as `jkt`), never their signatures; for a `tools/call`,
+//! the keys of its `_meta` (`meta`); and `validated`, the
+//! vendored schemas what the request carried held to — and the same objects
+//! are read back at `GET /_mock/record`: the server side's own account of
+//! what reached it, which a test counts instead of trusting the client.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -199,6 +213,34 @@ const PRIVATE_MEMBERS: [&str; 7] = ["d", "p", "q", "dp", "dq", "qi", "k"];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+thread_local! {
+    /// What the request this thread is handling showed: its assertions'
+    /// and proof's claims, and the schemas it was held to. Each request is
+    /// handled on a thread of its own; [`Company::handle`] empties this
+    /// into the request's record.
+    static SEEN: RefCell<Map<String, Value>> = RefCell::new(Map::new());
+}
+
+/// Note `value` under `key` in this request's record.
+fn seen(key: &str, value: Value) {
+    SEEN.with(|s| {
+        s.borrow_mut().insert(key.to_string(), value);
+    });
+}
+
+/// Note that what the request carried held to the vendored `schema`.
+fn validated(schema: &str) {
+    SEEN.with(|s| {
+        let mut s = s.borrow_mut();
+        let list = s.entry("validated").or_insert_with(|| json!([]));
+        if let Some(a) = list.as_array_mut()
+            && !a.iter().any(|x| x == schema)
+        {
+            a.push(json!(schema));
+        }
+    });
 }
 
 fn now() -> u64 {
@@ -674,6 +716,12 @@ struct State {
     records: Vec<Value>,
     /// How many tokens the fake has issued: the next [`Access::seq`].
     issued: u64,
+    /// MCP requests still to answer `401 invalid_token`, whatever they carry.
+    refuse_tokens: u32,
+    /// Token requests still to answer `401 invalid_client`.
+    refuse_grants: u32,
+    /// The extension the MCP servers refuse every request without.
+    extension_required: Option<String>,
 }
 
 /// The fake Company.
@@ -684,6 +732,8 @@ struct Company {
     /// The Personal Agents whose documents it has fetched, by `client_id`.
     clients: Mutex<BTreeMap<String, Arc<Client>>>,
     state: Mutex<State>,
+    /// A second MCP API listed from now on (`"extra_mcp"` in the control).
+    extra_mcp: AtomicBool,
 }
 
 impl Company {
@@ -713,7 +763,11 @@ impl Company {
                 limits: BTreeMap::new(),
                 records: Vec::new(),
                 issued: 0,
+                refuse_tokens: 0,
+                refuse_grants: 0,
+                extension_required: None,
             }),
+            extra_mcp: AtomicBool::new(false),
         }
     }
 
@@ -741,7 +795,7 @@ impl Company {
 
     fn mcp_urls(&self) -> Vec<String> {
         let mut urls = vec![format!("{}/mcp", self.origin())];
-        if self.has(Variant::TwoMcpApis) {
+        if self.has(Variant::TwoMcpApis) || self.extra_mcp.load(Ordering::SeqCst) {
             urls.push(format!("{}/mcp/orders", self.origin()));
         }
         urls
@@ -752,12 +806,16 @@ impl Company {
     }
 
     fn handle(&self, req: &Request) -> Reply {
+        SEEN.with(|s| s.borrow_mut().clear());
         let reply = self.route(req);
         let mut record = json!({
             "method": req.method,
             "path": req.path,
             "status": reply.status,
         });
+        for (k, v) in SEEN.with(|s| std::mem::take(&mut *s.borrow_mut())) {
+            record[k] = v;
+        }
         for (k, v) in &reply.note {
             record[k] = v.clone();
         }
@@ -1011,6 +1069,7 @@ impl Company {
         kit::kit()
             .validate("client-metadata.schema.json", &doc)
             .map_err(|e| format!("the client metadata document: {}", e.join("; ")))?;
+        validated("client-metadata.schema.json");
         if doc["client_id"] != client_id {
             return Err(
                 "the client metadata document's client_id is not the URL it was fetched from"
@@ -1123,6 +1182,7 @@ impl Company {
             .ok_or_else(|| invalid("no client_assertion".into()))?;
         let jws =
             decode_jws(assertion).map_err(|e| invalid(format!("the client assertion: {e}")))?;
+        seen("client_assertion", jws.claims.clone());
         let client = self
             .client(client_id, jws.header["kid"].as_str())
             .map_err(invalid)?;
@@ -1168,10 +1228,12 @@ impl Company {
             }
         };
         let jws = decode_jws(proof).map_err(|e| ProofError::Invalid(format!("the proof: {e}")))?;
+        seen("proof", jws.claims.clone());
         let parts = json!({"header": jws.header, "payload": jws.claims});
         kit::kit()
             .validate("dpop-proof.schema.json", &parts)
             .map_err(|e| ProofError::Invalid(format!("the proof: {}", e.join("; "))))?;
+        validated("dpop-proof.schema.json");
         if jws.header["alg"] != wire::ES256 {
             return Err(bad(
                 "the proof's alg is not one the Company accepts (ES256)",
@@ -1225,6 +1287,7 @@ impl Company {
         }
         let jkt = jwk::thumbprint(key)
             .map_err(|e| ProofError::Invalid(format!("the proof's jwk: {e}")))?;
+        seen("jkt", json!(jkt));
         Ok(Some(Proof { jkt }))
     }
 
@@ -1282,6 +1345,17 @@ impl Company {
         form: &BTreeMap<String, String>,
         g: &str,
     ) -> Result<Reply, Refusal> {
+        {
+            let mut st = lock(&self.state);
+            if st.refuse_grants > 0 {
+                st.refuse_grants -= 1;
+                return Err(refuse(
+                    401,
+                    err::INVALID_CLIENT,
+                    "this client is not accepted here",
+                ));
+            }
+        }
         let (client_id, client) = self.authenticate(form)?;
         let mut st = lock(&self.state);
         let proof = self
@@ -1436,6 +1510,7 @@ impl Company {
             .ok_or_else(|| invalid("no assertion".into()))?;
         let jws =
             decode_jws(assertion).map_err(|e| invalid(format!("the Session assertion: {e}")))?;
+        seen("assertion", jws.claims.clone());
         if !Company::signed_by(client, &jws) {
             return Err(invalid(
                 "the Session assertion is not signed ES256 by a key in the client's jwks_uri"
@@ -1445,6 +1520,7 @@ impl Company {
         kit::kit()
             .validate("session-assertion.schema.json", &jws.claims)
             .map_err(|e| invalid(format!("the Session assertion: {}", e.join("; "))))?;
+        validated("session-assertion.schema.json");
         if jws.claims["iss"] != *client_id {
             return Err(invalid(
                 "the Session assertion's iss is not the authenticated client_id".into(),
@@ -2051,6 +2127,21 @@ impl Company {
             return Reply::new(405);
         }
         let mut st = lock(&self.state);
+        if let Some(ext) = st.extension_required.clone() {
+            return Reply::new(403)
+                .with(
+                    "WWW-Authenticate",
+                    &format!(
+                        "Bearer error=\"{}\", extension=\"{ext}\"",
+                        err::EXTENSION_REQUIRED
+                    ),
+                )
+                .note("error", json!(err::EXTENSION_REQUIRED));
+        }
+        if st.refuse_tokens > 0 {
+            st.refuse_tokens -= 1;
+            return challenge(401, Some(err::INVALID_TOKEN));
+        }
         let (signed_in, scope) = match st.access.get(token) {
             Some(a) if a.expires_at >= now() && a.binding == Binding::Bearer(url.clone()) => {
                 (Company::signed_in_now(a, &st), a.scope.clone())
@@ -2077,6 +2168,11 @@ impl Company {
             )
         };
         let old = self.has(Variant::Mcp20250618);
+        // What a call says about its caller beside its arguments.
+        let meta: Vec<String> = frame["params"]["_meta"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
         let reply = match method.as_str() {
             "server/discover" if !old => ok(json!({
                 "resultType": "complete",
@@ -2116,20 +2212,29 @@ impl Company {
                     return Reply::new(429)
                         .with("Retry-After", &RETRY_AFTER_S.to_string())
                         .note("early", json!(early))
-                        .note("mcp", json!(method));
+                        .note("mcp", json!(method))
+                        .note("meta", json!(meta));
                 }
                 let args = &frame["params"]["arguments"];
-                match frame["params"]["name"].as_str() {
+                let answer = match frame["params"]["name"].as_str() {
+                    // The tool's own answer, not a refusal: a Personal Agent
+                    // hands it on as the Company wrote it.
+                    Some("search") if args["query"] == "coupon" => ok(json!({
+                        "isError": true,
+                        "content": [{"type": "text", "text": format!(
+                            "coupons are not sold here: {} and {} are the tool's words, not a refusal",
+                            err::SIGN_IN_REQUIRED, err::EXTENSION_REQUIRED
+                        )}]
+                    })),
                     Some("search") => ok(json!({
                         "content": [{"type": "text", "text": "1 result"}],
                         "structuredContent": {"results": [{"sku": "stormline-insulated-m", "query": args["query"]}]}
                     })),
                     Some("order_status") if !signed_in => {
-                        return challenge(403, Some(err::SIGN_IN_REQUIRED))
-                            .note("mcp", json!(method));
+                        challenge(403, Some(err::SIGN_IN_REQUIRED))
                     }
                     Some("order_status") if !scope.split(' ').any(|s| s == wire::SCOPE_READ) => {
-                        return Reply::new(403)
+                        Reply::new(403)
                             .with(
                                 "WWW-Authenticate",
                                 &format!(
@@ -2139,14 +2244,14 @@ impl Company {
                                 ),
                             )
                             .note("error", json!(err::INSUFFICIENT_SCOPE))
-                            .note("mcp", json!(method));
                     }
                     Some("order_status") => ok(json!({
                         "content": [{"type": "text", "text": "shipped"}],
                         "structuredContent": {"order_id": args["order_id"], "status": "shipped"}
                     })),
                     _ => rpc_err(-32602, "unknown tool"),
-                }
+                };
+                answer.note("meta", json!(meta))
             }
             _ => rpc_err(-32601, "method not found"),
         };
@@ -2179,6 +2284,21 @@ impl Company {
         }
         if let Some(n) = body["expires_in"].as_u64().filter(|n| *n > 0) {
             st.expires_in = n;
+        }
+        if let Some(n) = body["refuse_tokens"].as_u64() {
+            st.refuse_tokens = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(n) = body["refuse_grants"].as_u64() {
+            st.refuse_grants = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(ext) = body["extension_required"].as_str() {
+            st.extension_required = Some(ext.to_string());
+        }
+        if body["extra_mcp"] == true {
+            self.extra_mcp.store(true, Ordering::SeqCst);
+        }
+        if body["end_sessions"] == true {
+            st.sessions.clear();
         }
         Reply::json(200, &json!({"ok": true}))
     }

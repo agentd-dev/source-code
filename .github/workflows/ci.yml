@@ -240,6 +240,8 @@ jobs:
           - "--features decrypt" # encrypted instruction envelopes — in the release set
           - "--features mcp-events" # MCP Events bindings (RFC 0045, a draft extension) — in the release set
           - "--features mock-models" # the mock model endpoint — in the release set
+          - "--features companies" # acting at Companies for a person (RFC 0047, a draft protocol) — NOT in the release set
+          - "--features companies,a2a" # …with the listener that serves its identity
           - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models" # the release-artifact set, exactly (pinned by release_matrix.rs)
           - "--all-features"
     steps:

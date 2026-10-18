@@ -66,8 +66,8 @@ An ask answers a question and exits. None of them binds a socket or calls a
 model, and only `--login` and `--logout` dial a server: the authorization
 server's metadata, token and revocation endpoints. Every ask reads
 the configuration files you name, so a file that does not parse is exit 2 even
-for `--help`. Only `--validate-config`, `--capabilities` and
-`--effective-config` also run validation.
+for `--help`. Only `--validate-config`, `--capabilities`,
+`--effective-config` and `--print-company-client` also run validation.
 
 | Flag | Prints | Stream | Exit |
 |---|---|---|---|
@@ -83,6 +83,7 @@ for `--help`. Only `--validate-config`, `--capabilities` and
 | `--extension-schema <name>` | The schema bundle of one extension (`command`, `events`, `task-annotations`) | stdout | 0, or 2 for an unknown name |
 | `--login <target>` | Runs an interactive OAuth device login and caches the token. Targets: `intelligence`, `intelligence:<provider>`, `mcp:<name>`, `service:<name>`. Needs the `oauth` feature. | stdout | 0, or 2 on failure |
 | `--logout <target>` | Evicts a cached credential, then revokes it at its authorization server when the server's metadata lists a revocation endpoint (RFC 7009; needs the `oauth` feature). A revocation that fails exits 2, the credential evicted. | stdout | 0, or 2 on failure |
+| `--print-company-client <dir>` | Writes `client.json` (the client metadata document) and `jwks.json` (its key set, public halves only) for `security.companies.client` into `<dir>`, for static hosting at the `client_id` and `jwks_uri`, and prints their paths. Creates the signing key `0600` when it is absent. Dials nothing. Needs the `companies` feature. | stdout | 0, or 2 on an invalid configuration |
 
 > **Note.** `--validate-config` writes its verdict to **stderr**. A CI step
 > that captures stdout to check validity sees nothing; branch on the exit

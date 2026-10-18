@@ -459,11 +459,12 @@ impl Runtime {
         // hand the child an empty one rather than leave in place whatever the
         // template wrote: composition must not depend on a check somewhere
         // else still holding.
-        doc["services"] = self
-            .settings_doc
-            .get("services")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        doc["services"] = without_companies(
+            self.settings_doc
+                .get("services")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        );
         let mut security = json!({});
         if self.settings.security.allow_trifecta {
             security["allow_trifecta"] = json!(true);
@@ -1560,6 +1561,17 @@ impl Drop for PrivateDir {
     }
 }
 
+/// The parent's service catalogue as an instance child is handed it: every
+/// entry but the Companies. A child holding Company channels itself would
+/// mint other User IDs and hold tokens in another process, so it is given
+/// none (RFC 0047 §5.6), and its config cannot name one.
+fn without_companies(mut services: Value) -> Value {
+    if let Some(m) = services.as_object_mut() {
+        m.retain(|_, entry| entry.get("kind").and_then(Value::as_str) != Some("company"));
+    }
+    services
+}
+
 /// The delivered prose a composed config file carries, as the child's loader
 /// reads it — `agent.instruction` is the one string its `${VAR}`
 /// substitution leaves alone, so the file's text is the child's text; `None`
@@ -1738,6 +1750,18 @@ fn drop_inline_token(conn: &mut serde_json::Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An instance child is composed every service entry but a Company's.
+    #[test]
+    fn an_instance_child_is_handed_no_company() {
+        let services = json!({
+            "crm": {"kind": "mcp", "endpoint": "https://crm.example/mcp"},
+            "shop": {"kind": "company", "endpoint": "https://shop.example"}
+        });
+        let composed = without_companies(services);
+        assert!(composed.get("crm").is_some());
+        assert!(composed.get("shop").is_none(), "{composed}");
+    }
 
     /// The composed config's prose reaches the child's loader byte for byte,
     /// a `${VAR}` and a `$$` it quotes included — the digest the parent marks

@@ -274,6 +274,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "budget",
     "cgroup",
     "child",
+    "company",
     "config",
     "context",
     "correlate",

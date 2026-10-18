@@ -600,7 +600,7 @@ All `services` paths are live · op.
 
 | Path | Type | Default | What it does |
 |---|---|---|---|
-| `services.<name>.kind` | `mcp \| intelligence \| peer \| http` | `mcp` | The surface the entry serves. Matching is by kind. |
+| `services.<name>.kind` | `mcp \| intelligence \| peer \| http \| company` | `mcp` | The surface the entry serves. Matching is by kind. `company` needs the `companies` feature; see [Companies](#companies). |
 | `services.<name>.endpoint` | URL | required | The connection URL, and the match base (scheme, authority and path prefix on segment boundaries). |
 | `services.<name>.auth`, `.headers`, `.timeout` | — | — | Connection settings consumers inherit. |
 | `services.<name>.tags` | map | `{}` | Authoritative tags, unioned into every server whose endpoint matches, referencing or not. |
@@ -609,6 +609,11 @@ All `services` paths are live · op.
 | `services.<name>.rate` | rate | — | Pacing toward the service, shared by every consumer in each process. |
 | `services.<name>.methods` | list | any | `kind: http` only: the methods `http` steps may use. |
 | `services.<name>.breaker` | `{failures, cooldown}` | — | `kind: mcp` only: the default breaker for `mcp.tool` steps against it. |
+| `services.<name>.hosts` | list of host globs | the endpoint's host, the document's `organization.domain`, the subdomains of both, the issuer's host | `kind: company` only: every URL the Company's documents name must be on one of these hosts (`example.com`, `*.example.com`). |
+| `services.<name>.allow_private` | bool | `false` | `kind: company` only: admit loopback, private and link-local addresses. |
+| `services.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | `kind: company` only: the Company's interfaces agentd uses. This build uses `mcp`; `agent` and `openapi` are refused. |
+| `services.<name>.mcp_names` | map of an MCP API `url` to a server name | — | `kind: company` only: names the Company's MCP servers when it lists more than one. |
+| `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` the Company's MCP calls carry none of agentd's correlators — no `agent/*` `_meta` key, no idempotency key, no trace context; `standard` sends them, and is logged at boot (`company.privacy.standard`). |
 
 With `security.egress: closed`, every MCP dial, intelligence endpoint
 (top-level and providers; `mock:` aside), A2A peer, `http` step, HTTP store,
@@ -634,6 +639,53 @@ security:
 
 Under `closed`, an intelligence endpoint needs a `kind: intelligence` entry of
 its own. The hardening guide is [Harden a deployment](harden.md).
+
+### Companies
+
+A `kind: company` entry declares a Company agentd acts at for its one User,
+under the Personal Agent Protocol draft agentd is pinned to
+([RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md); the
+`companies` feature, which no release binary carries). `endpoint` is
+`https://<host>`, the domain whose `/.well-known/poppy.json` is read; a path is
+refused. The supervisor discovers and verifies the Company after load (never
+under `--validate-config`, which dials nothing), holds a signed-out Session
+there, and connects to each MCP API the Company lists as an MCP server of its
+own: named after the entry when there is one, by `mcp_names` when there are
+several, with every tool registered as `<server>.<tool>`. A Company that does
+not answer, or does not verify, is tried again with the backoff of a server
+down at boot. The tools are the supervisor's alone: no turn worker or
+subagent is handed a Company server to dial, and every call to one comes back
+to the supervisor. They are offered only in work the configured User owns,
+and in work nobody owns when the User is `operator` or an operator principal.
+A workflow calls them with `tool` steps (`shop.search`), under the same rule;
+an `mcp.tool` or `mcp.resource` step, a resource wait or a `subscribe` start
+naming a Company's server is refused, and neither an instruction, a workflow
+definition nor the store is read from one.
+
+A company entry refuses `auth`, `headers`, `methods` and `breaker`: the
+protocol defines how agentd authenticates there. Its `tags` default to
+`{"*": [untrusted_input, egress]}`. Adding, removing or changing a company
+entry is a restart (`config.reload.restart_required`). It needs
+`security.companies.client`, and a store that keeps the User ID: `store.kind`
+`none` and `memory` are refused, and a remote store (`mcp`, `http`) needs
+`security.companies.seal_key`. Once the store's User IDs are sealed, every
+Company is unavailable without the key they were sealed with — a removed key
+as much as a wrong one (`company.seal_key.mismatch`).
+
+```yaml
+# fragment: a Company, and who agentd is to it
+security:
+  companies:
+    client:
+      id: https://agent.example/companies/client.json
+      name: Dana's agent
+services:
+  shop:
+    kind: company
+    endpoint: https://example.com
+    hosts: ["example.com", "*.example.com"]
+    allow: ["search*", "order_*"]
+```
 
 ## tools
 
@@ -1091,6 +1143,16 @@ Every `security` path is restart · op.
 | `security.cgroup.memory_max` | `max` or a size | — | Per-child `memory.max`. |
 | `security.cgroup.pids_max` | `max` or a count | — | Per-child `pids.max`; counts threads. |
 | `security.aauth.provider`, `.key_file`, `.enroll_token`, `.enroll_assertion_file`, `.person_server` | — | — | The AAuth agent identity. Needs `aauth`; see [AAuth agent identity](aauth.md). |
+| `security.companies.user` | `operator` or a principal id | `operator` | The one User this instance acts for at every Company. `operator` is refused when `a2a.principals` holds more than one rule of role `operator`. Needs `companies`, like every `security.companies` path. |
+| `security.companies.client.id` | HTTPS URL | required with a company entry | The `client_id`: the URL of the client metadata document. |
+| `security.companies.client.name`, `.logo_uri` | string, HTTPS URL | required, — | The document's `client_name` and `logo_uri`. |
+| `security.companies.client.jwks_uri` | HTTPS URL | `<client_id origin>/companies/jwks.json` | The key set's URL, on the `client_id`'s host. |
+| `security.companies.client.key_file` | path | `/var/lib/agentd/company-client-key` | The ES256 signing key (PKCS#8), created `0600` when absent. Only the supervisor reads it. |
+| `security.companies.client.published_key_files` | list of paths | `[]` | Keys whose public halves the key set lists and that are never signed with: the next key before a rotation, the previous one after. |
+| `security.companies.client.serve` | bool | `false` | Serve the document and the key set on the A2A listener, at their URLs' paths. Needs `a2a`, and `a2a.url` the `client_id`'s origin. Otherwise publish what `agentd --print-company-client` writes. |
+| `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the User ID records, so the store cannot read them. Required with a remote store. |
+| `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. |
+| `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |
 
 The model these keys enforce is [Security model](security.md); the checklist is
 [Harden a deployment](harden.md).
@@ -1160,6 +1222,7 @@ refuses the reload with `config.reload.restart_required`:
   `observability.health_file`, `observability.events_ring`,
   `observability.traceparent`
 - `security` (every path)
+- a `services` entry of `kind: company`, added, removed or changed
 
 Every other path is applied live, as follows:
 
@@ -1227,6 +1290,7 @@ inline.
 | `intelligence.providers.<name>.token` | `config file: intelligence.providers.<name>.token carries an inline credential; …` |
 | `a2a.bearer` | `config file: a2a.bearer carries an inline credential; …` |
 | `security.aauth.enroll_token` | `config file: security.aauth.enroll_token carries an inline credential; …` |
+| `security.companies.seal_key` | `config file: security.companies.seal_key carries an inline credential; …` |
 | `mcp.servers[].oauth.client_secret` | `config file: mcp server '<name>' oauth.client_secret carries an inline credential; …` |
 | `a2a.principals[].match.bearer_ref` | `config file: a2a.principals[0].match.bearer_ref carries an inline credential; …` |
 | a webhook verifier's `bearer`, `header.equals` and `hmac.secret`: `webhooks.default_auth`, and the `auth` of every `webhook` start and webhook wait | `config file: workflows[0].steps.hook.auth.hmac.secret carries an inline credential; …` |

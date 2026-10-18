@@ -266,6 +266,27 @@ impl Runtime {
         if let Err(e) = self.registry.validate_args(name, &args) {
             return ToolOutcome::Ready(Value::String(e), true);
         }
+        // A Company's tool acts for its one User, and a subagent reaches one
+        // only by a grant its spawn made (RFC 0047 §5.6).
+        if self.company_server_of(name).is_some() {
+            if let Err(e) = self.company_work_admitted(caller.principal.as_deref()) {
+                return ToolOutcome::Ready(Value::String(e), true);
+            }
+            if let Some(h) = &caller.subagent {
+                let granted = self
+                    .subagents
+                    .get(h)
+                    .and_then(|r| r.payload.as_ref())
+                    .and_then(|p| p["gated_tools"].as_array())
+                    .is_some_and(|g| g.iter().any(|t| t.as_str() == Some(name)));
+                if !granted {
+                    return ToolOutcome::Ready(
+                        Value::String(format!("tool {name:?} is not granted to subagent:{h}")),
+                        true,
+                    );
+                }
+            }
+        }
         // The instance's own controls are the operator's, whichever door a
         // request uses. Every root turn is offered them, including one a
         // `user` or `agent` principal drives — so without this, a principal
@@ -467,23 +488,64 @@ impl Runtime {
                 true,
             );
         };
+        // A Company call holds one of the Company's places in flight for as
+        // long as it runs, and its failure is said as what it means.
+        #[cfg(feature = "companies")]
+        let company = match self
+            .companies
+            .as_ref()
+            .and_then(|c| c.company_of_server(server))
+        {
+            Some(c) => match crate::companies::Company::enter(&c) {
+                Some(slot) => Some(slot),
+                None => {
+                    return ToolOutcome::Ready(
+                        Value::String(format!(
+                            "company {} has {} calls in flight (security.companies.limits.in_flight); retry when one ends",
+                            c.name,
+                            c.limit()
+                        )),
+                        true,
+                    );
+                }
+            },
+            None => None,
+        };
         let tool = tool.to_string();
-        // `_meta` carried run, step, instance, idempotency key and attempt —
-        // and nothing about WHO the work is for, so a server could neither
-        // authorize nor attribute per person.
-        let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
-        meta["agent/acting_for"] = json!(
-            caller.principal.clone().unwrap_or_else(|| self
-                .settings
-                .identity
-                .autonomous_id()
-                .to_string())
-        );
-        let labels = self.labels_of(caller.principal.as_deref());
-        if !labels.is_empty() {
-            meta["agent/labels"] = json!(labels);
-        }
-        let call = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
+        // A Company under the strict privacy profile (RFC 0047 §5.10) sees
+        // none of agentd's correlators: no `agent/*` key, no idempotency
+        // key, no trace context. The call is still a span of the unit's in
+        // agentd's own telemetry.
+        #[cfg(feature = "companies")]
+        let strict = company.as_ref().is_some_and(|slot| slot.strict());
+        #[cfg(not(feature = "companies"))]
+        let strict = false;
+        let (meta, call) = if strict {
+            (
+                json!({}),
+                self.caller_trace(caller)
+                    .as_ref()
+                    .map(crate::obs::trace::TraceContext::child),
+            )
+        } else {
+            // `_meta` carried run, step, instance, idempotency key and attempt
+            // — and nothing about WHO the work is for, so a server could
+            // neither authorize nor attribute per person.
+            let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
+            meta["agent/acting_for"] = json!(
+                caller.principal.clone().unwrap_or_else(|| self
+                    .settings
+                    .identity
+                    .autonomous_id()
+                    .to_string())
+            );
+            let labels = self.labels_of(caller.principal.as_deref());
+            if !labels.is_empty() {
+                meta["agent/labels"] = json!(labels);
+            }
+            let call = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
+            (meta, call)
+        };
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         let server = server.to_string();
@@ -494,8 +556,21 @@ impl Runtime {
                 let start = crate::obs::otel::now_unix_nanos();
                 let (result, is_error) = match client.call_tool_with_meta(&tool, Some(args), meta) {
                     Ok(r) => (super::worker::tool_result_value(&r), r.is_error()),
-                    Err(e) => (Value::String(format!("transport error: {e}")), true),
+                    Err(e) => {
+                        let text = format!("transport error: {e}");
+                        // A refusal the Company's server sent is said as what
+                        // it means; a tool's own error is the Company's
+                        // answer, and stays as it wrote it.
+                        #[cfg(feature = "companies")]
+                        let text = match &company {
+                            Some(slot) => crate::companies::mcp::typed_error(slot.company(), &text),
+                            None => text,
+                        };
+                        (Value::String(text), true)
+                    }
                 };
+                #[cfg(feature = "companies")]
+                drop(company);
                 crate::obs::otel::mcp_span(
                     call.as_ref(),
                     "tools/call",

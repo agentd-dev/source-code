@@ -98,10 +98,15 @@ pub(crate) fn advertised_url(a2a: &crate::config::settings::A2a, bound: &str) ->
 /// would be without it, because it is not a mechanism any caller but the
 /// launcher's own client can use.
 ///
+/// `documents` are public JSON documents served at their paths to anyone:
+/// the client identity Companies fetch, when `security.companies.client`
+/// says to serve it (RFC 0047 §5.5.2).
+///
 /// Before anything binds, every rule id is recorded in the identity registry
 /// ([`crate::runtime::identities`]), and a `user`-role id that an approved
 /// device already owns refuses the start: the two would be one principal, and
 /// the rule would inherit the device's history.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_a2a_listener(
     a2a: &crate::config::settings::A2a,
     events_tx: Sender<Event>,
@@ -110,6 +115,7 @@ pub(crate) fn spawn_a2a_listener(
     _write_timeout: Duration,
     log: Logger,
     launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
+    documents: Vec<(String, Vec<u8>)>,
 ) -> Result<A2aServing, String> {
     use std::path::Path;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
@@ -220,6 +226,7 @@ pub(crate) fn spawn_a2a_listener(
             tls,
             request_timeout: bridge.request_timeout,
             stream_deadline: bridge.stream_deadline,
+            documents,
         },
         Arc::clone(&bridge),
         feed.clone(),
@@ -304,6 +311,7 @@ mod tests {
             Duration::from_secs(1),
             quiet(),
             launch,
+            Vec::new(),
         )
         .unwrap()
     }

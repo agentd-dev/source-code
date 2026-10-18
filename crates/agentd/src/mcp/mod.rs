@@ -118,6 +118,15 @@ pub fn from_spec(
     timeout: std::time::Duration,
 ) -> Result<client::McpClient, client::McpError> {
     use client::{McpClient, McpError};
+    // A Company's server is dialled by the supervisor alone, with the
+    // Session's Bearer token (`companies::mcp`): a spec that reached anyone
+    // else is refused here, before any socket opens.
+    if spec.company.is_some() {
+        return Err(McpError::Transport(format!(
+            "mcp server '{}' is a Company's, reached only through the supervisor",
+            spec.name
+        )));
+    }
     if spec.endpoint.trim().is_empty() {
         return Err(McpError::Transport(format!(
             "mcp server '{}' has no endpoint",

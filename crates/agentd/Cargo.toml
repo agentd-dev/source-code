@@ -142,6 +142,14 @@ sign = ["aauth", "instruction-core/sign"]
 # Plain HTTPS + JSON on the existing client; SHA-256 is the `ring` rustls
 # already resolves — no OCI client crate (the minimalism moat). OFF by default.
 oci = ["tls", "dep:ring"]
+# Acting at Companies for a person (RFC 0047): agentd as a Personal Agent
+# under the Personal Agent Protocol draft pinned at `95fcbf2` — `services`
+# entries of `kind: company`, `security.companies`, the client identity
+# (`--print-company-client`), discovery, DPoP-bound Sessions and the Company's
+# MCP tools, all held by the supervisor. ES256, DPoP and sealing are the
+# `ring` `oauth` already carries, and every Company URL is HTTPS: no new
+# crate. NOT in the release feature set — the draft moves (rfcs/0047 §11).
+companies = ["oauth", "tls"]
 # MCP Events (RFC 0045, SEP-3415 — a draft extension): `mcp.servers[].events`
 # bindings and `event_grants`, polled into declared streams. Hand-rolled on the
 # MCP socket; adds no dependency.

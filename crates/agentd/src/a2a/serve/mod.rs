@@ -130,7 +130,14 @@ pub struct Opts {
     /// How long an observation-feed stream is held open before it hands the
     /// client a cursor and asks it to come back.
     pub stream_deadline: Duration,
+    /// Public JSON documents served at their paths with a `GET`: the client
+    /// metadata document and key set a Company fetches (RFC 0047 §5.5.2),
+    /// when `security.companies.client.serve` says so. Mounted only then.
+    pub documents: Vec<(String, Vec<u8>)>,
 }
+
+/// How long a Company may cache a served document.
+const DOCUMENT_MAX_AGE: &str = "max-age=300";
 
 /// A running listener. Dropping it stops serving.
 pub struct Listener {
@@ -177,6 +184,7 @@ struct App {
     /// Whether a caller's session is still alive, consulted while its
     /// requests are in flight. `None` on a listener with no sessions.
     liveness: Option<Liveness>,
+    documents: Vec<(String, Vec<u8>)>,
     log: Logger,
 }
 
@@ -329,6 +337,7 @@ impl App {
             request_timeout: opts.request_timeout,
             stream_deadline: opts.stream_deadline,
             liveness,
+            documents: opts.documents,
             log,
         }
     }
@@ -374,7 +383,34 @@ fn router(app: Arc<App>) -> Router {
             );
         }
     }
+    // The public documents, at their paths: each the same bytes to every
+    // caller, with no credential asked for and none read.
+    for (path, body) in &app.documents {
+        let body = body.clone();
+        r = r.route(
+            path,
+            get(move || {
+                let body = body.clone();
+                async move { document(body) }
+            }),
+        );
+    }
     r.with_state(app)
+}
+
+/// A served public document.
+fn document(body: Vec<u8>) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, DOCUMENT_MAX_AGE),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 // ---- the authorization server's routes --------------------------------------
@@ -741,6 +777,7 @@ mod tests {
             tls: None,
             request_timeout: Duration::from_secs(5),
             stream_deadline: Duration::from_secs(5),
+            documents: Vec::new(),
         };
         let mut app = App::new(
             A2aBridge::new(tx, resolver),
@@ -2150,6 +2187,7 @@ mod tests {
                 tls: None,
                 request_timeout: Duration::from_secs(5),
                 stream_deadline: Duration::from_secs(5),
+                documents: Vec::new(),
             },
             A2aBridge::new(tx, resolver),
             None,

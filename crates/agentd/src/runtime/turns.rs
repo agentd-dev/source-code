@@ -183,12 +183,15 @@ impl Runtime {
     }
 
     /// The tool definitions + routing for a caller. `servers`, when given,
-    /// is the only set of MCP servers whose tools the plan holds.
+    /// is the only set of MCP servers whose tools the plan holds. `owner` is
+    /// who the work is for, which decides whether a Company's tools are in
+    /// it at all.
     pub(crate) fn tool_plan(
         &self,
         caller: &Caller,
         allow: Option<&[String]>,
         servers: Option<&[String]>,
+        owner: Option<&str>,
     ) -> ToolPlan {
         let select = match caller {
             Caller::Root => Some(&self.settings.agent.tools),
@@ -213,6 +216,11 @@ impl Runtime {
                 _ => true,
             });
         }
+        // A Company's tools act for one User: in anyone else's work they are
+        // not offered at all (RFC 0047 §5.6).
+        if self.company_work_admitted(owner).is_err() {
+            defs.retain(|d| self.company_server_of(&d.name).is_none());
+        }
         // Which policy caller this plan is being built for. A plan is per
         // turn, so this is fixed for every call the child will make.
         let who = match caller {
@@ -233,6 +241,14 @@ impl Runtime {
                 // lists would be advertised to the model and then fail to
                 // dispatch in the child, which is the worst of both.
                 Some((ToolClass::Internal | ToolClass::Workflow, _)) => {
+                    internal.push(d.name.clone())
+                }
+                // A Company's tools come back to the supervisor, whatever
+                // the policies say: only it holds the Session, and no worker
+                // is ever handed a Company server to dial.
+                Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, .. }))
+                    if self.is_company_server(server) =>
+                {
                     internal.push(d.name.clone())
                 }
                 Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, tool })) => {
@@ -471,7 +487,8 @@ impl Runtime {
         // the root tool plan. An instance has one operator, so there is no
         // narrower per-conversation grant to apply; per-principal narrowing
         // happens at the A2A boundary, not here.
-        let (tools, internal, routes) = self.tool_plan(&Caller::Root, None, None);
+        let owner = self.contexts.get(&ctx_id).and_then(|c| c.principal.clone());
+        let (tools, internal, routes) = self.tool_plan(&Caller::Root, None, None, owner.as_deref());
         let servers: Vec<String> = routes
             .values()
             .map(|(s, _)| s.clone())
@@ -1238,6 +1255,8 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             // anything a policy might touch was left out of `mcp_routes` and
             // put in `internal`, so there is nothing more to name here.
             gated_tools: Vec::new(),
+            // Its Company tools are in `TurnSpec.tools`, routed `internal`.
+            supervisor_tools: Vec::new(),
             mcp_routes: None,
             // An explicit `model:` on the node wins; then the model the
             // turn's role is bound to — summarising and triage are recurring

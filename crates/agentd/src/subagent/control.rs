@@ -74,6 +74,8 @@ const GATED_TOOL_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 struct NoSelfTools {
     /// Tool names to route up rather than call directly.
     gated: Vec<String>,
+    /// Definitions of gated tools no connection of the child lists.
+    offered: Vec<crate::wire::intel::ToolDef>,
     /// The upward channel: gated calls and each model call's usage.
     up: Up,
     /// The round-trip channel, when there is anything to route.
@@ -89,7 +91,7 @@ struct GatedBridge {
 
 impl SelfHandler for NoSelfTools {
     fn tools(&self) -> Vec<crate::wire::intel::ToolDef> {
-        Vec::new()
+        self.offered.clone()
     }
     fn handle(&mut self, name: &str, args: &serde_json::Value) -> Option<(String, bool)> {
         if !self.gated.iter().any(|g| g == name) {
@@ -362,6 +364,7 @@ pub fn run() -> i32 {
     // timeout is generous because a gate may be waiting on a person.
     let mut orch = NoSelfTools {
         gated: payload.gated_tools.clone(),
+        offered: payload.supervisor_tools.clone(),
         up: Arc::clone(&up),
         bridge: (!payload.gated_tools.is_empty()).then(|| GatedBridge {
             replies: Arc::clone(&replies),

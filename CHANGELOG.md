@@ -69,6 +69,109 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   the sentence of the draft it tests, verbatim, and each failing when the
   fake breaks that rule or a variant built to break it goes uncaught). The
   suite's binary is built with `oauth`.
+- Acting at Companies for a person (RFC 0047, P1a), behind the new cargo
+  feature `companies`, which no release binary carries. A `services` entry of
+  `kind: company` declares a Company by its domain (`endpoint:
+  https://<host>`), and `security.companies` names the one User the instance
+  acts for (`user`, default `operator`), the client identity every Company
+  sees (`client: {id, name, logo_uri, jwks_uri, key_file,
+  published_key_files, serve}`), the seal key (`seal_key`), the browser
+  servers to keep off Companies (`browsers`, validated) and the calls in
+  flight per Company (`limits.in_flight`, default 4). After load — never
+  under `--validate-config`, which dials nothing — the supervisor reads each
+  Company's discovery document and RFC 8414 metadata and verifies them: a
+  major `protocol_version` other than `0`, an `organization.domain` that is
+  not the serving host, an issuer that is not `auth.issuer` byte for byte, a
+  `poppy_domains` without the domain, no `ES256` (or the algorithms only under
+  the prefixed member), a missing endpoint, a redirect that is not HTTPS, and
+  a URL the documents name off the entry's `hosts` are each refused, logged
+  as `company.refused {company, reason}` (and `company.endpoint.refused
+  {company, field, host}`) and as `auth.unavailable` for target
+  `company:<name>`. Every Company dial goes through the SSRF guard; loopback
+  and private addresses need `allow_private`. The documents are kept for
+  their max-age, clamped to a minute and a day; a refetch that names another
+  issuer suspends the Company, and one that changes the MCP APIs logs
+  `company.apis_changed`, once per change, and changes no server until a
+  restart. A Company that is down or does not verify is tried again with the
+  backoff of a server down at boot, and its tools join when it does;
+  `auth.recovered` is said once a token is issued again, not when the
+  documents alone verify.
+- A Company's MCP APIs are MCP servers named at load — after the entry, or
+  by `mcp_names` when the Company lists several (several without names
+  refuse the Company) — whose tools register only as `<server>.<tool>`, their
+  descriptions prefixed with a note of whose words they are, the Company's
+  name in it quoted and capped. The supervisor holds a signed-out Session
+  at each Company: a random User ID per (User, issuer),
+  kept durably (sealed with AES-256-GCM, under ids the store cannot map to
+  issuers, when `seal_key` is set), the Session started with the JWT bearer
+  grant, an ES256 Session assertion and client assertion (`aud` the issuer,
+  a minute's life, a fresh `jti` on every retry) and a DPoP proof from a key
+  held in memory for the process; `use_dpop_nonce` is retried once with the
+  nonce. After a restart the same User ID and `session_id` are renewed with
+  the new DPoP key. Each MCP server gets a Bearer token requested without a
+  proof and with `resource` its `url`, once its RFC 9728 metadata names the
+  issuer; `401 invalid_token` renews it and retries once, `403
+  sign_in_required` is a typed tool error, and `403 extension_required`
+  makes the server unusable (`company.interface.refused`), its next calls
+  refused unsent; a tool's own error is handed on as the Company wrote it.
+  Under `privacy: strict`, the default, a Company's MCP calls carry none of
+  agentd's correlators: no `agent/*` `_meta` key, no idempotency key, no
+  trace context. `privacy: standard` sends them and is logged at boot
+  (`company.privacy.standard`). No token request follows a redirect or puts
+  a token in a URL.
+- A Company's tools are the supervisor's alone. No turn worker, subagent or
+  instance child is handed a Company server's spec or route: a turn routes
+  every Company tool back to the supervisor, and a subagent granted a Company
+  server is handed its tools' definitions (`SpawnPayload::supervisor_tools`)
+  and their names among `gated_tools`, whatever `security.policies` says, so
+  its calls come back too. They are offered only in work the configured User
+  owns, or in unowned work when the User is `operator` or an operator
+  principal; anywhere else a call is refused naming both. A workflow
+  reaches them through `tool` steps (`shop.search`), under the same rule: an
+  `mcp.tool` or `mcp.resource` step, a resource wait or a `subscribe` start
+  naming a Company's server is refused — at load, by `workflow.create`, and
+  when a templated name renders to one — and no instruction, workflow
+  definition or `store.mcp` is read from one.
+- `agentd --print-company-client <dir>` writes the client metadata document
+  and key set for static hosting, creating the signing key `0600`; with
+  `client.serve: true` the A2A listener serves both at their URLs' paths
+  (`Cache-Control: max-age=300`). Before its first Session the supervisor
+  fetches both from where they are published and requires them to match
+  (`company.identity.unpublished` otherwise), and requires `seal_key` to be
+  the key the store's User IDs were sealed with, and to be set once they are
+  (`company.seal_key.mismatch`). Load refuses, naming each: a company entry
+  with `auth`, `headers`, `methods` or `breaker`, an endpoint
+  with a path, interfaces other than `mcp`, two `mcp_names` alike or a name
+  another server has, an `mcp.servers` entry referencing a company entry, a
+  profile, skills source, override or `store.mcp.server` naming a Company's
+  server, no
+  `security.companies.client`, a non-HTTPS `client.id`, a `jwks_uri` on
+  another host, `serve` without the A2A listener at the `client_id`'s origin,
+  `user: operator` beside two operator principal rules, `store.kind` `none`
+  or `memory`, and a remote store without `seal_key`, which in a file must be
+  a secret reference. A reload that adds, removes or changes a company entry
+  is `config.reload.restart_required`.
+- `agentd-mcp`: `McpClient::with_vetted_dial` and
+  `HttpTransport::set_vetted` dial a server through the SSRF guard.
+  `agentd-core`: the `companies` module (`discover`, `dpop`, `http`,
+  `identity`, `mcp`, `session`, `token`, `user_id`, `Supervisor`,
+  `print_client`), `config::settings::companies`, `ServiceKind::Company`,
+  `Security::companies`, `McpServerSpec::company`, `Ask::PrintCompanyClient`,
+  `a2a::serve::Opts::documents`. The fake Company records each token
+  request's assertion and proof claims, the proof key's thumbprint and the
+  vendored schemas the request was held to, and its control steers
+  `refuse_tokens`, `refuse_grants`, `extension_required`, `extra_mcp` and
+  `end_sessions`. In
+  debug and `internal-mocks` builds `AGENTD_TEST_FRAMES_FILE` records every
+  frame to and from a child, with its environment, and
+  `AGENTD_TEST_COMPANY_MAX_AGE_MS` sets how long verified Company documents
+  are kept.
+- Conformance: seven `companies/agent-*` checks hold agentd itself to the
+  draft through the fake's record — no assertion to a Company that fails
+  discovery, the published `client_id`, the assertions' `aud`, a proof on
+  every token request, the Bearer token for the MCP server only, nonce
+  support, and the same User across a restart. The suite's binary is built
+  with `companies`.
 
 **Changed.**
 

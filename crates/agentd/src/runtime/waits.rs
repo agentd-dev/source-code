@@ -492,6 +492,12 @@ impl Runtime {
             "resource" => {
                 let server = spec.get("server").and_then(Value::as_str).unwrap_or("").to_string();
                 let uri = spec.get("uri").and_then(Value::as_str).unwrap_or("").to_string();
+                // A templated name the definition check could not see.
+                if self.is_company_server(&server) {
+                    let e = crate::config::settings::companies::direct_use_refused(&server);
+                    self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait resource: {e}")), 0);
+                    return;
+                }
                 // Subscribe (notify-then-read on the loop's notification poll).
                 match self.mcp.get(&server).cloned() {
                     Some(c) => {
@@ -1622,6 +1628,19 @@ impl Runtime {
             .and_then(Value::as_str)
             .unwrap_or("read")
             .to_string();
+        // A templated name the definition check could not see.
+        if self.is_company_server(&server) {
+            let e = crate::config::settings::companies::direct_use_refused(&server);
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some(format!("mcp.resource: {e}")),
+                0,
+            );
+            return;
+        }
         let Some(client) = self.mcp.get(&server).cloned() else {
             self.finish_step_pub(
                 run_id,

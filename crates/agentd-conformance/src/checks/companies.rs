@@ -8,6 +8,9 @@
 //! only when the conforming fake does what the draft says **and** the
 //! variant built to break that rule is caught breaking it.
 //!
+//! [`super::companies_agent`] then holds agentd itself to the draft, as the
+//! Personal Agent, against the same fake.
+//!
 //! Every check quotes the draft sentence it tests ([`QUOTES`]), as the
 //! draft's own Company validator does, and a unit test requires each quote
 //! to appear verbatim, in its section, in the pages vendored at the pin
@@ -30,7 +33,7 @@ pub fn checks() -> Vec<Check> {
         desc,
         run,
     };
-    vec![
+    let mut checks = vec![
         check(
             "companies/fake-issuer-matches-its-metadata",
             "the fake's RFC 8414 metadata, at the well-known URL with the suffix inserted before the issuer's path, names exactly the discovery document's issuer; the issuer-mismatch variant is refused for it",
@@ -141,7 +144,10 @@ pub fn checks() -> Vec<Check> {
             "an MCP tool that needs the account answers a signed-out Bearer token with 403 sign_in_required, and a signed-in one without poppy:read with 403 insufficient_scope naming it",
             mcp_account_errors,
         ),
-    ]
+    ];
+    // And agentd itself held to the draft, as the Personal Agent.
+    checks.extend(super::companies_agent::checks());
+    checks
 }
 
 /// A vendored page of the draft.
@@ -1838,6 +1844,11 @@ fn mcp_account_errors(h: &Harness) -> Outcome {
 mod tests {
     use super::*;
 
+    /// The fake's checks' quotes and agentd's.
+    fn all_quotes() -> impl Iterator<Item = &'static Quote> {
+        QUOTES.iter().chain(super::super::companies_agent::QUOTES)
+    }
+
     const VENDOR: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../agentd/tests/companies/vendor"
@@ -1888,11 +1899,11 @@ mod tests {
         let ids: Vec<&str> = checks().iter().map(|c| c.id).collect();
         for id in &ids {
             assert!(
-                QUOTES.iter().any(|q| q.check == *id),
+                all_quotes().any(|q| q.check == *id),
                 "{id} quotes no sentence of the draft"
             );
         }
-        for q in QUOTES {
+        for q in all_quotes() {
             assert!(
                 ids.contains(&q.check),
                 "a quote for {}, which is not a check",

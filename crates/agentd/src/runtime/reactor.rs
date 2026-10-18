@@ -400,8 +400,14 @@ pub struct Runtime {
     pub(crate) log: Logger,
     pub(crate) instance: String,
     pub(crate) run_id: String,
-    pub(crate) durable: Durable,
+    /// Shared, so the supervisor's Company Sessions keep the User's records
+    /// from the threads that open them (`companies::user_id`).
+    pub(crate) durable: Arc<Durable>,
     pub(crate) mcp: BTreeMap<String, Arc<McpClient>>,
+    /// The Personal Agent at the declared Companies (RFC 0047): `None` when
+    /// none is declared.
+    #[cfg(feature = "companies")]
+    pub(crate) companies: Option<Arc<crate::companies::Supervisor>>,
     pub(crate) mcp_specs: BTreeMap<String, crate::config::McpServerSpec>,
     /// Per server, the subscriptions an owner wants and the live connection
     /// does not hold after a failure that may pass, and when to ask again

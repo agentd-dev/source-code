@@ -12,6 +12,7 @@
 //! never merged); flags apply in argument order — a generic `--<path>` SETS,
 //! while a named repeatable alias (`--mcp`, `--a2a-peer`) ADDS to its list.
 
+pub mod companies;
 pub mod events;
 pub mod schema;
 
@@ -2233,6 +2234,26 @@ pub struct Service {
     /// `breaker:` wins.
     #[serde(default)]
     pub breaker: Option<Value>,
+    /// `kind: company` only — the host globs every endpoint the Company's
+    /// documents name must match (RFC 0047 §5.5.1). Absent: the endpoint's
+    /// host, the document's `organization.domain`, the subdomains of both,
+    /// and the issuer's host.
+    #[serde(default)]
+    pub hosts: Option<Vec<String>>,
+    /// `kind: company` only — admit loopback, private and link-local
+    /// addresses: an on-premises Company, or a fake one in a test.
+    #[serde(default)]
+    pub allow_private: Option<bool>,
+    /// `kind: company` only — which of the Company's interfaces are used.
+    #[serde(default)]
+    pub interfaces: Option<Vec<companies::Interface>>,
+    /// `kind: company` only — a server name for each MCP API `url`, when the
+    /// Company lists more than one.
+    #[serde(default)]
+    pub mcp_names: BTreeMap<String, String>,
+    /// `kind: company` only — what agentd's own correlators a Company sees.
+    #[serde(default)]
+    pub privacy: Option<companies::Privacy>,
 }
 
 /// Which outbound surface a catalog entry describes. Matching is
@@ -2247,6 +2268,10 @@ pub enum ServiceKind {
     Intelligence,
     Peer,
     Http,
+    /// A Company agentd acts at for its User (RFC 0047): the domain whose
+    /// discovery document names every endpoint, bounded by the entry's
+    /// `hosts`. Its MCP servers are made from it at load.
+    Company,
 }
 
 impl ServiceKind {
@@ -2256,6 +2281,7 @@ impl ServiceKind {
             ServiceKind::Intelligence => "intelligence",
             ServiceKind::Peer => "peer",
             ServiceKind::Http => "http",
+            ServiceKind::Company => "company",
         }
     }
 }
@@ -2281,6 +2307,13 @@ pub fn resolve_services(s: &mut Settings) -> Vec<String> {
             ));
             continue;
         };
+        if entry.kind == ServiceKind::Company {
+            errs.push(format!(
+                "mcp server '{}' references service '{name}', which is `kind: company`: a Company's MCP servers are made from its discovery document, under their own names",
+                srv.name
+            ));
+            continue;
+        }
         // Consumers reference, never restate: connection settings live in the
         // catalog only, so there is exactly one place to rotate a credential
         // or repoint a host.
@@ -2386,6 +2419,8 @@ pub fn resolve_services(s: &mut Settings) -> Vec<String> {
         peer.auth = entry.auth.clone();
         peer.headers = entry.headers.clone();
     }
+    // Last, so no loop above takes a Company's server for a consumer.
+    companies::synthesize(s, &mut errs);
     errs
 }
 
@@ -2566,6 +2601,10 @@ pub struct McpServer {
     /// §5.15).
     #[serde(default)]
     pub event_grants: Vec<events::EventGrant>,
+    /// NOT a config key: set on the MCP servers a company entry stands for
+    /// ([`companies::synthesize`]), which only the supervisor dials.
+    #[serde(skip)]
+    pub company: Option<companies::CompanyServer>,
 }
 
 impl McpServer {
@@ -2612,6 +2651,7 @@ impl McpServer {
             service: self.service.clone(),
             rate: self.service_rate.clone(),
             first_request: None,
+            company: self.company.as_ref().map(|c| c.entry.clone()),
         })
     }
 }
@@ -4012,6 +4052,9 @@ pub struct Security {
     /// asked for. It is also where the trifecta tags finally do work at
     /// runtime rather than only folding at startup.
     pub policies: Vec<Policy>,
+    /// Acting at Companies for one User (RFC 0047): who the User is, the
+    /// client identity every Company sees, and the seal key.
+    pub companies: companies::Companies,
 }
 
 /// One rule: what it matches, and what happens.
@@ -5617,6 +5660,10 @@ pub enum Ask {
     /// `--extensions`: print every URI agentd publishes — its extensions and
     /// its binding — with where the site serves each one's spec and schema.
     Extensions,
+    /// `--print-company-client <dir>`: write the client metadata document
+    /// and key set Companies fetch (RFC 0047 §5.5.2) into `dir`, for static
+    /// hosting, creating the signing key when absent. Dials nothing.
+    PrintCompanyClient(String),
 }
 
 /// The ask a flag makes, when it makes one: the flags that want something
@@ -5636,6 +5683,7 @@ fn ask_flag(flag: &str) -> Option<Ask> {
         "--logout" => Ask::Logout(String::new()),
         "--extension-schema" => Ask::ExtensionSchema(String::new()),
         "--extensions" => Ask::Extensions,
+        "--print-company-client" => Ask::PrintCompanyClient(String::new()),
         _ => return None,
     })
 }
@@ -5803,6 +5851,13 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                     Ask::ExtensionSchema(_) => {
                         Ask::ExtensionSchema(it.next().cloned().ok_or_else(|| {
                             usage("--extension-schema requires a name (e.g. command)".into())
+                        })?)
+                    }
+                    Ask::PrintCompanyClient(_) => {
+                        Ask::PrintCompanyClient(it.next().cloned().ok_or_else(|| {
+                            usage(
+                                "--print-company-client requires a directory to write into".into(),
+                            )
                         })?)
                     }
                     other => other,
@@ -7710,6 +7765,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     }
     // MCP Events bindings and grants.
     events::validate(s, &mut d);
+    // `security.companies` and the company entries.
+    companies::validate(s, &mut d);
 
     // mcp servers
     let mut names = std::collections::HashSet::new();
@@ -7817,7 +7874,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         // Kind-specific fields: the tool surface (allow/exclude/tags/breaker)
         // is `kind: mcp` vocabulary; `methods` is `kind: http` vocabulary.
-        if svc.kind != ServiceKind::Mcp {
+        if !matches!(svc.kind, ServiceKind::Mcp | ServiceKind::Company) {
             for (set, what) in [
                 (svc.allow.is_some(), "allow"),
                 (!svc.exclude.is_empty(), "exclude"),
@@ -9203,6 +9260,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         for e in undeclared_references(s, w) {
             err(&mut d, e);
         }
+        for e in companies::workflow_refusals(s, w) {
+            err(&mut d, e);
+        }
     }
     d
 }
@@ -9618,6 +9678,7 @@ const FILE_SECRET_PATHS: &[&str] = &[
     "/intelligence/token",
     "/a2a/bearer",
     "/security/aauth/enroll_token",
+    "/security/companies/seal_key",
 ];
 
 /// Inline (non-reference) credentials found in the FILE document.
@@ -10039,6 +10100,8 @@ pub fn help_text() -> String {
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
          \x20 --logout <target>          evict a cached credential\n\
+         \x20 --print-company-client <dir>  write the client metadata document + key set Companies fetch\n\
+         \x20                            into <dir>, creating the signing key; dials nothing (needs companies)\n\
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
          \x20 --env <FILE>               load a dotenv file into this process's environment (repeatable; real env wins, later files win)\n\
          \x20 -h, --help / -V, --version\n\
@@ -10227,7 +10290,7 @@ mod tests {
         // invalid in an editor.
         assert_eq!(
             schema["$defs"]["Service"]["properties"]["kind"]["enum"],
-            json!(["mcp", "intelligence", "peer", "http"]),
+            json!(["mcp", "intelligence", "peer", "http", "company"]),
         );
     }
 
@@ -11365,6 +11428,7 @@ mod tests {
             timeout: None,
             events: Vec::new(),
             event_grants: Vec::new(),
+            company: None,
         };
         let spec = s.to_spec().unwrap();
         let o = spec.oauth.expect("oauth reaches the runtime spec");
@@ -14763,6 +14827,11 @@ mod tests {
                 timeout: None,
                 methods: None,
                 breaker: None,
+                hosts: None,
+                allow_private: None,
+                interfaces: None,
+                mcp_names: BTreeMap::new(),
+                privacy: None,
             },
         );
         let m = ServiceKind::Mcp;

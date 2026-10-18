@@ -377,7 +377,7 @@ impl Runtime {
         // never gave it. (An internal tool a rule might touch is served the
         // same way, deliberately: `status`, `ask_human` and the rest are
         // granted to subagents, and the stream-taint check counts them.)
-        let gated_tools: Vec<String> = if self.settings.security.policies.is_empty() {
+        let mut gated_tools: Vec<String> = if self.settings.security.policies.is_empty() {
             Vec::new()
         } else {
             self.registry
@@ -398,18 +398,45 @@ impl Runtime {
                 })
                 .collect()
         };
+        // A Company's tools on the servers it was handed come back to the
+        // supervisor whatever the policies say, and only in work the
+        // Company's User owns (RFC 0047 §5.6): the child has no connection
+        // to a Company, so it is handed their definitions to offer its model,
+        // and its calls round-trip.
+        let company_tools: Vec<crate::wire::intel::ToolDef> = if self
+            .company_work_admitted(caller.principal.as_deref())
+            .is_ok()
+        {
+            self.registry
+                .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
+                .into_iter()
+                .filter(|d| {
+                    self.company_server_of(&d.name)
+                        .is_some_and(|s| servers.contains(&s))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for d in &company_tools {
+            if !gated_tools.contains(&d.name) {
+                gated_tools.push(d.name.clone());
+            }
+        }
         // The child's MCP catalogue, by the registry's names
         // (`SpawnPayload::mcp_routes`): each MCP tool the registry offers a
         // subagent on the servers it was handed, and a profile server's
         // contract tools under the contract's name where the mapping is a
-        // plain rename the child can make itself.
+        // plain rename the child can make itself. Never a Company's.
         let profiles = crate::registry::profile_servers(&self.settings);
         let mcp_routes: std::collections::BTreeMap<String, (String, String)> = self
             .registry
             .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
             .iter()
             .filter_map(|d| match self.registry.get(&d.name).map(|t| &t.imp) {
-                Some(crate::registry::Impl::Mcp { server, tool }) if servers.contains(server) => {
+                Some(crate::registry::Impl::Mcp { server, tool })
+                    if servers.contains(server) && !self.is_company_server(server) =>
+                {
                     Some((d.name.clone(), (server.clone(), tool.clone())))
                 }
                 Some(crate::registry::Impl::Mapped(m))
@@ -430,6 +457,7 @@ impl Runtime {
             output_contract,
             context_seed,
             gated_tools,
+            supervisor_tools: company_tools,
             mcp_routes: Some(mcp_routes),
             // An explicit `model:` (from the call, the template or the spawn
             // defaults) overrides the parent's turn model; otherwise the child

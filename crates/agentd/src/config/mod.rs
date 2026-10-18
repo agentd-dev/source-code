@@ -415,6 +415,11 @@ pub struct McpServerSpec {
     /// never configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_request: Option<::mcp::client::FirstRequest>,
+    /// The company entry a Company's MCP server belongs to (RFC 0047). Such
+    /// a server is reached only through the supervisor's Session: no spawn
+    /// payload carries its spec, and [`crate::mcp::from_spec`] refuses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
 }
 
 /// The runtime shape of an MCP server's OAuth 2.1 client-credentials config.

@@ -231,7 +231,9 @@ impl Runtime {
                         }
                     }
                 }
-                (None, Some(uri)) => match read_resource_any(mcp, uri) {
+                (None, Some(uri)) => match read_resource_any(mcp, uri, &|n| {
+                    self.is_company_server(n)
+                }) {
                     Ok(text) => match crate::config::file::parse_document(
                         &text,
                         crate::config::file::Format::detect(Some(std::path::Path::new(uri)), &text),
@@ -553,7 +555,9 @@ impl Runtime {
                         .is_some_and(|t| t.class == crate::registry::ToolClass::Workflow)
                     {
                         errs.push(format!("workflow {:?} step {:?}: tool {n:?} is a workflow's tool; run that workflow with a `workflow` step", w.name, s.id));
-                    } else if !registry.allowed(&Caller::Workflow, n) {
+                    } else if !registry.allowed(&Caller::Workflow, n)
+                        && !self.company_tool_to_come(n, registry)
+                    {
                         errs.push(format!("workflow {:?} step {:?}: tool {n:?} is unknown, disabled or not granted to workflows", w.name, s.id));
                     }
                 }
@@ -574,6 +578,11 @@ impl Runtime {
         // server that is down joins when it comes up (`runtime::join`); a
         // step calling it before then fails when it runs.
         errs.extend(crate::config::settings::undeclared_references(
+            &self.settings,
+            w,
+        ));
+        // A Company's server is reached through its tools alone.
+        errs.extend(crate::config::settings::companies::workflow_refusals(
             &self.settings,
             w,
         ));
@@ -1963,6 +1972,12 @@ impl Runtime {
                     .unwrap_or("")
                     .to_string();
                 let args = spec.get("args").cloned().unwrap_or(json!({}));
+                // A templated name the definition check could not see.
+                if self.is_company_server(&server) {
+                    let e = crate::config::settings::companies::direct_use_refused(&server);
+                    self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                    return;
+                }
                 // Pace calls toward a rated catalog service. A dry bucket fails
                 // the step — a refusal the workflow's `retry:` can absorb —
                 // rather than blocking the single-writer loop.
@@ -2531,7 +2546,13 @@ impl Runtime {
                     .map(str::to_string)
                     .collect()
             });
-            self.tool_plan(&Caller::Workflow, allow.as_deref(), listed.as_deref())
+            let owner = self.runs.get(run_id).and_then(|r| r.principal.clone());
+            self.tool_plan(
+                &Caller::Workflow,
+                allow.as_deref(),
+                listed.as_deref(),
+                owner.as_deref(),
+            )
         };
         let servers: Vec<String> = match listed {
             Some(listed) => listed,
@@ -4188,15 +4209,22 @@ fn as_definition(mut resolved: Value, entry: &Value) -> Result<Value, String> {
 
 /// Read a resource URI (`mcp://<server>/<uri>`, or a URI one of `mcp`'s
 /// servers serves) through the connection set given — the running one, or
-/// the one a reload has staged.
+/// the one a reload has staged — and never through a server `company` says
+/// is a Company's.
 pub(crate) fn read_resource_any(
     mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
     uri: &str,
+    company: &dyn Fn(&str) -> bool,
 ) -> Result<String, String> {
     if let Some(rest) = uri.strip_prefix("mcp://") {
         let (server, res) = rest
             .split_once('/')
             .ok_or("mcp:// uri needs <server>/<resource-uri>")?;
+        if company(server) {
+            return Err(format!(
+                "mcp server {server:?} is a Company's, and a definition is never read from one"
+            ));
+        }
         let c = mcp
             .get(server)
             .ok_or_else(|| format!("mcp server {server:?} is not connected"))?;
@@ -4206,7 +4234,7 @@ pub(crate) fn read_resource_any(
             .map_err(|e| e.to_string());
     }
     let mut last = String::from("no connected server serves it");
-    for c in mcp.values() {
+    for (_, c) in mcp.iter().filter(|(n, _)| !company(n)) {
         match c.read_resource(uri, None) {
             Ok(r) => return Ok(r.text()),
             Err(e) => last = e.to_string(),
@@ -4252,6 +4280,33 @@ fn scrub_url(text: &str, url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A definition is never read from a Company's server: named, it is
+    /// refused as one; unnamed, that server is not asked.
+    #[test]
+    fn a_definition_is_never_read_from_a_company() {
+        let shop = std::sync::Arc::new(
+            crate::mcp::client::McpClient::connect(
+                "shop",
+                "https://127.0.0.1:9/mcp",
+                Vec::new(),
+                std::time::Duration::from_millis(200),
+            )
+            .unwrap(),
+        );
+        let mcp = BTreeMap::from([("shop".to_string(), shop)]);
+        let company = |n: &str| n == "shop";
+        let e = read_resource_any(&mcp, "mcp://shop/flow.yaml", &company).unwrap_err();
+        assert!(e.contains("is a Company's"), "{e}");
+        let e = read_resource_any(&mcp, "file:///flow.yaml", &company).unwrap_err();
+        assert_eq!(
+            e, "no connected server serves it",
+            "the Company's server was asked"
+        );
+        // Another server is asked as before.
+        let e = read_resource_any(&mcp, "file:///flow.yaml", &|_| false).unwrap_err();
+        assert_ne!(e, "no connected server serves it");
+    }
 
     /// Every part of a URL that `url_locator` drops is taken out of an error
     /// about it: echoed whole (a URL that does not parse), or as a host with

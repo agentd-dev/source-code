@@ -47,6 +47,8 @@ oci = ["tls", "agentd/oci"]
 mcp-events = ["agentd/mcp-events"]
 # On-the-fly decryption of encrypted instruction envelopes (RFC 0041).
 decrypt = ["sign", "agentd/decrypt"]
+# Acting at Companies for a person (RFC 0047); not in the release set.
+companies = ["oauth", "tls", "agentd/companies"]
 internal-mocks = ["agentd/internal-mocks"]
 mock-models = ["agentd/mock-models"]
 

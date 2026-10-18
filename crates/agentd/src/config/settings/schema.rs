@@ -420,7 +420,29 @@ fn top_level_properties(
                     "workdir": { "type": "string" }, "timeout": duration,
                     "max_output": { "type": "integer" },
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
-                "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" } } }));
+                "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" },
+                "companies": companies() } }));
+}
+
+/// `security.companies` (RFC 0047): the one User, the client identity
+/// every Company sees, the seal key. Needs the `companies` feature.
+fn companies() -> Value {
+    json!({ "type": "object", "additionalProperties": false,
+        "description": "acting at Companies for one User (RFC 0047; needs the companies feature): who the User is, the client identity every Company sees, and the key the User ID records are sealed with. Restart-only, operator-only",
+        "properties": {
+            "user": { "type": "string", "description": "the User this instance acts for at every Company: `operator` (default; refused when a2a.principals holds more than one operator rule) or a principal id `<role>:<id>`" },
+            "client": { "type": "object", "additionalProperties": false, "required": ["id", "name"], "properties": {
+                "id": { "type": "string", "description": "the client_id: the HTTPS URL of the client metadata document" },
+                "name": { "type": "string", "description": "client_name, shown on Companies' consent pages" },
+                "logo_uri": { "type": "string", "description": "an HTTPS URL" },
+                "jwks_uri": { "type": "string", "description": "the key set's HTTPS URL, on the client_id's host; default <client_id origin>/companies/jwks.json" },
+                "key_file": { "type": "string", "description": "the ES256 signing key (PKCS#8), created 0600 when absent; default /var/lib/agentd/company-client-key" },
+                "published_key_files": { "type": "array", "items": { "type": "string" }, "description": "keys whose public halves are in the key set but are never signed with: the next key before a rotation, the previous one after it" },
+                "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" } } },
+            "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the User ID records, so a store cannot read them. Required with a remote store (mcp, http)" },
+            "browsers": { "type": "array", "items": { "type": "string" }, "description": "browser MCP servers to keep off every Company's hosts; each names an mcp.servers entry" },
+            "limits": { "type": "object", "additionalProperties": false, "properties": {
+                "in_flight": { "type": "integer", "minimum": 1, "description": "Company calls in flight per Company (default 4); one more is refused until one ends" } } } } })
 }
 
 /// `agent.instruction.mcp`: a served resource, and the MCP Events types
@@ -644,8 +666,8 @@ fn defs_properties(
     m.insert("Service".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
                 "description": "a service-catalog entry: connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
                 "properties": {
-                "kind": { "enum": ["mcp", "intelligence", "peer", "http"],
-                          "description": "which surface this entry serves; one host may appear under several kinds with different trust budgets" },
+                "kind": { "enum": ["mcp", "intelligence", "peer", "http", "company"],
+                          "description": "which surface this entry serves; one host may appear under several kinds with different trust budgets. `company` (RFC 0047, the companies feature): a Company agentd acts at for its User — `endpoint` is the https://<host> whose discovery document is read" },
                 "endpoint": { "type": "string", "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } },
@@ -659,7 +681,13 @@ fn defs_properties(
                              "description": "`kind: http` only — the METHOD ceiling for `http` steps against this entry (e.g. [GET, POST]); absent = any method" },
                 "breaker": { "type": "object", "additionalProperties": false,
                              "properties": { "failures": { "type": "integer", "minimum": 1 }, "cooldown": duration },
-                             "description": "`kind: mcp` only — a default breaker policy for `mcp.tool` steps against this entry; a step's own `breaker:` wins" } } }));
+                             "description": "`kind: mcp` only — a default breaker policy for `mcp.tool` steps against this entry; a step's own `breaker:` wins" },
+                "hosts": { "type": "array", "items": { "type": "string" },
+                           "description": "`kind: company` only — host globs (`example.com`, `*.example.com`) every endpoint the Company's documents name must match; default the endpoint's host, the document's organization.domain, their subdomains and the issuer's host" },
+                "allow_private": { "type": "boolean", "description": "`kind: company` only — admit loopback, private and link-local addresses (an on-premises Company); default false" },
+                "interfaces": { "type": "array", "items": { "enum": ["mcp", "agent", "openapi"] }, "description": "`kind: company` only — the Company's interfaces agentd uses; default [mcp], the only one this build uses" },
+                "mcp_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "`kind: company` only — a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry" },
+                "privacy": { "enum": ["strict", "standard"], "description": "`kind: company` only — strict (default) or standard, which sends agentd's usual correlators and is logged at boot" } } }));
     m.insert("A2aPeer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }, "endpoint": { "type": "string" },
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },

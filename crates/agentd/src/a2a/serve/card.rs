@@ -440,6 +440,7 @@ mod tests {
             tls: None,
             request_timeout: Duration::from_secs(120),
             stream_deadline: Duration::from_secs(5),
+            documents: Vec::new(),
         };
         let app = App::new(
             crate::runtime::a2a_server::A2aBridge::new(tx, resolver),

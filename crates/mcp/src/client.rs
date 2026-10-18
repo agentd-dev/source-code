@@ -232,6 +232,18 @@ impl McpClient {
         self
     }
 
+    /// Dial this server through the SSRF guard: resolved once, every address
+    /// classified, only a vetted one connected — loopback, private and
+    /// link-local refused unless `allow_private`. For a server whose URL
+    /// someone other than the operator chose. Call right after connect, as
+    /// [`Self::with_identity`].
+    pub fn with_vetted_dial(mut self, allow_private: bool) -> Self {
+        if let Some(h) = Arc::get_mut(&mut self.http) {
+            h.set_vetted(allow_private);
+        }
+        self
+    }
+
     /// Attach a mutual-TLS client identity (a mounted cert chain + key) for a
     /// `https://` endpoint. A no-op on non-TLS endpoints (the identity is only
     /// presented during the TLS handshake). The private key is read from a

@@ -83,6 +83,7 @@ these names, and anything else is refused at load.
 | `budget` | Token budgets: windows, degrade, the lifetime cap |
 | `cgroup` | cgroup v2 placement of children |
 | `child` | Child process exits and health |
+| `company` | Acting at Companies for a person (the `companies` feature): discovery, the client identity, Sessions and a Company's MCP servers |
 | `config` | Validation, reload and the config file watch |
 | `context` | Conversation compaction |
 | `correlate` | `correlate` start nodes |
@@ -225,6 +226,34 @@ case.
 |---|---|---|---|
 | `child.exit` | info | `kind`, `node`, `outcome`, `pid` | A child process was reaped. `outcome` is `Exited(<code>)` or a signal. |
 | `child.unhealthy` | warn | `health`, `node` | A child was found unhealthy and is being stopped. |
+
+### company
+
+Written by the supervisor, which alone acts at a Company. No event carries a
+token, an assertion, a proof or a User ID; `session_id` appears only at
+`debug`.
+
+| Event | Level | Fields | Notes |
+|---|---|---|---|
+| `company.verified` | info | `company`, `domain`, `issuer`, `interfaces`, `servers`, `max_age` | The Company's discovery document and metadata verified; `servers` are its MCP servers by name. Written once per change. |
+| `company.refused` | warn | `company`, `error`, `reason` | The Company's documents were not used. `reason`: `fetch`, `redirect`, `https`, `protocol_version`, `domain`, `auth`, `issuer`, `domains`, `es256`, `metadata`, `endpoint`, `mcp`, `mcp_names`. Written once per change; the Company is tried again with the backoff of a server down at boot. |
+| `company.endpoint.refused` | warn | `company`, `field`, `host` | A URL the Company's documents name is off the entry's `hosts`: `field` names where it is. Beside `company.refused` with `reason: endpoint`. |
+| `company.discovery.stale` | warn | `age_s`, `company`, `error` | A refetch failed; the documents verified `age_s` seconds ago serve, for up to a day. |
+| `company.issuer_changed` | warn | `company`, `new`, `old` | A refetch named another issuer: the Company is suspended until a restart. |
+| `company.apis_changed` | warn | `added`, `company`, `removed` | A refetch lists other MCP APIs; no server changes until a restart. Written once per change. |
+| `company.interface.refused` | warn | `company`, `error`, `interface`, `url` | An MCP server refused this agent outright (`extension_required`); it is not used again in this life. |
+| `company.identity.unpublished` | error | `error`, `kid`, `url` | The client metadata document or key set at its URL is not what this configuration prints: every Company is unavailable until it is. |
+| `company.seal_key.mismatch` | error | `error` | `security.companies.seal_key` opens none of the store's sealed User ID records, or is not set for a store whose records are sealed: every Company is unavailable, rather than meet a new User ID. |
+| `company.session.started` | info | `company`, `signed_in` | A new Session at the Company. |
+| `company.session.renewed` | debug | `company`, `signed_in` | The Session's Session Token renewed. |
+| `company.session.ended` | info | `company`, `reason` | The Company ended the Session (`invalid_session`); a new one is started. |
+| `company.session.id` | debug | `company`, `session_id` | The Session's id. |
+| `company.privacy.standard` | warn | `company` | The entry sets `privacy: standard`. Written at boot. |
+
+`auth.unavailable` and `auth.recovered` carry `target: company:<name>`:
+`auth.unavailable` while a Company cannot be verified or its Session cannot
+produce a token, and `auth.recovered` once a token is produced again — a
+Company that verifies while its token endpoint refuses has not recovered.
 
 ### config
 

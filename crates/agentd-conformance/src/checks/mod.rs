@@ -10,11 +10,13 @@
 //! promises held against the listener), [`mcp_auth_core`] (agentd as an
 //! OAuth client: metadata discovery, the issuer, revocation) and
 //! [`companies`] (the fake Company, held to the Personal Agent Protocol
-//! draft by the [`probe`] Personal Agent).
+//! draft by the [`probe`] Personal Agent, and agentd held to it as the
+//! Personal Agent by [`companies_agent`]).
 
 pub mod a2a_conversation;
 pub mod auth;
 pub mod companies;
+pub mod companies_agent;
 pub mod durability;
 pub mod events;
 pub mod extensions;

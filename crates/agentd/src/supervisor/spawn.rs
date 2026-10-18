@@ -119,6 +119,35 @@ fn subagent_command(exe: &Path, limits: &Limits) -> Command {
     cmd
 }
 
+/// A test **frame tap**: with `AGENTD_TEST_FRAMES_FILE` set (debug and
+/// `internal-mocks` builds only), every frame a child is sent and every frame
+/// it sends — the spawn payload first, with the environment the child is
+/// started in — is appended to that file as one JSON line, so a test can look
+/// for what must never cross to a child. It compiles to nothing in a release
+/// build without `internal-mocks`.
+fn tap(node: NodeId, dir: &str, frame: impl FnOnce() -> serde_json::Value) {
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    {
+        use std::io::Write;
+        static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        if let Ok(path) = std::env::var("AGENTD_TEST_FRAMES_FILE") {
+            let line = serde_json::json!({"node": node.0, "dir": dir, "frame": frame()});
+            let _held = WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
+    #[cfg(not(any(feature = "internal-mocks", debug_assertions)))]
+    {
+        let _ = (node, dir, frame);
+    }
+}
+
 /// Spawn a subagent that re-execs `exe` (normally `std::env::current_exe()`),
 /// delivering `payload`. Upward messages are handed to `events` tagged with
 /// `node`.
@@ -169,7 +198,17 @@ pub fn spawn(
         .ok_or_else(|| io::Error::other("no child stdout"))?;
 
     // Deliver the spawn payload as the first control frame.
-    frame::write_frame(&mut writer, &ControlMsg::Spawn(Box::new(payload.clone())))?;
+    let spawn = ControlMsg::Spawn(Box::new(payload.clone()));
+    tap(node, "spawn", || {
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+        for (k, v) in cmd.get_envs() {
+            if let (Some(k), Some(v)) = (k.to_str(), v.and_then(|v| v.to_str())) {
+                env.insert(k.to_string(), v.to_string());
+            }
+        }
+        serde_json::json!({"payload": serde_json::to_value(&spawn).unwrap_or_default(), "env": env})
+    });
+    frame::write_frame(&mut writer, &spawn)?;
 
     let reader = std::thread::Builder::new()
         .name(format!("subagent-events:{}", node.0))
@@ -177,6 +216,11 @@ pub fn spawn(
             let mut r = io::BufReader::new(stdout);
             // Exits on Ok(None) (clean EOF) or Err (child closed stdout/exited).
             while let Ok(Some(bytes)) = frame::read_frame(&mut r) {
+                tap(node, "up", || {
+                    serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                        serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+                    })
+                });
                 match serde_json::from_slice::<AgentMsg>(&bytes) {
                     Ok(msg) => {
                         if !events(node, msg) {
@@ -217,6 +261,9 @@ impl Subagent {
 
     /// Send a control message down (Ping / Cancel / Inject).
     pub fn send(&mut self, msg: &ControlMsg) -> io::Result<()> {
+        tap(self.node, "down", || {
+            serde_json::to_value(msg).unwrap_or_default()
+        });
         frame::write_frame(&mut self.writer, msg)
     }
 

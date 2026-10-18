@@ -49,13 +49,14 @@ fn binary() -> &'static PathBuf {
         // implicit in a debug build but we ask for it explicitly so a
         // `--release` conformance run still ships the mocks. `oauth` is the
         // interactive login the `mcp-auth-core` checks drive, and what the
-        // fake Company needs to verify ES256.
+        // fake Company needs to verify ES256; `companies` is agentd as the
+        // Personal Agent the `companies` family holds to the draft.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "a2a,cron,internal-mocks,oauth",
+            "a2a,cron,internal-mocks,oauth,companies",
         ]);
         let agentd = target_dir().join("agentd");
         assert!(

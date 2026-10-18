@@ -27,10 +27,14 @@ a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,m
 can try an agent or a workflow in the released agentd with no provider
 account.
 
-Two features are never in a release binary:
+Three features are never in a release binary:
 
 - `exec`, the local command runner. agentd's default posture is that it runs
   no local code; you opt in at build time and again at run time.
+- `companies`, agentd acting at Companies for one person under the Personal
+  Agent Protocol draft ([RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)).
+  The draft changes without a version signal, so agentd is pinned to one
+  revision of it and the feature stays out of the release set.
 - `internal-mocks`, the test scaffolding: the mock MCP servers and crash
   points the test suites drive, and, with `oauth` (and the default `tls`),
   the fake Company that `agentd-conformance` holds to the Personal Agent
@@ -57,17 +61,19 @@ Two features are never in a release binary:
 | `decrypt` | no | yes | none | Encrypted instruction envelopes: age v1 and JWE compact. Implies `sign`. |
 | `mcp-events` | no | yes | none | MCP Events: bindings, grants, `wait` subscriptions, the `events.*` tools and instruction updates by event. The extension is a draft (SEP-3415). |
 | `exec` | no | **no** | none | The guarded local `exec` tool, also gated by `security.exec.enabled`. |
+| `companies` | no | **no** | none new (reuses `ring`) | `services` entries of `kind: company` and `security.companies`: a signed-out Session at each declared Company, its MCP tools held by the supervisor, `agentd --print-company-client`. Implies `oauth` and `tls`. |
 | `mock-models` | no | yes | none | The mock model endpoint: `mock:final` and `mock:file:<playbook.json>`, scripted chat and decision answers. |
 | `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers, crash points and, with `oauth` (and the default `tls`), the fake Company. Implies `mock-models`. |
 
-Of the seventeen features, fourteen add no crate of their own: they gate code
+Of the eighteen features, fifteen add no crate of their own: they gate code
 written in this repository, or reuse `ring`, which every build already links.
 Beyond the default `tls`, the dependency cost of the release set comes from
 `a2a` and `cel`; see [Crate counts](#crate-counts).
 
 ## Configuration that needs a feature
 
-A release binary carries everything in this table except `exec`. In a build
+A release binary carries everything in this table except `exec` and
+`companies`. In a build
 from source, the right-hand column is what you
 see when the feature is missing.
 
@@ -88,6 +94,7 @@ see when the feature is missing.
 | `agent.instruction.decrypt`, or any encrypted envelope | `decrypt` | the envelope is recognised and refused; ciphertext never reaches the model |
 | `mcp.servers[].events`, `event_grants`, `agent.instruction.mcp.events`, `wait {on: event, subscribe:}` | `mcp-events` | refused at load: `mcp.servers[0]: MCP Events bindings and grants require building with --features mcp-events` |
 | `security.exec.enabled: true` | `exec` | refused at load: `security.exec.enabled needs the exec build feature, …` |
+| a `services` entry of `kind: company`, `security.companies`, `agentd --print-company-client` | `companies` | refused at load: ``services.shop: `kind: company` needs the `companies` feature (build with --features companies)`` |
 | `mock:` endpoints | `mock-models` (or a debug build) | refused at load: `mock: intelligence needs a build with --features mock-models` |
 
 Every path and its feature is in the [Configuration reference](configuration.md).
@@ -101,8 +108,9 @@ toolchain of at least 1.96 (edition 2024):
 cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
 ```
 
-Add `exec` for the local command runner, or `internal-mocks` to keep the test
-scaffolding in a release-profile build. `--no-default-features` drops `tls`;
+Add `exec` for the local command runner, `companies` to act at Companies for
+a person, or `internal-mocks` to keep the test scaffolding in a
+release-profile build. `--no-default-features` drops `tls`;
 such a binary reaches `https://` only through a TLS-terminating sidecar.
 
 The release profile is `opt-level = "z"`, `lto = true`, `codegen-units = 1`,

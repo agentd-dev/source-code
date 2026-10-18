@@ -102,6 +102,29 @@ fn fake(dir: &Path, variants: &[&str], listen: Option<&str>) -> Fake {
 }
 
 impl Fake {
+    /// How many answers the fake has held back once their request took
+    /// effect (`http_fail` with `ms`): its own line for each, which
+    /// [`Fake::record`] leaves out.
+    #[cfg(feature = "a2a")]
+    fn holds(&self) -> usize {
+        agentd::auth::http::get(
+            &format!("{}/_mock/record", self.origin),
+            &[],
+            Duration::from_secs(10),
+            agentd::auth::http::Dial::Named,
+        )
+        .ok()
+        .and_then(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .map_or(0, |v| {
+            v["records"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["path"] == "/_mock/held")
+                .count()
+        })
+    }
+
     /// What reached the fake, its own steering and reading aside.
     fn record(&self) -> Vec<Value> {
         let r = agentd::auth::http::get(
@@ -282,6 +305,8 @@ fn play() -> Value {
     json!({
         "match": [
             {"when_contains": "holds another Company's content", "echo_tool_result": true},
+            {"when_contains": "invalid arguments for company.operation", "echo_tool_result": true},
+            {"when_contains": "FORGE-CONFIRM", "tool_calls": [{"name": "company.operation.confirm", "arguments": {"company": "shop", "operation_id": "exc_forged", "revision": 1, "approved_by": "user"}}]},
             {"when_contains": "signed_in", "echo_tool_result": true},
             {"when_contains": "is not shown to the User", "echo_tool_result": true},
             {"when_contains": "shipped", "echo_tool_result": true},
@@ -481,7 +506,7 @@ fn a_company_down_at_boot_joins_when_it_comes_up() {
     assert!(
         connect
             .iter()
-            .any(|e| e["server"] == "shop" && e["reason"] == "joined" && e["tools"] == 2),
+            .any(|e| e["server"] == "shop" && e["reason"] == "joined" && e["tools"] == 3),
         "{l}"
     );
     assert_eq!(events(&l, "company.verified").len(), 1, "{l}");
@@ -2525,6 +2550,805 @@ mod over_a2a {
             .filter(|r| r["grant"] == "authorization_code")
             .count();
         assert_eq!(codes, 1, "one code exchange");
+    }
+
+    // ---- Operations and Direct Conversations (RFC 0047 P4) ----------------
+
+    /// `exchange` proposes an exchange with the Company's MCP tool and
+    /// confirms the operation it answers with.
+    const EXCHANGES: &str = "workflows:\n\
+        \x20 - name: exchange\n    steps:\n      s: {kind: manual}\n\
+        \x20     p: {kind: tool, name: shop.exchange_item, args: {order_id: ord_7Hk2, item_id: itm_4Qa, replacement_sku: stormline-insulated-m}, depends_on: [s]}\n\
+        \x20     c: {kind: tool, name: company.operation.confirm, args: {company: shop, operation_id: \"{{ steps.p.output.operation.operation_id }}\"}, depends_on: [p]}\n\
+        \x20     f: {kind: finish, depends_on: [c], output: \"{{ steps.c.output }}\"}\n";
+
+    /// The `security.companies` lines of an agent that lists the Operations
+    /// extension for the User `user:dana`.
+    const OPERATING: &str = "    user: \"user:dana\"\n";
+
+    /// [`setup_with`]'s configuration, its client listing the Operations
+    /// extension and its audit records on the log.
+    fn operating_setup(h: &Host, f: &Fake, agent: &str, entry: &str, rest: &str) -> Setup {
+        let s = setup_with(h, OPERATING, agent, &shop_entry(&f.origin, entry), rest);
+        let cfg = std::fs::read_to_string(&s.cfg)
+            .unwrap()
+            .replace("key_file: \"", "extensions: [operations], key_file: \"")
+            .replace(
+                "observability:\n  log_level: debug\n",
+                "observability:\n  log_level: debug\n  audit:\n    sink: [log]\n",
+            );
+        std::fs::write(&s.cfg, cfg).unwrap();
+        // The client document lists the extension the Company reads.
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([
+                "--config",
+                &s.cfg.display().to_string(),
+                "--print-company-client",
+            ])
+            .arg(s.dir.join("published"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        s
+    }
+
+    /// `s`, letting work nobody owns ask the User — a Company's request to
+    /// talk with them among it — once the listener is added.
+    fn unowned_gate(s: Setup) -> Setup {
+        let cfg = std::fs::read_to_string(&s.cfg).unwrap().replacen(
+            "agent:\n",
+            "agent:\n  ask_human_unowned: gate\n",
+            1,
+        );
+        std::fs::write(&s.cfg, cfg).unwrap();
+        s
+    }
+
+    /// The audit records on `log` of `action`.
+    fn audited(log: &str, action: &str) -> Vec<Value> {
+        events(log, "audit")
+            .into_iter()
+            .filter(|e| e["action"] == action)
+            .collect()
+    }
+
+    /// No confirm is sent without the User's own approval (RFC 0047 §5.8.1,
+    /// decision 9): the gate is the User's — the operator, who is not the
+    /// User, cannot answer it, and no judge does, with `agent.approval` and
+    /// the fallback both `auto` — its text agentd's with the Company's terms
+    /// quoted; the User's `approve` sends the confirm with `approved_by:
+    /// user` and the revision the gate showed. The audit stream holds the
+    /// question, the answer and the confirm, each with the one operation id
+    /// and revision.
+    #[test]
+    fn an_operation_is_confirmed_only_with_the_users_own_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = operating_setup(
+            &h,
+            &f,
+            "  approval: auto\n  ask_human_fallback: auto\n",
+            "",
+            EXCHANGES,
+        );
+        let (d, addr) = start_listening(&s, "approve", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("exchange").bearer(DANA).result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let t = wait_state(&addr, DANA, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        let q = status_text(&t);
+        assert!(
+            q.starts_with("\"Fake Company\" (127.0.0.1) asks you to approve this, in your signed-out Session at 127.0.0.1. The Company says: \"Exchange item itm_4Qa on order ord_7Hk2"),
+            "{q}"
+        );
+        assert!(q.ends_with("Answer approve or decline."), "{q}");
+        let confirms = |f: &Fake| {
+            f.record()
+                .into_iter()
+                .filter(|r| {
+                    r["operation_request"] == true
+                        && r["path"].as_str().unwrap_or_default().ends_with("/confirm")
+                })
+                .collect::<Vec<_>>()
+        };
+        // The operator is not the User.
+        let op = common::SendMessage::text("approve")
+            .bearer(OPERATOR)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert_eq!(op["error"]["code"], -32602, "{op}");
+        assert!(op.to_string().contains("user:dana"), "{op}");
+        assert_eq!(
+            get_task(&addr, DANA, &task)["status"]["state"],
+            "TASK_STATE_INPUT_REQUIRED"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(confirms(&f).is_empty(), "sent before the User approved");
+        // Only approve or decline.
+        let maybe = common::SendMessage::text("sure")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert_eq!(maybe["error"]["code"], -32602, "{maybe}");
+        let ok = common::SendMessage::text("approve")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        let done = wait_state(&addr, DANA, &task, "TASK_STATE_COMPLETED", &d.log);
+        let sent = confirms(&f);
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert_eq!(sent[0]["approved_by"], "user");
+        assert_eq!(sent[0]["revision"], 1);
+        let id = sent[0]["operation_id"].as_str().unwrap().to_string();
+        assert!(done.to_string().contains("succeeded"), "{done}");
+        let l = d.read();
+        assert!(events(&l, "human.judge.start").is_empty(), "{l}");
+        assert!(!l.contains("operator_override"), "{l}");
+        let records = audited(&l, "company.operation");
+        let outcome = |o: &str| {
+            records
+                .iter()
+                .find(|r| r["outcome"] == o)
+                .unwrap_or_else(|| panic!("no {o} record: {records:#?}"))
+                .clone()
+        };
+        let (asked, approved, confirmed) =
+            (outcome("asked"), outcome("approved"), outcome("confirmed"));
+        for r in [&asked, &approved, &confirmed] {
+            assert_eq!(r["target"]["operation_id"], id.as_str(), "{r}");
+            assert_eq!(r["target"]["revision"], 1, "{r}");
+            assert_eq!(r["target"]["company"], "shop", "{r}");
+        }
+        assert_eq!(approved["principal"], "user:dana");
+        assert_eq!(confirmed["target"]["approved_by"], "user");
+        assert_eq!(confirmed["target"]["state"], "succeeded");
+        assert!(
+            records
+                .iter()
+                .any(|r| r["outcome"] == "not_addressed" && r["principal"] == "operator"),
+            "the operator's answer is on the record too: {records:#?}"
+        );
+    }
+
+    /// The model passes neither a revision nor an approval: a confirm that
+    /// names either is refused by the tool's own arguments, and nothing
+    /// reaches the Company's operations endpoint.
+    #[test]
+    fn the_model_cannot_pass_a_revision_or_an_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = operating_setup(&h, &f, "", "", "");
+        let (d, addr) = start_listening(&s, "forged", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        common::SendMessage::text("FORGE-CONFIRM")
+            .bearer(DANA)
+            .post(&addr);
+        let l = wait_for(&d.log, "the refusal", |l| {
+            replies(l)
+                .iter()
+                .any(|r| r.contains("company.operation.confirm"))
+        });
+        let reply = replies(&l)
+            .into_iter()
+            .find(|r| r.contains("company.operation.confirm"))
+            .unwrap();
+        assert!(
+            reply.contains("revision") || reply.contains("additional"),
+            "{reply}"
+        );
+        assert!(
+            !f.record().iter().any(|r| r["operation_request"] == true),
+            "nothing reached the operations endpoint"
+        );
+    }
+
+    /// The request that proposed an operation is not sent again while it is
+    /// not final (Operations §6): a run calling the Company's tool twice
+    /// with the same arguments sends the first, and the second is refused
+    /// unsent, naming the operation.
+    #[test]
+    fn a_repeat_of_the_proposing_request_is_refused_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        const TWICE: &str = "workflows:\n\
+            \x20 - name: twice\n    steps:\n      s: {kind: manual}\n\
+            \x20     a: {kind: tool, name: shop.exchange_item, args: {order_id: ord_7Hk2, item_id: itm_4Qa, replacement_sku: stormline-m}, depends_on: [s]}\n\
+            \x20     b: {kind: tool, name: shop.exchange_item, args: {order_id: ord_7Hk2, item_id: itm_4Qa, replacement_sku: stormline-m}, depends_on: [a]}\n\
+            \x20     f: {kind: finish, depends_on: [b], status: completed}\n";
+        let s = operating_setup(&h, &f, "", "", TWICE);
+        let (d, addr) = start_listening(&s, "twice", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("twice").bearer(DANA).result(&addr);
+        assert!(started.get("error").is_none(), "{started}");
+        wait_for(&d.log, "the second call refused", |l| {
+            l.contains("which this request proposed, is still proposed")
+        });
+        let proposed: Vec<Value> = calls(&f)
+            .into_iter()
+            .filter(|c| c["operation_proposed"].is_string())
+            .collect();
+        assert_eq!(proposed.len(), 1, "sent once: {proposed:#?}");
+        assert_eq!(calls(&f).len(), 1);
+        let l = d.read();
+        assert_eq!(events(&l, "company.operation.proposed").len(), 1, "{l}");
+    }
+
+    /// The Company asks to talk with the User (§7.10): the User's own gate
+    /// asks them — the operator who is not the User cannot answer it — and
+    /// their first message starts the Direct Conversation as they wrote it,
+    /// `sender: human`; what the Company says there comes to their task, and
+    /// what they write on it goes to the Company as theirs. Nothing else is
+    /// ever sent as `human`. A decline is said in the conversation the
+    /// Company asked in.
+    #[test]
+    fn only_the_users_relayed_words_reach_a_direct_conversation_as_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"conversation": {"user_requested": "A specialist needs to confirm the exchange."}}));
+        let h = host();
+        const TALK: &str = "workflows:\n  - name: talk\n    steps:\n      s: {kind: manual}\n      c: {kind: tool, name: company.converse, args: {company: shop, text: \"hello from a workflow\", wait: 3}, depends_on: [s]}\n      f: {kind: finish, depends_on: [c], status: completed}\n";
+        let s = unowned_gate(setup_with(
+            &h,
+            "    user: \"user:dana\"\n",
+            "",
+            &shop_entry(&f.origin, ", interfaces: [agent]"),
+            TALK,
+        ));
+        let (d, addr) = start_listening(&s, "direct", &[]);
+        let started = run_workflow("talk").bearer(DANA).result(&addr);
+        assert!(started.get("error").is_none(), "{started}");
+        // The question, on a task of its own the User owns.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let gate = loop {
+            let tasks = common::rpc_as(&addr, DANA, 7, "ListTasks", json!({"pageSize": 100}));
+            if let Some(t) = tasks["result"]["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| {
+                    t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+                        && status_text(t).contains("asks to talk with you directly")
+                })
+            {
+                break t.clone();
+            }
+            assert!(Instant::now() < deadline, "no question: {}", d.read());
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let task = gate["id"].as_str().unwrap().to_string();
+        let q = status_text(&gate);
+        assert!(
+            q.starts_with("\"Fake Company\" (127.0.0.1) asks to talk with you directly. It says: \"A specialist needs to confirm the exchange.\"."),
+            "{q}"
+        );
+        let op = common::SendMessage::text("Operator here.")
+            .bearer(OPERATOR)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert_eq!(op["error"]["code"], -32602, "{op}");
+        let words = "Hi, this is Dana — about the exchange.";
+        let ok = common::SendMessage::text(words)
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        let wait_fake = |what: &str, pred: &dyn Fn(&Value) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(r) = f.record().into_iter().find(|r| pred(r)) {
+                    return r;
+                }
+                assert!(Instant::now() < deadline, "{what}: {}", d.read());
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let first = wait_fake("the first message", &|r| {
+            r["parent_conversation_id"].is_string()
+        });
+        assert_eq!(first["sender"], "human");
+        assert_eq!(first["text"], words, "as written");
+        let direct = first["conversation"].as_str().unwrap().to_string();
+        // The Company's reply comes to the User's task, as the Company's.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let t = get_task(&addr, DANA, &task);
+            let text = status_text(&t);
+            if text.starts_with("\"Fake Company\" (127.0.0.1) says: \"A specialist here. You said: Hi, this is Dana") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{t}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let later = common::SendMessage::text("Medium, please.")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(later.get("error").is_none(), "{later}");
+        let relayed = wait_fake("the relayed message", &|r| r["text"] == "Medium, please.");
+        assert_eq!(relayed["sender"], "human");
+        assert!(
+            relayed["path"].as_str().unwrap().contains(&direct),
+            "{relayed}"
+        );
+        // Nothing else was ever sent as the User.
+        for r in f.record().iter().filter(|r| r["sender"] == "human") {
+            assert!(r["text"] == words || r["text"] == "Medium, please.", "{r}");
+        }
+        for r in f.record().iter().filter(|r| r["sender"] == "agent") {
+            assert_ne!(r["text"], words, "{r}");
+        }
+        // Cancelling the task closes the Direct Conversation at the Company.
+        common::rpc_as(&addr, DANA, 8, "CancelTask", json!({"id": task}));
+        wait_fake("the close", &|r| {
+            r["path"].as_str().unwrap_or_default() == format!("/poppy/conversations/{direct}/close")
+        });
+        let l = d.read();
+        assert_eq!(events(&l, "company.direct.joined").len(), 1, "{l}");
+        assert!(events(&l, "human.judge.start").is_empty(), "{l}");
+    }
+
+    /// A decline is said in the conversation the Company asked in, as the
+    /// agent, and no Direct Conversation starts.
+    #[test]
+    fn a_decline_is_said_in_the_conversation_the_company_asked_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"conversation": {"user_requested": "Can we talk?"}}));
+        let h = host();
+        const TALK: &str = "workflows:\n  - name: talk\n    steps:\n      s: {kind: manual}\n      c: {kind: tool, name: company.converse, args: {company: shop, text: \"hello\", wait: 3}, depends_on: [s]}\n      f: {kind: finish, depends_on: [c], status: completed}\n";
+        let s = unowned_gate(setup_with(
+            &h,
+            "    user: \"user:dana\"\n",
+            "",
+            &shop_entry(&f.origin, ", interfaces: [agent]"),
+            TALK,
+        ));
+        let (d, addr) = start_listening(&s, "decline", &[]);
+        run_workflow("talk").bearer(DANA).result(&addr);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let task = loop {
+            let tasks = common::rpc_as(&addr, DANA, 7, "ListTasks", json!({"pageSize": 100}));
+            if let Some(t) = tasks["result"]["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| {
+                    t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+                        && status_text(t).contains("asks to talk with you directly")
+                })
+            {
+                break t["id"].as_str().unwrap().to_string();
+            }
+            assert!(Instant::now() < deadline, "no question: {}", d.read());
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        common::SendMessage::text("decline")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let said = loop {
+            if let Some(r) = f
+                .record()
+                .into_iter()
+                .find(|r| r["text"] == "The user declined a direct conversation.")
+            {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "{}", d.read());
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(said["sender"], "agent");
+        assert!(
+            said["path"].as_str().unwrap().ends_with("/messages"),
+            "{said}"
+        );
+        assert!(
+            !f.record()
+                .iter()
+                .any(|r| r["parent_conversation_id"].is_string()),
+            "no Direct Conversation was started"
+        );
+        wait_state(&addr, DANA, &task, "TASK_STATE_COMPLETED", &d.log);
+    }
+
+    /// The confirms that reached the fake's operations endpoint.
+    fn confirms_at(f: &Fake) -> Vec<Value> {
+        f.record()
+            .into_iter()
+            .filter(|r| {
+                r["operation_request"] == true
+                    && r["path"].as_str().unwrap_or_default().ends_with("/confirm")
+            })
+            .collect()
+    }
+
+    /// Wait up to 30 s for `pred` to hold of the fake's record, or fail.
+    fn wait_fake(f: &Fake, d: &Daemon, what: &str, pred: &dyn Fn(&[Value]) -> bool) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let record = f.record();
+            if pred(&record) {
+                return record;
+            }
+            assert!(Instant::now() < deadline, "{what}: {}", d.read());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A confirm on its way when the work that asked for it is cancelled
+    /// (Ops §7: "If it has already confirmed, it cancels"): the User
+    /// approved, the Company took the confirm while its answer was held, and
+    /// the run's task was cancelled meanwhile. The confirm's record is kept,
+    /// the withdrawal is on the record, and agentd cancels the operation at
+    /// the Company — the run is never told it was not confirmed.
+    #[test]
+    fn a_confirm_withdrawn_on_its_way_is_cancelled_at_the_company() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = operating_setup(&h, &f, "", "", EXCHANGES);
+        let (d, addr) = start_listening(&s, "withdrawn", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("exchange").bearer(DANA).result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        wait_state(&addr, DANA, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        f.control(json!({"http_fail": {"method": "POST", "path": "/poppy/operations/", "times": 1, "ms": 3000}}));
+        let ok = common::SendMessage::text("approve")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while f.holds() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the confirm never took effect: {}",
+                d.read()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let v = common::rpc_as(&addr, DANA, 8, "CancelTask", json!({"id": task}));
+        assert!(v.get("error").is_none(), "{v}");
+        let l = wait_for(&d.log, "the withdrawal", |l| {
+            !events(l, "company.operation.cancelled").is_empty()
+        });
+        let records = audited(&l, "company.operation");
+        let confirmed = records
+            .iter()
+            .find(|r| r["outcome"] == "confirmed")
+            .unwrap_or_else(|| panic!("the confirm's record was dropped: {records:#?}"));
+        assert_eq!(confirmed["target"]["approved_by"], "user");
+        assert_eq!(confirmed["target"]["state"], "succeeded");
+        let withdrawn = records
+            .iter()
+            .find(|r| r["outcome"] == "withdrawn")
+            .unwrap_or_else(|| panic!("{records:#?}"));
+        assert_eq!(withdrawn["target"]["cancel"], true, "{withdrawn}");
+        assert_eq!(
+            withdrawn["target"]["operation_id"],
+            confirmed["target"]["operation_id"]
+        );
+        let id = confirmed["target"]["operation_id"].as_str().unwrap();
+        wait_fake(&f, &d, "the cancel", &|r| {
+            r.iter()
+                .any(|x| x["path"] == format!("/poppy/operations/{id}/cancel"))
+        });
+        assert!(
+            !l.contains("it was NOT confirmed"),
+            "a confirm the Company took was said to be unconfirmed: {l}"
+        );
+        assert_eq!(confirms_at(&f).len(), 1);
+    }
+
+    /// An answer is bound to the question its task asked (Ops §5.1: an
+    /// approval covers one revision). The User approves revision 1 on the
+    /// run's task, and the Company changes the terms: agentd asks about
+    /// revision 2 on a NEW task, the old question closed and saying where
+    /// the new one is. Another `approve` on the old task — a second click, a
+    /// new message — is refused, as is the first answer sent again there or
+    /// to the new task, and nothing of revision 2 is confirmed. The terms
+    /// change again under the User's approval of revision 2: revision 3 is
+    /// asked on a third task, and the second, made for its question, is
+    /// cancelled and takes no answer. Only an `approve` on the task that
+    /// showed revision 3 confirms it, and the records tie each question, its
+    /// answer and the confirm it sent to the task that asked.
+    #[test]
+    fn an_approval_answers_only_the_question_its_task_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"operations": {"revise": 2}}));
+        let h = host();
+        let s = operating_setup(&h, &f, "", "", EXCHANGES);
+        let (d, addr) = start_listening(&s, "bound", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("exchange").bearer(DANA).result(&addr);
+        let first = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let t = wait_state(&addr, DANA, &first, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        assert!(
+            status_text(&t).contains("This is revision 1 of operation"),
+            "{t}"
+        );
+        // The task the question about `revision` was asked on.
+        let asked_on = |revision: u64| -> String {
+            let asked = |l: &str| {
+                events(l, "company.operation.asked")
+                    .into_iter()
+                    .find(|e| e["revision"] == revision)
+                    .and_then(|e| e["task"].as_str().map(str::to_string))
+            };
+            let l = wait_for(&d.log, &format!("revision {revision} asked"), |l| {
+                asked(l).is_some()
+            });
+            asked(&l).unwrap()
+        };
+        let approve = |task: &str| {
+            common::SendMessage::text("approve")
+                .bearer(DANA)
+                .task(task)
+                .return_immediately()
+        };
+        let answer = approve(&first);
+        let ok = answer.clone().post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        let second = asked_on(2);
+        // A second click on what the User was shown before — a new
+        // message on the task that showed revision 1 — approves nothing.
+        let click = approve(&first).post(&addr);
+        std::thread::sleep(Duration::from_millis(500));
+        let sent = confirms_at(&f);
+        assert_eq!(
+            sent.len(),
+            1,
+            "an approve on the task that showed revision 1 confirmed revision 2: {sent:#?}"
+        );
+        assert_eq!(sent[0]["revision"], 1);
+        assert_eq!(click["error"]["code"], -32602, "{click}");
+        assert!(click.to_string().contains("is closed"), "{click}");
+        assert_ne!(second, first, "revision 2 was asked on revision 1's task");
+        let t = wait_state(&addr, DANA, &second, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        assert!(
+            status_text(&t).contains("This is revision 2 of operation"),
+            "{t}"
+        );
+        let old = get_task(&addr, DANA, &first);
+        assert_eq!(old["status"]["state"], "TASK_STATE_WORKING", "{old}");
+        assert!(status_text(&old).contains(&second), "{old}");
+        // The first answer sent again, there or to the new question.
+        let again = answer.clone().post(&addr);
+        assert_eq!(again["error"]["code"], -32602, "{again}");
+        let moved = answer.clone().task(&second).post(&addr);
+        assert_eq!(moved["error"]["code"], -32602, "{moved}");
+        assert!(moved.to_string().contains("was taken already"), "{moved}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(confirms_at(&f).len(), 1);
+        assert_eq!(
+            get_task(&addr, DANA, &second)["status"]["state"],
+            "TASK_STATE_INPUT_REQUIRED"
+        );
+        // Approved, revision 2 changes too: its task, made for its
+        // question, is cancelled.
+        let ok = approve(&second).post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        let third = asked_on(3);
+        assert!(third != first && third != second, "{third}");
+        let closed = wait_state(&addr, DANA, &second, "TASK_STATE_CANCELED", &d.log);
+        assert!(status_text(&closed).contains(&third), "{closed}");
+        let late = approve(&second).post(&addr);
+        assert!(late.get("error").is_some(), "{late}");
+        let later = approve(&first).post(&addr);
+        assert_eq!(later["error"]["code"], -32602, "{later}");
+        std::thread::sleep(Duration::from_millis(500));
+        let sent = confirms_at(&f);
+        assert_eq!(sent.len(), 2, "{sent:#?}");
+        assert_eq!(sent[1]["revision"], 2);
+        let ok = approve(&third).post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        wait_state(&addr, DANA, &third, "TASK_STATE_COMPLETED", &d.log);
+        wait_state(&addr, DANA, &first, "TASK_STATE_COMPLETED", &d.log);
+        let sent = confirms_at(&f);
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert_eq!(sent[2]["revision"], 3);
+        assert_eq!(sent[2]["approved_by"], "user");
+        let records = audited(&d.read(), "company.operation");
+        let on = |outcome: &str, revision: u64| {
+            records
+                .iter()
+                .filter(|r| r["outcome"] == outcome && r["target"]["revision"] == revision)
+                .map(|r| r["target"]["task"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        for (task, revision) in [(&first, 1), (&second, 2), (&third, 3)] {
+            assert_eq!(on("asked", revision), [task.as_str()], "{records:#?}");
+            assert_eq!(on("approved", revision), [task.as_str()], "{records:#?}");
+        }
+        assert_eq!(on("confirm_refused", 1), [first.as_str()], "{records:#?}");
+        assert_eq!(on("confirm_refused", 2), [second.as_str()], "{records:#?}");
+        assert_eq!(on("confirmed", 3), [third.as_str()], "{records:#?}");
+    }
+
+    /// While the User's first message is on its way the task takes no
+    /// other — one sent then is refused, and no turn of the model's starts
+    /// — and a restart then sends it again under the id it was sent with:
+    /// the Company answers with the Direct Conversation it started, the
+    /// task relays it, and nothing is said in the conversation the Company
+    /// asked in.
+    #[test]
+    fn a_direct_conversation_starting_at_a_restart_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"conversation": {"user_requested": "A specialist needs to confirm the exchange."}}));
+        let h = host();
+        const TALK: &str = "workflows:\n  - name: talk\n    steps:\n      s: {kind: manual}\n      c: {kind: tool, name: company.converse, args: {company: shop, text: \"hello\", wait: 3}, depends_on: [s]}\n      f: {kind: finish, depends_on: [c], status: completed}\n";
+        let s = unowned_gate(setup_with(
+            &h,
+            "    user: \"user:dana\"\n",
+            "",
+            &shop_entry(&f.origin, ", interfaces: [agent]"),
+            TALK,
+        ));
+        let (mut d, addr) = start_listening(&s, "joining", &[]);
+        run_workflow("talk").bearer(DANA).result(&addr);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let task = loop {
+            let tasks = common::rpc_as(&addr, DANA, 7, "ListTasks", json!({"pageSize": 100}));
+            if let Some(t) = tasks["result"]["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| {
+                    t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+                        && status_text(t).contains("asks to talk with you directly")
+                })
+            {
+                break t["id"].as_str().unwrap().to_string();
+            }
+            assert!(Instant::now() < deadline, "no question: {}", d.read());
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        // The first message's answer is held back once the Company took it.
+        f.control(json!({"http_fail": {"method": "POST", "path": "/poppy/conversations", "times": 1, "ms": 5000}}));
+        let words = "Hi, this is Dana — about the exchange.";
+        let first = common::SendMessage::text(words)
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately();
+        let ok = first.clone().post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while f.holds() == 0 {
+            assert!(Instant::now() < deadline, "never sent: {}", d.read());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let second = common::SendMessage::text("Are you there?")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert_eq!(second["error"]["code"], -32602, "{second}");
+        assert!(
+            second
+                .to_string()
+                .contains("is starting with your first message"),
+            "{second}"
+        );
+        d.stop();
+        let again = start(
+            &s,
+            "restarted",
+            &[
+                ("COMPANIES_E2E_OPERATOR", OPERATOR),
+                ("COMPANIES_E2E_DANA", DANA),
+            ],
+        );
+        wait_for(&again.log, "listening again", |l| {
+            !events(l, "a2a.listen").is_empty()
+        });
+        // The task relays it: it said so, and the Company's reply is on it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let t = get_task(&addr, DANA, &task);
+            let said = |start: &str| {
+                t["history"].as_array().into_iter().flatten().any(|m| {
+                    m["parts"][0]["text"]
+                        .as_str()
+                        .is_some_and(|x| x.starts_with(start))
+                }) || status_text(&t).starts_with(start)
+            };
+            if said("You are talking with") && said("\"Fake Company\" (127.0.0.1) says:") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{t}\n{}", again.read());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Sent twice under one id — the held one is recorded once its hold
+        // ends — and the second answered with the first's conversation.
+        let firsts: Vec<Value> = wait_fake(&f, &again, "both first messages", &|r| {
+            r.iter()
+                .filter(|x| x["parent_conversation_id"].is_string())
+                .count()
+                == 2
+        })
+        .into_iter()
+        .filter(|r| r["parent_conversation_id"].is_string())
+        .collect();
+        assert_eq!(firsts[0]["message_id"], firsts[1]["message_id"]);
+        assert_eq!(
+            firsts.iter().filter(|x| x["duplicate"] == true).count(),
+            1,
+            "{firsts:#?}"
+        );
+        assert!(firsts.iter().all(|x| x["text"] == words));
+        let direct = firsts
+            .iter()
+            .find_map(|x| x["conversation"].as_str())
+            .unwrap_or_else(|| panic!("{firsts:#?}"))
+            .to_string();
+        for r in f.record() {
+            assert_ne!(
+                r["text"], "The user is not available for a direct conversation.",
+                "{r}"
+            );
+            assert_ne!(r["text"], "Are you there?", "{r}");
+        }
+        let later = common::SendMessage::text("Medium, please.")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(later.get("error").is_none(), "{later}");
+        let record = wait_fake(&f, &again, "the relayed message", &|r| {
+            r.iter().any(|x| x["text"] == "Medium, please.")
+        });
+        let relayed = record
+            .iter()
+            .find(|x| x["text"] == "Medium, please.")
+            .unwrap();
+        assert_eq!(relayed["sender"], "human");
+        assert!(
+            relayed["path"].as_str().unwrap().contains(&direct),
+            "{relayed}"
+        );
+        assert_eq!(events(&again.read(), "company.direct.resumed").len(), 1);
+        // The first message sent again by its client is not relayed again.
+        let resent = first.post(&addr);
+        assert!(resent.get("error").is_none(), "{resent}");
+        std::thread::sleep(Duration::from_millis(500));
+        let human: Vec<Value> = f
+            .record()
+            .into_iter()
+            .filter(|r| r["sender"] == "human")
+            .collect();
+        assert_eq!(
+            human.len(),
+            3,
+            "twice the first, once the later: {human:#?}"
+        );
     }
 
     /// `workflow.run` of the declared workflow `workflow`.

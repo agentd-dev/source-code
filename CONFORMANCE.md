@@ -161,9 +161,16 @@ skip.
 | `companies/agent-skips-what-it-does-not-recognize` | agentd talks to the Company Agent over the poppy protocol, never the type it does not speak listed before it, and the stream it appends the conversation's events to holds no event of the type the draft does not define and no text-delta piece |
 | `companies/agent-reconnects-a-stream-after-the-last-event` | a stream of a conversation's events that the Company ends is opened again with Last-Event-ID the last event agentd handled, and no cursor |
 | `companies/agent-reads-on-from-the-cursor-it-saved` | after a restart agentd's first read of an open conversation names the cursor it saved, the last event it handled |
-| `companies/agent-says-the-user-is-not-available` | when the Company Agent asks to talk with the User, agentd — which offers no Direct Conversation yet — says in the conversation that the User is not available, once, as the agent |
+| `companies/agent-says-the-user-is-not-available` | when the Company Agent asks to talk with the User and nobody can ask them, agentd says in the conversation that the User is not available, once, as the agent, and starts no Direct Conversation |
 | `companies/agent-sends-a-session-token-with-every-request` | every conversation request, and every API call an http step or company.api makes, carries the DPoP Session Token with a proof over it that the fake validated |
 | `companies/agent-reuses-an-idempotency-key-on-retry` | an API write whose operation declares Idempotency-Key, its answer lost, is sent again with the same version 4 UUID, and gets the first answer |
+| `companies/agent-lists-the-operations-extension` | with client.extensions [operations], the client metadata document the fake fetched lists operations at version 1, and the fake proposes the exchange as an operation; without it, the exchange is made, and nothing agentd sends confirms anything |
+| `companies/agent-confirms-only-what-the-user-approved` | a run's confirm of a proposed operation, with nobody to ask and agent.approval and the ask_human fallback auto, sends nothing to the operations endpoint; with the User asked at their gate — its text naming the Company and quoting the revision's summary — and answering approve, the confirm goes once, approved_by user, with the revision the gate showed |
+| `companies/agent-asks-again-when-the-terms-change` | a confirm the Company answers terms_changed is not sent again under the old approval: the User is asked about the new revision, and only their approve of it sends a confirm, of that revision |
+| `companies/agent-reads-an-operation-in-progress-after-retry-after` | a confirm answered in_progress with Retry-After is followed by a read of the operation no sooner than the wait, with the same operation id, until it is final |
+| `companies/agent-retries-a-confirm-with-the-same-operation` | a confirm whose answer is lost after the Company took it is sent again with the same operation id and revision, and the tool that proposed the operation is not called again |
+| `companies/agent-asks-the-user-before-a-direct-conversation` | when the Company Agent asks to talk with the User, agentd asks the User at their gate and starts no Direct Conversation until they answer; their answer is the first message, as they wrote it, sender human, with parent_conversation_id the conversation the Company asked in |
+| `companies/agent-says-a-decline-in-the-conversation` | when the User declines to talk with the Company directly, agentd says so in the conversation the Company asked in, once, as the agent, and starts no Direct Conversation |
 
 ## Running it
 
@@ -209,7 +216,12 @@ binary to the draft through the fake's record alone. The sign-in checks give
 the binary a unix A2A listener to ask the User on; the fake's scripted User
 signs in at the Company, as a person would, nobody answers agentd's gate, and
 the fake records when each poll came and whether an Account Token it issued
-was anywhere in a request but the one form member that may carry it. Every
+was anywhere in a request but the one form member that may carry it. The
+Operations and Direct Conversation checks give it a loopback listener with no
+credential — its caller the operator, who is the User — answer the User's
+gate there as the User would, and count the confirms, the operation reads and
+the messages the fake recorded, with the revision, `approved_by` and `sender`
+each carried. Every
 check quotes the sentence of the draft it tests, and the suite's unit test
 requires each quote to appear verbatim, in its section, in the vendored
 pages. The fake validates every document it sends against the vendored

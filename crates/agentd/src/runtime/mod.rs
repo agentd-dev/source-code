@@ -22,6 +22,10 @@ pub(crate) mod companies; // who reaches a Company's tools, and only through the
 #[cfg(feature = "companies")]
 pub(crate) mod company_calls; // a Company's agent and APIs, its conversation stream (RFC 0047 §5.5.7–§5.5.8)
 #[cfg(feature = "companies")]
+pub(crate) mod company_direct; // the User talks with a Company themselves (RFC 0047 §5.8.2)
+#[cfg(feature = "companies")]
+pub(crate) mod company_operations; // the User approves what the agent does at a Company (RFC 0047 §5.8.1)
+#[cfg(feature = "companies")]
 pub(crate) mod company_sign_in; // the User signs in at a Company, at their own gate (RFC 0047 §5.7)
 #[cfg(feature = "a2a")]
 pub mod conversations;
@@ -618,6 +622,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         companies,
         #[cfg(feature = "companies")]
         company_sign_ins: BTreeMap::new(),
+        #[cfg(feature = "companies")]
+        company_operations: BTreeMap::new(),
+        #[cfg(feature = "companies")]
+        company_directs: BTreeMap::new(),
         mcp,
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),

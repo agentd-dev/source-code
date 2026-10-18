@@ -439,13 +439,23 @@ fn companies() -> Value {
                 "key_file": { "type": "string", "description": "the ES256 signing key (PKCS#8), created 0600 when absent; default /var/lib/agentd/company-client-key" },
                 "published_key_files": { "type": "array", "items": { "type": "string" }, "description": "keys whose public halves are in the key set but are never signed with: the next key before a rotation, the previous one after it" },
                 "redirect_uri": { "type": "string", "description": "where Direct Sign-In returns the User, an HTTPS URL on the client_id's host; default <client_id origin>/companies/callback. Listed in the document's redirect_uris when a Company lists direct" },
-                "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths, and the Direct Sign-In callback when a Company lists direct (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" } } },
+                "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths, and the Direct Sign-In callback when a Company lists direct (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" },
+                "extensions": { "type": "array", "items": { "enum": ["operations"] }, "description": "the extensions the client metadata document lists: operations (version 1) — a Company proposes an action, and agentd confirms it only with the User's approval of its terms or a standing permission; default none" } } },
             "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http)" },
             "context": company_context("what the messages agentd sends in a Company's conversations share of the User's situation, each field in the draft's format; nothing is shared that is not set. Needs an entry that uses `agent`"),
             "browsers": { "type": "array", "items": { "type": "string" }, "description": "browser MCP servers to keep off every Company's hosts; each names an mcp.servers entry" },
             "limits": { "type": "object", "additionalProperties": false, "properties": {
                 "in_flight": { "type": "integer", "minimum": 1, "description": "Company calls in flight per Company (default 4); one more is refused until one ends" },
-                "conversations": { "type": "integer", "minimum": 1, "description": "open conversations per instance, each followed by a reader (default 16); a new one is refused until one closes" } } } } })
+                "conversations": { "type": "integer", "minimum": 1, "description": "open conversations per instance, each followed by a reader (default 16); a new one is refused until one closes" } } },
+            "standing": { "type": "array", "description": "standing permissions: an operation one of them covers is confirmed with approved_by standing_permission, without asking the User. Each covers one Company, one channel and every term key of the revision; never when the Company requires the User's approval. Needs client.extensions [operations] and the cel feature",
+                "items": { "type": "object", "additionalProperties": false, "required": ["company", "via", "terms", "when", "expires"], "properties": {
+                    "company": { "type": "string", "description": "the company entry" },
+                    "via": { "type": "object", "additionalProperties": false, "description": "the channel that proposed the operation: exactly one of tool (a glob of the Company tool's registered name, shop.exchange_*) or api (an api_allow operation, METHOD /path-template); an operation proposed in a conversation never matches",
+                        "properties": { "tool": { "type": "string" }, "api": { "type": "string" } } },
+                    "terms": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "every term key it covers: a revision with a key outside them, or with no terms, asks the User" },
+                    "when": { "type": "string", "description": "a CEL predicate over terms and summary; a term it reads that is missing is no match" },
+                    "expires": { "type": "string", "description": "an RFC 3339 time it stops applying at" },
+                    "uses": { "type": "integer", "minimum": 1, "description": "how many confirms it covers, each reserved before the confirm and given back when the Company refuses it; default no limit but expires" } } } } } })
 }
 
 /// A conversation's `context` (RFC 0047 §5.5.7): `security.companies.context`

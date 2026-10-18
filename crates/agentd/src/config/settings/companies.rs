@@ -52,6 +52,82 @@ pub struct Companies {
     /// Browser MCP servers to keep off every Company's hosts.
     pub browsers: Vec<String>,
     pub limits: Limits,
+    /// The standing permissions the operator gives agentd to confirm an
+    /// operation without asking the User (RFC 0047 §5.8.1): restart-only,
+    /// never written by anything but this configuration.
+    pub standing: Vec<Standing>,
+}
+
+/// An extension agentd lists in its client metadata document (draft §3.3,
+/// §4.1).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Extension {
+    /// The Operations extension, version 1: a Company proposes an action and
+    /// agentd confirms it only with the User's approval of its terms.
+    Operations,
+}
+
+impl Extension {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Extension::Operations => "operations",
+        }
+    }
+}
+
+/// One standing permission (`security.companies.standing[]`): an
+/// operation proposed at `company` through `via`, whose every term key is in
+/// `terms` and for which `when` holds, is confirmed with `approved_by:
+/// standing_permission` until `expires`, at most `uses` times.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Standing {
+    /// The company entry.
+    pub company: String,
+    /// The channel that proposed the operation: the draft gives an
+    /// operation no kind of action, so the channel stands for it.
+    pub via: Via,
+    /// Every term key it covers: a revision with a key outside them, or with
+    /// no `terms`, asks the User.
+    pub terms: Vec<String>,
+    /// A CEL predicate over `terms` and `summary`.
+    pub when: String,
+    /// When it stops applying, RFC 3339.
+    pub expires: String,
+    /// How many confirms it covers; none limits it to `expires` alone.
+    #[serde(default)]
+    pub uses: Option<u32>,
+}
+
+/// A standing permission's channel: one of the Company's MCP tools, by a
+/// glob of its registered name, or one OpenAPI operation.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Via {
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// `METHOD /path-template`.
+    #[serde(default)]
+    pub api: Option<String>,
+}
+
+/// Whether the client metadata document lists the Operations extension:
+/// agentd recognises operations, and offers the `company.operation.*`
+/// tools, only then.
+pub fn lists_operations(s: &Settings) -> bool {
+    s.security
+        .companies
+        .client
+        .as_ref()
+        .is_some_and(|c| c.extensions.contains(&Extension::Operations))
+}
+
+/// Whether a company entry has the stream `company.<name>`: its
+/// conversations' events go there when it uses `agent`, and its operations'
+/// final states when the Operations extension is listed.
+pub fn has_stream(s: &Settings, svc: &super::Service) -> bool {
+    interfaces_of(svc).contains(&Interface::Agent) || lists_operations(s)
 }
 
 impl Companies {
@@ -137,6 +213,9 @@ pub struct Client {
     /// Company lists `direct`, the Direct Sign-In callback.
     #[serde(default)]
     pub serve: bool,
+    /// The extensions the document lists.
+    #[serde(default)]
+    pub extensions: Vec<Extension>,
 }
 
 impl Client {
@@ -277,17 +356,35 @@ pub const CONVERSATION_TOOLS: [&str; 4] = [
 ];
 /// The `company.*` tools that reach a Company's OpenAPI APIs.
 pub const API_TOOLS: [&str; 2] = ["company.api", "company.api.describe"];
+/// The `company.*` tools that read, confirm and cancel a Company's
+/// operations (RFC 0047 §5.8.1).
+pub const OPERATION_TOOLS: [&str; 3] = [
+    "company.operation.get",
+    "company.operation.confirm",
+    "company.operation.cancel",
+];
+/// The tool that asks the User whether to talk with a Company directly
+/// (§5.8.2).
+pub const DIRECT_TOOL: &str = "company.direct";
 
 /// Whether `tool` reaches a Company's agent in a conversation.
 pub fn is_conversation_tool(tool: &str) -> bool {
     CONVERSATION_TOOLS.contains(&tool)
 }
 
-/// Whether `tool` reaches a Company's agent or its OpenAPI APIs: a tool
-/// that carries the Company's content, and acts at the Company its
-/// `company` argument names.
+/// Whether `tool` reads, confirms or cancels a Company's operation.
+pub fn is_operation_tool(tool: &str) -> bool {
+    OPERATION_TOOLS.contains(&tool)
+}
+
+/// Whether `tool` reaches a Company's agent, its OpenAPI APIs or its
+/// operations: a tool that carries the Company's content, and acts at the
+/// Company its `company` argument names.
 pub fn is_interface_tool(tool: &str) -> bool {
-    is_conversation_tool(tool) || API_TOOLS.contains(&tool)
+    is_conversation_tool(tool)
+        || API_TOOLS.contains(&tool)
+        || is_operation_tool(tool)
+        || tool == DIRECT_TOOL
 }
 
 /// The stream a Company's conversation events are appended to.
@@ -295,16 +392,20 @@ pub fn stream_of(entry: &str) -> String {
     format!("company.{entry}")
 }
 
-/// The tags the `company.*` tools that reach a Company's conversations and
-/// APIs carry: those of every entry that uses `agent` or `openapi` — its own,
-/// or [`default_tags`] — as its synthesized MCP servers carry them (§6.3).
+/// The tags the `company.*` tools that reach a Company's conversations,
+/// APIs and operations carry: those of every entry that uses `agent` or
+/// `openapi`, and of every entry once the Operations extension is listed —
+/// its own, or [`default_tags`] — as its synthesized MCP servers carry them
+/// (§6.3).
 pub fn interface_tags(s: &Settings) -> Vec<crate::sec::scope::TrifectaTag> {
     let mut out = Vec::new();
+    let operations = lists_operations(s);
     for svc in s.services.values().filter(|v| {
         v.kind == ServiceKind::Company
-            && interfaces_of(v)
-                .iter()
-                .any(|i| matches!(i, Interface::Agent | Interface::Openapi))
+            && (operations
+                || interfaces_of(v)
+                    .iter()
+                    .any(|i| matches!(i, Interface::Agent | Interface::Openapi)))
     }) {
         for t in entry_tags(svc) {
             if !out.contains(&t) {
@@ -440,17 +541,24 @@ pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<Str
 /// supervisor learns that at discovery. A name another server already has
 /// is refused, and the server is left out.
 ///
-/// An entry that uses `agent` gets the stream its conversation events are
-/// appended to, `company.<name>`, with the default retention unless
-/// `streams:` declares it.
+/// An entry that uses `agent`, or any entry once the Operations extension is
+/// listed, gets the stream its conversation events and its operations' final
+/// states are appended to, `company.<name>`, with the default retention
+/// unless `streams:` declares it.
 pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
     let mut added: Vec<McpServer> = Vec::new();
+    let mut streams = Vec::new();
+    for (entry, svc) in &s.services {
+        if svc.kind == ServiceKind::Company && has_stream(s, svc) {
+            streams.push(stream_of(entry));
+        }
+    }
+    for stream in streams {
+        s.streams.entry(stream).or_default();
+    }
     for (entry, svc) in &s.services {
         if svc.kind != ServiceKind::Company {
             continue;
-        }
-        if interfaces_of(svc).contains(&Interface::Agent) {
-            s.streams.entry(stream_of(entry)).or_default();
         }
         for (server, url) in server_names(entry, svc) {
             let taken = s
@@ -708,6 +816,14 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     {
         err(format!("security.companies.seal_key: {e}"));
     }
+    for (i, st) in c.standing.iter().enumerate() {
+        validate_standing(
+            s,
+            &format!("security.companies.standing[{i}]"),
+            st,
+            &mut err,
+        );
+    }
     if entries.is_empty() {
         return;
     }
@@ -810,6 +926,14 @@ fn validate_client(s: &Settings, cl: &Client, err: &mut impl FnMut(String)) {
         err(format!(
             "security.companies.client.logo_uri: {l:?} is not an HTTPS URL"
         ));
+    }
+    for (i, x) in cl.extensions.iter().enumerate() {
+        if cl.extensions[..i].contains(x) {
+            err(format!(
+                "security.companies.client.extensions: {} is listed twice",
+                x.as_str()
+            ));
+        }
     }
     let home = host_of(&cl.id);
     let jwks = cl.jwks_uri();
@@ -1030,6 +1154,103 @@ fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)
             ));
         }
         seen.push(server);
+    }
+}
+
+/// A standing permission (RFC 0047 §5.8.1): spending authority the
+/// operator gives agentd at one Company, through one channel, over a set of
+/// term keys, held to a CEL predicate and an expiry. One that could never
+/// apply is refused, naming why.
+fn validate_standing(s: &Settings, at: &str, st: &Standing, err: &mut impl FnMut(String)) {
+    if !lists_operations(s) {
+        err(format!(
+            "{at}: a standing permission confirms operations, which agentd recognises only once security.companies.client.extensions lists operations"
+        ));
+    }
+    let entry = s
+        .services
+        .get(&st.company)
+        .filter(|v| v.kind == ServiceKind::Company);
+    let Some(svc) = entry else {
+        err(format!(
+            "{at}.company: {:?} is not a company entry (services.<name>.kind: company)",
+            st.company
+        ));
+        return;
+    };
+    let name = &st.company;
+    match (&st.via.tool, &st.via.api) {
+        (Some(tool), None) => {
+            let servers: Vec<String> = server_names(name, svc)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            if servers.is_empty() {
+                err(format!(
+                    "{at}.via.tool: company {name} uses none of its MCP servers (services.{name}.interfaces lists no mcp)"
+                ));
+            } else if !servers
+                .iter()
+                .any(|srv| tool.starts_with(&format!("{srv}.")) && tool.len() > srv.len() + 1)
+            {
+                err(format!(
+                    "{at}.via.tool: {tool:?} names no tool of company {name}'s MCP servers — each of its tools is named <server>.<tool> ({})",
+                    servers
+                        .iter()
+                        .map(|srv| format!("{srv}.*"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        (None, Some(api)) => match parse_operation(api) {
+            Err(e) => err(format!("{at}.via.api: {api:?} {e}")),
+            Ok((method, template)) => {
+                let allowed = svc.api_allow.iter().flatten().any(|a| {
+                    parse_operation(a)
+                        .is_ok_and(|(m, t)| m == method && same_template(&t, &template))
+                });
+                if !allowed {
+                    err(format!(
+                        "{at}.via.api: {api:?} is not in services.{name}.api_allow, so agentd never calls it"
+                    ));
+                }
+            }
+        },
+        _ => err(format!(
+            "{at}.via: name exactly one channel, {{tool: <glob>}} or {{api: \"METHOD /path-template\"}}"
+        )),
+    }
+    if st.terms.is_empty() {
+        err(format!(
+            "{at}.terms: list every term key it covers; an operation with a key outside them, or with no terms, asks the User"
+        ));
+    }
+    for (i, t) in st.terms.iter().enumerate() {
+        if t.trim().is_empty() {
+            err(format!("{at}.terms: an empty term key"));
+        } else if st.terms[..i].contains(t) {
+            err(format!("{at}.terms: {t:?} is listed twice"));
+        }
+    }
+    let expr = st.when.trim().trim_start_matches("CEL:").trim();
+    if !cfg!(feature = "cel") {
+        err(format!(
+            "{at}.when needs the `cel` feature; this build cannot evaluate a standing permission's predicate"
+        ));
+    } else if let Err(e) = crate::cel::compile_check(expr) {
+        err(format!("{at}.when: {e}"));
+    }
+    if crate::obs::log::rfc3339_ms(&st.expires).is_none() {
+        err(format!(
+            "{at}.expires: {:?} is not an RFC 3339 time, such as 2026-12-31T00:00:00Z",
+            st.expires
+        ));
+    }
+    if st.uses == Some(0) {
+        err(format!(
+            "{at}.uses: 0 would never apply; at least 1, or leave it out to bound it by expires alone"
+        ));
     }
 }
 
@@ -1555,6 +1776,161 @@ mod tests {
         assert!(same_template("/orders/{order_id}", "/orders/{id}"));
         assert!(!same_template("/orders/{id}", "/orders/{id}/exchanges"));
         assert!(!same_template("/orders/latest", "/orders/{id}"));
+    }
+
+    /// The Operations extension and standing permissions (RFC 0047 §5.3,
+    /// §5.8.1): what load takes — the extension listed, the stream the
+    /// operations' final states go to, the tools' tags — and each refusal of
+    /// a permission that could never apply, named.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn standing_permissions_are_held_to_what_they_can_cover() {
+        let with = |client: &str, standing: &str, extra: &str| {
+            company(extra).replace(
+                "name: Agent}",
+                &format!("name: Agent{client}}}\n    standing:\n{standing}"),
+            )
+        };
+        let rule = |fields: &str| {
+            format!(
+                "      - {{company: shop, terms: [order_id, price], when: \"terms.price < 20\", expires: \"2026-12-31T00:00:00Z\"{fields}}}\n"
+            )
+        };
+        let listed = ", extensions: [operations]";
+        let ok = with(
+            listed,
+            &rule(", via: {tool: \"shop.exchange_*\"}, uses: 3"),
+            "",
+        );
+        if cfg!(feature = "cel") {
+            let s = load(&ok).unwrap();
+            assert!(lists_operations(&s));
+            assert_eq!(s.security.companies.standing[0].uses, Some(3));
+            assert!(
+                s.streams.contains_key("company.shop"),
+                "an entry of MCP servers alone has the stream its operations' final states go to"
+            );
+            assert_eq!(
+                interface_tags(&s).len(),
+                2,
+                "the operation tools carry its tags"
+            );
+            let api = with(
+                listed,
+                &rule(", via: {api: \"POST /orders/{id}/exchanges\"}"),
+                ", interfaces: [openapi], api_allow: [\"POST /orders/{order_id}/exchanges\"]",
+            );
+            load(&api).unwrap();
+        } else {
+            let e = load(&ok).unwrap_err();
+            assert!(
+                e.contains("standing[0].when needs the `cel` feature"),
+                "{e}"
+            );
+        }
+        let refused = |yaml: &str, why: &str| {
+            let e = load(yaml).expect_err(yaml);
+            assert!(e.contains(why), "want {why:?} in:\n{e}");
+        };
+        refused(
+            &with("", &rule(", via: {tool: \"shop.exchange_*\"}"), ""),
+            "standing[0]: a standing permission confirms operations, which agentd recognises only once security.companies.client.extensions lists operations",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.exchange_*\"}")
+                    .replace("company: shop", "company: other"),
+                "",
+            ),
+            "standing[0].company: \"other\" is not a company entry",
+        );
+        refused(
+            &with(listed, &rule(", via: {}"), ""),
+            "standing[0].via: name exactly one channel",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\", api: \"POST /x\"}"),
+                "",
+            ),
+            "standing[0].via: name exactly one channel",
+        );
+        refused(
+            &with(listed, &rule(", via: {tool: \"exchange_*\"}"), ""),
+            "standing[0].via.tool: \"exchange_*\" names no tool of company shop's MCP servers — each of its tools is named <server>.<tool> (shop.*)",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {api: \"POST /orders/{id}/returns\"}"),
+                ", interfaces: [openapi], api_allow: [\"POST /orders/{order_id}/exchanges\"]",
+            ),
+            "standing[0].via.api: \"POST /orders/{id}/returns\" is not in services.shop.api_allow",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}"),
+                ", interfaces: [openapi], api_allow: [\"POST /x\"]",
+            ),
+            "standing[0].via.tool: company shop uses none of its MCP servers",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}").replace("terms: [order_id, price]", "terms: []"),
+                "",
+            ),
+            "standing[0].terms: list every term key it covers",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}")
+                    .replace("terms: [order_id, price]", "terms: [a, a]"),
+                "",
+            ),
+            "standing[0].terms: \"a\" is listed twice",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}").replace("terms: [order_id, price], ", ""),
+                "",
+            ),
+            "missing field `terms`",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}").replace("2026-12-31T00:00:00Z", "next year"),
+                "",
+            ),
+            "standing[0].expires: \"next year\" is not an RFC 3339 time",
+        );
+        refused(
+            &with(listed, &rule(", via: {tool: \"shop.x\"}, uses: 0"), ""),
+            "standing[0].uses: 0 would never apply",
+        );
+        if cfg!(feature = "cel") {
+            refused(
+                &with(
+                    listed,
+                    &rule(", via: {tool: \"shop.x\"}").replace("terms.price < 20", "terms.price <"),
+                    "",
+                ),
+                "standing[0].when: CEL parse",
+            );
+        }
+        refused(
+            &company("").replace(
+                "name: Agent}",
+                "name: Agent, extensions: [operations, operations]}",
+            ),
+            "client.extensions: operations is listed twice",
+        );
     }
 
     #[cfg(not(feature = "companies"))]

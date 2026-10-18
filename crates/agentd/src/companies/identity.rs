@@ -77,6 +77,23 @@ impl Identity {
         if let Some(l) = &client.logo_uri {
             metadata["logo_uri"] = json!(l);
         }
+        // The extensions it supports, each at the version agentd speaks: a
+        // Company returns operations only to an agent that lists them
+        // (Operations §2).
+        if !client.extensions.is_empty() {
+            let mut ext = serde_json::Map::new();
+            for x in &client.extensions {
+                match x {
+                    crate::config::settings::companies::Extension::Operations => {
+                        ext.insert(
+                            super::wire::operations::EXTENSION.into(),
+                            json!({"version": super::wire::operations::VERSION}),
+                        );
+                    }
+                }
+            }
+            metadata[super::wire::EXTENSIONS_MEMBER] = Value::Object(ext);
+        }
         Ok(Identity {
             client_id: client.id.clone(),
             jwks_uri,
@@ -219,6 +236,7 @@ mod tests {
             published_key_files: vec![dir.join("next").display().to_string()],
             redirect_uri: None,
             serve: false,
+            extensions: Vec::new(),
         }
     }
 
@@ -269,5 +287,22 @@ mod tests {
             Some("https://agent.example/companies/callback")
         );
         assert!(id.redirect_uri.is_none());
+        assert!(
+            id.metadata().get("extensions").is_none(),
+            "nothing listed until configured"
+        );
+        // The Operations extension, listed at version 1 (Operations §2).
+        let listing = Identity::load(
+            &Client {
+                extensions: vec![crate::config::settings::companies::Extension::Operations],
+                ..client(dir.path())
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            listing.metadata()["extensions"],
+            json!({"operations": {"version": "1"}})
+        );
     }
 }

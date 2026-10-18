@@ -18,7 +18,11 @@
 //! the User ID ([`ledger`]). The Session is signed
 //! out until the User signs in themselves, at a gate agentd opens for them
 //! ([`signin`]); the Account Token that gives agentd is kept sealed, and
-//! only the supervisor ever reads it ([`account`]). No turn
+//! only the supervisor ever reads it ([`account`]). An action a Company
+//! proposes is confirmed only with the User's approval of its terms, or a
+//! standing permission the operator declared ([`operations`]), and the User
+//! talks with the Company themselves only when they choose to
+//! ([`direct`]). No turn
 //! worker, subagent or instance child is handed a Company server to dial, a
 //! key or a token: their calls come back to the supervisor (§5.6). What a
 //! Company is sent carries none of agentd's correlators under the strict
@@ -41,6 +45,8 @@ pub mod cli;
 #[cfg(feature = "companies")]
 pub mod conversation;
 #[cfg(feature = "companies")]
+pub mod direct;
+#[cfg(feature = "companies")]
 pub mod discover;
 #[cfg(feature = "companies")]
 pub mod dpop;
@@ -59,6 +65,8 @@ pub mod mcp;
 ))]
 pub mod mock;
 #[cfg(feature = "companies")]
+pub mod operations;
+#[cfg(feature = "companies")]
 pub mod privacy;
 #[cfg(feature = "companies")]
 pub mod request;
@@ -73,7 +81,7 @@ pub mod user_id;
 pub mod wire;
 
 #[cfg(feature = "companies")]
-pub use supervisor::{Company, Supervisor};
+pub use supervisor::{Company, Notice, Notify, Supervisor};
 
 /// `--print-company-client <dir>`: write the client metadata document and
 /// key set `settings` describe into `dir`, for static hosting at the
@@ -118,8 +126,8 @@ pub fn quoted(text: &str, cap: usize) -> String {
 #[cfg(feature = "companies")]
 mod supervisor {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     use serde_json::json;
@@ -253,6 +261,20 @@ mod supervisor {
         }
     }
 
+    /// What the supervisor tells the runtime, off the loop.
+    #[derive(Debug)]
+    pub enum Notice {
+        /// An operation reached a final state the runtime has not been told
+        /// of: for the stream `company.<name>` and the audit stream.
+        Final(super::operations::Final),
+        /// A Company asks to talk with the User directly in one of its
+        /// conversations (draft §7.10).
+        DirectAsked(super::direct::Asked),
+    }
+
+    /// Where notices go: the runtime's loop.
+    pub type Notify = Arc<dyn Fn(Notice) + Send + Sync>;
+
     /// What the checks before the first Session came to.
     enum Ready {
         Unchecked,
@@ -296,6 +318,24 @@ mod supervisor {
         pub(super) conversation_limit: u32,
         /// The OpenAPI descriptions fetched, by URL.
         pub(super) descriptions: Mutex<BTreeMap<String, Arc<super::api::Description>>>,
+        /// Whether the client metadata document lists the Operations
+        /// extension.
+        pub(super) operations: bool,
+        /// The standing permissions, as configured.
+        pub(super) standing: Vec<super::operations::Rule>,
+        /// The Companies whose standing permissions are suspended until a
+        /// restart.
+        pub(super) standing_suspended: Mutex<BTreeSet<String>>,
+        /// Wakes each Company's operations tracker.
+        pub(super) track_wake: (Mutex<u64>, Condvar),
+        /// This process's own: a confirm's lock names it, so a lock another
+        /// life left is known as one.
+        pub(super) life: String,
+        /// Where notices for the runtime go.
+        pub(super) notify: Mutex<Option<Notify>>,
+        /// Whether the User can be asked to join a Direct Conversation a
+        /// Company asks for: a listener serves, and unowned work may gate.
+        pub(super) direct_askable: AtomicBool,
         timeout: Duration,
         log: Logger,
     }
@@ -391,9 +431,34 @@ mod supervisor {
                 sink: Mutex::default(),
                 conversation_limit: c.conversations(),
                 descriptions: Mutex::default(),
+                operations: cfg::lists_operations(settings),
+                standing: c
+                    .standing
+                    .iter()
+                    .filter_map(super::operations::Rule::of)
+                    .collect(),
+                standing_suspended: Mutex::default(),
+                track_wake: (Mutex::new(0), Condvar::new()),
+                life: crate::sec::random::b64url_token(12)
+                    .map_err(|e| format!("no OS randomness: {e}"))?,
+                notify: Mutex::default(),
+                direct_askable: AtomicBool::new(false),
                 timeout,
                 log: log.clone(),
             })))
+        }
+
+        /// Where notices for the runtime go: an operation's final state, a
+        /// Company's request to talk with the User.
+        pub fn notify_to(&self, sink: Notify) {
+            *self.notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+        }
+
+        /// Whether the User can be asked to join a Direct Conversation a
+        /// Company asks for; when not, agentd says in the conversation that
+        /// they are not available.
+        pub fn set_direct_askable(&self, askable: bool) {
+            self.direct_askable.store(askable, Ordering::SeqCst);
         }
 
         pub fn log(&self) -> &Logger {

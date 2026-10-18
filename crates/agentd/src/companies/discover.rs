@@ -134,6 +134,9 @@ pub struct Verified {
     pub conversation: Option<Listed>,
     /// Every OpenAPI API the document lists: the description's URL.
     pub openapi: Vec<Listed>,
+    /// The Operations extension's endpoint, when the Company lists the
+    /// version agentd speaks (Operations §2).
+    pub operations: Option<Listed>,
     /// The interfaces agentd uses there.
     pub interfaces: Vec<Interface>,
     pub max_age: Duration,
@@ -458,9 +461,21 @@ fn verify(entry: &Entry) -> Verification {
     if let Some(u) = string(poppy, "/web/browser_session_endpoint") {
         named.push(("web.browser_session_endpoint".into(), u.to_string()));
     }
+    let mut operations = None;
     for (name, ext) in poppy["extensions"].as_object().into_iter().flatten() {
         if let Some(u) = ext["endpoint"].as_str() {
             named.push((format!("extensions.{name}.endpoint"), u.to_string()));
+        }
+        if let Some(r) = ext["resource"].as_str() {
+            named.push((format!("extensions.{name}.resource"), r.to_string()));
+        }
+        // An extension of another major version is one agentd does not
+        // speak, and is ignored (§3.3).
+        if name == wire::operations::EXTENSION
+            && ext["version"] == wire::operations::VERSION
+            && ext["endpoint"].is_string()
+        {
+            operations = Some(listed(ext, "endpoint"));
         }
     }
     for (field, url) in &named {
@@ -509,6 +524,7 @@ fn verify(entry: &Entry) -> Verification {
             mcp_urls: mcp_urls.clone(),
             conversation,
             openapi,
+            operations,
             interfaces: entry.interfaces.clone(),
             max_age,
             verified_at: Instant::now(),
@@ -869,6 +885,7 @@ mod tests {
             mcp_urls: urls(mcp),
             conversation: None,
             openapi: Vec::new(),
+            operations: None,
             interfaces: vec![Interface::Mcp],
             max_age: Duration::ZERO,
             verified_at: Instant::now(),

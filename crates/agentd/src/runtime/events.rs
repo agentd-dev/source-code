@@ -107,6 +107,25 @@ pub enum Event {
         by: Option<String>,
         outcome: Result<Value, String>,
     },
+    /// A confirm of a Company's operation moved on (RFC 0047 §5.8.1): the
+    /// User is to be asked, a standing permission approved it, the confirm
+    /// was answered, or it ended. Sent by the confirm's own thread.
+    #[cfg(feature = "companies")]
+    CompanyOperation {
+        id: String,
+        step: crate::companies::operations::Step,
+    },
+    /// What the supervisor tells the runtime: an operation's final state, a
+    /// Company's request to talk with the User.
+    #[cfg(feature = "companies")]
+    CompanyNotice(Box<crate::companies::Notice>),
+    /// A Direct Conversation moved on (§5.8.2): the User's answer was acted
+    /// on at the Company, or a relayed message failed.
+    #[cfg(feature = "companies")]
+    CompanyDirect {
+        id: String,
+        step: super::company_direct::DirectStep,
+    },
     /// The 200 ms tick.
     Tick,
 }

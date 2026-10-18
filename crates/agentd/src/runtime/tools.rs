@@ -606,11 +606,31 @@ impl Runtime {
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         let server = server.to_string();
+        // The call as an operation it proposes would name it (RFC 0047
+        // §5.8.1): its registered name and its arguments.
+        #[cfg(feature = "companies")]
+        let proposing = company.as_ref().map(|_| {
+            (
+                name.to_string(),
+                crate::companies::operations::call_digest(name, &args),
+            )
+        });
         std::thread::Builder::new()
             .name(format!("mcp:{server}.{tool}"))
             .spawn(move || {
                 // Unbounded as a whole, for the reason `run_mapped` gives.
                 let start = crate::obs::otel::now_unix_nanos();
+                // The request that proposed an operation that is not final
+                // is not sent again (Operations §6).
+                #[cfg(feature = "companies")]
+                if let (Some(slot), Some(sup), Some((_, digest))) = (&company, &sup, &proposing)
+                    && let Some(c) = sup.company(slot.company())
+                    && let Some(why) = sup.repeats(&c, digest)
+                {
+                    crate::obs::metrics::record_company_request(slot.company(), "mcp", "unsent");
+                    target.send(&tx, Value::String(why), true);
+                    return;
+                }
                 #[cfg(feature = "companies")]
                 let (meta, link) = match (&company, &private, &sup) {
                     (Some(slot), Some((key, unit)), Some(sup)) => {
@@ -655,6 +675,23 @@ impl Runtime {
                             origin: crate::companies::carry::origin(&issuer),
                             why: crate::companies::carry::why(slot.company()),
                         });
+                    }
+                    // An operation the tool proposes in place of performing
+                    // the action (Operations §4.2): kept, and nothing done.
+                    if let (Ok(r), Some(sup), Some((name, digest))) = (&res, &sup, &proposing)
+                        && !r.is_error()
+                        && let Some(op) = r
+                            .structured_content
+                            .as_ref()
+                            .and_then(|s| s.get(crate::companies::wire::operations::MEMBER))
+                        && let Some(c) = sup.company(slot.company())
+                    {
+                        sup.recognise(
+                            &c,
+                            crate::companies::ledger::Channel::Tool { name: name.clone() },
+                            Some(digest.clone()),
+                            op,
+                        );
                     }
                 }
                 let (result, is_error) = match res {
@@ -981,6 +1018,14 @@ impl Runtime {
             "company.sign_in" => self.company_sign_in_tool(caller, &args),
             #[cfg(feature = "companies")]
             "company.sign_out" => self.company_sign_out_tool(caller, &args),
+            #[cfg(feature = "companies")]
+            n if crate::config::settings::companies::is_operation_tool(n) => {
+                self.company_operation_tool(caller, n, &args)
+            }
+            #[cfg(feature = "companies")]
+            crate::config::settings::companies::DIRECT_TOOL => {
+                self.company_direct_tool(caller, &args)
+            }
             #[cfg(feature = "companies")]
             n if crate::config::settings::companies::is_interface_tool(n) => {
                 self.company_call_tool(caller, n, &args)
@@ -1866,11 +1911,13 @@ impl Runtime {
                     }
                 }
                 // Human gates run their own pass (auto-judge + prune + timeout),
-                // and so do Company sign-ins.
+                // and so do Company sign-ins, approvals and Direct Conversations.
                 PendingKind::Timer { .. }
                 | PendingKind::Think { .. }
                 | PendingKind::Human { .. }
-                | PendingKind::CompanySignIn { .. } => {}
+                | PendingKind::CompanySignIn { .. }
+                | PendingKind::CompanyOperation { .. }
+                | PendingKind::CompanyDirect { .. } => {}
             }
         }
         for (target, v, e) in done {

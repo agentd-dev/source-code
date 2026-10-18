@@ -716,10 +716,110 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// An RFC 3339 date-time — `2026-12-31T00:00:00Z`, a fraction and a
+/// `±HH:MM` offset allowed, `T` and `Z` in either case — as epoch
+/// milliseconds; `None` for anything else, or a time before the epoch.
+pub fn rfc3339_ms(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = s.get(from..to)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut at = 19;
+    let mut millis = 0i64;
+    if b[at] == b'.' {
+        let start = at + 1;
+        at = start;
+        while at < b.len() && b[at].is_ascii_digit() {
+            at += 1;
+        }
+        if at == start {
+            return None;
+        }
+        let digits = &s[start..at.min(start + 3)];
+        millis = digits.parse::<i64>().ok()? * 10i64.pow(3 - digits.len() as u32);
+    }
+    let offset_s = match &s[at..] {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && matches!(o.as_bytes()[0], b'+' | b'-') && o.as_bytes()[3] == b':' => {
+            let (oh, om) = (num(at + 1, at + 3)?, num(at + 4, at + 6)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let v = oh * 3600 + om * 60;
+            if o.starts_with('-') { -v } else { v }
+        }
+        _ => return None,
+    };
+    // Days since the epoch of the civil date (Hinnant's `days_from_civil`).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset_s;
+    u64::try_from(secs * 1000 + millis).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// An RFC 3339 time reads back as the instant `rfc3339_millis` writes,
+    /// its offset applied; anything else is refused.
+    #[test]
+    fn an_rfc3339_time_is_read_as_its_instant() {
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            rfc3339_ms("2023-11-14T22:13:20.123Z"),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            rfc3339_ms("2023-11-14t22:13:20.5z"),
+            Some(1_700_000_000_500)
+        );
+        assert_eq!(
+            rfc3339_ms("2026-10-08T12:20:00-07:00"),
+            rfc3339_ms("2026-10-08T19:20:00Z")
+        );
+        assert_eq!(
+            rfc3339_ms("2024-02-29T00:00:00+01:00"),
+            Some(19_782 * 86_400_000 - 3_600_000)
+        );
+        let t = UNIX_EPOCH + Duration::from_millis(1_792_368_123_456);
+        assert_eq!(rfc3339_ms(&rfc3339_millis(t)), Some(1_792_368_123_456));
+        for bad in [
+            "",
+            "2026-12-31",
+            "2026-12-31 00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-12-31T24:00:00Z",
+            "2026-12-31T00:00:00",
+            "2026-12-31T00:00:00.Z",
+            "2026-12-31T00:00:00+0100",
+            "1969-12-31T23:59:59Z",
+            "２026-12-31T00:00:00Z",
+        ] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn rfc3339_known_timestamps() {

@@ -690,7 +690,16 @@ impl Supervisor {
             ),
         })?;
         let query = checked(&detail, &params, call).map_err(|e| refused(e.join("; ")))?;
-        let mut url = format!("{}{}", desc.base, filled(&op.template, &params));
+        // The request that proposed an operation that is not final is not
+        // sent again (Operations §6).
+        let path_sent = filled(&op.template, &params);
+        let digest = super::operations::api_digest(&method, &path_sent, &query, call.json.as_ref());
+        if writes(&method)
+            && let Some(why) = self.repeats(company, &digest)
+        {
+            return Err(CallError::Unsent(why));
+        }
+        let mut url = format!("{}{path_sent}", desc.base);
         if !query.is_empty() {
             url.push('?');
             url.push_str(&query);
@@ -739,7 +748,27 @@ impl Supervisor {
         )?;
         let mut out = json!({"status": reply.status});
         match serde_json::from_slice::<Value>(&reply.body) {
-            Ok(j) => out["json"] = j,
+            Ok(j) => {
+                // An operation the Company proposes in place of performing
+                // the action (Operations §4.1): kept, and nothing done.
+                if reply.status == 202
+                    && let Some(proposal) = j.get(super::wire::operations::MEMBER)
+                    && let Some(id) = self.recognise(
+                        company,
+                        super::ledger::Channel::Api {
+                            method: method.clone(),
+                            template: op.template.clone(),
+                        },
+                        Some(digest.clone()),
+                        proposal,
+                    )
+                {
+                    out["note"] = json!(format!(
+                        "company {name} proposed operation {id}: it is not done until confirmed, and company.operation.confirm asks the User to approve its terms"
+                    ));
+                }
+                out["json"] = j;
+            }
             Err(_) if reply.body.is_empty() => out["json"] = Value::Null,
             Err(_) => {
                 let text = String::from_utf8_lossy(&reply.body);

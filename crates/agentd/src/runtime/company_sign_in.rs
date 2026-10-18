@@ -75,6 +75,10 @@ pub(crate) struct SignInTrack {
     pub deadline_ms: Option<u64>,
     /// Who asked.
     pub principal: Option<String>,
+    /// It signs in to another account than the one before: one that
+    /// succeeds suspends the Company's standing permissions until a restart
+    /// (RFC 0047 §5.8.1).
+    pub new_account: bool,
 }
 
 /// The shape a sign-in gate's answer takes: the User signs in at the
@@ -125,7 +129,7 @@ impl Runtime {
     }
 
     /// The target a tool call from `caller` is answered at.
-    fn target_of(caller: &ToolCaller) -> Target {
+    pub(crate) fn target_of(caller: &ToolCaller) -> Target {
         match (caller.node, &caller.run, &caller.step) {
             (Some(node), _, _) => Target::Child(node, caller.req),
             (None, Some(run), Some(step)) => Target::Step(run.clone(), step.clone()),
@@ -169,13 +173,21 @@ impl Runtime {
     }
 
     /// Whether a gate is open on `task`: an ask, a policy or Company gate,
-    /// or a sign-in — tracked there before its gate opens, too.
+    /// a sign-in or an operation's approval — tracked there before its gate
+    /// opens, and after its question there closed, too — or a Direct
+    /// Conversation's.
     pub(crate) fn gate_open_on(&self, task: &str) -> bool {
         self.sign_in_on(task).is_some()
             || self
                 .company_sign_ins
                 .values()
                 .any(|t| t.on.as_deref() == Some(task))
+            || self.company_operations.values().any(|t| {
+                t.on.as_deref() == Some(task)
+                    || t.gate.as_deref() == Some(task)
+                    || t.asked.iter().any(|(a, _)| a == task)
+            })
+            || self.company_directs.values().any(|t| t.task == task)
             || self
                 .pending
                 .iter()
@@ -266,6 +278,7 @@ impl Runtime {
         principal: Option<String>,
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
+        let new_account = ask.new_account;
         // A gate task made for a workflow step's sign-in is the run's task,
         // which the run's completion settles; the op's own task, and one
         // made for a turn, end with the sign-in.
@@ -287,6 +300,7 @@ impl Runtime {
                 requested: Vec::new(),
                 deadline_ms: None,
                 principal,
+                new_account,
             },
         );
         let Some(sup) = self.companies.clone() else {
@@ -366,11 +380,64 @@ impl Runtime {
         }
     }
 
+    /// The task a Company gate opens on: `on`, the asker's own — or, when no
+    /// caller owns the work that asks, a task of its own, owned by whom the
+    /// work runs for, else the operator: for a workflow step's call
+    /// (`target`), the run's task, which the run's completion settles; else
+    /// one in the conversation `ctx`.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn company_gate_task(
+        &mut self,
+        on: Option<String>,
+        target: Option<&Target>,
+        principal: Option<&str>,
+        ctx: &str,
+    ) -> String {
+        use crate::a2a::tasks::Link;
+        if let Some(task) = on {
+            return task;
+        }
+        let principal = crate::a2a::Principal {
+            id: principal.unwrap_or("operator").to_string(),
+            role: crate::config::settings::Role::Operator,
+            grants: Vec::new(),
+            rate: None,
+            budget: None,
+            labels: Default::default(),
+            session: None,
+        };
+        // A freshly minted id, never the listener's reservation: that
+        // belongs to the task the request being served creates.
+        let reserved = self.reserved_task_id.take();
+        let tid = match target {
+            Some(Target::Step(run, _)) => {
+                let ctx = format!("run-{run}");
+                let tid = self.task_create(&ctx, &principal, Link::Run { id: run.clone() }, None);
+                // The run's completion drives this task terminal.
+                if let Some(r) = self.runs.get_mut(run) {
+                    r.task = Some(tid.clone());
+                    r.touch();
+                }
+                tid
+            }
+            _ => self.task_create(
+                ctx,
+                &principal,
+                Link::Turn {
+                    ctx: ctx.to_string(),
+                },
+                None,
+            ),
+        };
+        self.reserved_task_id = reserved;
+        tid
+    }
+
     /// Open the sign-in `id`'s gate with `question`: on the task it opens on,
     /// or a task of its own, addressed to the User.
     #[cfg(feature = "a2a")]
     fn open_sign_in_gate(&mut self, id: &str, question: &str) {
-        use crate::a2a::tasks::{Link, SignInGate, State};
+        use crate::a2a::tasks::{SignInGate, State};
         let Some(t) = self.company_sign_ins.get(id) else {
             return;
         };
@@ -381,42 +448,16 @@ impl Runtime {
             t.owed.clone(),
             t.principal.clone(),
         );
-        let task = match on {
-            Some(task) => task,
-            None => {
-                // No caller owns the work that asks: a gate task of its own,
-                // owned by whom the work runs for, else the operator.
-                let principal = crate::a2a::Principal {
-                    id: principal.clone().unwrap_or_else(|| "operator".to_string()),
-                    role: crate::config::settings::Role::Operator,
-                    grants: Vec::new(),
-                    rate: None,
-                    budget: None,
-                    labels: Default::default(),
-                    session: None,
-                };
-                let reserved = self.reserved_task_id.take();
-                let tid = match &owed {
-                    Owed::Call(Target::Step(run, _)) => {
-                        let ctx = format!("run-{run}");
-                        let tid =
-                            self.task_create(&ctx, &principal, Link::Run { id: run.clone() }, None);
-                        // The run's completion drives this task terminal.
-                        if let Some(r) = self.runs.get_mut(run) {
-                            r.task = Some(tid.clone());
-                            r.touch();
-                        }
-                        tid
-                    }
-                    _ => {
-                        let ctx = format!("company-sign-in-{id}");
-                        self.task_create(&ctx, &principal, Link::Turn { ctx: ctx.clone() }, None)
-                    }
-                };
-                self.reserved_task_id = reserved;
-                tid
-            }
+        let target = match &owed {
+            Owed::Call(t) => Some(t.clone()),
+            Owed::Task(_) => None,
         };
+        let task = self.company_gate_task(
+            on,
+            target.as_ref(),
+            principal.as_deref(),
+            &format!("company-sign-in-{id}"),
+        );
         if let Some(t) = self.tasks.get_mut(&task) {
             t.ask_schema = Some(sign_in_answer_schema());
             t.ask_channel = None;
@@ -481,6 +522,14 @@ impl Runtime {
             }
         }
         let kind = track.kind.map(SignIn::as_str);
+        // The standing permissions were declared for the account connected
+        // before.
+        if track.new_account
+            && matches!(outcome, Outcome::SignedIn { .. })
+            && let Some(sup) = &self.companies
+        {
+            sup.suspend_standing(&company);
+        }
         match &outcome {
             Outcome::SignedIn { scope, requested } => self.log.info(
                 "company.signed_in",

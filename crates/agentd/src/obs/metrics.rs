@@ -485,7 +485,8 @@ pub fn set_mcp_event_lag(server: &str, event: &str, ms: u64) {
 
 /// One call agentd made to a Company (RFC 0047 §7,
 /// `agent_company_requests_total{company,interface,outcome}`): `interface` ∈
-/// `mcp`\|`agent` (a conversation request)\|`openapi`; `outcome` ∈ `ok`\|`error` (the Company's own answer, a tool's
+/// `mcp`\|`agent` (a conversation request)\|`openapi`\|`operations` (the
+/// operations endpoint); `outcome` ∈ `ok`\|`error` (the Company's own answer, a tool's
 /// `isError` or a refusal it sent)\|`unsent` (refused before it was sent)\|
 /// `unknown` (it may have run: no answer, or a `5xx`, after it was sent). An
 /// unknown value buckets `other`. `company` is a company entry's name.
@@ -581,23 +582,27 @@ pub fn set_company_conversations_open(company: &str, open: u64) {
 
 /// One User gate a Company call opened, and how it ended
 /// (`agent_company_gates_total{company,kind,answer}`): `kind` ∈
-/// `cross_company`\|`sign_in`; `answer` ∈ `approve`\|`deny`\|`unanswered`
-/// (it timed out or was cancelled)\|`unreachable` (nobody could be asked, so
-/// the call was refused), and for a sign-in how it ended: `signed_in`\|
-/// `cancelled`\|`denied`\|`expired`\|`account_mismatch`\|`interrupted`\|
-/// `failed`.
+/// `cross_company`\|`sign_in`\|`operation`\|`direct`; `answer` ∈
+/// `approve`\|`deny`\|`unanswered` (it timed out or was cancelled)\|
+/// `unreachable` (nobody could be asked, so the call was refused), for a
+/// sign-in how it ended: `signed_in`\|`cancelled`\|`denied`\|`expired`\|
+/// `account_mismatch`\|`interrupted`\|`failed`, for an operation
+/// `approve`\|`decline`\|`unanswered`\|`interrupted`, and for a Direct
+/// Conversation `join`\|`decline`\|`unanswered`\|`interrupted`.
 pub fn record_company_gate(company: &str, kind: &str, answer: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.event_add(
         "agent_company_gates_total",
         vec![
             company.into(),
-            imp::closed_label(kind, &["cross_company", "sign_in"]).into(),
+            imp::closed_label(kind, &["cross_company", "sign_in", "operation", "direct"]).into(),
             imp::closed_label(
                 answer,
                 &[
                     "approve",
                     "deny",
+                    "decline",
+                    "join",
                     "unanswered",
                     "unreachable",
                     "signed_in",
@@ -615,6 +620,25 @@ pub fn record_company_gate(company: &str, kind: &str, answer: &str) {
     );
     #[cfg(not(feature = "metrics"))]
     let _ = (company, kind, answer);
+}
+
+/// An operation a Company performed after a confirm reached a final state
+/// (`agent_company_operations_total{company,state,approved_by}`): `state` ∈
+/// `succeeded`\|`failed`\|`cancelled`\|`expired`; `approved_by` ∈ `user`\|
+/// `standing_permission`\|`none` (agentd confirmed none, and only read it).
+pub fn record_company_operation(company: &str, state: &str, approved_by: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_company_operations_total",
+        vec![
+            company.into(),
+            imp::closed_label(state, &["succeeded", "failed", "cancelled", "expired"]).into(),
+            imp::closed_label(approved_by, &["user", "standing_permission", "none"]).into(),
+        ],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, state, approved_by);
 }
 
 /// The active MCP Events subscriptions, by delivery mode — the `kind="event"`
@@ -994,6 +1018,12 @@ mod imp {
             "gauge",
             "Conversations open at the Company, each followed by a reader.",
             &["company"],
+        ),
+        (
+            "agent_company_operations_total",
+            "counter",
+            "Operations a Company performed after a confirm, by final state and how they were approved.",
+            &["company", "state", "approved_by"],
         ),
     ];
 

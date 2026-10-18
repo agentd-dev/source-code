@@ -1028,8 +1028,10 @@ the Personal Agent Protocol draft
   `limits.conversations` are open, each read by a thread of the
   supervisor's, which never blocks its loop and stops when the conversation
   closes or the instance drains. A Company's `text-delta` pieces are never
-  read, and an `authorization` or `user_requested` event never opens a gate
-  by itself: a Company cannot prompt the User at will. How far a call got is the transport's
+  read, and an `authorization` event never opens a gate by itself. A
+  `user_requested` event opens one question for the User per conversation at
+  a time, its text agentd's, and only in unowned work that may gate: a
+  Company cannot prompt the User at will. How far a call got is the transport's
   word, not the error's text, which the Company writes. A `Retry-After` on a
   `429` or `503` holds every request to the Company until it is over.
 - **Declared browsers stay off Companies' sites.** A call on a server
@@ -1040,6 +1042,32 @@ the Personal Agent Protocol draft
   Account Token, and drops the Session and the Company's MCP connections with
   the User ID, so nothing the Company tied to the old User — a token, an MCP
   session — reaches it again.
+- **Only the User approves an operation.** With the Operations extension
+  listed, an action a Company proposes is confirmed only with the User's
+  `approve` of the revision confirmed, at their own gate — never a judge's,
+  a model's, a message's or an operator's who is not the User — or under a
+  standing permission the operator declared in the configuration, which is
+  restart-only, never written by a document, a tool or a workflow, and never
+  applies where the Company requires the User's own approval. The model
+  passes no revision and no `approved_by`: agentd reads the operation again
+  and sends what it holds. The User's approval covers the revision the gate
+  showed only while the Company says the same of it — other terms under the
+  same revision ask again — and an answer is one message: one sent again
+  answers no later question. A standing permission covers one Company, one
+  channel and every term key of the revision, is asked again at each
+  confirm, and its limited uses are reserved with the confirm's lock and
+  spent only by a confirmation the Company recorded under it, so two calls
+  racing for the last one confirm once and a confirm the Company did not
+  take spends none. One confirm of an operation is in flight at a time (its
+  lock, kept in the ledger), and a confirm that got no answer is read until
+  the operation is final; until then the request that proposed it is refused
+  unsent, and an operation of the same terms is not confirmed.
+- **Only the User's words are `human`.** A Direct Conversation starts only
+  with the User's answer at their gate, and every message agentd sends there
+  is a message the User wrote on its task, as they wrote it — sent once,
+  however often their client sends it. The model's messages are `agent`, it
+  cannot write to a Direct Conversation, and a Company asking there to talk
+  with the User is answered with nothing.
 
 What does not:
 
@@ -1063,6 +1091,15 @@ What does not:
   agent to every Company the User signed in at. Keep the three apart.
 - A sign-out whose revocation fails forgets the Account Token here, and it
   stays good at the Company until it expires (`company.signed_out` says so).
+- `approved_by` works on trust: the Company cannot see the User's gate, and
+  agentd's audit records are agentd's account of who approved what, not
+  proof the Company can check.
+- The same action proposed again with other arguments and other terms is not
+  recognised as the same: the draft gives an operation no kind of action, and
+  a standing permission binds to the channel that proposed it for the same
+  reason. Nor does the draft name the account a Session is signed in to, so
+  a standing permission covers the account connected when it was declared; a
+  sign-in to a new account suspends it until a restart.
 
 ## What agentd does not protect against
 
@@ -1105,7 +1142,7 @@ class.
 
 | Tier | Callers | Tools |
 |---|---|---|
-| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe` |
+| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe`, `company.operation.get`, `company.operation.confirm`, `company.operation.cancel`, `company.direct` |
 | root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
 | root only | root | `instruction.subscribe`, `workflow.create`, `workflow.update`, `workflow.delete`, `workflow.pause`, `workflow.resume` |
 

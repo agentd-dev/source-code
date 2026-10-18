@@ -34,7 +34,8 @@
 //! | `GET /api/orders/{order_id}` | one of the User's orders: `sign_in_required` signed out, `insufficient_scope` without `poppy:read` |
 //! | `POST /api/orders/{order_id}/exchanges` | an exchange, declaring an `Idempotency-Key` header: a repeated key gets the first answer, with another body `422` |
 //! | `POST /api/notes` | a note, declaring no `Idempotency-Key` |
-//! | `POST /poppy/conversations`, `…/{id}/messages`, `GET …/{id}/events`, `POST …/{id}/handoff`, `…/close` | the Company Agent's conversations (§7), DPoP Session Tokens only |
+//! | `POST /poppy/conversations`, `…/{id}/messages`, `GET …/{id}/events`, `POST …/{id}/handoff`, `…/close` | the Company Agent's conversations (§7), Direct Conversations among them (§7.10), DPoP Session Tokens only |
+//! | `GET /poppy/operations/{id}`, `POST …/{id}/confirm`, `…/{id}/cancel` | the Operations extension's endpoint (Operations §5–§7), DPoP Session Tokens only |
 //! | `POST /_mock/control`, `GET /_mock/record` | steer the scripted User and token lifetimes; read what the fake saw |
 //!
 //! **What it holds a Personal Agent to.** Both assertions are verified
@@ -67,6 +68,28 @@
 //! `DELTA:`, which appear in no event — and then the stream ends, as a
 //! Company may end one at any time (§7.6). The protocol entry `poppy` is
 //! listed after one of a type agentd does not speak.
+//!
+//! **Operations.** The discovery document lists the Operations extension,
+//! version 1, at `/poppy/operations`. To a Personal Agent whose client
+//! metadata document lists it, an exchange is proposed as an operation —
+//! by the MCP tool `exchange_item`, by `POST /api/orders/{order_id}/exchanges`
+//! (`202 {operation}`, the same one for a repeated `Idempotency-Key`), and
+//! by the Company Agent when a message asks for an exchange — with the terms
+//! `order_id`, `item_id`, `replacement_sku` and `price_difference` (`70.00`
+//! USD for an insulated replacement, `15.00` otherwise), for ten minutes;
+//! to any other agent the exchange is simply made (Ops §2). An operation
+//! belongs to the Session it was proposed in, or to the account it was
+//! signed in to then (§3.2), and the confirm is held to §5.2: the latest
+//! revision (`terms_changed` with the current operation), `approved_by`
+//! allowed (`user_approval_required`), and a state other than `proposed`
+//! answered as it is. A confirm is final at once, `succeeded`, unless the
+//! control says otherwise.
+//!
+//! **Direct Conversations** (§7.10): a conversation started with
+//! `parent_conversation_id` is held to the parent's rules, adds
+//! `direct_opened` to it — and `direct_closed` when it closes — and its
+//! replies come from a person, `sender: human`; the parent takes no message
+//! while it is open (`direct_conversation_open`).
 //!
 //! **The scripted User** approves a device or Direct Sign-In as the account
 //! `acct_1`, granting every scope asked for, after one `authorization_pending`
@@ -104,9 +127,26 @@
 //! t`, `t` ms after, recording `/_mock/held` as each hold begins, and, with
 //! no `status`, then answered as they would have been;
 //! `"conversation": {"user_requested": reason}` has the Company Agent ask to
-//! talk with the User after its next reply; `"expire_events": true` forgets
+//! talk with the User after its next reply — in a Direct Conversation too,
+//! as no Company should; `"expire_events": true` forgets
 //! every conversation's events so far, so a cursor naming one of them is
-//! `cursor_expired`;
+//! `cursor_expired`; `"operations": {"in_progress": n}` answers the next
+//! confirm `in_progress` with `Retry-After`, and keeps the operation in
+//! progress for `n` reads before it succeeds; `{"revise": n}` gives the next
+//! `n` confirmed operations a new revision first — the price changed — so
+//! the confirm is `terms_changed`; `{"user_approval_required": true}` has
+//! every proposal from then on require the User's own approval;
+//! `{"refuse_standing": n}` refuses the next `n` confirms by a standing
+//! permission `user_approval_required`, whatever the proposal said;
+//! `{"insufficient_scope": n}` refuses the next `n` confirms
+//! `insufficient_scope` before anything is done (§5.2), and `{"drop": n}`
+//! answers the next `n` a bare `502` before anything is done;
+//! `{"cancel_first": n}` has the next `n` confirms find the operation
+//! cancelled already — the User cancelled it on the Company's site — and
+//! answered as it is; `{"rewrite": n}` has the next `n` reads of a proposed
+//! operation find other terms under the same revision, which Ops §3.1
+//! forbids; `{"extra_term": key}` adds `key` to every proposal's terms from
+//! then on, and `{"no_terms": true}` leaves them out;
 //! and a `stall` whose `method` is `token:<grant_type>` holds the answers to
 //! the next `n` token requests of that grant `t` ms after they took effect
 //! (a rotation already made, say, while its answer is on the way),
@@ -258,6 +298,10 @@ pub struct Options {
 const DOMAIN: &str = "127.0.0.1";
 /// Where the Company Agent's conversations are (§7.2).
 const CONVERSATIONS: &str = "/poppy/conversations";
+/// Where the Operations extension's endpoint is (Operations §2).
+const OPERATIONS: &str = "/poppy/operations";
+/// How long a proposed revision can be confirmed.
+const OPERATION_FOR_S: u64 = 600;
 /// The longest a read is held for an event, whatever its `wait`.
 const WAIT_CAP_S: u64 = 3;
 /// How long a proof or an assertion stays acceptable, either side of now.
@@ -685,6 +729,8 @@ struct Granted {
 struct Client {
     keys: Vec<Value>,
     redirect_uris: Vec<String>,
+    /// The extensions its metadata document lists at version 1.
+    extensions: Vec<String>,
 }
 
 struct Session {
@@ -832,6 +878,48 @@ struct State {
     user_requested: Option<String>,
     /// API writes, by `Idempotency-Key`: the body and the answer.
     writes: BTreeMap<String, (String, u16, Value)>,
+    /// The operations proposed, by operation ID.
+    operations: BTreeMap<String, Op>,
+    /// What the next proposals and confirms meet (`"operations"`).
+    ops: OpControl,
+}
+
+/// What the next proposals and confirms meet (`"operations"` in the
+/// control).
+#[derive(Default)]
+struct OpControl {
+    /// Reads the next confirmed operation stays `in_progress` for.
+    in_progress: Option<u32>,
+    /// Confirms still to meet a new revision first.
+    revise: u32,
+    user_approval_required: bool,
+    /// Confirms with `approved_by: standing_permission` still to refuse
+    /// `user_approval_required`, whatever the proposal said.
+    refuse_standing: u32,
+    /// Confirms still to refuse `insufficient_scope`, and to answer a bare
+    /// `502`, before anything is done.
+    insufficient_scope: u32,
+    drop: u32,
+    /// Confirms still to find the operation cancelled already.
+    cancel_first: u32,
+    /// Reads of a proposed operation still to find other terms under the
+    /// same revision.
+    rewrite: u32,
+    extra_term: Option<String>,
+    no_terms: bool,
+}
+
+/// One operation (Operations §3), and whose it is (§3.2).
+struct Op {
+    client_id: String,
+    user_id: String,
+    session_id: String,
+    /// The account it was proposed signed in to: it belongs to the account.
+    account: Option<String>,
+    v: Value,
+    expires_at: u64,
+    /// Reads it stays `in_progress` for.
+    reads_left: u32,
 }
 
 /// What the next API or conversation requests of one method and path meet
@@ -859,6 +947,10 @@ struct Conversation {
     kept_from: usize,
     status: &'static str,
     responder: &'static str,
+    /// The conversation it is a Direct Conversation of (§7.10).
+    direct_of: Option<String>,
+    /// Its open Direct Conversation.
+    direct: Option<String>,
 }
 
 /// The fake Company.
@@ -917,6 +1009,8 @@ impl Company {
                 events: 0,
                 user_requested: None,
                 writes: BTreeMap::new(),
+                operations: BTreeMap::new(),
+                ops: OpControl::default(),
             }),
             extra_mcp: AtomicBool::new(false),
             started: Instant::now(),
@@ -955,6 +1049,17 @@ impl Company {
 
     fn api_url(&self) -> String {
         format!("{}/api/openapi.json", self.origin())
+    }
+
+    /// Whether the Personal Agent `client_id` lists the Operations
+    /// extension in its client metadata document: only then is it returned
+    /// operations (Operations §2).
+    fn lists_operations(&self, client_id: &str) -> bool {
+        lock(&self.clients).get(client_id).is_some_and(|c| {
+            c.extensions
+                .iter()
+                .any(|e| e == wire::operations::EXTENSION)
+        })
     }
 
     fn handle(&self, req: &Request) -> Reply {
@@ -1075,6 +1180,9 @@ impl Company {
             (_, p) if p == CONVERSATIONS || p.starts_with(&format!("{CONVERSATIONS}/")) => {
                 self.held_http(req, Company::conversations)
             }
+            (_, p) if p.starts_with(&format!("{OPERATIONS}/")) => {
+                self.held_http(req, Company::operations)
+            }
             ("POST", "/_mock/control") => self.control(req),
             ("GET", "/_mock/record") => {
                 Reply::json(200, &json!({"records": lock(&self.state).records}))
@@ -1149,7 +1257,11 @@ impl Company {
                 {"type": "x-mock-voice", "endpoint": format!("{}/voice", self.origin())},
                 {"type": wire::CONVERSATION_TYPE, "endpoint": format!("{}{CONVERSATIONS}", self.origin())}
             ]},
-            "apis": apis
+            "apis": apis,
+            "extensions": {wire::operations::EXTENSION: {
+                "version": wire::operations::VERSION,
+                "endpoint": format!("{}{OPERATIONS}", self.origin())
+            }}
         });
         match self.conformant("poppy.schema.json", doc) {
             Ok(doc) => Reply::json(200, &doc).with("Cache-Control", "max-age=300"),
@@ -1349,9 +1461,19 @@ impl Company {
         {
             return Err("the key set holds a private key".into());
         }
+        let extensions = doc["extensions"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| v["version"] == "1")
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let client = Arc::new(Client {
             keys,
             redirect_uris,
+            extensions,
         });
         lock(&self.clients).insert(client_id.to_string(), Arc::clone(&client));
         Ok(client)
@@ -2447,6 +2569,17 @@ impl Company {
             a.scope.clone(),
             a.session_id.clone(),
         );
+        let (client_id, user_id, account) = st
+            .sessions
+            .get(&session_id)
+            .map(|s| {
+                (
+                    s.client_id.clone(),
+                    s.user_id.clone(),
+                    s.account.clone().filter(|_| signed_in),
+                )
+            })
+            .unwrap_or_default();
         let key = req.header("idempotency-key").map(str::to_string);
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let rest = req.path.trim_start_matches("/api");
@@ -2482,10 +2615,28 @@ impl Company {
                         &json!({"error": "invalid_request", "error_description": "the Idempotency-Key was used with another body"}),
                     ),
                     None => {
-                        let answer = json!({"exchange_id": opaque("exc_"), "order_id": id.trim_end_matches("/exchanges"),
-                                            "replacement_sku": body["replacement_sku"]});
-                        st.writes.insert(k, (digest, 201, answer.clone()));
-                        Reply::json(201, &answer)
+                        let order = id.trim_end_matches("/exchanges");
+                        // Proposed, to an agent that lists the extension
+                        // (Operations §4.1); made, to any other.
+                        let (status, answer) = if self.lists_operations(&client_id) {
+                            let op = self.propose(
+                                &mut st,
+                                (&client_id, &user_id, &session_id),
+                                account,
+                                order,
+                                body["item_id"].as_str().unwrap_or_default(),
+                                body["replacement_sku"].as_str().unwrap_or_default(),
+                            );
+                            (202, json!({"operation": op}))
+                        } else {
+                            (
+                                201,
+                                json!({"exchange_id": opaque("exc_"), "order_id": order,
+                                       "replacement_sku": body["replacement_sku"]}),
+                            )
+                        };
+                        st.writes.insert(k, (digest, status, answer.clone()));
+                        Reply::json(status, &answer)
                     }
                 }
             }
@@ -2495,12 +2646,308 @@ impl Company {
         reply.note("idempotency_key", json!(key)).note("body", body)
     }
 
+    // --- Operations (Operations §3–§7) ---------------------------------
+
+    /// Propose exchanging `item` on `order` for `sku`, for `owner` — the
+    /// Personal Agent, the User and the Session it is proposed in — signed in
+    /// to `account`, or not: the operation, kept.
+    fn propose(
+        &self,
+        st: &mut State,
+        owner: (&str, &str, &str),
+        account: Option<String>,
+        order: &str,
+        item: &str,
+        sku: &str,
+    ) -> Value {
+        let id = opaque("exc_");
+        let amount = if sku.contains("insulated") {
+            "70.00"
+        } else {
+            "15.00"
+        };
+        let expires_at = now() + OPERATION_FOR_S;
+        let mut v = json!({
+            "operation_id": id,
+            "revision": 1,
+            "state": wire::operations::PROPOSED,
+            "summary": format!("Exchange item {item} on order {order} for {sku}, for ${amount} more, charged to the card used for the order."),
+            "expires_at": crate::obs::log::rfc3339_millis(std::time::UNIX_EPOCH + Duration::from_secs(expires_at)),
+            "user_approval_required": st.ops.user_approval_required,
+            "url": format!("{}/orders/{order}/exchanges/{id}", self.origin()),
+            "confirmation": null,
+            "result": null,
+        });
+        if !st.ops.no_terms {
+            let mut terms = json!({"order_id": order, "item_id": item, "replacement_sku": sku,
+                                   "price_difference": {"amount": amount, "currency": "USD"}});
+            if let Some(k) = &st.ops.extra_term {
+                terms[k.as_str()] = json!(true);
+            }
+            v["terms"] = terms;
+        }
+        st.operations.insert(
+            id.clone(),
+            Op {
+                client_id: owner.0.to_string(),
+                user_id: owner.1.to_string(),
+                session_id: owner.2.to_string(),
+                account,
+                v: v.clone(),
+                expires_at,
+                reads_left: 0,
+            },
+        );
+        seen("operation_proposed", json!(id));
+        v
+    }
+
+    /// The operation's final, successful state: its `result`, the Company's
+    /// account of what happened (§6).
+    fn succeed(op: &mut Op) {
+        op.v["state"] = json!(wire::operations::SUCCEEDED);
+        op.v["result"] = json!({
+            "summary": "Exchange placed. The replacement ships today, and a return label for the original was emailed.",
+            "data": {"exchange_id": op.v["operation_id"]}
+        });
+    }
+
+    /// `op` as the endpoint answers it: `in_progress` with `Retry-After`.
+    fn operation_reply(status: u16, op: &Op) -> Reply {
+        let r = Reply::json(status, &op.v).note("op_state", op.v["state"].clone());
+        if op.v["state"] == wire::operations::IN_PROGRESS {
+            r.with("Retry-After", &RETRY_AFTER_S.to_string())
+        } else {
+            r
+        }
+    }
+
+    /// The operations endpoint (Operations §5–§7): DPoP Session Tokens only,
+    /// and an operation the Session's — or its account's, once one was signed
+    /// in (§3.2).
+    fn operations(&self, req: &Request) -> Reply {
+        let mut st = lock(&self.state);
+        let token = match self.dpop_access(req, &mut st) {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+        let a = &st.access[&token];
+        let signed_in = Company::signed_in_now(a, &st);
+        let session_id = a.session_id.clone();
+        let s = &st.sessions[&session_id];
+        let (client_id, user_id) = (s.client_id.clone(), s.user_id.clone());
+        let account = if signed_in { s.account.clone() } else { None };
+        let rest: Vec<String> = req.path[OPERATIONS.len()..]
+            .split('/')
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+            .collect();
+        let (id, tail) = match rest.as_slice() {
+            [id] => (id.clone(), None),
+            [id, t] => (id.clone(), Some(t.clone())),
+            _ => return Reply::new(404),
+        };
+        seen("operation_request", json!(true));
+        seen("operation_id", json!(id));
+        let owned = st.operations.get(&id).is_some_and(|o| {
+            o.client_id == client_id
+                && o.user_id == user_id
+                && match &o.account {
+                    Some(acct) => account.as_deref() == Some(acct.as_str()),
+                    None => o.session_id == session_id,
+                }
+        });
+        if !owned {
+            return self.poppy_error(
+                404,
+                err::OPERATION_NOT_FOUND,
+                "no such operation for this Session",
+            );
+        }
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let confirming = req.method == "POST" && tail.as_deref() == Some(wire::operations::CONFIRM);
+        if confirming {
+            seen("revision", body["revision"].clone());
+            seen("approved_by", body["approved_by"].clone());
+            if st.ops.insufficient_scope > 0 {
+                st.ops.insufficient_scope -= 1;
+                return Company::dpop_refusal(err::INSUFFICIENT_SCOPE, Some(wire::SCOPE_READ))
+                    .note("performed", json!(false));
+            }
+            if st.ops.drop > 0 {
+                st.ops.drop -= 1;
+                return Reply::new(502).note("performed", json!(false));
+            }
+        }
+        let cancel_first = confirming && st.ops.cancel_first > 0;
+        if cancel_first {
+            st.ops.cancel_first -= 1;
+        }
+        let rewrite = req.method == "GET"
+            && tail.is_none()
+            && st.ops.rewrite > 0
+            && st
+                .operations
+                .get(&id)
+                .is_some_and(|o| o.v["state"] == wire::operations::PROPOSED);
+        if rewrite {
+            st.ops.rewrite -= 1;
+        }
+        let revise = tail.as_deref() == Some(wire::operations::CONFIRM) && st.ops.revise > 0;
+        let in_progress = st.ops.in_progress;
+        let refuse_standing = st.ops.refuse_standing > 0
+            && tail.as_deref() == Some(wire::operations::CONFIRM)
+            && body["approved_by"] == wire::operations::APPROVED_BY_STANDING;
+        if refuse_standing {
+            st.ops.refuse_standing -= 1;
+        }
+        let Some(op) = st.operations.get_mut(&id) else {
+            return Reply::new(404);
+        };
+        if op.v["state"] == wire::operations::PROPOSED && now() >= op.expires_at {
+            op.v["state"] = json!(wire::operations::EXPIRED);
+            op.v["result"] = json!({"summary": "It was not confirmed in time. Nothing was done."});
+        }
+        let reply = match (req.method.as_str(), tail.as_deref()) {
+            ("GET", None) => {
+                if rewrite {
+                    if op.v.get("terms").is_some() {
+                        op.v["terms"]["price_difference"]["amount"] = json!("150.00");
+                    }
+                    let summary = op.v["summary"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .replace("$70.00", "$150.00")
+                        .replace("$15.00", "$150.00");
+                    op.v["summary"] = json!(summary);
+                    seen("rewritten", json!(true));
+                }
+                if op.v["state"] == wire::operations::IN_PROGRESS {
+                    op.reads_left = op.reads_left.saturating_sub(1);
+                    if op.reads_left == 0 {
+                        Company::succeed(op);
+                    }
+                }
+                Company::operation_reply(200, op)
+            }
+            ("POST", Some(t)) if t == wire::operations::CONFIRM => {
+                let revision = body["revision"].as_u64();
+                let by = body["approved_by"].as_str().unwrap_or_default().to_string();
+                if cancel_first && op.v["state"] == wire::operations::PROPOSED {
+                    op.v["state"] = json!(wire::operations::CANCELLED);
+                    op.v["result"] = json!({"summary": "Cancelled on the website before it was confirmed. Nothing was done."});
+                }
+                let allowed = [
+                    wire::operations::APPROVED_BY_USER,
+                    wire::operations::APPROVED_BY_STANDING,
+                ];
+                let Some(revision) = revision.filter(|_| allowed.contains(&by.as_str())) else {
+                    drop(st);
+                    return self.poppy_error(
+                        400,
+                        err::INVALID_REQUEST,
+                        "a confirm names a revision, and approved_by user or standing_permission",
+                    );
+                };
+                // The terms changed before the confirm arrived (§3.1).
+                let mut revised = false;
+                if revise && op.v["state"] == wire::operations::PROPOSED {
+                    let next = op.v["revision"].as_u64().unwrap_or(1) + 1;
+                    op.v["revision"] = json!(next);
+                    if op.v.get("terms").is_some() {
+                        op.v["terms"]["price_difference"]["amount"] = json!("85.00");
+                    }
+                    let summary = op.v["summary"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .replace("$70.00", "$85.00")
+                        .replace("$15.00", "$85.00");
+                    op.v["summary"] = json!(summary);
+                    op.expires_at = now() + OPERATION_FOR_S;
+                    op.v["expires_at"] = json!(crate::obs::log::rfc3339_millis(
+                        std::time::UNIX_EPOCH + Duration::from_secs(op.expires_at)
+                    ));
+                    revised = true;
+                }
+                if Some(revision) != op.v["revision"].as_u64() {
+                    let v = json!({"error": err::TERMS_CHANGED, "error_description": "the revision confirmed is not the latest", "operation": op.v});
+                    let body = op.v.clone();
+                    drop(st);
+                    let _ = body;
+                    if revised {
+                        lock(&self.state).ops.revise -= 1;
+                    }
+                    return match self.conformant("error.schema.json", v) {
+                        Ok(b) => Reply::json(409, &b).note("error", json!(err::TERMS_CHANGED)),
+                        Err(drift) => drift,
+                    };
+                }
+                if by == wire::operations::APPROVED_BY_STANDING
+                    && (op.v["user_approval_required"] == true || refuse_standing)
+                {
+                    drop(st);
+                    return self.poppy_error(
+                        403,
+                        err::USER_APPROVAL_REQUIRED,
+                        "this operation needs the User's approval of this revision",
+                    );
+                }
+                if op.v["state"] != wire::operations::PROPOSED {
+                    // Already confirmed, or final: as it is, nothing done.
+                    Company::operation_reply(200, op).note("duplicate", json!(true))
+                } else {
+                    op.v["confirmation"] = json!({
+                        "revision": revision,
+                        "approved_by": by,
+                        "confirmed_at": crate::obs::log::rfc3339_millis(std::time::SystemTime::now()),
+                    });
+                    match in_progress {
+                        Some(n) => {
+                            op.v["state"] = json!(wire::operations::IN_PROGRESS);
+                            op.reads_left = n;
+                            if n == 0 {
+                                op.reads_left = 1;
+                            }
+                            Company::operation_reply(202, op)
+                        }
+                        None => {
+                            Company::succeed(op);
+                            Company::operation_reply(200, op)
+                        }
+                    }
+                }
+            }
+            ("POST", Some(t)) if t == wire::operations::CANCEL => {
+                if op.v["state"] == wire::operations::PROPOSED {
+                    op.v["state"] = json!(wire::operations::CANCELLED);
+                    op.v["result"] =
+                        json!({"summary": "Cancelled before it was confirmed. Nothing was done."});
+                }
+                Company::operation_reply(200, op)
+            }
+            _ => Reply::new(404),
+        };
+        if tail.as_deref() == Some(wire::operations::CONFIRM) && reply.status < 300 {
+            st.ops.in_progress = None;
+        }
+        reply
+    }
+
     // --- Conversations (§7) -------------------------------------------
 
     /// A JSON error from a conversation endpoint (§7.13), held to the kit's
     /// schema.
     fn poppy_error(&self, status: u16, code: &str, why: &str) -> Reply {
-        let body = json!({"error": code, "error_description": why});
+        self.poppy_error_with(status, code, why, json!({}))
+    }
+
+    /// [`Company::poppy_error`] with the members `more` adds:
+    /// `conversation_id` for `direct_conversation_open`.
+    fn poppy_error_with(&self, status: u16, code: &str, why: &str, more: Value) -> Reply {
+        let mut body = json!({"error": code, "error_description": why});
+        for (k, v) in more.as_object().into_iter().flatten() {
+            body[k] = v.clone();
+        }
         match self.conformant("error.schema.json", body) {
             Ok(b) => Reply::json(status, &b).note("error", json!(code)),
             Err(drift) => drift,
@@ -2516,9 +2963,16 @@ impl Company {
         fields
     }
 
-    /// The Company Agent's answer to `text` in `c`, from a Session signed in
-    /// to `account` with `scope`, or signed out.
-    fn agent_reply(st: &mut State, cid: &str, text: &str, account: Option<&str>, scope: &str) {
+    /// The Company Agent's answer to `text` in `c`, from a Session —
+    /// `session_id` — signed in to `account` with `scope`, or signed out. In
+    /// a Direct Conversation a person at the Company answers.
+    fn agent_reply(
+        &self,
+        st: &mut State,
+        cid: &str,
+        text: &str,
+        (account, scope, session_id): (Option<&str>, &str, &str),
+    ) {
         let say = |st: &mut State, words: &str| {
             let id = opaque("msg_");
             Company::event(
@@ -2527,6 +2981,33 @@ impl Company {
                 json!({"message": {"id": id, "role": "company", "sender": wire::SENDER_AGENT, "text": words}}),
             )
         };
+        let (client_id, user_id, direct) = match st.conversations.get(cid) {
+            Some(c) => (
+                c.client_id.clone(),
+                c.user_id.clone(),
+                c.direct_of.is_some(),
+            ),
+            None => return,
+        };
+        if direct {
+            let mut out = vec![Company::event(
+                st,
+                wire::event::MESSAGE,
+                json!({"message": {"id": opaque("msg_"), "role": "company", "sender": wire::SENDER_HUMAN,
+                                    "text": format!("A specialist here. You said: {text}")}}),
+            )];
+            if let Some(reason) = st.user_requested.take() {
+                out.push(Company::event(
+                    st,
+                    wire::event::USER_REQUESTED,
+                    json!({"reason": reason}),
+                ));
+            }
+            if let Some(c) = st.conversations.get_mut(cid) {
+                c.events.extend(out);
+            }
+            return;
+        }
         // A type the draft does not define, before the reply: a Personal
         // Agent skips it, and reads on (§7.5).
         let mut out = vec![Company::event(
@@ -2559,6 +3040,24 @@ impl Company {
                     out.push(say(st, "Your order o1 has shipped."));
                 }
             }
+        } else if text.contains("exchange") && self.lists_operations(&client_id) {
+            // An action the agent proposes rather than performs (Operations
+            // §4.3).
+            let op = self.propose(
+                st,
+                (&client_id, &user_id, session_id),
+                account.map(str::to_string),
+                "ord_7Hk2",
+                "itm_4Qa",
+                "stormline-insulated-m",
+            );
+            out.push(Company::event(
+                st,
+                wire::event::MESSAGE,
+                json!({"message": {"id": opaque("msg_"), "role": "company", "sender": wire::SENDER_AGENT,
+                                    "text": "I can exchange it for the insulated version. Confirm whenever you are ready.",
+                                    "operation": op}}),
+            ));
         } else if !text.is_empty() {
             let words = format!("You said: {text}");
             out.push(say(st, &words));
@@ -2586,6 +3085,7 @@ impl Company {
         let a = &st.access[&token];
         let signed_in = Company::signed_in_now(a, &st);
         let scope = a.scope.clone();
+        let session_id = a.session_id.clone();
         let s = &st.sessions[&a.session_id];
         let (client_id, user_id) = (s.client_id.clone(), s.user_id.clone());
         let account = if signed_in { s.account.clone() } else { None };
@@ -2602,7 +3102,7 @@ impl Company {
                 None,
                 &body,
                 &q,
-                (&client_id, &user_id),
+                (&client_id, &user_id, &session_id),
                 account.as_deref(),
                 &scope,
             ),
@@ -2628,7 +3128,7 @@ impl Company {
                             Some(cid),
                             &body,
                             &q,
-                            (&client_id, &user_id),
+                            (&client_id, &user_id, &session_id),
                             account.as_deref(),
                             &scope,
                         ),
@@ -2658,7 +3158,7 @@ impl Company {
         cid: Option<&String>,
         body: &Value,
         q: &BTreeMap<String, String>,
-        (client_id, user_id): (&str, &str),
+        (client_id, user_id, session_id): (&str, &str, &str),
         account: Option<&str>,
         scope: &str,
     ) -> Reply {
@@ -2673,6 +3173,13 @@ impl Company {
         seen("role", m["role"].clone());
         seen("context", m["context"].clone());
         seen("text", m["text"].clone());
+        let direct_of = body[wire::conversation::PARENT]
+            .as_str()
+            .filter(|_| cid.is_none())
+            .map(str::to_string);
+        if direct_of.is_some() {
+            seen("parent_conversation_id", json!(direct_of));
+        }
         let digest = m.to_string();
         let new = cid.is_none();
         let key = (client_id.to_string(), user_id.to_string(), id.clone());
@@ -2686,6 +3193,40 @@ impl Company {
             }
             return Reply::json(*status, answer).note("duplicate", json!(true));
         }
+        // A Direct Conversation's parent: open, the same owner's, not a
+        // Direct Conversation itself, with none open (§7.10).
+        if let Some(parent) = &direct_of {
+            match st.conversations.get(parent) {
+                Some(p)
+                    if p.client_id == client_id
+                        && p.user_id == user_id
+                        && p.direct_of.is_none() =>
+                {
+                    if p.status == wire::STATUS_CLOSED {
+                        return self.poppy_error(
+                            409,
+                            err::CONVERSATION_CLOSED,
+                            "the parent conversation is closed",
+                        );
+                    }
+                    if let Some(open) = &p.direct {
+                        return self.poppy_error_with(
+                            409,
+                            err::DIRECT_CONVERSATION_OPEN,
+                            "the parent has a Direct Conversation open",
+                            json!({"conversation_id": open}),
+                        );
+                    }
+                }
+                _ => {
+                    return self.poppy_error(
+                        404,
+                        err::CONVERSATION_NOT_FOUND,
+                        "no such parent conversation",
+                    );
+                }
+            }
+        }
         let cid = match cid {
             Some(c) => {
                 let conv = &st.conversations[c];
@@ -2694,6 +3235,14 @@ impl Company {
                         409,
                         err::CONVERSATION_CLOSED,
                         "the conversation is closed",
+                    );
+                }
+                if let Some(open) = &conv.direct {
+                    return self.poppy_error_with(
+                        409,
+                        err::DIRECT_CONVERSATION_OPEN,
+                        "the conversation has a Direct Conversation open",
+                        json!({"conversation_id": open}),
                     );
                 }
                 c.clone()
@@ -2709,9 +3258,26 @@ impl Company {
                         events: Vec::new(),
                         kept_from: 0,
                         status: "idle",
-                        responder: "agent",
+                        responder: if direct_of.is_some() {
+                            "human"
+                        } else {
+                            "agent"
+                        },
+                        direct_of: direct_of.clone(),
+                        direct: None,
                     },
                 );
+                if let Some(parent) = &direct_of {
+                    let ev = Company::event(
+                        st,
+                        wire::event::DIRECT_OPENED,
+                        json!({"conversation_id": c}),
+                    );
+                    if let Some(p) = st.conversations.get_mut(parent) {
+                        p.direct = Some(c.clone());
+                        p.events.push(ev);
+                    }
+                }
                 c
             }
         };
@@ -2721,12 +3287,11 @@ impl Company {
         if let Some(c) = st.conversations.get_mut(&cid) {
             c.events.push(ev);
         }
-        Company::agent_reply(
+        self.agent_reply(
             st,
             &cid,
             m["text"].as_str().unwrap_or_default(),
-            account,
-            scope,
+            (account, scope, session_id),
         );
         let status = if new { 201 } else { 202 };
         let c = &st.conversations[&cid];
@@ -2851,6 +3416,34 @@ impl Company {
         if st.conversations[cid].status == wire::STATUS_CLOSED && to != wire::STATUS_CLOSED {
             return self.poppy_error(409, err::CONVERSATION_CLOSED, "the conversation is closed");
         }
+        if to != wire::STATUS_CLOSED
+            && let Some(open) = st.conversations[cid].direct.clone()
+        {
+            return self.poppy_error_with(
+                409,
+                err::DIRECT_CONVERSATION_OPEN,
+                "the conversation has a Direct Conversation open",
+                json!({"conversation_id": open}),
+            );
+        }
+        // Closing a conversation closes its open Direct Conversation, and
+        // closing a Direct Conversation is said in its parent (§7.10).
+        if to == wire::STATUS_CLOSED && moved {
+            if let Some(open) = st.conversations[cid].direct.clone() {
+                self.change(st, &open, wire::STATUS_CLOSED, 200);
+            }
+            if let Some(parent) = st.conversations[cid].direct_of.clone() {
+                let ev = Company::event(
+                    st,
+                    wire::event::DIRECT_CLOSED,
+                    json!({"conversation_id": cid}),
+                );
+                if let Some(p) = st.conversations.get_mut(&parent) {
+                    p.direct = None;
+                    p.events.push(ev);
+                }
+            }
+        }
         if moved {
             let responder = st.conversations[cid].responder;
             let ev = Company::event(
@@ -2924,10 +3517,12 @@ impl Company {
             st.refuse_tokens -= 1;
             return challenge(401, Some(err::INVALID_TOKEN));
         }
-        let (signed_in, scope) = match st.access.get(token) {
-            Some(a) if a.expires_at >= now() && a.binding == Binding::Bearer(url.clone()) => {
-                (Company::signed_in_now(a, &st), a.scope.clone())
-            }
+        let (signed_in, scope, session_id) = match st.access.get(token) {
+            Some(a) if a.expires_at >= now() && a.binding == Binding::Bearer(url.clone()) => (
+                Company::signed_in_now(a, &st),
+                a.scope.clone(),
+                a.session_id.clone(),
+            ),
             _ => return challenge(401, Some(err::INVALID_TOKEN)),
         };
         let Ok(frame) = serde_json::from_slice::<Value>(&req.body) else {
@@ -3030,7 +3625,10 @@ impl Company {
                 {"name": "search", "description": "Search the catalogue.",
                  "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
                 {"name": "order_status", "description": format!("The status of one of the User's orders. Needs a signed-in Session with {}.", wire::SCOPE_READ),
-                 "inputSchema": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}
+                 "inputSchema": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}},
+                {"name": "exchange_item", "description": "Exchange an item of one of the User's orders for another; proposed as an operation to an agent that lists the operations extension.",
+                 "inputSchema": {"type": "object", "properties": {"order_id": {"type": "string"}, "item_id": {"type": "string"}, "replacement_sku": {"type": "string"}},
+                                 "required": ["order_id", "item_id", "replacement_sku"]}}
             ]})),
             "tools/call" => {
                 if let Some(early) = self.rate_limited("mcp", &mut st) {
@@ -3075,6 +3673,39 @@ impl Company {
                         "content": [{"type": "text", "text": "shipped"}],
                         "structuredContent": {"order_id": args["order_id"], "status": "shipped"}
                     })),
+                    Some("exchange_item") => {
+                        let text = |k: &str| args[k].as_str().unwrap_or_default().to_string();
+                        let (client_id, user_id, account) = st
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| {
+                                (
+                                    s.client_id.clone(),
+                                    s.user_id.clone(),
+                                    s.account.clone().filter(|_| signed_in),
+                                )
+                            })
+                            .unwrap_or_default();
+                        if self.lists_operations(&client_id) {
+                            let op = self.propose(
+                                &mut st,
+                                (&client_id, &user_id, &session_id),
+                                account,
+                                &text("order_id"),
+                                &text("item_id"),
+                                &text("replacement_sku"),
+                            );
+                            ok(json!({
+                                "content": [{"type": "text", "text": format!("Proposed: {} Not done until confirmed.", op["summary"].as_str().unwrap_or_default())}],
+                                "structuredContent": {"operation": op}
+                            }))
+                        } else {
+                            ok(json!({
+                                "content": [{"type": "text", "text": "Exchanged."}],
+                                "structuredContent": {"exchanged": true, "order_id": args["order_id"]}
+                            }))
+                        }
+                    }
                     _ => rpc_err(-32602, "unknown tool"),
                 };
                 answer.note("idempotency_key", key)
@@ -3215,6 +3846,37 @@ impl Company {
             for c in st.conversations.values_mut() {
                 c.kept_from = c.events.len();
             }
+        }
+        let o = &body["operations"];
+        if let Some(n) = o["in_progress"].as_u64() {
+            st.ops.in_progress = Some(u32::try_from(n).unwrap_or(u32::MAX));
+        }
+        if let Some(n) = o["revise"].as_u64() {
+            st.ops.revise = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(b) = o["user_approval_required"].as_bool() {
+            st.ops.user_approval_required = b;
+        }
+        if let Some(n) = o["refuse_standing"].as_u64() {
+            st.ops.refuse_standing = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(n) = o["insufficient_scope"].as_u64() {
+            st.ops.insufficient_scope = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(n) = o["drop"].as_u64() {
+            st.ops.drop = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(n) = o["cancel_first"].as_u64() {
+            st.ops.cancel_first = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(n) = o["rewrite"].as_u64() {
+            st.ops.rewrite = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(k) = o["extra_term"].as_str() {
+            st.ops.extra_term = Some(k.to_string());
+        }
+        if let Some(b) = o["no_terms"].as_bool() {
+            st.ops.no_terms = b;
         }
         Reply::json(200, &json!({"ok": true}))
     }

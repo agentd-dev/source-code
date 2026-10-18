@@ -262,31 +262,62 @@ token, an assertion, a proof or a User ID; `session_id` appears only at
 | `company.account_token.rotated` | info | `company` | The Company returned a new Account Token in a token response; it was kept sealed before the response was used. |
 | `company.account_token.replaced` | info | `company`, `error`, `revoked` | A sign-in gave a new Account Token in place of the one held — more scopes, or another account — and the old one was revoked (`revoked`), or not (`error`). |
 | `company.account_token.dropped` | info | `company`, `reason` | The Company answered `invalid_grant` for the Account Token — a disconnect, a revocation, an expiry: it is forgotten, and the Session goes on signed out. Nothing else forgets it. |
-| `company.conversation.opened` | info | `company` | A conversation agentd started there opened; its reader follows it. |
+| `company.conversation.opened` | info | `company`, `direct?` | A conversation agentd started there opened; its reader follows it. `direct`: the User's Direct Conversation. |
 | `company.conversation.id` | debug | `company`, `conversation` | The conversation's id. |
 | `company.conversation.closed` | info | `company` | A conversation closed — by `company.close`, by the Company (a `state` event `closed`), or because the Company no longer has it — and its reader stopped. |
 | `company.conversation.cursor_expired` | info | `company`, `read` | The Company no longer had a conversation's events after a saved cursor: `read` (`reader`, `model`) read again from the start, and the model is told part of the conversation is missing at its next read. The reader also appends a `cursor_expired` event to the stream. |
-| `company.conversation.declined` | info | `company`, `error` | The Company asked to talk with the User directly (`user_requested`), and agentd said in the conversation that the User is not available; `error` says why it could not, when it could not. |
+| `company.conversation.declined` | info | `answer`, `company`, `error` | The Company asked to talk with the User directly (`user_requested`), and agentd said in the conversation that the User declined (`answer: declined`) or is not available (`not_available`: nobody could ask them, or they did not answer in 30 minutes); `error` says why it could not, when it could not. |
 | `company.conversation.read_failed` | warn | `company`, `error` | A conversation's reader could not read its events; it tries again from a second, doubling to a minute. Written once per change. |
 | `company.conversation.unfollowed` | warn | `company`, `limit`, `open` | At boot more conversations were open there than `limits.conversations` lets readers follow: `open` of them have none until others close. |
+| `company.operation.proposed` | info | `company`, `operation_id`, `revision`, `state` | An operation the Company proposed — in a tool's result, an API's `202`, a message — was kept, or a new revision of one: nothing is done until it is confirmed. |
+| `company.operation.refused` | warn | `company`, `error` | An `operation` the Company sent is not one agentd keeps: no id it would put in a URL, no revision, no summary, a state the extension does not define. |
+| `company.operation.asked` | info | `company`, `operation_id`, `revision`, `task` | The User's approval gate opened on `task` for `revision`. Also an audit record, `company.operation` (`asked`). |
+| `company.operation.approved` | info | `approved_by`, `by?`, `company`, `operation_id`, `revision` | The revision is approved: by the User at their gate (`approved_by: user`, `by` the principal), or by a standing permission (`standing_permission`). The User's is an audit record, `company.operation` (`approved`). |
+| `company.operation.declined` | info | `by`, `company`, `operation_id`, `revision` | The User declined: nothing is confirmed, and the operation is cancelled at the Company. Also an audit record, `company.operation` (`declined`). |
+| `company.operation.confirmed` | info | `approved_by`, `company`, `error`, `operation_id`, `outcome`, `revision`, `state` | The confirm was tried. `outcome`: `confirmed` (the Company recorded the confirmation; `state` as it said, `in_progress` or final), `not_confirmed` (it answered with the operation and did nothing with the confirm — not `proposed`, or expired; `state` as it is), `confirm_refused` (`error` its refusal; `terms_changed` and `user_approval_required` ask again), `confirm_unknown` (no attempt was answered, or its answer could not be kept: read again until it is final) or `confirm_unsent` (it never left). Also an audit record, `company.operation`, with `outcome` its outcome. |
+| `company.operation.read` | info | `company`, `operation_id`, `revision`, `state` | An operation read again — after its `Retry-After`, or a confirm no attempt of which was answered — is in another state. |
+| `company.operation.read_failed` | warn | `company`, `error`, `operation_id` | An operation could not be read again; it is read 20 s later. |
+| `company.operation.final` | info | `approved_by`, `company`, `operation_id`, `revision`, `state` | An operation agentd confirmed is final, the Company's `result` its account of what happened: appended to the stream `company.<name>` once. Also an audit record, `company.operation` (`final`). |
+| `company.operation.interrupted` | info | `company`, `operation_id`, `task` | An approval gate a previous life left open ended at boot; nothing was confirmed from it. |
+| `company.operation.rewritten` | warn | `company`, `operation_id`, `revision` | The Company said other terms, summary or expiry under a revision it had said before (Operations §3.1 forbids it): an approval of what it said before covers nothing, and the User is asked again. |
+| `company.operation.withdrawn` | info | `company`, `confirmed`, `operation_id`, `revision` | The work that asked for a confirm went — its run or its task cancelled — while the confirm was on its way: stopped before it was sent, or, `confirmed`, taken (or maybe taken) by the Company, which agentd asks to cancel it. Also an audit record, `company.operation` (`withdrawn`, `cancel` in its target). |
+| `company.operation.cancelled` | info | `company`, `error?`, `operation_id`, `state?` | The cancel agentd sent for a withdrawn confirm was answered: the operation's `state`, or the `error`. |
+| `company.standing.used` | info | `company`, `operation_id`, `revision`, `rule`, `uses_left` | A standing permission approved the revision, its use reserved; `uses_left` is null for one limited by `expires` alone. Also an audit record, `company.standing` (`used`). |
+| `company.standing.suspended` | info | `company` | The User signed in to a new account at the Company: its standing permissions apply to none until a restart. |
+| `company.direct.requested` | info | `by`, `company`, `task` | The User is asked on `task` whether to talk with the Company directly: `by` `company` (its `user_requested` event) or `agent` (`company.direct`). Also an audit record, `company.direct` (`asked`). |
+| `company.direct.repeated` | info | `company`, `note` | The Company asked again while the User's question about the conversation is open: nothing more is asked. |
+| `company.direct.asked` | info | `answer`, `by`, `company` | The User answered: `join`, their first message, or `decline`. Also an audit record, `company.direct`. |
+| `company.direct.joined` | info | `company`, `task` | The Direct Conversation started with the User's first message; `task` relays it. |
+| `company.direct.conversation` | debug | `company`, `conversation`, `parent` | The Direct Conversation's id, and the one it follows. |
+| `company.direct.undelivered` | warn | `company`, `error` | A message the User wrote in the Direct Conversation did not reach the Company; their task says so. |
+| `company.direct.closed` | info | `by?`, `company` | A Direct Conversation's relay ended: the conversation closed, or the User cancelled its task (`by: cancel`), which closes it at the Company. |
+| `company.direct.resumed` | info | `company`, `task` | At boot, the User's first message was on its way when agentd stopped: sent again under the id it was sent with, so the Company answers with the conversation it started. |
+| `company.direct.ignored` | info | `company`, `note` | The Company asked, in the User's own Direct Conversation, to talk with them directly: nothing is asked and nothing said. |
 | `company.user_id.reset` | info | `company`, `started_over` | The operator reset the User ID the Company knows the User by (`company.user_id.reset`): the Company sees a new User from the next call on. `started_over`: the seal key opened none of the store's records, and this Company started over with it as a new User — the others stay unavailable until each is reset, and the store takes the key once all are. Its MCP connections join again on new sessions (`mcp.disconnect` `user_id_reset`). Also an audit record. |
 
 #### The `company.<name>` stream
 
 Each open conversation's reader appends the conversation's `message`, `state`,
-`authorization` and `user_requested` events to the stream `company.<name>`,
-which agentd declares for every company entry that uses `agent` (a `streams:`
-entry of that name sets its retention). Each event's `subject` is the event's
+`authorization`, `user_requested`, `direct_opened` and `direct_closed` events
+to the stream `company.<name>`, which agentd declares for every company entry
+that uses `agent`, and for every one once the Operations extension is listed
+(a `streams:` entry of that name sets its retention). Each event's `subject` is the event's
 type — or `cursor_expired`, when part of the conversation is missing — its
 `correlation` the conversation's id, its `source` `company:<name>`, and its id
 `<conversation>/<event id>`, so a consumer drops a copy a reconnect hands on
 again. Its `data` is `{company, conversation, event, note?}`: `event` is the
 Company's event as it sent it, the Company's own words, and `note` is
 agentd's, saying what it did — an `authorization` it answered with the Account
-Token, or that needs `company.sign_in`; a `user_requested` it declined. Every
-event carries the Company's origin, `company:<issuer>`, so the run a `stream`
-start fires or a `wait {on: event}` resumes carries it too. No `text-delta`
-piece, and no event of a type the draft does not define, is ever appended.
+Token, or that needs `company.sign_in`; a `user_requested` it asked the User
+about, or declined; an operation a message proposed. Every event carries the
+Company's origin, `company:<issuer>`, so the run a `stream` start fires or a
+`wait {on: event}` resumes carries it too. No `text-delta` piece, and no event
+of a type the draft does not define, is ever appended.
+
+An operation agentd confirmed is appended once it is final, subject
+`operation`, correlation its `operation_id`, id `<operation_id>/<state>`, data
+`{company, operation}`: agentd's view of it, the Company's words under
+`operation.operation`.
 
 `auth.unavailable` and `auth.recovered` carry `target: company:<name>`:
 `auth.unavailable` while a Company cannot be verified or its Session cannot
@@ -990,12 +1021,13 @@ family past 512 series folds as the MCP Events families do.
 
 | Metric | Type | Labels | Status | Meaning |
 |---|---|---|---|---|
-| `agent_company_requests_total` | counter | `company`, `interface` (`mcp`, `agent`, `openapi`), `outcome` | live | Calls to a Company's tools, conversations and APIs: `ok`; `error` (the Company's own answer: a tool's error or a refusal it sent); `unsent` (refused before sending: the not-before instant, the in-flight limit, a credential, an operation outside the description or `api_allow`, a body its schema refuses); `unknown` (failed after it was sent, and not sent again) |
+| `agent_company_requests_total` | counter | `company`, `interface` (`mcp`, `agent`, `openapi`, `operations`), `outcome` | live | Calls to a Company's tools, conversations and APIs: `ok`; `error` (the Company's own answer: a tool's error or a refusal it sent); `unsent` (refused before sending: the not-before instant, the in-flight limit, a credential, an operation outside the description or `api_allow`, a body its schema refuses); `unknown` (failed after it was sent, and not sent again) |
 | `agent_company_token_requests_total` | counter | `company`, `grant` (`start`, `renew`, `bearer`, `resource`, `refresh`, `device_code`, `authorization_code`, `device_authorization`, `revoke`), `outcome` (`ok`, `refused`, `failed`) | live | Requests sent to the Company's token, device authorization and revocation endpoints, retries included; `resource` is a DPoP token for an endpoint the Company lists with one |
 | `agent_company_signed_in` | gauge | `company` | live | `1` while the Session there is signed in |
 | `agent_company_rate_limited_until_seconds` | gauge | `company` | live | The Company's not-before instant, in Unix seconds; a past instant holds nothing back |
-| `agent_company_gates_total` | counter | `company`, `kind` (`cross_company`, `sign_in`), `answer` (`approve`, `deny`, `unanswered`, `unreachable`; for `sign_in` how it ended: `signed_in`, `cancelled`, `denied`, `expired`, `account_mismatch`, `interrupted`, `failed`) | live | The User's gates a Company call opened, by how each ended |
+| `agent_company_gates_total` | counter | `company`, `kind` (`cross_company`, `sign_in`, `operation`, `direct`), `answer` (`approve`, `deny`, `unanswered`, `unreachable`; for `sign_in` how it ended: `signed_in`, `cancelled`, `denied`, `expired`, `account_mismatch`, `interrupted`, `failed`; for `operation` `approve`, `decline`, `unanswered`, `cancelled`, `interrupted`; for `direct` `join`, `decline`, `unanswered`, `interrupted`) | live | The User's gates a Company call opened, by how each ended |
 | `agent_company_conversations_open` | gauge | `company` | live | Conversations open there, each followed by a reader |
+| `agent_company_operations_total` | counter | `company`, `state` (`succeeded`, `failed`, `cancelled`, `expired`), `approved_by` (`user`, `standing_permission`, `none`) | live | Operations agentd confirmed, or read, that reached a final state, by how their revision was approved |
 
 ## Health surfaces
 
@@ -1143,7 +1175,15 @@ The `action` of an A2A call is `a2a.<method>`, or `a2a.<method>:<op>` when
 the message carried a command: `a2a.SendMessage:admin.drain`,
 `a2a.SendMessage:workflow.run`. A reload is `config.reload` with outcome
 `applied`, `invalid` or `restart_required`. MCP Events runtime subscriptions
-record `mcp.events.subscribed` and `mcp.events.unsubscribed`.
+record `mcp.events.subscribed` and `mcp.events.unsubscribed`. Acting at
+Companies records `company.sign_in`, `company.sign_out`,
+`company.user_id.reset`, `company.gate` (the cross-Company gate),
+`company.operation` — `asked`, `approved`, `declined`, `not_addressed`,
+`confirmed`, `not_confirmed`, `confirm_refused`, `confirm_unknown`,
+`confirm_unsent`, `withdrawn` and `final`, each naming the `operation_id`
+and `revision` in its `target`, so an approval and the confirm it sent read
+back as one — `company.standing` (`used`) and `company.direct` (`asked`,
+`join`, `decline`, `not_addressed`).
 
 | Sink | Where the record goes |
 |---|---|

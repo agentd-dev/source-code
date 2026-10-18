@@ -565,6 +565,12 @@ impl Runtime {
         for s in self.sign_ins_on(&id) {
             self.end_sign_in(&s, crate::companies::signin::Outcome::Cancelled);
         }
+        // A question about a Direct Conversation on it ends, the User not
+        // available; a Direct Conversation relayed through it closes. An
+        // operation's approval on it ends at the next tick, nothing
+        // confirmed.
+        #[cfg(feature = "companies")]
+        self.cancel_directs_on(&id);
         self.task_persist(&id);
         self.task_sync(&id);
         self.task_value(&id)
@@ -857,7 +863,11 @@ impl Runtime {
         }
         self.rebuild_human_asks();
         #[cfg(feature = "companies")]
-        self.interrupt_company_sign_ins();
+        {
+            self.interrupt_company_sign_ins();
+            self.interrupt_company_operation_gates();
+            self.restore_company_directs();
+        }
     }
 }
 

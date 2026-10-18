@@ -111,6 +111,12 @@ pub enum PendingKind {
     /// RFC 0047 §5.7): its gate and its outcome are the runtime's sign-in
     /// `id`'s.
     CompanySignIn { id: String, company: String },
+    /// A confirm of a Company's operation (`company.operation.confirm`, RFC
+    /// 0047 §5.8.1): its gate and its outcome are the runtime's `id`'s.
+    CompanyOperation { id: String, company: String },
+    /// The User asked whether to talk with a Company directly
+    /// (`company.direct`, §5.8.2).
+    CompanyDirect { id: String, company: String },
 }
 
 /// The tool call a gate holds (see [`PendingKind::Human`]): a
@@ -471,6 +477,15 @@ pub struct Runtime {
     /// In memory: a sign-in does not outlive the process that started it.
     #[cfg(feature = "companies")]
     pub(crate) company_sign_ins: BTreeMap<String, super::company_sign_in::SignInTrack>,
+    /// The confirms of Companies' operations in progress, by id
+    /// (`runtime::company_operations`). In memory, like the sign-ins.
+    #[cfg(feature = "companies")]
+    pub(crate) company_operations: BTreeMap<String, super::company_operations::OperationTrack>,
+    /// The User's Direct Conversations, asked about or relayed, by id
+    /// (`runtime::company_direct`): a relay a restart finds on its task is
+    /// tracked again.
+    #[cfg(feature = "companies")]
+    pub(crate) company_directs: BTreeMap<String, super::company_direct::DirectTrack>,
     pub(crate) mcp_specs: BTreeMap<String, crate::config::McpServerSpec>,
     /// Per server, the subscriptions an owner wants and the live connection
     /// does not hold after a failure that may pass, and when to ask again
@@ -816,6 +831,8 @@ impl Runtime {
             self.poll_pending();
             #[cfg(feature = "companies")]
             self.poll_company_sign_ins();
+            #[cfg(feature = "companies")]
+            self.poll_company_gates();
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
@@ -996,6 +1013,12 @@ impl Runtime {
                 by,
                 outcome,
             } => self.on_company_signed_out(owed, &company, by.as_deref(), outcome),
+            #[cfg(feature = "companies")]
+            Event::CompanyOperation { id, step } => self.on_company_operation(&id, step),
+            #[cfg(feature = "companies")]
+            Event::CompanyNotice(n) => self.on_company_notice(*n),
+            #[cfg(feature = "companies")]
+            Event::CompanyDirect { id, step } => self.on_company_direct(&id, step),
             Event::Background { .. } | Event::Tick => {}
         }
     }

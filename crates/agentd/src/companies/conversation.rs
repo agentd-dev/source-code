@@ -42,9 +42,17 @@
 //! Session is renewed with it, which signs it in, and the conversation goes
 //! on with the new token; otherwise it reaches the model as a fact, and the
 //! model may call `company.sign_in`, which asks the User. The Company's
-//! event never opens a gate by itself. A `user_requested` event (§7.10) is
-//! answered in the conversation: the User is not available for a direct
-//! conversation.
+//! `authorization` event never opens a gate by itself. A `user_requested`
+//! event (§7.10) asks the User whether to talk with the Company directly —
+//! the one gate a Company can open, at most one per conversation at a time
+//! (`super::direct`) — and when nobody can be asked, agentd says in the
+//! conversation that the User is not available. An operation a Company
+//! message carries is kept as one a conversation proposed
+//! (`super::operations`), which no standing permission covers.
+//!
+//! A Direct Conversation is the User's: its reader relays what the Company
+//! says there to the User, and nothing but the User's own words is sent to
+//! it — `company.converse` and `company.handoff` refuse one.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -77,9 +85,11 @@ const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// What agentd says in a conversation when the Company asks to talk with the
-/// User, in P3 (§7.10: "If they decline or aren't available, it says so in
-/// the conversation").
+/// User and nobody can ask them, or they do not answer (§7.10: "If they
+/// decline or aren't available, it says so in the conversation").
 pub const NOT_AVAILABLE: &str = "The user is not available for a direct conversation.";
+/// What agentd says there when the User declines.
+pub const DECLINED: &str = "The user declined a direct conversation.";
 
 /// A message the model asks agentd to send.
 #[derive(Debug, Clone, Default)]
@@ -134,7 +144,7 @@ pub struct Readers {
     /// Conversations being opened, counted against the limit until they are.
     opening: u32,
     /// The instance drains: no reader starts.
-    stopped: bool,
+    pub(super) stopped: bool,
 }
 
 /// A place for one conversation being opened; dropping it frees it.
@@ -206,7 +216,12 @@ fn handed_on(e: &Value) -> Option<&str> {
     let id = e["id"].as_str().filter(|i| is_id(i))?;
     matches!(
         e["type"].as_str()?,
-        event::MESSAGE | event::STATE | event::AUTHORIZATION | event::USER_REQUESTED
+        event::MESSAGE
+            | event::STATE
+            | event::AUTHORIZATION
+            | event::USER_REQUESTED
+            | event::DIRECT_OPENED
+            | event::DIRECT_CLOSED
     )
     .then_some(id)
 }
@@ -248,7 +263,7 @@ fn url_of(ep: &Listed, cid: &str, tail: &str, cursor: Option<&str>, wait: Option
 
 /// What a conversation request's refusal means (§7.13): the Company's error
 /// code, said in agentd's words, its description quoted.
-fn refusal(company: &str, cid: Option<&str>, status: u16, body: &[u8]) -> CallError {
+pub(super) fn refusal(company: &str, cid: Option<&str>, status: u16, body: &[u8]) -> CallError {
     let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let code = v["error"].as_str().map(str::to_string);
     let said = v["error_description"]
@@ -302,7 +317,10 @@ impl Supervisor {
     }
 
     /// The conversation endpoint at `company`, its documents verified.
-    fn endpoint(&self, company: &Company) -> Result<(Arc<Verified>, Listed), CallError> {
+    pub(super) fn conversation_endpoint(
+        &self,
+        company: &Company,
+    ) -> Result<(Arc<Verified>, Listed), CallError> {
         let unsent = |e: String| CallError::Unsent(e);
         if !company
             .discovery
@@ -369,7 +387,7 @@ impl Supervisor {
                 "a message needs text or data (draft §7.4)".to_string(),
             ));
         }
-        let (v, ep) = self.endpoint(company)?;
+        let (v, ep) = self.conversation_endpoint(company)?;
         let issuer = v.issuer.clone();
         let place = match &say.conversation {
             None => Some(self.opening()?),
@@ -380,6 +398,9 @@ impl Supervisor {
                         "the conversation {cid} at company {} is closed and takes no more messages",
                         company.name
                     )));
+                }
+                if c.direct_of.is_some() {
+                    return Err(CallError::Unsent(direct_refused(&company.name, cid)));
                 }
                 None
             }
@@ -523,7 +544,7 @@ impl Supervisor {
         wait: u32,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<Value, CallError> {
-        let (v, ep) = self.endpoint(company)?;
+        let (v, ep) = self.conversation_endpoint(company)?;
         let issuer = v.issuer.clone();
         let mut cursor = self.kept(company, &issuer, cid)?.read_cursor;
         let (mut events, mut notes) = (Vec::new(), Vec::new());
@@ -605,9 +626,11 @@ impl Supervisor {
         tail: &str,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<Value, CallError> {
-        let (v, ep) = self.endpoint(company)?;
+        let (v, ep) = self.conversation_endpoint(company)?;
         let issuer = v.issuer.clone();
-        self.kept(company, &issuer, cid)?;
+        if self.kept(company, &issuer, cid)?.direct_of.is_some() && tail == conv::HANDOFF {
+            return Err(CallError::Unsent(direct_refused(&company.name, cid)));
+        }
         let url = url_of(&ep, cid, tail, None, None);
         let what = format!("the {tail} request");
         let reply = self.send_signed(
@@ -703,28 +726,84 @@ impl Supervisor {
     ) -> Option<String> {
         let id = e["id"].as_str()?;
         let kind = e["type"].as_str()?;
+        // An operation a Company message carries (Operations §4.3): kept as
+        // one a conversation proposed, whichever read sees it.
+        if kind == event::MESSAGE
+            && e["message"]["role"] == wire::ROLE_COMPANY
+            && let Some(op) = e["message"].get(wire::operations::MEMBER)
+            && let Some(oid) = self.recognise(
+                company,
+                super::ledger::Channel::Conversation {
+                    conversation: cid.to_string(),
+                },
+                None,
+                op,
+            )
+        {
+            return Some(format!(
+                "company {} proposed operation {oid} in the conversation; it is not done until confirmed, and company.operation.confirm asks the User to approve its terms — a message is never the User's approval",
+                company.name
+            ));
+        }
         if !matches!(kind, event::AUTHORIZATION | event::USER_REQUESTED) {
             return None;
         }
-        let first = self
+        let (first, direct) = self
             .ledger
             .update(self.principal(), issuer, |b| {
-                Ok(b.conversations
-                    .get_mut(cid)
-                    .is_some_and(|c| remember(&mut c.acted, id)))
+                Ok(b.conversations.get_mut(cid).map_or((false, false), |c| {
+                    (remember(&mut c.acted, id), c.direct_of.is_some())
+                }))
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false));
         let name = &company.name;
-        if kind == event::USER_REQUESTED {
+        if kind == event::USER_REQUESTED && direct {
+            // The User is in this conversation already, and every message
+            // agentd sends in it is one they wrote: nothing is asked, and
+            // nothing said.
             if first {
-                self.decline(company, issuer, cid, id);
+                self.log().info(
+                    "company.direct.ignored",
+                    json!({"company": name, "note": "a request to talk with the User in their own Direct Conversation"}),
+                );
             }
-            let reason = e["reason"]
-                .as_str()
+            return Some(format!(
+                "company {name} asked to talk with the User directly in the Direct Conversation they are in already; agentd asked nobody and sent nothing"
+            ));
+        }
+        if kind == event::USER_REQUESTED {
+            let reason = e["reason"].as_str();
+            let said = reason
                 .map(|r| format!(" — it says {}", super::quoted(r, 200)))
                 .unwrap_or_default();
+            // The User is asked whether to join, when they can be: the
+            // Company's request opens their gate (§7.10: "The Personal Agent
+            // asks the User").
+            let askable = self.direct_askable.load(Ordering::SeqCst)
+                && self
+                    .notify
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+            if askable {
+                if first {
+                    self.direct_asked(company, issuer, cid, id, reason);
+                }
+                return Some(format!(
+                    "company {name} asked to talk with the User directly{said}; agentd asked the User whether to join, and only they decide"
+                ));
+            }
+            if first {
+                self.say_in(
+                    company,
+                    issuer,
+                    cid,
+                    &format!("declined/{cid}/{id}"),
+                    NOT_AVAILABLE,
+                );
+            }
             return Some(format!(
-                "company {name} asked to talk with the User directly{reason}; agentd answered in the conversation that the User is not available for a direct conversation"
+                "company {name} asked to talk with the User directly{said}; agentd answered in the conversation that the User is not available for a direct conversation"
             ));
         }
         let error = e["error"].as_str().unwrap_or(err::SIGN_IN_REQUIRED);
@@ -768,21 +847,34 @@ impl Supervisor {
         ))
     }
 
-    /// Answer the `user_requested` event `event_id` in `cid`: the User is
-    /// not available for a direct conversation — a message sent once, with
-    /// an id of its own kept for it.
-    fn decline(self: &Arc<Self>, company: &Arc<Company>, issuer: &str, cid: &str, event_id: &str) {
-        let Ok((_, ep)) = self.endpoint(company) else {
+    /// Say `text` in `cid`, as the agent: what agentd answers a
+    /// `user_requested` event with when the User declines or is not
+    /// available — a message sent once, under an id of its own kept for
+    /// `key`. Never in a Direct Conversation, where every message agentd
+    /// sends is the User's.
+    pub(super) fn say_in(&self, company: &Company, issuer: &str, cid: &str, key: &str, text: &str) {
+        let Ok((_, ep)) = self.conversation_endpoint(company) else {
             return;
         };
-        let key = format!("declined/{cid}/{event_id}");
+        let direct = self.ledger.load(self.principal(), issuer).map(|b| {
+            b.conversations
+                .get(cid)
+                .is_some_and(|c| c.direct_of.is_some())
+        });
+        if !matches!(direct, Ok(false)) {
+            self.log().warn(
+                "company.conversation.declined",
+                json!({"company": company.name, "error": "not said: the conversation is the User's Direct Conversation, or its record could not be read"}),
+            );
+            return;
+        }
         let sent = self
             .ledger
-            .update(self.principal(), issuer, |b| b.message_id(&key))
+            .update(self.principal(), issuer, |b| b.message_id(key))
             .map_err(CallError::Unsent)
             .and_then(|id| {
                 let body = serde_json::to_vec(&json!({"message": {
-                    "id": id, "sender": wire::SENDER_AGENT, "text": NOT_AVAILABLE,
+                    "id": id, "sender": wire::SENDER_AGENT, "text": text,
                 }}))
                 .unwrap_or_default();
                 self.send_signed(
@@ -810,7 +902,8 @@ impl Supervisor {
         };
         self.log().info(
             "company.conversation.declined",
-            json!({"company": company.name, "error": outcome}),
+            json!({"company": company.name, "error": outcome,
+                   "answer": if text == DECLINED { "declined" } else { "not_available" }}),
         );
     }
 
@@ -933,13 +1026,17 @@ impl Supervisor {
         self.readers_lock().running.len()
     }
 
-    /// Every reader stops, and none starts: the instance drains.
+    /// Every reader stops, and none starts — nor does an operation's
+    /// tracker read on: the instance drains.
     pub fn stop_readers(&self) {
-        let mut r = self.readers_lock();
-        r.stopped = true;
-        for (_, stop) in r.running.values() {
-            stop.store(true, Ordering::SeqCst);
+        {
+            let mut r = self.readers_lock();
+            r.stopped = true;
+            for (_, stop) in r.running.values() {
+                stop.store(true, Ordering::SeqCst);
+            }
         }
+        self.wake_tracker();
     }
 
     /// At boot, each Company that uses its agent or its APIs verified, and
@@ -1090,7 +1187,7 @@ impl Supervisor {
         last: &mut Option<String>,
         stop: &AtomicBool,
     ) -> Result<bool, CallError> {
-        let (_, ep) = self.endpoint(company)?;
+        let (_, ep) = self.conversation_endpoint(company)?;
         let kept = self.kept(company, issuer, cid)?;
         if !kept.open {
             return Ok(true);
@@ -1291,6 +1388,13 @@ impl Supervisor {
     }
 }
 
+/// Why the model may not write to the Direct Conversation `cid`.
+fn direct_refused(company: &str, cid: &str) -> String {
+    format!(
+        "the conversation {cid} at company {company} is the User's Direct Conversation: only the User's own words go there, as they write them (draft §7.8); write to the conversation it follows"
+    )
+}
+
 /// What the User is told when part of a conversation is missing (§7.5:
 /// "The Personal Agent then reads from the beginning and SHOULD tell the
 /// User that part of the conversation is missing").
@@ -1340,7 +1444,14 @@ mod tests {
     /// never — and an id the draft does not allow is never used.
     #[test]
     fn unknown_and_malformed_events_are_skipped() {
-        for t in ["message", "state", "authorization", "user_requested"] {
+        for t in [
+            "message",
+            "state",
+            "authorization",
+            "user_requested",
+            "direct_opened",
+            "direct_closed",
+        ] {
             assert_eq!(
                 handed_on(&json!({"id": "evt_1", "type": t})),
                 Some("evt_1"),
@@ -1350,7 +1461,6 @@ mod tests {
         for e in [
             json!({"id": "evt_1", "type": "x-unknown"}),
             json!({"id": "evt_1", "type": event::TEXT_DELTA}),
-            json!({"id": "evt_1", "type": event::DIRECT_OPENED}),
             json!({"id": "evt/1", "type": "message"}),
             json!({"id": "", "type": "message"}),
             json!({"type": "message"}),

@@ -731,8 +731,9 @@ Session at the first call.
   the instance, a new one refused until one closes — has a reader on a thread
   of its own: it asks for a stream (`text/event-stream`, a long poll from a
   Company that does not stream), opens it again with `Last-Event-ID` when it
-  ends, and appends the conversation's `message`, `state`, `authorization`
-  and `user_requested` events to the stream `company.<name>`, carrying the
+  ends, and appends the conversation's `message`, `state`, `authorization`,
+  `user_requested`, `direct_opened` and `direct_closed` events to the stream
+  `company.<name>`, carrying the
   Company's origin, so a workflow can start from them (`stream`) or wait for
   one (`wait {on: event}`). It saves its cursor once they are appended, and a
   restart reads on from it. It stops when the conversation closes and when
@@ -745,9 +746,14 @@ Session at the first call.
   is answered with the User's Account Token when one is held whose scopes
   cover it — the Session is signed in, and the conversation goes on with the
   new token — and otherwise reaches the model as a note that `company.sign_in`
-  asks the User; the Company's event never opens a gate itself. A
-  `user_requested` event is answered in the conversation: the User is not
-  available for a direct conversation.
+  asks the User; the Company's `authorization` event never opens a gate
+  itself. A `user_requested` event asks the User whether to talk with the
+  Company directly ([Direct Conversations](human-in-the-loop.md#direct-conversations)),
+  when they can be asked — the A2A listener serves and
+  `agent.ask_human_unowned` is `gate` — and is otherwise answered in the
+  conversation: the User is not available for a direct conversation. An
+  operation a Company message carries is kept as one the conversation
+  proposed ([A Company's operations](#a-companys-operations)).
 - **`company.api {company, api?, method, path, query?, json?, expect?}`**
   calls one operation of an OpenAPI 3.0 or 3.1 description (JSON, at most
   1 MiB; an operation's `$ref`s are followed when it is called or described,
@@ -793,6 +799,82 @@ workflows:
       order: {kind: http, depends_on: [s], url: "https://api.example.com/orders/1042",
               auth: {kind: company, company: shop}}
       f: {kind: finish, depends_on: [ask, order], status: completed}
+```
+
+#### A Company's operations
+
+With `security.companies.client.extensions: [operations]` the client metadata
+document lists the draft's Operations extension, version 1, and a Company may
+propose an action — an exchange, a booking change, a cancellation — as an
+operation instead of performing it: in an MCP tool's `structuredContent`, an
+OpenAPI `202 {operation}` or a conversation message. agentd keeps each one it
+sees in the User's ledger at the Company, with how it came and the digest of
+the request that proposed it, and does nothing with it until it is confirmed.
+Every company entry has the stream `company.<name>` then, where an
+operation's final state is appended.
+
+- **`company.operation.get {company, operation_id}`** reads it at the
+  Company's operations endpoint; **`company.operation.cancel`** cancels it.
+- **`company.operation.confirm {company, operation_id}`** confirms it, and
+  takes nothing else: the model passes no revision and no approval. agentd
+  reads the operation again and confirms its current revision only with the
+  User's `approve` at their gate ([Operation approvals](human-in-the-loop.md#operation-approvals))
+  or under a standing permission that covers it. The call waits while the
+  User decides. `terms_changed` asks again; `user_approval_required` asks the
+  User, never a permission; `in_progress` is read again after the Company's
+  `Retry-After`, across a restart too, and its final state appended to the
+  stream. A confirm that got no answer, or whose answer agentd could not
+  keep, is `outcome unknown`, and the operation is read until it is final; a
+  later confirm sends the one the User approved. A confirm whose run or task
+  is cancelled on its way is not sent, or — once the Company took it —
+  cancelled there.
+- **Nothing proposes the same action twice while it is open.** A request whose
+  digest — the tool and its arguments, or the method, path, query and body —
+  proposed an operation that is not final is refused unsent, and an operation
+  with the same terms in the same Session as an older one that is open is not
+  confirmed. The same action asked for with other arguments and other terms
+  is not recognised: the draft gives an operation no kind of action.
+
+`security.companies.standing` lists the operator's standing permissions: an
+operation one of them covers is confirmed with `approved_by:
+standing_permission`, and the User is not asked. Each covers one Company, one
+channel — `via: {tool: <glob>}`, a glob of a Company tool's registered name,
+or `via: {api: "METHOD /path-template"}`, an operation `api_allow` lists —
+and the term keys in `terms`. It applies only when the Company does not
+require the User's own approval, every channel the operation came through is
+`via` (one proposed in a conversation never matches), the revision has terms
+and every top-level key in them is listed, `when` — CEL over `terms` and
+`summary`, so it needs the `cel` feature — is true with every term it reads
+present, it has not passed `expires`, and a use is free. This is asked
+again at each confirm, a retry of one too: an earlier confirm by a
+permission is never reused. A limited use is reserved with the confirm's
+lock, so two calls racing for the last use confirm once; it is spent once
+the Company records a confirmation by the permission, and given back when
+the Company refuses the confirm, answers it without taking it, or the
+operation ends with none — a cancel after a confirm it took gives nothing
+back. A sign-in to a new account suspends the Company's standing
+permissions until a restart. They are restart-only and operator-only, like
+every `security.companies` path.
+
+```yaml
+# fragment: operations, and the exchanges agentd may confirm on its own
+security:
+  companies:
+    client:
+      id: https://agent.example/companies/client.json
+      name: Dana's agent
+      extensions: [operations]
+    standing:
+      - company: shop
+        via: {tool: "shop.exchange_*"}
+        terms: [order_id, item_id, replacement_sku, price_difference]
+        when: "terms.price_difference.currency == 'USD' && double(terms.price_difference.amount) <= 20.0"
+        expires: 2026-12-31T00:00:00Z
+        uses: 3
+services:
+  shop:
+    kind: company
+    endpoint: https://example.com
 ```
 
 A company entry refuses `auth`, `headers`, `methods` and `breaker`: the
@@ -1300,6 +1382,14 @@ Every `security` path is restart · op.
 | `security.companies.client.published_key_files` | list of paths | `[]` | Keys whose public halves the key set lists and that are never signed with: the next key before a rotation, the previous one after. |
 | `security.companies.client.redirect_uri` | HTTPS URL | `<client_id origin>/companies/callback` | Where Direct Sign-In returns the User, on the `client_id`'s host, with no query. Listed in the document's `redirect_uris` when a Company lists `direct`, which is `[]` otherwise. |
 | `security.companies.client.serve` | bool | `false` | Serve the document and the key set on the A2A listener, at their URLs' paths, and the Direct Sign-In callback at `redirect_uri`'s when a Company lists `direct`. Needs `a2a`, and `a2a.url` the `client_id`'s origin. Otherwise publish what `agentd --print-company-client` writes. |
+| `security.companies.client.extensions` | list of `operations` | `[]` | The extensions the document lists. `operations` (version 1): a Company may propose an action as an operation, which agentd confirms only with the User's approval or a standing permission ([A Company's operations](#a-companys-operations)). |
+| `security.companies.standing[]` | list | `[]` | Standing permissions: an operation one covers is confirmed with `approved_by: standing_permission`, the User not asked. Each needs `company`, `via`, `terms`, `when` and `expires`. Needs `client.extensions: [operations]` and the `cel` feature. |
+| `security.companies.standing[].company` | entry name | required | The company entry it covers. |
+| `security.companies.standing[].via` | `{tool: <glob>}` or `{api: "METHOD /path-template"}` | required | The channel that proposed the operation: a glob of a Company tool's registered name (`shop.exchange_*`), or an operation `api_allow` lists. An operation proposed in a conversation never matches. |
+| `security.companies.standing[].terms` | list of term keys | required | Every top-level term key it covers: a revision with another key, or with no terms, asks the User. |
+| `security.companies.standing[].when` | CEL | required | A predicate over `terms` and `summary`; a term it reads that is missing is no match. |
+| `security.companies.standing[].expires` | RFC 3339 time | required | When it stops applying. |
+| `security.companies.standing[].uses` | int ≥ 1 | no limit | How many confirms it covers: each reserved with the confirm, spent once the Company records a confirmation by it, and given back when the Company does not take the confirm or the operation ends unconfirmed. Counted per permission as written: one changed starts its count again. |
 | `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the Account Tokens a sign-in gives agentd, and the User ID records, so the store cannot read them. Required with any `sign_in`, and with a remote store. |
 | `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. A call on one with any string argument naming a Company's host as a browser reads it — or a host that is not ASCII — is refused unsent (`company.browser.refused`); their tools are served by the supervisor. |
 | `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |

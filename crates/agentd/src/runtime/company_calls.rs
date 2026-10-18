@@ -295,6 +295,10 @@ impl Runtime {
         carries.add([crate::companies::carry::origin(&d.issuer)], || {
             crate::companies::carry::why(&d.company)
         });
+        // What the Company says in a Direct Conversation reaches the User
+        // on its relay task (`runtime::company_direct`).
+        let events: Vec<Value> = d.items.iter().map(|i| i.data["event"].clone()).collect();
+        self.relay_company_events(&d.company, &d.conversation, &events);
         let mut outcome = Ok(());
         for item in d.items {
             if let Err(e) = self.append_carrying(
@@ -314,8 +318,11 @@ impl Runtime {
         let _ = d.ack.try_send(outcome);
     }
 
-    /// At boot: the readers' events go to the loop, and each open
-    /// conversation's reader starts again from its saved cursor.
+    /// At boot: the readers' events and the supervisor's notices go to the
+    /// loop, each open conversation's reader starts again from its saved
+    /// cursor, and each operation not final is read again when its time
+    /// comes. A Company's request to talk with the User is asked of them when
+    /// the listener serves and unowned work may gate.
     pub(crate) fn resume_company_conversations(&mut self) {
         let Some(sup) = self.companies.clone() else {
             return;
@@ -324,7 +331,18 @@ impl Runtime {
         sup.deliver_to(Arc::new(move |d| {
             let _ = tx.send(super::events::Event::CompanyDelivery(Box::new(d)));
         }));
+        let tx = self.events_tx.clone();
+        sup.notify_to(Arc::new(move |n| {
+            let _ = tx.send(super::events::Event::CompanyNotice(Box::new(n)));
+        }));
+        sup.set_direct_askable(
+            cfg!(feature = "a2a")
+                && self.settings.a2a.listen.is_some()
+                && self.settings.agent.ask_human_unowned
+                    == crate::config::settings::AskHumanUnowned::Gate,
+        );
         sup.resume_conversations();
+        sup.track_operations();
     }
 }
 

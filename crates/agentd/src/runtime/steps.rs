@@ -2340,6 +2340,14 @@ impl Runtime {
                     PendingKind::CompanySignIn { id, company } => {
                         json!({"kind": "company_sign_in", "sign_in": id, "company": company})
                     }
+                    // Nor does an operation's approval, or the User's
+                    // answer about a Direct Conversation.
+                    PendingKind::CompanyOperation { id, company } => {
+                        json!({"kind": "company_operation", "operation": id, "company": company})
+                    }
+                    PendingKind::CompanyDirect { id, company } => {
+                        json!({"kind": "company_direct", "direct": id, "company": company})
+                    }
                     PendingKind::Run { run, .. } => json!({"kind": "run", "run": run}),
                     PendingKind::Await {
                         condition,

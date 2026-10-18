@@ -382,6 +382,7 @@ fn every_published_identity_document_validates_against_the_kit() {
         published_key_files: Vec::new(),
         redirect_uri: None,
         serve: true,
+        extensions: Vec::new(),
     };
     let id = Identity::load(&client, false).unwrap();
     let kit = mock::kit::kit();
@@ -410,6 +411,21 @@ fn every_published_identity_document_validates_against_the_kit() {
             kit.validate("client-metadata.schema.json", &v).unwrap();
         }
     }
+    // Listing the Operations extension, it holds to the kit too.
+    let listing = Identity::load(
+        &agentd::config::settings::companies::Client {
+            extensions: vec![agentd::config::settings::companies::Extension::Operations],
+            ..client
+        },
+        false,
+    )
+    .unwrap();
+    kit.validate("client-metadata.schema.json", listing.metadata())
+        .unwrap();
+    assert_eq!(
+        listing.metadata()["extensions"]["operations"]["version"],
+        "1"
+    );
 }
 
 /// A Session, a Bearer token and the MCP server's tools: the fake accepts
@@ -424,7 +440,7 @@ fn a_signed_out_session_reaches_the_mcp_server_with_a_bearer_token_for_it() {
     let (client, tools) = agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20))
         .unwrap_or_else(|e| panic!("{e}"));
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["search", "order_status"]);
+    assert_eq!(names, ["search", "order_status", "exchange_item"]);
     assert!(
         tools[0]
             .description
@@ -1072,6 +1088,15 @@ fn signing_config(
 fn supervisor_of(
     settings: &agentd::config::settings::Settings,
     store: Arc<agentd::store::memory::MemoryStore>,
+    host: &Host,
+) -> Arc<Supervisor> {
+    supervisor_with(settings, store, host)
+}
+
+/// [`supervisor_of`] on any store.
+fn supervisor_with(
+    settings: &agentd::config::settings::Settings,
+    store: Arc<dyn agentd::store::Store>,
     host: &Host,
 ) -> Arc<Supervisor> {
     let durable = Arc::new(agentd::state::Durable::new(
@@ -2771,4 +2796,1103 @@ fn a_request_names_the_trace_its_profile_gives() {
     let (sent, link) = get(&s, &one);
     assert_eq!(sent, one.trace_id, "the unit's own trace");
     assert!(link.is_none());
+}
+
+// ---- Operations and Direct Conversations (RFC 0047 P4) --------------------
+
+use agentd::companies::ledger::{Approval, Channel};
+use agentd::companies::operations::{Outcome as Went, Step};
+
+/// The entry fields of a Company whose exchanges are operations: its MCP
+/// server, its agent and the exchanges of its API.
+const OPERATES: &str =
+    ", interfaces: [mcp, agent, openapi], api_allow: [\"POST /orders/{order_id}/exchanges\"]";
+
+/// A standing permission over the API's exchanges that cost at most $20.
+#[cfg(feature = "cel")]
+fn cheap_exchanges(uses: &str) -> String {
+    format!(
+        "      - {{company: shop, via: {{api: \"POST /orders/{{order_id}}/exchanges\"}}, terms: [order_id, item_id, replacement_sku, price_difference], when: \"terms.price_difference.currency == 'USD' && double(terms.price_difference.amount) <= 20.0\", expires: \"2099-01-01T00:00:00Z\"{uses}}}\n"
+    )
+}
+
+/// An agent that lists the Operations extension at `fake`, with the
+/// standing permissions `standing` (lines of a YAML list), on `store`.
+fn operating_on(
+    fake: &Fake,
+    host: &Host,
+    dir: &Path,
+    store: Arc<agentd::store::memory::MemoryStore>,
+    standing: &str,
+) -> Agent {
+    operating_with(fake, host, dir, store, standing)
+}
+
+/// [`operating_on`] on any store.
+fn operating_with(
+    fake: &Fake,
+    host: &Host,
+    dir: &Path,
+    store: Arc<dyn agentd::store::Store>,
+    standing: &str,
+) -> Agent {
+    let standing = if standing.is_empty() {
+        String::new()
+    } else {
+        format!("    standing:\n{standing}")
+    };
+    let yaml = format!(
+        "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\", extensions: [operations]}}\n{standing}\
+         store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
+         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{OPERATES}}}\n",
+        ca = fixture("ca.pem").display(),
+        h = host.origin,
+        d = dir.display(),
+        o = fake.origin,
+    );
+    let path = dir.join("c.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let settings =
+        agentd::config::settings::load(&["--config".to_string(), path.display().to_string()], &[])
+            .unwrap_or_else(|e| panic!("{e}"))
+            .0
+            .settings;
+    Agent {
+        sup: supervisor_with(&settings, store, host),
+        _dir: dir.to_path_buf(),
+    }
+}
+
+fn operating(fake: &Fake, standing: &str) -> Agent {
+    let dir = tempfile::tempdir().unwrap().keep();
+    operating_on(fake, &host(), &dir, Arc::default(), standing)
+}
+
+/// Propose exchanging `item` for `sku` through the API, as call `key`: the
+/// operation's id.
+fn propose(a: &Agent, item: &str, sku: &str, key: &str) -> String {
+    let out = a
+        .sup
+        .call_api(
+            &shop(a),
+            &Call {
+                method: "POST".into(),
+                path: "/orders/ord_7Hk2/exchanges".into(),
+                json: Some(json!({"item_id": item, "replacement_sku": sku})),
+                key: key.into(),
+                ..Call::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out["status"], 202, "{out}");
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("is not done until confirmed"),
+        "{out}"
+    );
+    out["json"]["operation"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Confirm `id`, `given` the User's approval or none: every step, in order.
+fn confirm(a: &Agent, id: &str, given: Option<Approval>) -> Vec<Step> {
+    let steps = Mutex::new(Vec::new());
+    a.sup
+        .confirm_operation(&shop(a), id, given, None, &AtomicBool::new(false), &|s| {
+            steps.lock().unwrap().push(s)
+        });
+    steps.into_inner().unwrap()
+}
+
+/// The User's approval of what `steps` asked them: its revision, and what
+/// the gate showed of it.
+fn approval(steps: &[Step]) -> Approval {
+    steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Ask {
+                revision, digest, ..
+            } => Some(Approval {
+                revision: *revision,
+                digest: digest.clone(),
+                approved_by: "user".into(),
+                by: "operator".into(),
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("nobody was asked: {steps:?}"))
+}
+
+/// The User's approval of what a confirm of `id` asks them now.
+fn approve(a: &Agent, id: &str) -> Approval {
+    approval(&confirm(a, id, None))
+}
+
+/// The confirms that reached the fake.
+fn confirms(f: &Fake) -> Vec<Value> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["operation_request"] == true && path_of(r).ends_with("/confirm"))
+        .collect()
+}
+
+/// The question a confirm's steps asked the User, and its revision.
+fn asked(steps: &[Step]) -> Option<(String, u64)> {
+    steps.iter().find_map(|s| match s {
+        Step::Ask {
+            question, revision, ..
+        } => Some((question.clone(), *revision)),
+        _ => None,
+    })
+}
+
+/// Whether a confirm's steps used a standing permission.
+fn standing_used(steps: &[Step]) -> bool {
+    steps.iter().any(|s| matches!(s, Step::Standing { .. }))
+}
+
+/// How a confirm's steps ended.
+fn done(steps: &[Step]) -> Result<Value, String> {
+    steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Done(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("it ended")
+}
+
+/// An operation is recognised where the Operations extension puts it — the
+/// API's `202 {operation}` — and proposed only to an agent that lists the
+/// extension; and no confirm is sent without the User's approval of its
+/// revision: the first confirm asks them, in agentd's words with the
+/// Company's summary and terms quoted beside its verified domain, and sends
+/// nothing; the one they approved is sent with `approved_by: user` and that
+/// revision, and a final operation is never confirmed again.
+#[test]
+fn no_confirm_is_sent_without_the_users_approval_of_its_revision() {
+    let f = fake(&[]);
+    // An agent that does not list the extension is never proposed one
+    // (Operations §2): the exchange is made.
+    let plain = talking(&f);
+    let made = plain
+        .sup
+        .call_api(
+            &shop(&plain),
+            &Call {
+                method: "POST".into(),
+                path: "/orders/ord_7Hk2/exchanges".into(),
+                json: Some(
+                    json!({"item_id": "itm_4Qa", "replacement_sku": "stormline-insulated-m"}),
+                ),
+                key: "plain#1".into(),
+                ..Call::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(made["status"], 201, "{made}");
+    let a = operating(&f, "");
+    let id = propose(&a, "itm_4Qa", "stormline-insulated-m", "run/p#1");
+    let steps = confirm(&a, &id, None);
+    let (q, revision) = asked(&steps).unwrap_or_else(|| panic!("{steps:?}"));
+    let approved = approval(&steps);
+    assert_eq!(revision, 1);
+    assert!(
+        q.starts_with("\"Fake Company\" (127.0.0.1) asks you to approve this, in your signed-out Session at 127.0.0.1. The Company says: \"Exchange item itm_4Qa on order ord_7Hk2 for stormline-insulated-m, for $70.00 more"),
+        "{q}"
+    );
+    assert!(q.contains("\"price_difference.amount\": \"70.00\""), "{q}");
+    assert!(
+        q.contains(&format!("This is revision 1 of operation {id}")),
+        "{q}"
+    );
+    assert!(q.ends_with("Answer approve or decline."), "{q}");
+    assert!(
+        confirms(&f).is_empty(),
+        "nothing confirmed before the User approved"
+    );
+    let steps = confirm(&a, &id, Some(approved.clone()));
+    assert!(
+        steps.contains(&Step::Confirmed {
+            revision: 1,
+            approved_by: "user".into(),
+            outcome: Went::Taken,
+            state: Some("succeeded".into()),
+            error: None
+        }),
+        "{steps:?}"
+    );
+    let out = done(&steps).unwrap();
+    assert_eq!(out["state"], "succeeded");
+    assert_eq!(out["approved_by"], "user");
+    assert!(out["operation"]["result"]["summary"].is_string(), "{out}");
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    assert_eq!(sent[0]["revision"], 1);
+    assert_eq!(sent[0]["approved_by"], "user");
+    assert!(
+        sent[0]["proof"]["ath"].is_string(),
+        "with the DPoP Session Token: {}",
+        sent[0]
+    );
+    // Final: nothing is confirmed again.
+    let again = done(&confirm(&a, &id, Some(approved))).unwrap();
+    assert!(
+        again["note"].as_str().unwrap().contains("is succeeded"),
+        "{again}"
+    );
+    assert_eq!(confirms(&f).len(), 1);
+}
+
+/// `terms_changed` asks again (Ops §5.1: "An approval covers one
+/// revision"): the User's approval of revision 1 does not cover revision 2,
+/// and the question says what changed.
+#[test]
+fn terms_changed_asks_again() {
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let id = propose(&a, "itm_4Qa", "stormline-insulated-m", "run/p#1");
+    let first = approve(&a, &id);
+    f.control(json!({"operations": {"revise": 1}}));
+    let steps = confirm(&a, &id, Some(first.clone()));
+    assert!(
+        steps.contains(&Step::Confirmed {
+            revision: 1,
+            approved_by: "user".into(),
+            outcome: Went::Refused,
+            state: None,
+            error: Some("terms_changed".into())
+        }),
+        "{steps:?}"
+    );
+    let second = approval(&steps);
+    let (q, revision) = asked(&steps).unwrap_or_else(|| panic!("{steps:?}"));
+    assert_eq!(revision, 2);
+    assert!(
+        q.contains(
+            "Changed from the revision before: \"price_difference.amount\": \"70.00\" → \"85.00\""
+        ),
+        "{q}"
+    );
+    assert!(
+        q.contains("The Company changed the terms since they were last approved."),
+        "{q}"
+    );
+    // The old approval is gone: the User is asked again, nothing sent.
+    assert!(asked(&confirm(&a, &id, None)).is_some());
+    assert!(asked(&confirm(&a, &id, Some(first))).is_some());
+    assert_eq!(confirms(&f).len(), 1);
+    let ok = confirm(&a, &id, Some(second));
+    assert_eq!(done(&ok).unwrap()["state"], "succeeded");
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["revision"], 2);
+}
+
+/// A standing permission confirms what it covers with `approved_by:
+/// standing_permission` and asks no one; a revision it does not cover asks
+/// the User: one dearer than its predicate allows, one with a term key it
+/// does not list, one with no terms, and one the Company holds to the User's
+/// own approval — which no standing permission ever confirms, even when the
+/// Company says so only once the confirm arrives.
+#[cfg(feature = "cel")]
+#[test]
+fn a_standing_permission_confirms_only_what_it_covers() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(""));
+    let cheap = propose(&a, "itm_1", "stormline-m", "run/s#1");
+    let steps = confirm(&a, &cheap, None);
+    assert!(asked(&steps).is_none(), "{steps:?}");
+    assert!(
+        steps.iter().any(|s| matches!(
+            s,
+            Step::Standing {
+                revision: 1,
+                uses_left: None,
+                ..
+            }
+        )),
+        "{steps:?}"
+    );
+    assert_eq!(done(&steps).unwrap()["approved_by"], "standing_permission");
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["approved_by"], "standing_permission");
+    let not_covered = |a: &Agent, item: &str, sku: &str, key: &str| {
+        let id = propose(a, item, sku, key);
+        let steps = confirm(a, &id, None);
+        assert!(asked(&steps).is_some(), "{key}: {steps:?}");
+        assert!(!standing_used(&steps), "{key}: {steps:?}");
+    };
+    not_covered(&a, "itm_2", "stormline-insulated-m", "dear");
+    f.control(json!({"operations": {"extra_term": "gift_wrap"}}));
+    not_covered(&a, "itm_3", "stormline-m", "extra-key");
+    assert_eq!(confirms(&f).len(), 1, "only the covered one was confirmed");
+    let g = fake(&[]);
+    g.control(json!({"operations": {"no_terms": true}}));
+    let b = operating(&g, &cheap_exchanges(""));
+    not_covered(&b, "itm_4", "stormline-m", "no-terms");
+    let h = fake(&[]);
+    h.control(json!({"operations": {"user_approval_required": true}}));
+    let c = operating(&h, &cheap_exchanges(""));
+    not_covered(&c, "itm_5", "stormline-m", "required");
+    assert!(confirms(&g).is_empty() && confirms(&h).is_empty());
+    // The Company requires the User's own approval only when the confirm
+    // arrives: asked, and never by the permission again.
+    let i = fake(&[]);
+    i.control(json!({"operations": {"refuse_standing": 1}}));
+    let d = operating(&i, &cheap_exchanges(""));
+    let id = propose(&d, "itm_6", "stormline-m", "late");
+    let steps = confirm(&d, &id, None);
+    assert!(
+        steps.contains(&Step::Confirmed {
+            revision: 1,
+            approved_by: "standing_permission".into(),
+            outcome: Went::Refused,
+            state: None,
+            error: Some("user_approval_required".into())
+        }),
+        "{steps:?}"
+    );
+    let (q, _) = asked(&steps).unwrap();
+    assert!(q.contains("only with your own approval"), "{q}");
+    let steps = confirm(&d, &id, None);
+    assert!(asked(&steps).is_some() && !standing_used(&steps));
+    assert_eq!(
+        confirms(&i).len(),
+        1,
+        "the permission was sent once, and refused"
+    );
+}
+
+/// Two calls racing for a standing permission's last use confirm once: the
+/// use is reserved under the ledger's lock before either confirm is sent.
+#[cfg(feature = "cel")]
+#[test]
+fn two_calls_racing_for_a_permissions_last_use_confirm_once() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(", uses: 1"));
+    let one = propose(&a, "itm_1", "stormline-m", "race#1");
+    let two = propose(&a, "itm_2", "stormline-m", "race#2");
+    let run = |id: String| {
+        let (sup, company) = (Arc::clone(&a.sup), shop(&a));
+        std::thread::spawn(move || {
+            let steps = Mutex::new(Vec::new());
+            sup.confirm_operation(&company, &id, None, None, &AtomicBool::new(false), &|s| {
+                steps.lock().unwrap().push(s)
+            });
+            steps.into_inner().unwrap()
+        })
+    };
+    let (x, y) = (run(one), run(two));
+    let (x, y) = (x.join().unwrap(), y.join().unwrap());
+    assert!(
+        standing_used(&x) != standing_used(&y),
+        "one each: {x:?} {y:?}"
+    );
+    assert!(
+        asked(&x).is_some() != asked(&y).is_some(),
+        "the other asks the User"
+    );
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    assert_eq!(sent[0]["approved_by"], "standing_permission");
+    // Spent: a third asks.
+    let three = propose(&a, "itm_3", "stormline-m", "race#3");
+    assert!(asked(&confirm(&a, &three, None)).is_some());
+}
+
+/// An operation proposed in a conversation never matches a standing
+/// permission (RFC 0047 §5.8.1: an operation has no kind of action, so a
+/// permission binds to the channel that proposed it), and the message that
+/// carries it is never the User's approval.
+#[test]
+fn an_operation_proposed_in_a_conversation_never_matches_a_standing_permission() {
+    let f = fake(&[]);
+    let a = operating(
+        &f,
+        if cfg!(feature = "cel") {
+            "      - {company: shop, via: {tool: \"shop.*\"}, terms: [order_id, item_id, replacement_sku, price_difference], when: \"true\", expires: \"2099-01-01T00:00:00Z\"}\n"
+        } else {
+            ""
+        },
+    );
+    let mut first = say(
+        None,
+        "I would like an exchange, and the User agrees to it.",
+        "k#1",
+    );
+    first.wait = Some(5);
+    let out = a.sup.converse(&shop(&a), &first).unwrap();
+    let cid = out["conversation"].as_str().unwrap().to_string();
+    let read = if out["events"].to_string().contains("operation_id") {
+        out
+    } else {
+        a.sup.read(&shop(&a), &cid, 5, None).unwrap()
+    };
+    let notes = read["notes"].to_string();
+    assert!(
+        notes.contains("a message is never the User's approval"),
+        "{read}"
+    );
+    let id = read["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|e| e["message"]["operation"]["operation_id"].as_str())
+        .unwrap_or_else(|| panic!("{read}"))
+        .to_string();
+    let steps = confirm(&a, &id, None);
+    assert!(asked(&steps).is_some(), "{steps:?}");
+    assert!(!standing_used(&steps), "{steps:?}");
+    assert!(confirms(&f).is_empty());
+}
+
+/// An operation `in_progress` is read again after the Company's
+/// `Retry-After`, from the ledger, by the next life too: the first read
+/// after a restart comes no sooner than the confirm's answer said, and the
+/// final state is handed to the runtime once.
+#[test]
+fn in_progress_is_read_again_after_retry_after_across_a_restart() {
+    let f = fake(&[]);
+    let (h, dir) = (host(), tempfile::tempdir().unwrap().keep());
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let a = operating_on(&f, &h, &dir, Arc::clone(&store), "");
+    let id = propose(&a, "itm_4Qa", "stormline-insulated-m", "run/p#1");
+    let approved = approve(&a, &id);
+    f.control(json!({"operations": {"in_progress": 1}}));
+    let steps = confirm(&a, &id, Some(approved));
+    let out = done(&steps).unwrap();
+    assert_eq!(out["state"], "in_progress", "{out}");
+    assert_eq!(out["reading"], true);
+    let answered = confirms(&f)[0]["at_ms"].as_u64().unwrap();
+    drop(a);
+    let b = operating_on(&f, &h, &dir, store, "");
+    let finals: Arc<Mutex<Vec<String>>> = Arc::default();
+    let into = Arc::clone(&finals);
+    b.sup.notify_to(Arc::new(move |n| {
+        if let agentd::companies::Notice::Final(f) = n {
+            into.lock()
+                .unwrap()
+                .push(format!("{}:{}", f.operation_id, f.state));
+            let _ = f.ack.try_send(Ok(()));
+        }
+    }));
+    b.sup.track_operations();
+    until("the final state handed on", || {
+        !finals.lock().unwrap().is_empty()
+    });
+    // The reads after the confirm's answer (one came before it: the confirm
+    // reads the operation first).
+    let reads: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| {
+            r["operation_request"] == true
+                && r["method"] == "GET"
+                && r["at_ms"].as_u64() > Some(answered)
+        })
+        .collect();
+    assert!(!reads.is_empty());
+    let first = reads[0]["at_ms"].as_u64().unwrap();
+    assert!(
+        first >= answered + 2_000,
+        "read {} ms after the answer, which said 2 s",
+        first - answered
+    );
+    assert_eq!(*finals.lock().unwrap(), [format!("{id}:succeeded")]);
+    let read = b.sup.get_operation(&shop(&b), &id, None).unwrap();
+    assert_eq!(read["state"], "succeeded");
+    assert_eq!(read["reading"], false);
+    b.sup.stop_readers();
+}
+
+/// After a confirm that got no answer, the same operation is confirmed again
+/// with the same id and revision, and read; the request that proposed it is
+/// refused unsent while it is not final, and an operation of the same terms
+/// through another channel is not confirmed — until it is final.
+#[test]
+fn after_a_confirm_timeout_nothing_proposes_the_same_action_until_it_is_final() {
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    let id = propose(&a, "itm_4Qa", "stormline-insulated-m", "run/p#1");
+    let approved = approve(&a, &id);
+    f.control(json!({"operations": {"in_progress": 30}}));
+    f.control(json!({"http_fail": {"method": "POST", "path": "/poppy/operations/", "times": 3, "status": 502}}));
+    let steps = confirm(&a, &id, Some(approved.clone()));
+    let e = done(&steps).unwrap_err();
+    assert!(e.starts_with("outcome unknown: "), "{e}");
+    assert!(
+        e.contains("company.operation.confirm sends this confirm again"),
+        "{e}"
+    );
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 3, "the transport's attempts: {sent:#?}");
+    for s in &sent {
+        assert_eq!(s["operation_id"], id.as_str());
+        assert_eq!(s["revision"], 1);
+    }
+    // The request that proposed it is not sent again.
+    let before = f.record().len();
+    let e = a
+        .sup
+        .call_api(
+            &shop(&a),
+            &Call {
+                method: "POST".into(),
+                path: "/orders/ord_7Hk2/exchanges".into(),
+                json: Some(
+                    json!({"item_id": "itm_4Qa", "replacement_sku": "stormline-insulated-m"}),
+                ),
+                key: "run/p#2".into(),
+                ..Call::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(e, CallError::Unsent(_)), "{e:?}");
+    assert!(
+        e.to_string().contains(&format!(
+            "operation {id}, which this request proposed, is still"
+        )),
+        "{e}"
+    );
+    assert_eq!(f.record().len(), before, "nothing reached the Company");
+    // The same terms through another channel: kept, and never confirmed
+    // while the first is open.
+    let r = client
+        .call_tool(
+            "exchange_item",
+            Some(json!({"order_id": "ord_7Hk2", "item_id": "itm_4Qa", "replacement_sku": "stormline-insulated-m"})),
+        )
+        .unwrap();
+    let other = a
+        .sup
+        .recognise(
+            &shop(&a),
+            Channel::Tool {
+                name: "shop.exchange_item".into(),
+            },
+            None,
+            &r.structured_content.unwrap()["operation"],
+        )
+        .unwrap();
+    assert_ne!(other, id);
+    let e = done(&confirm(&a, &other, Some(approved))).unwrap_err();
+    assert!(
+        e.contains(&format!("operation {id}, with the same terms, is still")),
+        "{e}"
+    );
+    // Confirmed again: read with the same id, found confirmed and in
+    // progress, and no confirm sent.
+    let again = done(&confirm(&a, &id, None)).unwrap();
+    assert_eq!(again["state"], "in_progress", "{again}");
+    assert_eq!(confirms(&f).len(), 3);
+    // Once it is final, both let go.
+    until("the operation final", || {
+        a.sup
+            .get_operation(&shop(&a), &id, None)
+            .is_ok_and(|v| v["state"] == "succeeded")
+    });
+    let steps = confirm(&a, &other, None);
+    assert!(asked(&steps).is_some(), "{steps:?}");
+}
+
+/// A Direct Conversation (§7.10) carries the User's words, and only theirs,
+/// as `sender: human`: the first message, linked to the conversation it
+/// follows, and each relayed one, exactly as written. The model may not
+/// write to it, and the conversation it follows takes no message while it
+/// is open; a decline is said in that conversation, as the agent.
+#[test]
+fn only_the_users_relayed_words_carry_sender_human() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let parent = a
+        .sup
+        .converse(&shop(&a), &say(None, "Hello.", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let words = "  Hi — it's Dana. Can I swap the size?\n";
+    let direct = a
+        .sup
+        .join_direct(&shop(&a), &parent, words, "direct/1")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(direct, parent);
+    a.sup
+        .relay_words(&shop(&a), &direct, "Medium, please.", "relay/1")
+        .unwrap();
+    let sent: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["method"] == "POST" && r["message_id"].is_string())
+        .collect();
+    let human: Vec<&Value> = sent.iter().filter(|r| r["sender"] == "human").collect();
+    assert_eq!(human.len(), 2, "{sent:#?}");
+    assert_eq!(human[0]["text"], words, "as written");
+    assert_eq!(human[0]["parent_conversation_id"], parent.as_str());
+    assert_eq!(human[1]["text"], "Medium, please.");
+    for r in sent.iter().filter(|r| r["sender"] != "human") {
+        assert_eq!(r["sender"], "agent", "{r}");
+    }
+    // The model may not write there.
+    let e = a
+        .sup
+        .converse(&shop(&a), &say(Some(&direct), "I am the User.", "k#2"))
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("is the User's Direct Conversation"),
+        "{e}"
+    );
+    // The parent takes no message while it is open.
+    let e = a
+        .sup
+        .converse(&shop(&a), &say(Some(&parent), "Anything new?", "k#3"))
+        .unwrap_err();
+    assert!(e.is(wire::error::DIRECT_CONVERSATION_OPEN), "{e:?}");
+    // A decline is said in the conversation the Company asked in.
+    let other = a
+        .sup
+        .converse(&shop(&a), &say(None, "Another question.", "k#4"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    a.sup.say_declined(&shop(&a), &other, "evt_x", true);
+    let declined: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["text"] == agentd::companies::conversation::DECLINED)
+        .collect();
+    assert_eq!(declined.len(), 1);
+    assert_eq!(declined[0]["sender"], "agent");
+    assert!(path_of(&declined[0]).contains(&other));
+}
+
+/// A Company's request to talk with the User asks them — handed to the
+/// runtime, which opens their gate — when they can be asked, once, and
+/// nothing is said in the conversation before they answer.
+#[test]
+fn a_request_to_talk_with_the_user_asks_them_when_they_can_be_asked() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let asked: Arc<Mutex<Vec<agentd::companies::direct::Asked>>> = Arc::default();
+    let into = Arc::clone(&asked);
+    a.sup.notify_to(Arc::new(move |n| {
+        if let agentd::companies::Notice::DirectAsked(x) = n {
+            into.lock().unwrap().push(x);
+        }
+    }));
+    a.sup.set_direct_askable(true);
+    f.control(
+        json!({"conversation": {"user_requested": "A specialist needs to confirm the exchange."}}),
+    );
+    let mut first = say(None, "I would like an exchange.", "k#1");
+    first.wait = Some(5);
+    let out = a.sup.converse(&shop(&a), &first).unwrap();
+    let notes = out["notes"].to_string();
+    assert!(
+        notes.contains("agentd asked the User whether to join"),
+        "{notes}"
+    );
+    until("the request handed on", || {
+        !asked.lock().unwrap().is_empty()
+    });
+    let x = asked.lock().unwrap()[0].clone();
+    assert_eq!(x.conversation, out["conversation"].as_str().unwrap());
+    assert_eq!(
+        x.reason.as_deref(),
+        Some("A specialist needs to confirm the exchange.")
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !conversation_requests(&f)
+            .iter()
+            .any(|r| r["text"] == NOT_AVAILABLE),
+        "nothing said for the User before they answer"
+    );
+    assert_eq!(asked.lock().unwrap().len(), 1, "once");
+}
+
+/// A store that refuses the next write of a Company record once it is
+/// armed, as a full one would.
+#[derive(Default)]
+struct Refusing {
+    inner: agentd::store::memory::MemoryStore,
+    armed: AtomicBool,
+}
+
+impl agentd::store::Store for Refusing {
+    fn put(
+        &self,
+        key: &str,
+        seq: u64,
+        envelope: &Value,
+    ) -> Result<agentd::store::PutOutcome, agentd::store::StoreError> {
+        if key.contains("/company/") && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(agentd::store::StoreError::Mapping(
+                "the store is full".into(),
+            ));
+        }
+        self.inner.put(key, seq, envelope)
+    }
+    fn get(&self, key: &str, seq: Option<u64>) -> Result<Option<Value>, agentd::store::StoreError> {
+        self.inner.get(key, seq)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<agentd::store::KeySeq>, agentd::store::StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), agentd::store::StoreError> {
+        self.inner.delete(key)
+    }
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+}
+
+/// How a confirm's steps said its confirm went.
+fn went(steps: &[Step]) -> Vec<Went> {
+    steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Confirmed { outcome, .. } => Some(*outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A standing permission is asked again at each confirm (Ops §5.1: it MUST
+/// "still be in effect"): a confirm by it that the Company refused before
+/// doing anything keeps no approval and gives its use back, so another
+/// operation takes the use and the next confirm of the first asks the User.
+#[cfg(feature = "cel")]
+#[test]
+fn a_refused_confirm_gives_its_use_back_and_approves_nothing_more() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(", uses: 1"));
+    let x = propose(&a, "itm_1", "stormline-m", "x#1");
+    f.control(json!({"operations": {"insufficient_scope": 1}}));
+    let steps = confirm(&a, &x, None);
+    assert!(standing_used(&steps), "{steps:?}");
+    assert_eq!(went(&steps), [Went::Refused], "{steps:?}");
+    assert!(done(&steps).is_err());
+    let view = a.sup.get_operation(&shop(&a), &x, None).unwrap();
+    assert!(view["approved_by"].is_null(), "no approval is kept: {view}");
+    let y = propose(&a, "itm_2", "stormline-m", "y#1");
+    let steps = confirm(&a, &y, None);
+    assert!(standing_used(&steps), "the use came back: {steps:?}");
+    assert_eq!(done(&steps).unwrap()["state"], "succeeded");
+    let steps = confirm(&a, &x, None);
+    assert!(
+        asked(&steps).is_some() && !standing_used(&steps),
+        "its one use is spent: {steps:?}"
+    );
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert_eq!(sent[1]["operation_id"], y.as_str());
+}
+
+/// A confirm by a standing permission that got no answer is not sent again
+/// on its old approval: once the permission no longer applies — suspended,
+/// the User having signed in to a new account there — the next confirm asks
+/// the User and sends nothing.
+#[cfg(feature = "cel")]
+#[test]
+fn a_standing_approval_is_asked_again_at_each_confirm() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(""));
+    let x = propose(&a, "itm_1", "stormline-m", "x#1");
+    f.control(json!({"operations": {"drop": 3}}));
+    let steps = confirm(&a, &x, None);
+    assert!(standing_used(&steps), "{steps:?}");
+    assert_eq!(went(&steps), [Went::Unknown], "{steps:?}");
+    let e = done(&steps).unwrap_err();
+    assert!(e.starts_with("outcome unknown: "), "{e}");
+    assert_eq!(confirms(&f).len(), 3, "the transport's attempts");
+    a.sup.suspend_standing("shop");
+    let steps = confirm(&a, &x, None);
+    assert!(
+        asked(&steps).is_some() && !standing_used(&steps),
+        "{steps:?}"
+    );
+    assert_eq!(confirms(&f).len(), 3, "nothing sent on the old approval");
+}
+
+/// A standing permission's use follows what the Company says of the
+/// operation it is reserved for: given back once the operation is cancelled
+/// unconfirmed, spent once a confirm of it was taken — whatever became of
+/// that confirm's answer — and a cancel after that gives nothing back.
+#[cfg(feature = "cel")]
+#[test]
+fn a_permissions_use_follows_what_the_company_says_of_its_operation() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(", uses: 2"));
+    // Unanswered, and never reached the action.
+    let x = propose(&a, "itm_1", "stormline-m", "x#1");
+    f.control(json!({"operations": {"drop": 3}}));
+    assert!(
+        done(&confirm(&a, &x, None))
+            .unwrap_err()
+            .starts_with("outcome unknown: ")
+    );
+    // Unanswered, and taken.
+    let z = propose(&a, "itm_2", "stormline-m", "z#1");
+    f.control(json!({"operations": {"in_progress": 30}}));
+    f.control(json!({"http_fail": {"method": "POST", "path": "/poppy/operations/", "times": 3, "status": 502}}));
+    assert!(
+        done(&confirm(&a, &z, None))
+            .unwrap_err()
+            .starts_with("outcome unknown: ")
+    );
+    // Both uses are held for them.
+    let y = propose(&a, "itm_3", "stormline-m", "y#1");
+    assert!(asked(&confirm(&a, &y, None)).is_some());
+    let out = a.sup.cancel_operation(&shop(&a), &x, None).unwrap();
+    assert_eq!(out["state"], "cancelled", "{out}");
+    let out = a.sup.cancel_operation(&shop(&a), &z, None).unwrap();
+    assert_eq!(
+        out["state"], "in_progress",
+        "confirmed, so not stopped: {out}"
+    );
+    // X's use came back; Z's is spent.
+    let w = propose(&a, "itm_4", "stormline-m", "w#1");
+    let steps = confirm(&a, &w, None);
+    assert!(standing_used(&steps), "{steps:?}");
+    let v = propose(&a, "itm_5", "stormline-m", "v#1");
+    let steps = confirm(&a, &v, None);
+    assert!(
+        asked(&steps).is_some() && !standing_used(&steps),
+        "both uses spent: {steps:?}"
+    );
+}
+
+/// A confirm the Company answers with the operation as it was — cancelled
+/// already, on its site — confirmed nothing (Ops §5.2: it "returns the
+/// operation as it is and does nothing else"): its outcome says so, and the
+/// permission's use goes back for another operation.
+#[cfg(feature = "cel")]
+#[test]
+fn a_confirm_the_company_did_nothing_with_spends_no_use() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(", uses: 1"));
+    let x = propose(&a, "itm_1", "stormline-m", "x#1");
+    f.control(json!({"operations": {"cancel_first": 1}}));
+    let steps = confirm(&a, &x, None);
+    assert!(
+        steps.iter().any(|s| matches!(s,
+            Step::Confirmed { outcome: Went::Untaken, state: Some(st), .. } if st == "cancelled")),
+        "{steps:?}"
+    );
+    let out = done(&steps).unwrap();
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap()
+            .contains("did nothing with the confirm"),
+        "{out}"
+    );
+    let y = propose(&a, "itm_2", "stormline-m", "y#1");
+    let steps = confirm(&a, &y, None);
+    assert!(standing_used(&steps), "the use was not spent: {steps:?}");
+    assert_eq!(went(&steps), [Went::Taken]);
+}
+
+/// The User's approval covers what the gate showed of a revision: when the
+/// Company says otherwise under the same revision — which Ops §3.1 forbids —
+/// the approval covers nothing, nothing is sent, and the User is asked
+/// again, the change shown.
+#[test]
+fn an_approval_covers_what_the_gate_showed_of_its_revision() {
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let id = propose(&a, "itm_4Qa", "stormline-insulated-m", "run/p#1");
+    let first = approve(&a, &id);
+    f.control(json!({"operations": {"rewrite": 1}}));
+    let steps = confirm(&a, &id, Some(first.clone()));
+    let (q, revision) = asked(&steps).unwrap_or_else(|| panic!("{steps:?}"));
+    assert_eq!(revision, 1);
+    assert!(
+        q.contains("The Company changed what this revision says after you were asked"),
+        "{q}"
+    );
+    assert!(
+        q.contains("\"price_difference.amount\": \"70.00\" → \"150.00\""),
+        "{q}"
+    );
+    assert!(confirms(&f).is_empty(), "nothing sent");
+    assert!(asked(&confirm(&a, &id, Some(first))).is_some());
+    let ok = confirm(&a, &id, Some(approval(&steps)));
+    assert_eq!(done(&ok).unwrap()["state"], "succeeded");
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["revision"], 1);
+    // An approval kept for a confirm that got no answer is shown as one
+    // only while the Company says what it approved.
+    let other = propose(&a, "itm_9", "stormline-insulated-m", "run/p#2");
+    let approved = approve(&a, &other);
+    f.control(json!({"operations": {"drop": 3}}));
+    assert!(done(&confirm(&a, &other, Some(approved))).is_err());
+    let view = a.sup.get_operation(&shop(&a), &other, None).unwrap();
+    assert_eq!(view["approved_by"], "user", "{view}");
+    f.control(json!({"operations": {"rewrite": 1}}));
+    let view = a.sup.get_operation(&shop(&a), &other, None).unwrap();
+    assert!(view["approved_by"].is_null(), "{view}");
+}
+
+/// A confirm the Company answered whose answer agentd could not keep — the
+/// store refusing the write — is `outcome unknown`, never unsent: its lock
+/// is let go and it is read again, so its final state is handed on.
+#[test]
+fn a_confirm_whose_answer_is_not_kept_is_outcome_unknown() {
+    let f = fake(&[]);
+    let store: Arc<Refusing> = Arc::default();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let a = operating_with(&f, &host(), &dir, Arc::clone(&store) as _, "");
+    let id = propose(&a, "itm_4Qa", "stormline-insulated-m", "run/p#1");
+    let approved = approve(&a, &id);
+    f.control(json!({"http_fail": {"method": "POST", "path": "/poppy/operations/", "times": 1, "ms": 1500}}));
+    let (sup, company) = (Arc::clone(&a.sup), shop(&a));
+    let (cid, given) = (id.clone(), approved);
+    let run = std::thread::spawn(move || {
+        let steps = Mutex::new(Vec::new());
+        sup.confirm_operation(
+            &company,
+            &cid,
+            Some(given),
+            None,
+            &AtomicBool::new(false),
+            &|s| steps.lock().unwrap().push(s),
+        );
+        steps.into_inner().unwrap()
+    });
+    // The fake's own line for the hold, which `Fake::record` leaves out.
+    until("the confirm taken", || {
+        get(&format!("{}/_mock/record", f.origin)).1["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|r| r["path"] == "/_mock/held")
+    });
+    store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let steps = run.join().unwrap();
+    assert_eq!(went(&steps), [Went::Unknown], "{steps:?}");
+    let e = done(&steps).unwrap_err();
+    assert!(
+        e.starts_with("outcome unknown: ") && e.contains("could not keep the answer"),
+        "{e}"
+    );
+    let finals: Arc<Mutex<Vec<String>>> = Arc::default();
+    let into = Arc::clone(&finals);
+    a.sup.notify_to(Arc::new(move |n| {
+        if let agentd::companies::Notice::Final(f) = n {
+            into.lock().unwrap().push(f.state.clone());
+            let _ = f.ack.try_send(Ok(()));
+        }
+    }));
+    a.sup.track_operations();
+    until("the final state handed on", || {
+        !finals.lock().unwrap().is_empty()
+    });
+    assert_eq!(*finals.lock().unwrap(), ["succeeded"]);
+    let view = a.sup.get_operation(&shop(&a), &id, None).unwrap();
+    assert_eq!(view["state"], "succeeded");
+    assert_eq!(confirms(&f).len(), 1);
+    a.sup.stop_readers();
+}
+
+/// A Company that asks, in the User's own Direct Conversation, to talk with
+/// them directly is asked nothing and told nothing: no question for the
+/// User, whether or not they can be asked, and no message of agentd's in a
+/// conversation that carries only the User's words.
+#[test]
+fn a_request_to_talk_in_a_direct_conversation_asks_nothing_and_says_nothing() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let asked: Arc<Mutex<Vec<agentd::companies::direct::Asked>>> = Arc::default();
+    let into = Arc::clone(&asked);
+    a.sup.notify_to(Arc::new(move |n| {
+        if let agentd::companies::Notice::DirectAsked(x) = n {
+            into.lock().unwrap().push(x);
+        }
+    }));
+    let parent = a
+        .sup
+        .converse(&shop(&a), &say(None, "Hello.", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = a
+        .sup
+        .join_direct(&shop(&a), &parent, "Hi, it's Dana.", "direct/1")
+        .unwrap();
+    for askable in [false, true] {
+        a.sup.set_direct_askable(askable);
+        f.control(json!({"conversation": {"user_requested": "Shall we talk directly?"}}));
+        a.sup
+            .relay_words(
+                &shop(&a),
+                &direct,
+                &format!("Still here ({askable})."),
+                &format!("relay/{askable}"),
+            )
+            .unwrap();
+        let read = a.sup.read(&shop(&a), &direct, 5, None).unwrap();
+        assert!(
+            read["notes"]
+                .to_string()
+                .contains("agentd asked nobody and sent nothing"),
+            "{read}"
+        );
+    }
+    // Nor is a decline ever said there.
+    a.sup.say_declined(&shop(&a), &direct, "evt_x", true);
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(asked.lock().unwrap().is_empty(), "nobody was asked");
+    let into_direct: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["method"] == "POST" && path_of(r).contains(&direct))
+        .collect();
+    assert_eq!(into_direct.len(), 2, "{into_direct:#?}");
+    for r in &into_direct {
+        assert_eq!(r["sender"], "human", "{r}");
+    }
+}
+
+/// The User's first message sent again — a restart while it was on its way
+/// — under the id it was sent with starts no other conversation: the
+/// Company answers with the Direct Conversation it started (§7.3).
+#[test]
+fn a_first_message_sent_again_starts_no_other_direct_conversation() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let parent = a
+        .sup
+        .converse(&shop(&a), &say(None, "Hello.", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let words = "Hi, it's Dana.";
+    let one = a
+        .sup
+        .join_direct(&shop(&a), &parent, words, "direct/task-1")
+        .unwrap();
+    let again = a
+        .sup
+        .join_direct(&shop(&a), &parent, words, "direct/task-1")
+        .unwrap();
+    assert_eq!(one, again);
+    let firsts: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["parent_conversation_id"].is_string())
+        .collect();
+    assert_eq!(firsts.len(), 2);
+    assert_eq!(firsts[0]["message_id"], firsts[1]["message_id"]);
+    assert_eq!(firsts[1]["duplicate"], true, "{:#?}", firsts[1]);
 }

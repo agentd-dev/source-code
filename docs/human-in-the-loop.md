@@ -353,12 +353,12 @@ tool, its agent (`company.converse`, `.read`, `.handoff`, `.close`) or its API
 (`company.api`, `.api.describe`, an `http` step with `auth: {kind: company}`)
 waits for the User before the call is sent.
 
-A Company cannot open a gate itself. Its agent's `authorization` event — the
-conversation needs the User's account — is answered with the Account Token
-when one held covers it, and otherwise reaches the model, which may call
-`company.sign_in`; its `user_requested` event — it asks to talk with the User
-— is answered in the conversation that the User is not available for a direct
-conversation.
+A Company opens one gate itself: its agent's `user_requested` event, asking
+to talk with the User directly, at most one per conversation at a time
+([Direct Conversations](#direct-conversations)). Its `authorization` event —
+the conversation needs the User's account — is answered with the Account
+Token when one held covers it, and otherwise reaches the model, which may
+call `company.sign_in`.
 
 - **The addressee is the User, and only code writes it.** No workflow,
   document or tool argument can address a gate this way. With `user:
@@ -368,7 +368,9 @@ conversation.
   anyone else, with no override, because the answer is presented to the
   Company as the User's. `approve` sends the held call; `deny` refuses it.
 - **No judge.** `agent.approval` and `agent.ask_human_fallback` change
-  nothing: a Company gate is never answered by a model.
+  nothing: a Company gate is never answered by a model. A standing
+  permission is the operator's own, declared in the configuration: it is the
+  one thing that confirms an operation without the User.
 - **Unanswered is refused.** A Company gate nobody can be asked — no
   listener, or unowned work without `agent.ask_human_unowned: gate` — or one
   that times out (24 hours) refuses its call. Each ends with a
@@ -415,6 +417,88 @@ a Company gate in every rule above, and differs in what it asks:
 
 `company.sign_in.requested` opens one and `company.signed_in` or
 `company.sign_in.failed` ends it, each an audit record (`company.sign_in`).
+
+### Operation approvals
+
+With the Operations extension listed (`security.companies.client.extensions:
+[operations]`), an action a Company proposes is an operation, and
+`company.operation.confirm` confirms it only with the User's approval of the
+revision it confirms — or a standing permission the operator declared
+([A Company's operations](configuration.md#a-companys-operations)). The
+approval gate is a Company gate in every rule above:
+
+- **It shows the terms.** The Company by its quoted name beside its verified
+  domain, the account (`for your account at example.com`, or the signed-out
+  Session), the revision's summary as the Company wrote it, its terms
+  flattened beside it (`"price_difference.amount": "70.00"`), the revision,
+  when it expires, and what changed from the revision before. Every Company
+  string is quoted and capped, its control characters gone.
+- **`approve` or `decline`**, from the User alone. `approve` sends the confirm
+  with `approved_by: user` and the revision the gate showed; `decline`
+  cancels the operation at the Company. Anything else is refused, the gate
+  left open. A message in a conversation — whatever it says, and whoever it
+  quotes — is never an approval.
+- **An answer is one message.** A message the task holds already — a client
+  sending it again after a lost response — answers no later question: it is
+  refused, and the gate stays open.
+- **One approval, one revision, as shown.** The approval covers the revision
+  the gate showed while the Company still says the same of it: when the
+  Company answers `terms_changed`, or says other terms under the same
+  revision, the User is asked again, on a new task, the change named;
+  when it answers `user_approval_required`, the User is asked even though a
+  standing permission applied. Each question is a task of its own: asked
+  again, the earlier question's task closes — cancelled when it was made for
+  the question, back to working when it is the work's own, saying where the
+  new question is — and refuses every message while the confirm lives, so a
+  second `approve` where revision 1 was shown approves nothing, and the
+  records of the answer and of the confirm it sent name the task that asked.
+- **The model passes nothing that approves.** The tool takes the company and
+  the operation's id, and a call naming a revision or `approved_by` is
+  refused by its arguments.
+- **Cancelling its task, or the 24-hour timeout, while the gate is open
+  confirms nothing**, and a restart ends a gate it finds open,
+  `interrupted`. Once the User approved and the confirm is on its way, a
+  cancel of the work that asked stops it before it is sent; if the Company
+  took it, or may have, agentd cancels the operation there (Operations §7),
+  and the confirm's record is kept.
+
+The gate's question (`asked`) and answer (`approved`, `declined`), a standing
+permission's use (`company.standing`), the confirm — `confirmed`,
+`not_confirmed` (the Company answered and did nothing with it),
+`confirm_refused`, `confirm_unknown` or `confirm_unsent`, with `approved_by`
+and the state — a withdrawal (`withdrawn`) and the final state (`final`) are
+audit records (`company.operation`) naming the same `operation_id` and
+revision.
+
+### Direct Conversations
+
+When a Company asks to talk with the User (`user_requested`), or the model
+asks with `company.direct {company, conversation}`, the User decides whether
+to talk with the Company themselves, in a Direct Conversation linked to the
+one the agent is having there:
+
+- **The question is the User's own task**, made for it and owned by them —
+  for a Company's request, only when the A2A listener serves and
+  `agent.ask_human_unowned` is `gate`; otherwise agentd says in the
+  conversation that the User is not available. Its text is agentd's, the
+  Company's reason quoted.
+- **Their answer is their first message**, sent as they wrote it with
+  `sender: human`, or `decline`, which agentd says in the conversation, as
+  does a question unanswered for 30 minutes, cancelled, or open at a
+  restart. Only the User answers it; an operator who is not the User is
+  refused.
+- **The task becomes the conversation.** Every message the User sends on it
+  goes to the Company as they wrote it, `sender: human`, and every message
+  the Company sends there comes to it, labelled as the Company's. Nothing
+  else is ever sent there: the model's `company.converse` and
+  `company.handoff` refuse a Direct Conversation, and a Company asking in it
+  to talk with the User is asked nothing and told nothing. It ends when the
+  conversation closes, and cancelling the task closes it at the Company. A
+  restart keeps it.
+- **While the first message is on its way** the task takes no other: one
+  sent then is refused, to be sent again in a moment. A restart then sends
+  the first message again under the id it was sent with, and the Company
+  answers with the conversation it started.
 
 ## Answer from a client
 

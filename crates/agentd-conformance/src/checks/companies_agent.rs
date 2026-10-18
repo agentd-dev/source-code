@@ -11,7 +11,10 @@
 //! The sign-in checks give agentd a unix A2A listener to ask the User on and
 //! let the gate of unowned work open (`agent.ask_human_unowned: gate`); the
 //! fake's scripted User signs in at the Company, as a person would, and
-//! nobody answers the gate.
+//! nobody answers the gate. The Operations and Direct Conversation checks
+//! give it a loopback A2A listener with no credential, whose caller is the
+//! operator — and with `security.companies.user` left `operator`, the User —
+//! and answer the User's gate there as the User would.
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +22,7 @@ use serde_json::Value;
 
 use super::companies::{Page, Quote};
 use crate::checks::probe::{Agent, Company};
+use crate::checks::util::{free_port, rpc, rpc_value, text_params, wait_ready};
 use crate::harness::{Daemon, TempDir, tls_fixture};
 use crate::{Category, Check, Harness, Outcome};
 
@@ -137,7 +141,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check(
             "companies/agent-says-the-user-is-not-available",
-            "when the Company Agent asks to talk with the User, agentd — which offers no Direct Conversation yet — says in the conversation that the User is not available, once, as the agent",
+            "when the Company Agent asks to talk with the User and nobody can ask them, agentd says in the conversation that the User is not available, once, as the agent, and starts no Direct Conversation",
             says_the_user_is_not_available,
         ),
         check(
@@ -150,6 +154,41 @@ pub fn checks() -> Vec<Check> {
             "an API write whose operation declares Idempotency-Key, its answer lost, is sent again with the same version 4 UUID, and gets the first answer",
             reuses_an_idempotency_key_on_retry,
         ),
+        check(
+            "companies/agent-lists-the-operations-extension",
+            "with client.extensions [operations], the client metadata document the fake fetched lists operations at version 1, and the fake proposes the exchange as an operation; without it, the exchange is made, and nothing agentd sends confirms anything",
+            lists_the_operations_extension,
+        ),
+        check(
+            "companies/agent-confirms-only-what-the-user-approved",
+            "a run's confirm of a proposed operation, with nobody to ask and agent.approval and the ask_human fallback auto, sends nothing to the operations endpoint; with the User asked at their gate — its text naming the Company and quoting the revision's summary — and answering approve, the confirm goes once, approved_by user, with the revision the gate showed",
+            confirms_only_what_the_user_approved,
+        ),
+        check(
+            "companies/agent-asks-again-when-the-terms-change",
+            "a confirm the Company answers terms_changed is not sent again under the old approval: the User is asked about the new revision, and only their approve of it sends a confirm, of that revision",
+            asks_again_when_the_terms_change,
+        ),
+        check(
+            "companies/agent-reads-an-operation-in-progress-after-retry-after",
+            "a confirm answered in_progress with Retry-After is followed by a read of the operation no sooner than the wait, with the same operation id, until it is final",
+            reads_an_operation_in_progress_after_retry_after,
+        ),
+        check(
+            "companies/agent-retries-a-confirm-with-the-same-operation",
+            "a confirm whose answer is lost after the Company took it is sent again with the same operation id and revision, and the tool that proposed the operation is not called again",
+            retries_a_confirm_with_the_same_operation,
+        ),
+        check(
+            "companies/agent-asks-the-user-before-a-direct-conversation",
+            "when the Company Agent asks to talk with the User, agentd asks the User at their gate and starts no Direct Conversation until they answer; their answer is the first message, as they wrote it, sender human, with parent_conversation_id the conversation the Company asked in",
+            asks_the_user_before_a_direct_conversation,
+        ),
+        check(
+            "companies/agent-says-a-decline-in-the-conversation",
+            "when the User declines to talk with the Company directly, agentd says so in the conversation the Company asked in, once, as the agent, and starts no Direct Conversation",
+            says_a_decline_in_the_conversation,
+        ),
     ]
 }
 
@@ -157,6 +196,15 @@ const fn spec(check: &'static str, section: &'static str, text: &'static str) ->
     Quote {
         check,
         page: Page::Spec,
+        section,
+        text,
+    }
+}
+
+const fn ops(check: &'static str, section: &'static str, text: &'static str) -> Quote {
+    Quote {
+        check,
+        page: Page::Operations,
         section,
         text,
     }
@@ -373,6 +421,51 @@ pub const QUOTES: &[Quote] = &[
         "Retries",
         "Send an `Idempotency-Key` on API writes that accept one. Use a random UUID (version 4), and reuse the same key when you retry the same request.",
     ),
+    ops(
+        "companies/agent-lists-the-operations-extension",
+        "2",
+        "A Personal Agent that supports operations lists the extension in its client metadata document (spec 4.1):",
+    ),
+    ops(
+        "companies/agent-confirms-only-what-the-user-approved",
+        "5.1",
+        "Before confirming, the Personal Agent MUST have the User's approval for the revision it confirms, in one of two ways:",
+    ),
+    ops(
+        "companies/agent-confirms-only-what-the-user-approved",
+        "5.1",
+        "The Personal Agent MUST show the User the Company's name and the revision's `summary`, and MUST take the User's answer through its own interface.",
+    ),
+    ops(
+        "companies/agent-asks-again-when-the-terms-change",
+        "5.1",
+        "An approval covers one revision. When a new revision arrives, the Personal Agent needs a new approval for it, unless a standing permission covers it.",
+    ),
+    ops(
+        "companies/agent-reads-an-operation-in-progress-after-retry-after",
+        "6",
+        "While it is `in_progress`, the Company SHOULD include `Retry-After`, and the Personal Agent reads again after that time.",
+    ),
+    ops(
+        "companies/agent-retries-a-confirm-with-the-same-operation",
+        "6",
+        "If a confirm request fails or times out, the Personal Agent retries it or reads the operation, with the same operation ID. It MUST NOT ask for a new proposal of the same action until the operation is final.",
+    ),
+    spec(
+        "companies/agent-asks-the-user-before-a-direct-conversation",
+        "7.10",
+        "Only the Personal Agent starts Direct Conversations, so the User decides when they're brought in.",
+    ),
+    spec(
+        "companies/agent-asks-the-user-before-a-direct-conversation",
+        "7.10",
+        "The Personal Agent sends the User's messages as written, with `sender: \"human\"` (7.8), and shows the Company's replies to the User.",
+    ),
+    spec(
+        "companies/agent-says-a-decline-in-the-conversation",
+        "7.10",
+        "If they decline or aren't available, it says so in the conversation.",
+    ),
 ];
 
 fn verdict(r: Result<(), String>) -> Outcome {
@@ -396,6 +489,8 @@ struct Run {
     tmp: TempDir,
     cfg: String,
     daemon: Option<Daemon>,
+    /// The loopback A2A listener's `host:port`, when it has one.
+    a2a: Option<String>,
 }
 
 /// What a check declares beside the one Company `shop`.
@@ -414,6 +509,11 @@ struct Extra<'a> {
     /// run's own, a unix A2A listener to ask the User on, and the gate of
     /// unowned work let open.
     signs_in: bool,
+    /// Fields the client identity gets: `extensions`.
+    client: &'a str,
+    /// A loopback A2A listener with no credential — its caller the operator,
+    /// who is the User — and the gate of unowned work let open.
+    listens: bool,
 }
 
 impl Run {
@@ -505,6 +605,13 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
         listener = format!("a2a:\n  listen: \"unix://{dir}/a2a.sock\"\n");
         agent.push_str("  ask_human_unowned: gate\n");
     }
+    let mut a2a = None;
+    if extra.listens {
+        let addr = format!("127.0.0.1:{}", free_port());
+        listener = format!("a2a:\n  listen: \"http://{addr}\"\n");
+        agent.push_str("  ask_human_unowned: gate\n");
+        a2a = Some(addr);
+    }
     let mut services = entry("shop", &company.origin);
     for (name, c) in &more {
         services.push_str(&entry(name, &c.origin));
@@ -517,11 +624,12 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
              store: {{kind: file, file: {{path: \"{dir}/state\"}}}}\n\
              lifecycle: {{run_until: drained}}\n\
              observability: {{log_level: debug, log_content: true}}\n\
-             security:\n  tls_ca: \"{ca}\"\n  companies:\n    client: {{id: \"{o}/companies/client.json\", name: \"agentd conformance\", key_file: \"{dir}/client-key\"}}\n{companies}\
+             security:\n  tls_ca: \"{ca}\"\n  companies:\n    client: {{id: \"{o}/companies/client.json\", name: \"agentd conformance\", key_file: \"{dir}/client-key\"{client}}}\n{companies}\
              services:\n{services}{listener}{rest}",
             ca = tls_fixture("ca.pem").display(),
             o = host.origin,
             rest = extra.rest,
+            client = extra.client,
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -551,6 +659,7 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
         tmp,
         cfg,
         daemon: None,
+        a2a,
     })
 }
 
@@ -1638,6 +1747,428 @@ fn reuses_an_idempotency_key_on_retry(h: &Harness) -> Outcome {
         need(
             s[1]["duplicate"] == true && s[1]["status"] == 201,
             format!("the retry was not answered as the first: {}", s[1]),
+        )
+    })())
+}
+
+/// The client identity listing the Operations extension.
+const LISTS: &str = ", extensions: [operations]";
+
+/// A run that proposes an exchange with the Company's MCP tool — tried
+/// again until the Company's server has joined — and confirms the operation
+/// it answers with.
+const EXCHANGE: &str = "      p: {kind: tool, name: shop.exchange_item, args: {order_id: ord_7Hk2, item_id: itm_4Qa, replacement_sku: stormline-insulated-m}, depends_on: [s], retry: {max: 40, backoff: 250ms}}\n      c: {kind: tool, name: company.operation.confirm, args: {company: shop, operation_id: \"{{steps.p.output.operation.operation_id}}\"}, depends_on: [p]}\n";
+
+/// agentd listing the Operations extension, `controls` steering the fake
+/// first, `agent` lines under `agent:`, and — with `listens` — a loopback
+/// listener the User is asked on; its run proposes and confirms an exchange.
+fn operating(h: &Harness, controls: &[Value], agent: &str, listens: bool) -> Result<Run, String> {
+    let rest = once("exchange", EXCHANGE, "c");
+    let mut run = prepare_with(
+        h,
+        &[],
+        &Extra {
+            client: LISTS,
+            agent,
+            listens,
+            rest: &rest,
+            ..Extra::default()
+        },
+    )?;
+    for c in controls {
+        run.company.control(c.clone());
+    }
+    run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+    if let Some(addr) = &run.a2a {
+        wait_ready(addr);
+    }
+    Ok(run)
+}
+
+/// The text of a task's status message.
+fn status_text(t: &Value) -> String {
+    t["status"]["message"]["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The task on `addr` whose question holds `text`, once one does.
+fn question(addr: &str, text: &str) -> Result<Value, String> {
+    let mut found = None;
+    wait(40, &format!("a question holding {text:?}"), || {
+        let tasks = rpc(addr, 70, "ListTasks", serde_json::json!({"pageSize": 100}));
+        found = tasks["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| {
+                t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED" && status_text(t).contains(text)
+            })
+            .cloned();
+        found.is_some()
+    })?;
+    found.ok_or_else(|| "no question".to_string())
+}
+
+/// Answer the question `task` with `text`, as the User.
+fn answer(addr: &str, task: &Value, text: &str) -> Result<(), String> {
+    let id = task["id"].as_str().ok_or("a task without an id")?;
+    let v = rpc_value(addr, 71, "SendMessage", text_params(text, Some(id), true));
+    need(
+        v.get("error").is_none(),
+        format!("the answer was refused: {v}"),
+    )
+}
+
+/// The operation requests that reached the fake: `/confirm`s, or reads.
+fn operation_requests(record: &[Value], confirm: bool) -> Vec<Value> {
+    record
+        .iter()
+        .filter(|r| {
+            r["operation_request"] == true
+                && (r["method"] == "POST"
+                    && r["path"].as_str().is_some_and(|p| p.ends_with("/confirm")))
+                    == confirm
+                && (confirm || r["method"] == "GET")
+        })
+        .cloned()
+        .collect()
+}
+
+/// The operation the fake proposed to agentd.
+fn proposed(record: &[Value]) -> Vec<String> {
+    record
+        .iter()
+        .filter_map(|r| r["operation_proposed"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn lists_the_operations_extension(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = operating(
+            h,
+            &[],
+            "  approval: auto\n  ask_human_fallback: auto\n",
+            false,
+        )?;
+        wait(40, "an operation proposed", || {
+            !proposed(&run.record()).is_empty()
+        })?;
+        let fetched = run
+            .record()
+            .into_iter()
+            .find(|r| {
+                r["validated"]
+                    .as_array()
+                    .is_some_and(|v| v.contains(&serde_json::json!("client-metadata.schema.json")))
+            })
+            .ok_or("the fake never fetched the client metadata document")?;
+        let _ = fetched;
+        let doc: Value = serde_json::from_slice(
+            &std::fs::read(run.tmp.path().join("published/client.json"))
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        need(
+            doc["extensions"]["operations"]["version"] == "1",
+            format!("the client metadata document lists no operations, version 1: {doc}"),
+        )?;
+        // Without the extension, the same call makes the exchange.
+        let plain = prepare_with(
+            h,
+            &[],
+            &Extra {
+                rest: &once(
+                    "exchange",
+                    "      p: {kind: tool, name: shop.exchange_item, args: {order_id: ord_7Hk2, item_id: itm_4Qa, replacement_sku: stormline-insulated-m}, depends_on: [s], retry: {max: 40, backoff: 250ms}}\n",
+                    "p",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        let mut plain = plain;
+        plain.daemon = Some(h.spawn(&["--config", &plain.cfg]));
+        wait(40, "the exchange made", || {
+            tools_calls(&plain.record())
+                .iter()
+                .any(|c| c["status"] == 200)
+        })?;
+        need(
+            proposed(&plain.record()).is_empty(),
+            "the fake proposed an operation to an agent that does not list the extension",
+        )
+    })())
+}
+
+fn confirms_only_what_the_user_approved(h: &Harness) -> Outcome {
+    verdict((|| {
+        // Nobody to ask, and every fallback a judge: nothing is confirmed.
+        let run = operating(
+            h,
+            &[],
+            "  approval: auto\n  ask_human_fallback: auto\n",
+            false,
+        )?;
+        wait(40, "the operation read before the confirm", || {
+            !operation_requests(&run.record(), false).is_empty()
+        })?;
+        std::thread::sleep(Duration::from_millis(1500));
+        need(
+            operation_requests(&run.record(), true).is_empty(),
+            "a confirm reached the Company with nobody to approve it",
+        )?;
+        // The User asked, and approving.
+        let run = operating(h, &[], "", true)?;
+        let addr = run.a2a.clone().ok_or("no listener")?;
+        let gate = question(&addr, "asks you to approve this")?;
+        let q = status_text(&gate);
+        need(
+            q.contains("\"Fake Company\" (127.0.0.1)")
+                && q.contains("The Company says: \"Exchange item itm_4Qa on order ord_7Hk2"),
+            format!("the question names no Company or summary: {q}"),
+        )?;
+        need(
+            operation_requests(&run.record(), true).is_empty(),
+            "a confirm reached the Company before the User answered",
+        )?;
+        answer(&addr, &gate, "approve")?;
+        wait(40, "the confirm", || {
+            !operation_requests(&run.record(), true).is_empty()
+        })?;
+        std::thread::sleep(Duration::from_millis(500));
+        let sent = operation_requests(&run.record(), true);
+        need(
+            sent.len() == 1,
+            format!("{} confirms were sent", sent.len()),
+        )?;
+        need(
+            sent[0]["approved_by"] == "user" && sent[0]["revision"] == 1,
+            format!(
+                "the confirm is not the User's approval of revision 1: {}",
+                sent[0]
+            ),
+        )
+    })())
+}
+
+fn asks_again_when_the_terms_change(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = operating(
+            h,
+            &[serde_json::json!({"operations": {"revise": 1}})],
+            "",
+            true,
+        )?;
+        let addr = run.a2a.clone().ok_or("no listener")?;
+        let gate = question(&addr, "This is revision 1 of operation")?;
+        answer(&addr, &gate, "approve")?;
+        let again = question(&addr, "This is revision 2 of operation")?;
+        let sent = operation_requests(&run.record(), true);
+        need(
+            sent.len() == 1 && sent[0]["error"] == "terms_changed",
+            format!("the first confirm was not the one the terms changed under: {sent:?}"),
+        )?;
+        answer(&addr, &again, "approve")?;
+        wait(40, "the second confirm", || {
+            operation_requests(&run.record(), true).len() >= 2
+        })?;
+        let sent = operation_requests(&run.record(), true);
+        need(
+            sent.len() == 2 && sent[1]["revision"] == 2 && sent[1]["approved_by"] == "user",
+            format!("revision 2 was not confirmed with the User's approval of it: {sent:?}"),
+        )
+    })())
+}
+
+fn reads_an_operation_in_progress_after_retry_after(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = operating(
+            h,
+            &[serde_json::json!({"operations": {"in_progress": 1}})],
+            "",
+            true,
+        )?;
+        let addr = run.a2a.clone().ok_or("no listener")?;
+        let gate = question(&addr, "asks you to approve this")?;
+        answer(&addr, &gate, "approve")?;
+        wait(40, "the confirm", || {
+            !operation_requests(&run.record(), true).is_empty()
+        })?;
+        let confirmed = operation_requests(&run.record(), true)[0].clone();
+        need(
+            confirmed["op_state"] == "in_progress",
+            format!("the confirm was not answered in_progress: {confirmed}"),
+        )?;
+        let at = confirmed["at_ms"].as_u64().unwrap_or(0);
+        wait(40, "a read after the confirm", || {
+            operation_requests(&run.record(), false)
+                .iter()
+                .any(|r| r["at_ms"].as_u64() > Some(at))
+        })?;
+        let read = operation_requests(&run.record(), false)
+            .into_iter()
+            .find(|r| r["at_ms"].as_u64() > Some(at))
+            .ok_or("no read")?;
+        need(
+            read["at_ms"].as_u64().unwrap_or(0) >= at + 2_000,
+            format!(
+                "read {} ms after the confirm's answer, which asked for 2 s",
+                read["at_ms"].as_u64().unwrap_or(0) - at
+            ),
+        )?;
+        need(
+            read["operation_id"] == confirmed["operation_id"],
+            "the read named another operation",
+        )
+    })())
+}
+
+fn retries_a_confirm_with_the_same_operation(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = operating(
+            h,
+            &[
+                serde_json::json!({"http_fail": {"method": "POST", "path": "/poppy/operations/", "times": 1, "status": 502}}),
+            ],
+            "",
+            true,
+        )?;
+        let addr = run.a2a.clone().ok_or("no listener")?;
+        let gate = question(&addr, "asks you to approve this")?;
+        answer(&addr, &gate, "approve")?;
+        wait(40, "the confirm sent again", || {
+            operation_requests(&run.record(), true).len() >= 2
+        })?;
+        std::thread::sleep(Duration::from_millis(500));
+        let sent = operation_requests(&run.record(), true);
+        need(
+            sent[0]["failed"] == 502,
+            format!(
+                "the first confirm was not the one whose answer was lost: {}",
+                sent[0]
+            ),
+        )?;
+        need(
+            sent[0]["operation_id"] == sent[1]["operation_id"]
+                && sent[0]["revision"] == sent[1]["revision"],
+            format!("the confirm was sent again for another operation or revision: {sent:?}"),
+        )?;
+        need(
+            proposed(&run.record()).len() == 1,
+            "the tool that proposed the operation was called again",
+        )
+    })())
+}
+
+/// agentd talking with the Company's agent, which asks to talk with the
+/// User after its first reply; the User is asked on a loopback listener.
+fn asked_for_the_user(h: &Harness) -> Result<Run, String> {
+    let rest = once(
+        "talk",
+        "      c: {kind: tool, name: company.converse, args: {company: shop, text: \"I would like some help.\"}, depends_on: [s]}\n",
+        "c",
+    );
+    let mut run = prepare_with(
+        h,
+        &[],
+        &Extra {
+            entry: ", interfaces: [agent]",
+            listens: true,
+            rest: &rest,
+            ..Extra::default()
+        },
+    )?;
+    run.company.control(
+        serde_json::json!({"conversation": {"user_requested": "A specialist needs to confirm the exchange."}}),
+    );
+    run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+    if let Some(addr) = &run.a2a {
+        wait_ready(addr);
+    }
+    Ok(run)
+}
+
+fn asks_the_user_before_a_direct_conversation(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = asked_for_the_user(h)?;
+        let addr = run.a2a.clone().ok_or("no listener")?;
+        let gate = question(&addr, "asks to talk with you directly")?;
+        need(
+            status_text(&gate).contains("It says: \"A specialist needs to confirm the exchange.\""),
+            format!(
+                "the question does not quote the Company: {}",
+                status_text(&gate)
+            ),
+        )?;
+        let started = |r: &[Value]| -> Vec<Value> {
+            r.iter()
+                .filter(|m| m["parent_conversation_id"].is_string())
+                .cloned()
+                .collect()
+        };
+        need(
+            started(&run.record()).is_empty(),
+            "a Direct Conversation started before the User answered",
+        )?;
+        let parent = run
+            .record()
+            .into_iter()
+            .find_map(|r| r["conversation"].as_str().map(str::to_string))
+            .ok_or("no conversation")?;
+        let words = "Hello — this is the User, about the exchange.";
+        answer(&addr, &gate, words)?;
+        wait(40, "the Direct Conversation", || {
+            !started(&run.record()).is_empty()
+        })?;
+        let first = started(&run.record())[0].clone();
+        need(
+            first["sender"] == "human" && first["text"] == words,
+            format!("the first message is not the User's words as they wrote them: {first}"),
+        )?;
+        need(
+            first["parent_conversation_id"] == parent.as_str(),
+            format!("it does not follow the conversation the Company asked in: {first}"),
+        )?;
+        for m in messages(&run.record()) {
+            need(
+                m["sender"] == "agent" || (m["sender"] == "human" && m["text"] == words),
+                format!("a message carries sender human that is not the User's words: {m}"),
+            )?;
+        }
+        Ok(())
+    })())
+}
+
+fn says_a_decline_in_the_conversation(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = asked_for_the_user(h)?;
+        let addr = run.a2a.clone().ok_or("no listener")?;
+        let gate = question(&addr, "asks to talk with you directly")?;
+        answer(&addr, &gate, "decline")?;
+        let said = |r: &[Value]| -> Vec<Value> {
+            messages(r)
+                .into_iter()
+                .filter(|m| m["text"].as_str().is_some_and(|t| t.contains("declined")))
+                .cloned()
+                .collect()
+        };
+        wait(40, "the decline said", || !said(&run.record()).is_empty())?;
+        std::thread::sleep(Duration::from_millis(1000));
+        let declined = said(&run.record());
+        need(
+            declined.len() == 1,
+            format!("said {} times", declined.len()),
+        )?;
+        need(declined[0]["sender"] == "agent", "not said as the agent")?;
+        need(
+            !run.record()
+                .iter()
+                .any(|r| r["parent_conversation_id"].is_string()),
+            "a Direct Conversation started after the User declined",
         )
     })())
 }

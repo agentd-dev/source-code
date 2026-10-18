@@ -76,6 +76,36 @@ pub mod event {
 /// Who wrote a message (§7.4, §7.8).
 pub const SENDER_AGENT: &str = "agent";
 pub const SENDER_HUMAN: &str = "human";
+/// Who a Company message's side is, as the Company records it (§7.4).
+pub const ROLE_COMPANY: &str = "company";
+
+/// The document member listing extensions, in a discovery document and a
+/// client metadata document (§3.3, §4.1).
+pub const EXTENSIONS_MEMBER: &str = "extensions";
+
+/// The Operations extension, version 1 (Operations §2–§9).
+pub mod operations {
+    /// Its name under `extensions`, and the version agentd speaks.
+    pub const EXTENSION: &str = "operations";
+    pub const VERSION: &str = "1";
+    /// The member an operation travels in: an MCP result's
+    /// `structuredContent`, an OpenAPI `202` body, a message (§4).
+    pub const MEMBER: &str = "operation";
+    /// The requests under the operations endpoint (§5.2, §7).
+    pub const CONFIRM: &str = "confirm";
+    pub const CANCEL: &str = "cancel";
+    /// How the User's approval was given (§5.1).
+    pub const APPROVED_BY_USER: &str = "user";
+    pub const APPROVED_BY_STANDING: &str = "standing_permission";
+    /// An operation's states (§3); the last four are final.
+    pub const PROPOSED: &str = "proposed";
+    pub const IN_PROGRESS: &str = "in_progress";
+    pub const SUCCEEDED: &str = "succeeded";
+    pub const FAILED: &str = "failed";
+    pub const CANCELLED: &str = "cancelled";
+    pub const EXPIRED: &str = "expired";
+    pub const FINAL: [&str; 4] = [SUCCEEDED, FAILED, CANCELLED, EXPIRED];
+}
 /// The status of a conversation that takes no more messages (§7.7).
 pub const STATUS_CLOSED: &str = "closed";
 
@@ -150,4 +180,8 @@ pub mod error {
     pub const MESSAGE_ID_CONFLICT: &str = "message_id_conflict";
     pub const INVALID_CURSOR: &str = "invalid_cursor";
     pub const CURSOR_EXPIRED: &str = "cursor_expired";
+    /// The operations endpoint's errors (Operations §9).
+    pub const OPERATION_NOT_FOUND: &str = "operation_not_found";
+    pub const TERMS_CHANGED: &str = "terms_changed";
+    pub const USER_APPROVAL_REQUIRED: &str = "user_approval_required";
 }

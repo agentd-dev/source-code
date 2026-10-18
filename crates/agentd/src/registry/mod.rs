@@ -271,15 +271,17 @@ impl Registry {
                             .any(|s| s.event_grants.iter().any(|g| g.tools))
                 }
                 // Signing in and out only where a Company lets agentd sign
-                // the User in; conversations and API calls only where one
-                // uses those interfaces.
+                // the User in; conversations, Direct Conversations and API
+                // calls only where one uses those interfaces; operations
+                // only where agentd lists the Operations extension.
                 "companies" => {
                     use crate::config::settings::companies::{self as co, Interface};
                     cfg!(feature = "companies")
                         && co::any_company(settings)
                         && match c.name {
                             "company.sign_in" | "company.sign_out" => co::signs_in(settings),
-                            n if co::is_conversation_tool(n) => {
+                            n if co::is_operation_tool(n) => co::lists_operations(settings),
+                            n if co::is_conversation_tool(n) || n == co::DIRECT_TOOL => {
                                 co::any_uses(settings, Interface::Agent)
                             }
                             n if co::is_interface_tool(n) => {

@@ -933,6 +933,20 @@ impl Runtime {
                         let out = crate::companies::signin::Outcome::Interrupted.result(company).unwrap_or_default();
                         resolve.push((rid.clone(), sid.clone(), StepStatus::Done, out, None));
                     }
+                    // A confirm this process does not hold was a previous
+                    // life's: whatever it reached is in the ledger, and the
+                    // operation says where it is.
+                    #[cfg(feature = "companies")]
+                    Some("company_operation") if !self.company_operations.contains_key(w["operation"].as_str().unwrap_or_default()) => {
+                        let company = w["company"].as_str().unwrap_or_default();
+                        let why = format!("company {company}: agentd restarted while confirming this operation; company.operation.get reads where it is, and company.operation.confirm asks again");
+                        resolve.push((rid.clone(), sid.clone(), StepStatus::Failed, Value::Null, Some(why)));
+                    }
+                    #[cfg(feature = "companies")]
+                    Some("company_direct") if !self.company_directs.contains_key(w["direct"].as_str().unwrap_or_default()) => {
+                        let company = w["company"].as_str().unwrap_or_default();
+                        resolve.push((rid.clone(), sid.clone(), StepStatus::Done, json!({"company": company, "outcome": "interrupted"}), None));
+                    }
                     // Absence IS the branch: an event that never arrives routes
                     // through `on_timeout` like any other deadline, which is
                     // what makes "alert fired, no recovery in ten minutes"

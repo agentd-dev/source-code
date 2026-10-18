@@ -514,11 +514,155 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   read on from after a restart, the User not available said in the
   conversation, a Session Token with every API and conversation request, an
   `Idempotency-Key` reused on retry.
+- A Company's operations (RFC 0047, P4; the draft's Operations extension,
+  version 1). With `security.companies.client.extensions: [operations]` the
+  client metadata document lists the extension, and an operation a Company
+  proposes — in an MCP result's `structuredContent.operation`, an OpenAPI
+  `202 {operation}` or a conversation message's `operation` — is kept in the
+  User's sealed ledger at the Company with the Session it was proposed in,
+  every channel it came through and the SHA-256 of the request that proposed
+  it (the tool and its arguments, or the method, path, query and body, as
+  canonical JSON). Nothing proposed is acted on. `company.operation.get` and
+  `company.operation.cancel {company, operation_id}` read and cancel one;
+  `company.operation.confirm {company, operation_id}` confirms it and takes
+  nothing else — a revision or `approved_by` from the model is refused by
+  the tool's arguments. It reads the operation again at the operations
+  endpoint (never the model's copy), requires it `proposed` and unexpired,
+  and sends `{revision, approved_by}` only with the User's approval of that
+  revision — while the Company says of it what their gate showed: other
+  terms under the same revision ask again (`company.operation.rewritten`) —
+  or a standing permission that covers it, under the operation's lock (a
+  compare-and-set on the ledger record), again with the same id and
+  revision when no answer came. `terms_changed` asks again, the change
+  named; `user_approval_required` asks the User, never a permission;
+  `in_progress` is read again after its `Retry-After` from the ledger, so
+  across a restart too, by a thread per Company; a confirm no attempt of
+  which was answered, or whose answer agentd could not keep, is `outcome
+  unknown`, its lock let go, read until it is final, and a later confirm
+  sends the one the User approved. A 200 with no confirmation in it
+  confirmed nothing (`not_confirmed`). While an operation is not final the
+  request that proposed it is refused unsent, and an operation of the same
+  terms in the same Session as an older open one is not confirmed. A final
+  state is appended to the stream `company.<name>` — which every entry has
+  once the extension is listed — subject `operation`, carrying the
+  Company's origin, and the operation answers as agentd's view with the
+  Company's words under `operation`.
+- **The approval gate**, a Company gate: the User's alone — an operator who
+  is not the User is refused, no judge answers it — on the task of the work
+  that asks, or in unowned work with `agent.ask_human_unowned: gate` on one
+  made for it, its text agentd's: the Company's quoted name beside its
+  verified domain, the account, the summary as written, the terms flattened
+  beside it, the revision, when it expires and what changed. `approve`
+  confirms with `approved_by: user`; `decline` cancels the operation at the
+  Company; anything else is refused with the gate left open, and so is a
+  message the task holds already, which answers no later question. Each
+  question is a task of its own: asked again, the User is asked on a new
+  task and the earlier one closes — cancelled when it was made for the
+  question — refusing every message while the confirm lives, so a second
+  `approve` where an earlier revision was shown approves nothing, and the
+  confirm's audit record names the task whose question the User answered.
+  Cancelling its task while it is open, or 24 hours, confirms nothing, and a
+  restart ends one it finds open. Once the confirm is on its way, a cancel
+  of the work that asked stops it before it is sent, or — the Company having
+  taken it, or maybe — cancels the operation there (Ops §7), the confirm's
+  records kept and the withdrawal audited.
+- **Standing permissions**, `security.companies.standing[]` (restart-only,
+  operator-only, needs `cel`): `{company, via: {tool: <glob>} | {api:
+  "METHOD /path-template"}, terms: [<keys>], when: <CEL>, expires, uses?}`.
+  One applies only when the Company does not require the User's own
+  approval, every channel the operation came through is `via` — one
+  proposed in a conversation never matches — the revision has terms and
+  every top-level key is listed, `when` over `terms` and `summary` is true
+  with every term it reads present, it has not expired, and a use is free —
+  asked again at each confirm, a retry's too. A limited use is reserved
+  with the confirm's lock, spent once the Company records a confirmation by
+  the permission, and given back when it does not take the confirm or the
+  operation ends unconfirmed, so two calls racing for the last one confirm
+  once and a cancel after a taken confirm gives nothing back. Operations
+  final with nothing to hand on, proposed ones a day after they expired,
+  and proposed ones past 128 are forgotten; none confirmed and not final
+  is. A sign-in to a new account suspends the Company's
+  standing permissions until a restart. Load refuses one that could never
+  apply, naming why: without the extension listed, a company that is not an
+  entry, a `via` that is not exactly one channel or names no tool of the
+  Company's servers or no operation in `api_allow`, `terms` empty or
+  repeated, `when` without `cel` or not CEL, `expires` not RFC 3339,
+  `uses: 0`.
+- **Direct Conversations** (draft §7.10). A `user_requested` event asks the
+  User, on a task of its own they own, whether to talk with the Company
+  directly — at most one question per conversation at a time, when the A2A
+  listener serves and `agent.ask_human_unowned` is `gate` — and the model may
+  ask with `company.direct {company, conversation}`, pending until they
+  answer. The question is the User's alone, its text agentd's with the
+  Company's reason quoted. Their answer is the Direct Conversation's first
+  message, sent as they wrote it with `parent_conversation_id` and `sender:
+  human`, or `decline`, which agentd says in the conversation the Company
+  asked in, as it says the User is not available when nobody can ask them,
+  they do not answer in 30 minutes, cancel the task, or a restart finds it
+  open. The task then relays the conversation: what the User sends on it
+  goes to the Company as they wrote it, `sender: human`, under a message id
+  kept for their A2A message — once, however often their client sends it —
+  and what the Company says there is posted to it as the Company's words;
+  it ends when the conversation closes, a cancelled task closes it at the
+  Company, and a restart binds it again. While the first message is on its
+  way the task takes no other, and a restart sends it again under the id it
+  was sent with. `company.converse` and `company.handoff` refuse a Direct
+  Conversation, and a `user_requested` in one asks nothing and says
+  nothing.
+- Events `company.operation.{proposed, refused, asked, approved, declined,
+  confirmed, read, read_failed, final, interrupted, rewritten, withdrawn,
+  cancelled}`, `company.standing.{used, suspended}`,
+  `company.direct.{requested, repeated, asked, joined, conversation,
+  undelivered, closed, resumed, ignored}`;
+  `company.conversation.declined` gains `answer` and
+  `company.conversation.opened` `direct`. Audit records `company.operation`
+  (`asked`, `approved`, `declined`, `not_addressed`, `confirmed`,
+  `not_confirmed`, `confirm_refused`, `confirm_unknown`, `confirm_unsent`,
+  `withdrawn`, `final`), each naming the `operation_id` and revision,
+  `company.standing` (`used`) and `company.direct`. The counter
+  `agent_company_operations_total{company, state, approved_by}`;
+  `agent_company_gates_total` counts kinds `operation` and `direct`, and
+  `agent_company_requests_total` the interface `operations`.
+- `agentd-core`: `companies::{operations, direct}` —
+  `Supervisor::{recognise, repeats, get_operation, cancel_operation,
+  confirm_operation, track_operations, standing_suspended, suspend_standing,
+  operations_listed, notify_to, set_direct_askable, join_direct,
+  relay_words, say_declined, may_follow}`, `operations::{Sent, sent, Step,
+  Outcome, Rule, Final, covers, question, canonical, call_digest,
+  api_digest, approval_digest}`, `direct::{Asked, Answer, answer_of,
+  question, relayed}`, `companies::{Notice, Notify}`, `ledger::{Operation,
+  Channel, Approval, Uses, Book::{settle, trim_operations}, LAPSED_FOR_MS,
+  PROPOSED}`, `conversation::DECLINED`, `a2a::tasks::Task::holds_inbound`,
+  `discover::Verified::operations`, `wire::{operations, EXTENSIONS_MEMBER,
+  ROLE_COMPANY}`, `config::settings::companies::{Extension, Standing, Via,
+  lists_operations, has_stream, is_operation_tool, OPERATION_TOOLS,
+  DIRECT_TOOL}`, `a2a::tasks::{CompanyGate, CompanyGateKind}` and
+  `obs::log::rfc3339_ms`. The fake Company lists the Operations extension
+  and proposes an exchange as an operation to an agent that lists it — by
+  the MCP tool `exchange_item`, the API's exchanges and the Company Agent —
+  serves the operations endpoint held to §5.2 (the latest revision, an
+  allowed `approved_by`, a state other than `proposed` answered as it is)
+  and Direct Conversations; its control gains `operations` (`in_progress`,
+  `revise`, `user_approval_required`, `refuse_standing`,
+  `insufficient_scope`, `drop`, `cancel_first`, `rewrite`, `extra_term`,
+  `no_terms`), a `user_requested` asked in a Direct Conversation too, and
+  its record an operation request's id, revision,
+  `approved_by` and state, and a message's `parent_conversation_id`.
+- Conformance: seven more `companies/agent-*` checks — the Operations
+  extension listed, only what the User approved confirmed, the User asked
+  again when the terms change, an operation in progress read after its
+  `Retry-After`, a confirm retried with the same operation, the User asked
+  before a Direct Conversation, and a decline said in the conversation.
 
 **Changed.**
 
 - A company entry's `interfaces` take `agent` and `openapi`, which load
   refused while only a Company's MCP servers were used.
+- A Company's `user_requested` event asks the User whether to talk with it
+  directly when they can be asked, and is answered in the conversation that
+  the User is not available only when they cannot. A conversation's reader
+  hands on `direct_opened` and `direct_closed` events too, to the model and
+  the stream `company.<name>`.
 - The credentialed HTTP helper (`auth::http`) makes the TLS handshake before
   it writes a request, so a server it cannot reach over TLS has been sent
   nothing, and says so (`Failure::Unsent`).

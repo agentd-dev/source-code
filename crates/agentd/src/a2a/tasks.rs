@@ -170,6 +170,13 @@ pub struct Task {
     /// that started it, so a restart that finds one ends it `interrupted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in: Option<SignInGate>,
+    /// The other Company gate this task is (RFC 0047 §5.8), while it is
+    /// open: the User's approval of an operation, or their Direct
+    /// Conversation — the question whether to join, then its relay. Durable
+    /// with the task: a restart ends a question it finds open, and binds a
+    /// relay again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_gate: Option<CompanyGate>,
     /// The command op that opened this task, when a command did (a built-in
     /// op, or a workflow's declared `a2a` command). What marks the result as
     /// the command vocabulary's data rather than an answer in prose.
@@ -227,6 +234,36 @@ pub struct SignInGate {
     pub standalone: bool,
 }
 
+/// A Company gate a task is ([`Task::company_gate`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanyGate {
+    /// The company entry.
+    pub company: String,
+    pub kind: CompanyGateKind,
+    /// The task exists only for the gate: it ends with it.
+    pub standalone: bool,
+}
+
+/// What a Company gate asks the User.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompanyGateKind {
+    /// To approve one revision of an operation.
+    Operation { operation: String },
+    /// To talk with the Company directly after `conversation`: while the
+    /// User's first message is on its way, `joining` is it, so a restart
+    /// sends it again under the id it was sent with; once they joined,
+    /// `joined` is the Direct Conversation their messages here are relayed
+    /// to.
+    Direct {
+        conversation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        joining: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        joined: Option<String>,
+    },
+}
+
 impl Task {
     pub fn new(id: &str, context_id: &str, principal: Option<&str>, link: Link) -> Task {
         let now = now_ms();
@@ -234,6 +271,7 @@ impl Task {
             ask_schema: None,
             ask_channel: None,
             sign_in: None,
+            company_gate: None,
             id: id.to_string(),
             context_id: context_id.to_string(),
             conversation: context_id.to_string(),
@@ -345,6 +383,14 @@ impl Task {
         self.push_message(TaskMessage::Inbound {
             message: Value::Object(o),
         });
+    }
+
+    /// Whether the conversation holds a caller's message `message_id` — one
+    /// the caller is sending again.
+    pub fn holds_inbound(&self, message_id: &str) -> bool {
+        self.messages.iter().any(
+            |m| matches!(m, TaskMessage::Inbound { message } if message["messageId"] == message_id),
+        )
     }
 
     /// Append to the conversation, dropping the oldest entries until both

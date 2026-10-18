@@ -339,6 +339,30 @@ impl Runtime {
         {
             return self.company_sign_in_answer(&id, tid, principal, text, message);
         }
+        // An operation's approval, the User's to give (RFC 0047 §5.8.1);
+        // the question whether to talk with a Company directly, and the
+        // Direct Conversation the User's later messages are relayed to
+        // (§5.8.2).
+        #[cfg(feature = "companies")]
+        if let Some((tid, _)) = &existing {
+            if let Some(id) = self.operation_gate_on(tid) {
+                return self.company_operation_answer(&id, tid, principal, text, message);
+            }
+            // An approval question that is closed: an answer is bound to the
+            // question its task asked, never to a later revision's.
+            if let Some(id) = self.operation_closed_on(tid) {
+                return self.company_operation_closed(&id, tid);
+            }
+            if let Some(id) = self.direct_gate_on(tid) {
+                return self.company_direct_answer(&id, tid, principal, text, message);
+            }
+            if let Some(id) = self.direct_joining_on(tid) {
+                return self.company_direct_joining(&id, tid, principal);
+            }
+            if let Some(id) = self.direct_relay_on(tid) {
+                return self.company_direct_relay(&id, tid, principal, text, message);
+            }
+        }
         // A LIVE human gate on the addressed task: the reply
         // resolves the suspended asker directly — the tool call returns the
         // text to the model, the `human` step completes with it — instead of

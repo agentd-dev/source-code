@@ -10417,6 +10417,10 @@ mod tests {
                         "intelligence.budget.windows" | "agent.conversation_budget.windows" => {
                             json!([{"per": "hour", "tokens": 1}])
                         }
+                        "security.companies.standing" => json!([{
+                            "company": "shop", "via": {"tool": "shop.x"}, "terms": ["a"],
+                            "when": "true", "expires": "2026-12-31T00:00:00Z"
+                        }]),
                         other => panic!("no sample for object list {other}"),
                     },
                     paths::Kind::Enum(vs) => json!([vs[0]]),

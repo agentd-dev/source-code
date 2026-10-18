@@ -701,16 +701,16 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
             feed(&into.stream, &tags, producer.clone(), producer);
         }
     }
-    // A Company's conversation events, appended to `company.<name>`, carry
-    // the entry's tags, as its MCP servers do (RFC 0047 §6.3).
+    // A Company's conversation events and its operations' final states,
+    // appended to `company.<name>`, carry the entry's tags, as its MCP
+    // servers do (RFC 0047 §6.3).
     for (name, svc) in &ctx.s.services {
         use crate::config::settings::companies as co;
-        if svc.kind != crate::config::settings::ServiceKind::Company
-            || !co::interfaces_of(svc).contains(&co::Interface::Agent)
+        if svc.kind != crate::config::settings::ServiceKind::Company || !co::has_stream(ctx.s, svc)
         {
             continue;
         }
-        let producer = format!("the conversations of company entry {name:?}");
+        let producer = format!("the conversations and operations of company entry {name:?}");
         feed(
             &co::stream_of(name),
             &co::entry_tags(svc),
@@ -869,10 +869,15 @@ fn named(servers: &[(String, Held)], names: &[String]) -> Vec<Held> {
 
 /// The `exec` tool, which is both legs on its own: it can touch anything
 /// inside its `workdir` and talk to the network.
-/// The `company.*` tools that reach a Company's agent or its APIs.
+/// The `company.*` tools that reach a Company's agent, its APIs or its
+/// operations.
 fn company_tools() -> impl Iterator<Item = &'static str> {
     use crate::config::settings::companies as co;
-    co::CONVERSATION_TOOLS.into_iter().chain(co::API_TOOLS)
+    co::CONVERSATION_TOOLS
+        .into_iter()
+        .chain(co::API_TOOLS)
+        .chain(co::OPERATION_TOOLS)
+        .chain([co::DIRECT_TOOL])
 }
 
 fn exec_held() -> Held {
@@ -1111,7 +1116,7 @@ impl<'a> Reach<'a> {
             exec: (cfg!(feature = "exec") && s.security.exec.enabled)
                 || s.tools.overrides.contains_key("exec"),
             companies: (!company_tags.is_empty()).then(|| Held {
-                label: "the Companies' conversations and APIs (company.*)".to_string(),
+                label: "the Companies' conversations, APIs and operations (company.*)".to_string(),
                 tags: company_tags,
             }),
             servers,

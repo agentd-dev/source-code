@@ -2262,6 +2262,14 @@ pub struct Service {
     /// User for there.
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
+    /// `kind: company` only — the OpenAPI operations agentd may call there,
+    /// each `METHOD /path-template`; one outside them is refused unsent.
+    #[serde(default)]
+    pub api_allow: Option<Vec<String>>,
+    /// `kind: company` only — what its conversations' messages share of the
+    /// User's situation, over `security.companies.context`.
+    #[serde(default)]
+    pub context: Option<companies::Context>,
 }
 
 /// Which outbound surface a catalog entry describes. Matching is
@@ -8081,7 +8089,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             // checked at execution (`step_http`'s runtime gate).
             if let Some(steps) = w.get("steps").and_then(Value::as_object) {
                 for (sid, st) in steps {
+                    // One that calls a Company's API is held to the company
+                    // entry's hosts when it runs, the catalog entry for every
+                    // dial to the Company.
                     if st.get("kind").and_then(Value::as_str) == Some("http")
+                        && st.pointer("/auth/kind").and_then(Value::as_str) != Some("company")
                         && let Some(u) = st.get("url").and_then(Value::as_str)
                         && !u.contains("{{")
                     {
@@ -9085,6 +9097,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         tags.push(crate::sec::scope::TrifectaTag::Sensitive);
         tags.push(crate::sec::scope::TrifectaTag::Egress);
     }
+    // A Company's conversations and APIs are reached through `company.*`
+    // tools, not a server, and carry the entry's tags as its MCP servers do
+    // (RFC 0047 §6.3).
+    tags.extend(companies::interface_tags(s));
     use crate::sec::scope::{TrifectaVerdict, check_trifecta};
     if check_trifecta(tags, s.security.allow_trifecta) == TrifectaVerdict::RefusedTrifecta {
         err(&mut d, "lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)".into());
@@ -14842,6 +14858,8 @@ mod tests {
                 privacy: None,
                 sign_in: None,
                 scopes: None,
+                api_allow: None,
+                context: None,
             },
         );
         let m = ServiceKind::Mcp;

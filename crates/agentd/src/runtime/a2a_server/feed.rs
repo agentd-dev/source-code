@@ -49,6 +49,27 @@ pub struct SharedFeed {
     /// every `hello` tells a subscriber. Atomic because the operator can
     /// toggle it at runtime (`admin.set`, a reload).
     introspection: std::sync::atomic::AtomicBool,
+    /// The subscribers attached now: how many streams each principal holds
+    /// open, and whether it is an operator.
+    attached: Mutex<std::collections::BTreeMap<String, (u32, bool)>>,
+}
+
+/// A subscriber attached to the feed, until it is dropped.
+pub struct Attached {
+    feed: std::sync::Arc<SharedFeed>,
+    principal: String,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let mut a = self.feed.attached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((n, _)) = a.get_mut(&self.principal) {
+            *n -= 1;
+            if *n == 0 {
+                a.remove(&self.principal);
+            }
+        }
+    }
 }
 
 struct FeedInner {
@@ -70,7 +91,28 @@ impl SharedFeed {
                 dropped: 0,
             }),
             introspection: std::sync::atomic::AtomicBool::new(introspection),
+            attached: Mutex::default(),
         }
+    }
+
+    /// `principal` subscribes: attached until the guard is dropped.
+    pub fn attach(self: &std::sync::Arc<Self>, principal: &str, operator: bool) -> Attached {
+        let mut a = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+        a.entry(principal.to_string()).or_insert((0, operator)).0 += 1;
+        Attached {
+            feed: std::sync::Arc::clone(self),
+            principal: principal.to_string(),
+        }
+    }
+
+    /// Whether a subscriber `who` accepts — by its principal id, and whether
+    /// it is an operator — is attached now.
+    pub fn attached(&self, who: impl Fn(&str, bool) -> bool) -> bool {
+        self.attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(p, (_, op))| who(p, *op))
     }
 
     /// Whether introspection is on right now (runtime-togglable via

@@ -60,25 +60,34 @@ impl ToolCaller {
 }
 
 impl Runtime {
-    /// A tool call's `agent/idempotency_key`. A workflow step's says which
-    /// call it is by its run and step, and stays the same across the step's
-    /// retries and a restart. A turn's or a subagent's carries this process
-    /// and the child: a child's request ids begin at 1 in every child, so
-    /// two turns of one conversation sent the same key, and so did two lives
-    /// of the instance.
+    /// A tool call's `agent/idempotency_key` ([`call_key`]).
     pub(crate) fn idempotency_key(&self, caller: &ToolCaller) -> String {
-        if caller.subagent.is_none() && caller.run.is_some() && caller.step.is_some() {
-            return format!("{}/{}#{}", self.instance, caller.label(), caller.req);
-        }
-        format!(
-            "{}/{}@{}.{}#{}",
-            self.instance,
-            caller.label(),
-            self.process_nonce,
-            caller.node.map_or(0, |n| n.0),
-            caller.req
-        )
+        call_key(&self.instance, &self.process_nonce, caller)
     }
+}
+
+/// The idempotency key of `caller`'s call in the instance `instance`, in the
+/// process `nonce`. A workflow step's own call says which call it is by its
+/// run and step alone, and stays the same across the step's retries and a
+/// restart's replay: the attempt is not in it. A turn's — a model's call
+/// inside a step included — or a subagent's carries the process and the
+/// child: a child's request ids begin at 1 in every child, so two turns of
+/// one conversation, two attempts of one step's turn and two lives of the
+/// instance sent the same key.
+fn call_key(instance: &str, nonce: &str, caller: &ToolCaller) -> String {
+    if caller.node.is_none()
+        && caller.subagent.is_none()
+        && caller.run.is_some()
+        && caller.step.is_some()
+    {
+        return format!("{instance}/{}", caller.label());
+    }
+    format!(
+        "{instance}/{}@{nonce}.{}#{}",
+        caller.label(),
+        caller.node.map_or(0, |n| n.0),
+        caller.req
+    )
 }
 
 /// The result of executing a tool.
@@ -972,6 +981,10 @@ impl Runtime {
             "company.sign_in" => self.company_sign_in_tool(caller, &args),
             #[cfg(feature = "companies")]
             "company.sign_out" => self.company_sign_out_tool(caller, &args),
+            #[cfg(feature = "companies")]
+            n if crate::config::settings::companies::is_interface_tool(n) => {
+                self.company_call_tool(caller, n, &args)
+            }
             // ---- time ----
             "sleep" => {
                 let d = match crate::config::parse_duration(args["duration"].as_str().unwrap_or(""))
@@ -1956,13 +1969,13 @@ enum RouteKind {
 }
 
 /// Where an executor thread's result goes.
-enum ExecTarget {
+pub(super) enum ExecTarget {
     Tool { node: NodeId, req: u64 },
     Step { run: String, step: String },
 }
 
 impl ExecTarget {
-    fn from(caller: &ToolCaller) -> ExecTarget {
+    pub(super) fn from(caller: &ToolCaller) -> ExecTarget {
         match (caller.node, &caller.run, &caller.step) {
             (Some(node), _, _) => ExecTarget::Tool {
                 node,
@@ -1978,7 +1991,7 @@ impl ExecTarget {
             },
         }
     }
-    fn send(self, tx: &std::sync::mpsc::Sender<Event>, result: Value, is_error: bool) {
+    pub(super) fn send(self, tx: &std::sync::mpsc::Sender<Event>, result: Value, is_error: bool) {
         let ev = match self {
             ExecTarget::Tool { node, req } => Event::ToolDone {
                 node,
@@ -1996,5 +2009,52 @@ impl ExecTarget {
             },
         };
         let _ = tx.send(ev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A step's own call keeps its key across its attempts; a model's call
+    /// inside the step is its child's, so two attempts — two children, each
+    /// counting its requests from 1 — and two lives never share one.
+    #[test]
+    fn a_steps_call_keeps_its_key_and_a_models_call_in_it_has_its_own() {
+        let step = |req: u64| ToolCaller {
+            run: Some("r1".into()),
+            step: Some("ask".into()),
+            req,
+            ..Default::default()
+        };
+        let key = call_key("inst", "p1", &step(1));
+        assert_eq!(key, "inst/step:r1/ask");
+        assert_eq!(key, call_key("inst", "p1", &step(2)), "a retry");
+        assert_eq!(key, call_key("inst", "p2", &step(2)), "a replay");
+        assert_ne!(
+            key,
+            call_key(
+                "inst",
+                "p1",
+                &ToolCaller {
+                    step: Some("other".into()),
+                    ..step(1)
+                }
+            )
+        );
+        let turn = |node: u64, nonce: &str| {
+            call_key(
+                "inst",
+                nonce,
+                &ToolCaller {
+                    node: Some(NodeId(node)),
+                    ..step(1)
+                },
+            )
+        };
+        assert_eq!(turn(3, "p1"), turn(3, "p1"), "a retry of one call");
+        assert_ne!(turn(3, "p1"), turn(4, "p1"), "the step's next attempt");
+        assert_ne!(turn(3, "p1"), turn(3, "p2"), "the next life");
+        assert_ne!(turn(3, "p1"), key);
     }
 }

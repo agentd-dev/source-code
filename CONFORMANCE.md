@@ -156,6 +156,14 @@ skip.
 | `companies/agent-keeps-account-tokens-secret` | the Account Token a sign-in gave agentd reaches the Company only in the refresh_token member of a token request — never in a URL, a header or another body — and appears in no line of agentd's log and no file of its state |
 | `companies/agent-uses-the-newest-account-token` | against the rotation variant, agentd uses each Account Token the Company returns from then on, across a restart: no token request it makes presents a spent one |
 | `companies/agent-signs-out-by-revoking` | company.sign_out revokes the Account Token at the revocation endpoint (token_type_hint refresh_token, the client assertion), and the Session goes on signed out: the next token is the assertion's |
+| `companies/agent-retries-a-message-with-its-id` | a message whose answer was lost — a 502 after the Company took it — is sent again with the same id, and the Company answers it as the message it has; another message has an id of its own |
+| `companies/agent-says-who-wrote-each-message` | every message agentd sends in a conversation says sender agent, and none sends role |
+| `companies/agent-skips-what-it-does-not-recognize` | agentd talks to the Company Agent over the poppy protocol, never the type it does not speak listed before it, and the stream it appends the conversation's events to holds no event of the type the draft does not define and no text-delta piece |
+| `companies/agent-reconnects-a-stream-after-the-last-event` | a stream of a conversation's events that the Company ends is opened again with Last-Event-ID the last event agentd handled, and no cursor |
+| `companies/agent-reads-on-from-the-cursor-it-saved` | after a restart agentd's first read of an open conversation names the cursor it saved, the last event it handled |
+| `companies/agent-says-the-user-is-not-available` | when the Company Agent asks to talk with the User, agentd — which offers no Direct Conversation yet — says in the conversation that the User is not available, once, as the agent |
+| `companies/agent-sends-a-session-token-with-every-request` | every conversation request, and every API call an http step or company.api makes, carries the DPoP Session Token with a proof over it that the fake validated |
+| `companies/agent-reuses-an-idempotency-key-on-retry` | an API write whose operation declares Idempotency-Key, its answer lost, is sent again with the same version 4 UUID, and gets the first answer |
 
 ## Running it
 

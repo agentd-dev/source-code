@@ -10,7 +10,12 @@
 //! holds a Session with DPoP-bound tokens ([`session`], [`token`],
 //! [`dpop`]) over requests held to the host rule, the SSRF guard and the
 //! Company's not-before instant ([`http`]), and connects to the Company's
-//! MCP servers with a Bearer token for each ([`mcp`]). The Session is signed
+//! MCP servers with a Bearer token for each ([`mcp`]). It talks with the
+//! Company's agent in conversations a reader follows ([`conversation`]) and
+//! calls its OpenAPI operations ([`api`]), each request carrying the DPoP
+//! Session Token and a proof ([`request`]); what it keeps of them — the
+//! conversations and their cursors, the ids a retry reuses — is sealed with
+//! the User ID ([`ledger`]). The Session is signed
 //! out until the User signs in themselves, at a gate agentd opens for them
 //! ([`signin`]); the Account Token that gives agentd is kept sealed, and
 //! only the supervisor ever reads it ([`account`]). No turn
@@ -28,9 +33,13 @@
 #[cfg(feature = "companies")]
 pub mod account;
 #[cfg(feature = "companies")]
+pub mod api;
+#[cfg(feature = "companies")]
 pub mod carry;
 #[cfg(all(feature = "companies", feature = "a2a"))]
 pub mod cli;
+#[cfg(feature = "companies")]
+pub mod conversation;
 #[cfg(feature = "companies")]
 pub mod discover;
 #[cfg(feature = "companies")]
@@ -39,6 +48,8 @@ pub mod dpop;
 pub mod http;
 #[cfg(feature = "companies")]
 pub mod identity;
+#[cfg(feature = "companies")]
+pub mod ledger;
 #[cfg(feature = "companies")]
 pub mod mcp;
 #[cfg(all(
@@ -49,6 +60,8 @@ pub mod mcp;
 pub mod mock;
 #[cfg(feature = "companies")]
 pub mod privacy;
+#[cfg(feature = "companies")]
+pub mod request;
 #[cfg(feature = "companies")]
 pub mod session;
 #[cfg(feature = "companies")]
@@ -115,6 +128,7 @@ mod supervisor {
     use super::discover::{Discovery, Entry, Note, Verified};
     use super::http::Pace;
     use super::identity::Identity;
+    use super::ledger::Ledger;
     use super::session::{Env, Session};
     use super::user_id::{self, UserIds};
     use super::wire;
@@ -272,6 +286,16 @@ mod supervisor {
         /// of the store's records ([`UserIds::start_over_at`]), checked out
         /// while the others wait for their own reset.
         started_over: Mutex<BTreeSet<String>>,
+        /// What agentd keeps of its conversations and calls at each Company.
+        pub(super) ledger: Ledger,
+        /// The readers of the open conversations.
+        pub(super) readers: Mutex<super::conversation::Readers>,
+        /// Where the readers' events go: the runtime.
+        pub(super) sink: Mutex<Option<super::conversation::Sink>>,
+        /// `security.companies.limits.conversations`.
+        pub(super) conversation_limit: u32,
+        /// The OpenAPI descriptions fetched, by URL.
+        pub(super) descriptions: Mutex<BTreeMap<String, Arc<super::api::Description>>>,
         timeout: Duration,
         log: Logger,
     }
@@ -307,6 +331,7 @@ mod supervisor {
                 Some(raw) => Some(Accounts::new(Arc::clone(&durable), &client.id, raw)?),
                 None => None,
             };
+            let ledger = Ledger::new(Arc::clone(&durable), &client.id, seal)?;
             let users = UserIds::new(durable, &client.id, seal)?;
             let timeout = settings
                 .mcp
@@ -361,6 +386,11 @@ mod supervisor {
                 sessions: Mutex::default(),
                 ready: Mutex::new(Ready::Unchecked),
                 started_over: Mutex::default(),
+                ledger,
+                readers: Mutex::default(),
+                sink: Mutex::default(),
+                conversation_limit: c.conversations(),
+                descriptions: Mutex::default(),
                 timeout,
                 log: log.clone(),
             })))
@@ -429,6 +459,47 @@ mod supervisor {
                 meta.extend(s.meta());
             }
             Ok((serde_json::Value::Object(meta), span))
+        }
+
+        /// The span a conversation or API request made for the unit of work
+        /// `unit` names in its `traceparent` header, and the one agentd's
+        /// span for the request, `call`, links to (RFC 0047 §5.10, §7):
+        /// under the strict profile the trace the unit has at this Company,
+        /// which only that link ties to the unit's; under `standard`, `call`
+        /// itself, a span of the unit's trace. A secret that cannot be read
+        /// fails the request, unsent.
+        pub fn request_trace(
+            &self,
+            company: &Company,
+            unit: Option<&crate::obs::trace::TraceContext>,
+            call: Option<&crate::obs::trace::TraceContext>,
+        ) -> Result<
+            (
+                Option<crate::obs::trace::TraceContext>,
+                Option<crate::obs::trace::TraceContext>,
+            ),
+            String,
+        > {
+            if company.privacy == Privacy::Standard {
+                return Ok((call.cloned(), None));
+            }
+            let Some(unit) = unit else {
+                return Ok((None, None));
+            };
+            let secret = self
+                .secret(company)
+                .map_err(|e| format!("{e}; the request was not sent"))?;
+            let sent = super::privacy::reroot(&secret, unit);
+            Ok((Some(sent.clone()), Some(sent)))
+        }
+
+        /// The span a request that belongs to no unit of work names in its
+        /// `traceparent` header — a reader's, a decline's: none under the
+        /// strict profile, the process's own under `standard`.
+        pub fn connection_trace(company: &Company) -> Option<crate::obs::trace::TraceContext> {
+            (company.privacy == Privacy::Standard)
+                .then(crate::obs::trace::process)
+                .flatten()
         }
 
         /// Whether the Session at `company` is signed in, once one is open.
@@ -560,6 +631,17 @@ mod supervisor {
                 )
             })?;
             self.users.forget(&self.principal, &issuer)?;
+            // The conversations were the old User's (draft §7.2): their
+            // readers stop, and what was kept of them goes.
+            for cid in self
+                .ledger
+                .load(&self.principal, &issuer)
+                .map(|b| b.conversations.into_keys().collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                self.stop_reader(&issuer, &cid);
+            }
+            self.ledger.forget(&self.principal, &issuer)?;
             self.sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

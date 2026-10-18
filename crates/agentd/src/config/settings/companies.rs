@@ -29,6 +29,9 @@ pub const DEFAULT_JWKS_PATH: &str = "/companies/jwks.json";
 pub const DEFAULT_REDIRECT_PATH: &str = "/companies/callback";
 /// Concurrent Company calls per Company when `limits.in_flight` says none.
 pub const DEFAULT_IN_FLIGHT: u32 = 4;
+/// Open conversations, each with its reader, per instance when
+/// `limits.conversations` says none.
+pub const DEFAULT_CONVERSATIONS: u32 = 16;
 
 /// `security.companies`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -43,6 +46,9 @@ pub struct Companies {
     /// with it, and when it is set the User ID records too, so a store that
     /// holds them cannot read them.
     pub seal_key: Option<Secret>,
+    /// What the messages agentd sends in a Company's conversations tell it
+    /// of the User's situation (draft §7.4): nothing it does not set.
+    pub context: Option<Context>,
     /// Browser MCP servers to keep off every Company's hosts.
     pub browsers: Vec<String>,
     pub limits: Limits,
@@ -56,6 +62,51 @@ impl Companies {
 
     pub fn in_flight(&self) -> u32 {
         self.limits.in_flight.unwrap_or(DEFAULT_IN_FLIGHT)
+    }
+
+    pub fn conversations(&self) -> u32 {
+        self.limits.conversations.unwrap_or(DEFAULT_CONVERSATIONS)
+    }
+}
+
+/// `security.companies.context`, and a company entry's own `context`: the
+/// facts about the User's situation a conversation message may carry, each
+/// in the draft's format (§7.4). What is not set is not shared.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Context {
+    /// A language tag (RFC 5646), such as `en-US`.
+    pub locale: Option<String>,
+    /// An IANA time zone name, such as `America/Los_Angeles`.
+    pub time_zone: Option<String>,
+    /// Share `user_available`: whether the User has a client attached to
+    /// agentd now.
+    pub share_availability: Option<bool>,
+}
+
+impl Context {
+    /// This context, each field it leaves unset taken from `base`.
+    pub fn over(&self, base: &Context) -> Context {
+        Context {
+            locale: self.locale.clone().or_else(|| base.locale.clone()),
+            time_zone: self.time_zone.clone().or_else(|| base.time_zone.clone()),
+            share_availability: self.share_availability.or(base.share_availability),
+        }
+    }
+
+    /// Whether it shares anything.
+    pub fn is_empty(&self) -> bool {
+        self.locale.is_none() && self.time_zone.is_none() && self.share_availability != Some(true)
+    }
+}
+
+/// The context a company entry's messages carry: its own, over
+/// `security.companies.context`.
+pub fn context_of(s: &Settings, svc: &super::Service) -> Context {
+    let base = s.security.companies.context.clone().unwrap_or_default();
+    match &svc.context {
+        Some(c) => c.over(&base),
+        None => base,
     }
 }
 
@@ -124,6 +175,8 @@ impl Client {
 pub struct Limits {
     /// Concurrent Company calls per Company.
     pub in_flight: Option<u32>,
+    /// Open conversations, each followed by a reader, per instance.
+    pub conversations: Option<u32>,
 }
 
 /// `services.<name>.privacy`.
@@ -183,9 +236,104 @@ pub fn signs_in(s: &Settings) -> bool {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Interface {
+    /// Its MCP servers (draft §6).
     Mcp,
+    /// Its Company Agent, in conversations (§7).
     Agent,
+    /// Its OpenAPI APIs (§6).
     Openapi,
+}
+
+impl Interface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Interface::Mcp => "mcp",
+            Interface::Agent => "agent",
+            Interface::Openapi => "openapi",
+        }
+    }
+}
+
+/// The interfaces a company entry uses: its own, or `[mcp]`.
+pub fn interfaces_of(svc: &super::Service) -> Vec<Interface> {
+    svc.interfaces
+        .clone()
+        .unwrap_or_else(|| vec![Interface::Mcp])
+}
+
+/// Whether some company entry uses `interface`.
+pub fn any_uses(s: &Settings, interface: Interface) -> bool {
+    s.services
+        .values()
+        .any(|v| v.kind == ServiceKind::Company && interfaces_of(v).contains(&interface))
+}
+
+/// The `company.*` tools that reach a Company's agent in a conversation.
+pub const CONVERSATION_TOOLS: [&str; 4] = [
+    "company.converse",
+    "company.read",
+    "company.handoff",
+    "company.close",
+];
+/// The `company.*` tools that reach a Company's OpenAPI APIs.
+pub const API_TOOLS: [&str; 2] = ["company.api", "company.api.describe"];
+
+/// Whether `tool` reaches a Company's agent in a conversation.
+pub fn is_conversation_tool(tool: &str) -> bool {
+    CONVERSATION_TOOLS.contains(&tool)
+}
+
+/// Whether `tool` reaches a Company's agent or its OpenAPI APIs: a tool
+/// that carries the Company's content, and acts at the Company its
+/// `company` argument names.
+pub fn is_interface_tool(tool: &str) -> bool {
+    is_conversation_tool(tool) || API_TOOLS.contains(&tool)
+}
+
+/// The stream a Company's conversation events are appended to.
+pub fn stream_of(entry: &str) -> String {
+    format!("company.{entry}")
+}
+
+/// The tags the `company.*` tools that reach a Company's conversations and
+/// APIs carry: those of every entry that uses `agent` or `openapi` — its own,
+/// or [`default_tags`] — as its synthesized MCP servers carry them (§6.3).
+pub fn interface_tags(s: &Settings) -> Vec<crate::sec::scope::TrifectaTag> {
+    let mut out = Vec::new();
+    for svc in s.services.values().filter(|v| {
+        v.kind == ServiceKind::Company
+            && interfaces_of(v)
+                .iter()
+                .any(|i| matches!(i, Interface::Agent | Interface::Openapi))
+    }) {
+        for t in entry_tags(svc) {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// The tags every channel to a company entry carries: its own, or
+/// [`default_tags`].
+pub fn entry_tags(svc: &super::Service) -> Vec<crate::sec::scope::TrifectaTag> {
+    let tags = if svc.tags.is_empty() {
+        default_tags()
+    } else {
+        svc.tags.clone()
+    };
+    let mut out = Vec::new();
+    for t in tags
+        .values()
+        .flatten()
+        .filter_map(|t| crate::sec::scope::TrifectaTag::parse(t))
+    {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// What makes a synthesized MCP server a Company's: the entry it belongs to
@@ -273,12 +421,7 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 /// The MCP servers a company entry stands for, by name, with the `url` each
 /// one is when `mcp_names` names them.
 pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<String>)> {
-    if !svc
-        .interfaces
-        .as_deref()
-        .unwrap_or(&[Interface::Mcp])
-        .contains(&Interface::Mcp)
-    {
+    if !interfaces_of(svc).contains(&Interface::Mcp) {
         return Vec::new();
     }
     if svc.mcp_names.is_empty() {
@@ -296,11 +439,18 @@ pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<Str
 /// `exclude`, `rate` and `timeout`, no AAuth, and no endpoint — the
 /// supervisor learns that at discovery. A name another server already has
 /// is refused, and the server is left out.
+///
+/// An entry that uses `agent` gets the stream its conversation events are
+/// appended to, `company.<name>`, with the default retention unless
+/// `streams:` declares it.
 pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
     let mut added: Vec<McpServer> = Vec::new();
     for (entry, svc) in &s.services {
         if svc.kind != ServiceKind::Company {
             continue;
+        }
+        if interfaces_of(svc).contains(&Interface::Agent) {
+            s.streams.entry(stream_of(entry)).or_default();
         }
         for (server, url) in server_names(entry, svc) {
             let taken = s
@@ -412,6 +562,22 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
                     direct_use_refused(srv)
                 ));
             }
+            // An `http` step that calls a Company's API names an entry that
+            // uses `openapi`; a templated name is held to it when it runs.
+            if st.kind == "http"
+                && let Some(name) = st
+                    .field("auth")
+                    .and_then(|a| a.get("company"))
+                    .and_then(serde_json::Value::as_str)
+                && !name.contains("{{")
+                && !s.services.get(name).is_some_and(|v| {
+                    v.kind == ServiceKind::Company && interfaces_of(v).contains(&Interface::Openapi)
+                })
+            {
+                out.push(format!(
+                    "workflow {wf:?} step {id:?}: auth.company {name:?} is not a company entry that uses `openapi` (services.<name>.interfaces)"
+                ));
+            }
             if let Some(b) = &st.body {
                 walk(s, wf, &b.steps, out);
             }
@@ -450,6 +616,8 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             (svc.privacy.is_some(), "privacy"),
             (svc.sign_in.is_some(), "sign_in"),
             (svc.scopes.is_some(), "scopes"),
+            (svc.api_allow.is_some(), "api_allow"),
+            (svc.context.is_some(), "context"),
         ] {
             if set {
                 err(format!(
@@ -506,6 +674,22 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             "security.companies.limits.in_flight: 0 would let no Company call run; at least 1"
                 .into(),
         );
+    }
+    if let Some(l) = c.limits.conversations
+        && l == 0
+    {
+        err(
+            "security.companies.limits.conversations: 0 would let no conversation open; at least 1"
+                .into(),
+        );
+    }
+    if let Some(ctx) = &c.context {
+        validate_context("security.companies.context", ctx, &mut err);
+        if !any_uses(s, Interface::Agent) {
+            err(
+                "security.companies.context: no company entry uses `agent` (services.<name>.interfaces), so no conversation would carry it".into(),
+            );
+        }
     }
     let company_names = company_servers(s);
     for b in &c.browsers {
@@ -744,17 +928,50 @@ fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)
             ));
         }
     }
-    let ifaces = svc.interfaces.as_deref().unwrap_or(&[Interface::Mcp]);
-    for i in ifaces {
-        if *i != Interface::Mcp {
+    let ifaces = interfaces_of(svc);
+    if ifaces.is_empty() {
+        err(format!(
+            "{at}.interfaces: an empty list uses none of the Company's interfaces; list mcp, agent or openapi"
+        ));
+    }
+    for (i, x) in ifaces.iter().enumerate() {
+        if ifaces[..i].contains(x) {
+            err(format!("{at}.interfaces: {} is listed twice", x.as_str()));
+        }
+    }
+    // What only one interface reads is refused without it: it would do
+    // nothing.
+    if !ifaces.contains(&Interface::Mcp) {
+        for (set, what) in [
+            (svc.rate.is_some(), "rate"),
+            (svc.allow.is_some(), "allow"),
+            (!svc.exclude.is_empty(), "exclude"),
+            (!svc.mcp_names.is_empty(), "mcp_names"),
+        ] {
+            if set {
+                err(format!(
+                    "{at}.{what}: it shapes the Company's MCP servers, which the entry does not use — add mcp to {at}.interfaces"
+                ));
+            }
+        }
+    }
+    if svc.api_allow.is_some() && !ifaces.contains(&Interface::Openapi) {
+        err(format!(
+            "{at}.api_allow: the OpenAPI operations agentd may call apply when the entry uses `openapi` — add it to {at}.interfaces"
+        ));
+    }
+    for op in svc.api_allow.iter().flatten() {
+        if let Err(e) = parse_operation(op) {
+            err(format!("{at}.api_allow: {op:?} {e}"));
+        }
+    }
+    if let Some(ctx) = &svc.context {
+        if !ifaces.contains(&Interface::Agent) {
             err(format!(
-                "{at}.interfaces: {} is not used by this build — agentd uses a Company's `mcp` APIs",
-                match i {
-                    Interface::Agent => "agent",
-                    _ => "openapi",
-                }
+                "{at}.context: a conversation's context applies when the entry uses `agent` — add it to {at}.interfaces"
             ));
         }
+        validate_context(&format!("{at}.context"), ctx, err);
     }
     let kinds = sign_in_of(svc);
     if kinds.contains(&SignIn::Mediated) {
@@ -813,6 +1030,89 @@ fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)
             ));
         }
         seen.push(server);
+    }
+}
+
+/// The HTTP methods an OpenAPI operation may have (OpenAPI 3.1 §4.8.9).
+pub const OPERATION_METHODS: [&str; 8] = [
+    "GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE",
+];
+
+/// An `api_allow` entry, `METHOD /path-template`, as its method and its
+/// path template.
+pub fn parse_operation(op: &str) -> Result<(String, String), String> {
+    let (method, path) = op.split_once(' ').ok_or("is not `METHOD /path-template`")?;
+    if !OPERATION_METHODS.contains(&method) {
+        return Err(format!(
+            "names the method {method:?}; an operation's method is one of {}, in capitals",
+            OPERATION_METHODS.join(", ")
+        ));
+    }
+    if !path.starts_with('/') || path.contains([' ', '?', '#']) {
+        return Err(
+            "has a path that does not start with `/`, or carries a space, a query or a fragment"
+                .into(),
+        );
+    }
+    let mut open = false;
+    for c in path.chars() {
+        match c {
+            '{' if !open => open = true,
+            '}' if open => open = false,
+            '{' | '}' => return Err("has a path whose `{…}` parameters do not pair".into()),
+            _ => {}
+        }
+    }
+    if open {
+        return Err("has a path whose `{…}` parameters do not pair".into());
+    }
+    Ok((method.to_string(), path.to_string()))
+}
+
+/// Whether the path templates `a` and `b` name the same paths: segment by
+/// segment equal, each `{…}` parameter matching another whatever its name.
+pub fn same_template(a: &str, b: &str) -> bool {
+    let param = |s: &str| s.starts_with('{') && s.ends_with('}');
+    let (x, y): (Vec<&str>, Vec<&str>) = (a.split('/').collect(), b.split('/').collect());
+    x.len() == y.len()
+        && x.iter()
+            .zip(&y)
+            .all(|(p, q)| p == q || (param(p) && param(q)))
+}
+
+/// A context's fields, each in the format the draft gives it (§7.4).
+fn validate_context(at: &str, ctx: &Context, err: &mut impl FnMut(String)) {
+    // RFC 5646's shape: a primary subtag of letters, then subtags of
+    // letters and digits.
+    if let Some(l) = &ctx.locale {
+        let mut parts = l.split('-');
+        let primary = parts.next().unwrap_or_default();
+        let ok = (2..=8).contains(&primary.len())
+            && primary.bytes().all(|b| b.is_ascii_alphabetic())
+            && parts.all(|p| {
+                (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())
+            });
+        if !ok {
+            err(format!(
+                "{at}.locale: {l:?} is not a language tag (RFC 5646), such as en-US"
+            ));
+        }
+    }
+    // An IANA time zone name: `Area/Location` segments of letters, digits,
+    // `_`, `-` and `+`, or a single one such as `UTC`.
+    if let Some(z) = &ctx.time_zone {
+        let ok = z.len() <= 64
+            && z.split('/').all(|p| {
+                !p.is_empty()
+                    && p.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
+            });
+        if !ok {
+            err(format!(
+                "{at}.time_zone: {z:?} is not an IANA time zone name, such as America/Los_Angeles"
+            ));
+        }
     }
 }
 
@@ -940,9 +1240,10 @@ mod tests {
             &company("").replace(STORE, "store: {kind: memory}\n"),
             "store.kind memory forgets every User ID",
         );
+        refused(&company(", interfaces: []"), "an empty list uses none");
         refused(
-            &company(", interfaces: [mcp, agent]"),
-            "interfaces: agent is not used",
+            &company(", interfaces: [mcp, agent, mcp]"),
+            "interfaces: mcp is listed twice",
         );
         refused(
             &company(", hosts: [\"https://example.com\"]"),
@@ -1114,6 +1415,146 @@ mod tests {
         );
         assert!(signs_in(&s) && !signs_in_directly(&s));
         assert_eq!(sign_in_of(&s.services["shop"]), [SignIn::Device]);
+    }
+
+    /// An entry that uses a Company's agent and its APIs: what load takes —
+    /// the stream its conversations go to, its operations and its context —
+    /// and what it refuses, each named (RFC 0047 §5.3).
+    #[cfg(feature = "companies")]
+    #[test]
+    fn a_company_s_agent_and_apis_are_configured_and_checked() {
+        let both = ", interfaces: [agent, openapi], api_allow: [\"GET /orders/{order_id}\", \"POST /orders/{id}/exchanges\"], context: {locale: en-US}";
+        let s = load(&company(both).replace(
+            "name: Agent}",
+            "name: Agent}\n    context: {time_zone: America/Los_Angeles, share_availability: true}\n    limits: {conversations: 2}",
+        ))
+        .unwrap();
+        assert!(
+            s.streams.contains_key("company.shop"),
+            "its stream is declared"
+        );
+        assert!(company_servers(&s).is_empty(), "no MCP server without mcp");
+        let ctx = context_of(&s, &s.services["shop"]);
+        assert_eq!(ctx.locale.as_deref(), Some("en-US"));
+        assert_eq!(
+            ctx.time_zone.as_deref(),
+            Some("America/Los_Angeles"),
+            "inherited"
+        );
+        assert_eq!(ctx.share_availability, Some(true));
+        assert_eq!(s.security.companies.conversations(), 2);
+        assert!(any_uses(&s, Interface::Agent) && any_uses(&s, Interface::Openapi));
+        assert_eq!(interface_tags(&s).len(), 2, "untrusted_input and egress");
+        // An operator's own declaration of the stream is kept.
+        let s = load(&format!(
+            "{}streams:\n  company.shop: {{retention: {{max_events: 5}}}}\n",
+            company(", interfaces: [agent]")
+        ))
+        .unwrap();
+        assert_eq!(s.streams["company.shop"].max_events(), 5);
+        let refused = |yaml: &str, why: &str| {
+            let e = load(yaml).expect_err(yaml);
+            assert!(e.contains(why), "want {why:?} in:\n{e}");
+        };
+        refused(
+            &company(", api_allow: [\"GET /orders\"]"),
+            "services.shop.api_allow: the OpenAPI operations agentd may call apply when the entry uses `openapi`",
+        );
+        refused(
+            &company(", interfaces: [openapi], api_allow: [\"get /orders\"]"),
+            "names the method \"get\"",
+        );
+        refused(
+            &company(", interfaces: [openapi], api_allow: [\"GET orders\"]"),
+            "does not start with `/`",
+        );
+        refused(
+            &company(", interfaces: [openapi], api_allow: [\"GET /orders/{id\"]"),
+            "do not pair",
+        );
+        refused(
+            &company(", context: {locale: en-US}"),
+            "services.shop.context: a conversation's context applies when the entry uses `agent`",
+        );
+        // What shapes only the Company's MCP servers, without them.
+        for (field, why) in [
+            (
+                ", rate: \"30/60s\"",
+                "services.shop.rate: it shapes the Company's MCP servers",
+            ),
+            (", allow: [\"orders_*\"]", "services.shop.allow: it shapes"),
+            (
+                ", exclude: [\"cancel_*\"]",
+                "services.shop.exclude: it shapes",
+            ),
+            (
+                ", mcp_names: {\"https://example.com/mcp\": search}",
+                "services.shop.mcp_names: it shapes",
+            ),
+        ] {
+            refused(
+                &company(&format!(", interfaces: [agent, openapi]{field}")),
+                why,
+            );
+            load(&company(&format!(", interfaces: [mcp, agent]{field}")))
+                .unwrap_or_else(|e| panic!("{field}: {e}"));
+        }
+        refused(
+            &company(", interfaces: [agent], context: {locale: \"en US\"}"),
+            "is not a language tag",
+        );
+        refused(
+            &company(", interfaces: [agent], context: {time_zone: \"/etc/localtime\"}"),
+            "is not an IANA time zone name",
+        );
+        refused(
+            &company("").replace("name: Agent}", "name: Agent}\n    context: {locale: en-US}"),
+            "security.companies.context: no company entry uses `agent`",
+        );
+        refused(
+            &company(", interfaces: [agent]").replace(
+                "name: Agent}",
+                "name: Agent}\n    limits: {conversations: 0}",
+            ),
+            "limits.conversations: 0 would let no conversation open",
+        );
+        refused(
+            &format!(
+                "{CLIENT}{STORE}services:\n  m: {{kind: mcp, endpoint: \"https://m.example/mcp\", api_allow: [\"GET /x\"]}}\n"
+            ),
+            "`api_allow` applies to `kind: company` entries only",
+        );
+        // An `http` step reaches a Company's API only at an entry that uses
+        // `openapi`, and names no credential, body or host rule of its own.
+        let flow = |step: &str| {
+            format!(
+                "{}workflows:\n  - name: w\n    steps:\n      s: {{kind: once}}\n      h: {{kind: http, depends_on: [s], {step}}}\n      f: {{kind: finish, depends_on: [h], status: completed}}\n",
+                company(", interfaces: [openapi], api_allow: [\"GET /orders/{order_id}\"]")
+            )
+        };
+        load(&flow(
+            "url: \"https://example.com/api/orders/o1\", auth: {kind: company, company: shop}",
+        ))
+        .unwrap();
+        refused(
+            &flow(
+                "url: \"https://example.com/api/orders/o1\", auth: {kind: company, company: other}",
+            ),
+            "auth.company \"other\" is not a company entry that uses `openapi`",
+        );
+        refused(
+            &flow("url: \"https://example.com/x\", auth: {kind: bearer, company: shop}"),
+            "http auth takes {kind: company, company: <entry>}",
+        );
+        refused(
+            &flow(
+                "url: \"https://example.com/x\", auth: {kind: company, company: shop}, sign: {secret: x}",
+            ),
+            "`sign` does not apply to an http step that calls a Company's API",
+        );
+        assert!(same_template("/orders/{order_id}", "/orders/{id}"));
+        assert!(!same_template("/orders/{id}", "/orders/{id}/exchanges"));
+        assert!(!same_template("/orders/latest", "/orders/{id}"));
     }
 
     #[cfg(not(feature = "companies"))]

@@ -504,6 +504,34 @@ pub fn mcp_span_linked(
     s.end(ok);
 }
 
+/// Record the CLIENT span of one call the supervisor made to a Company's
+/// agent or API for a unit of work — `tool` the `company.*` tool, `call` the
+/// span of the unit's trace it is — linked to `link`, the span the Company
+/// was sent in its place under the strict privacy profile (RFC 0047 §5.10).
+pub fn company_span(
+    call: Option<&TraceContext>,
+    tool: &str,
+    company: &str,
+    ok: bool,
+    start_unix_nanos: u128,
+    link: Option<&TraceContext>,
+) {
+    let s = span(
+        call,
+        &format!("{tool} {company}"),
+        Kind::Client,
+        start_unix_nanos,
+    )
+    .attr("gen_ai.operation.name", "execute_tool")
+    .attr("gen_ai.tool.name", tool)
+    .attr("agentd.company", company);
+    let s = match link {
+        Some(l) => s.link(&l.traceparent()),
+        None => s,
+    };
+    s.end(ok);
+}
+
 /// Buffer one log record for OTLP export. A no-op unless
 /// [`arm_logs`] installed the exporter (and always a no-op without `otel`).
 pub fn capture_log(unix_nanos: u128, level: &str, event: &str, fields: &serde_json::Value) {

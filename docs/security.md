@@ -983,10 +983,13 @@ the Personal Agent Protocol draft
   its code never exchanged. The device code, the PKCE verifier and the
   `state` are in supervisor memory only.
 - **Company content is untrusted input.** A company entry's tags default to
-  `untrusted_input` and `egress`, and fold into check 1 like any server's:
-  an instance that declares a Company and a `sensitive` server does not
-  start without `security.allow_trifecta`. Split them across two instances
-  linked over A2A instead.
+  `untrusted_input` and `egress`, and fold into check 1 like any server's —
+  its MCP servers', and the `company.*` tools' that reach its agent and its
+  APIs, which carry the same tags: an instance that declares a Company and a
+  `sensitive` server does not start without `security.allow_trifecta`. Split
+  them across two instances linked over A2A instead. The stream a Company's
+  conversations feed, `company.<name>`, carries its tags in the stream-taint
+  check, and every event on it carries the Company's origin.
 - **One Company never acts for another.** A Company call's answer adds the
   Company's origin, `company:<issuer>`, to the record of the conversation,
   run or subagent it reaches — the outside-input record, handed on to what
@@ -998,12 +1001,35 @@ the Personal Agent Protocol draft
 - **No correlators** under `privacy: strict`, the default: a Company is sent
   its own keyed idempotency key and its own trace, no instance, run,
   context, principal or label, no `clientInfo.title`, no AAuth signature,
-  and no trace context on the handshake or the tool list.
+  and no trace context on the handshake, the tool list or a conversation
+  reader's requests.
 - **No call sent twice blind.** A `tools/call` that failed after it was sent
   — no answer, a `5xx`, a result agentd could not read — answers `outcome
   unknown` and is not repeated, by a step's `retry:` or by a restart that
   finds its step still running; the handshake, tool lists and token requests
-  are repeated at most three times. How far a call got is the transport's
+  are repeated at most three times. A conversation message is sent again only
+  with the id it was first sent with, and an API write only when its
+  operation declares `Idempotency-Key`, with the key it was first sent with;
+  any other API write that may have run is `outcome unknown`. A workflow
+  step's call keeps its id and key across the step's attempts and a
+  restart's replay.
+- **What a Company's API takes is what its description says.** `company.api`
+  and the `http` step with `auth: {kind: company}` send an operation only
+  when the Company's OpenAPI description has it and `api_allow` lists it, its
+  parameters and body held to the operation's schemas; anything else is
+  refused unsent, and so is a path segment a server may resolve to another
+  operation (`.`, `..`, or one holding `/` or `\` once decoded). What is sent
+  is the operation's own template, its parameters percent-encoded into it.
+  An operation's `$ref`s are resolved when it is called, to at most 20 000
+  values, so a description whose references multiply costs one operation at
+  a time. Every API and conversation request carries the User's DPoP Session
+  Token with a proof of its own, and no correlator of agentd's.
+- **Conversations are bounded and the supervisor's.** At most
+  `limits.conversations` are open, each read by a thread of the
+  supervisor's, which never blocks its loop and stops when the conversation
+  closes or the instance drains. A Company's `text-delta` pieces are never
+  read, and an `authorization` or `user_requested` event never opens a gate
+  by itself: a Company cannot prompt the User at will. How far a call got is the transport's
   word, not the error's text, which the Company writes. A `Retry-After` on a
   `429` or `503` holds every request to the Company until it is over.
 - **Declared browsers stay off Companies' sites.** A call on a server
@@ -1079,7 +1105,7 @@ class.
 
 | Tier | Callers | Tools |
 |---|---|---|
-| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status`, `company.sign_in`, `company.sign_out` |
+| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe` |
 | root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
 | root only | root | `instruction.subscribe`, `workflow.create`, `workflow.update`, `workflow.delete`, `workflow.pause`, `workflow.resume` |
 

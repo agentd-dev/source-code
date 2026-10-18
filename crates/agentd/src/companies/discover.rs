@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 
 use super::http::{Dialer, Pace, Refused};
 use super::wire;
-use crate::config::settings::companies::{SignIn, host_of, is_https_url};
+use crate::config::settings::companies::{Interface, SignIn, host_of, is_https_url};
 
 /// The shortest and longest a verified document is kept.
 pub const MIN_MAX_AGE: Duration = Duration::from_secs(60);
@@ -67,6 +67,10 @@ pub struct Entry {
     pub sign_in: Vec<SignIn>,
     /// The most scopes agentd asks the User for there.
     pub scopes: Vec<String>,
+    /// The interfaces agentd uses there.
+    pub interfaces: Vec<Interface>,
+    /// The OpenAPI operations agentd may call there, `METHOD /path-template`.
+    pub api_allow: Vec<String>,
 }
 
 impl Entry {
@@ -85,8 +89,18 @@ impl Entry {
             pace: Arc::new(Pace::new(name, None)),
             sign_in: crate::config::settings::companies::sign_in_of(svc),
             scopes: svc.scopes.clone().unwrap_or_default(),
+            interfaces: crate::config::settings::companies::interfaces_of(svc),
+            api_allow: svc.api_allow.clone().unwrap_or_default(),
         }
     }
+}
+
+/// A listed endpoint, and the `resource` its tokens must be issued for when
+/// the Company names one (draft §3.1, §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub url: String,
+    pub resource: Option<String>,
 }
 
 /// A Company's documents, verified.
@@ -115,6 +129,13 @@ pub struct Verified {
     pub mcp: BTreeMap<String, String>,
     /// Every MCP API the discovery document lists, in its order.
     pub mcp_urls: Vec<String>,
+    /// The Company Agent's `poppy` conversation endpoint, the first the
+    /// document lists — other types are skipped (§7.1).
+    pub conversation: Option<Listed>,
+    /// Every OpenAPI API the document lists: the description's URL.
+    pub openapi: Vec<Listed>,
+    /// The interfaces agentd uses there.
+    pub interfaces: Vec<Interface>,
     pub max_age: Duration,
     pub verified_at: Instant,
 }
@@ -137,7 +158,7 @@ impl Verified {
             "company": self.company,
             "domain": self.domain,
             "issuer": self.issuer,
-            "interfaces": ["mcp"],
+            "interfaces": self.interfaces.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
             "servers": self.mcp.keys().collect::<Vec<_>>(),
             "max_age": self.max_age.as_secs(),
         })
@@ -209,8 +230,18 @@ fn string<'a>(v: &'a Value, ptr: &str) -> Option<&'a str> {
 /// verified.
 pub fn discover(entry: &Entry) -> Result<Verified, Refusal> {
     let (verified, listed) = verify(entry)?;
-    let mcp = name_servers(entry, &listed)?;
+    let mcp = servers_of(entry, &listed)?;
     Ok(Verified { mcp, ..verified })
+}
+
+/// The entry's MCP servers ([`name_servers`]), none when it does not use
+/// the Company's MCP APIs.
+fn servers_of(entry: &Entry, listed: &[String]) -> Result<BTreeMap<String, String>, Refusal> {
+    if entry.interfaces.contains(&Interface::Mcp) {
+        name_servers(entry, listed)
+    } else {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// What steps 1–7 come to: the verified documents and the MCP APIs they
@@ -389,14 +420,25 @@ fn verify(entry: &Entry) -> Verification {
     if let Some(u) = string(poppy, "/auth/mediated/endpoint") {
         named.push(("auth.mediated.endpoint".into(), u.to_string()));
     }
+    let listed = |v: &Value, at: &str| Listed {
+        url: v[at].as_str().unwrap_or_default().to_string(),
+        resource: v["resource"].as_str().map(str::to_string),
+    };
     let mut mcp_urls = Vec::new();
+    let mut openapi = Vec::new();
     for (i, a) in poppy["apis"].as_array().into_iter().flatten().enumerate() {
-        let url = a["url"].as_str().unwrap_or_default().to_string();
+        let api = listed(a, "url");
         if a["type"] == wire::API_MCP {
-            mcp_urls.push(url.clone());
+            mcp_urls.push(api.url.clone());
+        } else if a["type"] == wire::API_OPENAPI {
+            openapi.push(api.clone());
         }
-        named.push((format!("apis[{i}].url"), url));
+        if let Some(r) = &api.resource {
+            named.push((format!("apis[{i}].resource"), r.clone()));
+        }
+        named.push((format!("apis[{i}].url"), api.url));
     }
+    let mut conversation = None;
     for (i, p) in poppy
         .pointer("/agent/protocols")
         .and_then(Value::as_array)
@@ -404,10 +446,14 @@ fn verify(entry: &Entry) -> Verification {
         .flatten()
         .enumerate()
     {
-        named.push((
-            format!("agent.protocols[{i}].endpoint"),
-            p["endpoint"].as_str().unwrap_or_default().to_string(),
-        ));
+        let proto = listed(p, "endpoint");
+        if let Some(r) = &proto.resource {
+            named.push((format!("agent.protocols[{i}].resource"), r.clone()));
+        }
+        named.push((format!("agent.protocols[{i}].endpoint"), proto.url.clone()));
+        if conversation.is_none() && p["type"] == wire::CONVERSATION_TYPE {
+            conversation = Some(proto);
+        }
     }
     if let Some(u) = string(poppy, "/web/browser_session_endpoint") {
         named.push(("web.browser_session_endpoint".into(), u.to_string()));
@@ -461,6 +507,9 @@ fn verify(entry: &Entry) -> Verification {
             hosts,
             mcp: BTreeMap::new(),
             mcp_urls: mcp_urls.clone(),
+            conversation,
+            openapi,
+            interfaces: entry.interfaces.clone(),
             max_age,
             verified_at: Instant::now(),
         },
@@ -647,7 +696,7 @@ impl Discovery {
             // A refetch keeps the servers as first verified.
             Some(old) => Ok((v, listed, Some(Arc::clone(old)))),
             None => {
-                let mcp = name_servers(&self.entry, &listed)?;
+                let mcp = servers_of(&self.entry, &listed)?;
                 Ok((Verified { mcp, ..v }, listed, None))
             }
         });
@@ -666,7 +715,8 @@ impl Discovery {
                     st.verified = None;
                     return (Err(why), notes);
                 }
-                if listed == old.mcp_urls {
+                let uses_mcp = self.entry.interfaces.contains(&Interface::Mcp);
+                if listed == old.mcp_urls || !uses_mcp {
                     st.apis_said = None;
                 } else if st.apis_said.as_ref() != Some(&listed) {
                     st.apis_said = Some(listed.clone());
@@ -750,6 +800,8 @@ mod tests {
             pace: Arc::default(),
             sign_in: Vec::new(),
             scopes: Vec::new(),
+            interfaces: vec![Interface::Mcp],
+            api_allow: Vec::new(),
         }
     }
 
@@ -815,6 +867,9 @@ mod tests {
             hosts: vec!["example.com".into()],
             mcp: BTreeMap::new(),
             mcp_urls: urls(mcp),
+            conversation: None,
+            openapi: Vec::new(),
+            interfaces: vec![Interface::Mcp],
             max_age: Duration::ZERO,
             verified_at: Instant::now(),
         };

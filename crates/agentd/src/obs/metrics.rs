@@ -485,7 +485,7 @@ pub fn set_mcp_event_lag(server: &str, event: &str, ms: u64) {
 
 /// One call agentd made to a Company (RFC 0047 §7,
 /// `agent_company_requests_total{company,interface,outcome}`): `interface` ∈
-/// `mcp`; `outcome` ∈ `ok`\|`error` (the Company's own answer, a tool's
+/// `mcp`\|`agent` (a conversation request)\|`openapi`; `outcome` ∈ `ok`\|`error` (the Company's own answer, a tool's
 /// `isError` or a refusal it sent)\|`unsent` (refused before it was sent)\|
 /// `unknown` (it may have run: no answer, or a `5xx`, after it was sent). An
 /// unknown value buckets `other`. `company` is a company entry's name.
@@ -506,7 +506,9 @@ pub fn record_company_request(company: &str, interface: &str, outcome: &str) {
 
 /// One request agentd sent a Company's token endpoint
 /// (`agent_company_token_requests_total{company,grant,outcome}`): `grant` ∈
-/// `start`\|`renew`\|`bearer`; `outcome` ∈ `ok`\|`refused` (an OAuth
+/// `start`\|`renew`\|`bearer`\|`resource` (a DPoP token for an endpoint the
+/// Company lists with one)\|`refresh`\|`device_code`\|`authorization_code`\|
+/// `device_authorization`\|`revoke`; `outcome` ∈ `ok`\|`refused` (an OAuth
 /// error)\|`failed` (no usable answer).
 pub fn record_company_token_request(company: &str, grant: &str, outcome: &str) {
     #[cfg(feature = "metrics")]
@@ -514,7 +516,21 @@ pub fn record_company_token_request(company: &str, grant: &str, outcome: &str) {
         "agent_company_token_requests_total",
         vec![
             company.into(),
-            imp::closed_label(grant, &["start", "renew", "bearer"]).into(),
+            imp::closed_label(
+                grant,
+                &[
+                    "start",
+                    "renew",
+                    "bearer",
+                    "resource",
+                    "refresh",
+                    "device_code",
+                    "authorization_code",
+                    "device_authorization",
+                    "revoke",
+                ],
+            )
+            .into(),
             imp::closed_label(outcome, &["ok", "refused", "failed"]).into(),
         ],
         1,
@@ -550,19 +566,50 @@ pub fn set_company_rate_limited_until(company: &str, unix_s: u64) {
     let _ = (company, unix_s);
 }
 
+/// The conversations agentd has open at a Company, each followed by a
+/// reader (`agent_company_conversations_open{company}`).
+pub fn set_company_conversations_open(company: &str, open: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_set(
+        "agent_company_conversations_open",
+        vec![company.into()],
+        open,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, open);
+}
+
 /// One User gate a Company call opened, and how it ended
 /// (`agent_company_gates_total{company,kind,answer}`): `kind` ∈
-/// `cross_company`; `answer` ∈ `approve`\|`deny`\|`unanswered` (it timed
-/// out or was cancelled)\|`unreachable` (nobody could be asked, so the call
-/// was refused).
+/// `cross_company`\|`sign_in`; `answer` ∈ `approve`\|`deny`\|`unanswered`
+/// (it timed out or was cancelled)\|`unreachable` (nobody could be asked, so
+/// the call was refused), and for a sign-in how it ended: `signed_in`\|
+/// `cancelled`\|`denied`\|`expired`\|`account_mismatch`\|`interrupted`\|
+/// `failed`.
 pub fn record_company_gate(company: &str, kind: &str, answer: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.event_add(
         "agent_company_gates_total",
         vec![
             company.into(),
-            imp::closed_label(kind, &["cross_company"]).into(),
-            imp::closed_label(answer, &["approve", "deny", "unanswered", "unreachable"]).into(),
+            imp::closed_label(kind, &["cross_company", "sign_in"]).into(),
+            imp::closed_label(
+                answer,
+                &[
+                    "approve",
+                    "deny",
+                    "unanswered",
+                    "unreachable",
+                    "signed_in",
+                    "cancelled",
+                    "denied",
+                    "expired",
+                    "account_mismatch",
+                    "interrupted",
+                    "failed",
+                ],
+            )
+            .into(),
         ],
         1,
     );
@@ -941,6 +988,12 @@ mod imp {
             "counter",
             "User gates a Company call opened, by kind and answer.",
             &["company", "kind", "answer"],
+        ),
+        (
+            "agent_company_conversations_open",
+            "gauge",
+            "Conversations open at the Company, each followed by a reader.",
+            &["company"],
         ),
     ];
 

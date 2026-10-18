@@ -2532,3 +2532,336 @@ mod over_a2a {
         common::SendMessage::command("workflow.run", json!({"workflow": workflow}))
     }
 }
+
+/// Every event the store under `dir` holds on `stream`, in order.
+fn stream_events(dir: &Path, stream: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(v) =
+                serde_json::from_slice::<Value>(&std::fs::read(&p).unwrap_or_default())
+                && v["kind"] == "event"
+                && v["state"]["stream"] == stream
+            {
+                out.push(v["state"].clone());
+            }
+        }
+    }
+    out.sort_by_key(|e| e["seq"].as_u64());
+    out
+}
+
+/// Every file under `dir`, as text.
+fn files_text(dir: &Path) -> String {
+    let mut out = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push_str(&String::from_utf8_lossy(
+                    &std::fs::read(&p).unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// A conversation a workflow opens with `company.converse`: its reader
+/// appends the Company's events to the stream `company.shop`, each carrying
+/// the Company's origin — the type the draft does not define skipped, and no
+/// `text-delta` piece in the stream, the store or the log — and every
+/// message says `sender: agent`. After a restart the reader reads on from
+/// the cursor it saved.
+#[test]
+fn a_conversation_reaches_its_stream_and_a_restart_reads_on_from_its_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    const FLOW: &str = "workflows:\n  - name: talk\n    steps:\n      s: {kind: once}\n      c: {kind: tool, name: company.converse, args: {company: shop, text: \"hello from a workflow\", wait: 5}, depends_on: [s]}\n      f: {kind: finish, depends_on: [c], status: completed}\n";
+    let s = setup_with(
+        &h,
+        "",
+        "",
+        &shop_entry(&f.origin, ", interfaces: [agent]"),
+        FLOW,
+    );
+    let mut d = start(&s, "talk", &[]);
+    let state = s.dir.join("state");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !stream_events(&state, "company.shop").iter().any(|e| {
+        e["data"]
+            .to_string()
+            .contains("You said: hello from a workflow")
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            std::fs::read_to_string(&d.log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    d.stop();
+    let kept = stream_events(&state, "company.shop");
+    let issuer = format!("{}/auth", f.origin);
+    for e in &kept {
+        assert_eq!(e["source"], "company:shop", "{e}");
+        assert!(
+            e["carries"]["origins"]
+                .as_array()
+                .is_some_and(|o| o.contains(&json!(format!("company:{issuer}")))),
+            "the Company's origin: {e}"
+        );
+        assert!(
+            ["message", "state", "authorization", "user_requested"]
+                .contains(&e["subject"].as_str().unwrap()),
+            "{e}"
+        );
+    }
+    let log = std::fs::read_to_string(&d.log).unwrap();
+    assert!(
+        !files_text(&state).contains("DELTA:"),
+        "no piece in the store"
+    );
+    assert!(
+        !files_text(&state).contains("x-mock-receipt"),
+        "the unknown type"
+    );
+    assert!(!log.contains("DELTA:"), "no piece in the log");
+    assert_eq!(
+        events(&log, "company.conversation.opened").len(),
+        1,
+        "{log}"
+    );
+    for r in f.record().iter().filter(|r| r["sender"].is_string()) {
+        assert_eq!(r["sender"], "agent", "{r}");
+    }
+    // The reader's reads belong to no unit of work: under the strict
+    // profile they name no trace.
+    let reads: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| r["conversation_request"] == true && r["stream"] == true)
+        .collect();
+    assert!(!reads.is_empty());
+    for r in &reads {
+        assert!(r["trace_header"].is_null(), "{r}");
+    }
+    let last = kept.last().unwrap()["data"]["event"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = f.record().len();
+    let d = start(&s, "again", &[]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let first = loop {
+        if let Some(r) = f.record()[before..]
+            .iter()
+            .find(|r| r["path"].as_str().unwrap_or_default().ends_with("/events"))
+        {
+            break r.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            std::fs::read_to_string(&d.log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(first["cursor"], last.as_str(), "the saved cursor: {first}");
+    assert!(first["last_event_id"].is_null(), "{first}");
+    assert_eq!(first["stream"], true);
+}
+
+/// A workflow reaches a Company's API through an `http` step with `auth:
+/// {kind: company}` as through `company.api`, under the same rules: what
+/// `api_allow` lists goes out with the DPoP Session Token and, a write, an
+/// `Idempotency-Key`; what it does not is refused unsent; the Company's
+/// `sign_in_required` is said as what it means.
+#[test]
+fn an_http_step_calls_a_company_api_under_the_tools_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    let one = |name: &str, step: &str| {
+        format!(
+            "  - name: {name}\n    steps:\n      s: {{kind: once}}\n      {name}: {{{step}, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [{name}], status: completed}}\n"
+        )
+    };
+    let flow = format!(
+        "workflows:\n{}{}{}",
+        one(
+            "n",
+            &format!(
+                "kind: http, method: POST, url: \"{}/api/notes\", auth: {{kind: company, company: shop}}, json: {{text: from a step}}",
+                f.origin
+            )
+        ),
+        one(
+            "o",
+            &format!(
+                "kind: http, url: \"{}/api/orders/o1\", auth: {{kind: company, company: shop}}",
+                f.origin
+            )
+        ),
+        one(
+            "x",
+            "kind: tool, name: company.api, args: {company: shop, method: GET, path: /session}"
+        ),
+    );
+    let s = setup_with(
+        &h,
+        "",
+        "",
+        &shop_entry(
+            &f.origin,
+            ", interfaces: [openapi], api_allow: [\"GET /orders/{order_id}\", \"POST /notes\"]",
+        ),
+        &flow,
+    );
+    let d = start(&s, "calls", &[]);
+    let done = |l: &str, step: &str| {
+        events(l, "step.done")
+            .into_iter()
+            .find(|e| e["step"] == step)
+    };
+    let l = wait_for(&d.log, "the three steps", |l| {
+        ["n", "o", "x"].iter().all(|s| done(l, s).is_some())
+    });
+    let n = done(&l, "n").unwrap();
+    assert!(n["err"].is_null(), "{n}");
+    let o = done(&l, "o").unwrap();
+    assert!(
+        o["err"].as_str().is_some_and(
+            |e| e.contains("needs a signed-in Session") && e.contains("sign_in_required")
+        ),
+        "{o}"
+    );
+    let x = done(&l, "x").unwrap();
+    assert!(
+        x["err"]
+            .as_str()
+            .is_some_and(|e| e.contains("GET /session is not in services.shop.api_allow")),
+        "{x}"
+    );
+    let record = f.record();
+    let note = record.iter().find(|r| r["path"] == "/api/notes").unwrap();
+    assert_eq!(note["status"], 201, "{note}");
+    assert!(
+        note["proof"]["ath"].is_string(),
+        "a DPoP proof over the token: {note}"
+    );
+    assert_eq!(note["body"], json!({"text": "from a step"}));
+    assert!(
+        note["idempotency_key"]
+            .as_str()
+            .is_some_and(|k| k.len() == 36),
+        "{note}"
+    );
+    assert!(
+        record.iter().all(|r| r["path"] != "/api/session"),
+        "refused unsent"
+    );
+    // Each call names the trace its run has at the Company, never the run's
+    // own; the description, fetched with no credential, names none.
+    let ours: Vec<String> = l
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|v| v["trace_id"].as_str().map(str::to_string))
+        .collect();
+    for r in record
+        .iter()
+        .filter(|r| r["path"].as_str().unwrap_or_default().starts_with("/api/"))
+    {
+        assert!(r["aauth"].is_null(), "{r}");
+        if r["path"] == "/api/openapi.json" {
+            assert!(r["trace_header"].is_null(), "{r}");
+            continue;
+        }
+        let sent = r["trace_header"].as_str().unwrap_or_else(|| panic!("{r}"));
+        assert!(!ours.iter().any(|t| t == sent), "agentd's own trace: {r}");
+    }
+}
+
+/// A step's message is kept for the step, not for its attempt: a restart
+/// that finds the step running after the Company took its message sends it
+/// again with the id it was sent with, and the Company answers it as the
+/// message it has — one conversation, one message.
+#[test]
+fn a_replayed_step_sends_its_message_with_the_id_it_was_sent_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    const FLOW: &str = "workflows:\n  - name: talk\n    steps:\n      s: {kind: once}\n      c: {kind: tool, name: company.converse, args: {company: shop, text: \"only once\"}, depends_on: [s]}\n      f: {kind: finish, depends_on: [c], status: completed}\n";
+    let s = setup_with(
+        &h,
+        "",
+        "",
+        &shop_entry(&f.origin, ", interfaces: [agent]"),
+        FLOW,
+    );
+    // The first message's answer is held back once the Company took it.
+    f.control(json!({"http_fail": {"method": "POST", "path": "/poppy/conversations", "times": 1, "ms": 30000}}));
+    let mut d = start(&s, "first", &[]);
+    let held = || {
+        agentd::auth::http::get(
+            &format!("{}/_mock/record", f.origin),
+            &[],
+            Duration::from_secs(10),
+            agentd::auth::http::Dial::Named,
+        )
+        .ok()
+        .and_then(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .is_some_and(|v| {
+            v["records"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| r["path"] == "/_mock/held")
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !held() {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            std::fs::read_to_string(&d.log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Gone while the step runs: nothing more of it is written.
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let again = start(&s, "again", &[]);
+    let l = wait_for(&again.log, "the replayed step", |l| {
+        events(l, "step.done").iter().any(|e| e["step"] == "c")
+    });
+    let c = events(&l, "step.done")
+        .into_iter()
+        .find(|e| e["step"] == "c")
+        .unwrap();
+    assert!(c["err"].is_null(), "{c}");
+    let posts: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| r["method"] == "POST" && r["path"] == "/poppy/conversations")
+        .collect();
+    assert!(
+        posts
+            .iter()
+            .any(|p| p["duplicate"] == true && p["text"] == "only once"),
+        "the message sent again with its id: {posts:#?}"
+    );
+    let ids: std::collections::BTreeSet<&str> = posts
+        .iter()
+        .filter_map(|p| p["message_id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), 1, "one message, one conversation: {posts:#?}");
+}

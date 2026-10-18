@@ -349,7 +349,16 @@ An instance that acts at Companies for a person (the `companies` feature,
 its own, addressed to the configured User, `security.companies.user`. The
 first is the cross-Company gate: work that has read one Company's answer —
 or its error, or a message from work that had — and calls another Company's
-tool waits for the User before the call is sent.
+tool, its agent (`company.converse`, `.read`, `.handoff`, `.close`) or its API
+(`company.api`, `.api.describe`, an `http` step with `auth: {kind: company}`)
+waits for the User before the call is sent.
+
+A Company cannot open a gate itself. Its agent's `authorization` event — the
+conversation needs the User's account — is answered with the Account Token
+when one held covers it, and otherwise reaches the model, which may call
+`company.sign_in`; its `user_requested` event — it asks to talk with the User
+— is answered in the conversation that the User is not available for a direct
+conversation.
 
 - **The addressee is the User, and only code writes it.** No workflow,
   document or tool argument can address a gate this way. With `user:

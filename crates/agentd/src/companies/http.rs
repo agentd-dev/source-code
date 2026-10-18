@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
-use crate::auth::http::{self as ahttp, Dial, Reply};
+use crate::auth::http::{self as ahttp, Dial, Failure, Reply};
 use crate::config::settings::companies::{host_matches, host_of, is_https_url};
 use crate::obs::log::Logger;
 
@@ -226,6 +226,50 @@ impl Dialer {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Reply, String> {
+        self.send_reaching(method, url, headers, body)
+            .map_err(|f| f.to_string())
+    }
+
+    /// [`Dialer::send`], saying how far a failed request got: refused before
+    /// it was dialled, or by the connection, is [`Failure::Unsent`]; a
+    /// redirect is an answer, so it is [`Failure::Unanswered`] — the request
+    /// it answered was sent.
+    pub fn send_reaching(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Reply, Failure> {
+        self.may_send(url).map_err(Failure::Unsent)?;
+        let reply = ahttp::send_reaching(method, url, headers, body, self.timeout, self.dial())?;
+        self.pace.note(&reply);
+        self.no_redirect(url, reply.status)?;
+        Ok(reply)
+    }
+
+    /// One credentialed request whose answer is read as it arrives — a
+    /// conversation's events, streamed (§7.6) — held to the rules of
+    /// [`Dialer::send`], each read of it waiting at most `read_for`.
+    pub fn stream(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        read_for: Duration,
+    ) -> Result<crate::net::http::StreamingResponse<Box<dyn crate::net::http::Stream>>, Failure>
+    {
+        self.may_send(url).map_err(Failure::Unsent)?;
+        let r = ahttp::send_streaming(method, url, headers, &[], read_for, self.dial())?;
+        self.pace.learn(r.status, r.retry_after());
+        self.pace.date(r.header("date"));
+        self.no_redirect(url, r.status)?;
+        Ok(r)
+    }
+
+    /// Whether a credentialed request to `url` may go: admitted, carrying no
+    /// token, and not before the not-before instant.
+    fn may_send(&self, url: &str) -> Result<(), String> {
         self.admits(url).map_err(|r| r.say(&self.company))?;
         if url
             .split_once('?')
@@ -236,16 +280,17 @@ impl Dialer {
                 self.company
             ));
         }
-        self.pace.check()?;
-        let reply = ahttp::send(method, url, headers, body, self.timeout, self.dial())?;
-        self.pace.note(&reply);
-        if (300..400).contains(&reply.status) {
-            return Err(format!(
+        self.pace.check()
+    }
+
+    fn no_redirect(&self, url: &str, status: u16) -> Result<(), Failure> {
+        if (300..400).contains(&status) {
+            return Err(Failure::Unanswered(format!(
                 "company {}: {url} answered a redirect, which a request carrying a credential never follows",
                 self.company
-            ));
+            )));
         }
-        Ok(reply)
+        Ok(())
     }
 
     /// GET a document with no credential: HTTPS redirects followed, each hop
@@ -253,6 +298,11 @@ impl Dialer {
     /// The URL it was served from after the redirects, its JSON and its
     /// cache lifetime.
     pub fn document(&self, url: &str) -> Result<Document, Refused> {
+        self.document_up_to(url, MAX_DOCUMENT)
+    }
+
+    /// [`Dialer::document`], the body capped at `cap` bytes.
+    pub fn document_up_to(&self, url: &str, cap: usize) -> Result<Document, Refused> {
         let mut at = url.to_string();
         let mut hops = 0;
         loop {
@@ -284,9 +334,9 @@ impl Dialer {
             if reply.status != 200 {
                 return Err(Refused::Fetch(format!("{at}: HTTP {}", reply.status)));
             }
-            if reply.body.len() > MAX_DOCUMENT {
+            if reply.body.len() > cap {
                 return Err(Refused::Fetch(format!(
-                    "{at}: the document is over {MAX_DOCUMENT} bytes"
+                    "{at}: the document is over {cap} bytes"
                 )));
             }
             let json =

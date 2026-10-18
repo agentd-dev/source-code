@@ -40,6 +40,49 @@ pub const BROWSER_ASSERTION_TYPE: &str = "poppy-browser+jwt";
 /// The conversation protocol type the draft defines (§7.1).
 pub const CONVERSATION_TYPE: &str = "poppy";
 
+/// A conversation's requests under the `poppy` entry's endpoint (§7.2–§7.6).
+pub mod conversation {
+    pub const MESSAGES: &str = "messages";
+    pub const EVENTS: &str = "events";
+    pub const HANDOFF: &str = "handoff";
+    pub const CLOSE: &str = "close";
+    /// The query parameters of a read, and of a `POST` that waits for the
+    /// reply (§7.3, §7.5).
+    pub const CURSOR: &str = "cursor";
+    pub const WAIT: &str = "wait";
+    /// What a stream's reconnect sends in place of `cursor` (§7.6).
+    pub const LAST_EVENT_ID: &str = "Last-Event-ID";
+    /// The media type a read asks for a stream with (§7.6).
+    pub const EVENT_STREAM: &str = "text/event-stream";
+    /// The prefix the draft suggests for a message ID (§7.2).
+    pub const MESSAGE_ID_PREFIX: &str = "msg_";
+    /// The request member naming the conversation a Direct Conversation
+    /// follows (§7.10).
+    pub const PARENT: &str = "parent_conversation_id";
+}
+
+/// The conversation event types (§7.5, §7.6).
+pub mod event {
+    pub const MESSAGE: &str = "message";
+    pub const STATE: &str = "state";
+    pub const AUTHORIZATION: &str = "authorization";
+    pub const USER_REQUESTED: &str = "user_requested";
+    pub const DIRECT_OPENED: &str = "direct_opened";
+    pub const DIRECT_CLOSED: &str = "direct_closed";
+    /// A piece of a message being written, sent only in a stream (§7.6).
+    pub const TEXT_DELTA: &str = "text-delta";
+}
+
+/// Who wrote a message (§7.4, §7.8).
+pub const SENDER_AGENT: &str = "agent";
+pub const SENDER_HUMAN: &str = "human";
+/// The status of a conversation that takes no more messages (§7.7).
+pub const STATUS_CLOSED: &str = "closed";
+
+/// The header an API write's idempotency key travels in (Guides
+/// #both-retries).
+pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
+
 /// The API types of `apis[].type` (§6).
 pub const API_MCP: &str = "mcp";
 pub const API_OPENAPI: &str = "openapi";
@@ -100,4 +143,11 @@ pub mod error {
     pub const INVALID_TOKEN: &str = "invalid_token";
     pub const SIGN_IN_REQUIRED: &str = "sign_in_required";
     pub const INSUFFICIENT_SCOPE: &str = "insufficient_scope";
+    /// The conversation errors (§7.13).
+    pub const CONVERSATION_NOT_FOUND: &str = "conversation_not_found";
+    pub const CONVERSATION_CLOSED: &str = "conversation_closed";
+    pub const DIRECT_CONVERSATION_OPEN: &str = "direct_conversation_open";
+    pub const MESSAGE_ID_CONFLICT: &str = "message_id_conflict";
+    pub const INVALID_CURSOR: &str = "invalid_cursor";
+    pub const CURSOR_EXPIRED: &str = "cursor_expired";
 }

@@ -93,6 +93,11 @@ pub enum Event {
     /// the supervisor to check.
     #[cfg(feature = "companies")]
     CompanyCallback { query: String },
+    /// A Company conversation's reader has events for the stream
+    /// `company.<name>` (RFC 0047 §5.5.7), and waits to be told they are
+    /// appended.
+    #[cfg(feature = "companies")]
+    CompanyDelivery(Box<crate::companies::conversation::Delivery>),
     /// A Company sign-out finished: who is owed its outcome, and the
     /// outcome.
     #[cfg(feature = "companies")]

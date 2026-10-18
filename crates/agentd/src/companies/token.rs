@@ -9,6 +9,7 @@
 //! | Renew a signed-out one | the same | `session_id` | a proof |
 //! | Use the Account Token: sign a Session in, renew it, or start one signed in | `refresh_token` | `refresh_token`, `session_id`?, a narrower `scope`? | a proof |
 //! | A Bearer token for an MCP server | the Session's renew grant | `session_id`, `resource` = its `url` | none (§4.3: "without the `DPoP` header") |
+//! | A DPoP token for an API or a conversation endpoint the Company lists with a `resource` | the Session's renew grant | `session_id`, `resource` | a proof |
 //! | Device Sign-In's poll | `device_code` | `device_code`, `session_id` | a proof |
 //! | Direct Sign-In's code | `authorization_code` | `code`, `redirect_uri`, `code_verifier`, `session_id` | a proof |
 //!
@@ -117,6 +118,15 @@ impl<'a> Request<'a> {
         }
     }
 
+    /// A DPoP token issued for `resource` — an API or conversation endpoint
+    /// the Company lists with one (§3.1, §4.3) — for `session_id`.
+    pub fn resource(session_id: &'a str, resource: &'a str) -> Request<'a> {
+        Request {
+            resource: Some(resource),
+            ..Request::renew(session_id)
+        }
+    }
+
     /// The same request granted on the Account Token `token` instead —
     /// narrowed to `scope` when it names fewer scopes than the token holds.
     pub fn with_account(self, token: &'a str, scope: Option<&'a str>) -> Request<'a> {
@@ -155,7 +165,8 @@ impl<'a> Request<'a> {
     /// names it.
     pub fn grant(&self) -> &'static str {
         match (self.grant, self.resource, self.session_id) {
-            (_, Some(_), _) => "bearer",
+            (_, Some(_), _) if !self.dpop => "bearer",
+            (_, Some(_), _) => "resource",
             (Grant::Refresh { .. }, None, _) => "refresh",
             (Grant::DeviceCode { .. }, None, _) => "device_code",
             (Grant::Code { .. }, None, _) => "authorization_code",
@@ -594,6 +605,8 @@ mod tests {
         assert_eq!(Request::start().grant(), "start");
         assert_eq!(Request::renew("s").grant(), "renew");
         assert_eq!(Request::bearer("s", "https://m/mcp").grant(), "bearer");
+        assert_eq!(Request::resource("s", "https://api/v1").grant(), "resource");
+        assert!(Request::resource("s", "https://api/v1").dpop);
         assert_eq!(
             Request::renew("s").with_account("pat", None).grant(),
             "refresh"

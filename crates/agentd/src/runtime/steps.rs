@@ -1951,6 +1951,26 @@ impl Runtime {
                 let args = spec.get("args").cloned().unwrap_or(json!({}));
                 self.step_tool_call(run_id, step_id, &step_caller, &name, args);
             }
+            // A Company's API, called as `company.api` (RFC 0047 §5.5.8).
+            "http"
+                if spec
+                    .get("auth")
+                    .and_then(|a| a.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("company") =>
+            {
+                #[cfg(feature = "companies")]
+                self.step_http_company(run_id, step_id, &step_caller, &spec);
+                #[cfg(not(feature = "companies"))]
+                self.finish_step(
+                    run_id,
+                    step_id,
+                    StepStatus::Failed,
+                    None,
+                    Some("http: auth kind company needs the `companies` feature".into()),
+                    0,
+                );
+            }
             "http" => self.step_http(run_id, step_id, &spec),
             k if k.starts_with("memory.")
                 || k.starts_with("artifact.")
@@ -2268,7 +2288,7 @@ impl Runtime {
     }
 
     /// A step's internal tool call (in-loop or deferred/executor).
-    fn step_tool_call(
+    pub(crate) fn step_tool_call(
         &mut self,
         run_id: &str,
         step_id: &str,

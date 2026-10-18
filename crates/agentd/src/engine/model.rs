@@ -511,6 +511,7 @@ pub const KINDS: &[KindInfo] = &[
             "idempotency",
             "breaker",
             "rate",
+            "auth",
         ],
         &["url"],
         true,
@@ -2115,6 +2116,35 @@ fn parse_step(
         && let Err(e) = jsonschema::check_schema(s)
     {
         errs.push(format!("{at}: output_schema: {}", e.join("; ")));
+    }
+    // `auth: {kind: company, company: <entry>}` makes an `http` step a call
+    // of a Company's API (RFC 0047 §5.5.8): the credential, the hosts and the
+    // `Idempotency-Key` are agentd's, so a step names none of its own.
+    if kind == "http"
+        && let Some(auth) = spec.get("auth")
+    {
+        let ok = auth.as_object().is_some_and(|o| {
+            o.get("kind").and_then(Value::as_str) == Some("company")
+                && o.get("company").is_some_and(Value::is_string)
+                && o.keys().all(|k| k == "kind" || k == "company")
+        });
+        if !ok {
+            errs.push(format!(
+                "{at}: http auth takes {{kind: company, company: <entry>}}"
+            ));
+        }
+        for field in ["sign", "allow_private", "idempotency", "body"] {
+            if spec.get(field).is_some() {
+                errs.push(format!(
+                    "{at}: `{field}` does not apply to an http step that calls a Company's API (auth kind company): agentd sends its credential, its JSON body and its Idempotency-Key, to the company entry's hosts"
+                ));
+            }
+        }
+        if spec.get("headers").is_some() {
+            errs.push(format!(
+                "{at}: `headers` does not apply to an http step that calls a Company's API (auth kind company): the operation's description says what it takes"
+            ));
+        }
     }
     // `idempotency` shapes. Validated per kind because the transports differ:
     // HTTP names WHERE the key travels (a header or a query parameter), the

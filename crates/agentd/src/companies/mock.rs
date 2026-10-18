@@ -29,7 +29,12 @@
 //! | `POST /auth/revoke` | RFC 7009 revocation of an Account Token (§4.9) |
 //! | `POST /mcp` | an MCP server taking only Bearer tokens issued for its URL (§6); its `search` for `coupon` is the tool's own error, worded with the codes a refusal carries |
 //! | `GET /.well-known/oauth-protected-resource/mcp` | its RFC 9728 metadata |
-//! | `GET /api/openapi.json`, `GET /api/session` | an OpenAPI description and its one operation, which takes DPoP Session Tokens (§4.3, §6) |
+//! | `GET /api/openapi.json` | an OpenAPI description of the operations below, which take DPoP Session Tokens only (§4.3, §6) |
+//! | `GET /api/session` | the Session the presented token belongs to |
+//! | `GET /api/orders/{order_id}` | one of the User's orders: `sign_in_required` signed out, `insufficient_scope` without `poppy:read` |
+//! | `POST /api/orders/{order_id}/exchanges` | an exchange, declaring an `Idempotency-Key` header: a repeated key gets the first answer, with another body `422` |
+//! | `POST /api/notes` | a note, declaring no `Idempotency-Key` |
+//! | `POST /poppy/conversations`, `…/{id}/messages`, `GET …/{id}/events`, `POST …/{id}/handoff`, `…/close` | the Company Agent's conversations (§7), DPoP Session Tokens only |
 //! | `POST /_mock/control`, `GET /_mock/record` | steer the scripted User and token lifetimes; read what the fake saw |
 //!
 //! **What it holds a Personal Agent to.** Both assertions are verified
@@ -47,6 +52,22 @@
 //! is strict where the draft is: a Personal Agent tested against it learns
 //! of a mistake at the request that makes it.
 //!
+//! **The Company Agent** answers each message at once: a message asking
+//! about an order gets an `authorization` event and a request to sign in
+//! from a signed-out Session (`insufficient_scope` from one without
+//! `poppy:read`), and the order's status from a signed-in one — after which
+//! the conversation belongs to the account (§7.2, §7.11); any other message
+//! is echoed. Before each reply comes an event of a type the draft does not
+//! define, which a Personal Agent must skip (§7.5). A message whose id the
+//! User sent before gets the first answer when its content is the same, and
+//! `message_id_conflict` when not (§7.3). A read waits at most three seconds
+//! for an event, whatever its `wait` asks (§7.5: the Company "MAY … cap
+//! `wait`"), and one that asks for a stream gets every event it has as SSE
+//! — each Company message's text first sent in `text-delta` pieces marked
+//! `DELTA:`, which appear in no event — and then the stream ends, as a
+//! Company may end one at any time (§7.6). The protocol entry `poppy` is
+//! listed after one of a type agentd does not speak.
+//!
 //! **The scripted User** approves a device or Direct Sign-In as the account
 //! `acct_1`, granting every scope asked for, after one `authorization_pending`
 //! poll. `POST /_mock/control {"approver": {"decision": "approve|deny|expire",
@@ -55,7 +76,8 @@
 //! steers what a Personal Agent is tested against mid-run: `"refuse_tokens":
 //! n` answers the next `n` MCP requests `401 invalid_token`;
 //! `"refuse_grants": n` answers the next `n` token requests `401
-//! invalid_client`;
+//! invalid_client`; `"refuse_dpop": n` answers the next `n` API and
+//! conversation requests `401 invalid_token`, whatever they carry;
 //! `"extension_required": "<name>"` has the MCP servers refuse every request
 //! from then on with `403 extension_required`; `"extra_mcp": true` lists a
 //! second MCP API, at `/mcp/orders`, from then on; `"end_sessions": true`
@@ -76,6 +98,15 @@
 //! settings: every Account Token is revoked, and the Sessions signed in with
 //! them signed out (§4.9); `"device": {"expires_in": n, "interval": n}` has
 //! the next device authorizations say those numbers, whatever the fake keeps;
+//! `"http_fail": {"method": m, "path": p, "times": n, "status": s}` answers
+//! the next `n` API or conversation requests of method `m` whose path starts
+//! with `p` with the bare status `s`, after they took effect — with `"ms":
+//! t`, `t` ms after, recording `/_mock/held` as each hold begins, and, with
+//! no `status`, then answered as they would have been;
+//! `"conversation": {"user_requested": reason}` has the Company Agent ask to
+//! talk with the User after its next reply; `"expire_events": true` forgets
+//! every conversation's events so far, so a cursor naming one of them is
+//! `cursor_expired`;
 //! and a `stall` whose `method` is `token:<grant_type>` holds the answers to
 //! the next `n` token requests of that grant `t` ms after they took effect
 //! (a rotation already made, say, while its answer is on the way),
@@ -103,8 +134,8 @@
 //! `scope` and, granted on an Account Token, which one (`account_token`, named
 //! as `presented` names tokens), and for a device authorization or a
 //! revocation the same of theirs; for any
-//! request, whether it carried an AAuth signature (`aauth`), a
-//! `traceparent` header (`trace_header`) or a `User-Agent` (`user_agent`),
+//! request, whether it carried an AAuth signature (`aauth`), the trace id
+//! of a `traceparent` header (`trace_header`), its `User-Agent` (`user_agent`),
 //! when it arrived (`at_ms`, from the fake's start), and whether an Account
 //! Token the fake issued was anywhere in it but the one form member that
 //! may carry it to the token or revocation endpoint (`account_token_leaked`);
@@ -225,6 +256,10 @@ pub struct Options {
 /// The organization's domain: the host the fake serves its discovery
 /// document on.
 const DOMAIN: &str = "127.0.0.1";
+/// Where the Company Agent's conversations are (§7.2).
+const CONVERSATIONS: &str = "/poppy/conversations";
+/// The longest a read is held for an event, whatever its `wait`.
+const WAIT_CAP_S: u64 = 3;
 /// How long a proof or an assertion stays acceptable, either side of now.
 const WINDOW_S: u64 = 60;
 /// The longest assertion lifetime the fake accepts: the draft asks for
@@ -474,6 +509,9 @@ fn write_reply(stream: &mut impl Write, r: &Reply) {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
+        410 => "Gone",
+        422 => "Unprocessable Content",
         429 => "Too Many Requests",
         _ => "Status",
     };
@@ -764,6 +802,8 @@ struct State {
     refuse_tokens: u32,
     /// Token requests still to answer `401 invalid_client`.
     refuse_grants: u32,
+    /// API and conversation requests still to answer `401 invalid_token`.
+    refuse_dpop: u32,
     /// The extension the MCP servers refuse every request without.
     extension_required: Option<String>,
     /// MCP requests to hold or fail, in the order the control set them.
@@ -778,6 +818,47 @@ struct State {
     /// Token requests whose answers to hold back after they took effect, by
     /// grant (`"stall"` with a `method` of `token:<grant_type>`).
     token_holds: Vec<Hold>,
+    /// API and conversation requests to fail after they took effect, by
+    /// method and path prefix (`"http_fail"`).
+    http_holds: Vec<HttpHold>,
+    /// The conversations, by Conversation ID.
+    conversations: BTreeMap<String, Conversation>,
+    /// The messages the Personal Agents sent, by (client_id, User ID,
+    /// message id): their content and the answer they got (§7.3).
+    messages: BTreeMap<(String, String, String), (String, u16, Value)>,
+    /// The last event id handed out.
+    events: u64,
+    /// What the Company Agent asks after its next reply.
+    user_requested: Option<String>,
+    /// API writes, by `Idempotency-Key`: the body and the answer.
+    writes: BTreeMap<String, (String, u16, Value)>,
+}
+
+/// What the next API or conversation requests of one method and path meet
+/// (`http_fail`).
+struct HttpHold {
+    method: String,
+    /// The path prefix it holds.
+    path: String,
+    times: u32,
+    /// How long their answers are held back after they took effect.
+    ms: u64,
+    /// The bare status they are answered with, after they took effect; none
+    /// answers them as served.
+    status: Option<u16>,
+}
+
+/// One conversation (§7).
+struct Conversation {
+    client_id: String,
+    user_id: String,
+    /// The account it used; it belongs to that account from then on (§7.2).
+    account: Option<String>,
+    events: Vec<Value>,
+    /// Events before this index are no longer kept (`cursor_expired`).
+    kept_from: usize,
+    status: &'static str,
+    responder: &'static str,
 }
 
 /// The fake Company.
@@ -823,12 +904,19 @@ impl Company {
                 issued: 0,
                 refuse_tokens: 0,
                 refuse_grants: 0,
+                refuse_dpop: 0,
                 extension_required: None,
                 holds: Vec::new(),
                 date_skew_s: 0,
                 slow_down: 0,
                 device_said: (None, None),
                 token_holds: Vec::new(),
+                http_holds: Vec::new(),
+                conversations: BTreeMap::new(),
+                messages: BTreeMap::new(),
+                events: 0,
+                user_requested: None,
+                writes: BTreeMap::new(),
             }),
             extra_mcp: AtomicBool::new(false),
             started: Instant::now(),
@@ -900,8 +988,8 @@ impl Company {
         }) {
             record["aauth"] = json!(true);
         }
-        if req.header("traceparent").is_some() {
-            record["trace_header"] = json!(true);
+        if let Some(tp) = req.header("traceparent") {
+            record["trace_header"] = json!(tp.split('-').nth(1).unwrap_or(tp));
         }
         if let Some(ua) = req.header("user-agent") {
             record["user_agent"] = json!(ua);
@@ -983,7 +1071,10 @@ impl Company {
             }
             (_, p) if self.is_mcp(p) => self.mcp(req),
             ("GET", "/api/openapi.json") => self.openapi(),
-            ("GET", "/api/session") => self.session_operation(req),
+            (_, p) if p.starts_with("/api/") => self.held_http(req, Company::api),
+            (_, p) if p == CONVERSATIONS || p.starts_with(&format!("{CONVERSATIONS}/")) => {
+                self.held_http(req, Company::conversations)
+            }
             ("POST", "/_mock/control") => self.control(req),
             ("GET", "/_mock/record") => {
                 Reply::json(200, &json!({"records": lock(&self.state).records}))
@@ -1045,7 +1136,7 @@ impl Company {
             .into_iter()
             .map(|url| json!({"type": wire::API_MCP, "url": url, "description": "Product search and order status"}))
             .collect();
-        apis.push(json!({"type": wire::API_OPENAPI, "url": self.api_url(), "description": "The Session a token belongs to"}));
+        apis.push(json!({"type": wire::API_OPENAPI, "url": self.api_url(), "description": "Orders, exchanges, notes, and the Session a token belongs to"}));
         let doc = json!({
             "protocol_version": wire::PROTOCOL_VERSION,
             "organization": {"name": "Fake Company", "domain": DOMAIN},
@@ -1054,6 +1145,10 @@ impl Company {
                 "direct": {"scopes": SIGN_IN_SCOPES},
                 "device": {"scopes": SIGN_IN_SCOPES}
             },
+            "agent": {"protocols": [
+                {"type": "x-mock-voice", "endpoint": format!("{}/voice", self.origin())},
+                {"type": wire::CONVERSATION_TYPE, "endpoint": format!("{}{CONVERSATIONS}", self.origin())}
+            ]},
             "apis": apis
         });
         match self.conformant("poppy.schema.json", doc) {
@@ -1118,21 +1213,60 @@ impl Company {
     }
 
     fn openapi(&self) -> Reply {
+        let json_of = |schema: Value| json!({"application/json": {"schema": schema}});
         Reply::json(
             200,
             &json!({
                 "openapi": "3.1.0",
                 "info": {"title": "Fake Company", "version": "1"},
                 "servers": [{"url": format!("{}/api", self.origin())}],
-                "paths": {"/session": {"get": {
-                    "operationId": "getSession",
-                    "summary": "The Session the presented token belongs to",
-                    "responses": {"200": {"description": "The Session", "content": {"application/json": {"schema": {
-                        "type": "object",
-                        "properties": {"session_id": {"type": "string"}, "signed_in": {"type": "boolean"}, "scope": {"type": "string"}}
-                    }}}}}
-                }}},
-                "components": {"securitySchemes": {"dpop": {"type": "http", "scheme": wire::TOKEN_TYPE_DPOP}}},
+                "paths": {
+                    "/session": {"get": {
+                        "operationId": "getSession",
+                        "summary": "The Session the presented token belongs to",
+                        "responses": {"200": {"description": "The Session", "content": json_of(json!({
+                            "type": "object",
+                            "properties": {"session_id": {"type": "string"}, "signed_in": {"type": "boolean"}, "scope": {"type": "string"}}
+                        }))}}
+                    }},
+                    "/orders/{order_id}": {
+                        "parameters": [{"name": "order_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1}}],
+                        "get": {
+                            "operationId": "getOrder",
+                            "summary": "One of the User's orders; needs a signed-in Session with poppy:read",
+                            "responses": {"200": {"description": "The order", "content": json_of(json!({"$ref": "#/components/schemas/Order"}))}}
+                        }
+                    },
+                    "/orders/{order_id}/exchanges": {"post": {
+                        "operationId": "exchangeItem",
+                        "summary": "Exchange an item of an order",
+                        "parameters": [
+                            {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string"}},
+                            {"$ref": "#/components/parameters/IdempotencyKey"}
+                        ],
+                        "requestBody": {"required": true, "content": json_of(json!({"$ref": "#/components/schemas/Exchange"}))},
+                        "responses": {"201": {"description": "The exchange", "content": json_of(json!({"type": "object"}))}}
+                    }},
+                    "/notes": {"post": {
+                        "operationId": "addNote",
+                        "summary": "Leave a note for the Company",
+                        "requestBody": {"required": true, "content": json_of(json!({
+                            "type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}
+                        }))},
+                        "responses": {"201": {"description": "The note", "content": json_of(json!({"type": "object"}))}}
+                    }}
+                },
+                "components": {
+                    "schemas": {
+                        "Order": {"type": "object", "properties": {"order_id": {"type": "string"}, "status": {"type": "string"}}},
+                        "Exchange": {
+                            "type": "object", "required": ["item_id", "replacement_sku"], "additionalProperties": false,
+                            "properties": {"item_id": {"type": "string"}, "replacement_sku": {"type": "string", "minLength": 3}}
+                        }
+                    },
+                    "parameters": {"IdempotencyKey": {"name": wire::IDEMPOTENCY_KEY, "in": "header", "required": true, "schema": {"type": "string"}}},
+                    "securitySchemes": {"dpop": {"type": "http", "scheme": wire::TOKEN_TYPE_DPOP}}
+                },
                 "security": [{"dpop": []}]
             }),
         )
@@ -2174,9 +2308,12 @@ impl Company {
                 .is_some_and(|s| s.signed_in)
     }
 
-    /// The API's one operation, which takes a DPoP Session Token and its
-    /// proof, and nothing else.
-    fn session_operation(&self, req: &Request) -> Reply {
+    /// The DPoP Session Token `req` carries, held to §4.3: one the fake
+    /// issued, unexpired and DPoP-bound, with exactly one proof, by the key
+    /// the token is bound to, whose `ath` is the token's hash — and never in
+    /// the URL. A refusal is the `401` with `WWW-Authenticate: DPoP` §6
+    /// gives.
+    fn dpop_access(&self, req: &Request, st: &mut State) -> Result<String, Reply> {
         let challenge = |error: &str, why: &str| {
             Reply::new(401)
                 .with(
@@ -2189,57 +2326,549 @@ impl Company {
                 .note("error", json!(error))
         };
         if req.query.contains("access_token=") {
-            return self.oauth_error(refuse(
+            return Err(self.oauth_error(refuse(
                 400,
                 err::INVALID_REQUEST,
                 "a token in a URL is refused",
-            ));
+            )));
         }
         let Some(auth) = req.header("authorization") else {
-            return Reply::new(401).with(
+            return Err(Reply::new(401).with(
                 "WWW-Authenticate",
                 &format!("DPoP algs=\"{}\"", wire::ES256),
-            );
+            ));
         };
         let Some(token) = auth.strip_prefix("DPoP ") else {
-            return challenge(
+            return Err(challenge(
                 err::INVALID_TOKEN,
-                "this API takes DPoP Session Tokens only",
-            );
+                "this endpoint takes DPoP Session Tokens only",
+            ));
         };
-        let mut st = lock(&self.state);
+        if st.refuse_dpop > 0 {
+            st.refuse_dpop -= 1;
+            return Err(challenge(err::INVALID_TOKEN, "the token is refused"));
+        }
         let jkt = match st.access.get(token) {
-            Some(a) if a.expires_at >= now() => match &a.binding {
-                Binding::Dpop(jkt) => jkt.clone(),
-                Binding::Bearer(_) => {
-                    return challenge(
-                        err::INVALID_TOKEN,
-                        "a Bearer token is for its MCP server only",
-                    );
+            Some(a) if a.expires_at >= now() && st.sessions.contains_key(&a.session_id) => {
+                match &a.binding {
+                    Binding::Dpop(jkt) => jkt.clone(),
+                    Binding::Bearer(_) => {
+                        return Err(challenge(
+                            err::INVALID_TOKEN,
+                            "a Bearer token is for its MCP server only",
+                        ));
+                    }
                 }
-            },
-            _ => return challenge(err::INVALID_TOKEN, "the token is unknown or expired"),
+            }
+            _ => {
+                return Err(challenge(
+                    err::INVALID_TOKEN,
+                    "the token is unknown or expired",
+                ));
+            }
         };
-        let proof = match self.check_proof(req, Some(token), false, &mut st) {
+        let proof = match self.check_proof(req, Some(token), false, st) {
             Ok(Some(p)) => p,
-            Ok(None) => return challenge(err::INVALID_DPOP_PROOF, "no DPoP Proof"),
-            Err(ProofError::Invalid(why)) => return challenge(err::INVALID_DPOP_PROOF, &why),
+            Ok(None) => return Err(challenge(err::INVALID_DPOP_PROOF, "no DPoP Proof")),
+            Err(ProofError::Invalid(why)) => return Err(challenge(err::INVALID_DPOP_PROOF, &why)),
             Err(ProofError::Nonce(n)) => {
-                return challenge(err::USE_DPOP_NONCE, "a nonce is required")
-                    .with(wire::DPOP_NONCE_HEADER, &n);
+                return Err(challenge(err::USE_DPOP_NONCE, "a nonce is required")
+                    .with(wire::DPOP_NONCE_HEADER, &n));
             }
         };
         if proof.jkt != jkt {
-            return challenge(
+            return Err(challenge(
                 err::INVALID_DPOP_PROOF,
                 "the proof's key is not the one the token is bound to",
-            );
+            ));
         }
-        let a = &st.access[token];
-        Reply::json(
-            200,
-            &json!({"session_id": a.session_id, "signed_in": Company::signed_in_now(a, &st), "scope": a.scope}),
+        seen(
+            "signed_in",
+            json!(Company::signed_in_now(&st.access[token], st)),
+        );
+        Ok(token.to_string())
+    }
+
+    /// `serve`'s answer to `req`, unless an `http_fail` control holds it:
+    /// then held back for the time it names and the bare status it names,
+    /// after the request took effect.
+    fn held_http(&self, req: &Request, serve: fn(&Company, &Request) -> Reply) -> Reply {
+        let reply = serve(self, req);
+        let held = lock(&self.state)
+            .http_holds
+            .iter_mut()
+            .find(|h| h.method == req.method && req.path.starts_with(&h.path) && h.times > 0)
+            .map(|h| {
+                h.times -= 1;
+                (h.ms, h.status)
+            });
+        let Some((ms, failed)) = held else {
+            return reply;
+        };
+        if ms > 0 {
+            // Said as it begins, so a test knows the request took effect.
+            let begun = json!({"path": "/_mock/held", "held": req.path, "ms": ms,
+                               "at_ms": self.started.elapsed().as_millis() as u64});
+            eprintln!("COMPANY {begun}");
+            lock(&self.state).records.push(begun);
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        match failed {
+            Some(status) => {
+                let mut r = Reply::new(status);
+                r.note = reply.note;
+                r.note("failed", json!(status))
+            }
+            None => reply,
+        }
+    }
+
+    /// A `403` naming what the token lacks (§6).
+    fn dpop_refusal(error: &str, scope: Option<&str>) -> Reply {
+        let mut v = format!("DPoP error=\"{error}\"");
+        if let Some(s) = scope {
+            v.push_str(&format!(", scope=\"{s}\""));
+        }
+        Reply::new(403)
+            .with("WWW-Authenticate", &v)
+            .note("error", json!(error))
+    }
+
+    /// The API (§6): the operations its description lists.
+    fn api(&self, req: &Request) -> Reply {
+        let mut st = lock(&self.state);
+        let token = match self.dpop_access(req, &mut st) {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+        let a = &st.access[&token];
+        let (signed_in, scope, session_id) = (
+            Company::signed_in_now(a, &st),
+            a.scope.clone(),
+            a.session_id.clone(),
+        );
+        let key = req.header("idempotency-key").map(str::to_string);
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let rest = req.path.trim_start_matches("/api");
+        let order = rest.strip_prefix("/orders/");
+        let reply = match (req.method.as_str(), rest, order) {
+            ("GET", "/session", _) => Reply::json(
+                200,
+                &json!({"session_id": session_id, "signed_in": signed_in, "scope": scope}),
+            ),
+            ("GET", _, Some(id)) if !id.contains('/') => {
+                if !signed_in {
+                    Company::dpop_refusal(err::SIGN_IN_REQUIRED, None)
+                } else if !scope.split(' ').any(|s| s == wire::SCOPE_READ) {
+                    Company::dpop_refusal(err::INSUFFICIENT_SCOPE, Some(wire::SCOPE_READ))
+                } else {
+                    Reply::json(200, &json!({"order_id": id, "status": "shipped"}))
+                }
+            }
+            ("POST", _, Some(id)) if id.ends_with("/exchanges") => {
+                let Some(k) = key.clone() else {
+                    return Reply::json(
+                        400,
+                        &json!({"error": "invalid_request", "error_description": "an exchange needs an Idempotency-Key"}),
+                    );
+                };
+                let digest = body.to_string();
+                match st.writes.get(&k) {
+                    Some((d, status, answer)) if *d == digest => {
+                        Reply::json(*status, answer).note("duplicate", json!(true))
+                    }
+                    Some(_) => Reply::json(
+                        422,
+                        &json!({"error": "invalid_request", "error_description": "the Idempotency-Key was used with another body"}),
+                    ),
+                    None => {
+                        let answer = json!({"exchange_id": opaque("exc_"), "order_id": id.trim_end_matches("/exchanges"),
+                                            "replacement_sku": body["replacement_sku"]});
+                        st.writes.insert(k, (digest, 201, answer.clone()));
+                        Reply::json(201, &answer)
+                    }
+                }
+            }
+            ("POST", "/notes", _) => Reply::json(201, &json!({"note_id": opaque("note_")})),
+            _ => Reply::new(404),
+        };
+        reply.note("idempotency_key", json!(key)).note("body", body)
+    }
+
+    // --- Conversations (§7) -------------------------------------------
+
+    /// A JSON error from a conversation endpoint (§7.13), held to the kit's
+    /// schema.
+    fn poppy_error(&self, status: u16, code: &str, why: &str) -> Reply {
+        let body = json!({"error": code, "error_description": why});
+        match self.conformant("error.schema.json", body) {
+            Ok(b) => Reply::json(status, &b).note("error", json!(code)),
+            Err(drift) => drift,
+        }
+    }
+
+    /// The next event of a conversation: `fields` and its own id and time.
+    fn event(st: &mut State, kind: &str, mut fields: Value) -> Value {
+        st.events += 1;
+        fields["id"] = json!(format!("evt_{}", st.events));
+        fields["type"] = json!(kind);
+        fields["created_at"] = json!(crate::obs::log::rfc3339_millis(std::time::SystemTime::now()));
+        fields
+    }
+
+    /// The Company Agent's answer to `text` in `c`, from a Session signed in
+    /// to `account` with `scope`, or signed out.
+    fn agent_reply(st: &mut State, cid: &str, text: &str, account: Option<&str>, scope: &str) {
+        let say = |st: &mut State, words: &str| {
+            let id = opaque("msg_");
+            Company::event(
+                st,
+                wire::event::MESSAGE,
+                json!({"message": {"id": id, "role": "company", "sender": wire::SENDER_AGENT, "text": words}}),
+            )
+        };
+        // A type the draft does not define, before the reply: a Personal
+        // Agent skips it, and reads on (§7.5).
+        let mut out = vec![Company::event(
+            st,
+            "x-mock-receipt",
+            json!({"note": "a type the draft does not define"}),
+        )];
+        if text.contains("order") {
+            match account {
+                None => {
+                    out.push(Company::event(
+                        st,
+                        wire::event::AUTHORIZATION,
+                        json!({"error": err::SIGN_IN_REQUIRED}),
+                    ));
+                    out.push(say(st, "To look up an order I need you to sign in."));
+                }
+                Some(_) if !scope.split(' ').any(|s| s == wire::SCOPE_READ) => {
+                    out.push(Company::event(
+                        st,
+                        wire::event::AUTHORIZATION,
+                        json!({"error": err::INSUFFICIENT_SCOPE, "scope": wire::SCOPE_READ}),
+                    ));
+                    out.push(say(st, "I need to read your account to look up an order."));
+                }
+                Some(acct) => {
+                    if let Some(c) = st.conversations.get_mut(cid) {
+                        c.account = Some(acct.to_string());
+                    }
+                    out.push(say(st, "Your order o1 has shipped."));
+                }
+            }
+        } else if !text.is_empty() {
+            let words = format!("You said: {text}");
+            out.push(say(st, &words));
+        }
+        if let Some(reason) = st.user_requested.take() {
+            out.push(Company::event(
+                st,
+                wire::event::USER_REQUESTED,
+                json!({"reason": reason}),
+            ));
+        }
+        if let Some(c) = st.conversations.get_mut(cid) {
+            c.events.extend(out);
+        }
+    }
+
+    /// A conversation request (§7.2): DPoP Session Tokens only, and the
+    /// conversation the token's owner's — its account's, once it used one.
+    fn conversations(&self, req: &Request) -> Reply {
+        let mut st = lock(&self.state);
+        let token = match self.dpop_access(req, &mut st) {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+        let a = &st.access[&token];
+        let signed_in = Company::signed_in_now(a, &st);
+        let scope = a.scope.clone();
+        let s = &st.sessions[&a.session_id];
+        let (client_id, user_id) = (s.client_id.clone(), s.user_id.clone());
+        let account = if signed_in { s.account.clone() } else { None };
+        let q = decode_form(req.query.as_bytes()).unwrap_or_default();
+        let rest: Vec<String> = req.path[CONVERSATIONS.len()..]
+            .split('/')
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+            .collect();
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let mut reply = match (req.method.as_str(), rest.as_slice()) {
+            ("POST", []) => self.message(
+                &mut st,
+                None,
+                &body,
+                &q,
+                (&client_id, &user_id),
+                account.as_deref(),
+                &scope,
+            ),
+            ("POST", [cid, tail]) | ("GET", [cid, tail]) => {
+                // Ownership (§7.2): the User's, and once it used the
+                // account, the account's (§7.11).
+                let owner = match st.conversations.get(cid) {
+                    Some(c) if c.client_id == client_id && c.user_id == user_id => {
+                        Some(c.account.clone())
+                    }
+                    _ => None,
+                };
+                match owner {
+                    None => {
+                        self.poppy_error(404, err::CONVERSATION_NOT_FOUND, "no such conversation")
+                    }
+                    Some(Some(acct)) if account.as_deref() != Some(acct.as_str()) => {
+                        Company::dpop_refusal(err::SIGN_IN_REQUIRED, None)
+                    }
+                    Some(_) => match (req.method.as_str(), tail.as_str()) {
+                        ("POST", "messages") => self.message(
+                            &mut st,
+                            Some(cid),
+                            &body,
+                            &q,
+                            (&client_id, &user_id),
+                            account.as_deref(),
+                            &scope,
+                        ),
+                        ("GET", "events") => {
+                            drop(st);
+                            return self.read_events(req, cid, &q);
+                        }
+                        ("POST", "handoff") => self.change(&mut st, cid, "queued", 202),
+                        ("POST", "close") => self.change(&mut st, cid, wire::STATUS_CLOSED, 200),
+                        _ => Reply::new(404),
+                    },
+                }
+            }
+            _ => Reply::new(404),
+        };
+        reply = reply.note("conversation_request", json!(true));
+        reply
+    }
+
+    /// A message: a new conversation's first (`cid` none) or the next of
+    /// `cid` — held to the kit's schema, answered once per message id with
+    /// the same content (§7.3), and with `wait` as a read of its events.
+    #[allow(clippy::too_many_arguments)]
+    fn message(
+        &self,
+        st: &mut State,
+        cid: Option<&String>,
+        body: &Value,
+        q: &BTreeMap<String, String>,
+        (client_id, user_id): (&str, &str),
+        account: Option<&str>,
+        scope: &str,
+    ) -> Reply {
+        if let Err(e) = kit::kit().validate("conversation-request.schema.json", body) {
+            return self.poppy_error(400, err::INVALID_REQUEST, &e.join("; "));
+        }
+        validated("conversation-request.schema.json");
+        let m = &body["message"];
+        let id = m["id"].as_str().unwrap_or_default().to_string();
+        seen("message_id", json!(id));
+        seen("sender", m["sender"].clone());
+        seen("role", m["role"].clone());
+        seen("context", m["context"].clone());
+        seen("text", m["text"].clone());
+        let digest = m.to_string();
+        let new = cid.is_none();
+        let key = (client_id.to_string(), user_id.to_string(), id.clone());
+        if let Some((d, status, answer)) = st.messages.get(&key) {
+            if *d != digest {
+                return self.poppy_error(
+                    409,
+                    err::MESSAGE_ID_CONFLICT,
+                    "the id was used with other content",
+                );
+            }
+            return Reply::json(*status, answer).note("duplicate", json!(true));
+        }
+        let cid = match cid {
+            Some(c) => {
+                let conv = &st.conversations[c];
+                if conv.status == wire::STATUS_CLOSED {
+                    return self.poppy_error(
+                        409,
+                        err::CONVERSATION_CLOSED,
+                        "the conversation is closed",
+                    );
+                }
+                c.clone()
+            }
+            None => {
+                let c = opaque("cnv_");
+                st.conversations.insert(
+                    c.clone(),
+                    Conversation {
+                        client_id: client_id.to_string(),
+                        user_id: user_id.to_string(),
+                        account: None,
+                        events: Vec::new(),
+                        kept_from: 0,
+                        status: "idle",
+                        responder: "agent",
+                    },
+                );
+                c
+            }
+        };
+        let mut recorded = m.clone();
+        recorded["role"] = json!("user");
+        let ev = Company::event(st, wire::event::MESSAGE, json!({"message": recorded}));
+        if let Some(c) = st.conversations.get_mut(&cid) {
+            c.events.push(ev);
+        }
+        Company::agent_reply(
+            st,
+            &cid,
+            m["text"].as_str().unwrap_or_default(),
+            account,
+            scope,
+        );
+        let status = if new { 201 } else { 202 };
+        let c = &st.conversations[&cid];
+        let mut answer =
+            json!({"conversation_id": cid, "status": c.status, "responder": c.responder});
+        if q.contains_key(wire::conversation::WAIT) {
+            answer = self
+                .page(c, q.get(wire::conversation::CURSOR).map(String::as_str))
+                .unwrap_or(answer);
+        }
+        st.messages.insert(key, (digest, status, answer.clone()));
+        Reply::json(status, &answer).note("conversation", json!(cid))
+    }
+
+    /// The events of `c` after `cursor` as a read answers them (§7.5); `None`
+    /// for a cursor it does not know or no longer keeps.
+    fn page(&self, c: &Conversation, cursor: Option<&str>) -> Result<Value, (u16, &'static str)> {
+        let from = match cursor {
+            None => c.kept_from,
+            Some(cur) => match c.events.iter().position(|e| e["id"] == cur) {
+                Some(i) if i >= c.kept_from => i + 1,
+                Some(_) => return Err((410, err::CURSOR_EXPIRED)),
+                None => return Err((400, err::INVALID_CURSOR)),
+            },
+        };
+        let events: Vec<Value> = c.events[from.max(c.kept_from)..].to_vec();
+        let last = events
+            .last()
+            .and_then(|e| e["id"].as_str().map(str::to_string))
+            .or(cursor.map(str::to_string));
+        Ok(
+            json!({"events": events, "cursor": last, "has_more": false, "status": c.status, "responder": c.responder}),
         )
+    }
+
+    /// `GET …/{cid}/events`: what came after the cursor — or `Last-Event-ID`,
+    /// which wins (§7.6) — held up to [`WAIT_CAP_S`] while there is
+    /// nothing, as JSON or, when asked, as a stream that ends with it.
+    fn read_events(&self, req: &Request, cid: &str, q: &BTreeMap<String, String>) -> Reply {
+        let last_event_id = req.header("last-event-id").map(str::to_string);
+        let cursor = last_event_id
+            .clone()
+            .or_else(|| q.get(wire::conversation::CURSOR).cloned());
+        let stream = req
+            .header("accept")
+            .is_some_and(|a| a.contains(wire::conversation::EVENT_STREAM));
+        let wait = q
+            .get(wire::conversation::WAIT)
+            .and_then(|w| w.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(WAIT_CAP_S);
+        let until = Instant::now() + Duration::from_secs(wait);
+        let notes = |r: Reply| {
+            r.note("conversation", json!(cid))
+                .note("cursor", json!(q.get(wire::conversation::CURSOR)))
+                .note("last_event_id", json!(last_event_id))
+                .note("stream", json!(stream))
+                .note("conversation_request", json!(true))
+        };
+        loop {
+            let st = lock(&self.state);
+            let Some(c) = st.conversations.get(cid) else {
+                drop(st);
+                return notes(self.poppy_error(
+                    404,
+                    err::CONVERSATION_NOT_FOUND,
+                    "no such conversation",
+                ));
+            };
+            let page = match self.page(c, cursor.as_deref()) {
+                Ok(p) => p,
+                Err((status, code)) => {
+                    drop(st);
+                    return notes(self.poppy_error(status, code, "the cursor names no event kept"));
+                }
+            };
+            let empty = page["events"].as_array().is_none_or(Vec::is_empty);
+            if empty && Instant::now() < until {
+                drop(st);
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            drop(st);
+            if !stream {
+                return notes(match self.conformant("events-response.schema.json", page) {
+                    Ok(b) => Reply::json(200, &b),
+                    Err(drift) => drift,
+                });
+            }
+            // Each Company message's text in pieces first, with no id, then
+            // every event with its id — and then the stream ends.
+            let mut sse = String::from(": the fake's stream\n\n");
+            for e in page["events"].as_array().into_iter().flatten() {
+                if e["type"] == wire::event::MESSAGE && e["message"]["role"] == "company" {
+                    let text = e["message"]["text"].as_str().unwrap_or_default();
+                    for piece in text.split_inclusive(' ') {
+                        let delta = json!({"message_id": e["message"]["id"], "text": format!("DELTA:{piece}")});
+                        sse.push_str(&format!(
+                            "event: {}\ndata: {delta}\n\n",
+                            wire::event::TEXT_DELTA
+                        ));
+                    }
+                }
+                sse.push_str(&format!(
+                    "id: {}\ndata: {e}\n\n",
+                    e["id"].as_str().unwrap_or_default()
+                ));
+            }
+            let mut r = Reply::new(200).with("Content-Type", wire::conversation::EVENT_STREAM);
+            r.body = sse.into_bytes();
+            return notes(r);
+        }
+    }
+
+    /// Handoff (§7.9) and close (§7.12): the status moved, a `state` event
+    /// added when it changed.
+    fn change(&self, st: &mut State, cid: &str, to: &'static str, code: u16) -> Reply {
+        let moved = st
+            .conversations
+            .get(cid)
+            .is_some_and(|c| c.status != to && c.status != wire::STATUS_CLOSED);
+        if st.conversations[cid].status == wire::STATUS_CLOSED && to != wire::STATUS_CLOSED {
+            return self.poppy_error(409, err::CONVERSATION_CLOSED, "the conversation is closed");
+        }
+        if moved {
+            let responder = st.conversations[cid].responder;
+            let ev = Company::event(
+                st,
+                wire::event::STATE,
+                json!({"status": to, "responder": responder}),
+            );
+            if let Some(c) = st.conversations.get_mut(cid) {
+                c.status = to;
+                c.events.push(ev);
+            }
+        }
+        let c = &st.conversations[cid];
+        let body = json!({"status": c.status, "responder": c.responder});
+        match self.conformant("conversation-response.schema.json", body) {
+            Ok(b) => Reply::json(code, &b),
+            Err(drift) => drift,
+        }
     }
 
     /// An MCP server (§6): Streamable HTTP over Bearer Session Tokens issued
@@ -2498,6 +3127,9 @@ impl Company {
         if let Some(n) = body["refuse_grants"].as_u64() {
             st.refuse_grants = u32::try_from(n).unwrap_or(u32::MAX);
         }
+        if let Some(n) = body["refuse_dpop"].as_u64() {
+            st.refuse_dpop = u32::try_from(n).unwrap_or(u32::MAX);
+        }
         if let Some(ext) = body["extension_required"].as_str() {
             st.extension_required = Some(ext.to_string());
         }
@@ -2559,6 +3191,30 @@ impl Company {
         }
         if let Some(n) = body["date_skew_s"].as_i64() {
             st.date_skew_s = n;
+        }
+        let f = &body["http_fail"];
+        if let (Some(m), Some(path)) = (f["method"].as_str(), f["path"].as_str()) {
+            st.http_holds.push(HttpHold {
+                method: m.to_string(),
+                path: path.to_string(),
+                times: f["times"]
+                    .as_u64()
+                    .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+                ms: f["ms"].as_u64().unwrap_or(0),
+                status: match f["status"].as_u64().and_then(|s| u16::try_from(s).ok()) {
+                    Some(s) => Some(s),
+                    None if f["ms"].is_u64() => None,
+                    None => Some(502),
+                },
+            });
+        }
+        if let Some(r) = body["conversation"]["user_requested"].as_str() {
+            st.user_requested = Some(r.to_string());
+        }
+        if body["expire_events"] == true {
+            for c in st.conversations.values_mut() {
+                c.kept_from = c.events.len();
+            }
         }
         Reply::json(200, &json!({"ok": true}))
     }

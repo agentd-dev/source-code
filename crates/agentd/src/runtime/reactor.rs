@@ -988,6 +988,8 @@ impl Runtime {
             #[cfg(feature = "companies")]
             Event::CompanyCallback { query } => self.on_company_callback(query),
             #[cfg(feature = "companies")]
+            Event::CompanyDelivery(d) => self.on_company_delivery(*d),
+            #[cfg(feature = "companies")]
             Event::CompanySignedOut {
                 owed,
                 company,
@@ -1940,8 +1942,13 @@ impl Runtime {
             json!({"draining": true, "reason": reason}),
         );
         // Work in flight runs on (`runtime::drain`); what has no end of its
-        // own — a warm subagent, an instance-tier child — is asked to stop.
+        // own — a warm subagent, an instance-tier child, a Company
+        // conversation's reader — is asked to stop.
         self.stop_endless();
+        #[cfg(feature = "companies")]
+        if let Some(sup) = &self.companies {
+            sup.stop_readers();
+        }
         // Deinitialization workflows: `event {on: lifecycle.shutdown}` starts
         // fire NOW — releasing a claimed webhook route, deregistering from a
         // service, flushing a summary — and the drain WAITS for exactly

@@ -611,11 +611,13 @@ All `services` paths are live · op.
 | `services.<name>.breaker` | `{failures, cooldown}` | — | `kind: mcp` only: the default breaker for `mcp.tool` steps against it. |
 | `services.<name>.hosts` | list of host globs | the endpoint's host, the document's `organization.domain`, the subdomains of both, the issuer's host | `kind: company` only: every URL the Company's documents name must be on one of these hosts (`example.com`, `*.example.com`), and its host a plain one — no userinfo, and no `\`, which a browser reads as `/`. |
 | `services.<name>.allow_private` | bool | `false` | `kind: company` only: admit loopback, private and link-local addresses. |
-| `services.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | `kind: company` only: the Company's interfaces agentd uses. This build uses `mcp`; `agent` and `openapi` are refused. |
-| `services.<name>.mcp_names` | map of an MCP API `url` to a server name | — | `kind: company` only: names the Company's MCP servers when it lists more than one. |
+| `services.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | `kind: company` only: the Company's interfaces agentd uses — its MCP servers, its agent (conversations, and the stream `company.<name>`), its OpenAPI APIs. See [A Company's agent and its APIs](#a-companys-agent-and-its-apis). |
+| `services.<name>.mcp_names` | map of an MCP API `url` to a server name | — | `kind: company` only: names the Company's MCP servers when it lists more than one. A company entry whose `interfaces` lack `mcp` refuses it, and `rate`, `allow` and `exclude` with it: they shape only the Company's MCP servers. |
 | `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` a Company sees none of agentd's correlators. Its calls carry their idempotency key keyed under the (User, Company) pair's secret and a trace of their own per unit of work and Company — no other `agent/*` `_meta` key, no `tracestate` — and the handshake and tool list carry no trace context and no `clientInfo.title`. `standard` sends agentd's usual correlators, the instance label and the process trace included, and is logged at boot (`company.privacy.standard`). |
 | `services.<name>.sign_in` | list of `device \| direct` | `[]` | `kind: company` only: the sign-in types agentd may start with the User, the first the Company offers taken. `direct` needs `security.companies.client.serve`. `mediated` is refused: the User's password would pass through a gate, whose answer agentd keeps in the task's history and hands to the model. Needs `security.companies.seal_key` and `scopes`. |
 | `services.<name>.scopes` | list of scopes | `[]` | `kind: company` only: the most account scopes agentd asks the User for there. A sign-in asks for what is needed within these and what its type grants; a held Account Token is used for no more, and one that grants none of these — or any, once the entry lists no `sign_in` — is not used: requests there are signed out, and the token is kept until the User signs out. |
+| `services.<name>.api_allow` | list of `METHOD /path-template` | none | `kind: company` only: the OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Needs `openapi` in `interfaces`. |
+| `services.<name>.context` | `{locale, time_zone, share_availability}` | inherits | `kind: company` only: what this Company's conversations share of the User's situation, each field over `security.companies.context`. Needs `agent` in `interfaces`. |
 
 With `security.egress: closed`, every MCP dial, intelligence endpoint
 (top-level and providers; `mock:` aside), A2A peer, `http` step, HTTP store,
@@ -690,6 +692,108 @@ or started again when the Company ends one — until the Company answers
 `invalid_grant` for it: a disconnect, a revocation, an expiry. Then it is
 forgotten and work goes on signed out. `company.sign_out` and
 `agentd --logout company:<name>` revoke and forget it.
+
+#### A Company's agent and its APIs
+
+An entry whose `interfaces` list `agent` talks with the Company's agent, in the
+one conversation protocol the draft defines, `poppy`; one that lists
+`openapi` calls the operations of the OpenAPI APIs the Company lists. Both are
+reached through `company.*` tools — internal tools the supervisor serves, as
+it serves a Company's MCP tools, under the same rules: the User's work only,
+`limits.in_flight`, the Company's `Retry-After`, the cross-Company gate, and
+the Company's origin on whatever reads the answer. Every request carries the
+User's DPoP Session Token and a proof of its own, and no correlator of
+agentd's. A request made for a unit of work names a trace in `traceparent`:
+under `privacy: strict` the unit's own trace at this Company — the same for
+each of the unit's requests there, linked to the unit's trace only in
+agentd's telemetry — and under `standard` the unit's own. One that belongs to
+no unit of work — a reader's — names the process trace under `standard`, and
+none under `strict`. Such a Company is verified at boot too, and opens its
+Session at the first call.
+
+- **`company.converse {company, conversation?, text?, data?, wait?}`** sends a
+  message: with no `conversation` it starts one and answers its id. The
+  message's id is `msg_` and 128 random bits, kept for the call before it is
+  sent, so every send of the call — the transport's retry, and a workflow
+  step's `retry:` or its replay after a restart, the step's own key holding
+  across its attempts — carries the same id, and the Company answers it as the
+  message it has (other content under it is `message_id_conflict`). A model's
+  call is its turn's: a step's next attempt is a new turn, whose calls are
+  new. Its `sender` is always `agent`, and its `context` holds only what
+  `security.companies.context` (or the entry's own `context`) shares. With
+  `wait`, at most 30 s, the reply is read too.
+- **`company.read {company, conversation, wait?}`** answers the events since
+  the model's last read, waiting up to `wait` (default 30) while there are
+  none; **`company.handoff`** asks for a person at the Company;
+  **`company.close`** closes the conversation. A read asked to `wait` is
+  waited for that long and 15 s more, whatever the entry's `timeout`.
+- **The reader.** Each open conversation — at most `limits.conversations` in
+  the instance, a new one refused until one closes — has a reader on a thread
+  of its own: it asks for a stream (`text/event-stream`, a long poll from a
+  Company that does not stream), opens it again with `Last-Event-ID` when it
+  ends, and appends the conversation's `message`, `state`, `authorization`
+  and `user_requested` events to the stream `company.<name>`, carrying the
+  Company's origin, so a workflow can start from them (`stream`) or wait for
+  one (`wait {on: event}`). It saves its cursor once they are appended, and a
+  restart reads on from it. It stops when the conversation closes and when
+  the instance drains. Each read skips event types agentd does not recognise
+  and events it handled before, never hands on a `text-delta` piece, and on
+  `cursor_expired` reads again from the start, telling the model that part of
+  the conversation is missing. agentd declares `company.<name>` itself; a
+  `streams:` entry of that name sets its retention.
+- **What the supervisor does with an event**, once: an `authorization` event
+  is answered with the User's Account Token when one is held whose scopes
+  cover it — the Session is signed in, and the conversation goes on with the
+  new token — and otherwise reaches the model as a note that `company.sign_in`
+  asks the User; the Company's event never opens a gate itself. A
+  `user_requested` event is answered in the conversation: the User is not
+  available for a direct conversation.
+- **`company.api {company, api?, method, path, query?, json?, expect?}`**
+  calls one operation of an OpenAPI 3.0 or 3.1 description (JSON, at most
+  1 MiB; an operation's `$ref`s are followed when it is called or described,
+  within the description, at most 16 deep and to at most 20 000 values).
+  Unless `method` and `path` name an operation of the description that
+  `api_allow` lists, and the path parameters, query and body hold to its
+  schemas, nothing is sent. Each path segment is read percent-decoded, and one
+  that is `.` or `..`, or holds `/` or `\` once decoded, is refused: a server
+  may resolve it to another operation. What is sent is the operation's
+  template, each parameter percent-encoded into it. A write
+  carries an `Idempotency-Key`, a UUID kept for the call, and is sent again
+  after a lost answer only when its operation declares that header; any other
+  write that may have run is `outcome unknown`. It answers `{status, json}`;
+  a status outside `expect` (default 2xx) is an error. A Company's
+  `WWW-Authenticate` errors are handled as for its MCP servers.
+  **`company.api.describe {company, api?, operation?}`** lists the operations,
+  or gives one's parameters and schemas.
+- **The `http` step** with `auth: {kind: company, company: <name>}` is a
+  `company.api` call made by the workflow: its `url` is the operation's (or
+  its path under the API's server URL), with the step's `method`, `query`,
+  `json` and `expect`. It takes no `headers`, `body`, `sign`,
+  `allow_private` or `idempotency`: the credential, the body, the hosts and
+  the key are agentd's.
+
+```yaml
+# fragment: a Company's agent and one of its APIs
+security:
+  companies:
+    context: {locale: en-US, time_zone: America/Los_Angeles}
+    limits: {conversations: 8}
+services:
+  shop:
+    kind: company
+    endpoint: https://example.com
+    interfaces: [agent, openapi]
+    api_allow: ["GET /orders/{order_id}", "POST /orders/{order_id}/exchanges"]
+workflows:
+  - name: exchange
+    steps:
+      s: {kind: once}
+      ask: {kind: tool, name: company.converse, depends_on: [s],
+            args: {company: shop, text: "The jacket from order 1042 is too thin. Can it be exchanged?", wait: 20}}
+      order: {kind: http, depends_on: [s], url: "https://api.example.com/orders/1042",
+              auth: {kind: company, company: shop}}
+      f: {kind: finish, depends_on: [ask, order], status: completed}
+```
 
 A company entry refuses `auth`, `headers`, `methods` and `breaker`: the
 protocol defines how agentd authenticates there. Its `tags` default to
@@ -1199,6 +1303,10 @@ Every `security` path is restart · op.
 | `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the Account Tokens a sign-in gives agentd, and the User ID records, so the store cannot read them. Required with any `sign_in`, and with a remote store. |
 | `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. A call on one with any string argument naming a Company's host as a browser reads it — or a host that is not ASCII — is refused unsent (`company.browser.refused`); their tools are served by the supervisor. |
 | `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |
+| `security.companies.limits.conversations` | int | `16` | Open conversations in the instance, each followed by a reader; a new one is refused until one closes. |
+| `security.companies.context.locale` | language tag | — | Shared in a conversation message's `context` as `locale` (RFC 5646, `en-US`). Needs an entry that uses `agent`. |
+| `security.companies.context.time_zone` | IANA name | — | Shared as `time_zone` (`America/Los_Angeles`). |
+| `security.companies.context.share_availability` | bool | `false` | Share `user_available`: whether the User has a client attached to the observation feed now. |
 
 The model these keys enforce is [Security model](security.md); the checklist is
 [Harden a deployment](harden.md).

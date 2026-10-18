@@ -705,6 +705,13 @@
           "description": "`kind: company` only — admit loopback, private and link-local addresses (an on-premises Company); default false",
           "type": "boolean"
         },
+        "api_allow": {
+          "description": "`kind: company` only — the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Needs `openapi` in interfaces; default none",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "auth": {
           "$ref": "#/$defs/Auth"
         },
@@ -722,6 +729,25 @@
             "failures": {
               "minimum": 1,
               "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "context": {
+          "additionalProperties": false,
+          "description": "`kind: company` only — what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces",
+          "properties": {
+            "locale": {
+              "description": "a language tag (RFC 5646), such as en-US",
+              "type": "string"
+            },
+            "share_availability": {
+              "description": "share user_available: whether the User has a client attached to agentd now (default false)",
+              "type": "boolean"
+            },
+            "time_zone": {
+              "description": "an IANA time zone name, such as America/Los_Angeles",
+              "type": "string"
             }
           },
           "type": "object"
@@ -751,7 +777,7 @@
           "type": "array"
         },
         "interfaces": {
-          "description": "`kind: company` only — the Company's interfaces agentd uses; default [mcp], the only one this build uses",
+          "description": "`kind: company` only — the Company's interfaces agentd uses: mcp (its MCP servers), agent (conversations with its Company Agent, through company.converse and the company.<name> stream), openapi (its OpenAPI APIs, through company.api); default [mcp]",
           "items": {
             "enum": [
               "mcp",
@@ -1870,7 +1896,8 @@
           "sign",
           "idempotency",
           "breaker",
-          "rate"
+          "rate",
+          "auth"
         ],
         "implemented": true,
         "required": [
@@ -4299,9 +4326,33 @@
               ],
               "type": "object"
             },
+            "context": {
+              "additionalProperties": false,
+              "description": "what the messages agentd sends in a Company's conversations share of the User's situation, each field in the draft's format; nothing is shared that is not set. Needs an entry that uses `agent`",
+              "properties": {
+                "locale": {
+                  "description": "a language tag (RFC 5646), such as en-US",
+                  "type": "string"
+                },
+                "share_availability": {
+                  "description": "share user_available: whether the User has a client attached to agentd now (default false)",
+                  "type": "boolean"
+                },
+                "time_zone": {
+                  "description": "an IANA time zone name, such as America/Los_Angeles",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
             "limits": {
               "additionalProperties": false,
               "properties": {
+                "conversations": {
+                  "description": "open conversations per instance, each followed by a reader (default 16); a new one is refused until one closes",
+                  "minimum": 1,
+                  "type": "integer"
+                },
                 "in_flight": {
                   "description": "Company calls in flight per Company (default 4); one more is refused until one ends",
                   "minimum": 1,

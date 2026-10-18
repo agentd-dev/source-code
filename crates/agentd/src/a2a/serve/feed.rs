@@ -66,7 +66,11 @@ pub(super) fn feed_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<axum::response::sse::Event>(64);
     let is_op = principal.is_operator();
     let who = principal.id.clone();
+    // Attached for as long as its stream runs: a Company may be told
+    // whether the User can answer now (RFC 0047 §5.5.7).
+    let attached = feed.attach(&who, is_op);
     tokio::spawn(async move {
+        let _attached = attached;
         let hello = json!({"hello": {
             "seq": newest,
             "resume": after,

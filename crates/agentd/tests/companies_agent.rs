@@ -124,6 +124,8 @@ impl Fake {
             pace: Default::default(),
             sign_in: Vec::new(),
             scopes: Vec::new(),
+            interfaces: vec![agentd::config::settings::companies::Interface::Mcp],
+            api_allow: Vec::new(),
         }
     }
 }
@@ -198,6 +200,13 @@ impl Host {
 struct Agent {
     sup: Arc<Supervisor>,
     _dir: PathBuf,
+}
+
+/// Its conversations' readers stop with it.
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.sup.stop_readers();
+    }
 }
 
 fn config(host: &Host, fake: &Fake, dir: &Path, extra: &str) -> agentd::config::settings::Settings {
@@ -1941,4 +1950,825 @@ fn direct_sign_in_spends_its_state_once_and_refuses_another_issuer() {
         1,
         "the forged code was not exchanged"
     );
+}
+
+// ---- Conversations and OpenAPI (RFC 0047 P3) ------------------------------
+
+use agentd::companies::api::Call;
+use agentd::companies::conversation::{Delivery, Item, NOT_AVAILABLE, Say};
+use agentd::companies::request::CallError;
+
+/// The entry fields of a Company used through its agent and its APIs.
+const TALKS: &str = ", interfaces: [agent, openapi], api_allow: [\"GET /orders/{order_id}\", \"POST /orders/{order_id}/exchanges\", \"POST /notes\"]";
+
+fn talking(fake: &Fake) -> Agent {
+    let dir = tempfile::tempdir().unwrap().keep();
+    agent_on(fake, &host(), &dir, Arc::default(), TALKS)
+}
+
+/// [`signing`], used through its agent and its APIs.
+fn talking_signed(fake: &Fake) -> Agent {
+    let dir = tempfile::tempdir().unwrap().keep();
+    signing_on(
+        fake,
+        &host(),
+        &dir,
+        Arc::default(),
+        &format!("{BOTH}{TALKS}"),
+    )
+}
+
+/// What the readers of `a`'s conversations hand the stream, each delivery
+/// acknowledged as the runtime acknowledges it.
+fn stream_of(a: &Agent) -> Arc<Mutex<Vec<Item>>> {
+    let got: Arc<Mutex<Vec<Item>>> = Arc::default();
+    let into = Arc::clone(&got);
+    a.sup.deliver_to(Arc::new(move |d: Delivery| {
+        into.lock().unwrap().extend(d.items);
+        let _ = d.ack.try_send(Ok(()));
+    }));
+    got
+}
+
+fn say(conversation: Option<&str>, text: &str, key: &str) -> Say {
+    Say {
+        conversation: conversation.map(str::to_string),
+        text: Some(text.to_string()),
+        key: key.to_string(),
+        ..Say::default()
+    }
+}
+
+fn shop(a: &Agent) -> Arc<agentd::companies::Company> {
+    a.sup.company("shop").unwrap()
+}
+
+/// Wait up to 20 s for `done`, or fail saying `what`.
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} never happened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The conversation requests that reached the fake.
+fn conversation_requests(f: &Fake) -> Vec<Value> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["conversation_request"] == true)
+        .collect()
+}
+
+fn path_of(r: &Value) -> &str {
+    r["path"].as_str().unwrap_or_default()
+}
+
+/// A message sent again after its answer was lost carries the same id, and
+/// the Company answers it as the message it has; the same call sent with
+/// other content is `message_id_conflict`. Every message agentd sends says
+/// `sender: agent` and no `role`, holds to the kit's schema, and carries a
+/// DPoP proof over the Session Token.
+#[test]
+fn a_retried_message_gets_the_first_answer_and_other_content_a_conflict() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let first = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "run/a#1"))
+        .unwrap();
+    let cid = first["conversation"].as_str().unwrap().to_string();
+    assert!(cid.starts_with("cnv_"), "{first}");
+    // The next message's answer is lost after the Company took it.
+    f.control(json!({"http_fail": {"method": "POST", "path": format!("/poppy/conversations/{cid}/messages"), "times": 1, "status": 502}}));
+    let second = a
+        .sup
+        .converse(&shop(&a), &say(Some(&cid), "second", "run/a#2"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(second["conversation"], cid.as_str());
+    let posts: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["method"] == "POST" && path_of(r).ends_with("/messages"))
+        .collect();
+    assert_eq!(posts.len(), 2, "{posts:#?}");
+    assert_eq!(posts[0]["failed"], 502);
+    assert_eq!(
+        posts[0]["message_id"], posts[1]["message_id"],
+        "the same id"
+    );
+    assert_eq!(
+        posts[1]["duplicate"], true,
+        "answered as the message it has"
+    );
+    // The same call with other content: the id it was given, and the
+    // Company's conflict, typed.
+    let e = a
+        .sup
+        .converse(&shop(&a), &say(Some(&cid), "changed", "run/a#2"))
+        .unwrap_err();
+    assert!(e.is(wire::error::MESSAGE_ID_CONFLICT), "{e:?}");
+    assert!(
+        e.to_string()
+            .contains("accepted a message with this id before, with other content"),
+        "{e}"
+    );
+    for r in conversation_requests(&f)
+        .iter()
+        .filter(|r| r["method"] == "POST")
+    {
+        assert_eq!(r["sender"], "agent", "{r}");
+        assert!(r["role"].is_null(), "role is never sent: {r}");
+        assert!(
+            r["validated"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("conversation-request.schema.json")),
+            "{r}"
+        );
+        assert!(r["proof"]["ath"].is_string(), "{r}");
+    }
+}
+
+/// The reader of an open conversation asks for a stream, skips the event
+/// type the draft does not define, hands on no `text-delta` piece — to the
+/// stream or to the model — and, as the stream ends, opens it again with
+/// `Last-Event-ID` set to the last event it handled.
+#[test]
+fn the_reader_skips_unknown_events_hands_on_no_delta_and_reconnects_after_the_last() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let got = stream_of(&a);
+    let first = a
+        .sup
+        .converse(&shop(&a), &say(None, "boots in size 9", "k#1"))
+        .unwrap();
+    let cid = first["conversation"].as_str().unwrap().to_string();
+    until("the Company's reply on the stream", || {
+        got.lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.data.to_string().contains("You said: boots in size 9"))
+    });
+    let last = got.lock().unwrap().last().unwrap().id.clone();
+    let last = last.split('/').nth(1).unwrap().to_string();
+    until("a stream opened again after the last event", || {
+        conversation_requests(&f)
+            .iter()
+            .any(|r| r["stream"] == true && r["last_event_id"] == last.as_str())
+    });
+    let items = got.lock().unwrap().clone();
+    let all: String = items.iter().map(|i| i.data.to_string()).collect();
+    assert!(
+        !all.contains("DELTA:"),
+        "no piece reaches the stream: {all}"
+    );
+    assert!(
+        !all.contains("x-mock-receipt"),
+        "the unknown type is skipped: {all}"
+    );
+    for i in &items {
+        assert_eq!(i.data["conversation"], cid.as_str());
+        assert!(
+            ["message", "state", "authorization", "user_requested"].contains(&i.subject.as_str()),
+            "{i:?}"
+        );
+    }
+    let reads: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| path_of(r).ends_with("/events"))
+        .collect();
+    assert!(
+        reads
+            .iter()
+            .any(|r| r["stream"] == true && r["last_event_id"].is_null()),
+        "{reads:#?}"
+    );
+    // The model's read, as JSON, is held to the same rules.
+    let read = a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    let said = read["events"].to_string();
+    assert!(
+        said.contains("You said: boots in size 9")
+            && !said.contains("x-mock-receipt")
+            && !said.contains("DELTA:"),
+        "{read}"
+    );
+    assert_eq!(read["status"], "idle");
+    // Read again, it has nothing new.
+    assert_eq!(
+        a.sup.read(&shop(&a), &cid, 0, None).unwrap()["events"],
+        json!([])
+    );
+}
+
+/// After a restart the reader resumes from the cursor it saved: its first
+/// read names it, with no `Last-Event-ID`, and nothing the first life
+/// handed on is handed on again.
+#[test]
+fn a_restart_resumes_from_the_saved_cursor() {
+    let f = fake(&[]);
+    let (h, dir) = (host(), tempfile::tempdir().unwrap().keep());
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let a = agent_on(&f, &h, &dir, Arc::clone(&store), TALKS);
+    let got = stream_of(&a);
+    let cid = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until("the reply on the stream", || {
+        got.lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.data.to_string().contains("You said: hello"))
+    });
+    drop(a);
+    // The stopped reader's read in flight ends within the fake's hold.
+    std::thread::sleep(Duration::from_millis(3500));
+    let before = f.record().len();
+    let last = got
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .id
+        .split('/')
+        .nth(1)
+        .unwrap()
+        .to_string();
+    let b = agent_on(&f, &h, &dir, store, TALKS);
+    let again = stream_of(&b);
+    b.sup.resume_conversations();
+    until("the resumed reader's first read", || {
+        f.record()[before..]
+            .iter()
+            .any(|r| r["conversation"] == cid.as_str() && path_of(r).ends_with("/events"))
+    });
+    let first = f.record()[before..]
+        .iter()
+        .find(|r| path_of(r).ends_with("/events"))
+        .cloned()
+        .unwrap();
+    assert_eq!(first["cursor"], last.as_str(), "the saved cursor: {first}");
+    assert!(first["last_event_id"].is_null(), "{first}");
+    assert_eq!(b.sup.conversations_open(), 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        again
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|i| !i.data.to_string().contains("You said: hello"))
+    );
+}
+
+/// A cursor the Company no longer keeps: the read starts again from the
+/// beginning, and the model is told, once, that part of the conversation
+/// is missing — the reader saying it on the stream too.
+#[test]
+fn cursor_expired_reads_again_from_the_start_and_says_part_is_missing() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let got = stream_of(&a);
+    let cid = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    f.control(json!({"expire_events": true}));
+    a.sup
+        .converse(&shop(&a), &say(Some(&cid), "after the gap", "k#2"))
+        .unwrap();
+    until("the reader saying it on the stream", || {
+        got.lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.subject == "cursor_expired")
+    });
+    let read = a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    assert!(
+        read["notes"]
+            .to_string()
+            .contains("part of this conversation is missing"),
+        "{read}"
+    );
+    assert!(
+        read["events"]
+            .to_string()
+            .contains("You said: after the gap"),
+        "{read}"
+    );
+    let reads: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| path_of(r).ends_with("/events") && r["stream"] == false)
+        .collect();
+    let expired = reads
+        .iter()
+        .position(|r| r["error"] == wire::error::CURSOR_EXPIRED)
+        .expect("a cursor_expired");
+    assert!(
+        reads[expired + 1]["cursor"].is_null(),
+        "read again from the start: {reads:#?}"
+    );
+    assert!(
+        !a.sup.read(&shop(&a), &cid, 0, None).unwrap()["notes"]
+            .to_string()
+            .contains("missing"),
+        "said once"
+    );
+}
+
+/// An `authorization` event (§7.11) from a signed-out Session reaches the
+/// model as a fact, saying company.sign_in asks the User; once the User
+/// signed in, the same conversation goes on with the signed-in token. With
+/// the Account Token held, a message the Company refuses `sign_in_required`
+/// signs the Session in with it and is sent once more.
+#[test]
+fn an_authorization_event_continues_the_same_conversation_after_sign_in() {
+    let f = fake(&[]);
+    let a = talking_signed(&f);
+    let mut ask_order = say(None, "Where is my order?", "k#1");
+    ask_order.wait = Some(5);
+    let first = a.sup.converse(&shop(&a), &ask_order).unwrap();
+    let cid = first["conversation"].as_str().unwrap().to_string();
+    assert!(
+        first["events"].to_string().contains("\"authorization\""),
+        "{first}"
+    );
+    let notes = first["notes"].to_string();
+    assert!(
+        notes.contains(
+            "holds no Account Token that covers it: company.sign_in asks the User to sign in"
+        ),
+        "{notes}"
+    );
+    let (_, outcome) = sign_in(&a, &ask(&["poppy:read"]));
+    assert!(matches!(outcome, Outcome::SignedIn { .. }), "{outcome:?}");
+    let mut again = say(Some(&cid), "Please check my order now.", "k#2");
+    again.wait = Some(5);
+    let next = a.sup.converse(&shop(&a), &again).unwrap();
+    assert_eq!(next["conversation"], cid.as_str(), "the same conversation");
+    assert!(
+        next["events"]
+            .to_string()
+            .contains("Your order o1 has shipped."),
+        "{next}"
+    );
+    let posts: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["method"] == "POST")
+        .collect();
+    assert_eq!(posts[0]["signed_in"], false, "{posts:#?}");
+    let after = posts
+        .iter()
+        .find(|r| r["text"] == "Please check my order now.")
+        .unwrap();
+    assert_eq!(after["signed_in"], true, "the new token: {after}");
+    assert!(path_of(after).contains(&cid));
+    // The Company signs the Session out; the conversation belongs to the
+    // account now, so its next message is `sign_in_required` — answered
+    // with the Account Token, and sent once more.
+    f.control(json!({"sign_out_sessions": true}));
+    let third = a
+        .sup
+        .converse(&shop(&a), &say(Some(&cid), "Thanks for checking.", "k#3"));
+    assert!(third.is_ok(), "{third:?}");
+    let last: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| path_of(r).ends_with("/messages") && r["status"] != 202)
+        .collect();
+    assert!(
+        last.iter()
+            .any(|r| r["error"] == wire::error::SIGN_IN_REQUIRED),
+        "{last:#?}"
+    );
+    let sent: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["text"] == "Thanks for checking.")
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    assert_eq!(sent[0]["signed_in"], true, "{sent:#?}");
+}
+
+/// The Company asks to talk with the User directly (§7.10): in this phase
+/// agentd says in the conversation that the User is not available, once,
+/// as the agent.
+#[test]
+fn a_request_to_talk_with_the_user_is_declined_in_the_conversation() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    f.control(
+        json!({"conversation": {"user_requested": "A specialist needs to confirm the exchange."}}),
+    );
+    let mut first = say(None, "I would like an exchange.", "k#1");
+    first.wait = Some(5);
+    let out = a.sup.converse(&shop(&a), &first).unwrap();
+    assert!(
+        out["events"].to_string().contains("\"user_requested\""),
+        "{out}"
+    );
+    let notes = out["notes"].to_string();
+    assert!(
+        notes.contains("answered in the conversation that the User is not available"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("A specialist needs to confirm the exchange."),
+        "quoted: {notes}"
+    );
+    until("the decline sent", || {
+        conversation_requests(&f)
+            .iter()
+            .any(|r| r["text"] == NOT_AVAILABLE)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let declined: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| r["text"] == NOT_AVAILABLE)
+        .collect();
+    assert_eq!(declined.len(), 1, "once: {declined:#?}");
+    assert_eq!(declined[0]["sender"], "agent");
+    assert_eq!(declined[0]["status"], 202);
+}
+
+/// An operation the description does not have, one `api_allow` does not
+/// list, and a body that fails the operation's schema are each refused
+/// before anything is sent; what passes is sent with a DPoP proof over the
+/// Session Token, a write with an `Idempotency-Key`.
+#[test]
+fn an_operation_outside_the_description_or_api_allow_or_its_schema_is_refused_unsent() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let call = |method: &str, path: &str, json: Option<Value>| Call {
+        method: method.into(),
+        path: path.into(),
+        json,
+        key: format!("{method} {path}"),
+        ..Call::default()
+    };
+    let e = a
+        .sup
+        .call_api(&shop(&a), &call("GET", "/nope", None))
+        .unwrap_err();
+    assert!(e.to_string().contains("has no operation GET /nope"), "{e}");
+    let e = a
+        .sup
+        .call_api(&shop(&a), &call("GET", "/session", None))
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("GET /session is not in services.shop.api_allow"),
+        "{e}"
+    );
+    let e = a
+        .sup
+        .call_api(
+            &shop(&a),
+            &call(
+                "POST",
+                "/orders/o1/exchanges",
+                Some(json!({"item_id": 7, "replacement_sku": "x"})),
+            ),
+        )
+        .unwrap_err();
+    assert!(matches!(e, CallError::Refused(_)), "{e:?}");
+    assert!(
+        e.to_string().contains("the body:") && e.to_string().contains("nothing was sent"),
+        "{e}"
+    );
+    // A path a server may resolve to an operation `api_allow` does not list.
+    for path in ["/orders/../notes", "/orders/o1%2F..%2F..%2Fnotes/exchanges"] {
+        let e = a
+            .sup
+            .call_api(&shop(&a), &call("POST", path, Some(json!({"text": "x"}))))
+            .unwrap_err();
+        assert!(matches!(e, CallError::Refused(_)), "{path}: {e:?}");
+        assert!(e.to_string().contains("which a server may"), "{path}: {e}");
+    }
+    let api: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| path_of(r).starts_with("/api/") && r["path"] != "/api/openapi.json")
+        .collect();
+    assert!(api.is_empty(), "nothing reached the API: {api:#?}");
+    let ok = a
+        .sup
+        .call_api(
+            &shop(&a),
+            &call(
+                "POST",
+                "/notes",
+                Some(json!({"text": "leave it at the door"})),
+            ),
+        )
+        .unwrap();
+    assert_eq!(ok["status"], 201, "{ok}");
+    let note = f
+        .record()
+        .into_iter()
+        .find(|r| r["path"] == "/api/notes")
+        .unwrap();
+    assert!(note["proof"]["ath"].is_string(), "{note}");
+    assert!(
+        note["idempotency_key"]
+            .as_str()
+            .is_some_and(|k| k.len() == 36),
+        "a key on every write: {note}"
+    );
+}
+
+/// A write whose operation declares `Idempotency-Key` is sent again with
+/// the same key when its answer is lost, and gets the first answer; one
+/// that declares none is `outcome unknown`, and is not sent again.
+#[test]
+fn an_idempotency_key_is_reused_on_retry_and_a_write_without_one_is_not_retried() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    f.control(json!({"http_fail": {"method": "POST", "path": "/api/orders/o1/exchanges", "times": 1, "status": 502}}));
+    let ok = a
+        .sup
+        .call_api(
+            &shop(&a),
+            &Call {
+                method: "POST".into(),
+                path: "/orders/o1/exchanges".into(),
+                json: Some(
+                    json!({"item_id": "itm_4Qa", "replacement_sku": "stormline-insulated-m"}),
+                ),
+                key: "run/x#1".into(),
+                ..Call::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(ok["status"], 201, "{ok}");
+    let sent: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| r["path"] == "/api/orders/o1/exchanges")
+        .collect();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert_eq!(
+        sent[0]["idempotency_key"], sent[1]["idempotency_key"],
+        "the same key"
+    );
+    assert_eq!(sent[1]["duplicate"], true);
+    assert_ne!(
+        sent[0]["proof"]["jti"], sent[1]["proof"]["jti"],
+        "a fresh proof"
+    );
+    f.control(
+        json!({"http_fail": {"method": "POST", "path": "/api/notes", "times": 1, "status": 502}}),
+    );
+    let e = a
+        .sup
+        .call_api(
+            &shop(&a),
+            &Call {
+                method: "POST".into(),
+                path: "/notes".into(),
+                json: Some(json!({"text": "hi"})),
+                key: "run/x#2".into(),
+                ..Call::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(e, CallError::Unknown(_)), "{e:?}");
+    assert!(
+        e.to_string()
+            .starts_with("outcome unknown: company shop may have performed POST /notes"),
+        "{e}"
+    );
+    assert_eq!(
+        f.record()
+            .iter()
+            .filter(|r| r["path"] == "/api/notes")
+            .count(),
+        1,
+        "sent once"
+    );
+}
+
+/// `WWW-Authenticate` errors at an API are handled as at an MCP server
+/// (§6): `invalid_token` renews and sends once more; `sign_in_required`
+/// with no Account Token is typed; `insufficient_scope` names the scope.
+#[test]
+fn www_authenticate_errors_map_as_for_mcp() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let get = |a: &Agent, path: &str| {
+        a.sup.call_api(
+            &shop(a),
+            &Call {
+                method: "GET".into(),
+                path: path.into(),
+                key: "k".into(),
+                ..Call::default()
+            },
+        )
+    };
+    let e = get(&a, "/orders/o1").unwrap_err();
+    assert!(e.is(wire::error::SIGN_IN_REQUIRED), "{e:?}");
+    assert!(
+        e.to_string().contains("company.sign_in asks the User"),
+        "{e}"
+    );
+    f.control(json!({"refuse_dpop": 1}));
+    let before = tokens(&f.record()).len();
+    let e = get(&a, "/orders/o1").unwrap_err();
+    assert!(
+        e.is(wire::error::SIGN_IN_REQUIRED),
+        "renewed, then the operation's own refusal: {e:?}"
+    );
+    let sent: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| r["path"] == "/api/orders/o1")
+        .collect();
+    let n = sent.len();
+    assert_eq!(
+        sent[n - 2]["error"],
+        wire::error::INVALID_TOKEN,
+        "{sent:#?}"
+    );
+    assert_ne!(
+        sent[n - 2]["presented"],
+        sent[n - 1]["presented"],
+        "a new token"
+    );
+    assert!(tokens(&f.record()).len() > before, "renewed");
+    // Signed in without poppy:read: the scope the Company names, quoted.
+    let s = talking_signed(&f);
+    f.control(json!({"approver": {"scope": "poppy:write"}}));
+    let (_, outcome) = sign_in(&s, &ask(&["poppy:write"]));
+    assert!(matches!(outcome, Outcome::SignedIn { .. }), "{outcome:?}");
+    let e = get(&s, "/orders/o1").unwrap_err();
+    assert!(e.is(wire::error::INSUFFICIENT_SCOPE), "{e:?}");
+    assert!(
+        e.to_string().contains("it needs the scope \"poppy:read\""),
+        "{e}"
+    );
+}
+
+/// At most `limits.conversations` conversations are open, each with its
+/// reader; closing one stops its reader and frees its place, and a closed
+/// conversation takes no more messages.
+#[test]
+fn the_conversation_limit_holds_and_closing_frees_a_place() {
+    let f = fake(&[]);
+    let dir = tempfile::tempdir().unwrap().keep();
+    let h = host();
+    let mut settings = config(&h, &f, &dir, TALKS);
+    settings.security.companies.limits.conversations = Some(1);
+    let durable = Arc::new(agentd::state::Durable::new(
+        Arc::<agentd::store::memory::MemoryStore>::default(),
+        "t/",
+        "t",
+        agentd::state::Policy::default(),
+        None,
+    ));
+    let a = Agent {
+        sup: Supervisor::build(&settings, durable, &logger())
+            .unwrap()
+            .unwrap(),
+        _dir: dir,
+    };
+    h.publish(&a.sup.identity);
+    let one = a.sup.converse(&shop(&a), &say(None, "one", "k#1")).unwrap();
+    let cid = one["conversation"].as_str().unwrap().to_string();
+    let e = a
+        .sup
+        .converse(&shop(&a), &say(None, "two", "k#2"))
+        .unwrap_err();
+    assert!(matches!(e, CallError::Unsent(_)), "{e:?}");
+    assert!(e.to_string().contains("1 conversations are open"), "{e}");
+    let closed = a
+        .sup
+        .conversation_op(&shop(&a), &cid, "close", None)
+        .unwrap();
+    assert_eq!(closed["status"], "closed");
+    assert_eq!(a.sup.conversations_open(), 0);
+    let e = a
+        .sup
+        .converse(&shop(&a), &say(Some(&cid), "more", "k#3"))
+        .unwrap_err();
+    assert!(e.to_string().contains("is closed"), "{e}");
+    a.sup.converse(&shop(&a), &say(None, "two", "k#2")).unwrap();
+    assert_eq!(a.sup.conversations_open(), 1);
+}
+
+/// A read the Company is asked to hold for longer than the entry's
+/// `timeout` is waited for as long as it was asked to: an idle conversation
+/// answers no events, not a read that got no answer.
+#[test]
+fn a_held_read_outlasts_the_entrys_timeout() {
+    let f = fake(&[]);
+    let dir = tempfile::tempdir().unwrap().keep();
+    let a = agent_on(
+        &f,
+        &host(),
+        &dir,
+        Arc::default(),
+        &format!("{TALKS}, timeout: 1s"),
+    );
+    let cid = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    let begun = Instant::now();
+    let read = a
+        .sup
+        .read(&shop(&a), &cid, 2, None)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(read["events"], json!([]), "{read}");
+    assert!(begun.elapsed() >= Duration::from_secs(2), "it was held");
+    let waits: Vec<Value> = conversation_requests(&f)
+        .into_iter()
+        .filter(|r| path_of(r).ends_with("/events") && r["stream"] == false)
+        .collect();
+    assert_eq!(waits.len(), 2, "one read each, none sent again: {waits:#?}");
+}
+
+/// A request made for a unit of work names, under the strict profile, the
+/// trace the unit has at this Company — the same for every request of the
+/// unit there, never the unit's own — and under `standard` the unit's own
+/// trace. A reader's requests belong to no unit, and name none under
+/// `strict`.
+#[test]
+fn a_request_names_the_trace_its_profile_gives() {
+    let f = fake(&[]);
+    let a = talking(&f);
+    let (one, two) = (
+        agentd::obs::trace::TraceContext::mint(),
+        agentd::obs::trace::TraceContext::mint(),
+    );
+    let get = |a: &Agent, unit: &agentd::obs::trace::TraceContext| {
+        let (sent, link) = a
+            .sup
+            .request_trace(&shop(a), Some(unit), Some(&unit.child()))
+            .unwrap();
+        let before = f.record().len();
+        a.sup
+            .call_api(
+                &shop(a),
+                &Call {
+                    method: "POST".into(),
+                    path: "/notes".into(),
+                    json: Some(json!({"text": "traced"})),
+                    key: format!("{}#{before}", unit.trace_id),
+                    trace: sent,
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+        let r = f.record()[before..]
+            .iter()
+            .find(|r| r["path"] == "/api/notes")
+            .cloned()
+            .unwrap();
+        (r["trace_header"].as_str().unwrap().to_string(), link)
+    };
+    let (first, link) = get(&a, &one);
+    assert_ne!(first, one.trace_id, "never the unit's own trace");
+    assert_eq!(
+        link.map(|l| l.trace_id),
+        Some(first.clone()),
+        "agentd's span links to what was sent"
+    );
+    assert_eq!(get(&a, &one).0, first, "one trace per unit at the Company");
+    assert_ne!(get(&a, &two).0, first, "another unit, another trace");
+    // A reader's requests name none under the strict profile.
+    let cid = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "k#1"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    until("the reader's first read", || {
+        conversation_requests(&f)
+            .iter()
+            .any(|r| r["conversation"] == cid.as_str() && r["stream"] == true)
+    });
+    for r in conversation_requests(&f) {
+        assert!(r["trace_header"].is_null(), "{r}");
+    }
+    let dir = tempfile::tempdir().unwrap().keep();
+    let s = agent_on(
+        &f,
+        &host(),
+        &dir,
+        Arc::default(),
+        &format!("{TALKS}, privacy: standard"),
+    );
+    let (sent, link) = get(&s, &one);
+    assert_eq!(sent, one.trace_id, "the unit's own trace");
+    assert!(link.is_none());
 }

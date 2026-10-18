@@ -53,6 +53,12 @@ pub enum Kind {
     /// hash of the principal id. Durable because ownership is: a name that
     /// outlived a restart still owns its history, so the claim must too.
     Identity,
+    /// What agentd keeps of its work at one Company for one User (RFC 0047
+    /// §5.6): its conversations and their cursors, and the ids of the
+    /// messages and API writes it may send again — sealed when a seal key
+    /// is set, keyed by a hash of the (User, issuer) pair, looked up by it
+    /// and never restored as a set.
+    Company,
 }
 
 impl Kind {
@@ -71,6 +77,7 @@ impl Kind {
             Kind::Audit => "audit",
             Kind::Cred => "cred",
             Kind::Identity => "identity",
+            Kind::Company => "company",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -88,17 +95,25 @@ impl Kind {
             "audit" => Kind::Audit,
             "cred" => Kind::Cred,
             "identity" => Kind::Identity,
+            "company" => Kind::Company,
             _ => return None,
         })
     }
     /// Kinds the manifest indexes (restorable without `list`). Memory keys keep
     /// their own index record; audit records are append-only history; cred records
     /// are a self-keyed credential cache (not manifest-indexed); identity
-    /// records are looked up by the id they claim, never restored as a set.
+    /// records are looked up by the id they claim, and company records by the
+    /// (User, issuer) pair they keep, never restored as a set.
     pub fn indexed(self) -> bool {
         !matches!(
             self,
-            Kind::Manifest | Kind::Memory | Kind::Audit | Kind::Cred | Kind::Event | Kind::Identity
+            Kind::Manifest
+                | Kind::Memory
+                | Kind::Audit
+                | Kind::Cred
+                | Kind::Event
+                | Kind::Identity
+                | Kind::Company
         )
     }
 }

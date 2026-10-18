@@ -372,9 +372,156 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - Conformance: four more `companies/agent-*` checks — a Device Sign-In only
   as the User does it, Account Tokens only in a token request's form, the
   newest Account Token used across a restart, and signing out by revoking.
+- A Company's agent and its APIs (RFC 0047, P3). A company entry's
+  `interfaces` may list `agent` and `openapi` beside `mcp`; an entry without
+  `mcp` names no MCP server, is verified at boot all the same, and refuses
+  `rate`, `allow`, `exclude` and `mcp_names`, which shape only the Company's
+  MCP servers. Every
+  conversation and API request is the supervisor's, off its loop, under the
+  rules of a Company's MCP tools — the User's work only, `limits.in_flight`,
+  the Company's `Retry-After`, the cross-Company gate, the Company's origin on
+  whatever reads the answer — and carries the User's DPoP Session Token with a
+  proof of its own (`ath` over the token, the origin's nonce), and no
+  correlator of agentd's. A request made for a unit of work names in
+  `traceparent` the trace its profile gives — under `strict` the unit's own
+  trace at this Company, under `standard` the unit's — and is a span of the
+  unit's in agentd's trace, linked to what the Company was sent; a reader's
+  names the process trace under `standard` and none under `strict`. A read
+  asked to `wait` is waited for that long and 15 s more, however short the
+  entry's `timeout`. `401 invalid_token`
+  renews and sends once more, `403 sign_in_required` with an Account Token
+  held signs the Session in with it and sends once more, and
+  `insufficient_scope` and `extension_required` are typed errors naming what
+  the Company needs. A request that failed before a byte of it left is sent
+  again, at most three times in all; one that left and got no answer, or a
+  `5xx`, only when it is safe to.
+- **Conversations** (`poppy`, draft §7), through internal tools:
+  `company.converse {company, conversation?, text?, data?, wait?}` sends a
+  message — with no conversation, the first of a new one — and with `wait`
+  (at most 30 s) reads the reply; `company.read {company, conversation,
+  wait?}` answers the events since the model's last read; `company.handoff`
+  asks for a person; `company.close` closes it. A message's id is `msg_` and
+  128 random bits, kept for its call before it is sent, so every send of the
+  call — the transport's retry, and a workflow step's `retry:` or its replay
+  after a restart — carries the same id; other content under it is the
+  Company's `message_id_conflict`, typed. A workflow step's own call is keyed
+  by its run and step, not its attempt, and a model's call inside a step by
+  its turn, so the step's next attempt sends new ones. Its
+  `sender` is always `agent`, `role` is never sent, and its `context` holds
+  only what `security.companies.context` (`locale`, `time_zone`,
+  `share_availability`) or the entry's own `context` shares — `user_available`
+  from whether the User has a client attached to the observation feed. The
+  conversation errors of §7.13 are typed; one the Company no longer has, or
+  has closed, is kept closed.
+- **Readers.** Each open conversation — at most
+  `security.companies.limits.conversations` in the instance (default 16), a
+  new one refused until one closes — is followed by a reader on a thread of
+  the supervisor's, stopped when the conversation closes and when the
+  instance drains. It asks for a stream (`Accept: text/event-stream`, a 30 s
+  long poll from a Company that does not stream), opens it again with
+  `Last-Event-ID` set to the last event it handled when it ends, skips event
+  types it does not recognise and events it handled before, never reads a
+  `text-delta` piece, and appends the `message`, `state`, `authorization` and
+  `user_requested` events to the stream `company.<name>` — declared by agentd
+  for every entry that uses `agent` — each carrying the Company's origin, then
+  saves its cursor; a restart reads on from it. `cursor_expired` reads again
+  from the start, saying part of the conversation is missing on the log, on
+  the stream and to the model at its next read. An `authorization` event is
+  answered with the User's Account Token when one held covers its scopes —
+  the Session is signed in and the conversation goes on with the new token —
+  and otherwise reaches the model as a note that `company.sign_in` asks the
+  User; a `user_requested` event is answered in the conversation: the User is
+  not available for a direct conversation. Neither opens a gate. A read's
+  answer is taken as open issue #13 leaves it: `events` required, the rest
+  as given.
+- **OpenAPI** (draft §6): `company.api {company, api?, method, path, query?,
+  json?, expect?}` calls one operation of a listed OpenAPI 3.0 or 3.1
+  description — fetched as the discovery documents are, JSON only, at most
+  1 MiB, each operation's `$ref`s followed when it is called or described,
+  within the description, at most 16 deep and to at most 20 000 values — and
+  `company.api.describe {company, api?, operation?}` lists its operations or
+  gives one's parameters and schemas. `services.<name>.api_allow` (`METHOD
+  /path-template`, needs `openapi`) is the ceiling: an operation outside it or
+  outside the description, and path parameters, a query or a body that fail
+  the operation's schemas, are refused unsent, and so is a path segment that
+  is `.` or `..` or holds `/` or `\` once decoded; what is sent is the
+  operation's template, its parameters percent-encoded into it. A write
+  carries an `Idempotency-Key`, a UUID kept for its call, and is sent again
+  after a lost answer only when its operation declares that header; any other
+  write that may have run is `outcome unknown`. It answers `{status, json}`,
+  a status outside `expect` (default 2xx) an error. An `http` step with
+  `auth: {kind: company, company: <name>}` is a `company.api` call made by
+  the workflow, its `url` the operation's; `headers`, `body`, `sign`,
+  `allow_private` and `idempotency` are refused with it, and closed egress
+  does not judge its URL, which the company entry's hosts do.
+- A Company's tags fold into check 1 for its `company.*` tools as for its MCP
+  servers, the conversation and API tools carry them, and the stream-taint
+  check takes `company.<name>` as fed by the Company. The tools are offered
+  only where an entry uses `agent` (`company.converse`, `.read`, `.handoff`,
+  `.close`) or `openapi` (`company.api`, `.api.describe`).
+- A DPoP token for an API or conversation endpoint the Company lists with a
+  `resource` (draft §3.1, §4.3): the Session's renew grant with a proof and
+  that `resource`, held per `resource` and dropped when the Session is signed
+  in or out.
+- A workflow step's own tool call's `agent/idempotency_key` — and with it
+  the message id and `Idempotency-Key` minted for the call — no longer
+  carries the attempt: it is the same across the step's retries and a
+  restart's replay, as an `mcp.tool` step's is. A model's call inside a step
+  carries the process and its child, as a turn's does: two attempts of a
+  step's turn, each counting its requests from 1, were sent the same key.
+- Events `company.conversation.opened`, `.id` (debug), `.closed`,
+  `.cursor_expired`, `.declined`, `.read_failed`, `.unfollowed`;
+  `company.verified` names the interfaces the entry uses; the gauge
+  `agent_company_conversations_open{company}`; `agent_company_requests_total`
+  counts `interface` `agent` and `openapi` — a `company.api` status outside
+  `expect` an `error` — and
+  `agent_company_token_requests_total` the grant `resource`.
+- `agentd-core`: `companies::{conversation, api, request, ledger}` —
+  `Supervisor::{converse, read, conversation_op, call_api, describe_api,
+  description, send_signed, open_signed, request_trace, connection_trace,
+  deliver_to, resume_conversations, stop_readers, conversations_open}`,
+  `conversation::{Say, Delivery, Item, Sink, Page, page, is_id, MAX_WAIT,
+  NOT_AVAILABLE}`, `api::{Call, Description, Description::detail, Detail,
+  Operation, Param, describe, matching, segments}`, `request::{Signed,
+  Repeat, CallError, Answer, HOLD_MARGIN}`, `obs::otel::company_span`,
+  `ledger::{Ledger, Book, Conversation}` — the record kind
+  `state::Kind::Company`, `Session::{dpop_token, proof, learn_nonce,
+  refused_dpop}`, `token::Request::resource`,
+  `discover::{Listed, Verified::{conversation, openapi, interfaces},
+  Entry::{interfaces, api_allow}}`, `auth::http::{Failure, send_reaching,
+  send_streaming}`, `companies::http::Dialer::{send_reaching, stream,
+  document_up_to}`, `config::settings::companies::{Context, context_of,
+  interfaces_of, any_uses, interface_tags, entry_tags, stream_of,
+  parse_operation, same_template, is_conversation_tool, is_interface_tool,
+  CONVERSATION_TOOLS, API_TOOLS, OPERATION_METHODS, DEFAULT_CONVERSATIONS}`,
+  `Service::{api_allow, context}`, `Limits::conversations`, and
+  `runtime::a2a_server::SharedFeed::{attach, attached}`. The fake Company
+  lists its agent (after a protocol of a type agentd does not speak) and
+  serves conversations — messages answered once per id, events read as JSON
+  or a stream that ends, `text-delta` pieces marked `DELTA:`, an event of a
+  type the draft does not define before each reply, `authorization` events
+  for an order asked about signed out — and three more API operations, one
+  declaring `Idempotency-Key`; its control gains `http_fail` (with `ms`, the
+  answer held back after the request took effect), `refuse_dpop`,
+  `conversation.user_requested` and `expire_events`, and its record a
+  conversation request's message id, `sender`, `role`, `context` and text,
+  its cursor, `Last-Event-ID` and whether it asked for a stream, whether the
+  token was signed in, an API write's `Idempotency-Key` and body, and the
+  trace id a `traceparent` header names.
+- Conformance: eight more `companies/agent-*` checks — a message retried
+  with its id, every message as the agent, what agentd does not recognise
+  skipped, a stream opened again after the last event, the saved cursor
+  read on from after a restart, the User not available said in the
+  conversation, a Session Token with every API and conversation request, an
+  `Idempotency-Key` reused on retry.
 
 **Changed.**
 
+- A company entry's `interfaces` take `agent` and `openapi`, which load
+  refused while only a Company's MCP servers were used.
+- The credentialed HTTP helper (`auth::http`) makes the TLS handshake before
+  it writes a request, so a server it cannot reach over TLS has been sent
+  nothing, and says so (`Failure::Unsent`).
 - `agentd-mcp`: a `RequestSigner`'s `on_response` is also shown a `429` or
   `503` that carries `Retry-After`, so a signer can hold every request its
   credential serves (the transport's own per-socket wait is unchanged).
@@ -548,6 +695,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `WWW-Authenticate` value. A breaking change to the crate's public API.
 
 **Fixed.**
+
+- `agent_company_token_requests_total` counted a `refresh`, `device_code`,
+  `authorization_code`, `device_authorization` or `revoke` request as grant
+  `other`, and `agent_company_gates_total` a sign-in gate as kind `other`
+  with its answer `other`: each is counted by its own name, as the telemetry
+  reference lists them.
 
 - A subagent's tokens are charged call by call, as each model call
   returns. They went up once, when the child's run or warm turn ended, so

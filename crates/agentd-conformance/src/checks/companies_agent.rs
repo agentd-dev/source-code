@@ -110,6 +110,46 @@ pub fn checks() -> Vec<Check> {
             "company.sign_out revokes the Account Token at the revocation endpoint (token_type_hint refresh_token, the client assertion), and the Session goes on signed out: the next token is the assertion's",
             signs_out_by_revoking,
         ),
+        check(
+            "companies/agent-retries-a-message-with-its-id",
+            "a message whose answer was lost — a 502 after the Company took it — is sent again with the same id, and the Company answers it as the message it has; another message has an id of its own",
+            retries_a_message_with_its_id,
+        ),
+        check(
+            "companies/agent-says-who-wrote-each-message",
+            "every message agentd sends in a conversation says sender agent, and none sends role",
+            says_who_wrote_each_message,
+        ),
+        check(
+            "companies/agent-skips-what-it-does-not-recognize",
+            "agentd talks to the Company Agent over the poppy protocol, never the type it does not speak listed before it, and the stream it appends the conversation's events to holds no event of the type the draft does not define and no text-delta piece",
+            skips_what_it_does_not_recognize,
+        ),
+        check(
+            "companies/agent-reconnects-a-stream-after-the-last-event",
+            "a stream of a conversation's events that the Company ends is opened again with Last-Event-ID the last event agentd handled, and no cursor",
+            reconnects_a_stream_after_the_last_event,
+        ),
+        check(
+            "companies/agent-reads-on-from-the-cursor-it-saved",
+            "after a restart agentd's first read of an open conversation names the cursor it saved, the last event it handled",
+            reads_on_from_the_cursor_it_saved,
+        ),
+        check(
+            "companies/agent-says-the-user-is-not-available",
+            "when the Company Agent asks to talk with the User, agentd — which offers no Direct Conversation yet — says in the conversation that the User is not available, once, as the agent",
+            says_the_user_is_not_available,
+        ),
+        check(
+            "companies/agent-sends-a-session-token-with-every-request",
+            "every conversation request, and every API call an http step or company.api makes, carries the DPoP Session Token with a proof over it that the fake validated",
+            sends_a_session_token_with_every_request,
+        ),
+        check(
+            "companies/agent-reuses-an-idempotency-key-on-retry",
+            "an API write whose operation declares Idempotency-Key, its answer lost, is sent again with the same version 4 UUID, and gets the first answer",
+            reuses_an_idempotency_key_on_retry,
+        ),
     ]
 }
 
@@ -272,6 +312,66 @@ pub const QUOTES: &[Quote] = &[
         "companies/agent-signs-out-by-revoking",
         "4.9",
         "Usually those Sessions continue signed out, so a cart or an open conversation carries on: the Personal Agent renews them with its assertion (4.2) and gets signed-out Session Tokens.",
+    ),
+    spec(
+        "companies/agent-retries-a-message-with-its-id",
+        "7.3",
+        "To retry a message, it sends it again with the same ID.",
+    ),
+    spec(
+        "companies/agent-retries-a-message-with-its-id",
+        "7.3",
+        "The Personal Agent chooses each message's `id`, and MUST make it unique for the User.",
+    ),
+    spec(
+        "companies/agent-says-who-wrote-each-message",
+        "7.8",
+        "On the Personal Agent's side, the Personal Agent MUST set each message's `sender`: `agent` when the Personal Agent wrote it, and `human` only when it carries the User's own words.",
+    ),
+    spec(
+        "companies/agent-says-who-wrote-each-message",
+        "7.4",
+        "The Personal Agent doesn't send it, and the Company ignores it if sent.",
+    ),
+    spec(
+        "companies/agent-skips-what-it-does-not-recognize",
+        "7.1",
+        "It skips unfamiliar types.",
+    ),
+    spec(
+        "companies/agent-skips-what-it-does-not-recognize",
+        "7.5",
+        "Personal Agents MUST skip event types they don't recognize, so later versions and extensions can add types.",
+    ),
+    spec(
+        "companies/agent-skips-what-it-does-not-recognize",
+        "7.6",
+        "It MUST NOT act on text from a `text-delta` event.",
+    ),
+    spec(
+        "companies/agent-reconnects-a-stream-after-the-last-event",
+        "7.6",
+        "The Personal Agent reconnects with `Last-Event-ID` set to the last event it handled, in place of `cursor`.",
+    ),
+    spec(
+        "companies/agent-reads-on-from-the-cursor-it-saved",
+        "7.5",
+        "The Personal Agent handles events in order and saves the cursor after them.",
+    ),
+    spec(
+        "companies/agent-says-the-user-is-not-available",
+        "7.10",
+        "If they decline or aren't available, it says so in the conversation.",
+    ),
+    spec(
+        "companies/agent-sends-a-session-token-with-every-request",
+        "4.3",
+        "Personal Agents MUST send a Session Token on every API and conversation request, and MUST NOT leave it out to appear to the Company as a person on their own.",
+    ),
+    guides(
+        "companies/agent-reuses-an-idempotency-key-on-retry",
+        "Retries",
+        "Send an `Idempotency-Key` on API writes that accept one. Use a random UUID (version 4), and reuse the same key when you retry the same request.",
     ),
 ];
 
@@ -1197,6 +1297,347 @@ fn signs_out_by_revoking(h: &Harness) -> Outcome {
             next["grant"] == "urn:ietf:params:oauth:grant-type:jwt-bearer"
                 && next["session_id"].is_string(),
             format!("the Session was not renewed signed out with its assertion: {next}"),
+        )
+    })())
+}
+
+// ---- Conversations and APIs (RFC 0047 P3) -----------------------------------
+
+/// The Company used through its agent and its APIs.
+const TALKS: &str = ", interfaces: [agent, openapi], api_allow: [\"GET /orders/{order_id}\", \"POST /orders/{order_id}/exchanges\", \"POST /notes\"]";
+
+/// Two messages at boot: the first starts a conversation, the second goes on
+/// in it.
+const TWO_MESSAGES: &str = "      c: {kind: tool, name: company.converse, args: {company: shop, text: \"first\"}, depends_on: [s]}\n      m: {kind: tool, name: company.converse, args: {company: shop, conversation: \"{{steps.c.output.conversation}}\", text: \"second\"}, depends_on: [c]}\n";
+
+/// agentd, the fake steered with `controls` first, running the workflows
+/// `rest` declares.
+fn talked(h: &Harness, controls: &[Value], rest: &str) -> Result<Run, String> {
+    let mut run = prepare_with(
+        h,
+        &[],
+        &Extra {
+            entry: TALKS,
+            rest,
+            ..Extra::default()
+        },
+    )?;
+    for c in controls {
+        run.company.control(c.clone());
+    }
+    run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+    Ok(run)
+}
+
+/// The messages agentd sent, as the fake recorded them.
+fn messages(record: &[Value]) -> Vec<&Value> {
+    record
+        .iter()
+        .filter(|r| r["message_id"].is_string())
+        .collect()
+}
+
+/// Every event the store under `dir` holds on `stream`, in order.
+fn stream_events(dir: &std::path::Path, stream: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(v) =
+                serde_json::from_slice::<Value>(&std::fs::read(&p).unwrap_or_default())
+                && v["kind"] == "event"
+                && v["state"]["stream"] == stream
+            {
+                out.push(v["state"].clone());
+            }
+        }
+    }
+    out.sort_by_key(|e| e["seq"].as_u64());
+    out
+}
+
+fn retries_a_message_with_its_id(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = talked(
+            h,
+            &[
+                serde_json::json!({"http_fail": {"method": "POST", "path": "/poppy/conversations/cnv_", "times": 1, "status": 502}}),
+            ],
+            &once("talk", TWO_MESSAGES, "m"),
+        )?;
+        wait(40, "the second message answered", || {
+            messages(&run.record())
+                .iter()
+                .any(|m| m["text"] == "second" && m["duplicate"] == true)
+        })?;
+        let record = run.record();
+        let sent = messages(&record);
+        let second: Vec<&&Value> = sent.iter().filter(|m| m["text"] == "second").collect();
+        need(
+            second.len() == 2,
+            format!("the lost message was not sent again: {second:?}"),
+        )?;
+        need(
+            second[0]["failed"] == 502,
+            "the first attempt was not the one that failed",
+        )?;
+        need(
+            second[0]["message_id"] == second[1]["message_id"],
+            "the retry carried another id",
+        )?;
+        let first = sent
+            .iter()
+            .find(|m| m["text"] == "first")
+            .ok_or("no first message")?;
+        need(
+            first["message_id"] != second[0]["message_id"],
+            "two messages shared an id",
+        )
+    })())
+}
+
+fn says_who_wrote_each_message(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = talked(h, &[], &once("talk", TWO_MESSAGES, "m"))?;
+        wait(40, "two messages", || messages(&run.record()).len() >= 2)?;
+        for m in messages(&run.record()) {
+            need(
+                m["sender"] == "agent",
+                format!("a message says sender {}", m["sender"]),
+            )?;
+            need(
+                m["role"].is_null(),
+                format!("a message sent role {}", m["role"]),
+            )?;
+        }
+        Ok(())
+    })())
+}
+
+fn skips_what_it_does_not_recognize(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = talked(h, &[], &once("talk", TWO_MESSAGES, "m"))?;
+        let state = run.tmp.path().join("state");
+        wait(40, "the Company's reply on the stream", || {
+            stream_events(&state, "company.shop")
+                .iter()
+                .any(|e| e["data"].to_string().contains("You said: second"))
+        })?;
+        let held: String = stream_events(&state, "company.shop")
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        need(
+            !held.contains("x-mock-receipt"),
+            "the stream holds an event of a type the draft does not define",
+        )?;
+        need(
+            !held.contains("DELTA:"),
+            "the stream holds text from a text-delta piece",
+        )?;
+        need(
+            run.record().iter().all(|r| r["path"] != "/voice"),
+            "agentd used the conversation protocol it does not speak",
+        )
+    })())
+}
+
+fn reconnects_a_stream_after_the_last_event(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = talked(h, &[], &once("talk", TWO_MESSAGES, "m"))?;
+        let state = run.tmp.path().join("state");
+        wait(40, "the Company's reply on the stream", || {
+            stream_events(&state, "company.shop")
+                .iter()
+                .any(|e| e["data"].to_string().contains("You said: second"))
+        })?;
+        let last = stream_events(&state, "company.shop")
+            .last()
+            .and_then(|e| e["data"]["event"]["id"].as_str().map(str::to_string))
+            .ok_or("an empty stream")?;
+        wait(40, "a stream opened again after the last event", || {
+            run.record()
+                .iter()
+                .any(|r| r["stream"] == true && r["last_event_id"] == last.as_str())
+        })?;
+        let again: Vec<Value> = run
+            .record()
+            .into_iter()
+            .filter(|r| r["last_event_id"] == last.as_str())
+            .collect();
+        need(
+            again.iter().all(|r| r["cursor"].is_null()),
+            "a reconnect named a cursor beside Last-Event-ID",
+        )
+    })())
+}
+
+fn reads_on_from_the_cursor_it_saved(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = talked(h, &[], &once("talk", TWO_MESSAGES, "m"))?;
+        let state = run.tmp.path().join("state");
+        wait(40, "the Company's reply on the stream", || {
+            stream_events(&state, "company.shop")
+                .iter()
+                .any(|e| e["data"].to_string().contains("You said: second"))
+        })?;
+        run.stop();
+        let last = stream_events(&state, "company.shop")
+            .last()
+            .and_then(|e| e["data"]["event"]["id"].as_str().map(str::to_string))
+            .ok_or("an empty stream")?;
+        let before = run.record().len();
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        wait(40, "a read after the restart", || {
+            run.record()[before..]
+                .iter()
+                .any(|r| r["path"].as_str().is_some_and(|p| p.ends_with("/events")))
+        })?;
+        let record = run.record();
+        let first = record[before..]
+            .iter()
+            .find(|r| r["path"].as_str().is_some_and(|p| p.ends_with("/events")))
+            .ok_or("no read")?;
+        need(
+            first["cursor"] == last.as_str() && first["last_event_id"].is_null(),
+            format!(
+                "the first read after the restart is not from the saved cursor {last}: {first}"
+            ),
+        )
+    })())
+}
+
+fn says_the_user_is_not_available(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = talked(
+            h,
+            &[
+                serde_json::json!({"conversation": {"user_requested": "A specialist needs to confirm the exchange."}}),
+            ],
+            &once(
+                "talk",
+                "      c: {kind: tool, name: company.converse, args: {company: shop, text: \"I would like an exchange.\"}, depends_on: [s]}\n",
+                "c",
+            ),
+        )?;
+        let said = |r: &[Value]| -> Vec<Value> {
+            messages(r)
+                .into_iter()
+                .filter(|m| {
+                    m["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("not available"))
+                })
+                .cloned()
+                .collect()
+        };
+        wait(40, "agentd saying the User is not available", || {
+            !said(&run.record()).is_empty()
+        })?;
+        std::thread::sleep(Duration::from_millis(1500));
+        let declined = said(&run.record());
+        need(
+            declined.len() == 1,
+            format!("said {} times", declined.len()),
+        )?;
+        need(declined[0]["sender"] == "agent", "not said as the agent")?;
+        need(
+            declined[0]["status"] == 202,
+            format!("the Company did not take it: {}", declined[0]),
+        )
+    })())
+}
+
+fn sends_a_session_token_with_every_request(h: &Harness) -> Outcome {
+    verdict((|| {
+        // Each in a run of its own: the order is refused signed out, and a
+        // run ends at its first failed step.
+        let run = talked(
+            h,
+            &[],
+            &format!(
+                "{}{}{}",
+                once("talk", TWO_MESSAGES, "m"),
+                once(
+                    "note",
+                    "      n: {kind: http, method: POST, url: /notes, auth: {kind: company, company: shop}, json: {text: hi}, depends_on: [s]}\n",
+                    "n",
+                )
+                .replacen("workflows:\n", "", 1),
+                once(
+                    "order",
+                    "      o: {kind: tool, name: company.api, args: {company: shop, method: GET, path: /orders/o1}, depends_on: [s]}\n",
+                    "o",
+                )
+                .replacen("workflows:\n", "", 1),
+            ),
+        )?;
+        wait(40, "the conversation and the API calls", || {
+            let r = run.record();
+            r.iter().any(|x| x["path"] == "/api/notes")
+                && r.iter().any(|x| x["path"] == "/api/orders/o1")
+                && messages(&r).len() >= 2
+        })?;
+        for r in run.record().iter().filter(|r| {
+            r["conversation_request"] == true
+                || r["path"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("/api/") && p != "/api/openapi.json")
+        }) {
+            need(
+                r["presented"].is_string() && r["proof"]["ath"].is_string(),
+                format!("a request without the Session Token and a proof over it: {r}"),
+            )?;
+            need(
+                r["error"] != "invalid_dpop_proof" && r["error"] != "invalid_token",
+                format!("the fake refused a request's token or proof: {r}"),
+            )?;
+        }
+        Ok(())
+    })())
+}
+
+fn reuses_an_idempotency_key_on_retry(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = talked(
+            h,
+            &[
+                serde_json::json!({"http_fail": {"method": "POST", "path": "/api/orders/o1/exchanges", "times": 1, "status": 502}}),
+            ],
+            &once(
+                "exchange",
+                "      x: {kind: tool, name: company.api, args: {company: shop, method: POST, path: /orders/o1/exchanges, json: {item_id: itm_4Qa, replacement_sku: stormline-insulated-m}}, depends_on: [s]}\n",
+                "x",
+            ),
+        )?;
+        let sent = |r: &[Value]| -> Vec<Value> {
+            r.iter()
+                .filter(|x| x["path"] == "/api/orders/o1/exchanges")
+                .cloned()
+                .collect()
+        };
+        wait(40, "the exchange sent again", || {
+            sent(&run.record()).len() >= 2
+        })?;
+        let s = sent(&run.record());
+        let key = s[0]["idempotency_key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        need(
+            key.len() == 36 && &key[14..15] == "4",
+            format!("not a version 4 UUID: {key:?}"),
+        )?;
+        need(
+            s[1]["idempotency_key"] == key.as_str(),
+            "the retry carried another key",
+        )?;
+        need(
+            s[1]["duplicate"] == true && s[1]["status"] == 201,
+            format!("the retry was not answered as the first: {}", s[1]),
         )
     })())
 }

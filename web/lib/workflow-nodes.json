@@ -390,7 +390,8 @@
       "sign",
       "idempotency",
       "breaker",
-      "rate"
+      "rate",
+      "auth"
     ],
     "implemented": true,
     "kind": "http",

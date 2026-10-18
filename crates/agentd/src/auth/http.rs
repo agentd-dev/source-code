@@ -90,8 +90,39 @@ pub fn send(
     timeout: Duration,
     dial: Dial,
 ) -> Result<Reply, String> {
-    let u = Url::parse(url).map_err(|e| format!("oauth: url {url}: {e}"))?;
-    let mut stream = connect(&u, timeout, dial)?;
+    send_reaching(method, url, headers, body, timeout, dial).map_err(|f| f.to_string())
+}
+
+/// Why a request got no answer, and whether any of it left: a request that
+/// failed before a byte of it was sent is safe to send again, whatever it
+/// was (RFC 0047 §5.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// Nothing was sent: no connection, or no TLS session with the server.
+    Unsent(String),
+    /// Some or all of it was sent, and no whole answer came.
+    Unanswered(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Unsent(e) | Failure::Unanswered(e) => f.write_str(e),
+        }
+    }
+}
+
+/// [`send`], saying how far a failed request got.
+pub fn send_reaching(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout: Duration,
+    dial: Dial,
+) -> Result<Reply, Failure> {
+    let u = Url::parse(url).map_err(|e| Failure::Unsent(format!("oauth: url {url}: {e}")))?;
+    let mut stream = connect(&u, timeout, dial).map_err(Failure::Unsent)?;
     let resp = http::send(
         stream.as_mut(),
         &u.host_header(),
@@ -100,7 +131,7 @@ pub fn send(
         headers,
         body,
     )
-    .map_err(|e| format!("oauth: request failed: {e}"))?;
+    .map_err(|e| Failure::Unanswered(format!("oauth: request failed: {e}")))?;
     Ok(Reply {
         status: resp.status,
         headers: resp.headers,
@@ -108,11 +139,30 @@ pub fn send(
     })
 }
 
+/// One request whose answer is read as it arrives: the status and headers,
+/// and the body left on the connection for the caller to read — a
+/// `text/event-stream`, say, event by event.
+pub fn send_streaming(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout: Duration,
+    dial: Dial,
+) -> Result<http::StreamingResponse<Box<dyn http::Stream>>, Failure> {
+    let u = Url::parse(url).map_err(|e| Failure::Unsent(format!("oauth: url {url}: {e}")))?;
+    let stream = connect(&u, timeout, dial).map_err(Failure::Unsent)?;
+    http::send_streaming(stream, &u.host_header(), method, &u.path, headers, body)
+        .map_err(|e| Failure::Unanswered(format!("oauth: request failed: {e}")))
+}
+
 /// Connect to an OAuth endpoint as `dial` says: `https://` over TLS, and a
 /// [`Dial::Named`] `http://` in the clear. Plain HTTP is only ever sane for a
 /// loopback development authorization server — one reached in the clear sees
 /// the client's credential and returns the token in the clear — so a real
-/// deployment configures `https` endpoints.
+/// deployment configures `https` endpoints. The TLS handshake is made here,
+/// before the request is written, so a server agentd could not reach over
+/// TLS has been sent nothing.
 fn connect(url: &Url, timeout: Duration, dial: Dial) -> Result<Box<dyn http::Stream>, String> {
     let tcp = match dial {
         Dial::Named => http::connect_tcp(&url.host, url.port, timeout),
@@ -130,8 +180,11 @@ fn connect(url: &Url, timeout: Duration, dial: Dial) -> Result<Box<dyn http::Str
     if url.is_tls() {
         #[cfg(feature = "tls")]
         {
-            let s = crate::net::tls::connect(tcp, &url.host, None)
-                .map_err(|e| format!("oauth: tls {}: {e}", url.host))?;
+            let tls = |e: std::io::Error| format!("oauth: tls {}: {e}", url.host);
+            let mut s = crate::net::tls::connect(tcp, &url.host, None).map_err(tls)?;
+            while s.conn.is_handshaking() {
+                s.conn.complete_io(&mut s.sock).map_err(tls)?;
+            }
             Ok(Box::new(s))
         }
         #[cfg(not(feature = "tls"))]

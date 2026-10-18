@@ -11,7 +11,10 @@
 //! and only when the Company says it has ended (`invalid_session`) is a new
 //! one started and kept instead. A Bearer token for an MCP server is the
 //! Session's renew grant without a proof and with `resource` the server's
-//! `url` (§4.3); it is used only there.
+//! `url` (§4.3); it is used only there. The DPoP Session Token is what every
+//! API and conversation request carries, with a proof of its own signed for
+//! it ([`Session::proof`]); an endpoint the Company lists with a `resource`
+//! gets the renew grant with a proof and that `resource` instead.
 //!
 //! While the User's Account Token is held ([`super::account`]) every token
 //! is granted on it (§4.8): the Session is renewed, or signed in, with it and
@@ -114,6 +117,18 @@ struct State {
     scope: Vec<String>,
     /// Bearer tokens, by MCP server `url`.
     bearer: BTreeMap<String, Held>,
+    /// DPoP tokens issued for a `resource` an API or conversation endpoint
+    /// is listed with, by that `resource`.
+    resource: BTreeMap<String, Held>,
+}
+
+impl State {
+    /// Every token issued for one `resource`, Bearer or DPoP: each belongs
+    /// to the Session as it was signed in, or out, when it was issued.
+    fn drop_scoped(&mut self) {
+        self.bearer.clear();
+        self.resource.clear();
+    }
 }
 
 impl Session {
@@ -156,25 +171,17 @@ impl Session {
         }
     }
 
-    /// One token request for the Session `sid` (none starts one), for
-    /// `resource` when it is a Bearer token: granted on the Account Token
-    /// while one is held, else on the assertion. A token the Company rotated
-    /// is kept before the answer is used; an `invalid_grant` for the Account
-    /// Token forgets it, and the request is made again signed out.
+    /// One token request, `base`: granted on the Account Token while one is
+    /// held, else on the assertion. A token the Company rotated is kept
+    /// before the answer is used; an `invalid_grant` for the Account Token
+    /// forgets it, and the request is made again signed out.
     fn request(
         &self,
         env: &Env<'_>,
         user_id: &str,
-        sid: Option<&str>,
-        resource: Option<&str>,
+        base: Request<'_>,
     ) -> Result<TokenResponse, TokenError> {
         let company = &env.verified.company;
-        // A Bearer token is only ever asked for an open Session.
-        let base = match (sid, resource) {
-            (Some(s), Some(url)) => Request::bearer(s, url),
-            (Some(s), None) => Request::renew(s),
-            (None, _) => Request::start(),
-        };
         let account = env.account(&self.issuer).map_err(TokenError::Transport)?;
         // A token the entry now admits none of is not used: the request is
         // made signed out, and the token kept for the User to sign out of.
@@ -238,7 +245,7 @@ impl Session {
         let rec = self.record(env, st)?;
         let company = &env.verified.company;
         let renewed = match rec.session_id.as_deref() {
-            Some(sid) => match self.request(env, &rec.user_id, Some(sid), None) {
+            Some(sid) => match self.request(env, &rec.user_id, Request::renew(sid)) {
                 // Ended — or, with an Account Token, signed in to another
                 // account than the token's (§4.4): either way a new Session.
                 Err(e) if e.is(err::INVALID_SESSION) || e.is(err::ACCOUNT_MISMATCH) => {
@@ -254,7 +261,7 @@ impl Session {
         };
         let (got, started) = match renewed {
             Some(r) => (r, false),
-            None => (self.request(env, &rec.user_id, None, None), true),
+            None => (self.request(env, &rec.user_id, Request::start()), true),
         };
         let got = got.map_err(|e| format!("company {company}: {e}"))?;
         self.adopt(env, st, &got, started)
@@ -278,8 +285,9 @@ impl Session {
                 .save(env.principal, &self.issuer, &rec)
                 .map_err(|e| format!("company {company}: {e}"))?;
             st.record = Some(rec);
-            // Bearer tokens belong to the Session they were issued for.
-            st.bearer.clear();
+            // Tokens for one resource belong to the Session they were issued
+            // for.
+            st.drop_scoped();
         }
         let line = json!({"company": company, "signed_in": got.signed_in});
         if started {
@@ -293,7 +301,7 @@ impl Session {
         );
         if st.signed_in != got.signed_in {
             // Tokens issued before reflect the Session as it was (§4.4).
-            st.bearer.clear();
+            st.drop_scoped();
         }
         st.signed_in = got.signed_in;
         st.scope = got.scope.clone();
@@ -308,7 +316,52 @@ impl Session {
     /// has ended.
     pub fn bearer(&self, env: &Env<'_>, url: &str) -> Result<String, String> {
         let mut st = self.lock();
-        if let Some(h) = st.bearer.get(url).filter(|h| h.fresh()) {
+        self.scoped(env, &mut st, url, false)
+    }
+
+    /// The DPoP Session Token an API or conversation request carries (§4.3,
+    /// §6): the Session's own, opened or renewed as needed — or, for an
+    /// endpoint the Company lists with a `resource`, one issued for that
+    /// `resource`.
+    pub fn dpop_token(&self, env: &Env<'_>, resource: Option<&str>) -> Result<String, String> {
+        let mut st = self.lock();
+        match resource {
+            Some(r) => self.scoped(env, &mut st, r, true),
+            None => {
+                self.open_locked(env, &mut st)?;
+                st.session
+                    .as_ref()
+                    .map(|h| h.token.clone())
+                    .ok_or_else(|| format!("company {}: no Session", env.verified.company))
+            }
+        }
+    }
+
+    /// A DPoP proof for `method` at `url`, with `ath` over `token` and the
+    /// origin's nonce, signed now (§4.3).
+    pub fn proof(&self, method: &str, url: &str, token: &str) -> Result<String, String> {
+        self.dpop
+            .proof(method, url, Some(token), self.nonces.get(url).as_deref())
+    }
+
+    /// Keep the nonce a response from `url`'s origin carried.
+    pub fn learn_nonce(&self, url: &str, nonce: &str) {
+        self.nonces.learn(url, nonce);
+    }
+
+    /// The token for `resource` — Bearer for an MCP server, or DPoP: the one
+    /// held when it is fresh, else a new one for the Session, which is
+    /// opened first when it has no `session_id`, and started again when the
+    /// Company says it has ended.
+    fn scoped(
+        &self,
+        env: &Env<'_>,
+        st: &mut State,
+        resource: &str,
+        dpop: bool,
+    ) -> Result<String, String> {
+        let held = if dpop { &st.resource } else { &st.bearer };
+        if let Some(h) = held.get(resource).filter(|h| h.fresh()) {
             return Ok(h.token.clone());
         }
         if st
@@ -317,17 +370,23 @@ impl Session {
             .and_then(|r| r.session_id.as_ref())
             .is_none()
         {
-            self.open_locked(env, &mut st)?;
+            self.open_locked(env, st)?;
         }
         let company = &env.verified.company;
+        let what = if dpop { "A DPoP" } else { "A Bearer" };
         for attempt in 0..2 {
             let rec = st.record.clone().ok_or("no User record")?;
             let sid = rec.session_id.clone().unwrap_or_default();
-            match self.request(env, &rec.user_id, Some(&sid), Some(url)) {
+            let req = if dpop {
+                Request::resource(&sid, resource)
+            } else {
+                Request::bearer(&sid, resource)
+            };
+            match self.request(env, &rec.user_id, req) {
                 Ok(got) => {
                     if got.session_id != sid {
                         return Err(format!(
-                            "company {company}: a Bearer token came back for another Session"
+                            "company {company}: {what} token for {resource} came back for another Session"
                         ));
                     }
                     if got.signed_in != st.signed_in {
@@ -336,11 +395,16 @@ impl Session {
                         st.signed_in = got.signed_in;
                         st.scope = got.scope.clone();
                         st.session = None;
-                        st.bearer.clear();
+                        st.drop_scoped();
                         crate::obs::metrics::set_company_signed_in(company, got.signed_in);
                     }
                     let token = got.access_token.clone();
-                    st.bearer.insert(url.to_string(), Held::of(&got));
+                    let into = if dpop {
+                        &mut st.resource
+                    } else {
+                        &mut st.bearer
+                    };
+                    into.insert(resource.to_string(), Held::of(&got));
                     return Ok(token);
                 }
                 Err(e)
@@ -355,12 +419,15 @@ impl Session {
                     if let Some(r) = st.record.as_mut() {
                         r.session_id = None;
                     }
-                    self.open_locked(env, &mut st)?;
+                    self.open_locked(env, st)?;
                 }
                 Err(e) => return Err(format!("company {company}: {e}")),
             }
         }
-        Err(format!("company {company}: no Session took a Bearer token"))
+        Err(format!(
+            "company {company}: no Session took {} token for {resource}",
+            what.to_ascii_lowercase()
+        ))
     }
 
     /// The Session's `session_id`, opened first when it has none.
@@ -433,7 +500,7 @@ impl Session {
                 kind: kind.to_string(),
             },
         )?;
-        st.bearer.clear();
+        st.drop_scoped();
         self.adopt(env, &mut st, got, false)?;
         Ok(old.filter(|o| o.token != rt))
     }
@@ -456,7 +523,7 @@ impl Session {
             store.forget(principal, &self.issuer)?;
         }
         st.session = None;
-        st.bearer.clear();
+        st.drop_scoped();
         st.signed_in = false;
         st.scope.clear();
         crate::obs::metrics::set_company_signed_in(company, false);
@@ -492,6 +559,18 @@ impl Session {
         if st.bearer.get(url).is_some_and(|h| h.token == token) {
             st.bearer.remove(url);
         }
+    }
+
+    /// An API or conversation endpoint refused the DPoP token `token`
+    /// (`invalid_token`), or needs the Session signed in with the held
+    /// Account Token (`sign_in_required`): it is not used again, so the next
+    /// request renews the Session — on the Account Token while one is held.
+    pub fn refused_dpop(&self, token: &str) {
+        let mut st = self.lock();
+        if st.session.as_ref().is_some_and(|h| h.token == token) {
+            st.session = None;
+        }
+        st.resource.retain(|_, h| h.token != token);
     }
 }
 

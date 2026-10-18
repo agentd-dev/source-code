@@ -972,6 +972,9 @@ Calls any tool by its registry name: built-in, code-registered or MCP.
 - **Output:** the tool's result.
 - The tool must be granted to workflows. One that is unknown, disabled or
   not granted exits `2` at startup.
+- The call's `agent/idempotency_key` is the step's: the same across its
+  retries and a restart's replay. A `company.*` call keeps the message id or
+  `Idempotency-Key` it minted under it, so a retry sends the same one.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -984,7 +987,7 @@ One outbound HTTP request.
 
 - **Fields:** **`url`**, `method`, `headers`, `query`, `body`, `json`,
   `timeout`, `expect`, `allow_private`, `sign`, `idempotency`, `breaker`,
-  `rate`.
+  `rate`, `auth`.
 - **Output:** `{status, ok, headers, body, json}`; `json` is the body parsed,
   or null.
 - `method` defaults to `GET`. Success is a status from 200 to 399 unless
@@ -1005,6 +1008,15 @@ One outbound HTTP request.
 - The request carries the step's span as `traceparent` and `tracestate`,
   unless `headers` sets either: then it carries what `headers` set and
   nothing of agentd's.
+- `auth: {kind: company, company: <entry>}` calls a Company's OpenAPI API
+  for its User instead (the `companies` feature): the step is a
+  `company.api` call, under its rules — `url` an operation of the
+  description that `api_allow` lists (or its path under the API's server
+  URL), the query and `json` held to its schemas, the User's DPoP Session
+  Token, an `Idempotency-Key` on a write — and its output is the tool's,
+  `{status, json}`. `headers`, `body`, `sign`, `allow_private` and
+  `idempotency` are refused with it. See
+  [A Company's agent and its APIs](configuration.md#a-companys-agent-and-its-apis).
 
 ```yaml
 # fragment: under workflows[].steps

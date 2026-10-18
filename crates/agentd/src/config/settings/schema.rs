@@ -441,9 +441,21 @@ fn companies() -> Value {
                 "redirect_uri": { "type": "string", "description": "where Direct Sign-In returns the User, an HTTPS URL on the client_id's host; default <client_id origin>/companies/callback. Listed in the document's redirect_uris when a Company lists direct" },
                 "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths, and the Direct Sign-In callback when a Company lists direct (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" } } },
             "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http)" },
+            "context": company_context("what the messages agentd sends in a Company's conversations share of the User's situation, each field in the draft's format; nothing is shared that is not set. Needs an entry that uses `agent`"),
             "browsers": { "type": "array", "items": { "type": "string" }, "description": "browser MCP servers to keep off every Company's hosts; each names an mcp.servers entry" },
             "limits": { "type": "object", "additionalProperties": false, "properties": {
-                "in_flight": { "type": "integer", "minimum": 1, "description": "Company calls in flight per Company (default 4); one more is refused until one ends" } } } } })
+                "in_flight": { "type": "integer", "minimum": 1, "description": "Company calls in flight per Company (default 4); one more is refused until one ends" },
+                "conversations": { "type": "integer", "minimum": 1, "description": "open conversations per instance, each followed by a reader (default 16); a new one is refused until one closes" } } } } })
+}
+
+/// A conversation's `context` (RFC 0047 §5.5.7): `security.companies.context`
+/// and a company entry's own.
+fn company_context(description: &str) -> Value {
+    json!({ "type": "object", "additionalProperties": false, "description": description,
+        "properties": {
+            "locale": { "type": "string", "description": "a language tag (RFC 5646), such as en-US" },
+            "time_zone": { "type": "string", "description": "an IANA time zone name, such as America/Los_Angeles" },
+            "share_availability": { "type": "boolean", "description": "share user_available: whether the User has a client attached to agentd now (default false)" } } })
 }
 
 /// `agent.instruction.mcp`: a served resource, and the MCP Events types
@@ -686,13 +698,16 @@ fn defs_properties(
                 "hosts": { "type": "array", "items": { "type": "string" },
                            "description": "`kind: company` only — host globs (`example.com`, `*.example.com`) every endpoint the Company's documents name must match; default the endpoint's host, the document's organization.domain, their subdomains and the issuer's host" },
                 "allow_private": { "type": "boolean", "description": "`kind: company` only — admit loopback, private and link-local addresses (an on-premises Company); default false" },
-                "interfaces": { "type": "array", "items": { "enum": ["mcp", "agent", "openapi"] }, "description": "`kind: company` only — the Company's interfaces agentd uses; default [mcp], the only one this build uses" },
+                "interfaces": { "type": "array", "items": { "enum": ["mcp", "agent", "openapi"] }, "description": "`kind: company` only — the Company's interfaces agentd uses: mcp (its MCP servers), agent (conversations with its Company Agent, through company.converse and the company.<name> stream), openapi (its OpenAPI APIs, through company.api); default [mcp]" },
                 "mcp_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "`kind: company` only — a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry" },
                 "privacy": { "enum": ["strict", "standard"], "description": "`kind: company` only — strict (default) or standard, which sends agentd's usual correlators and is logged at boot" },
                 "sign_in": { "type": "array", "items": { "enum": ["device", "direct", "mediated"] },
                              "description": "`kind: company` only — the sign-in types agentd may start with the User, in the order it tries them: device (a link and a code) or direct (the Company's page, back to the served callback; needs client.serve). mediated is refused. Needs scopes and security.companies.seal_key" },
                 "scopes": { "type": "array", "items": { "type": "string" },
-                            "description": "`kind: company` only — the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants" } } }));
+                            "description": "`kind: company` only — the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants" },
+                "api_allow": { "type": "array", "items": { "type": "string" },
+                               "description": "`kind: company` only — the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Needs `openapi` in interfaces; default none" },
+                "context": company_context("`kind: company` only — what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces") } }));
     m.insert("A2aPeer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }, "endpoint": { "type": "string" },
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },

@@ -83,7 +83,7 @@ these names, and anything else is refused at load.
 | `budget` | Token budgets: windows, degrade, the lifetime cap |
 | `cgroup` | cgroup v2 placement of children |
 | `child` | Child process exits and health |
-| `company` | Acting at Companies for a person (the `companies` feature): discovery, the client identity, Sessions and a Company's MCP servers |
+| `company` | Acting at Companies for a person (the `companies` feature): discovery, the client identity, Sessions, a Company's MCP servers, its conversations and its APIs |
 | `config` | Validation, reload and the config file watch |
 | `context` | Conversation compaction |
 | `correlate` | `correlate` start nodes |
@@ -235,7 +235,7 @@ token, an assertion, a proof or a User ID; `session_id` appears only at
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `company.verified` | info | `company`, `domain`, `issuer`, `interfaces`, `servers`, `max_age` | The Company's discovery document and metadata verified; `servers` are its MCP servers by name. Written once per change. |
+| `company.verified` | info | `company`, `domain`, `issuer`, `interfaces`, `servers`, `max_age` | The Company's discovery document and metadata verified; `interfaces` are the ones the entry uses there, `servers` its MCP servers by name. Written once per change. |
 | `company.refused` | warn | `company`, `error`, `reason` | The Company's documents were not used. `reason`: `fetch`, `redirect`, `https`, `protocol_version`, `domain`, `auth`, `issuer`, `domains`, `es256`, `metadata`, `endpoint`, `mcp`, `mcp_names`. Written once per change; the Company is tried again with the backoff of a server down at boot. |
 | `company.endpoint.refused` | warn | `company`, `field`, `host` | A URL the Company's documents name is off the entry's `hosts`: `field` names where it is. Beside `company.refused` with `reason: endpoint`. Also a device authorization's `verification_uri` or `verification_uri_complete` that is not an HTTPS URL with a plain host on the hosts, in printable ASCII: the sign-in is refused before a gate opens, and `host` is null when the URL names no plain host. |
 | `company.discovery.stale` | warn | `age_s`, `company`, `error` | A refetch failed; the documents verified `age_s` seconds ago serve, for up to a day. |
@@ -262,7 +262,31 @@ token, an assertion, a proof or a User ID; `session_id` appears only at
 | `company.account_token.rotated` | info | `company` | The Company returned a new Account Token in a token response; it was kept sealed before the response was used. |
 | `company.account_token.replaced` | info | `company`, `error`, `revoked` | A sign-in gave a new Account Token in place of the one held — more scopes, or another account — and the old one was revoked (`revoked`), or not (`error`). |
 | `company.account_token.dropped` | info | `company`, `reason` | The Company answered `invalid_grant` for the Account Token — a disconnect, a revocation, an expiry: it is forgotten, and the Session goes on signed out. Nothing else forgets it. |
+| `company.conversation.opened` | info | `company` | A conversation agentd started there opened; its reader follows it. |
+| `company.conversation.id` | debug | `company`, `conversation` | The conversation's id. |
+| `company.conversation.closed` | info | `company` | A conversation closed — by `company.close`, by the Company (a `state` event `closed`), or because the Company no longer has it — and its reader stopped. |
+| `company.conversation.cursor_expired` | info | `company`, `read` | The Company no longer had a conversation's events after a saved cursor: `read` (`reader`, `model`) read again from the start, and the model is told part of the conversation is missing at its next read. The reader also appends a `cursor_expired` event to the stream. |
+| `company.conversation.declined` | info | `company`, `error` | The Company asked to talk with the User directly (`user_requested`), and agentd said in the conversation that the User is not available; `error` says why it could not, when it could not. |
+| `company.conversation.read_failed` | warn | `company`, `error` | A conversation's reader could not read its events; it tries again from a second, doubling to a minute. Written once per change. |
+| `company.conversation.unfollowed` | warn | `company`, `limit`, `open` | At boot more conversations were open there than `limits.conversations` lets readers follow: `open` of them have none until others close. |
 | `company.user_id.reset` | info | `company`, `started_over` | The operator reset the User ID the Company knows the User by (`company.user_id.reset`): the Company sees a new User from the next call on. `started_over`: the seal key opened none of the store's records, and this Company started over with it as a new User — the others stay unavailable until each is reset, and the store takes the key once all are. Its MCP connections join again on new sessions (`mcp.disconnect` `user_id_reset`). Also an audit record. |
+
+#### The `company.<name>` stream
+
+Each open conversation's reader appends the conversation's `message`, `state`,
+`authorization` and `user_requested` events to the stream `company.<name>`,
+which agentd declares for every company entry that uses `agent` (a `streams:`
+entry of that name sets its retention). Each event's `subject` is the event's
+type — or `cursor_expired`, when part of the conversation is missing — its
+`correlation` the conversation's id, its `source` `company:<name>`, and its id
+`<conversation>/<event id>`, so a consumer drops a copy a reconnect hands on
+again. Its `data` is `{company, conversation, event, note?}`: `event` is the
+Company's event as it sent it, the Company's own words, and `note` is
+agentd's, saying what it did — an `authorization` it answered with the Account
+Token, or that needs `company.sign_in`; a `user_requested` it declined. Every
+event carries the Company's origin, `company:<issuer>`, so the run a `stream`
+start fires or a `wait {on: event}` resumes carries it too. No `text-delta`
+piece, and no event of a type the draft does not define, is ever appended.
 
 `auth.unavailable` and `auth.recovered` carry `target: company:<name>`:
 `auth.unavailable` while a Company cannot be verified or its Session cannot
@@ -966,11 +990,12 @@ family past 512 series folds as the MCP Events families do.
 
 | Metric | Type | Labels | Status | Meaning |
 |---|---|---|---|---|
-| `agent_company_requests_total` | counter | `company`, `interface` (`mcp`), `outcome` | live | Calls to a Company's tools: `ok`; `error` (the Company's own answer: a tool's error or a refusal it sent); `unsent` (refused before sending: the not-before instant, the in-flight limit, a credential); `unknown` (failed after it was sent, and not sent again) |
-| `agent_company_token_requests_total` | counter | `company`, `grant` (`start`, `renew`, `bearer`, `refresh`, `device_code`, `authorization_code`, `device_authorization`, `revoke`), `outcome` (`ok`, `refused`, `failed`) | live | Requests sent to the Company's token, device authorization and revocation endpoints, retries included |
+| `agent_company_requests_total` | counter | `company`, `interface` (`mcp`, `agent`, `openapi`), `outcome` | live | Calls to a Company's tools, conversations and APIs: `ok`; `error` (the Company's own answer: a tool's error or a refusal it sent); `unsent` (refused before sending: the not-before instant, the in-flight limit, a credential, an operation outside the description or `api_allow`, a body its schema refuses); `unknown` (failed after it was sent, and not sent again) |
+| `agent_company_token_requests_total` | counter | `company`, `grant` (`start`, `renew`, `bearer`, `resource`, `refresh`, `device_code`, `authorization_code`, `device_authorization`, `revoke`), `outcome` (`ok`, `refused`, `failed`) | live | Requests sent to the Company's token, device authorization and revocation endpoints, retries included; `resource` is a DPoP token for an endpoint the Company lists with one |
 | `agent_company_signed_in` | gauge | `company` | live | `1` while the Session there is signed in |
 | `agent_company_rate_limited_until_seconds` | gauge | `company` | live | The Company's not-before instant, in Unix seconds; a past instant holds nothing back |
-| `agent_company_gates_total` | counter | `company`, `kind` (`cross_company`, `sign_in`), `answer` (`approve`, `deny`, `unanswered`, `unreachable`; for `sign_in` how it ended: `signed_in`, `cancelled`, `denied`, `expired`, `account_mismatch`, `failed`) | live | The User's gates a Company call opened, by how each ended |
+| `agent_company_gates_total` | counter | `company`, `kind` (`cross_company`, `sign_in`), `answer` (`approve`, `deny`, `unanswered`, `unreachable`; for `sign_in` how it ended: `signed_in`, `cancelled`, `denied`, `expired`, `account_mismatch`, `interrupted`, `failed`) | live | The User's gates a Company call opened, by how each ended |
+| `agent_company_conversations_open` | gauge | `company` | live | Conversations open there, each followed by a reader |
 
 ## Health surfaces
 
@@ -1054,6 +1079,7 @@ is up, the rest is dropped and counted lost.
 | `emit <stream>` | PRODUCER | when appended | the step's | `messaging.operation.type`, `messaging.destination.name`, `agentd.stream.seq` |
 | `append <stream>` | PRODUCER | when an `into:` appends: a trace of its own, linked to the request's span | none | as `emit` |
 | `tools/call <tool>`, `resources/read <uri>`, `prompts/get <name>`, `completion/complete <server>`, `resources/list <server>`, `resources/templates/list <server>` | CLIENT | when answered | the step's, the turn's, or the tool call's | `mcp.method.name`, `agentd.mcp.server`, `gen_ai.operation.name` and `gen_ai.tool.name` (`tools/call`), `mcp.resource.uri` (`resources/read`), `gen_ai.prompt.name` (`prompts/get`) |
+| `<company.* tool> <company>` | CLIENT | when answered: a call to a Company's agent or API (`company.converse`, `.read`, `.handoff`, `.close`, `company.api`, `.api.describe`, and an `http` step with `auth: {kind: company}`). Under `privacy: strict` linked to the trace the Company was sent in its place | the step's, the turn's, or the tool call's | `gen_ai.operation.name`, `gen_ai.tool.name`, `agentd.company` |
 | `<METHOD>` | CLIENT | when answered: an `http` step's request, or a `forward: {webhook}` push | the step's, or the emit's | `http.request.method`, `http.response.status_code`; an `http` step's `url.full`, `agentd.run`, `agentd.step`; a forward's `url.scheme`, `server.address`, `server.port`, `messaging.destination.name` — not its URL, which can be a credential |
 | `a2a.send <peer>`, `a2a.delegate <peer>`, `instance.send <handle>`, `forward <stream>` | CLIENT | when answered; a delegation is one span, its card read, send and polls | the step's, the turn's, or the emit's | `rpc.system`, `rpc.method`, `agentd.a2a.peer`, `agentd.instance.handle`, `messaging.destination.name` |
 | `a2a.push` | CLIENT | when delivered | the task's | `http.request.method`, `url.scheme`, `server.address`, `server.port` — not the push URL, which can be a credential |

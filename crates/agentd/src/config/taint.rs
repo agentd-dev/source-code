@@ -701,6 +701,23 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
             feed(&into.stream, &tags, producer.clone(), producer);
         }
     }
+    // A Company's conversation events, appended to `company.<name>`, carry
+    // the entry's tags, as its MCP servers do (RFC 0047 §6.3).
+    for (name, svc) in &ctx.s.services {
+        use crate::config::settings::companies as co;
+        if svc.kind != crate::config::settings::ServiceKind::Company
+            || !co::interfaces_of(svc).contains(&co::Interface::Agent)
+        {
+            continue;
+        }
+        let producer = format!("the conversations of company entry {name:?}");
+        feed(
+            &co::stream_of(name),
+            &co::entry_tags(svc),
+            producer.clone(),
+            producer,
+        );
+    }
     // The runs an outside caller hands its text to directly. Not judged on
     // their own reach (see [`RunTaint::outside`]); seeded so what they emit
     // and start carries it.
@@ -852,6 +869,12 @@ fn named(servers: &[(String, Held)], names: &[String]) -> Vec<Held> {
 
 /// The `exec` tool, which is both legs on its own: it can touch anything
 /// inside its `workdir` and talk to the network.
+/// The `company.*` tools that reach a Company's agent or its APIs.
+fn company_tools() -> impl Iterator<Item = &'static str> {
+    use crate::config::settings::companies as co;
+    co::CONVERSATION_TOOLS.into_iter().chain(co::API_TOOLS)
+}
+
 fn exec_held() -> Held {
     Held {
         label: "the `exec` tool".into(),
@@ -921,6 +944,9 @@ struct Reach<'a> {
     flat: BTreeMap<String, Option<Vec<String>>>,
     /// The `exec` tool is callable: run locally, or mapped off-box.
     exec: bool,
+    /// What the `company.*` tools that reach a Company's agent or its APIs
+    /// hold: the tags of every entry that uses them, when one does.
+    companies: Option<Held>,
     /// Each internal contract's grant, from the registry's own table.
     grants: BTreeMap<&'static str, DefaultGrant>,
     /// The internal contracts that hand text onward, and where
@@ -1079,10 +1105,15 @@ impl<'a> Reach<'a> {
                     .to_string(),
             ));
         }
+        let company_tags = crate::config::settings::companies::interface_tags(s);
         let mut reach = Reach {
             s,
             exec: (cfg!(feature = "exec") && s.security.exec.enabled)
                 || s.tools.overrides.contains_key("exec"),
+            companies: (!company_tags.is_empty()).then(|| Held {
+                label: "the Companies' conversations and APIs (company.*)".to_string(),
+                tags: company_tags,
+            }),
             servers,
             templates,
             flat,
@@ -1182,6 +1213,11 @@ impl<'a> Reach<'a> {
                 out.extend(named(&self.servers, std::slice::from_ref(server)));
             }
         }
+        if let Some(h) = &self.companies
+            && company_tools().any(|t| !self.disabled(t))
+        {
+            out.push(h.clone());
+        }
         out
     }
 
@@ -1201,6 +1237,13 @@ impl<'a> Reach<'a> {
         }
         if tool == "exec" {
             union(&mut tags, &exec_held().tags);
+        }
+        if let Some(h) = self
+            .companies
+            .as_ref()
+            .filter(|_| crate::config::settings::companies::is_interface_tool(tool))
+        {
+            union(&mut tags, &h.tags);
         }
         for (_, server) in self.mapped.iter().filter(|(t, _)| t == tool) {
             for h in named(&self.servers, std::slice::from_ref(server)) {
@@ -1398,6 +1441,11 @@ impl<'a> Reach<'a> {
         }
         if self.exec && self.callable(who, "exec") {
             e.held.push(exec_held());
+        }
+        if let Some(h) = &self.companies
+            && company_tools().any(|t| self.callable(who, t))
+        {
+            e.held.push(h.clone());
         }
         for (tool, server) in &self.mapped {
             if self.callable(who, tool) {

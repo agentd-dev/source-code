@@ -155,7 +155,7 @@ fn browsed(s: &str) -> Option<Browsed> {
 
 /// `s` with its `%XX` escapes decoded; `None` when the bytes are not UTF-8.
 #[cfg(feature = "companies")]
-fn percent_decoded(s: &str) -> Option<String> {
+pub(crate) fn percent_decoded(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -370,9 +370,10 @@ impl Runtime {
 #[cfg(feature = "companies")]
 impl Runtime {
     /// The cross-Company rule (RFC 0047 §6.2): a call to a Company's tool
-    /// `name` from work that holds another Company's content opens the
-    /// User's gate, holding the call, unless the User already approved it.
-    /// `None` when the work holds no other Company's content.
+    /// `name` — one of its MCP servers', or a `company.*` tool reaching its
+    /// agent or its APIs — from work that holds another Company's content
+    /// opens the User's gate, holding the call, unless the User already
+    /// approved it. `None` when the work holds no other Company's content.
     pub(crate) fn company_cross_check(
         &mut self,
         caller: &super::tools::ToolCaller,
@@ -384,10 +385,25 @@ impl Runtime {
             return None;
         }
         let sup = self.companies.clone()?;
-        let company = sup.company_of_server(&self.company_server_of(name)?)?;
-        // A Company's tools are listed only once it is verified.
-        let issuer = company.issuer()?;
-        let from = crate::companies::carry::foreign(&self.caller_carries(caller), &issuer);
+        // A Company's MCP tool, or a tool that reaches its agent or its
+        // APIs, which names the Company it acts at.
+        let company = match self.company_server_of(name) {
+            Some(server) => sup.company_of_server(&server)?,
+            None if crate::config::settings::companies::is_interface_tool(name) => {
+                sup.company(args["company"].as_str()?)?
+            }
+            None => return None,
+        };
+        // A Company's MCP tools are listed only once it is verified; its
+        // `company.*` tools exist before, and a Company not yet verified
+        // could be any of those the work holds content from.
+        let carries = self.caller_carries(caller);
+        let from = match company.issuer() {
+            Some(issuer) => crate::companies::carry::foreign(&carries, &issuer),
+            None => crate::companies::carry::issuers(&carries)
+                .map(str::to_string)
+                .collect(),
+        };
         if from.is_empty() {
             return None;
         }

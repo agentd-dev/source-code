@@ -20,6 +20,8 @@ pub mod breaker;
 pub mod children;
 pub(crate) mod companies; // who reaches a Company's tools, and only through the supervisor (RFC 0047)
 #[cfg(feature = "companies")]
+pub(crate) mod company_calls; // a Company's agent and APIs, its conversation stream (RFC 0047 §5.5.7–§5.5.8)
+#[cfg(feature = "companies")]
 pub(crate) mod company_sign_in; // the User signs in at a Company, at their own gate (RFC 0047 §5.7)
 #[cfg(feature = "a2a")]
 pub mod conversations;
@@ -1203,6 +1205,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     rt.arm_freshness();
     rt.respawn_restored_subagents();
     rt.respawn_restored_instances();
+    // Each open Company conversation's reader, from its saved cursor, its
+    // events handed to the loop for the stream `company.<name>`.
+    #[cfg(feature = "companies")]
+    rt.resume_company_conversations();
     // The A2A transport: the HTTPS listener for conversations,
     // command DataParts, and durable tasks. A bind/TLS/principals failure at
     // startup is fatal — the daemon cannot serve its only external channel.

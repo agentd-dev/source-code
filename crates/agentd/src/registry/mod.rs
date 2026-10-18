@@ -246,6 +246,13 @@ impl Registry {
                 // Subscribing sends arguments to the server, so the tools
                 // carry the tags of every server a grant offers them on.
                 (Impl::BuiltIn, events_tool_tags(settings))
+            } else if crate::config::settings::companies::is_interface_tool(c.name) {
+                // A Company's conversations and APIs carry its tags, as its
+                // MCP servers do (RFC 0047 §6.3).
+                (
+                    Impl::BuiltIn,
+                    crate::config::settings::companies::interface_tags(settings),
+                )
             } else if c.builtin {
                 (Impl::BuiltIn, Vec::new())
             } else {
@@ -264,12 +271,22 @@ impl Registry {
                             .any(|s| s.event_grants.iter().any(|g| g.tools))
                 }
                 // Signing in and out only where a Company lets agentd sign
-                // the User in.
+                // the User in; conversations and API calls only where one
+                // uses those interfaces.
                 "companies" => {
+                    use crate::config::settings::companies::{self as co, Interface};
                     cfg!(feature = "companies")
-                        && crate::config::settings::companies::any_company(settings)
-                        && (!matches!(c.name, "company.sign_in" | "company.sign_out")
-                            || crate::config::settings::companies::signs_in(settings))
+                        && co::any_company(settings)
+                        && match c.name {
+                            "company.sign_in" | "company.sign_out" => co::signs_in(settings),
+                            n if co::is_conversation_tool(n) => {
+                                co::any_uses(settings, Interface::Agent)
+                            }
+                            n if co::is_interface_tool(n) => {
+                                co::any_uses(settings, Interface::Openapi)
+                            }
+                            _ => true,
+                        }
                 }
                 _ => true,
             };

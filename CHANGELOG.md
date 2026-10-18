@@ -40,6 +40,35 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   delay-seconds or an HTTP-date in each of the three forms RFC 9110 has a
   recipient accept; `Response::retry_after`, `StreamingResponse::retry_after`
   and `RETRY_AFTER_MAX`, the five minutes a server's wait is cut to.
+- `agentd-core`: `jsonschema::validate_with` and its `Resolver`, for a
+  schema set published as several files: a `$ref` into another document is
+  resolved by the caller and walked in that document, and every regex
+  `pattern` is held to the caller's check for it — one with no check is a
+  violation, never a silent pass.
+- The Personal Agent Protocol draft, which agentd's Personal Agent support
+  (RFC 0047) is built against, vendored at commit `95fcbf2` under
+  `crates/agentd/tests/companies/vendor/`: the Company kit's 19 JSON Schemas
+  and the specification, Operations extension and guides pages, verbatim,
+  Apache-2.0 with the licence alongside, a `PIN` naming the commit and a
+  drift test CI runs against a checkout of it. Forcing tests fail a re-pin
+  that brings a regex pattern without a hand-written check, a schema the
+  checks do not load, or a keyword the validator would skip.
+- A fake Company to test a Personal Agent against: the hidden
+  `--internal-mock-company` mode of debug and `internal-mocks` builds with
+  `oauth` (and the default `tls`). It serves the discovery document and RFC 8414 metadata, every
+  grant of the token endpoint, device authorization with a scripted User,
+  Direct Sign-In, revocation, an MCP server that takes only Bearer tokens
+  issued for its URL, and an OpenAPI operation that takes DPoP Session
+  Tokens; it verifies both assertions against the agent's fetched key set and
+  every DPoP Proof as the draft lists, validates each document it sends
+  against the vendored schemas, and has twelve `--variant`s that each break
+  one rule.
+- Conformance families `mcp-auth-core` (RFC 8414 and RFC 9728 metadata read
+  first at the path-inserted URLs, a mismatched issuer refused, revocation on
+  `--logout`) and `companies` (22 checks of the fake Company, each quoting
+  the sentence of the draft it tests, verbatim, and each failing when the
+  fake breaks that rule or a variant built to break it goes uncaught). The
+  suite's binary is built with `oauth`.
 
 **Changed.**
 

@@ -1,0 +1,15 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "mediated-sign-in-request.schema.json",
+    "title": "Mediated Sign-In request",
+    "description": "The JSON body a Personal Agent posts to auth.mediated.endpoint. Spec section 4.7 (Mediated Sign-In). credentials has a value for every field in auth.mediated.fields, keyed by name.",
+    "type": "object",
+    "required": ["scope", "credentials"],
+    "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "credentials": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+        }
+    }
+}

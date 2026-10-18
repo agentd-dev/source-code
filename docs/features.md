@@ -32,8 +32,11 @@ Two features are never in a release binary:
 - `exec`, the local command runner. agentd's default posture is that it runs
   no local code; you opt in at build time and again at run time.
 - `internal-mocks`, the test scaffolding: the mock MCP servers and crash
-  points the test suites drive. It includes `mock-models`. Debug builds carry
-  it automatically, so `cargo run` and the test suites need no flag.
+  points the test suites drive, and, with `oauth` (and the default `tls`),
+  the fake Company that `agentd-conformance` holds to the Personal Agent
+  Protocol draft. It includes `mock-models`.
+  Debug builds carry it automatically, so `cargo run` and the test suites
+  need no flag.
 
 ## Features
 
@@ -55,7 +58,7 @@ Two features are never in a release binary:
 | `mcp-events` | no | yes | none | MCP Events: bindings, grants, `wait` subscriptions, the `events.*` tools and instruction updates by event. The extension is a draft (SEP-3415). |
 | `exec` | no | **no** | none | The guarded local `exec` tool, also gated by `security.exec.enabled`. |
 | `mock-models` | no | yes | none | The mock model endpoint: `mock:final` and `mock:file:<playbook.json>`, scripted chat and decision answers. |
-| `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers and crash points. Implies `mock-models`. |
+| `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers, crash points and, with `oauth` (and the default `tls`), the fake Company. Implies `mock-models`. |
 
 Of the seventeen features, fourteen add no crate of their own: they gate code
 written in this repository, or reuse `ring`, which every build already links.

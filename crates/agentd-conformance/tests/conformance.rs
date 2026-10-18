@@ -70,6 +70,16 @@ fn auth_conformance() {
     run_family(Category::Auth);
 }
 
+#[test]
+fn mcp_auth_core_conformance() {
+    run_family(Category::McpAuthCore);
+}
+
+#[test]
+fn companies_conformance() {
+    run_family(Category::Companies);
+}
+
 /// Every family runs as a test above: one missing here would never run under
 /// `cargo test`, and CI would stay green over it.
 #[test]

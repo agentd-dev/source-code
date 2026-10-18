@@ -1,0 +1,23 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "oauth-error.schema.json",
+    "title": "OAuth error response",
+    "description": "An error from the token endpoint, revocation endpoint, or device authorization endpoint, as an OAuth error response (RFC 6749 section 5.2). Spec section 4.2 lists the Poppy codes. extension_required names the extension in extension (3.3). Unknown fields are allowed.",
+    "type": "object",
+    "required": ["error"],
+    "properties": {
+        "error": { "type": "string", "pattern": "^[\\x20\\x21\\x23-\\x5B\\x5D-\\x7E]+$" },
+        "error_description": { "type": "string" },
+        "error_uri": { "type": "string" },
+        "extension": { "type": "string", "minLength": 1 }
+    },
+    "allOf": [
+        {
+            "if": {
+                "properties": { "error": { "const": "extension_required" } },
+                "required": ["error"]
+            },
+            "then": { "required": ["extension"] }
+        }
+    ]
+}

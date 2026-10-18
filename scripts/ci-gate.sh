@@ -105,24 +105,31 @@ fi
 
 if [ "${1:-}" != "quick" ]; then
   # The drift tests compare the vendored schema and conformance fixtures with
-  # the specification, and SKIP where no clone is at hand — reporting `ok`. So
-  # this step pins them: it reads ci.yml's spec revision (never a second copy
+  # the specification, and the vendored Personal Agent Protocol draft with its
+  # repository, and SKIP where no clone is at hand — reporting `ok`. So this
+  # step pins them: it reads ci.yml's revision of each (never a second copy
   # here), extracts exactly that revision from a local clone, and points
-  # INSTRUCTION_SPEC_REPO at it for this step AND the workspace test run. A
-  # local checkout that has moved past the pin then reddens nothing and greens
-  # nothing, and a run that could not reach the pin FAILS — it is never
-  # recorded as NOT RUN, because CI always runs it.
+  # INSTRUCTION_SPEC_REPO and COMPANIES_DRAFT_REPO at them for this step AND
+  # the workspace test run. A local checkout that has moved past the pin then
+  # reddens nothing and greens nothing, and a run that could not reach the pin
+  # FAILS — it is never recorded as NOT RUN, because CI always runs it.
   step "spec drift (pinned)"
   spec_sha=$(sed -n '/repository: instruction-md\/specification/,/path:/s/^ *ref: *\([0-9a-f]\{40\}\) *$/\1/p' \
                .github/workflows/ci.yml | head -n1)
   spec_clone=${INSTRUCTION_SPEC_REPO:-/root/instruction-md/specification}
   spec_tree=$(mktemp -d)
-  trap 'rm -rf "$spec_tree"' EXIT
+  draft_sha=$(sed -n '/repository: personal-agent-protocol\/personal-agent-protocol/,/path:/s/^ *ref: *\([0-9a-f]\{40\}\) *$/\1/p' \
+                .github/workflows/ci.yml | head -n1)
+  draft_clone=${COMPANIES_DRAFT_REPO:-/root/personal-agent-protocol}
+  draft_tree=$(mktemp -d)
+  trap 'rm -rf "$spec_tree" "$draft_tree"' EXIT
+  # The revision the drift tests below are run against, for their verdict.
+  against=
   drift() {
     local out
     out=$(cargo test -p "$1" --all-features --test "$2" -- --exact "$3" --nocapture 2>&1) || true
     if grep -q "drift check skipped" <<<"$out" || ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
-      echo "  FAIL  $3 did not run and pass against $spec_sha"
+      echo "  FAIL  $3 did not run and pass against $against"
       grep -E 'drifted|differs|not vendored|not upstream|skipped|panicked' <<<"$out" | head -n8 | sed 's/^/        /'
       fail=1
     else
@@ -145,8 +152,28 @@ if [ "${1:-}" != "quick" ]; then
   else
     export INSTRUCTION_SPEC_REPO="$spec_tree"
     echo "  spec $spec_sha from $spec_clone"
+    against=$spec_sha
     drift agentd-instruction corpus the_vendored_corpus_matches_upstream_when_present
     drift agentd-cli instruction_spec_corpus the_vendored_schema_matches_upstream_when_present
+  fi
+  if [ -z "$draft_sha" ]; then
+    echo "  FAIL  ci.yml's personal-agent-protocol checkout pins no 40-hex ref"
+    fail=1
+  elif ! git -C "$draft_clone" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "  FAIL  no draft clone at $draft_clone — clone personal-agent-protocol/personal-agent-protocol"
+    echo "        (or set COMPANIES_DRAFT_REPO to one)"
+    fail=1
+  elif ! git -C "$draft_clone" cat-file -e "$draft_sha^{commit}" 2>/dev/null; then
+    echo "  FAIL  $draft_clone lacks the pinned revision $draft_sha — fetch upstream"
+    fail=1
+  elif ! git -C "$draft_clone" archive "$draft_sha" | tar -x -C "$draft_tree"; then
+    echo "  FAIL  could not extract $draft_sha from $draft_clone"
+    fail=1
+  else
+    export COMPANIES_DRAFT_REPO="$draft_tree"
+    echo "  draft $draft_sha from $draft_clone"
+    against=$draft_sha
+    drift agentd-core companies the_vendored_draft_matches_upstream_when_present
   fi
 
   step "test (workspace, all features)"

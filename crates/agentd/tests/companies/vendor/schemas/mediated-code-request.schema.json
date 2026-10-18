@@ -1,0 +1,11 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "mediated-code-request.schema.json",
+    "title": "Mediated Sign-In code request",
+    "description": "The JSON body a Personal Agent posts to {auth.mediated.endpoint}/{sign_in_id} to submit a one-time code. Spec section 4.7 (Mediated Sign-In). It carries only the code, not the credentials again.",
+    "type": "object",
+    "required": ["code"],
+    "properties": {
+        "code": { "type": "string", "minLength": 1 }
+    }
+}

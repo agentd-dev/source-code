@@ -39,6 +39,16 @@ jobs:
           ref: 345f27588f5982cbe530254b82aba4ed90a34292
           path: .spec-upstream
       - run: echo "INSTRUCTION_SPEC_REPO=$GITHUB_WORKSPACE/.spec-upstream" >> "$GITHUB_ENV"
+      # The Personal Agent Protocol draft, at the commit its vendored copy
+      # was taken from (crates/agentd/tests/companies/vendor/PIN), for the
+      # same reason. The ref moves only with a re-pin, in the same commit as
+      # the PIN; a test holds the two equal.
+      - uses: actions/checkout@v4
+        with:
+          repository: personal-agent-protocol/personal-agent-protocol
+          ref: 95fcbf22c5991a0090061aed3dbeb68c0ea575e0
+          path: .companies-draft
+      - run: echo "COMPANIES_DRAFT_REPO=$GITHUB_WORKSPACE/.companies-draft" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # agentd-instruction is published on its own and most consumers build it
@@ -57,8 +67,8 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agentd-instruction --features sign
       - if: ${{ !cancelled() }}
         run: cargo test -p agentd-instruction --no-fail-fast
-      # The two drift checks, by exact name, against the pinned checkout above.
-      # Each skips where no spec clone exists, and a skipped test still reports
+      # The drift checks, by exact name, against the pinned checkouts above.
+      # Each skips where no upstream clone exists, and a skipped test still reports
       # `ok` — so this step fails on the skip marker, and unless exactly the one
       # test passed, rather than trusting the suite's verdict.
       - name: spec drift (pinned)
@@ -74,6 +84,7 @@ jobs:
           }
           drift agentd-instruction corpus the_vendored_corpus_matches_upstream_when_present
           drift agentd-cli instruction_spec_corpus the_vendored_schema_matches_upstream_when_present
+          drift agentd-core companies the_vendored_draft_matches_upstream_when_present
       # The whole workspace under all features: agentd's feature-gated tests
       # (a2a_*_e2e / otel_e2e / …) and the black-box agentd-conformance suite,
       # which builds + drives the real binary, both run here.

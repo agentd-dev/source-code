@@ -1,3 +1,9 @@
+# THIRD-PARTY CONTENT (see NOTICE beside this file): `tests/companies/vendor/**`
+# is the Personal Agent Protocol draft at the commit its PIN names — the Company
+# kit's JSON Schemas and three pages, Apache-2.0, verbatim, with the upstream
+# LICENSE alongside. The package ships it, and NOTICE with it; the fake Company
+# reads the schemas as data in debug and `internal-mocks` builds with `oauth`
+# (and the default `tls`) only.
 [package]
 name = "agentd-core"
 version = "1.20.0"
@@ -93,7 +99,8 @@ config-watch = ["hot-reload"]
 # `--features otel` stays dependency-free (3 deps).
 otel = []
 # Test scaffolding the test + conformance suites drive — mock MCP servers (the
-# hidden `--internal-mock-mcp` re-exec mode), crash points — never a shippable
+# hidden `--internal-mock-mcp` re-exec mode), crash points, and with `oauth`
+# the fake Company (`--internal-mock-company`, RFC 0047) — never a shippable
 # capability, so it's OFF in release and the production binary carries none of
 # it. It includes `mock-models`, which the release ships on its own. Debug builds enable it automatically (the
 # `debug_assertions` cfg on the modules), so `cargo test` and the conformance

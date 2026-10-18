@@ -1,0 +1,35 @@
+# The Personal Agent Protocol draft agentd implements as a Personal Agent
+# (rfcs/0047), vendored verbatim from its repository at one commit. Apache-2.0;
+# see LICENSE beside this file and the NOTICE of the crate.
+#
+# The draft moves without a version signal, so agentd is pinned to a commit,
+# and a re-pin is a deliberate change: copy every file below from a checkout
+# of the new commit, move `commit` here and the checkout's `ref` in
+# .github/workflows/ci.yml together, and fix whatever the forcing tests in
+# crates/agentd/tests/companies.rs then name. A line is `<key> <value…>`;
+# `#` starts a comment.
+
+repository https://github.com/personal-agent-protocol/personal-agent-protocol
+commit 95fcbf22c5991a0090061aed3dbeb68c0ea575e0
+date 2026-10-16
+
+# What is vendored, and from where: `file <vendored> <upstream>`, or
+# `dir <vendored> <upstream>` for every file of a directory, compared both
+# ways. The pages are the site's Markdown renderings of the specification,
+# the Operations extension and the guides, as the repository ships them for
+# reading offline (`pnpm kit` writes them from content/*.mdx, links made
+# absolute) and as https://personalagentprotocol.org/docs/<page>.md serves
+# them.
+file LICENSE LICENSE
+dir schemas kit/company/schemas
+file spec.md skills/implement-personal-agent-protocol/reference/spec.md
+file operations.md skills/implement-personal-agent-protocol/reference/operations.md
+file guides.md skills/implement-personal-agent-protocol/reference/guides.md
+
+# Known conflicts inside this revision; agentd follows the specification.
+#
+# - schemas/session-assertion.schema.json describes `aud` as "the Company's
+#   token_endpoint". Spec 4.1, 4.2 and 8.4 make it the Company's
+#   `auth.issuer` (since 483c3ce), and so do the guides and the kit's
+#   validator. The schema's text does not constrain the value, so
+#   validation is unaffected.

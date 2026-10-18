@@ -51,11 +51,18 @@ pub enum Category {
     /// enforces, the extended card needs a declared credential, and a browser
     /// reaches the agent only from a listed origin.
     Auth,
+    /// Core MCP authorization, agentd as the OAuth client: where it finds an
+    /// authorization server's metadata, the issuer it insists on, and what
+    /// it revokes (RFC 0044's family, opened by RFC 0047 P0).
+    McpAuthCore,
+    /// The Personal Agent Protocol draft agentd is pinned to: the fake
+    /// Company it is tested against, held to the draft's own sentences.
+    Companies,
 }
 
 impl Category {
     /// Every family, in report order: the one list the docs are held to.
-    pub const ALL: [Category; 9] = [
+    pub const ALL: [Category; 11] = [
         Category::Supervisor,
         Category::Security,
         Category::Store,
@@ -65,6 +72,8 @@ impl Category {
         Category::Events,
         Category::Extensions,
         Category::Auth,
+        Category::McpAuthCore,
+        Category::Companies,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,6 +87,8 @@ impl Category {
             Category::Events => "events",
             Category::Extensions => "extensions",
             Category::Auth => "auth",
+            Category::McpAuthCore => "mcp-auth-core",
+            Category::Companies => "companies",
         }
     }
 }
@@ -167,6 +178,8 @@ pub fn family(category: Category) -> Vec<Check> {
         Category::Events => checks::events::checks(),
         Category::Extensions => checks::extensions::checks(),
         Category::Auth => checks::auth::checks(),
+        Category::McpAuthCore => checks::mcp_auth_core::checks(),
+        Category::Companies => checks::companies::checks(),
     }
 }
 

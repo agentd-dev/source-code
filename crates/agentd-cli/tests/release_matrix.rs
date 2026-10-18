@@ -216,9 +216,10 @@ fn gate_job(ci: &str) -> &str {
     job.split("\n  deny:\n").next().unwrap_or(job)
 }
 
-/// The two drift tests: (package, test target, test name). Each compares a
-/// vendored copy of the Instruction Specification with upstream, and each
-/// SKIPS — reporting `ok` — where no spec clone is at hand.
+/// The drift tests: (package, test target, test name). Each compares a
+/// vendored copy — of the Instruction Specification, or of the Personal Agent
+/// Protocol draft — with upstream, and each SKIPS — reporting `ok` — where no
+/// upstream clone is at hand.
 const DRIFT_TESTS: &[(&str, &str, &str)] = &[
     (
         "agentd-instruction",
@@ -229,6 +230,11 @@ const DRIFT_TESTS: &[(&str, &str, &str)] = &[
         "agentd-cli",
         "crates/agentd-cli/tests/instruction_spec_corpus.rs",
         "the_vendored_schema_matches_upstream_when_present",
+    ),
+    (
+        "agentd-core",
+        "crates/agentd/tests/companies.rs",
+        "the_vendored_draft_matches_upstream_when_present",
     ),
 ];
 
@@ -286,7 +292,7 @@ fn every_document_naming_the_vendored_revision_names_the_pin() {
     }
 }
 
-/// Both drift checks RUN, in CI and in the local gate, against the pinned
+/// Every drift check RUNS, in CI and in the local gate, against the pinned
 /// revision: each gate runs them by exact name and fails on the skip marker or
 /// on anything but one passing test, because a skipped drift test still says
 /// `ok`. Neither gate may `--skip` them, and the local gate reads the pin from
@@ -346,13 +352,19 @@ fn the_spec_drift_checks_cannot_be_skipped() {
             && gate.contains(".github/workflows/ci.yml"),
         "scripts/ci-gate.sh must read the spec pin from ci.yml"
     );
-    // And the workspace test run sees the same pinned tree.
-    let export = gate.find("export INSTRUCTION_SPEC_REPO=");
-    let tests = gate.find("cargo test --workspace");
     assert!(
-        matches!((export, tests), (Some(e), Some(t)) if e < t),
-        "scripts/ci-gate.sh must point INSTRUCTION_SPEC_REPO at the pinned tree before the workspace test run"
+        gate.contains("repository: personal-agent-protocol\\/personal-agent-protocol"),
+        "scripts/ci-gate.sh must read the Personal Agent Protocol draft's pin from ci.yml"
     );
+    // And the workspace test run sees the same pinned trees.
+    let tests = gate.find("cargo test --workspace");
+    for var in ["INSTRUCTION_SPEC_REPO", "COMPANIES_DRAFT_REPO"] {
+        let export = gate.find(&format!("export {var}="));
+        assert!(
+            matches!((export, tests), (Some(e), Some(t)) if e < t),
+            "scripts/ci-gate.sh must point {var} at the pinned tree before the workspace test run"
+        );
+    }
 }
 
 /// agentd-instruction is linted and tested in its default build — without

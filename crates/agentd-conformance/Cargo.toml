@@ -30,3 +30,11 @@ path = "src/main.rs"
 serde_json = "1"
 # Only for SIGTERM (graceful daemon drain) + reaping in the harness.
 libc = "0.2"
+# The `companies` family acts as a Personal Agent toward the fake Company: it
+# signs ES256 assertions and DPoP Proofs (`ring`) and speaks HTTPS, as client
+# and as the server of its own client metadata document (`agentd-net`'s TLS
+# connect and acceptor, the transport only). Both are already in the
+# workspace's graph — no new crate — and the protocol itself, every JWT,
+# proof and request, is written here from the draft, not taken from agentd.
+ring = "0.17"
+net = { package = "agentd-net", path = "../net", version = "2.0.0", features = ["tls"] }

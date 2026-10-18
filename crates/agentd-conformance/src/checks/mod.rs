@@ -6,14 +6,20 @@
 //! (the durable-store contract), [`durability`] (the crash/restore contract),
 //! [`tools`] (the internal tool registry), [`a2a_conversation`] (the core A2A
 //! surface), [`events`] (the observation feed), [`extensions`] (activation and
-//! what an extension may add to a reply) and [`auth`] (the card's security
-//! promises held against the listener).
+//! what an extension may add to a reply), [`auth`] (the card's security
+//! promises held against the listener), [`mcp_auth_core`] (agentd as an
+//! OAuth client: metadata discovery, the issuer, revocation) and
+//! [`companies`] (the fake Company, held to the Personal Agent Protocol
+//! draft by the [`probe`] Personal Agent).
 
 pub mod a2a_conversation;
 pub mod auth;
+pub mod companies;
 pub mod durability;
 pub mod events;
 pub mod extensions;
+pub mod mcp_auth_core;
+pub mod probe;
 pub mod security;
 pub mod store;
 pub mod supervisor;

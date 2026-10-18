@@ -1,0 +1,30 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "error.schema.json",
+    "title": "Poppy JSON error",
+    "description": "An error with a JSON body from an endpoint this protocol or an extension defines, such as conversations (spec 7.13) and Mediated Sign-In (4.7), including rate_limited (4.3) and extension_required (3.3). extension_required names the extension in extension, and direct_conversation_open names the open Direct Conversation in conversation_id (7.10). Unknown fields are allowed.",
+    "type": "object",
+    "required": ["error"],
+    "properties": {
+        "error": { "type": "string", "minLength": 1 },
+        "error_description": { "type": "string" },
+        "extension": { "type": "string", "minLength": 1 },
+        "conversation_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,256}$" }
+    },
+    "allOf": [
+        {
+            "if": {
+                "properties": { "error": { "const": "extension_required" } },
+                "required": ["error"]
+            },
+            "then": { "required": ["extension"] }
+        },
+        {
+            "if": {
+                "properties": { "error": { "const": "direct_conversation_open" } },
+                "required": ["error"]
+            },
+            "then": { "required": ["conversation_id"] }
+        }
+    ]
+}

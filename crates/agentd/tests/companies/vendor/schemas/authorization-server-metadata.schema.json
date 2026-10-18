@@ -1,0 +1,35 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "authorization-server-metadata.schema.json",
+    "title": "OAuth Authorization Server Metadata",
+    "description": "The RFC 8414 metadata the Company's auth.issuer publishes, with the fields Poppy requires. Spec section 3.2 (OAuth server). Other fields are allowed, and Personal Agents ignore them. authorization_endpoint is required when poppy.json has auth.direct, and device_authorization_endpoint when it has auth.device; those depend on poppy.json and are checked separately.",
+    "type": "object",
+    "required": [
+        "issuer",
+        "token_endpoint",
+        "revocation_endpoint",
+        "dpop_signing_alg_values_supported",
+        "poppy_domains"
+    ],
+    "properties": {
+        "issuer": { "$ref": "#/$defs/https_url" },
+        "token_endpoint": { "$ref": "#/$defs/https_url" },
+        "revocation_endpoint": { "$ref": "#/$defs/https_url" },
+        "authorization_endpoint": { "$ref": "#/$defs/https_url" },
+        "device_authorization_endpoint": { "$ref": "#/$defs/https_url" },
+        "dpop_signing_alg_values_supported": {
+            "description": "The JWS algorithms the Company accepts for DPoP Proofs (RFC 9449 section 5.1). It must include ES256, which is checked separately.",
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+        },
+        "poppy_domains": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+        }
+    },
+    "$defs": {
+        "https_url": { "type": "string", "pattern": "^https://[^\\s/?#]+" }
+    }
+}

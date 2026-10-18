@@ -56,6 +56,18 @@ fn dispatch() -> i32 {
         return mock_mcp_http(&argv[2..]);
     }
 
+    // Hidden fake Company (tests/conformance): a Company as the Personal
+    // Agent Protocol draft describes one, over HTTPS on loopback, announced
+    // through <addr-file>.
+    #[cfg(all(
+        feature = "oauth",
+        feature = "tls",
+        any(feature = "internal-mocks", debug_assertions)
+    ))]
+    if argv.get(1).map(String::as_str) == Some("--internal-mock-company") {
+        return mock_company(&argv[2..]);
+    }
+
     // Hidden built-in mock LLM (tests):
     // `--internal-mock-llm <addr-file> [final|read|schedule|file:<playbook>]`.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
@@ -139,6 +151,60 @@ fn mock_mcp_http(args: &[String]) -> i32 {
         opts.uri = (*uri).to_string();
     }
     run_with(addr_file, &opts)
+}
+
+/// `--internal-mock-company <addr-file> --cert <pem> --key <pem> [--ca <pem>]
+/// [--variant <name>]… [--listen <addr>]`: the fake Company, serving HTTPS
+/// with the identity in `--cert` and `--key`, trusting `--ca` when it
+/// fetches a Personal Agent's documents, and departing from the draft as
+/// each `--variant` names. Anything else is a usage error.
+#[cfg(all(
+    feature = "oauth",
+    feature = "tls",
+    any(feature = "internal-mocks", debug_assertions)
+))]
+fn mock_company(args: &[String]) -> i32 {
+    use agentd::companies::mock::{Options, Variant, run_with};
+    let usage = |what: &str| {
+        eprintln!("--internal-mock-company: {what}");
+        exit::USAGE
+    };
+    let mut opts = Options::default();
+    let mut addr_file = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value = match arg.as_str() {
+            "--cert" | "--key" | "--ca" | "--variant" | "--listen" => match it.next() {
+                Some(v) => v.clone(),
+                None => return usage(&format!("{arg} needs a value")),
+            },
+            other if addr_file.is_none() && !other.starts_with("--") => {
+                addr_file = Some(other.to_string());
+                continue;
+            }
+            other => return usage(&format!("unknown argument {other:?}")),
+        };
+        match arg.as_str() {
+            "--cert" => opts.cert = value,
+            "--key" => opts.key = value,
+            "--ca" => opts.ca = Some(value),
+            "--listen" => opts.listen = Some(value),
+            _ => match Variant::parse(&value) {
+                Some(v) => opts.variants.push(v),
+                None => {
+                    let names: Vec<&str> = Variant::ALL.iter().map(|v| v.name()).collect();
+                    return usage(&format!("--variant {value:?}: one of {}", names.join(", ")));
+                }
+            },
+        }
+    }
+    let Some(addr_file) = addr_file else {
+        return usage("an <addr-file> is required");
+    };
+    if opts.cert.is_empty() || opts.key.is_empty() {
+        return usage("--cert and --key are required: the fake Company serves HTTPS only");
+    }
+    run_with(&addr_file, &opts)
 }
 
 /// A loaded daemon invocation: the configuration, what was asked of it, and

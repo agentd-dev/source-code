@@ -1,0 +1,35 @@
+agentd-core — third-party material included in this crate
+=========================================================
+
+This crate's own source is AGPL-3.0-only (see the repository's LICENSE). One
+set of files in it comes from elsewhere and carries its own terms. It is named
+here because this notice ships inside the published package: attribution has
+to travel with the copy.
+
+The Personal Agent Protocol (https://personalagentprotocol.org), whose
+repository is https://github.com/personal-agent-protocol/personal-agent-protocol.
+
+`tests/companies/vendor/**`
+   The draft agentd's Personal Agent support is built against, copied
+   verbatim at commit 95fcbf22c5991a0090061aed3dbeb68c0ea575e0 (2026-10-16),
+   which `tests/companies/vendor/PIN` names with the upstream path of every
+   file: the 19 JSON Schemas of the draft's Company kit (`schemas/`, from
+   `kit/company/schemas/`), and the Markdown renderings of the specification,
+   the Operations extension and the guides (`spec.md`, `operations.md`,
+   `guides.md`). The files are unmodified.
+   Licence: **Apache-2.0** — the specification and its documentation,
+   examples included, are published under it. The full text is at
+   `tests/companies/vendor/LICENSE`, copied alongside the files as that
+   licence requires.
+   The licence does not cover the names "Personal Agent Protocol" and
+   "Poppy", the logo, or the design of the protocol's site. The vendored files
+   keep the names as upstream wrote them, which is a copy, not a use of them:
+   agentd's own surface uses neutral names (`companies`, `company`), and the
+   protocol's wire constants, which contain its name, live in one module
+   (`src/companies/wire.rs`).
+
+The schemas are read as data by the fake Company the tests run against
+(`src/companies/mock/kit.rs` embeds them): test scaffolding compiled only into
+debug builds and builds with `internal-mocks`, and only with `oauth` (and the
+default `tls`). No release binary carries them. The pages are test input: the
+conformance suite holds the draft sentences its checks quote to them.

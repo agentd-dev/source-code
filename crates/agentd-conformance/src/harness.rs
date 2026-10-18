@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A self-cleaning scratch directory (no `tempfile` dependency — the suite keeps
-/// to just `serde_json` + `libc`).
+/// A self-cleaning scratch directory (no `tempfile` dependency — the suite
+/// keeps to crates the workspace already builds).
 pub struct TempDir {
     path: PathBuf,
 }
@@ -47,13 +47,15 @@ fn binary() -> &'static PathBuf {
         // MCP the suite drives) exists, whether we were invoked via `cargo test`
         // (which builds it) or `cargo run` (which may not). `internal-mocks` is
         // implicit in a debug build but we ask for it explicitly so a
-        // `--release` conformance run still ships the mocks.
+        // `--release` conformance run still ships the mocks. `oauth` is the
+        // interactive login the `mcp-auth-core` checks drive, and what the
+        // fake Company needs to verify ES256.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "a2a,cron,internal-mocks",
+            "a2a,cron,internal-mocks,oauth",
         ]);
         let agentd = target_dir().join("agentd");
         assert!(
@@ -120,7 +122,35 @@ impl Harness {
         if !emit {
             args.push(Path::new("--no-emit"));
         }
-        ConfServer::spawn_http(&self.agentd, &args, addr_file)
+        ConfServer::spawn_http(&self.agentd, &args, addr_file, "http")
+    }
+
+    /// Launch the built-in fake Company (`--internal-mock-company`): HTTPS on
+    /// loopback with the test PKI's server identity ([`tls_fixture`]),
+    /// trusting the test CA for the documents it fetches, and departing from
+    /// the draft as each of `variants` names. Blocks until announced; the
+    /// guard kills it on drop. Its endpoint is `https://127.0.0.1:<port>`.
+    pub fn spawn_company(&self, addr_file: &Path, variants: &[&str]) -> ConfServer {
+        let (cert, key, ca) = (
+            tls_fixture("server.pem"),
+            tls_fixture("server.key"),
+            tls_fixture("ca.pem"),
+        );
+        let mut args: Vec<&Path> = vec![
+            Path::new("--internal-mock-company"),
+            addr_file,
+            Path::new("--cert"),
+            &cert,
+            Path::new("--key"),
+            &key,
+            Path::new("--ca"),
+            &ca,
+        ];
+        for v in variants {
+            args.push(Path::new("--variant"));
+            args.push(Path::new(v));
+        }
+        ConfServer::spawn_http(&self.agentd, &args, addr_file, "https")
     }
 
     pub fn tempdir(&self) -> TempDir {
@@ -208,7 +238,7 @@ pub struct ConfServer {
 }
 
 impl ConfServer {
-    fn spawn_http(bin: &Path, args: &[&Path], addr_file: &Path) -> ConfServer {
+    fn spawn_http(bin: &Path, args: &[&Path], addr_file: &Path, scheme: &str) -> ConfServer {
         let _ = std::fs::remove_file(addr_file);
         let child = Self::launch(bin, args, addr_file);
         let addr = std::fs::read_to_string(addr_file)
@@ -216,7 +246,7 @@ impl ConfServer {
         ConfServer {
             child,
             path: addr_file.to_path_buf(),
-            endpoint: format!("http://{}", addr.trim()),
+            endpoint: format!("{scheme}://{}", addr.trim()),
         }
     }
 
@@ -314,6 +344,15 @@ impl RunResult {
     pub fn saw_event(&self, name: &str) -> bool {
         self.events().iter().any(|e| e["event"] == name)
     }
+}
+
+/// A file of the workspace's test PKI (`crates/net/tests/fixtures`): a CA and
+/// a server identity for `localhost`, `127.0.0.1` and `::1`, committed test
+/// data that protects nothing.
+pub fn tls_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../net/tests/fixtures")
+        .join(name)
 }
 
 /// Block until `path` exists (a socket has bound), or panic past `timeout`.

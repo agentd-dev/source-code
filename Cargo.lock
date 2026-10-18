@@ -76,7 +76,9 @@ dependencies = [
 name = "agentd-conformance"
 version = "1.7.0"
 dependencies = [
+ "agentd-net",
  "libc",
+ "ring",
  "serde_json",
 ]
 

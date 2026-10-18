@@ -36,8 +36,28 @@ where someone happens to have a checkout does not hold.
    checkout exists; `the_vendored_corpus_matches_upstream_when_present` checks
    every file against the published fixtures in both directions.
 
+The Personal Agent Protocol (https://personalagentprotocol.org,
+https://github.com/personal-agent-protocol/personal-agent-protocol). agentd's
+Personal Agent support is built against one revision of the draft, so that
+revision is vendored rather than referenced — the draft moves without a
+version signal.
+
+3. `crates/agentd/tests/companies/vendor/**`
+   The draft at commit 95fcbf22c5991a0090061aed3dbeb68c0ea575e0, verbatim, as
+   its `PIN` file maps it: the 19 JSON Schemas of the Company kit, and the
+   Markdown renderings of the specification, the Operations extension and the
+   guides. Licence: **Apache-2.0** — see
+   `crates/agentd/tests/companies/vendor/LICENSE`, copied alongside, and
+   `crates/agentd/NOTICE`. The licence does not cover the names "Personal
+   Agent Protocol" and "Poppy", the logo or the site's design; the vendored
+   files keep the names as written, and agentd's own surface does not use
+   them. `the_vendored_draft_matches_upstream_when_present` checks every file
+   against the pinned commit.
+
 Both licences are compatible with distributing this repository under the AGPL:
 CC BY 4.0 and Apache-2.0 permit redistribution with attribution, which this
-notice and the copied LICENSE files provide. Neither vendored artifact is
-compiled into the agentd binary as code — the schema is read as data, and the
-corpus is test input.
+notice and the copied LICENSE files provide. No vendored artifact is compiled
+into a release binary as code — the instruction schema is read as data, the
+corpus and the draft's pages are test input, and the draft's schemas are read
+as data by the fake Company, test scaffolding that only debug builds and
+`internal-mocks` builds with `oauth` (and the default `tls`) carry.

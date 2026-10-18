@@ -13,6 +13,12 @@
 //! `examples`/`$schema`/`$id`/`$comment` (accepted, not enforced — `pattern`
 //! is checked only for the same literal shapes as `patternProperties`).
 //!
+//! [`validate_with`] takes a [`Resolver`] for what this subset leaves out:
+//! a `$ref` to another document (`message.schema.json`), and a matcher for
+//! each regex `pattern`. A schema set published as several files, with
+//! patterns in it, is validated that way; the caller supplies the files and
+//! a hand-written check per pattern.
+//!
 //! Errors are collected (not fail-fast) and name the JSON pointer of the
 //! offending value, so a model or an author sees every miss at once.
 
@@ -21,10 +27,80 @@ use serde_json::{Map, Value};
 /// Validate `value` against `schema`. `Ok(())` or every violation, each as
 /// `"<pointer>: <message>"` (`<pointer>` is `/a/0/b`, or `/` for the root).
 pub fn validate(schema: &Value, value: &Value) -> Result<(), Vec<String>> {
+    run(
+        Cx {
+            root: schema,
+            resolver: None,
+        },
+        value,
+    )
+}
+
+/// What [`validate_with`] adds to [`validate`]: the documents a `$ref` may
+/// name besides the schema itself, and a matcher for each regex `pattern`,
+/// which this validator has no engine to run.
+pub trait Resolver {
+    /// The schema document an external `$ref` names — `message.schema.json`
+    /// in `{"$ref": "message.schema.json"}` or
+    /// `{"$ref": "message.schema.json#/$defs/id"}` — if the caller has it.
+    fn document(&self, uri: &str) -> Option<&Value>;
+
+    /// Whether `s` matches the regex `pattern`; `None` when the caller has no
+    /// check for that pattern.
+    fn pattern(&self, pattern: &str, s: &str) -> Option<bool>;
+}
+
+/// [`validate`], with `resolver` for references to other documents and for
+/// regex patterns. A reference into another document is walked in that
+/// document, so its own `#/…` references resolve against it. Every regex
+/// `pattern` is held to the resolver's check, and one it has no check for
+/// is a violation: a caller who supplies a resolver says it enforces the
+/// patterns, and a pattern skipped silently would pass anything.
+pub fn validate_with(
+    schema: &Value,
+    value: &Value,
+    resolver: &dyn Resolver,
+) -> Result<(), Vec<String>> {
+    run(
+        Cx {
+            root: schema,
+            resolver: Some(resolver),
+        },
+        value,
+    )
+}
+
+fn run(cx: Cx<'_>, value: &Value) -> Result<(), Vec<String>> {
     let mut errs = Vec::new();
     let mut depth = 0u32;
-    walk(schema, schema, value, "", &mut errs, &mut depth);
+    walk(cx, cx.root, value, "", &mut errs, &mut depth);
     if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+/// Where a walk is: the document its local `#…` references are read from,
+/// and the caller's [`Resolver`], if any.
+#[derive(Clone, Copy)]
+struct Cx<'a> {
+    root: &'a Value,
+    resolver: Option<&'a dyn Resolver>,
+}
+
+impl<'a> Cx<'a> {
+    /// The schema `r` names, and where to walk it: a local reference stays
+    /// in this document, and one into another document moves there.
+    fn resolve(self, r: &str) -> Option<(Cx<'a>, &'a Value)> {
+        let doc = r.split('#').next().unwrap_or_default();
+        let cx = if doc.is_empty() {
+            self
+        } else {
+            Cx {
+                root: self.resolver?.document(doc)?,
+                ..self
+            }
+        };
+        let local = &r[doc.len()..];
+        resolve_ref(cx.root, if local.is_empty() { "#" } else { local }).map(|t| (cx, t))
+    }
 }
 
 /// One-line rendering of a validation failure (for tool errors / logs).
@@ -48,7 +124,7 @@ fn ptr(path: &str) -> &str {
 }
 
 fn walk(
-    root: &Value,
+    cx: Cx<'_>,
     schema: &Value,
     value: &Value,
     path: &str,
@@ -60,12 +136,12 @@ fn walk(
         return;
     }
     *depth += 1;
-    walk_inner(root, schema, value, path, errs, depth);
+    walk_inner(cx, schema, value, path, errs, depth);
     *depth -= 1;
 }
 
 fn walk_inner(
-    root: &Value,
+    cx: Cx<'_>,
     schema: &Value,
     value: &Value,
     path: &str,
@@ -89,8 +165,8 @@ fn walk_inner(
     };
     // $ref (draft 2020-12: siblings apply too).
     if let Some(Value::String(r)) = s.get("$ref") {
-        match resolve_ref(root, r) {
-            Some(target) => walk(root, target, value, path, errs, depth),
+        match cx.resolve(r) {
+            Some((at, target)) => walk(at, target, value, path, errs, depth),
             None => errs.push(format!("{}: unresolvable $ref {r:?}", ptr(path))),
         }
     }
@@ -135,16 +211,16 @@ fn walk_inner(
     }
     // Per-type keywords.
     match value {
-        Value::Object(obj) => object_keywords(root, s, obj, path, errs, depth),
-        Value::Array(arr) => array_keywords(root, s, arr, path, errs, depth),
-        Value::String(st) => string_keywords(s, st, path, errs),
+        Value::Object(obj) => object_keywords(cx, s, obj, path, errs, depth),
+        Value::Array(arr) => array_keywords(cx, s, arr, path, errs, depth),
+        Value::String(st) => string_keywords(cx, s, st, path, errs),
         Value::Number(n) => number_keywords(s, n, path, errs),
         _ => {}
     }
     // Combinators.
     if let Some(Value::Array(all)) = s.get("allOf") {
         for sub in all {
-            walk(root, sub, value, path, errs, depth);
+            walk(cx, sub, value, path, errs, depth);
         }
     }
     if let Some(Value::Array(any)) = s.get("anyOf") {
@@ -152,7 +228,7 @@ fn walk_inner(
         let mut matched = false;
         for sub in any {
             let mut e = Vec::new();
-            walk(root, sub, value, path, &mut e, depth);
+            walk(cx, sub, value, path, &mut e, depth);
             if e.is_empty() {
                 matched = true;
                 break;
@@ -174,7 +250,7 @@ fn walk_inner(
         let mut best: Option<Vec<String>> = None;
         for sub in one {
             let mut e = Vec::new();
-            walk(root, sub, value, path, &mut e, depth);
+            walk(cx, sub, value, path, &mut e, depth);
             if e.is_empty() {
                 n += 1;
             } else if best.as_ref().is_none_or(|b| e.len() < b.len()) {
@@ -195,27 +271,27 @@ fn walk_inner(
     }
     if let Some(not) = s.get("not") {
         let mut e = Vec::new();
-        walk(root, not, value, path, &mut e, depth);
+        walk(cx, not, value, path, &mut e, depth);
         if e.is_empty() {
             errs.push(format!("{}: must not match the `not` schema", ptr(path)));
         }
     }
     if let Some(cond) = s.get("if") {
         let mut e = Vec::new();
-        walk(root, cond, value, path, &mut e, depth);
+        walk(cx, cond, value, path, &mut e, depth);
         let branch = if e.is_empty() {
             s.get("then")
         } else {
             s.get("else")
         };
         if let Some(b) = branch {
-            walk(root, b, value, path, errs, depth);
+            walk(cx, b, value, path, errs, depth);
         }
     }
 }
 
 fn object_keywords(
-    root: &Value,
+    cx: Cx<'_>,
     s: &Map<String, Value>,
     obj: &Map<String, Value>,
     path: &str,
@@ -239,13 +315,13 @@ fn object_keywords(
         let mut covered = false;
         if let Some(sub) = props.and_then(|p| p.get(k)) {
             covered = true;
-            walk(root, sub, v, &child, errs, depth);
+            walk(cx, sub, v, &child, errs, depth);
         }
         if let Some(pp) = pattern_props {
             for (pat, sub) in pp {
                 if literal_pattern_matches(pat, k) {
                     covered = true;
-                    walk(root, sub, v, &child, errs, depth);
+                    walk(cx, sub, v, &child, errs, depth);
                 }
             }
         }
@@ -254,7 +330,7 @@ fn object_keywords(
                 Some(Value::Bool(false)) => {
                     errs.push(format!("{}: unknown property {k:?}", ptr(path)))
                 }
-                Some(sub @ Value::Object(_)) => walk(root, sub, v, &child, errs, depth),
+                Some(sub @ Value::Object(_)) => walk(cx, sub, v, &child, errs, depth),
                 _ => {}
             }
         }
@@ -285,7 +361,7 @@ fn object_keywords(
 }
 
 fn array_keywords(
-    root: &Value,
+    cx: Cx<'_>,
     s: &Map<String, Value>,
     arr: &[Value],
     path: &str,
@@ -297,7 +373,7 @@ fn array_keywords(
     for (i, v) in arr.iter().enumerate() {
         let child = format!("{path}/{i}");
         if let Some(p) = prefix.and_then(|p| p.get(i)) {
-            walk(root, p, v, &child, errs, depth);
+            walk(cx, p, v, &child, errs, depth);
             continue;
         }
         match items {
@@ -305,7 +381,7 @@ fn array_keywords(
                 errs.push(format!("{}: no additional items allowed", ptr(&child)));
             }
             Some(sub @ (Value::Object(_) | Value::Bool(_))) => {
-                walk(root, sub, v, &child, errs, depth)
+                walk(cx, sub, v, &child, errs, depth)
             }
             _ => {}
         }
@@ -334,7 +410,7 @@ fn array_keywords(
     if let Some(c) = s.get("contains") {
         let any = arr.iter().any(|v| {
             let mut e = Vec::new();
-            walk(root, c, v, path, &mut e, depth);
+            walk(cx, c, v, path, &mut e, depth);
             e.is_empty()
         });
         if !any {
@@ -343,7 +419,13 @@ fn array_keywords(
     }
 }
 
-fn string_keywords(s: &Map<String, Value>, st: &str, path: &str, errs: &mut Vec<String>) {
+fn string_keywords(
+    cx: Cx<'_>,
+    s: &Map<String, Value>,
+    st: &str,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
     let len = st.chars().count() as u64;
     if let Some(n) = s.get("minLength").and_then(Value::as_u64)
         && len < n
@@ -355,11 +437,20 @@ fn string_keywords(s: &Map<String, Value>, st: &str, path: &str, errs: &mut Vec<
     {
         errs.push(format!("{}: at most {n} characters allowed", ptr(path)));
     }
-    if let Some(Value::String(p)) = s.get("pattern")
-        && is_literal_pattern(p)
-        && !literal_pattern_matches(p, st)
-    {
-        errs.push(format!("{}: does not match pattern {p:?}", ptr(path)));
+    if let Some(Value::String(p)) = s.get("pattern") {
+        let matched = if is_literal_pattern(p) {
+            Some(literal_pattern_matches(p, st))
+        } else {
+            match cx.resolver {
+                Some(r) => r.pattern(p, st),
+                None => Some(true),
+            }
+        };
+        match matched {
+            Some(true) => {}
+            Some(false) => errs.push(format!("{}: does not match pattern {p:?}", ptr(path))),
+            None => errs.push(format!("{}: no check for pattern {p:?}", ptr(path))),
+        }
     }
 }
 
@@ -799,5 +890,71 @@ mod tests {
         );
         assert!(joined.contains("/$ref: only local references"), "{joined}");
         assert!(check_schema(&json!(true)).is_ok());
+    }
+
+    /// Two documents and one hand-written pattern check, as a schema set
+    /// published in several files is validated.
+    struct Two {
+        message: Value,
+    }
+
+    impl Resolver for Two {
+        fn document(&self, uri: &str) -> Option<&Value> {
+            (uri == "message.schema.json").then_some(&self.message)
+        }
+        fn pattern(&self, pattern: &str, s: &str) -> Option<bool> {
+            (pattern == "^[a-z]+$")
+                .then(|| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase()))
+        }
+    }
+
+    /// A reference into another document is walked there, so that
+    /// document's own `#/$defs/…` resolves against it rather than against
+    /// the schema that referred to it; a regex pattern is held to the
+    /// resolver's check, and one it has no check for is a violation.
+    #[test]
+    fn references_to_other_documents_and_patterns_go_through_the_resolver() {
+        let two = Two {
+            message: json!({
+                "type": "object",
+                "required": ["id"],
+                "properties": {"id": {"$ref": "#/$defs/id"}},
+                "$defs": {"id": {"type": "string", "pattern": "^[a-z]+$"}}
+            }),
+        };
+        let event = json!({
+            "type": "object",
+            "properties": {
+                "message": {"$ref": "message.schema.json"},
+                "id": {"$ref": "message.schema.json#/$defs/id"},
+                "other": {"type": "string", "pattern": "^[0-9]+$"}
+            },
+            "$defs": {"id": {"type": "integer"}}
+        });
+        assert!(validate_with(&event, &json!({"message": {"id": "abc"}, "id": "x"}), &two).is_ok());
+        let e = validate_with(&event, &json!({"message": {"id": "ABC"}}), &two).unwrap_err();
+        assert_eq!(e, ["/message/id: does not match pattern \"^[a-z]+$\""]);
+        let e = validate_with(&event, &json!({"message": {}, "id": "A"}), &two).unwrap_err();
+        assert!(
+            e.iter()
+                .any(|m| m == "/message: missing required property \"id\""),
+            "{e:?}"
+        );
+        assert!(
+            e.iter().any(|m| m.starts_with("/id: does not match")),
+            "{e:?}"
+        );
+        let e = validate_with(&event, &json!({"other": "12"}), &two).unwrap_err();
+        assert_eq!(e, ["/other: no check for pattern \"^[0-9]+$\""]);
+        // Without a resolver the other document is not there, and a regex
+        // pattern is not enforced.
+        let e = validate(&event, &json!({"message": {"id": "abc"}})).unwrap_err();
+        assert!(
+            e[0].contains("unresolvable $ref \"message.schema.json\""),
+            "{e:?}"
+        );
+        assert!(validate(&event, &json!({"other": "x"})).is_ok());
+        let e = validate_with(&json!({"$ref": "nope.schema.json"}), &json!(1), &two).unwrap_err();
+        assert!(e[0].contains("unresolvable $ref"), "{e:?}");
     }
 }

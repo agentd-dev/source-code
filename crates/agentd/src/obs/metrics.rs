@@ -483,6 +483,93 @@ pub fn set_mcp_event_lag(server: &str, event: &str, ms: u64) {
     let _ = (server, event, ms);
 }
 
+/// One call agentd made to a Company (RFC 0047 §7,
+/// `agent_company_requests_total{company,interface,outcome}`): `interface` ∈
+/// `mcp`; `outcome` ∈ `ok`\|`error` (the Company's own answer, a tool's
+/// `isError` or a refusal it sent)\|`unsent` (refused before it was sent)\|
+/// `unknown` (it may have run: no answer, or a `5xx`, after it was sent). An
+/// unknown value buckets `other`. `company` is a company entry's name.
+pub fn record_company_request(company: &str, interface: &str, outcome: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_company_requests_total",
+        vec![
+            company.into(),
+            interface.into(),
+            imp::closed_label(outcome, &["ok", "error", "unsent", "unknown"]).into(),
+        ],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, interface, outcome);
+}
+
+/// One request agentd sent a Company's token endpoint
+/// (`agent_company_token_requests_total{company,grant,outcome}`): `grant` ∈
+/// `start`\|`renew`\|`bearer`; `outcome` ∈ `ok`\|`refused` (an OAuth
+/// error)\|`failed` (no usable answer).
+pub fn record_company_token_request(company: &str, grant: &str, outcome: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_company_token_requests_total",
+        vec![
+            company.into(),
+            imp::closed_label(grant, &["start", "renew", "bearer"]).into(),
+            imp::closed_label(outcome, &["ok", "refused", "failed"]).into(),
+        ],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, grant, outcome);
+}
+
+/// Whether agentd's Session at a Company is signed in
+/// (`agent_company_signed_in{company}`, 0 or 1).
+pub fn set_company_signed_in(company: &str, signed_in: bool) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_set(
+        "agent_company_signed_in",
+        vec![company.into()],
+        u64::from(signed_in),
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, signed_in);
+}
+
+/// The instant before which nothing is sent to a Company, in seconds since
+/// the Unix epoch (`agent_company_rate_limited_until_seconds{company}`); a
+/// past instant holds nothing back.
+pub fn set_company_rate_limited_until(company: &str, unix_s: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_set(
+        "agent_company_rate_limited_until_seconds",
+        vec![company.into()],
+        unix_s,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, unix_s);
+}
+
+/// One User gate a Company call opened, and how it ended
+/// (`agent_company_gates_total{company,kind,answer}`): `kind` ∈
+/// `cross_company`; `answer` ∈ `approve`\|`deny`\|`unanswered` (it timed
+/// out or was cancelled)\|`unreachable` (nobody could be asked, so the call
+/// was refused).
+pub fn record_company_gate(company: &str, kind: &str, answer: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_company_gates_total",
+        vec![
+            company.into(),
+            imp::closed_label(kind, &["cross_company"]).into(),
+            imp::closed_label(answer, &["approve", "deny", "unanswered", "unreachable"]).into(),
+        ],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (company, kind, answer);
+}
+
 /// The active MCP Events subscriptions, by delivery mode — the `kind="event"`
 /// series of `agent_subscriptions_active{kind,mode}`, replaced whole.
 pub fn set_event_subscriptions(by_mode: Vec<(String, u64)>) {
@@ -642,6 +729,16 @@ mod imp {
         "unauthenticated",
     ];
 
+    /// `value` when it is one of `domain`, else `other`: a label from a
+    /// closed set stays closed whatever a caller passes.
+    pub(super) fn closed_label<'a>(value: &'a str, domain: &[&str]) -> &'a str {
+        if domain.contains(&value) {
+            value
+        } else {
+            "other"
+        }
+    }
+
     /// An MCP Events outcome as its label: itself when in the domain, else
     /// `other`.
     pub(super) fn event_outcome(outcome: &str) -> &str {
@@ -780,7 +877,8 @@ mod imp {
     type EventFamilies =
         std::collections::BTreeMap<&'static str, std::collections::BTreeMap<Vec<String>, u64>>;
 
-    /// The MCP Events families: name, type, help, label names.
+    /// The labeled families — MCP Events' and the Companies' — name, type,
+    /// help, label names.
     const EVENT_FAMILIES: &[(&str, &str, &str, &[&str])] = &[
         (
             "agent_mcp_events_total",
@@ -811,6 +909,38 @@ mod imp {
             "gauge",
             "Append time minus the occurrence's server-reported timestamp (ms).",
             &["server", "event"],
+        ),
+        // --- Companies (RFC 0047 §7): `company` is a company entry's name,
+        // and no label carries a User ID, a session or a conversation.
+        (
+            "agent_company_requests_total",
+            "counter",
+            "Calls agentd made to a Company, by interface and outcome.",
+            &["company", "interface", "outcome"],
+        ),
+        (
+            "agent_company_token_requests_total",
+            "counter",
+            "Requests agentd sent a Company's token endpoint, by grant and outcome.",
+            &["company", "grant", "outcome"],
+        ),
+        (
+            "agent_company_signed_in",
+            "gauge",
+            "Whether agentd's Session at the Company is signed in (0 or 1).",
+            &["company"],
+        ),
+        (
+            "agent_company_rate_limited_until_seconds",
+            "gauge",
+            "The instant before which nothing is sent to the Company (Unix seconds).",
+            &["company"],
+        ),
+        (
+            "agent_company_gates_total",
+            "counter",
+            "User gates a Company call opened, by kind and answer.",
+            &["company", "kind", "answer"],
         ),
     ];
 
@@ -1532,7 +1662,7 @@ mod imp {
                     let _ = writeln!(s, "{name}{{stream=\"other\",consumer=\"other\"}} {other}");
                 }
             }
-            // --- MCP Events (RFC 0045 §5.12) ----------------------------------
+            // --- MCP Events (RFC 0045 §5.12) and Companies (RFC 0047 §7) --------
             for (name, kind, help, labels) in EVENT_FAMILIES {
                 let _ = writeln!(s, "# HELP {name} {help}");
                 let _ = writeln!(s, "# TYPE {name} {kind}");

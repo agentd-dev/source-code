@@ -1137,6 +1137,21 @@ impl RmcpClient {
         meta: Option<serde_json::Map<String, Value>>,
         bound: Option<Duration>,
     ) -> Result<Value, McpError> {
+        self.call_tool_reaching(name, args, meta, bound)
+            .map_err(|(e, _)| e)
+    }
+
+    /// [`Self::call_tool`], a failure saying how far the call got
+    /// ([`crate::client::Reach`]): what the transport wrote on an error it
+    /// made up for an exchange it ended, and the HTTP status of the server's
+    /// own error answer.
+    pub fn call_tool_reaching(
+        &self,
+        name: &str,
+        args: Option<Value>,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Option<Duration>,
+    ) -> Result<Value, (McpError, crate::client::Reach)> {
         let arguments = match args {
             Some(Value::Object(m)) => m,
             _ => serde_json::Map::new(),
@@ -1151,16 +1166,43 @@ impl RmcpClient {
                 // The timer is built inside the runtime: it needs its clock.
                 .block_on(async { tokio::time::timeout(bound, call).await })
                 .map_err(|_| {
-                    rpc_err(
-                        &self.name,
-                        &op,
-                        format!("timed out after {} ms", bound.as_millis()),
+                    (
+                        rpc_err(
+                            &self.name,
+                            &op,
+                            format!("timed out after {} ms", bound.as_millis()),
+                        ),
+                        crate::client::Reach::Unanswered,
                     )
                 })?,
             None => self.rt.block_on(call),
         }
-        .map_err(|e| self.fail(&op, e))?;
-        serde_json::to_value(&res).map_err(|e| rpc_err(&self.name, "tools/call", e))
+        .map_err(|e| self.call_failed(&op, e))?;
+        serde_json::to_value(&res).map_err(|e| {
+            (
+                rpc_err(&self.name, "tools/call", e),
+                crate::client::Reach::Unreadable,
+            )
+        })
+    }
+
+    /// [`Self::fail`] for a `tools/call`, with how far it got: the
+    /// transport's word on an exchange it ended, otherwise a JSON-RPC error
+    /// is the server's answer, and any other failure of the SDK's — a
+    /// closed transport, a timeout — one that may have been sent.
+    fn call_failed(&self, op: &str, e: rmcp::ServiceError) -> (McpError, crate::client::Reach) {
+        use crate::client::Reach;
+        let (e, reach) = match e {
+            rmcp::ServiceError::McpError(mut d) => {
+                let reach = crate::rmcp_transport::unmark(&mut d.data)
+                    .unwrap_or(Reach::Answered { status: 200 });
+                (rmcp::ServiceError::McpError(d), reach)
+            }
+            e @ (rmcp::ServiceError::UnexpectedResponse
+            | rmcp::ServiceError::InputRequiredRoundsExceeded { .. }) => (e, Reach::Unreadable),
+            e => (e, Reach::Unanswered),
+        };
+        (self.fail(op, e), reach)
     }
 
     /// `resources/list`, following the cursor to the end. With `meta`, each

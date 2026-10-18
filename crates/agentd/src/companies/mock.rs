@@ -59,7 +59,15 @@
 //! `"extension_required": "<name>"` has the MCP servers refuse every request
 //! from then on with `403 extension_required`; `"extra_mcp": true` lists a
 //! second MCP API, at `/mcp/orders`, from then on; `"end_sessions": true`
-//! ends every Session, so its next renewal is `invalid_session`.
+//! ends every Session, so its next renewal is `invalid_session`;
+//! `"stall": {"method": m, "times": n, "ms": t}` holds the next `n` MCP
+//! requests of method `m` `t` ms before answering them (a Personal Agent
+//! whose timeout is shorter sees no answer to a request that arrived);
+//! `"fail": {"method": m, "times": n, "status": s}` answers the next `n` of
+//! them with the bare status `s` after they arrived — or, with `"error": e`
+//! or `"result": r`, with `s` and a JSON-RPC answer carrying that member;
+//! `"date_skew_s": n` sets every reply's `Date` `n` seconds from the fake's
+//! clock.
 //!
 //! **Its documents cannot drift from the kit.** Every JSON body it sends is
 //! validated against its vendored schema first ([`kit`], patterns and
@@ -75,11 +83,17 @@
 //! had been issued for its Session, which the Personal Agent was to use
 //! instead, §4.3); for a token request the claims of each assertion and
 //! proof it carried (`client_assertion`, `assertion`, `proof`, the proof's
-//! key thumbprint as `jkt`), never their signatures; for a `tools/call`,
-//! the keys of its `_meta` (`meta`); and `validated`, the
-//! vendored schemas what the request carried held to — and the same objects
-//! are read back at `GET /_mock/record`: the server side's own account of
-//! what reached it, which a test counts instead of trusting the client.
+//! key thumbprint as `jkt`), never their signatures; for every MCP request,
+//! the keys of its `_meta` (`meta`), the trace id its `traceparent` names
+//! (`trace_id`), the `clientInfo.title` it carries (`client_title`), the
+//! `Mcp-Session-Id` it carries (`mcp_session`), and for a `tools/call` its
+//! `agent/idempotency_key` (`idempotency_key`); for any
+//! request, whether it carried an AAuth signature (`aauth`), a
+//! `traceparent` header (`trace_header`) or a `User-Agent` (`user_agent`);
+//! and `validated`, the vendored schemas what the request carried held to —
+//! and the same objects are read back at `GET /_mock/record`: the server
+//! side's own account of what reached it, which a test counts instead of
+//! trusting the client.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -700,6 +714,18 @@ struct Limit {
     until: Option<Instant>,
 }
 
+/// What the next MCP requests of one method meet (`stall`, `fail`).
+struct Hold {
+    method: String,
+    times: u32,
+    /// Hold it this long before answering.
+    ms: u64,
+    /// Answer it with this status instead: bare, or with a JSON-RPC body
+    /// whose `error` or `result` is `body`'s.
+    status: Option<u16>,
+    body: Option<Value>,
+}
+
 struct State {
     client_jtis: BTreeMap<String, u64>,
     assertion_jtis: BTreeMap<String, u64>,
@@ -722,6 +748,10 @@ struct State {
     refuse_grants: u32,
     /// The extension the MCP servers refuse every request without.
     extension_required: Option<String>,
+    /// MCP requests to hold or fail, in the order the control set them.
+    holds: Vec<Hold>,
+    /// How far every reply's `Date` is from the fake's clock.
+    date_skew_s: i64,
 }
 
 /// The fake Company.
@@ -766,6 +796,8 @@ impl Company {
                 refuse_tokens: 0,
                 refuse_grants: 0,
                 extension_required: None,
+                holds: Vec::new(),
+                date_skew_s: 0,
             }),
             extra_mcp: AtomicBool::new(false),
         }
@@ -807,7 +839,15 @@ impl Company {
 
     fn handle(&self, req: &Request) -> Reply {
         SEEN.with(|s| s.borrow_mut().clear());
-        let reply = self.route(req);
+        let skew = lock(&self.state).date_skew_s;
+        let reply = self.route(req).with(
+            "Date",
+            &imf_date(
+                i64::try_from(now())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(skew),
+            ),
+        );
         let mut record = json!({
             "method": req.method,
             "path": req.path,
@@ -818,6 +858,21 @@ impl Company {
         }
         for (k, v) in &reply.note {
             record[k] = v.clone();
+        }
+        // What a request says about its sender beside its credential.
+        if req.headers.iter().any(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "signature" | "signature-input" | "signature-key"
+            ) || k.starts_with("aauth")
+        }) {
+            record["aauth"] = json!(true);
+        }
+        if req.header("traceparent").is_some() {
+            record["trace_header"] = json!(true);
+        }
+        if let Some(ua) = req.header("user-agent") {
+            record["user_agent"] = json!(ua);
         }
         let mut st = lock(&self.state);
         // A Session Token comes only in `Authorization`, at the API or MCP.
@@ -2168,11 +2223,54 @@ impl Company {
             )
         };
         let old = self.has(Variant::Mcp20250618);
-        // What a call says about its caller beside its arguments.
-        let meta: Vec<String> = frame["params"]["_meta"]
+        // What a request says about its caller beside its arguments: the
+        // keys of its `_meta`, the trace it names, the title its client
+        // gives itself (in `initialize`'s `clientInfo`, or, at 2026-07-28,
+        // on every request).
+        let m = &frame["params"]["_meta"];
+        let meta: Vec<String> = m
             .as_object()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
+        let trace_id = m["traceparent"]
+            .as_str()
+            .and_then(|t| t.split('-').nth(1))
+            .map(str::to_string);
+        let title = frame["params"]["clientInfo"]["title"]
+            .as_str()
+            .or_else(|| m["io.modelcontextprotocol/clientInfo"]["title"].as_str())
+            .map(str::to_string);
+        let mcp_session = req.header("mcp-session-id").map(str::to_string);
+        let held = st
+            .holds
+            .iter_mut()
+            .find(|h| h.method == method && h.times > 0)
+            .map(|h| {
+                h.times -= 1;
+                (h.ms, h.status, h.body.clone())
+            });
+        let stalled = held.as_ref().is_some_and(|(_, status, _)| status.is_none());
+        if let Some((ms, status, body)) = held {
+            drop(st);
+            std::thread::sleep(Duration::from_millis(ms));
+            if let Some(code) = status {
+                let reply = match body {
+                    Some(mut b) => {
+                        b["jsonrpc"] = json!("2.0");
+                        b["id"] = id.clone();
+                        Reply::json(code, &b)
+                    }
+                    None => Reply::new(code),
+                };
+                return reply
+                    .note("mcp", json!(method))
+                    .note("meta", json!(meta))
+                    .note("trace_id", json!(trace_id))
+                    .note("mcp_session", json!(mcp_session))
+                    .note("failed", json!(code));
+            }
+            st = lock(&self.state);
+        }
         let reply = match method.as_str() {
             "server/discover" if !old => ok(json!({
                 "resultType": "complete",
@@ -2216,6 +2314,7 @@ impl Company {
                         .note("meta", json!(meta));
                 }
                 let args = &frame["params"]["arguments"];
+                let key = m["agent/idempotency_key"].clone();
                 let answer = match frame["params"]["name"].as_str() {
                     // The tool's own answer, not a refusal: a Personal Agent
                     // hands it on as the Company wrote it.
@@ -2251,11 +2350,21 @@ impl Company {
                     })),
                     _ => rpc_err(-32602, "unknown tool"),
                 };
-                answer.note("meta", json!(meta))
+                answer.note("idempotency_key", key)
             }
             _ => rpc_err(-32601, "method not found"),
         };
-        reply.note("mcp", json!(method))
+        let reply = reply
+            .note("mcp", json!(method))
+            .note("meta", json!(meta))
+            .note("trace_id", json!(trace_id))
+            .note("client_title", json!(title))
+            .note("mcp_session", json!(mcp_session));
+        if stalled {
+            reply.note("stalled", json!(true))
+        } else {
+            reply
+        }
     }
 
     // --- Steering the fake ---------------------------------------------
@@ -2300,8 +2409,61 @@ impl Company {
         if body["end_sessions"] == true {
             st.sessions.clear();
         }
+        for (key, fails) in [("stall", false), ("fail", true)] {
+            let h = &body[key];
+            let Some(method) = h["method"].as_str() else {
+                continue;
+            };
+            let status = match h["status"].as_u64().and_then(|s| u16::try_from(s).ok()) {
+                Some(s) => Some(s),
+                None if fails => return Reply::new(400),
+                None => None,
+            };
+            let body = ["error", "result"]
+                .into_iter()
+                .find_map(|k| h.get(k).map(|v| json!({k: v})));
+            st.holds.push(Hold {
+                method: method.to_string(),
+                times: h["times"]
+                    .as_u64()
+                    .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+                ms: h["ms"].as_u64().unwrap_or(0),
+                status,
+                body,
+            });
+        }
+        if let Some(n) = body["date_skew_s"].as_i64() {
+            st.date_skew_s = n;
+        }
         Reply::json(200, &json!({"ok": true}))
     }
+}
+
+/// `unix_s` as an IMF-fixdate (RFC 9110 §5.6.7), the form a `Date` takes.
+fn imf_date(unix_s: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (days, secs) = (unix_s.div_euclid(86_400), unix_s.rem_euclid(86_400));
+    // Days to a civil date (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        DAYS[days.rem_euclid(7) as usize],
+        MONTHS[(month - 1) as usize],
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
 }
 
 /// The OAuth error a refused proof is (§4.2's table).
@@ -2340,6 +2502,16 @@ fn user_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every reply's `Date` is an IMF-fixdate, which agentd reads back as
+    /// the same instant.
+    #[test]
+    fn a_reply_is_dated_in_the_form_http_takes() {
+        assert_eq!(imf_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(imf_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        let at = 1_792_368_000 + 3_723;
+        assert_eq!(crate::net::http::http_date(&imf_date(at), at), Some(at));
+    }
 
     fn fake(variants: &[Variant]) -> Company {
         Company::new(8443, variants.to_vec(), None)

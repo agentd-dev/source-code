@@ -121,6 +121,8 @@ const SEND = {
   [OPS.authDeviceDeny]: (c, e) => c.authDeviceDeny(e.all ? { all: true } : { userCode: e.user_code }),
   [OPS.authSessions]: (c) => c.authSessions(),
   [OPS.authSessionsRevoke]: (c, e) => c.authSessionsRevoke(e.sid ? { sid: e.sid } : e.name ? { name: e.name } : { all: true }),
+  [OPS.companyStatus]: (c) => c.companyStatus(),
+  [OPS.companyUserIdReset]: (c, e) => c.companyUserIdReset(e.company),
 };
 
 /**
@@ -163,6 +165,8 @@ const MORE = [
   { op: OPS.authSessionsRevoke, sid: 's-1' },
   { op: OPS.authSessionsRevoke, name: 'alice.laptop' },
   { op: OPS.authSessionsRevoke, all: true },
+  { op: OPS.companyStatus },
+  { op: OPS.companyUserIdReset, company: 'shop' },
 ];
 
 /** Replace fetch for one test: record each JSON-RPC body, answer `reply(body)` with the echo `echo`. */

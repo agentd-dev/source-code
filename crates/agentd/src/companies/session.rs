@@ -175,6 +175,7 @@ impl Session {
             json!({"company": company, "session_id": got.session_id}),
         );
         st.signed_in = got.signed_in;
+        crate::obs::metrics::set_company_signed_in(company, got.signed_in);
         st.session = Some(Held::of(&got));
         st.record = Some(rec);
         Ok(())
@@ -229,6 +230,28 @@ impl Session {
             }
         }
         Err(format!("company {company}: no Session took a Bearer token"))
+    }
+
+    /// Whether the Session is signed in, once it has been opened.
+    pub fn signed_in(&self) -> Option<bool> {
+        let st = self.lock();
+        st.session.as_ref().map(|_| st.signed_in)
+    }
+
+    /// The (User, Company) pair's own secret, from its record — read from
+    /// the store, or minted, the first time. The privacy profile derives
+    /// what a Company is sent in place of agentd's correlators from it
+    /// (`super::privacy`).
+    pub fn secret(&self, users: &UserIds, principal: &str) -> Result<String, String> {
+        let mut st = self.lock();
+        if st.record.is_none() {
+            st.record = Some(users.load_or_mint(principal, &self.issuer)?);
+        }
+        Ok(st
+            .record
+            .as_ref()
+            .map(|r| r.secret.clone())
+            .unwrap_or_default())
     }
 
     /// The server at `url` refused `token`: it is not used again, so the

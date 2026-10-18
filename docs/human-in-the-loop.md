@@ -342,6 +342,32 @@ security:
 
 [Harden a deployment](harden.md) covers policies in full.
 
+## Company gates
+
+An instance that acts at Companies for a person (the `companies` feature,
+[RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)) opens gates of
+its own, addressed to the configured User, `security.companies.user`. The
+first is the cross-Company gate: work that has read one Company's answer —
+or its error, or a message from work that had — and calls another Company's
+tool waits for the User before the call is sent.
+
+- **The addressee is the User, and only code writes it.** No workflow,
+  document or tool argument can address a gate this way. With `user:
+  operator` every operator principal is the User; otherwise the one
+  principal id is.
+- **Nobody else answers.** An operator who is not the User is refused like
+  anyone else, with no override, because the answer is presented to the
+  Company as the User's. `approve` sends the held call; `deny` refuses it.
+- **No judge.** `agent.approval` and `agent.ask_human_fallback` change
+  nothing: a Company gate is never answered by a model.
+- **Unanswered is refused.** A Company gate nobody can be asked — no
+  listener, or unowned work without `agent.ask_human_unowned: gate` — or one
+  that times out (24 hours) refuses its call. Each ends with a
+  `company.cross_company.asked` line and audit record naming the answer.
+- **The text is agentd's.** Each Company is named by its own name, quoted
+  and capped, beside the domain agentd verified; the call's arguments are
+  shown as one line of JSON.
+
 ## Answer from a client
 
 In the [terminal or web UI](interface.md), an open question shows in the

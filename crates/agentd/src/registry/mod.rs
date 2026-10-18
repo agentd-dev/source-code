@@ -252,14 +252,23 @@ impl Registry {
                 (Impl::MappingOnly, Vec::new())
             };
             // The events tools exist only where a grant offers them, in a
-            // build that has MCP Events.
-            let offered = c.family != "events"
-                || (cfg!(feature = "mcp-events")
-                    && settings
-                        .mcp
-                        .servers
-                        .iter()
-                        .any(|s| s.event_grants.iter().any(|g| g.tools)));
+            // build that has MCP Events; the company tools only where a
+            // Company is declared, in a build that can act at one.
+            let offered = match c.family {
+                "events" => {
+                    cfg!(feature = "mcp-events")
+                        && settings
+                            .mcp
+                            .servers
+                            .iter()
+                            .any(|s| s.event_grants.iter().any(|g| g.tools))
+                }
+                "companies" => {
+                    cfg!(feature = "companies")
+                        && crate::config::settings::companies::any_company(settings)
+                }
+                _ => true,
+            };
             reg.tools.insert(
                 c.name.to_string(),
                 ToolSpec {

@@ -8,17 +8,22 @@
 //! one ([`discover`]), presents the one client identity every Company sees
 //! ([`identity`]), keeps the User's pseudonymous ID there ([`user_id`]),
 //! holds a signed-out Session with DPoP-bound tokens ([`session`],
-//! [`token`], [`dpop`]) over requests held to the host rule and the SSRF
-//! guard ([`http`]), and connects to the Company's MCP servers with a
-//! Bearer token for each ([`mcp`]). No turn worker, subagent or instance
-//! child is handed a Company server to dial, a key or a token: their calls
-//! come back to the supervisor (§5.6).
+//! [`token`], [`dpop`]) over requests held to the host rule, the SSRF guard
+//! and the Company's not-before instant ([`http`]), and connects to the
+//! Company's MCP servers with a Bearer token for each ([`mcp`]). No turn
+//! worker, subagent or instance child is handed a Company server to dial, a
+//! key or a token: their calls come back to the supervisor (§5.6). What a
+//! Company is sent carries none of agentd's correlators under the strict
+//! privacy profile ([`privacy`]), and which Companies' content each context
+//! holds decides when a call must ask the User first ([`carry`]).
 //!
 //! Built with the `companies` feature. [`wire`] (every constant the
 //! protocol puts on the wire) and [`mock`] (the fake Company the Personal
 //! Agent is tested against) are also compiled where the mock MCP servers
 //! are — debug builds, or `internal-mocks` — with `oauth` and `tls`.
 
+#[cfg(feature = "companies")]
+pub mod carry;
 #[cfg(feature = "companies")]
 pub mod discover;
 #[cfg(feature = "companies")]
@@ -35,6 +40,8 @@ pub mod mcp;
     any(debug_assertions, feature = "internal-mocks")
 ))]
 pub mod mock;
+#[cfg(feature = "companies")]
+pub mod privacy;
 #[cfg(feature = "companies")]
 pub mod session;
 #[cfg(feature = "companies")]
@@ -92,6 +99,7 @@ mod supervisor {
     use serde_json::json;
 
     use super::discover::{Discovery, Entry, Note, Verified};
+    use super::http::Pace;
     use super::identity::Identity;
     use super::session::{Env, Session};
     use super::user_id::{self, UserIds};
@@ -126,6 +134,11 @@ mod supervisor {
         /// Whether the call goes under the strict privacy profile.
         pub fn strict(&self) -> bool {
             self.0.privacy == Privacy::Strict
+        }
+
+        /// The issuer the Company was last verified with.
+        pub fn issuer(&self) -> Option<String> {
+            self.0.issuer()
         }
     }
 
@@ -168,6 +181,48 @@ mod supervisor {
         pub fn limit(&self) -> u32 {
             self.limit
         }
+
+        /// Calls in flight at the Company now.
+        pub fn in_flight(&self) -> u32 {
+            self.in_flight.load(Ordering::SeqCst)
+        }
+
+        /// The Company's not-before instant.
+        pub fn pace(&self) -> &Pace {
+            &self.discovery.entry.pace
+        }
+
+        /// The issuer the Company was last verified with — read without
+        /// fetching anything.
+        pub fn issuer(&self) -> Option<String> {
+            self.discovery.last().map(|v| v.issuer.clone())
+        }
+
+        /// The Company as a gate names it: its own name quoted, beside the
+        /// domain agentd verified (the entry's endpoint host before that).
+        pub fn named(&self) -> String {
+            match self.discovery.last() {
+                Some(v) => super::carry::named(&v.name, &v.domain),
+                None => {
+                    let host = cfg::host_of(&self.discovery.entry.endpoint).unwrap_or_default();
+                    super::carry::named(&host, &host)
+                }
+            }
+        }
+
+        /// The host globs every URL of the Company is held to: those it was
+        /// last verified with, else the entry's own, else the endpoint's host
+        /// and its subdomains.
+        pub fn hosts(&self) -> Vec<String> {
+            if let Some(v) = self.discovery.last() {
+                return v.hosts.clone();
+            }
+            let e = &self.discovery.entry;
+            e.hosts.clone().unwrap_or_else(|| {
+                let home = cfg::host_of(&e.endpoint).unwrap_or_default();
+                vec![home.clone(), format!("*.{home}")]
+            })
+        }
     }
 
     /// What the checks before the first Session came to.
@@ -192,6 +247,10 @@ mod supervisor {
         sessions: Mutex<BTreeMap<String, Arc<Session>>>,
         /// Whether the seal key and the published identity have checked out.
         ready: Mutex<Ready>,
+        /// The Companies that started over with a seal key that opens none
+        /// of the store's records ([`UserIds::start_over_at`]), checked out
+        /// while the others wait for their own reset.
+        started_over: Mutex<BTreeSet<String>>,
         timeout: Duration,
         log: Logger,
     }
@@ -238,11 +297,15 @@ mod supervisor {
                 if privacy == Privacy::Standard {
                     log.warn("company.privacy.standard", json!({"company": name}));
                 }
+                let entry = Entry {
+                    pace: Arc::new(Pace::new(name, Some(log.clone()))),
+                    ..Entry::from_settings(name, svc, timeout)
+                };
                 companies.insert(
                     name.clone(),
                     Arc::new(Company {
                         name: name.clone(),
-                        discovery: Discovery::new(Entry::from_settings(name, svc, timeout)),
+                        discovery: Discovery::new(entry),
                         privacy,
                         unusable: Mutex::default(),
                         resources: Mutex::default(),
@@ -269,6 +332,7 @@ mod supervisor {
                 servers,
                 sessions: Mutex::default(),
                 ready: Mutex::new(Ready::Unchecked),
+                started_over: Mutex::default(),
                 timeout,
                 log: log.clone(),
             })))
@@ -287,6 +351,192 @@ mod supervisor {
             self.companies.get(name).cloned()
         }
 
+        /// Every declared Company, by entry name.
+        pub fn companies(&self) -> impl Iterator<Item = &Arc<Company>> {
+            self.companies.values()
+        }
+
+        /// How a gate names the Company whose issuer is `issuer`: as
+        /// [`Company::named`] when one was last verified with it, else the
+        /// issuer itself, quoted.
+        pub fn named_by_issuer(&self, issuer: &str) -> String {
+            self.companies
+                .values()
+                .find(|c| c.issuer().as_deref() == Some(issuer))
+                .map_or_else(|| super::quoted(issuer, 128), |c| c.named())
+        }
+
+        /// The (User, Company) pair's own secret, which the privacy profile
+        /// derives from: from the Session's record, read or minted the first
+        /// time. May fetch the Company's documents once they expire, so it is
+        /// called off the loop.
+        pub fn secret(&self, company: &Company) -> Result<String, String> {
+            let verified = self.verify(company)?;
+            self.session(&verified.issuer)?
+                .secret(&self.users, &self.principal)
+        }
+
+        /// The `_meta` a call carries under the strict privacy profile (RFC
+        /// 0047 §5.10), and the span it names: the call's idempotency key
+        /// `key` keyed under the (User, Company) pair's secret, and — when
+        /// the call is made for a unit of work — a span of the trace the
+        /// unit has at this Company. Nothing else of agentd's. A secret that
+        /// cannot be read fails the call, unsent.
+        pub fn private_meta(
+            &self,
+            slot: &Slot,
+            key: &str,
+            unit: Option<&crate::obs::trace::TraceContext>,
+        ) -> Result<(serde_json::Value, Option<crate::obs::trace::TraceContext>), String> {
+            let secret = self
+                .secret(&slot.0)
+                .map_err(|e| format!("{e}; the call was not sent"))?;
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "agent/idempotency_key".into(),
+                json!(super::privacy::idempotency_key(&secret, key)),
+            );
+            let span = unit.map(|u| super::privacy::reroot(&secret, u));
+            if let Some(s) = &span {
+                meta.extend(s.meta());
+            }
+            Ok((serde_json::Value::Object(meta), span))
+        }
+
+        /// Whether the Session at `company` is signed in, once one is open.
+        pub fn signed_in(&self, company: &Company) -> Option<bool> {
+            let issuer = company.issuer()?;
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.get(&issuer).and_then(|s| s.signed_in())
+        }
+
+        /// Why `company` is unavailable, when the checks before the first
+        /// Session failed — every Company's, unless it started over.
+        pub fn not_ready(&self, company: &Company) -> Option<String> {
+            match &*self.ready.lock().unwrap_or_else(|e| e.into_inner()) {
+                Ready::Failed(_) if self.has_started_over(company) => None,
+                Ready::Failed(e) => Some(e.clone()),
+                _ => None,
+            }
+        }
+
+        fn has_started_over(&self, company: &Company) -> bool {
+            self.started_over
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&company.name)
+        }
+
+        /// `company.status` for one Company, as the supervisor knows it now —
+        /// nothing is fetched. `joined` names the Company's MCP servers the
+        /// runtime has connected. `detail` adds why a failed Company failed,
+        /// in agentd's words with the values its documents gave: the
+        /// operator's view, not the model's.
+        pub fn status_of(
+            &self,
+            company: &Company,
+            joined: &BTreeSet<String>,
+            detail: bool,
+        ) -> serde_json::Value {
+            let last = company.discovery.last();
+            let failed = company.discovery.failed();
+            let (state, error) = if let Some(why) = company.discovery.suspended() {
+                ("suspended", Some(why))
+            } else if let Some(why) = self.not_ready(company) {
+                ("unavailable", Some(why))
+            } else if last.is_some() {
+                ("verified", None)
+            } else if let Some((_, line)) = &failed {
+                ("unavailable", Some(line.clone()))
+            } else {
+                ("unverified", None)
+            };
+            let servers: Vec<serde_json::Value> = self
+                .servers
+                .iter()
+                .filter(|(_, entry)| **entry == company.name)
+                .map(|(server, _)| {
+                    let unusable = last
+                        .as_ref()
+                        .and_then(|v| v.mcp.get(server))
+                        .is_some_and(|url| company.is_unusable(url));
+                    json!({"server": server, "joined": joined.contains(server), "unusable": unusable})
+                })
+                .collect();
+            let mut doc = json!({
+                "company": company.name,
+                "state": state,
+                "reason": failed.filter(|_| last.is_none()).map(|(r, _)| r),
+                "domain": last.as_ref().map(|v| v.domain.clone()),
+                "issuer": last.as_ref().map(|v| v.issuer.clone()),
+                "privacy": match company.privacy {
+                    Privacy::Strict => "strict",
+                    Privacy::Standard => "standard",
+                },
+                "signed_in": self.signed_in(company),
+                "rate_limited_until": company
+                    .pace()
+                    .until()
+                    .map(crate::obs::log::rfc3339_millis),
+                "in_flight": company.in_flight(),
+                "limit": company.limit(),
+                "servers": servers,
+            });
+            if detail {
+                doc["error"] = json!(error);
+            }
+            doc
+        }
+
+        /// `company.user_id.reset`: forget the User ID agentd keeps for the
+        /// User at `company`, with its secret and its `session_id`, and drop
+        /// the Session held there — the Company sees a new User from the
+        /// next call on, and loses whatever it kept for the old one. The
+        /// issuer is the one the Company was last verified with; nothing is
+        /// fetched.
+        ///
+        /// With a seal key that opens none of the store's records, every
+        /// Company is unavailable and none is verified: the reset starts
+        /// this one over with the key, as a new User, and the others stay
+        /// unavailable until each is reset too (RFC 0047 §5.5.3). Once every
+        /// Company has started over, the store takes the key.
+        pub fn reset_user(&self, company: &Company) -> Result<serde_json::Value, String> {
+            if self.users.check_seal().is_err() && !self.has_started_over(company) {
+                self.users.start_over_at(&company.name)?;
+                let all: Vec<&str> = self.companies.keys().map(String::as_str).collect();
+                if all.iter().all(|e| self.users.started_over(e)) {
+                    self.users.start_over(&all)?;
+                    *self.ready.lock().unwrap_or_else(|e| e.into_inner()) = Ready::Unchecked;
+                    self.started_over
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                }
+                return Ok(self.said_reset(company, true));
+            }
+            let issuer = company.issuer().ok_or_else(|| {
+                format!(
+                    "company {} has not been verified since agentd started, so the issuer its User ID is kept under is not known",
+                    company.name
+                )
+            })?;
+            self.users.forget(&self.principal, &issuer)?;
+            self.sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&issuer);
+            Ok(self.said_reset(company, false))
+        }
+
+        fn said_reset(&self, company: &Company, started_over: bool) -> serde_json::Value {
+            crate::obs::metrics::set_company_signed_in(&company.name, false);
+            self.log.info(
+                "company.user_id.reset",
+                json!({"company": company.name, "started_over": started_over}),
+            );
+            json!({"company": company.name, "reset": true, "started_over": started_over})
+        }
+
         /// The Company the MCP server `server` belongs to.
         pub fn company_of_server(&self, server: &str) -> Option<Arc<Company>> {
             self.servers.get(server).and_then(|c| self.company(c))
@@ -297,23 +547,36 @@ mod supervisor {
         /// identity the Company could not fetch as configured, makes every
         /// Company unavailable, saying why. A success is kept; a failure is
         /// checked again at the next use.
-        fn ready(&self) -> Result<(), String> {
+        ///
+        /// A Company that started over with a seal key the store's records
+        /// do not open ([`Self::reset_user`]) passes on its own; the others
+        /// stay unavailable.
+        fn ready(&self, company: &Company) -> Result<(), String> {
             let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(*ready, Ready::Passed) {
+            if matches!(*ready, Ready::Passed) || self.has_started_over(company) {
                 return Ok(());
             }
-            let outcome = self
-                .users
-                .check_seal()
-                .map_err(|e| ("company.seal_key.mismatch", e))
-                .and_then(|()| {
-                    self.identity
-                        .self_check(self.timeout.min(Duration::from_secs(10)))
-                        .map_err(|e| ("company.identity.unpublished", e))
-                });
+            let outcome = match self.users.check_seal() {
+                Ok(()) => Ok(true),
+                Err(_) if self.users.started_over(&company.name) => Ok(false),
+                Err(e) => Err(("company.seal_key.mismatch", e)),
+            }
+            .and_then(|all| {
+                self.identity
+                    .self_check(self.timeout.min(Duration::from_secs(10)))
+                    .map(|()| all)
+                    .map_err(|e| ("company.identity.unpublished", e))
+            });
             match outcome {
-                Ok(()) => {
+                Ok(true) => {
                     *ready = Ready::Passed;
+                    Ok(())
+                }
+                Ok(false) => {
+                    self.started_over
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(company.name.clone());
                     Ok(())
                 }
                 Err((event, e)) => {
@@ -345,7 +608,7 @@ mod supervisor {
         /// [`Self::verified`], unreported: for the caller to report as part
         /// of its own attempt.
         fn verify(&self, company: &Company) -> Result<Arc<Verified>, String> {
-            self.ready().and_then(|()| {
+            self.ready(company).and_then(|()| {
                 let (out, notes) = company.discovery.current();
                 for n in notes {
                     self.say(&company.name, n);

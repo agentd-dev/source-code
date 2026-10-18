@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::http::{Dialer, Refused};
+use super::http::{Dialer, Pace, Refused};
 use super::wire;
 use crate::config::settings::companies::{host_of, is_https_url};
 
@@ -61,6 +61,8 @@ pub struct Entry {
     pub timeout: Duration,
     /// The entry's MCP servers, by name, with the `url` `mcp_names` gives.
     pub servers: Vec<(String, Option<String>)>,
+    /// The Company's not-before instant, shared by every dial to it.
+    pub pace: Arc<Pace>,
 }
 
 impl Entry {
@@ -76,6 +78,7 @@ impl Entry {
             allow_private: svc.allow_private.unwrap_or(false),
             timeout: svc.timeout.map(|d| d.0).unwrap_or(timeout),
             servers: crate::config::settings::companies::server_names(name, svc),
+            pace: Arc::new(Pace::new(name, None)),
         }
     }
 }
@@ -111,6 +114,7 @@ impl Verified {
             hosts: self.hosts.clone(),
             allow_private: entry.allow_private,
             timeout: entry.timeout,
+            pace: Arc::clone(&entry.pace),
         }
     }
 
@@ -216,6 +220,7 @@ fn verify(entry: &Entry) -> Verification {
         hosts: first_hosts,
         allow_private: entry.allow_private,
         timeout: entry.timeout,
+        pace: Arc::clone(&entry.pace),
     };
     let doc = fetch
         .document(&format!("{}{}", entry.endpoint, wire::DISCOVERY_PATH))
@@ -266,6 +271,7 @@ fn verify(entry: &Entry) -> Verification {
         hosts: hosts.clone(),
         allow_private: entry.allow_private,
         timeout: entry.timeout,
+        pace: Arc::clone(&entry.pace),
     };
     let off_host = |field: &str, url: &str| {
         let host = host_of(url).unwrap_or_else(|| url.to_string());
@@ -521,6 +527,9 @@ struct State {
     /// The MCP APIs a refetch last listed, when they differ from the ones
     /// verified first: said once per change.
     apis_said: Option<Vec<String>>,
+    /// Why the last attempt failed, until one succeeds: its reason and
+    /// line.
+    failed: Option<(String, String)>,
 }
 
 /// What a refetch changed that is said, for the caller to log.
@@ -548,6 +557,37 @@ impl Discovery {
             entry,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// The documents as last verified, without fetching anything: what a
+    /// caller that must not wait on the network reads — the issuer a call's
+    /// content came from, the hosts a URL is held to. `None` before the
+    /// first verification and while the Company is suspended.
+    pub fn last(&self) -> Option<Arc<Verified>> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.suspended.is_some() {
+            return None;
+        }
+        st.verified.clone()
+    }
+
+    /// Why the last verification failed — its reason and line — until one
+    /// succeeds.
+    pub fn failed(&self) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failed
+            .clone()
+    }
+
+    /// Why the Company is unusable until a restart, when it is.
+    pub fn suspended(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .suspended
+            .clone()
     }
 
     /// The verified documents, fetched again when they have expired, and
@@ -640,6 +680,10 @@ impl Discovery {
                 }
             },
         };
+        st.failed = out
+            .as_ref()
+            .err()
+            .map(|r| (r.reason.to_string(), r.detail.clone()));
         let said = match &out {
             Ok(v) => format!("verified {}", v.line()),
             Err(r) => format!("refused {} {}", r.reason, r.detail),
@@ -670,6 +714,7 @@ mod tests {
                 .iter()
                 .map(|(s, u)| (s.to_string(), u.map(str::to_string)))
                 .collect(),
+            pace: Arc::default(),
         }
     }
 

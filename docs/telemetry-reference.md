@@ -249,6 +249,11 @@ token, an assertion, a proof or a User ID; `session_id` appears only at
 | `company.session.ended` | info | `company`, `reason` | The Company ended the Session (`invalid_session`); a new one is started. |
 | `company.session.id` | debug | `company`, `session_id` | The Session's id. |
 | `company.privacy.standard` | warn | `company` | The entry sets `privacy: standard`. Written at boot. |
+| `company.rate_limited` | info | `company`, `status`, `until` | The Company answered `429` or `503` with `Retry-After`: nothing is sent to it, by any task or interface, before `until` (RFC 3339; a wait over 5 minutes is cut to 5). Written when the instant moves later. |
+| `company.clock_skew` | warn | `company`, `skew_s` | A response's `Date` is more than 30 s from agentd's clock (`skew_s` is the Company's minus agentd's). Proofs and assertions live about a minute, so the Company may refuse them. Written once per Company. |
+| `company.cross_company.asked` | info | `answer`, `by`, `from`, `to`, `tool` | A call to the Company `to` from work holding the content of the Companies whose issuers are `from` asked the User, and ended with `answer`: `approve`, `deny`, `unanswered` (timed out or cancelled) or `unreachable` (nobody could be asked; the call was refused). `by` is who answered. Also an audit record, `company.gate`. |
+| `company.browser.refused` | warn | `company`, `host`, `server` | A call on a declared browser (`security.companies.browsers`) named the Company's host `host` as a browser reads it, or a host that is not ASCII (`company` null): refused unsent. |
+| `company.user_id.reset` | info | `company`, `started_over` | The operator reset the User ID the Company knows the User by (`company.user_id.reset`): the Company sees a new User from the next call on. `started_over`: the seal key opened none of the store's records, and this Company started over with it as a new User — the others stay unavailable until each is reset, and the store takes the key once all are. Its MCP connections join again on new sessions (`mcp.disconnect` `user_id_reset`). Also an audit record. |
 
 `auth.unavailable` and `auth.recovered` carry `target: company:<name>`:
 `auth.unavailable` while a Company cannot be verified or its Session cannot
@@ -449,7 +454,7 @@ Company that verifies while its token endpoint refuses has not recovered.
 |---|---|---|---|
 | `mcp.connect` | info | `server`, `tools`, `protocol`, `reason?` | A server connected. `protocol` is the negotiated MCP revision. `reason` marks a reload, a re-dial or a join. |
 | `mcp.connect.fail` | warn | `server`, `err`, `reason?` | A server could not be connected. Not fatal: agentd retries on a backoff. |
-| `mcp.disconnect` | info, warn | `reason`, `server` | A connection closed. `reason`: `reload`, `reload refused`, or `session_lost` (re-dialed). |
+| `mcp.disconnect` | info, warn | `reason`, `server` | A connection closed. `reason`: `reload`, `reload refused`, `session_lost` (re-dialed), or `user_id_reset` (a Company's connection, dropped by `company.user_id.reset`; it joins again on a new one). |
 | `mcp.events.arm.fail` | error, warn | `err`, `event_type`, `retry_ms`, `server` |  |
 | `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present`, `truncated?` | An MCP Events binding started polling, or its webhook subscription was made. |
 | `mcp.events.callback_failed` | error | `event_type`, `reason`, `server`, `url` | The server could not reach or verify `webhooks.url`. |
@@ -582,7 +587,7 @@ Company that verifies while its token endpoint refuses has not recovered.
 | `restore.done` | info | `generation`, `fresh_manifest`, `entities`, `lost`, `unindexed` |  |
 | `restore.fresh` | info | `generation`, `superseded?`, `retired?`, `msg?` | A new generation started (first start, or `--fresh`). |
 | `restore.run.corrupt` | warn | `err`, `id` |  |
-| `restore.step.failed` | warn | `on_replay`, `run`, `step` |  |
+| `restore.step.failed` | warn | `company?`, `on_replay?`, `reason?`, `run`, `step` | A step left running when the process stopped ended failed: its `on_replay` is `fail`, or (`reason: outcome_unknown`) a call of it to the Company `company` may have been sent, and is not sent again. |
 | `restore.step.replay` | info | `attempt`, `run`, `step` |  |
 | `restore.step.skipped` | info | `on_replay`, `run`, `step` |  |
 | `restore.subagent.corrupt` | warn | `err`, `id` |  |
@@ -675,6 +680,7 @@ Company that verifies while its token endpoint refuses has not recovered.
 | `step.rate_wait` | info | `rate`, `run`, `step`, `wait_ms` |  |
 | `step.rate_wait_fail` | warn | `err`, `run`, `step` |  |
 | `step.retry` | info | `attempt`, `backoff_ms`, `run`, `step` | A step is retried after `backoff_ms`. |
+| `step.retry.skipped` | info | `attempt`, `reason`, `run`, `step` | A failed step with a `retry:` is not retried: `reason: outcome unknown`, a Company call that failed after it was sent and may have been performed. |
 | `step.start` | info | `attempt`, `kind`, `run`, `step` | A workflow step started. |
 | `step.timeout_routed` | info | `run`, `step`, `to` |  |
 | `step.turn.spawn` | info | `node`, `run`, `step` |  |
@@ -942,6 +948,20 @@ Use the log events for anything a series below does not cover.
 The MCP Events families take `server` and `event` from the operator's
 bindings (at most 256). A family past 512 series folds the rest into one
 series whose labels all read `other`.
+
+### Companies
+
+The supervisor's, with the `companies` feature. `company` is a company
+entry's name; no label carries a User ID, a session or a conversation. A
+family past 512 series folds as the MCP Events families do.
+
+| Metric | Type | Labels | Status | Meaning |
+|---|---|---|---|---|
+| `agent_company_requests_total` | counter | `company`, `interface` (`mcp`), `outcome` | live | Calls to a Company's tools: `ok`; `error` (the Company's own answer: a tool's error or a refusal it sent); `unsent` (refused before sending: the not-before instant, the in-flight limit, a credential); `unknown` (failed after it was sent, and not sent again) |
+| `agent_company_token_requests_total` | counter | `company`, `grant` (`start`, `renew`, `bearer`), `outcome` (`ok`, `refused`, `failed`) | live | Requests sent to the Company's token endpoint, retries included |
+| `agent_company_signed_in` | gauge | `company` | live | `1` while the Session there is signed in |
+| `agent_company_rate_limited_until_seconds` | gauge | `company` | live | The Company's not-before instant, in Unix seconds; a past instant holds nothing back |
+| `agent_company_gates_total` | counter | `company`, `kind` (`cross_company`), `answer` (`approve`, `deny`, `unanswered`, `unreachable`) | live | The User's gates a Company call opened, by how each ended |
 
 ## Health surfaces
 

@@ -396,6 +396,7 @@ configuration can narrow.
 | `skills.list`, `.load`, `.unload` | root, workflow, subagent | The skills catalogue and the loaded set |
 | `finish` | root, subagent | End the current unit of work with a status |
 | `status` | everyone, A2A callers included | The instance's runs, subagents, conversations, budget and store |
+| `company.status` | root, workflow, subagent | The Companies the instance acts at for its User, as it knows them now: verified, signed in, held by a `Retry-After`, which MCP servers joined. Offered only where a Company is declared (the `companies` feature), in the User's work |
 | `knowledge.search`, `.get`, `.list` | root, workflow, subagent | A contract: implemented by `knowledge.server` or a mapping |
 | `search.query`, `.fetch` | root, workflow, subagent | A contract: implemented by `search.server` or a mapping |
 | `code.run` | root, workflow | A contract: implemented only by a mapping to a sandbox server |

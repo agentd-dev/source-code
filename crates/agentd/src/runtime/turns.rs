@@ -219,7 +219,7 @@ impl Runtime {
         // A Company's tools act for one User: in anyone else's work they are
         // not offered at all (RFC 0047 §5.6).
         if self.company_work_admitted(owner).is_err() {
-            defs.retain(|d| self.company_server_of(&d.name).is_none());
+            defs.retain(|d| !self.is_company_tool(&d.name));
         }
         // Which policy caller this plan is being built for. A plan is per
         // turn, so this is fixed for every call the child will make.
@@ -245,9 +245,11 @@ impl Runtime {
                 }
                 // A Company's tools come back to the supervisor, whatever
                 // the policies say: only it holds the Session, and no worker
-                // is ever handed a Company server to dial.
+                // is ever handed a Company server to dial. So do a declared
+                // browser's, which the supervisor keeps off every Company's
+                // hosts (RFC 0047 §5.5.9).
                 Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, .. }))
-                    if self.is_company_server(server) =>
+                    if self.is_company_server(server) || self.is_browser_server(server) =>
                 {
                     internal.push(d.name.clone())
                 }
@@ -371,6 +373,11 @@ impl Runtime {
             // per conversation: a restart or reload that moves the turn
             // model or adds a smaller route moves a restored one too.
             c.model_window = window;
+            // What the message's sender held of a Company's, before anything
+            // reads the message.
+            if c.carries.union(&job.carries) {
+                c.dirty = true;
+            }
             // A message replayed from the inbox after the turn that took it
             // was stopped — by a drain, or a crash — is already this
             // conversation's last word, unanswered: it is not said twice.

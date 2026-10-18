@@ -452,6 +452,14 @@ impl Runtime {
                 _ => None,
             })
             .collect();
+        // A declared browser's tools come back to the supervisor too, where
+        // the browser guard keeps them off every Company's hosts (RFC 0047
+        // §5.5.9); the child still lists them from its own connection.
+        for (name, (server, _)) in &mcp_routes {
+            if self.is_browser_server(server) && !gated_tools.contains(name) {
+                gated_tools.push(name.clone());
+            }
+        }
         let mut payload = SpawnPayload {
             instruction: instruction.clone(),
             output_contract,
@@ -749,7 +757,7 @@ impl Runtime {
             .contains(&crate::config::settings::WakeEvent::SubagentResult)
         {
             let text = self.withhold_text(
-                &super::withhold::Reader::Conversation,
+                &super::withhold::Reader::Conversation(Some(crate::context::ROOT.to_string())),
                 super::withhold::Source::Child(&handle),
                 distill_text(&outcome.result),
                 "agent.wake_on",
@@ -840,7 +848,7 @@ impl Runtime {
             .contains(&crate::config::settings::WakeEvent::SubagentResult)
         {
             let note = self.withhold_text(
-                &super::withhold::Reader::Conversation,
+                &super::withhold::Reader::Conversation(Some(crate::context::ROOT.to_string())),
                 source,
                 note,
                 "agent.wake_on",
@@ -867,9 +875,15 @@ impl Runtime {
         ok: bool,
         note: &str,
     ) {
-        let reader = super::withhold::Reader::Conversation;
+        let reader = super::withhold::Reader::Conversation(None);
         let withheld = self.withheld(&reader, source).filter(|_| !note.is_empty());
         let note = withheld.as_deref().unwrap_or(note);
+        // A note handed whole hands the conversation the Companies it carries.
+        let companies = if withheld.is_none() {
+            self.companies_carried(source)
+        } else {
+            Default::default()
+        };
         let mut settled = false;
         for id in self.contexts.ids() {
             if let Some(c) = self.contexts.get_mut(&id)
@@ -878,6 +892,7 @@ impl Runtime {
                 let advanced = p.settle_binding(binding, ok, Some(note));
                 if !advanced.is_empty() {
                     settled = true;
+                    c.carries.union(&companies);
                     c.touch();
                     self.log.info(
                         "plan.updated",

@@ -11,17 +11,25 @@
 //!   URL"), and no redirect followed on a request that carries a credential:
 //!   a `3xx` there is a refusal, so nothing is re-sent to wherever it points.
 //!
+//! - nothing before the Company's not-before instant ([`Pace`]): a `429` or
+//!   `503` with `Retry-After` from any of its endpoints holds every request
+//!   to it, from every task, until the wait is over (§4.3: "The Personal
+//!   Agent MUST wait at least that long before sending the request again").
+//!
 //! A discovery document is fetched without credentials and may redirect, to
 //! HTTPS only (§3) and at most three times, each hop to an admitted host; its
 //! body is capped and its JSON must not name a member twice
 //! (Guides #both-transport).
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::auth::http::{self as ahttp, Dial, Reply};
 use crate::config::settings::companies::{host_matches, host_of, is_https_url};
+use crate::obs::log::Logger;
 
 /// The most redirects a discovery fetch follows.
 pub const MAX_REDIRECTS: usize = 3;
@@ -29,6 +37,151 @@ pub const MAX_REDIRECTS: usize = 3;
 pub const MAX_DOCUMENT: usize = 100 * 1024;
 /// How long a discovery fetch may take.
 pub const DOCUMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many times a request that is safe to repeat is sent before its
+/// failure is the caller's (RFC 0047 §5.9): token requests, the MCP
+/// handshake and tool lists. A `tools/call` is never one of them.
+pub const ATTEMPTS: u32 = 3;
+
+/// The wait before attempt `attempt + 1`: 250 ms doubling, at most 2 s, each
+/// between half and all of that (Guides #both-retries: "back off
+/// exponentially with jitter, cap the delay, and limit the number of
+/// attempts").
+pub fn backoff(attempt: u32) -> Duration {
+    let cap = Duration::from_millis(250 * (1u64 << attempt.saturating_sub(1).min(3)))
+        .min(Duration::from_secs(2));
+    let mut b = [0u8; 2];
+    let frac = match crate::sec::random::fill(&mut b) {
+        Ok(()) => f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX),
+        Err(_) => 1.0,
+    };
+    cap.mul_f64(0.5 + frac / 2.0)
+}
+
+/// How far a Company's `Date` may stray from agentd's clock before it is
+/// said (RFC 0047 §5.5.5): proofs and assertions live about a minute.
+pub const CLOCK_SKEW: Duration = Duration::from_secs(30);
+
+/// When a Company may next be sent anything, shared by every task and every
+/// interface of one company entry (Guides #both-rate-limits: "keep track of
+/// limits for each company and share them across your tasks"). A `429` or
+/// `503` with `Retry-After` from any endpoint moves the instant later, cut to
+/// [`crate::net::http::RETRY_AFTER_MAX`]; a request before it is refused
+/// unsent. The same place notes, once, a `Date` that strays more than
+/// [`CLOCK_SKEW`] from agentd's clock.
+#[derive(Default)]
+pub struct Pace {
+    company: String,
+    log: Option<Logger>,
+    until: Mutex<Option<(Instant, SystemTime)>>,
+    skew_said: AtomicBool,
+}
+
+impl std::fmt::Debug for Pace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pace")
+            .field("company", &self.company)
+            .field("until", &self.until())
+            .finish()
+    }
+}
+
+impl Pace {
+    pub fn new(company: &str, log: Option<Logger>) -> Pace {
+        Pace {
+            company: company.to_string(),
+            log,
+            ..Pace::default()
+        }
+    }
+
+    /// The instant before which nothing is sent, while it is ahead.
+    pub fn until(&self) -> Option<SystemTime> {
+        let u = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        u.filter(|(at, _)| Instant::now() < *at)
+            .map(|(_, wall)| wall)
+    }
+
+    /// `Ok` when a request may be sent now; otherwise why not, and until
+    /// when.
+    pub fn check(&self) -> Result<(), String> {
+        match self.until() {
+            None => Ok(()),
+            Some(wall) => Err(format!(
+                "rate limited by {} until {}; nothing is sent to it before then",
+                self.company,
+                crate::obs::log::rfc3339_millis(wall)
+            )),
+        }
+    }
+
+    /// What a response says about pacing: a `429` or `503` with a
+    /// `Retry-After` holds the Company until the wait is over.
+    pub fn learn(&self, status: u16, retry_after: Option<Duration>) {
+        let Some(wait) = retry_after.filter(|_| matches!(status, 429 | 503)) else {
+            return;
+        };
+        let wait = wait.min(crate::net::http::RETRY_AFTER_MAX);
+        let at = (Instant::now() + wait, SystemTime::now() + wait);
+        let moved = {
+            let mut u = self.until.lock().unwrap_or_else(|e| e.into_inner());
+            match *u {
+                Some((was, _)) if was >= at.0 => false,
+                _ => {
+                    *u = Some(at);
+                    true
+                }
+            }
+        };
+        if !moved {
+            return;
+        }
+        let secs =
+            at.1.duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+        crate::obs::metrics::set_company_rate_limited_until(&self.company, secs);
+        if let Some(log) = &self.log {
+            log.info(
+                "company.rate_limited",
+                json!({"company": self.company, "until": crate::obs::log::rfc3339_millis(at.1),
+                       "status": status}),
+            );
+        }
+    }
+
+    /// A response's `Date`, against agentd's clock: said once when they are
+    /// more than [`CLOCK_SKEW`] apart.
+    pub fn date(&self, header: Option<&str>) {
+        let Some(now) = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64)
+        else {
+            return;
+        };
+        let Some(at) = header.and_then(|h| crate::net::http::http_date(h, now)) else {
+            return;
+        };
+        let skew = at - now;
+        if skew.unsigned_abs() <= CLOCK_SKEW.as_secs()
+            || self.skew_said.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        if let Some(log) = &self.log {
+            log.warn(
+                "company.clock_skew",
+                json!({"company": self.company, "skew_s": skew}),
+            );
+        }
+    }
+
+    /// What one reply says about pacing and the Company's clock.
+    fn note(&self, reply: &Reply) {
+        self.learn(reply.status, reply.retry_after());
+        self.date(reply.header("date"));
+    }
+}
 
 /// Where a Company's requests may go, and how they are dialled.
 #[derive(Debug, Clone)]
@@ -39,6 +192,8 @@ pub struct Dialer {
     pub hosts: Vec<String>,
     pub allow_private: bool,
     pub timeout: Duration,
+    /// The company entry's not-before instant.
+    pub pace: Arc<Pace>,
 }
 
 impl Dialer {
@@ -61,8 +216,9 @@ impl Dialer {
         }
     }
 
-    /// One credentialed request: `url` admitted, no token in it, and a
-    /// redirect refused rather than followed.
+    /// One credentialed request: `url` admitted, no token in it, not before
+    /// the Company's not-before instant, and a redirect refused rather than
+    /// followed.
     pub fn send(
         &self,
         method: &str,
@@ -80,7 +236,9 @@ impl Dialer {
                 self.company
             ));
         }
+        self.pace.check()?;
         let reply = ahttp::send(method, url, headers, body, self.timeout, self.dial())?;
+        self.pace.note(&reply);
         if (300..400).contains(&reply.status) {
             return Err(format!(
                 "company {}: {url} answered a redirect, which a request carrying a credential never follows",
@@ -99,6 +257,7 @@ impl Dialer {
         let mut hops = 0;
         loop {
             self.admits(&at)?;
+            self.pace.check().map_err(Refused::Fetch)?;
             let reply = ahttp::get(
                 &at,
                 &[("Accept", "application/json")],
@@ -106,6 +265,7 @@ impl Dialer {
                 self.dial(),
             )
             .map_err(Refused::Fetch)?;
+            self.pace.note(&reply);
             if (300..400).contains(&reply.status) {
                 let to = reply.header("location").unwrap_or_default().to_string();
                 let to = absolute(&at, &to);
@@ -310,7 +470,62 @@ mod tests {
             hosts: vec!["example.com".into(), "*.example.com".into()],
             allow_private: false,
             timeout: Duration::from_secs(1),
+            pace: Arc::new(Pace::new("shop", None)),
         }
+    }
+
+    #[test]
+    fn a_retry_backs_off_with_jitter_under_a_cap() {
+        for attempt in 1..=6 {
+            let cap = Duration::from_millis(250 * (1 << (attempt - 1).min(3)))
+                .min(Duration::from_secs(2));
+            let b = backoff(attempt);
+            assert!(b >= cap / 2 && b <= cap, "attempt {attempt}: {b:?}");
+        }
+    }
+
+    /// A `429` or `503` with `Retry-After` holds every request until the
+    /// wait is over, refused unsent; a later, shorter wait does not shorten
+    /// it, and a status that asks for no wait sets none.
+    #[test]
+    fn a_wait_the_company_asks_for_holds_every_request() {
+        let pace = Pace::new("shop", None);
+        pace.learn(500, Some(Duration::from_secs(60)));
+        pace.learn(429, None);
+        assert!(pace.check().is_ok(), "no wait was asked for");
+        pace.learn(429, Some(Duration::from_secs(2)));
+        let e = pace.check().unwrap_err();
+        assert!(e.starts_with("rate limited by shop until "), "{e}");
+        let first = pace.until().unwrap();
+        pace.learn(503, Some(Duration::from_millis(10)));
+        assert_eq!(pace.until(), Some(first), "a shorter wait keeps the longer");
+        let d = Dialer {
+            pace: Arc::new(pace),
+            ..dialer()
+        };
+        let e = d
+            .send("POST", "https://auth.example.com/token", &[], &[])
+            .unwrap_err();
+        assert!(e.starts_with("rate limited by shop"), "refused unsent: {e}");
+        let e = d.document("https://example.com/x").unwrap_err();
+        assert!(
+            matches!(&e, Refused::Fetch(m) if m.starts_with("rate limited")),
+            "{e:?}"
+        );
+        // A Company whose clock is far from agentd's is said once; a
+        // `Date` that does not parse says nothing.
+        let clock = Pace::new("shop", None);
+        clock.date(Some("not a date"));
+        clock.date(None);
+        assert!(!clock.skew_said.load(Ordering::SeqCst));
+        clock.date(Some("Sun, 06 Nov 1994 08:49:37 GMT"));
+        assert!(clock.skew_said.load(Ordering::SeqCst));
+        // Past the instant, a request may go again.
+        let short = Pace::new("shop", None);
+        short.learn(429, Some(Duration::from_millis(20)));
+        assert!(short.check().is_err());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(short.check().is_ok());
     }
 
     /// The host rule and HTTPS are judged before any socket opens, and a

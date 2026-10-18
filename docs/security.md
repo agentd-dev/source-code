@@ -943,6 +943,67 @@ must match a catalog entry before agentd dials it.
 [Write and ship instruction documents](instruction-documents.md) shows how to
 sign, pin and encrypt documents.
 
+## Companies
+
+With the `companies` feature agentd acts at Companies for one person under
+the Personal Agent Protocol draft
+([RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)). What holds:
+
+- **Custody.** The client key, the DPoP keys and every Session and Bearer
+  token live in the supervisor. No turn worker, subagent or instance child is
+  handed a Company server to dial; their calls to a Company's tools come
+  back to the supervisor.
+- **Company content is untrusted input.** A company entry's tags default to
+  `untrusted_input` and `egress`, and fold into check 1 like any server's:
+  an instance that declares a Company and a `sensitive` server does not
+  start without `security.allow_trifecta`. Split them across two instances
+  linked over A2A instead.
+- **One Company never acts for another.** A Company call's answer adds the
+  Company's origin, `company:<issuer>`, to the record of the conversation,
+  run or subagent it reaches — the outside-input record, handed on to what
+  that work starts, spawns, signals, steers or messages, and to whatever
+  reads its result back. A Company's error counts as its answer does. A call
+  to another Company from work holding one waits for the User
+  ([Company gates](human-in-the-loop.md#company-gates)), before any policy is
+  consulted.
+- **No correlators** under `privacy: strict`, the default: a Company is sent
+  its own keyed idempotency key and its own trace, no instance, run,
+  context, principal or label, no `clientInfo.title`, no AAuth signature,
+  and no trace context on the handshake or the tool list.
+- **No call sent twice blind.** A `tools/call` that failed after it was sent
+  — no answer, a `5xx`, a result agentd could not read — answers `outcome
+  unknown` and is not repeated, by a step's `retry:` or by a restart that
+  finds its step still running; the handshake, tool lists and token requests
+  are repeated at most three times. How far a call got is the transport's
+  word, not the error's text, which the Company writes. A `Retry-After` on a
+  `429` or `503` holds every request to the Company until it is over.
+- **Declared browsers stay off Companies' sites.** A call on a server
+  `security.companies.browsers` names is refused when any string argument
+  names a Company's host as a browser would read it, or a host that is not
+  ASCII.
+- **A reset is a new User.** `company.user_id.reset` drops the Session and
+  the Company's MCP connections with the User ID, so nothing the Company tied
+  to the old User — a token, an MCP session — reaches it again.
+
+What does not:
+
+- The origin record does not follow content into memory or artifacts:
+  Company content written there and read later reaches another Company
+  unasked.
+- Under the default tags nothing stops a Company's answer leaving through a
+  non-Company `egress` tool (mail, a webhook): a Company channel is not
+  `sensitive`, so the Rule of Two does not see that flow. Add `sensitive` to
+  the entry for a Company whose data is.
+- A browser that follows a link onto a Company's site, or one not declared
+  in `browsers`, is not caught. A browser call to a host that is not ASCII
+  (an IDNA name not in its `xn--` form) is refused whatever it names.
+- A step's call cut off by a crash is ended, not replayed, only when the
+  step made it; a subagent's call to a Company is not on its step's record,
+  and a step that spawned the subagent replays as any other.
+- The `client_id` of a self-hosted single-user agent identifies its person
+  to every Company, whatever the User IDs say, and every Company sees the
+  same network address.
+
 ## What agentd does not protect against
 
 Stated plainly, so you size the surrounding environment correctly.
@@ -984,7 +1045,7 @@ class.
 
 | Tier | Callers | Tools |
 |---|---|---|
-| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal` |
+| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status` |
 | root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
 | root only | root | `instruction.subscribe`, `workflow.create`, `workflow.update`, `workflow.delete`, `workflow.pause`, `workflow.resume` |
 

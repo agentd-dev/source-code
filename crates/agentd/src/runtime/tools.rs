@@ -229,18 +229,19 @@ impl Runtime {
         name: &str,
         args: Value,
     ) -> ToolOutcome {
-        self.execute_tool_as(caller, name, args, true)
+        self.execute_tool_as(caller, name, args, super::reactor::Passed::default())
     }
 
-    /// [`Runtime::execute_tool`], with the policy verdict applied or — for a
-    /// call a policy gate's addressee has just approved — not applied again:
-    /// the grant, the argument schema and the result schema still are.
+    /// [`Runtime::execute_tool`], with every gate applied but those `passed`
+    /// says the call was approved past — a policy gate's addressee, or the
+    /// User for a Company gate: the grant, the argument schema, every other
+    /// gate and the result schema still are.
     fn execute_tool_as(
         &mut self,
         caller: &ToolCaller,
         name: &str,
         args: Value,
-        policed: bool,
+        passed: super::reactor::Passed,
     ) -> ToolOutcome {
         // Grant + availability.
         let allowed = match (&caller.subagent, &caller.run) {
@@ -267,12 +268,15 @@ impl Runtime {
             return ToolOutcome::Ready(Value::String(e), true);
         }
         // A Company's tool acts for its one User, and a subagent reaches one
-        // only by a grant its spawn made (RFC 0047 §5.6).
-        if self.company_server_of(name).is_some() {
+        // of a Company's servers only by a grant its spawn made (RFC 0047
+        // §5.6).
+        if self.is_company_tool(name) {
             if let Err(e) = self.company_work_admitted(caller.principal.as_deref()) {
                 return ToolOutcome::Ready(Value::String(e), true);
             }
-            if let Some(h) = &caller.subagent {
+            if let Some(h) = &caller.subagent
+                && self.company_server_of(name).is_some()
+            {
                 let granted = self
                     .subagents
                     .get(h)
@@ -308,13 +312,20 @@ impl Runtime {
                 true,
             );
         }
+        // A call to one Company from work holding another's content asks the
+        // User first (RFC 0047 §6.2), before any rule is consulted: no
+        // policy can answer for the User.
+        #[cfg(feature = "companies")]
+        if let Some(outcome) = self.company_cross_check(caller, name, &args, passed) {
+            return outcome;
+        }
         // The policy verdict, at the one chokepoint every call passes — and
         // deliberately AFTER `validate_args`, so an argument guard judges
         // arguments that already conform to the tool's schema rather than
         // whatever the model happened to emit.
-        if policed
+        if !passed.policy
             && !self.settings.security.policies.is_empty()
-            && let Some(outcome) = self.apply_policy(caller, name, &args)
+            && let Some(outcome) = self.apply_policy(caller, name, &args, passed)
         {
             return outcome;
         }
@@ -394,6 +405,9 @@ impl Runtime {
             Ok(a) => a,
             Err(e) => return ToolOutcome::Ready(Value::String(e), true),
         };
+        if let Some(e) = self.browser_refused(&m.server, &mcp_args) {
+            return ToolOutcome::Ready(Value::String(e), true);
+        }
         if let Err(e) = self.service_rate_take(&m.server) {
             return ToolOutcome::Ready(Value::String(e), true);
         }
@@ -482,44 +496,78 @@ impl Runtime {
         if let Err(e) = self.service_rate_take(server) {
             return ToolOutcome::Ready(Value::String(e), true);
         }
+        if let Some(e) = self.browser_refused(server, &args) {
+            return ToolOutcome::Ready(Value::String(e), true);
+        }
         let Some(client) = self.mcp.get(server).cloned() else {
             return ToolOutcome::Ready(
                 Value::String(format!("server {server:?} for {name} is not connected")),
                 true,
             );
         };
-        // A Company call holds one of the Company's places in flight for as
-        // long as it runs, and its failure is said as what it means.
+        // A Company call is sent nothing before the Company's not-before
+        // instant, holds one of its places in flight for as long as it runs,
+        // and its failure is said as what it means.
         #[cfg(feature = "companies")]
         let company = match self
             .companies
             .as_ref()
             .and_then(|c| c.company_of_server(server))
         {
-            Some(c) => match crate::companies::Company::enter(&c) {
-                Some(slot) => Some(slot),
-                None => {
+            Some(c) => {
+                if let Err(e) = c.pace().check() {
+                    crate::obs::metrics::record_company_request(&c.name, "mcp", "unsent");
                     return ToolOutcome::Ready(
-                        Value::String(format!(
-                            "company {} has {} calls in flight (security.companies.limits.in_flight); retry when one ends",
-                            c.name,
-                            c.limit()
-                        )),
+                        Value::String(format!("{e}; the call was not sent")),
                         true,
                     );
                 }
-            },
+                match crate::companies::Company::enter(&c) {
+                    Some(slot) => Some(slot),
+                    None => {
+                        crate::obs::metrics::record_company_request(&c.name, "mcp", "unsent");
+                        return ToolOutcome::Ready(
+                            Value::String(format!(
+                                "company {} has {} calls in flight (security.companies.limits.in_flight); retry when one ends",
+                                c.name,
+                                c.limit()
+                            )),
+                            true,
+                        );
+                    }
+                }
+            }
             None => None,
         };
+        // A step's call to a Company is on its record before it leaves: a
+        // restart that finds the step running does not send it again.
+        #[cfg(feature = "companies")]
+        if let (Some(slot), Some(run), Some(step), None) =
+            (&company, &caller.run, &caller.step, &caller.subagent)
+            && let Some(r) = self.runs.get_mut(run)
+            && let Some(st) = r.steps.get_mut(step)
+        {
+            st.company = Some(slot.company().to_string());
+            r.dirty = true;
+            self.checkpoint(false);
+        }
         let tool = tool.to_string();
         // A Company under the strict privacy profile (RFC 0047 §5.10) sees
-        // none of agentd's correlators: no `agent/*` key, no idempotency
-        // key, no trace context. The call is still a span of the unit's in
-        // agentd's own telemetry.
+        // none of agentd's correlators: its `_meta` is built on the call's
+        // thread from the (User, Company) pair's secret — the idempotency
+        // key keyed, the trace re-rooted — and the call is a span of the
+        // unit's in agentd's own telemetry, linked to the trace the Company
+        // sees.
         #[cfg(feature = "companies")]
         let strict = company.as_ref().is_some_and(|slot| slot.strict());
         #[cfg(not(feature = "companies"))]
         let strict = false;
+        #[cfg(feature = "companies")]
+        let private = strict.then(|| (self.idempotency_key(caller), self.caller_trace(caller)));
+        #[cfg(feature = "companies")]
+        let reads = self.reads_of(caller);
+        #[cfg(feature = "companies")]
+        let sup = self.companies.clone();
         let (meta, call) = if strict {
             (
                 json!({}),
@@ -554,30 +602,83 @@ impl Runtime {
             .spawn(move || {
                 // Unbounded as a whole, for the reason `run_mapped` gives.
                 let start = crate::obs::otel::now_unix_nanos();
-                let (result, is_error) = match client.call_tool_with_meta(&tool, Some(args), meta) {
+                #[cfg(feature = "companies")]
+                let (meta, link) = match (&company, &private, &sup) {
+                    (Some(slot), Some((key, unit)), Some(sup)) => {
+                        match sup.private_meta(slot, key, unit.as_ref()) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                crate::obs::metrics::record_company_request(
+                                    slot.company(),
+                                    "mcp",
+                                    "unsent",
+                                );
+                                target.send(&tx, Value::String(e), true);
+                                return;
+                            }
+                        }
+                    }
+                    _ => (meta, None),
+                };
+                #[cfg(not(feature = "companies"))]
+                let link: Option<crate::obs::trace::TraceContext> = None;
+                let res = client.call_tool_reaching(&tool, Some(args), meta);
+                // A Company's answer is its content: the context it reaches
+                // carries the Company's origin from then on, written before
+                // the answer is read — and so does a failure whose error may
+                // hold what the Company sent.
+                #[cfg(feature = "companies")]
+                let failure = res
+                    .as_ref()
+                    .err()
+                    .map(|f| crate::companies::mcp::Failure::of(f.reach));
+                #[cfg(feature = "companies")]
+                if let Some(slot) = &company {
+                    let (outcome, read) = match (&res, failure) {
+                        (Ok(r), _) if r.is_error() => ("error", true),
+                        (_, Some(f)) => (f.outcome(), f.read_the_company()),
+                        _ => ("ok", true),
+                    };
+                    crate::obs::metrics::record_company_request(slot.company(), "mcp", outcome);
+                    if read && let (Some(into), Some(issuer)) = (reads.clone(), slot.issuer()) {
+                        let _ = tx.send(super::events::Event::CompanyRead {
+                            into,
+                            origin: crate::companies::carry::origin(&issuer),
+                            why: crate::companies::carry::why(slot.company()),
+                        });
+                    }
+                }
+                let (result, is_error) = match res {
                     Ok(r) => (super::worker::tool_result_value(&r), r.is_error()),
-                    Err(e) => {
-                        let text = format!("transport error: {e}");
+                    Err(f) => {
+                        let text = format!("transport error: {}", f.error);
                         // A refusal the Company's server sent is said as what
-                        // it means; a tool's own error is the Company's
-                        // answer, and stays as it wrote it.
+                        // it means, and a call that may have run is `outcome
+                        // unknown`, never sent again; a tool's own error is
+                        // the Company's answer, and stays as it wrote it.
                         #[cfg(feature = "companies")]
-                        let text = match &company {
-                            Some(slot) => crate::companies::mcp::typed_error(slot.company(), &text),
-                            None => text,
+                        let text = match (&company, failure) {
+                            (Some(slot), Some(failure)) => crate::companies::mcp::call_failed(
+                                slot.company(),
+                                &format!("{server}.{tool}"),
+                                failure,
+                                &text,
+                            ),
+                            _ => text,
                         };
                         (Value::String(text), true)
                     }
                 };
                 #[cfg(feature = "companies")]
                 drop(company);
-                crate::obs::otel::mcp_span(
+                crate::obs::otel::mcp_span_linked(
                     call.as_ref(),
                     "tools/call",
                     &tool,
                     &server,
                     !is_error,
                     start,
+                    link.as_ref(),
                 );
                 target.send(&tx, result, is_error);
             })
@@ -864,6 +965,9 @@ impl Runtime {
             // ---- status ----
             // The model is its caller's deputy: it reads what that caller may.
             "status" => ok(self.status_for(caller.principal.as_deref())),
+            // ---- companies ----
+            #[cfg(feature = "companies")]
+            "company.status" => ok(self.company_status(false)),
             // ---- time ----
             "sleep" => {
                 let d = match crate::config::parse_duration(args["duration"].as_str().unwrap_or(""))
@@ -1005,6 +1109,7 @@ impl Runtime {
         caller: &ToolCaller,
         name: &str,
         args: &Value,
+        passed: super::reactor::Passed,
     ) -> Option<ToolOutcome> {
         use crate::config::settings::PolicyAction;
         let tags = self
@@ -1073,7 +1178,7 @@ impl Runtime {
                 };
                 Some(ToolOutcome::Ready(Value::String(msg), true))
             }
-            PolicyAction::Ask => self.policy_gate(caller, name, args, &verdict),
+            PolicyAction::Ask => self.policy_gate(caller, name, args, &verdict, passed),
         }
     }
 
@@ -1096,6 +1201,7 @@ impl Runtime {
         name: &str,
         args: &Value,
         verdict: &crate::sec::policy::Verdict,
+        passed: super::reactor::Passed,
     ) -> Option<ToolOutcome> {
         use crate::config::settings::PolicyAction;
         let question = verdict
@@ -1154,6 +1260,8 @@ impl Runtime {
                     args: args.clone(),
                     rule: verdict.rule,
                     on_timeout: verdict.on_timeout,
+                    company: None,
+                    passed,
                 };
                 let question = format!(
                     "{question}\n\nAnswer `{}` to run this call or `{}` to refuse it.",
@@ -1171,6 +1279,8 @@ impl Runtime {
                 ));
             }
         }
+        #[cfg(not(feature = "a2a"))]
+        let _ = passed;
         // Nobody to ask. `on_timeout` decides, and it defaults to deny: a gate
         // that cannot be answered has not been approved, and quietly running
         // the call because nobody can be asked would make the policy a
@@ -1210,6 +1320,22 @@ impl Runtime {
         approved: bool,
         by: &str,
     ) {
+        // The User's gate says so in its own words, and its own record.
+        #[cfg(feature = "companies")]
+        if let Some(ask) = &call.company {
+            let answer = if approved { "approve" } else { "deny" };
+            self.company_gate_said(target, ask, &call.tool, answer, Some(by));
+            if !approved {
+                let msg = format!(
+                    "company {}: the User refused this call — it was NOT executed",
+                    ask.company
+                );
+                self.reply(target, Value::String(msg), true);
+                return;
+            }
+            self.run_approved(target, call);
+            return;
+        }
         let trace = self.target_trace(target);
         self.log.in_trace(trace.as_ref()).info(
             "tool.policy.decided",
@@ -1234,6 +1360,13 @@ impl Runtime {
             self.reply(target, Value::String(msg), true);
             return;
         }
+        self.run_approved(target, call);
+    }
+
+    /// Run the call an approved gate held, past that gate and those it had
+    /// passed already, and hand the asker its outcome.
+    fn run_approved(&mut self, target: &Target, call: &super::reactor::PolicyCall) {
+        let passed = call.passed.and(call);
         match target {
             Target::Child(node, req) => {
                 let (node, req) = (*node, *req);
@@ -1241,7 +1374,7 @@ impl Runtime {
                 let Some(caller) = self.child_caller(node, req) else {
                     return;
                 };
-                let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), false);
+                let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), passed);
                 self.child_tool_outcome(node, req, &call.tool, outcome);
             }
             Target::Step(run, step) => {
@@ -1249,7 +1382,7 @@ impl Runtime {
                 let Some(caller) = self.resume_gated_step(&run, &step) else {
                     return;
                 };
-                let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), false);
+                let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), passed);
                 self.step_tool_outcome(&run, &step, &call.tool, outcome);
             }
         }
@@ -1310,6 +1443,12 @@ impl Runtime {
         let mut payload = json!({"text": text, "context_id": ctx, "msg_depth": depth});
         if owner_checked {
             payload["owner_checked"] = Value::Bool(true);
+        }
+        // The text may be a Company's: whatever it reaches carries the
+        // Companies whose content the sender holds (RFC 0047 §6.2).
+        let carried = super::withhold::companies_of(&self.caller_carries(caller));
+        if !carried.is_empty() {
+            payload["carries"] = json!(carried);
         }
         // The turn it starts continues the sender's trace.
         let trace = self.caller_trace(caller);

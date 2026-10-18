@@ -46,6 +46,17 @@
 //! notification. A call its caller merely abandons is NOT hung up: the SDK
 //! keeps that stream until it ends or the client closes (see
 //! `RmcpClient::call_tool`).
+//!
+//! ## How far a `tools/call` got
+//!
+//! A `tools/call` that failed may or may not have been acted on, and its
+//! error may or may not hold the server's words; a caller that must not send
+//! it twice, or that tracks whose words reached a model, needs to know which
+//! ([`Reach`]). That is said on the error itself, where the SDK carries it:
+//! an error this transport makes up for an exchange it ended, and a server's
+//! JSON-RPC error that came with a non-success status, carry a mark in
+//! `data` holding a random token of this process's, which no server can know
+//! to write (see `mark`). The client takes it off before the error is said.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,7 +71,88 @@ use rmcp::transport::streamable_http_client::{
 use serde_json::Value;
 use sse_stream::{Error as SseError, Sse};
 
+use crate::client::Reach;
 use crate::http::{Hangup, HttpError, HttpTransport};
+
+/// The member of an error's `data` that carries a [`Reach`].
+const REACH: &str = "agentd/reach";
+
+/// This process's token in every mark: random, never sent, so a mark a
+/// server wrote into its own error is not one.
+fn token() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write(b"agentd tools/call reach");
+        h.finish()
+    })
+}
+
+/// Write `reach` on the JSON-RPC error answer `v`. What `data` held is kept
+/// under `value`, for [`unmark`] to put back.
+fn mark(v: &mut Value, reach: Reach) {
+    let Some(error) = v.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let (what, status) = match reach {
+        Reach::Unsent => ("unsent", None),
+        Reach::Unsigned => ("unsigned", None),
+        Reach::Unanswered => ("unanswered", None),
+        Reach::Answered { status } => ("answered", Some(status)),
+        Reach::Unreadable => ("unreadable", None),
+    };
+    let mut data = serde_json::Map::new();
+    data.insert(
+        REACH.into(),
+        serde_json::json!({"token": token().to_string(), "reach": what, "status": status}),
+    );
+    if let Some(was) = error.remove("data") {
+        data.insert("value".into(), was);
+    }
+    error.insert("data".into(), Value::Object(data));
+}
+
+/// The [`Reach`] this process wrote on an error's `data`, taken off it and
+/// `data` put back as the server sent it. `None` for an error that carries
+/// none — the server's own answer, whatever it wrote there.
+pub(crate) fn unmark(data: &mut Option<Value>) -> Option<Reach> {
+    let m = data.as_ref()?.get(REACH)?;
+    if m["token"].as_str() != Some(token().to_string().as_str()) {
+        return None;
+    }
+    let reach = match m["reach"].as_str()? {
+        "unsent" => Reach::Unsent,
+        "unsigned" => Reach::Unsigned,
+        "unanswered" => Reach::Unanswered,
+        "answered" => Reach::Answered {
+            status: m["status"].as_u64().and_then(|s| u16::try_from(s).ok())?,
+        },
+        "unreadable" => Reach::Unreadable,
+        _ => return None,
+    };
+    *data = data
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|d| d.remove("value"));
+    Some(reach)
+}
+
+/// How far a request whose exchange ended in `e` got.
+fn reach_of(e: &HttpError) -> Reach {
+    match e {
+        HttpError::Connect(_)
+        | HttpError::Unsupported(_)
+        | HttpError::RetryAfter { sent: false, .. } => Reach::Unsent,
+        HttpError::Credential(_) => Reach::Unsigned,
+        HttpError::Status(status)
+        | HttpError::RetryAfter {
+            status, sent: true, ..
+        } => Reach::Answered { status: *status },
+        HttpError::Refused(c) => Reach::Answered { status: c.status },
+        HttpError::Http(_) | HttpError::NoResponse | HttpError::NoEventStream => Reach::Unanswered,
+    }
+}
 
 /// What an extension adds to a connection's `subscriptions/listen`: members
 /// of its filter, and the notifications it delivers on that stream, which go
@@ -381,6 +473,12 @@ impl StreamableHttpClient for AgentdHttp {
             rmcp::model::JsonRpcMessage::Request(r)
                 if matches!(r.request, rmcp::model::ClientRequest::ListToolsRequest(_))
         );
+        // A `tools/call`'s failure says how far it got (the module doc).
+        let calls_tool = matches!(
+            &message,
+            rmcp::model::JsonRpcMessage::Request(r)
+                if matches!(r.request, rmcp::model::ClientRequest::CallToolRequest(_))
+        );
         let listen_idle = match &message {
             rmcp::model::JsonRpcMessage::Request(r) => match r.request {
                 rmcp::model::ClientRequest::SubscriptionsListenRequest(_) => self.listen_idle,
@@ -451,7 +549,7 @@ impl StreamableHttpClient for AgentdHttp {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let resp = http.send_until_hangup(
+            let resp = http.exchange_until_hangup(
                 request_id,
                 &body,
                 timeout,
@@ -470,6 +568,21 @@ impl StreamableHttpClient for AgentdHttp {
                 },
                 &hangup,
             );
+            // A `tools/call`'s error answer that came with a failing status
+            // says it: a `5xx` may mean the call ran.
+            let resp = resp.map(|a| {
+                a.map(
+                    |crate::http::Answer {
+                         mut message,
+                         status,
+                     }| {
+                        if calls_tool && !(200..300).contains(&status) {
+                            mark(&mut message, Reach::Answered { status });
+                        }
+                        message
+                    },
+                )
+            });
             if let (Some(n), Err(HttpError::Http(io))) = (&idle_cuts, &resp)
                 && hangup.streamed()
                 && matches!(
@@ -517,7 +630,7 @@ impl StreamableHttpClient for AgentdHttp {
                         Some((Ok(as_event(&answered(id, v, false))), (Some(rx), held)))
                     }
                     Some(Pumped::Done(Err(e))) => {
-                        Some((Ok(as_event(&failed(id, &e.to_string()))), (None, held)))
+                        Some((Ok(as_event(&failed(id, &e, calls_tool))), (None, held)))
                     }
                     // Accepted with no body, or the pump vanished: the stream
                     // is over, and the SDK fails the request for want of an
@@ -582,7 +695,7 @@ impl StreamableHttpClient for AgentdHttp {
             // is told apart by the client, as for every request).
             Some(Pumped::Done(Err(e))) if lists_tools => {
                 let id = request_id.unwrap_or_default();
-                let message = serde_json::from_value(failed(id, &e.to_string()))
+                let message = serde_json::from_value(failed(id, &e, false))
                     .map_err(StreamableHttpError::Deserialize)?;
                 return Ok(StreamableHttpPostResponse::Json(
                     message,
@@ -633,7 +746,7 @@ impl StreamableHttpClient for AgentdHttp {
                     // its answer is the transport's reason, as on any other
                     // request's stream, not the SDK's generic "closed early".
                     Some(Pumped::Done(Err(e))) if !bootstrap => {
-                        request_id.map(|id| (Ok(as_event(&failed(id, &e.to_string()))), (rx, held)))
+                        request_id.map(|id| (Ok(as_event(&failed(id, &e, calls_tool))), (rx, held)))
                     }
                     // Done — cleanly, or with an error the first frame already
                     // outlived. Either way this POST's stream is over, and ending
@@ -803,15 +916,19 @@ fn answered(id: i64, mut v: Value, bootstrap: bool) -> Value {
     v
 }
 
-/// The error response a request gets when its exchange ended before the
-/// server answered it: JSON-RPC's internal error, with the transport's reason
-/// as the message.
-fn failed(id: i64, reason: &str) -> Value {
-    serde_json::json!({
+/// The error response a request gets when its exchange ended in `e` before
+/// the server answered it: JSON-RPC's internal error, with the transport's
+/// reason as the message — and, for a `tools/call`, how far it got.
+fn failed(id: i64, e: &HttpError, calls_tool: bool) -> Value {
+    let mut v = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {"code": crate::rpc::INTERNAL_ERROR, "message": format!("mcp: transport: {reason}")}
-    })
+        "error": {"code": crate::rpc::INTERNAL_ERROR, "message": format!("mcp: transport: {e}")}
+    });
+    if calls_tool {
+        mark(&mut v, reach_of(e));
+    }
+    v
 }
 
 /// The SDK's headers, flattened to the pairs our transport takes. A header whose
@@ -886,6 +1003,62 @@ mod tests {
             .block_on(agentd.post_message(Arc::from(ep), discover, None, None, HashMap::new()))
             .ok();
         agentd.bootstrap_failure()
+    }
+
+    /// A mark comes off as it went on, leaving `data` as the server sent
+    /// it; one without this process's token is the server's data, left be.
+    #[test]
+    fn a_mark_is_this_processs_alone() {
+        for data in [
+            None,
+            Some(serde_json::json!({"k": 1})),
+            Some(serde_json::json!("text")),
+        ] {
+            let mut v = serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "m"}});
+            if let Some(d) = &data {
+                v["error"]["data"] = d.clone();
+            }
+            mark(&mut v, Reach::Answered { status: 503 });
+            let mut got = v["error"].get("data").cloned();
+            assert_eq!(unmark(&mut got), Some(Reach::Answered { status: 503 }));
+            assert_eq!(got, data);
+        }
+        let forged = serde_json::json!({REACH: {"token": "1", "reach": "unsent"}});
+        let mut got = Some(forged.clone());
+        assert_eq!(unmark(&mut got), None);
+        assert_eq!(got, Some(forged), "the server's data, as it sent it");
+        for (e, want) in [
+            (
+                HttpError::Connect(std::io::Error::other("refused")),
+                Reach::Unsent,
+            ),
+            (HttpError::Unsupported("tls".into()), Reach::Unsent),
+            (
+                HttpError::RetryAfter {
+                    status: 429,
+                    wait: Duration::from_secs(1),
+                    sent: false,
+                },
+                Reach::Unsent,
+            ),
+            (HttpError::Credential("none".into()), Reach::Unsigned),
+            (HttpError::Status(502), Reach::Answered { status: 502 }),
+            (
+                HttpError::RetryAfter {
+                    status: 503,
+                    wait: Duration::from_secs(1),
+                    sent: true,
+                },
+                Reach::Answered { status: 503 },
+            ),
+            (
+                HttpError::Http(std::io::Error::other("reset")),
+                Reach::Unanswered,
+            ),
+            (HttpError::NoResponse, Reach::Unanswered),
+        ] {
+            assert_eq!(reach_of(&e), want, "{e}");
+        }
     }
 
     #[test]

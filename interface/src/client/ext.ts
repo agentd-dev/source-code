@@ -93,6 +93,8 @@ export const OPS = Object.freeze({
   authDeviceDeny: 'auth.device.deny',
   authSessions: 'auth.sessions',
   authSessionsRevoke: 'auth.sessions.revoke',
+  companyStatus: 'company.status',
+  companyUserIdReset: 'company.user_id.reset',
 } as const);
 
 /**

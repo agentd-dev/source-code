@@ -147,6 +147,11 @@ skip.
 | `companies/agent-uses-bearer-only-at-its-mcp-server` | agentd requests the MCP server's token without a proof, with resource the server's url and its session_id, and presents it at that server only, never a superseded one |
 | `companies/agent-supports-nonces` | against the nonce-required variant, agentd's use_dpop_nonce is followed by one retry carrying the nonce, with fresh assertions and a fresh proof |
 | `companies/agent-keeps-the-user-across-restarts` | after a restart agentd presents the same User ID and renews the same session_id, with a new DPoP key |
+| `companies/agent-sends-a-company-none-of-its-correlators` | the calls a workflow makes to two Companies carry none of agentd's instance, run, context, principal or label keys, and no trace or idempotency key seen at one is seen at the other; the handshake and tool list carry no trace context, no clientInfo.title and no AAuth signature |
+| `companies/agent-acts-at-one-company-for-another-only-with-the-user` | a run that read one Company's answer sends another Company nothing when the User cannot be asked, with agent.approval and the ask_human fallback both auto |
+| `companies/agent-waits-out-a-companys-retry-after` | against the retry-after variant, whose token endpoint and MCP server each answer 429 with Retry-After, nothing agentd sends reaches the Company before the wait is over, and it joins and calls once it is |
+| `companies/agent-never-repeats-a-call-that-may-have-run` | a tools/call that got no answer in time, or a 502, after it was sent is not sent again — by the transport or by the step's retry: — so no run's call reaches the Company twice: each run's calls go out in one trace of its own there, and no trace id is seen twice |
+| `companies/agent-keeps-tokens-out-of-its-log` | no Session Token or Bearer token the Company issued appears in agentd's log, at debug level with content logging on |
 
 ## Running it
 
@@ -182,8 +187,10 @@ Personal Agent written in the suite from the draft drives it, and each check
 passes only when the fake does what the draft says and, where a variant is
 built to break that rule, the variant is caught. The fake's record of every
 request it served — what was refused and why, the tokens it issued, and for a
-request carrying a Session Token whether a newer one had replaced it, and the
-claims of the assertions and proofs a token request carried — is what the
+request carrying a Session Token whether a newer one had replaced it, the
+claims of the assertions and proofs a token request carried, and what each MCP
+request said of its sender beside its credential — its trace, its client's
+title, an AAuth signature, its idempotency key — is what the
 `companies/agent-*` checks count: they declare the fake as agentd's Company,
 host the identity `agentd --print-company-client` writes, and hold the real
 binary to the draft through the fake's record alone. Every

@@ -138,6 +138,8 @@ workflow may declare them as a command.
 | `auth.device.deny` | task | operator | `a2a.device_grant.enabled` | Refuse a pending device sign-in {user_code}, or all of them {all: true} |
 | `auth.sessions` | message | operator | a TCP listener | The signed-in sessions: kind, name, principal and expiry |
 | `auth.sessions.revoke` | task | operator | a TCP listener | End one session {sid}, every session of a name {name}, or all {all: true} |
+| `company.status` | message | operator | a `kind: company` entry | Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, whether the Session is signed in, until when it asked for no requests, and its MCP servers |
+| `company.user_id.reset` | task | operator | a `kind: company` entry | Forget the User ID one Company knows the User by {company}, with its Session and MCP connections: the Company sees a new User from the next call on |
 | `_instance.result` | task | operator | always | reserved: a `mode: sync` child's first result, recorded on the parent's handle; operator only |
 | `_instance.emit` | task | operator | always | reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; operator only |
 | `ask_human` | task | operator | never | reserved: the model's tool for asking a person; not served over A2A |

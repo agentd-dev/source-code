@@ -457,6 +457,8 @@ op answers with a Task whose `<taskId>.result` artifact carries the result.
 | `auth.device.deny` | task | operator | device grant on | `user_code`, or `all: true` |
 | `auth.sessions` | message | operator | a TCP listener | none |
 | `auth.sessions.revoke` | task | operator | a TCP listener | `sid`, `name`, or `all: true` |
+| `company.status` | message | operator | a `kind: company` entry | none |
+| `company.user_id.reset` | task | operator | a `kind: company` entry | `company` |
 
 Arguments before a semicolon are required. "A grant" means no role reaches
 the op by default and a principal needs a grant naming it. The operator
@@ -476,6 +478,15 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   `^[a-z0-9][a-z0-9._-]{0,63}$`, not `operator`, `anonymous`, `unknown`,
   `launcher`, `runtime` or `system`, and not a configured principal id. The
   answer's `existing: true` says the name was approved before.
+- **`company.status`** and **`company.user_id.reset`** are served where a
+  Company is declared (the `companies` feature). `company.status` is the
+  `company.status` tool's document with why each failed Company failed;
+  `company.user_id.reset {company}` forgets the User ID that Company knows
+  the User by, and drops the Session there and the Company's MCP
+  connections, which join again on new sessions: the Company sees a new
+  User. With a seal key that opens none of the store's records it starts
+  that Company over with the key (`started_over: true`); the others stay
+  unavailable until each is reset.
 
 **Reserved names.** `_instance.result` and `_instance.emit` are how a child
 instance reports to its parent; they are the operator's and are not listed in

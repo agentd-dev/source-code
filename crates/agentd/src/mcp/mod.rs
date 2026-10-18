@@ -93,7 +93,7 @@ pub fn stamp_trace(
 /// supervisor's at exit, a worker's as its `invoke_agent`), so the server's
 /// span for the request has its parent in the collector. A request made for
 /// a unit of work names a span of its own under the unit's, and that wins.
-fn process_request_meta() -> serde_json::Map<String, serde_json::Value> {
+pub(crate) fn process_request_meta() -> serde_json::Map<String, serde_json::Value> {
     crate::obs::trace::process()
         .map(|t| t.meta())
         .unwrap_or_default()
@@ -111,6 +111,12 @@ static WORKLOAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// Set the workload label sessions announce; first caller wins (idempotent).
 pub fn set_workload_label(label: &str) {
     let _ = WORKLOAD.set(label.to_string());
+}
+
+/// The workload label sessions announce, once it is set.
+#[cfg(feature = "companies")]
+pub(crate) fn workload_label() -> Option<String> {
+    WORKLOAD.get().cloned()
 }
 
 pub fn from_spec(

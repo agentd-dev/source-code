@@ -482,6 +482,12 @@ The audit record of an A2A call whose task is in another trace than the
 caller's — a message continuing it, the answer to its gate, a read — names
 the caller's span as `link`.
 
+A call to a Company under `privacy: strict` (the `companies` feature) goes
+out in a trace of its own per unit of work and Company, so two Companies the
+unit calls cannot match it: the call's span stays in the unit's trace, and
+links to the span the Company was sent. A Company's handshake and tool list
+carry no trace context.
+
 An inbound `traceparent` is correlation and nothing more. No identity,
 authorization, rate limit, idempotency key or deduplication reads it. One
 that is not valid W3C is ignored and the work gets a trace of its own; two

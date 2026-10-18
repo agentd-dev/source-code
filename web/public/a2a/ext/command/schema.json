@@ -366,6 +366,36 @@
           "if": {
             "properties": {
               "op": {
+                "const": "company.status"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/company.status"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "company.user_id.reset"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/company.user_id.reset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
                 "const": "_instance.result"
               }
             },
@@ -703,6 +733,36 @@
           },
           "required": [
             "op"
+          ],
+          "type": "object"
+        },
+        "company.status": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "company.status"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "company.user_id.reset": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry whose User ID is forgotten",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "company.user_id.reset"
+            }
+          },
+          "required": [
+            "op",
+            "company"
           ],
           "type": "object"
         },
@@ -1533,6 +1593,179 @@
           },
           "required": [
             "revoked"
+          ],
+          "type": "object"
+        }
+      },
+      "company.status": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, whether the Session is signed in, until when it asked for no requests, and its MCP servers",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "companies": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "company": {
+                    "description": "the company entry",
+                    "type": "string"
+                  },
+                  "domain": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "in_flight": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "issuer": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "limit": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "privacy": {
+                    "enum": [
+                      "strict",
+                      "standard"
+                    ]
+                  },
+                  "rate_limited_until": {
+                    "description": "RFC 3339: nothing is sent to the Company before then",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "description": "why its documents were refused, as one word, while it is unverified",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "servers": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "joined": {
+                          "type": "boolean"
+                        },
+                        "server": {
+                          "type": "string"
+                        },
+                        "unusable": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "server",
+                        "joined",
+                        "unusable"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "signed_in": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "state": {
+                    "enum": [
+                      "verified",
+                      "unverified",
+                      "unavailable",
+                      "suspended"
+                    ]
+                  }
+                },
+                "required": [
+                  "company",
+                  "state",
+                  "reason",
+                  "domain",
+                  "issuer",
+                  "privacy",
+                  "signed_in",
+                  "rate_limited_until",
+                  "in_flight",
+                  "limit",
+                  "servers",
+                  "error"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "user": {
+              "description": "The User every Company sees this instance act for",
+              "type": "string"
+            }
+          },
+          "required": [
+            "user",
+            "companies"
+          ],
+          "type": "object"
+        }
+      },
+      "company.user_id.reset": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry whose User ID is forgotten",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "company"
+          ],
+          "type": "object"
+        },
+        "description": "Forget the User ID one Company knows the User by {company}, with its Session and MCP connections: the Company sees a new User from the next call on",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "type": "string"
+            },
+            "reset": {
+              "const": true
+            },
+            "started_over": {
+              "description": "the seal key opened none of the store's records: this Company started over with it as a new User, and the others stay unavailable until each is reset",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "company",
+            "reset",
+            "started_over"
           ],
           "type": "object"
         }

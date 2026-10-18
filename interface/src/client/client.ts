@@ -463,6 +463,18 @@ export class AgentdClient {
     return this.data(OPS.authSessionsRevoke, args);
   }
 
+  // ---- companies -----------------------------------------------------------
+
+  /** Each Company the agent acts at for its User, as the agent knows it now. */
+  async companyStatus(): Promise<Json> {
+    return this.data(OPS.companyStatus);
+  }
+
+  /** Forget the User ID one Company knows the User by: it sees a new User. */
+  async companyUserIdReset(company: string): Promise<Json> {
+    return this.data(OPS.companyUserIdReset, { company });
+  }
+
   // ---- streams -----------------------------------------------------------
 
   /**

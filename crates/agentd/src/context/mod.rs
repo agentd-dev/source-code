@@ -306,6 +306,12 @@ pub struct ContextState {
     /// The A2A task the conversation's current work is attached to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// The Companies whose content the conversation has read (RFC 0047
+    /// §6.2): `company:<issuer>` origins, added when a Company call's result
+    /// or a read-back carrying one reaches it, and never removed. A call to
+    /// another Company from it asks the User first.
+    #[serde(default, skip_serializing_if = "crate::engine::run::Carries::is_empty")]
+    pub carries: crate::engine::run::Carries,
     #[serde(default)]
     pub turns: u64,
     #[serde(default)]
@@ -332,6 +338,7 @@ impl ContextState {
             principal: None,
             wire_id: None,
             task: None,
+            carries: Default::default(),
             turns: 0,
             created: now_ms(),
             updated: now_ms(),

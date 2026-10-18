@@ -41,8 +41,10 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone)]
 pub(crate) enum Reader {
     /// A conversation: a turn under the root grant, the plan it reads every
-    /// turn, the notes left in its transcript.
-    Conversation,
+    /// turn, the notes left in its transcript — by id, when the read lands
+    /// in one: what it is handed whole adds the Companies it carries to the
+    /// conversation's record (RFC 0047 §6.2).
+    Conversation(Option<String>),
     /// A workflow run, by id: what one of its steps reads, every later step
     /// of it can.
     Run(String),
@@ -56,6 +58,23 @@ pub(crate) enum Source<'a> {
     Run(&'a str),
     Child(&'a str),
 }
+
+/// The Company origins of `c` (RFC 0047 §6.2), with its reason.
+pub(crate) fn companies_of(c: &Carries) -> Carries {
+    let mut out = Carries::default();
+    out.add(
+        c.origins
+            .iter()
+            .filter(|o| o.starts_with(COMPANY_ORIGIN))
+            .cloned(),
+        || c.why.clone().unwrap_or_default(),
+    );
+    out
+}
+
+/// What every Company origin starts with (RFC 0047 §6.2): what a
+/// conversation keeps of what it reads back.
+pub(crate) const COMPANY_ORIGIN: &str = "company:";
 
 /// The origin of a run or a child no longer on record: no reader holds it,
 /// so a reader holding both legs is withheld from.
@@ -83,7 +102,7 @@ pub(crate) fn peer_carries(peer: &str, how: &str) -> Carries {
 impl Reader {
     fn label(&self) -> String {
         match self {
-            Reader::Conversation => "conversation".into(),
+            Reader::Conversation(_) => "conversation".into(),
             Reader::Run(id) => format!("run:{id}"),
             Reader::Child(h) => format!("subagent:{h}"),
         }
@@ -102,7 +121,8 @@ impl Runtime {
         if let Some(r) = &caller.run {
             return Some(Reader::Run(r.clone()));
         }
-        (caller.node.is_some() || caller.ctx.is_some()).then_some(Reader::Conversation)
+        (caller.node.is_some() || caller.ctx.is_some())
+            .then(|| Reader::Conversation(Some(caller.context_id())))
     }
 
     /// The context a deferred reply to `target` is read into. A child that
@@ -115,7 +135,8 @@ impl Runtime {
             Target::Child(node, _) => match self.children.get(*node).map(|c| &c.kind) {
                 Some(ChildKind::StepTurn { run, .. }) => Reader::Run(run.clone()),
                 Some(ChildKind::Subagent { handle }) => Reader::Child(handle.clone()),
-                _ => Reader::Conversation,
+                Some(ChildKind::RootTurn { ctx, .. }) => Reader::Conversation(Some(ctx.clone())),
+                _ => Reader::Conversation(None),
             },
         }
     }
@@ -126,7 +147,7 @@ impl Runtime {
     pub(crate) fn withheld(&self, reader: &Reader, source: Source) -> Option<String> {
         let table = self.registry.withholding();
         let (both, handed, who) = match reader {
-            Reader::Conversation => (
+            Reader::Conversation(_) => (
                 table.root_holds_both(),
                 Carries::default(),
                 "this conversation".to_string(),
@@ -159,11 +180,18 @@ impl Runtime {
         if !both {
             // Handed whole, the reader carries it on: its own result is
             // judged with it, whatever the table says the reader can read.
-            if matches!(reader, Reader::Run(_) | Reader::Child(_)) {
+            // A conversation keeps only the Companies it was handed, for the
+            // cross-Company rule.
+            let flow = match reader {
+                Reader::Run(_) | Reader::Child(_) => Some(carried),
+                Reader::Conversation(Some(_)) => Some(companies_of(&carried)),
+                Reader::Conversation(None) => None,
+            };
+            if let Some(flow) = flow.filter(|c| !c.is_empty()) {
                 self.read_flows
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push((reader.clone(), carried));
+                    .push((reader.clone(), flow));
             }
             return None;
         }
@@ -343,8 +371,27 @@ impl Runtime {
             match reader {
                 Reader::Run(id) => self.hand_run(&id, &carries),
                 Reader::Child(h) => self.steer_carries(&h, &carries),
-                Reader::Conversation => {}
+                Reader::Conversation(Some(ctx)) => self.hand_conversation(&ctx, &carries),
+                Reader::Conversation(None) => {}
             }
+        }
+    }
+
+    /// The Companies whose content `source`'s result carries.
+    pub(crate) fn companies_carried(&self, source: Source) -> Carries {
+        companies_of(&match source {
+            Source::Run(id) => self.run_carries(id),
+            Source::Child(h) => self.child_carries(h),
+        })
+    }
+
+    /// Add `carries` to conversation `ctx`'s record — the Companies whose
+    /// content reached it.
+    pub(crate) fn hand_conversation(&mut self, ctx: &str, carries: &Carries) {
+        if let Some(c) = self.contexts.get_mut(ctx)
+            && c.carries.union(carries)
+        {
+            c.dirty = true;
         }
     }
 
@@ -354,11 +401,11 @@ impl Runtime {
     /// conversation, the peer's text — decided now, while who it is is
     /// known, and recorded on what it reaches.
     ///
-    /// A conversation carries nothing else. A root holding both legs is
-    /// withheld every tainted result; one holding a leg less is judged by
-    /// everything it can hand its text on to (`config::taint::Withholding`),
-    /// so what it starts or spawns holds a leg less too, and no reader
-    /// downstream of it holds both.
+    /// A conversation carries nothing else but the Companies whose content
+    /// it read. A root holding both legs is withheld every tainted result;
+    /// one holding a leg less is judged by everything it can hand its text
+    /// on to (`config::taint::Withholding`), so what it starts or spawns
+    /// holds a leg less too, and no reader downstream of it holds both.
     pub(crate) fn caller_carries(&self, caller: &ToolCaller) -> Carries {
         if let Some(h) = &caller.subagent {
             return self.child_carries(h);
@@ -367,6 +414,15 @@ impl Runtime {
             return self.run_carries(r);
         }
         let mut c = Carries::default();
+        if let Some(ctx) = caller.ctx.as_deref() {
+            if let Some(held) = self.contexts.get(ctx) {
+                c.union(&held.carries);
+            }
+            self.unsettled(
+                |r| matches!(r, Reader::Conversation(Some(x)) if x == ctx),
+                &mut c,
+            );
+        }
         if let Some(p) = caller.principal.as_deref()
             && self
                 .principal_index
@@ -382,21 +438,17 @@ impl Runtime {
     /// or a child's record, or, for a conversation an A2A peer (an `agent`
     /// principal) holds, the peer's text.
     pub(crate) fn target_carries(&self, target: &Target) -> Carries {
-        use super::children::ChildKind;
         match self.reader_at(target) {
             Reader::Run(r) => self.run_carries(&r),
             Reader::Child(h) => self.child_carries(&h),
-            Reader::Conversation => {
-                let principal = match target {
-                    Target::Child(node, _) => match self.children.get(*node).map(|c| &c.kind) {
-                        Some(ChildKind::RootTurn { ctx, .. }) => {
-                            self.contexts.get(ctx).and_then(|c| c.principal.clone())
-                        }
-                        _ => None,
-                    },
-                    Target::Step(..) => None,
-                };
-                let mut c = Carries::default();
+            Reader::Conversation(ctx) => {
+                let held = ctx.as_deref().and_then(|x| self.contexts.get(x));
+                let principal = held.and_then(|c| c.principal.clone());
+                let mut c = held.map(|h| h.carries.clone()).unwrap_or_default();
+                self.unsettled(
+                    |r| matches!(r, Reader::Conversation(Some(x)) if Some(x) == ctx.as_ref()),
+                    &mut c,
+                );
                 if let Some(p) = principal.as_deref()
                     && self
                         .principal_index

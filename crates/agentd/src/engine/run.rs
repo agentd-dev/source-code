@@ -100,6 +100,12 @@ pub struct StepState {
     /// exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<String>,
+    /// The Company a call of this attempt was sent to, written durably
+    /// before the call left: a restart that finds the step still running
+    /// ends it `outcome unknown` rather than send the call again (RFC 0047
+    /// §5.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -392,6 +398,7 @@ impl RunState {
             st.error = None;
             st.wait = None;
             st.cache_key = None;
+            st.company = None;
             st.span = Some(crate::obs::trace::new_span_id());
             // `forced` stays: a routed step caught running by a crash is
             // replayed as routed — past its dependencies, as the edge sent it.

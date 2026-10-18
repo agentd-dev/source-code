@@ -445,6 +445,9 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
             // Nothing here spawns a subagent; the subagent reads are held
             // to their schemas by the tool schemas they publish verbatim.
             "subagent.status" | "subagent.get" => continue,
+            // Served only with a declared Company, which needs the fake
+            // Company: companies_e2e holds its reply to this same schema.
+            "company.status" => continue,
             other => panic!("the read {other} needs arguments in this test"),
         };
         run(op, args);

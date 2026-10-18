@@ -84,6 +84,36 @@ pub fn redial_backoff(n: u32) -> Duration {
 
 impl std::error::Error for McpError {}
 
+/// How far a failed `tools/call` got: whether the server may have acted on
+/// it, and whether anything in its error is the server's. The transport says
+/// it — beside the error, never inside text the server could have written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// It never left: no connection was made, this build cannot speak the
+    /// endpoint's scheme, or the server's own wait (`Retry-After`) was still
+    /// running. Nothing in the error is the server's.
+    Unsent,
+    /// It never left: the request signer produced no credential. The error
+    /// carries the signer's cause.
+    Unsigned,
+    /// It was sent and no answer came — silence past the timeout, a dropped
+    /// connection, a stream that ended first: the server may have acted on it.
+    Unanswered,
+    /// The server answered with an error — a JSON-RPC error, or an HTTP
+    /// status without one — and this HTTP status.
+    Answered { status: u16 },
+    /// The server answered with a result this client could not read: it
+    /// acted on the request.
+    Unreadable,
+}
+
+/// A `tools/call` that failed, and how far it got.
+#[derive(Debug)]
+pub struct CallFailed {
+    pub error: McpError,
+    pub reach: Reach,
+}
+
 /// A connected (and, after [`McpClient::initialize`], handshaken) remote MCP
 /// server over Streamable HTTP.
 pub struct McpClient {
@@ -523,6 +553,18 @@ impl McpClient {
         self.call(name, arguments, Some(extra_meta), Some(timeout))
     }
 
+    /// [`Self::call_tool_with_meta`], saying of a failure how far the call
+    /// got ([`Reach`]): for a caller that must know whether the server may
+    /// have acted on it, and whether its error holds the server's words.
+    pub fn call_tool_reaching(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        extra_meta: Value,
+    ) -> Result<CallToolResult, CallFailed> {
+        self.call_reaching(name, arguments, Some(extra_meta), None)
+    }
+
     /// Every `tools/call` path lands here, so the persistent meta rides each
     /// one — the subagent loop's plain `call_tool` included.
     fn call(
@@ -532,10 +574,28 @@ impl McpClient {
         extra_meta: Option<Value>,
         bound: Option<Duration>,
     ) -> Result<CallToolResult, McpError> {
+        self.call_reaching(name, arguments, extra_meta, bound)
+            .map_err(|f| f.error)
+    }
+
+    fn call_reaching(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        extra_meta: Option<Value>,
+        bound: Option<Duration>,
+    ) -> Result<CallToolResult, CallFailed> {
         let meta = merge_meta(self.tool_meta.as_ref(), extra_meta.as_ref());
-        let raw = self.sdk()?.call_tool(name, arguments, meta, bound)?;
-        serde_json::from_value(raw).map_err(|e| {
-            McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
+        let sdk = self.sdk().map_err(|error| CallFailed {
+            error,
+            reach: Reach::Unsent,
+        })?;
+        let raw = sdk
+            .call_tool_reaching(name, arguments, meta, bound)
+            .map_err(|(error, reach)| CallFailed { error, reach })?;
+        serde_json::from_value(raw).map_err(|e| CallFailed {
+            error: McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name)),
+            reach: Reach::Unreadable,
         })
     }
 

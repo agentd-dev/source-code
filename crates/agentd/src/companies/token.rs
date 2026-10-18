@@ -12,16 +12,19 @@
 //! Session assertion, both with `aud` the issuer as one string; every retry
 //! signs fresh ones (Guides #both-retries). A `use_dpop_nonce` is retried
 //! once with the nonce the Company sent (§4.3: "Personal Agents MUST support
-//! nonces"). A response is used only with every member §4.2 requires; one
-//! missing any is an error. Bodies are never logged: an error carries the
-//! code the Company gave, and nothing it wrote.
+//! nonces"). A token request is safe to repeat (RFC 0047 §5.9), so one that
+//! got no answer or a `5xx` is sent again, at most [`ATTEMPTS`] times in all,
+//! backing off between — never before the Company's not-before instant,
+//! which refuses it unsent. A response is used only with every member §4.2
+//! requires; one missing any is an error. Bodies are never logged: an error
+//! carries the code the Company gave, and nothing it wrote.
 
 use std::time::Duration;
 
 use serde_json::Value;
 
 use super::dpop::{DpopKey, Nonces};
-use super::http::Dialer;
+use super::http::{ATTEMPTS, Dialer, backoff};
 use super::identity::Identity;
 use super::wire::{self, error as err, grant, param};
 use crate::auth::client_assertion::ASSERTION_TYPE;
@@ -73,6 +76,16 @@ impl<'a> Request<'a> {
             dpop: false,
         }
     }
+
+    /// What the request is for, as `agent_company_token_requests_total`
+    /// names it.
+    pub fn grant(&self) -> &'static str {
+        match (self.resource, self.session_id) {
+            (Some(_), _) => "bearer",
+            (None, Some(_)) => "renew",
+            (None, None) => "start",
+        }
+    }
 }
 
 /// A token response (§4.2).
@@ -111,6 +124,11 @@ pub enum TokenError {
     },
     /// The request was not sent, or no answer came.
     Transport(String),
+    /// A status other than success, with no OAuth error.
+    Status(u16),
+    /// Not sent: the Company asked for no request before an instant still
+    /// ahead.
+    Paced(String),
     /// An answer that is not a token response the draft describes.
     Malformed(String),
 }
@@ -120,6 +138,16 @@ impl TokenError {
         match self {
             TokenError::Refused { code, .. } => Some(code),
             _ => None,
+        }
+    }
+
+    /// Whether sending the request again could get another answer: no
+    /// answer came, or the Company's server failed (`5xx`).
+    fn repeatable(&self) -> bool {
+        match self {
+            TokenError::Transport(_) => true,
+            TokenError::Status(s) | TokenError::Refused { status: s, .. } => *s >= 500,
+            TokenError::Paced(_) | TokenError::Malformed(_) => false,
         }
     }
 }
@@ -140,24 +168,55 @@ impl std::fmt::Display for TokenError {
                 Ok(())
             }
             TokenError::Transport(e) => write!(f, "the token request failed: {e}"),
+            TokenError::Status(s) => {
+                write!(
+                    f,
+                    "the token endpoint answered HTTP {s} with no OAuth error"
+                )
+            }
+            TokenError::Paced(e) => write!(f, "the token request was not sent: {e}"),
             TokenError::Malformed(e) => write!(f, "the token endpoint answered {e}"),
         }
     }
 }
 
-/// Send `req`, retrying once with the Company's nonce when it asks for one.
+/// Send `req`: once more with the Company's nonce when it asks for one, and
+/// again after a back-off when no answer came or its server failed, at most
+/// [`ATTEMPTS`] times.
 pub fn request(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
-    match once(ctx, req) {
-        Err(TokenError::Refused { code, .. }) if req.dpop && code == err::USE_DPOP_NONCE => {
-            once(ctx, req)
+    let (mut nonce, mut attempt) = (false, 1);
+    loop {
+        match once(ctx, req) {
+            Err(TokenError::Refused { code, .. })
+                if req.dpop && !nonce && code == err::USE_DPOP_NONCE =>
+            {
+                nonce = true;
+            }
+            Err(e) if e.repeatable() && attempt < ATTEMPTS => {
+                std::thread::sleep(backoff(attempt));
+                attempt += 1;
+            }
+            other => return other,
         }
-        other => other,
     }
 }
 
 /// One attempt, with fresh assertions and, when it carries one, a fresh
-/// proof.
+/// proof — counted by its outcome once it is sent.
 fn once(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
+    ctx.dialer.pace.check().map_err(TokenError::Paced)?;
+    let out = attempt(ctx, req);
+    let outcome = match &out {
+        Ok(_) => "ok",
+        Err(TokenError::Refused { .. }) => "refused",
+        Err(TokenError::Paced(_)) => return out,
+        Err(_) => "failed",
+    };
+    crate::obs::metrics::record_company_token_request(&ctx.dialer.company, req.grant(), outcome);
+    out
+}
+
+fn attempt(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
     let mut form = crate::auth::oauth2::Form::new();
     form.field("grant_type", grant::JWT_BEARER);
     let assertion = ctx
@@ -218,7 +277,7 @@ fn once(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
                 extension: json["extension"].as_str().map(str::to_string),
                 retry_after: reply.retry_after(),
             },
-            None => TokenError::Malformed(format!("HTTP {} with no OAuth error", reply.status)),
+            None => TokenError::Status(reply.status),
         });
     }
     parse(&json, req)
@@ -278,6 +337,29 @@ mod tests {
     fn good() -> Value {
         json!({"access_token": "t", "token_type": "DPoP", "expires_in": 60, "scope": "",
                "session_id": "ses_1", "signed_in": false})
+    }
+
+    /// A token request is sent again only when another answer could come:
+    /// none came, or the Company's server failed. A refusal, a malformed
+    /// answer and a wait the Company asked for are final.
+    #[test]
+    fn only_a_request_that_got_no_answer_or_a_5xx_is_repeated() {
+        let refused = |status| TokenError::Refused {
+            status,
+            code: "invalid_grant".into(),
+            extension: None,
+            retry_after: None,
+        };
+        assert!(TokenError::Transport("reset".into()).repeatable());
+        assert!(TokenError::Status(502).repeatable());
+        assert!(refused(503).repeatable());
+        assert!(!refused(400).repeatable());
+        assert!(!TokenError::Status(404).repeatable());
+        assert!(!TokenError::Paced("rate limited".into()).repeatable());
+        assert!(!TokenError::Malformed("x".into()).repeatable());
+        assert_eq!(Request::start().grant(), "start");
+        assert_eq!(Request::renew("s").grant(), "renew");
+        assert_eq!(Request::bearer("s", "https://m/mcp").grant(), "bearer");
     }
 
     /// A response missing any member §4.2 requires is an error, not a token.

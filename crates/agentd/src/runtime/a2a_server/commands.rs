@@ -85,6 +85,7 @@ enum Route {
     Introspection(super::introspection::IntrospectionOp),
     Auth,
     Instance(crate::runtime::instances::InstanceOp),
+    Company,
 }
 
 /// The row and route of `op`, or `None` for an op nothing serves. The ONE
@@ -121,6 +122,7 @@ fn route(op: &str) -> Option<(&'static surface::OpSpec, Route)> {
         Handler::Introspection => IntrospectionOp::of(op).map(Route::Introspection),
         Handler::Auth => Some(Route::Auth),
         Handler::Instance => InstanceOp::of(op).map(Route::Instance),
+        Handler::Company => Some(Route::Company),
         Handler::Reserved => None,
     };
     route.map(|r| (spec, r))
@@ -211,6 +213,15 @@ impl Runtime {
             Route::Auth => match super::auth_ops::handle(self, principal, op, data) {
                 Ok(super::auth_ops::AuthAnswer::Doc(doc)) => Answer::Doc(doc),
                 Ok(super::auth_ops::AuthAnswer::Done(text, result)) => Answer::Done {
+                    link: None,
+                    text: Some(text),
+                    result: Some(result),
+                },
+                Err(e) => Answer::Reply(e),
+            },
+            Route::Company => match super::company_ops::handle(self, principal, op, data) {
+                Ok(super::company_ops::CompanyAnswer::Doc(doc)) => Answer::Doc(doc),
+                Ok(super::company_ops::CompanyAnswer::Done(text, result)) => Answer::Done {
                     link: None,
                     text: Some(text),
                     result: Some(result),

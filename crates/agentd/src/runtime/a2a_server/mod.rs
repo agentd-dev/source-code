@@ -36,6 +36,7 @@ mod admin;
 mod auth_ops;
 mod card;
 mod commands;
+mod company_ops;
 mod feed;
 mod introspection;
 mod listener;

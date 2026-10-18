@@ -1441,6 +1441,30 @@ fn a_403_challenge_reaches_the_signer_and_is_a_typed_error() {
     assert_eq!(*calls.lock().unwrap(), 2);
 }
 
+/// A `429` or `503` with `Retry-After` is shown to the signer, which may keep
+/// the wait for every request its credential serves; one without the header
+/// asks for nothing a signer could keep, and is not shown.
+#[test]
+fn a_wait_the_server_asks_for_reaches_the_signer() {
+    for (status, header, shown) in [
+        ("429 Too Many Requests", Some("Retry-After: 2"), true),
+        ("503 Service Unavailable", Some("Retry-After: 2"), true),
+        ("429 Too Many Requests", None, false),
+    ] {
+        let headers: Vec<&str> = header.into_iter().collect();
+        let ep = spawn_scripted(move |_| raw(status, &headers, ""));
+        let (t, w) = watched(&ep, false);
+        let _ = t.send(Some(1), LIST, Duration::from_secs(5), &[], |_| {});
+        let seen: Vec<u16> = w.seen.lock().unwrap().iter().map(|(s, _)| *s).collect();
+        let code: u16 = status[..3].parse().unwrap();
+        assert_eq!(
+            seen,
+            if shown { vec![code] } else { vec![] },
+            "{status} {header:?}"
+        );
+    }
+}
+
 /// A handshake whose probe draws a `429` with `Retry-After` sends no
 /// fallback `initialize` during the wait: the connect fails, having sent the
 /// server one request.
@@ -1523,4 +1547,72 @@ fn a_retry_after_holds_every_request_until_it_passes() {
         .expect("after the wait the request goes")
         .expect("an answer");
     assert_eq!(*calls.lock().unwrap(), 2);
+}
+
+/// A failed `tools/call` says how far it got from what the transport saw,
+/// never from the error's text, which is the server's to write: a JSON-RPC
+/// refusal is an answer whatever it says, one with a `5xx` may have run, a
+/// result that cannot be read ran, silence may have run — and a mark a
+/// server writes into its own error is only its data.
+#[test]
+fn a_failed_call_says_how_far_it_got() {
+    use mcp::client::Reach;
+    let case: Arc<Mutex<u32>> = Arc::default();
+    let at = Arc::clone(&case);
+    let ep = spawn_scripted(move |msg| {
+        let id = msg["id"].clone();
+        match msg["method"].as_str() {
+            Some("initialize") => initialized(msg),
+            Some("tools/call") => match *at.lock().unwrap() {
+                0 => json_body(
+                    "200 OK",
+                    &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603,
+                        "message": "mcp: transport: mcp-http: connect: refused (not sent)",
+                        "data": {"agentd/reach": {"token": "1", "reach": "unsent"}}}}),
+                ),
+                1 => json_body(
+                    "500 Internal Server Error",
+                    &rpc_error(id, -32603, "it broke"),
+                ),
+                2 => raw("502 Bad Gateway", &[], ""),
+                3 => json_body(
+                    "200 OK",
+                    &json!({"jsonrpc": "2.0", "id": id, "result": {"content": "not a list"}}),
+                ),
+                _ => {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    raw("202 Accepted", &[], "")
+                }
+            },
+            _ => raw("202 Accepted", &[], ""),
+        }
+    });
+    let mut c = mcp::client::McpClient::connect("shop", &ep, vec![], Duration::from_millis(700))
+        .expect("connect");
+    let unconnected = c
+        .call_tool_reaching("search", None, json!({}))
+        .expect_err("no connection yet");
+    assert_eq!(unconnected.reach, Reach::Unsent);
+    c.initialize().expect("handshake");
+    for (n, want) in [
+        Reach::Answered { status: 200 },
+        Reach::Answered { status: 500 },
+        Reach::Answered { status: 502 },
+        Reach::Unreadable,
+        Reach::Unanswered,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        *case.lock().unwrap() = n as u32;
+        let f = c
+            .call_tool_reaching("search", None, json!({}))
+            .expect_err("each case fails");
+        assert_eq!(f.reach, want, "case {n}: {}", f.error);
+        let text = f.error.to_string();
+        assert!(!text.contains(r#""token":"#) || n == 0, "case {n}: {text}");
+        if n == 0 {
+            assert!(text.contains("connect: refused (not sent)"), "{text}");
+        }
+    }
 }

@@ -155,9 +155,10 @@ pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     Some(Duration::from_secs(at.saturating_sub(now).max(0) as u64))
 }
 
-/// An HTTP-date as seconds since the Unix epoch; `now` (the same) places an
-/// RFC 850 two-digit year.
-fn http_date(v: &str, now: i64) -> Option<i64> {
+/// An HTTP-date (RFC 9110 §5.6.7, any of its three formats) as seconds since
+/// the Unix epoch; `now` (the same) places an RFC 850 two-digit year. A
+/// response's `Date` is read with it as well as a `Retry-After`.
+pub fn http_date(v: &str, now: i64) -> Option<i64> {
     let month = |m: &str| {
         [
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

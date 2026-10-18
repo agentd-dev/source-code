@@ -384,10 +384,19 @@ impl Hangup {
     }
 }
 
+/// A request's answer: the server's JSON-RPC message, and the HTTP status
+/// it came with — a JSON-RPC error a server sends with a `5xx` is an answer,
+/// and one that may say the request ran.
+#[derive(Debug)]
+pub(crate) struct Answer {
+    pub(crate) message: Value,
+    pub(crate) status: u16,
+}
+
 /// The classification of one [`HttpTransport::send_once`] attempt (AAuth loop).
 enum SendOutcome {
-    /// A final JSON-RPC result (or `None` for a notification ack).
-    Result(Option<Value>),
+    /// A final JSON-RPC answer (or `None` for a notification ack).
+    Result(Option<Answer>),
     /// A terminal transport/HTTP error.
     Error(HttpError),
     /// The signer satisfied an `AAuth-Requirement`; re-sign and retry.
@@ -443,13 +452,14 @@ pub trait RequestSigner: Send + Sync {
         path: &str,
         body: &[u8],
     ) -> Result<Vec<(String, String)>, String>;
-    /// React to a response — every `401`, `403` and `202`, and any carrying an
-    /// AAuth header: adopt an `AAuth-Access` token, satisfy an
-    /// `AAuth-Requirement` (e.g. run the Person-Server exchange), renew a
-    /// credential a `WWW-Authenticate` challenge refused, and return `true`
-    /// iff the request should be RE-SIGNED and retried (something was newly
-    /// satisfied). The default reacts to nothing. May do network I/O (the PS
-    /// token exchange, a token renewal).
+    /// React to a response — every `401`, `403` and `202`, a `429` or `503`
+    /// with a `Retry-After`, and any carrying an AAuth header: adopt an
+    /// `AAuth-Access` token, satisfy an `AAuth-Requirement` (e.g. run the
+    /// Person-Server exchange), renew a credential a `WWW-Authenticate`
+    /// challenge refused, keep the wait a `Retry-After` asks for, and return
+    /// `true` iff the request should be RE-SIGNED and retried (something was
+    /// newly satisfied). The default reacts to nothing. May do network I/O
+    /// (the PS token exchange, a token renewal).
     fn on_response(&self, _resp: &AuthResponse, _authority: &str) -> bool {
         false
     }
@@ -768,9 +778,31 @@ impl HttpTransport {
         body: &[u8],
         timeout: Duration,
         extra_headers: &[(&str, &str)],
-        mut on_notification: F,
+        on_notification: F,
         hangup: &Hangup,
     ) -> Result<Option<Value>, HttpError> {
+        self.exchange_until_hangup(
+            request_id,
+            body,
+            timeout,
+            extra_headers,
+            on_notification,
+            hangup,
+        )
+        .map(|a| a.map(|a| a.message))
+    }
+
+    /// [`Self::send_until_hangup`], with the HTTP status the answer came
+    /// with.
+    pub(crate) fn exchange_until_hangup<F: FnMut(Value)>(
+        &self,
+        request_id: Option<i64>,
+        body: &[u8],
+        timeout: Duration,
+        extra_headers: &[(&str, &str)],
+        mut on_notification: F,
+        hangup: &Hangup,
+    ) -> Result<Option<Answer>, HttpError> {
         // Stamped once: every AAuth retry sends, and signs, the same bytes.
         let stamped = self.stamped(request_id, body);
         let out = self.send_attempts(
@@ -794,7 +826,7 @@ impl HttpTransport {
         extra_headers: &[(&str, &str)],
         on_notification: &mut F,
         hangup: &Hangup,
-    ) -> Result<Option<Value>, HttpError> {
+    ) -> Result<Option<Answer>, HttpError> {
         // AAuth request loop: send signed; if the server answers
         // with an `AAuth-Requirement` the signer can satisfy (adopt an access
         // token, run the Person-Server exchange), re-sign and retry — bounded,
@@ -915,11 +947,12 @@ impl HttpTransport {
         }
 
         // The signer's reaction: adopt an AAuth access token, satisfy a
-        // requirement, renew a credential the server refused. `on_response`
-        // returns whether a retry would now differ. Only consulted when a
-        // signer is present AND the response carries an auth signal (an AAuth
-        // requirement, an access token, a 401, 403 or 202) — a plain success
-        // skips it.
+        // requirement, renew a credential the server refused, keep a wait the
+        // server asked for. `on_response` returns whether a retry would now
+        // differ. Only consulted when a signer is present AND the response
+        // carries an auth signal (an AAuth requirement, an access token, a
+        // 401, 403 or 202) or a `Retry-After` on a 429 or 503 — a plain
+        // success skips it.
         let www_authenticate = resp.header("www-authenticate").map(str::to_string);
         let retry_after = resp.retry_after();
         if let Some(signer) = &self.signer {
@@ -939,6 +972,7 @@ impl HttpTransport {
             if ar.requirement.is_some()
                 || ar.access.is_some()
                 || matches!(resp.status, 401 | 403 | 202)
+                || (matches!(resp.status, 429 | 503) && retry_after.is_some())
             {
                 let authority = self.endpoint.host_header().to_string();
                 if signer.on_response(&ar, &authority) {
@@ -980,7 +1014,7 @@ impl HttpTransport {
                 && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
                 && is_json_rpc_error(&v)
             {
-                return Ok(SendOutcome::Result(Some(v)));
+                return Ok(SendOutcome::Result(Some(Answer { message: v, status })));
             }
             return Ok(SendOutcome::Error(
                 throttled.unwrap_or(HttpError::Status(status)),
@@ -992,6 +1026,7 @@ impl HttpTransport {
             return Ok(SendOutcome::Result(None));
         }
 
+        let status = resp.status;
         if resp.is_event_stream() {
             let mut sse = resp.sse();
             let mut first = true;
@@ -1000,7 +1035,10 @@ impl HttpTransport {
                     hangup.open_stream();
                 }
                 if let Some(msg) = route_message(&ev, request_id, on_notification) {
-                    return Ok(SendOutcome::Result(Some(msg)));
+                    return Ok(SendOutcome::Result(Some(Answer {
+                        message: msg,
+                        status,
+                    })));
                 }
             }
             Ok(SendOutcome::Error(HttpError::NoResponse))
@@ -1014,7 +1052,7 @@ impl HttpTransport {
             }
             let v: Value = serde_json::from_slice(&bytes)
                 .map_err(|e| HttpError::Http(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-            Ok(SendOutcome::Result(Some(v)))
+            Ok(SendOutcome::Result(Some(Answer { message: v, status })))
         }
     }
 

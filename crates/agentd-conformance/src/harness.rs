@@ -207,6 +207,17 @@ impl Harness {
         self.spawn_env(args, &[])
     }
 
+    /// Like [`Harness::spawn`], its stderr — agentd's log — written to `log`.
+    pub fn spawn_logged(&self, args: &[&str], log: &Path) -> Daemon {
+        let child = Command::new(&self.agentd)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(log).expect("a log file for the daemon"))
+            .spawn()
+            .expect("spawn agentd daemon");
+        Daemon { child: Some(child) }
+    }
+
     /// Like [`Harness::spawn`], with extra environment variables — how a check
     /// hands the daemon a credential its config names as `{{secret:NAME}}`,
     /// since agentd refuses one written inline.

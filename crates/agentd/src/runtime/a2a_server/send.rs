@@ -349,9 +349,14 @@ impl Runtime {
             // already rewrite the config, the store or the definition; what
             // actually matters is that the record names who really answered,
             // so an override is marked as one and audited as one.
-            let addressee = match &self.pending[i].kind {
-                PendingKind::Human { addressee, .. } => addressee.clone(),
-                _ => None,
+            let (addressee, users_own) = match &self.pending[i].kind {
+                PendingKind::Human {
+                    addressee, policy, ..
+                } => (
+                    addressee.clone(),
+                    policy.as_ref().is_some_and(|c| c.company.is_some()),
+                ),
+                _ => (None, false),
             };
             // The gate's run or turn keeps its own trace; the request that
             // answered it, from the caller's, is recorded as a link.
@@ -363,7 +368,10 @@ impl Runtime {
             if let Some(a) = &addressee
                 && !a.matches(principal)
             {
-                if !principal.is_operator() {
+                // A Company gate is the User's alone (RFC 0047 §5.7): its
+                // answer is presented to the Company as the User's, so an
+                // operator who is not the User has no override.
+                if !principal.is_operator() || users_own {
                     let want = a.describe();
                     glog.info(
                         "human.answer.not_addressed",

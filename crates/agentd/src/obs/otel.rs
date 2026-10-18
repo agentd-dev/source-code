@@ -466,6 +466,21 @@ pub fn mcp_span(
     ok: bool,
     start_unix_nanos: u128,
 ) {
+    mcp_span_linked(call, method, target, server, ok, start_unix_nanos, None);
+}
+
+/// [`mcp_span`], linked to `link`: the span the server was sent in its
+/// place — a Company's own trace under the strict privacy profile (RFC 0047
+/// §5.10), which only agentd's telemetry ties to the unit's.
+pub fn mcp_span_linked(
+    call: Option<&TraceContext>,
+    method: &str,
+    target: &str,
+    server: &str,
+    ok: bool,
+    start_unix_nanos: u128,
+    link: Option<&TraceContext>,
+) {
     let s = span(
         call,
         &format!("{method} {target}"),
@@ -474,6 +489,10 @@ pub fn mcp_span(
     )
     .attr("mcp.method.name", method)
     .attr("agentd.mcp.server", server);
+    let s = match link {
+        Some(l) => s.link(&l.traceparent()),
+        None => s,
+    };
     let s = match method {
         "tools/call" => s
             .attr("gen_ai.operation.name", "execute_tool")

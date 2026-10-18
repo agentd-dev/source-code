@@ -60,6 +60,31 @@ pub fn checks() -> Vec<Check> {
             "after a restart agentd presents the same User ID and renews the same session_id, with a new DPoP key",
             keeps_the_user_across_restarts,
         ),
+        check(
+            "companies/agent-sends-a-company-none-of-its-correlators",
+            "the calls a workflow makes to two Companies carry none of agentd's instance, run, context, principal or label keys, and no trace or idempotency key seen at one is seen at the other; the handshake and tool list carry no trace context, no clientInfo.title and no AAuth signature",
+            sends_a_company_none_of_its_correlators,
+        ),
+        check(
+            "companies/agent-acts-at-one-company-for-another-only-with-the-user",
+            "a run that read one Company's answer sends another Company nothing when the User cannot be asked, with agent.approval and the ask_human fallback both auto",
+            acts_at_one_company_for_another_only_with_the_user,
+        ),
+        check(
+            "companies/agent-waits-out-a-companys-retry-after",
+            "against the retry-after variant, whose token endpoint and MCP server each answer 429 with Retry-After, nothing agentd sends reaches the Company before the wait is over, and it joins and calls once it is",
+            waits_out_a_companys_retry_after,
+        ),
+        check(
+            "companies/agent-never-repeats-a-call-that-may-have-run",
+            "a tools/call that got no answer in time, or a 502, after it was sent is not sent again — by the transport or by the step's retry: — so no run's call reaches the Company twice: each run's calls go out in one trace of its own there, and no trace id is seen twice",
+            never_repeats_a_call_that_may_have_run,
+        ),
+        check(
+            "companies/agent-keeps-tokens-out-of-its-log",
+            "no Session Token or Bearer token the Company issued appears in agentd's log, at debug level with content logging on",
+            keeps_tokens_out_of_its_log,
+        ),
     ]
 }
 
@@ -67,6 +92,15 @@ const fn spec(check: &'static str, section: &'static str, text: &'static str) ->
     Quote {
         check,
         page: Page::Spec,
+        section,
+        text,
+    }
+}
+
+const fn guides(check: &'static str, section: &'static str, text: &'static str) -> Quote {
+    Quote {
+        check,
+        page: Page::Guides,
         section,
         text,
     }
@@ -144,6 +178,41 @@ pub const QUOTES: &[Quote] = &[
         "4.2",
         "The ID is stable, so the Company sees the same User across Sessions.",
     ),
+    spec(
+        "companies/agent-sends-a-company-none-of-its-correlators",
+        "4.2",
+        "It is opaque and different for each Company, so Companies can't match Users with each other.",
+    ),
+    spec(
+        "companies/agent-acts-at-one-company-for-another-only-with-the-user",
+        "8.1",
+        "A Personal Agent MUST NOT act at one Company, or send it information, because content from another Company asked it to.",
+    ),
+    spec(
+        "companies/agent-acts-at-one-company-for-another-only-with-the-user",
+        "8.1",
+        "Only the User decides what the Personal Agent does.",
+    ),
+    spec(
+        "companies/agent-waits-out-a-companys-retry-after",
+        "4.3",
+        "The Personal Agent MUST wait at least that long before sending the request again.",
+    ),
+    guides(
+        "companies/agent-waits-out-a-companys-retry-after",
+        "Rate limits",
+        "Personal agents: keep track of limits for each company and share them across your tasks and users, rather than letting each task find the limit on its own.",
+    ),
+    spec(
+        "companies/agent-never-repeats-a-call-that-may-have-run",
+        "4.3",
+        "A request that changes something then relies on being idempotent, so a replay doesn't repeat it.",
+    ),
+    guides(
+        "companies/agent-keeps-tokens-out-of-its-log",
+        "Handling secrets",
+        "Keep them out of logs, telemetry, error reports, model context, conversation messages, and URLs.",
+    ),
 ];
 
 fn verdict(r: Result<(), String>) -> Outcome {
@@ -161,10 +230,25 @@ fn need(cond: bool, why: impl Into<String>) -> Result<(), String> {
 /// probe's document server.
 struct Run {
     company: Company,
+    /// The Companies declared beside it, by entry.
+    more: Vec<(String, Company)>,
     _host: Agent,
     tmp: TempDir,
     cfg: String,
     daemon: Option<Daemon>,
+}
+
+/// What a check declares beside the one Company `shop`.
+#[derive(Default)]
+struct Extra<'a> {
+    /// More Companies: each entry and its fake's variants.
+    more: &'a [(&'a str, &'a [&'a str])],
+    /// Fields every company entry gets.
+    entry: &'a str,
+    /// Lines under `agent:`.
+    agent: &'a str,
+    /// Configuration after the services: workflows.
+    rest: &'a str,
 }
 
 impl Run {
@@ -222,24 +306,45 @@ impl Run {
 /// The fake (with `variants`), agentd's configuration for it, and its
 /// identity printed and hosted.
 fn prepare(h: &Harness, variants: &[&str]) -> Result<Run, String> {
+    prepare_with(h, variants, &Extra::default())
+}
+
+/// [`prepare`], with what `extra` declares beside it.
+fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, String> {
     let tmp = h.tempdir();
     let company = Company::spawn(h, &tmp, variants);
+    let more: Vec<(String, Company)> = extra
+        .more
+        .iter()
+        .map(|(name, v)| (name.to_string(), Company::spawn(h, &tmp, v)))
+        .collect();
     let host = Agent::start();
     let dir = tmp.path().display().to_string();
     let cfg = format!("{dir}/agent.yaml");
+    let entry = |name: &str, origin: &str| {
+        format!(
+            "  {name}: {{kind: company, endpoint: \"{origin}\", allow_private: true{}}}\n",
+            extra.entry
+        )
+    };
+    let mut services = entry("shop", &company.origin);
+    for (name, c) in &more {
+        services.push_str(&entry(name, &c.origin));
+    }
     std::fs::write(
         &cfg,
         format!(
-            "agent: {{name: conformance-pa, instruction: Shop., prompt: Wait., preflight: never}}\n\
+            "agent:\n  name: conformance-pa\n  instruction: Shop.\n  prompt: Wait.\n  preflight: never\n{agent}\
              intelligence: {{endpoints: \"mock:final\", model: mock}}\n\
              store: {{kind: file, file: {{path: \"{dir}/state\"}}}}\n\
              lifecycle: {{run_until: drained}}\n\
-             observability: {{log_level: warn}}\n\
+             observability: {{log_level: debug, log_content: true}}\n\
              security:\n  tls_ca: \"{ca}\"\n  companies:\n    client: {{id: \"{o}/companies/client.json\", name: \"agentd conformance\", key_file: \"{dir}/client-key\"}}\n\
-             services:\n  shop: {{kind: company, endpoint: \"{c}\", allow_private: true}}\n",
+             services:\n{services}{rest}",
+            agent = extra.agent,
             ca = tls_fixture("ca.pem").display(),
             o = host.origin,
-            c = company.origin,
+            rest = extra.rest,
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -264,11 +369,50 @@ fn prepare(h: &Harness, variants: &[&str]) -> Result<Run, String> {
     }
     Ok(Run {
         company,
+        more,
         _host: host,
         tmp,
         cfg,
         daemon: None,
     })
+}
+
+/// What reached `c`, its steering and reading aside.
+fn record_of(c: &Company) -> Vec<Value> {
+    c.record()
+        .into_iter()
+        .filter(|r| {
+            !r["path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("/_mock/")
+        })
+        .collect()
+}
+
+fn tools_calls(record: &[Value]) -> Vec<&Value> {
+    record.iter().filter(|r| r["mcp"] == "tools/call").collect()
+}
+
+/// Wait up to `secs` for `done` to hold, or say `what` never happened.
+fn wait(secs: u64, what: &str, mut done: impl FnMut() -> bool) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !done() {
+        if Instant::now() > deadline {
+            return Err(format!("{what} never happened"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// A workflow `name` that runs every second, whose `steps` (YAML lines under
+/// `steps:`, each depending on the start `s` or a step) call Companies, and
+/// that finishes once the steps `ends` names have.
+fn every_second(name: &str, steps: &str, ends: &str) -> String {
+    format!(
+        "workflows:\n  - name: {name}\n    steps:\n      s: {{kind: schedule, every: 1s}}\n{steps}      f: {{kind: finish, depends_on: [{ends}], status: completed}}\n"
+    )
 }
 
 fn joined(h: &Harness) -> Result<Run, String> {
@@ -537,5 +681,241 @@ fn keeps_the_user_across_restarts(h: &Harness) -> Outcome {
             renewed["jkt"] != started["jkt"],
             "the same DPoP key after the restart",
         )
+    })())
+}
+
+/// The `_meta` keys of agentd's own a Company must never be sent under the
+/// strict privacy profile (RFC 0047 §5.10).
+const CORRELATORS: [&str; 7] = [
+    "agent/instance",
+    "agent/run_id",
+    "agent/run",
+    "agent/ctx",
+    "agent/acting_for",
+    "agent/labels",
+    "agent/attempt",
+];
+
+fn sends_a_company_none_of_its_correlators(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = prepare_with(
+            h,
+            &[],
+            &Extra {
+                more: &[("travel", &[])],
+                rest: &every_second(
+                    "both",
+                    "      a: {kind: tool, name: shop.search, args: {query: boots}, depends_on: [s]}\n      b: {kind: tool, name: travel.search, args: {query: flights}, depends_on: [s]}\n",
+                    "a, b",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        let travel = &run.more[0].1;
+        wait(40, "a call to each Company", || {
+            tools_calls(&record_of(&run.company)).len() >= 2
+                && tools_calls(&record_of(travel)).len() >= 2
+        })?;
+        let (shop, travel) = (record_of(&run.company), record_of(travel));
+        let seen = |r: &[Value], key: &str| -> Vec<String> {
+            tools_calls(r)
+                .iter()
+                .filter_map(|c| c[key].as_str().map(str::to_string))
+                .collect()
+        };
+        for (company, record) in [("shop", &shop), ("travel", &travel)] {
+            for c in tools_calls(record) {
+                let meta: Vec<&str> = c["meta"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                if let Some(k) = CORRELATORS.iter().find(|k| meta.contains(k)) {
+                    return Err(format!("{company} was sent {k}: {c}"));
+                }
+            }
+            for r in record
+                .iter()
+                .filter(|r| r["path"] == "/mcp" && r["mcp"] != "tools/call")
+            {
+                need(
+                    r["trace_id"].is_null() && r["client_title"].is_null(),
+                    format!("{company}'s connection request carries agentd's trace or label: {r}"),
+                )?;
+            }
+            for r in record.iter() {
+                need(
+                    r["aauth"].is_null() && r["trace_header"].is_null(),
+                    format!("{company} was sent an AAuth signature or a trace header: {r}"),
+                )?;
+            }
+        }
+        for key in ["trace_id", "idempotency_key"] {
+            let at_shop = seen(&shop, key);
+            need(
+                !at_shop.is_empty(),
+                format!("no call to shop carries a {key}"),
+            )?;
+            if let Some(both) = seen(&travel, key).iter().find(|k| at_shop.contains(k)) {
+                return Err(format!("shop and travel were both sent the {key} {both}"));
+            }
+        }
+        Ok(())
+    })())
+}
+
+fn acts_at_one_company_for_another_only_with_the_user(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = prepare_with(
+            h,
+            &[],
+            &Extra {
+                more: &[("travel", &[])],
+                agent: "  approval: auto\n  ask_human_fallback: auto\n",
+                rest: &every_second(
+                    "cross",
+                    "      a: {kind: tool, name: shop.search, args: {query: boots}, depends_on: [s]}\n      b: {kind: tool, name: travel.search, args: {query: flights}, depends_on: [a]}\n",
+                    "b",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        let travel = &run.more[0].1;
+        wait(40, "travel joined and shop answered two runs", || {
+            record_of(travel).iter().any(|r| r["mcp"] == "tools/list")
+                && tools_calls(&record_of(&run.company)).len() >= 3
+        })?;
+        let sent = record_of(travel);
+        need(
+            tools_calls(&sent).is_empty(),
+            format!(
+                "travel was called by work holding shop's content: {:?}",
+                tools_calls(&sent)
+            ),
+        )
+    })())
+}
+
+fn waits_out_a_companys_retry_after(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = prepare_with(
+            h,
+            &["retry-after"],
+            &Extra {
+                rest: &every_second(
+                    "paced",
+                    "      t: {kind: tool, name: shop.search, args: {query: boots}, depends_on: [s]}\n",
+                    "t",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        wait(40, "a call after the tools/call's 429", || {
+            tools_calls(&run.record())
+                .iter()
+                .any(|c| c["status"] == 200)
+        })?;
+        let record = run.record();
+        need(
+            record.iter().any(|r| r["status"] == 429),
+            "the variant never asked agentd to wait",
+        )?;
+        match record.iter().find(|r| r["early"] == true) {
+            Some(r) => Err(format!("sent before the Company's wait was over: {r}")),
+            None => Ok(()),
+        }
+    })())
+}
+
+fn never_repeats_a_call_that_may_have_run(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = prepare_with(
+            h,
+            &[],
+            &Extra {
+                entry: ", timeout: 1s",
+                rest: &every_second(
+                    "retried",
+                    "      t: {kind: tool, name: shop.search, args: {query: boots}, depends_on: [s], retry: {max: 3, backoff: 10ms}}\n",
+                    "t",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        wait(40, "a first call", || {
+            !tools_calls(&run.record()).is_empty()
+        })?;
+        run.company.control(serde_json::json!({
+            "stall": {"method": "tools/call", "times": 1, "ms": 2500}
+        }));
+        run.company.control(serde_json::json!({
+            "fail": {"method": "tools/call", "times": 1, "status": 502}
+        }));
+        let before = tools_calls(&run.record()).len();
+        wait(40, "the calls after the stalled and the failed one", || {
+            tools_calls(&run.record()).len() >= before + 4
+        })?;
+        std::thread::sleep(Duration::from_millis(2600));
+        let record = run.record();
+        // Under the strict profile a run's calls share one trace at the
+        // Company, and each scheduled run is a trace of its own: a call sent
+        // twice is one trace id seen twice.
+        let traces: Vec<&str> = tools_calls(&record)
+            .iter()
+            .filter_map(|c| c["trace_id"].as_str())
+            .collect();
+        need(
+            record
+                .iter()
+                .any(|r| r["stalled"] == true || r["failed"] == 502),
+            "the fake never held or failed a call",
+        )?;
+        need(!traces.is_empty(), "no call carried a trace")?;
+        for (i, t) in traces.iter().enumerate() {
+            if traces[..i].contains(t) {
+                return Err(format!(
+                    "a run's call reached the Company twice (trace {t})"
+                ));
+            }
+        }
+        Ok(())
+    })())
+}
+
+fn keeps_tokens_out_of_its_log(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = prepare_with(
+            h,
+            &[],
+            &Extra {
+                rest: &every_second(
+                    "calls",
+                    "      t: {kind: tool, name: shop.search, args: {query: boots}, depends_on: [s]}\n",
+                    "t",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        let log = run.tmp.path().join("agentd.log");
+        run.daemon = Some(h.spawn_logged(&["--config", &run.cfg], &log));
+        wait(40, "two calls", || tools_calls(&run.record()).len() >= 2)?;
+        run.stop();
+        let text = std::fs::read_to_string(&log).map_err(|e| e.to_string())?;
+        need(!text.is_empty(), "agentd wrote no log")?;
+        let issued: Vec<String> = run
+            .record()
+            .iter()
+            .filter_map(|r| r["issued"]["access_token"].as_str().map(str::to_string))
+            .collect();
+        need(issued.len() >= 2, "the Company issued no tokens")?;
+        match issued.iter().find(|t| text.contains(t.as_str())) {
+            Some(_) => Err("a token the Company issued is in agentd's log".into()),
+            None => Ok(()),
+        }
     })())
 }

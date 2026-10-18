@@ -963,18 +963,27 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // the declared policy decides. `retry` (the default) keeps the old
     // behaviour, so this only changes runs that asked for something else.
     if !replayed.is_empty() {
-        let policies: Vec<(String, String, crate::engine::model::OnReplay)> = replayed
+        let policies: Vec<(String, String, Option<crate::engine::model::OnReplay>)> = replayed
             .iter()
-            .filter_map(|(rid, sid)| {
-                let wf_name = rt.runs.get(rid)?.workflow.clone();
-                let step = rt.workflows.get(&wf_name)?.steps.get(sid)?;
-                Some((rid.clone(), sid.clone(), step.on_replay))
+            .map(|(rid, sid)| {
+                let policy = rt.runs.get(rid).and_then(|r| {
+                    let step = rt.workflows.get(&r.workflow)?.steps.get(sid)?;
+                    Some(step.on_replay)
+                });
+                (rid.clone(), sid.clone(), policy)
             })
             .collect();
         for (rid, sid, policy) in policies {
-            match policy {
-                crate::engine::model::OnReplay::Retry => {}
-                crate::engine::model::OnReplay::Skip => {
+            // A step whose call to a Company may have been sent is never sent
+            // again (RFC 0047 §5.9): `skip` still skips it, and anything else
+            // ends it `outcome unknown`.
+            let company = rt
+                .runs
+                .get(&rid)
+                .and_then(|r| r.steps.get(&sid))
+                .and_then(|st| st.company.clone());
+            match (policy, company) {
+                (Some(crate::engine::model::OnReplay::Skip), _) => {
                     if let Some(r) = rt.runs.get_mut(&rid) {
                         r.end_step(&sid, StepStatus::Skipped, None, None);
                     }
@@ -983,7 +992,25 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                         json!({"run": rid, "step": sid, "on_replay": "skip"}),
                     );
                 }
-                crate::engine::model::OnReplay::Fail => {
+                (_, Some(company)) => {
+                    if let Some(r) = rt.runs.get_mut(&rid) {
+                        r.end_step(
+                            &sid,
+                            StepStatus::Failed,
+                            None,
+                            Some(format!(
+                                "{}company {company} may have performed this step's call: the step was running when the process stopped, and agentd does not send it again — read its state at the Company before deciding",
+                                companies::OUTCOME_UNKNOWN
+                            )),
+                        );
+                    }
+                    rt.run_log(&rid).warn(
+                        "restore.step.failed",
+                        json!({"run": rid, "step": sid, "company": company, "reason": "outcome_unknown"}),
+                    );
+                }
+                (Some(crate::engine::model::OnReplay::Retry) | None, None) => {}
+                (Some(crate::engine::model::OnReplay::Fail), None) => {
                     if let Some(r) = rt.runs.get_mut(&rid) {
                         r.end_step(
                             &sid,

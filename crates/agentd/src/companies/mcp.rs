@@ -21,17 +21,34 @@
 //! | `403 sign_in_required` | a typed error: the Company needs a signed-in Session |
 //! | `403 insufficient_scope` | a typed error naming the scopes |
 //! | `403 extension_required` | the server is unusable for this instance (§6: "only to refuse the Personal Agent entirely") |
+//! | `429` / `503` with `Retry-After` | the Company's not-before instant: nothing more is sent to it, by any task, until then (§4.3) |
+//!
+//! The handshake and the tool list are safe to repeat, and a failure of
+//! either is tried again at most [`ATTEMPTS`] times before the join's own
+//! back-off takes over. A `tools/call` never is: one that failed after it
+//! was sent — no answer, a `5xx`, a result agentd could not read — may have
+//! been performed, and is answered `outcome unknown` ([`Failure`], RFC 0047
+//! §5.9), for the model or the User to read the state and decide. How far a
+//! call got is the transport's word ([`Reach`]), never read from the error's
+//! text, which holds what the Company wrote.
+//!
+//! Under `privacy: strict` a connection's own requests carry nothing of
+//! agentd's — no `clientInfo.title`, no trace context; `standard` gives them
+//! the instance label and the process trace, as any server gets.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::mcp::client::McpClient;
+use ::mcp::client::{McpClient, Reach};
 use ::mcp::http::{AuthResponse, Challenge, RequestSigner};
 use serde_json::json;
 
+use super::http::{ATTEMPTS, backoff};
 use super::wire::{self, error as err};
 use super::{Company, Supervisor};
+use crate::config::settings::companies::Privacy;
+use crate::runtime::companies::OUTCOME_UNKNOWN;
 
 /// Why a Company's server did not join.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +115,8 @@ pub fn connect(
         company: Arc::clone(&company),
         url: url.clone(),
     });
-    let mut client = McpClient::connect_signed(
+    let standard = company.privacy == Privacy::Standard;
+    let client = McpClient::connect_signed(
         server,
         &url,
         Vec::new(),
@@ -110,8 +128,13 @@ pub fn connect(
     .with_client_info(::mcp::wire::Implementation {
         name: "agentd".into(),
         version: crate::VERSION.into(),
-        title: None,
+        title: standard.then(crate::mcp::workload_label).flatten(),
     });
+    let mut client = if standard {
+        client.with_request_meta(Arc::new(crate::mcp::process_request_meta))
+    } else {
+        client
+    };
     let refused = |e: &dyn std::fmt::Display| {
         let e = e.to_string();
         if company.is_unusable(&url) {
@@ -120,8 +143,24 @@ pub fn connect(
             Refused::Unavailable(typed_error(&company.name, &e))
         }
     };
-    client.initialize().map_err(|e| refused(&e))?;
-    let mut tools = client.list_tools().map_err(|e| refused(&e))?;
+    let mut attempt = 1;
+    let mut tools = loop {
+        let listed = client.initialize().and_then(|()| client.list_tools());
+        match listed {
+            Ok(tools) => break tools,
+            // Safe to repeat, whatever the failure: nothing in it reaches a
+            // model, and a refusal is asked again at most twice.
+            Err(_)
+                if attempt < ATTEMPTS
+                    && !company.is_unusable(&url)
+                    && company.pace().check().is_ok() =>
+            {
+                std::thread::sleep(backoff(attempt));
+                attempt += 1;
+            }
+            Err(e) => return Err(refused(&e)),
+        }
+    };
     let note = description_note(&company.name, &verified.name, &verified.domain);
     for t in &mut tools {
         t.description = Some(match t.description.as_deref() {
@@ -132,10 +171,72 @@ pub fn connect(
     Ok((client, tools))
 }
 
+/// Where a failed Company `tools/call` stopped, from how far the transport
+/// says it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// It never left, and nothing in the error is the Company's: no
+    /// connection made, a wait the Company asked for.
+    Unsent,
+    /// It never left: no credential for it. The cause may say what the
+    /// Company's token endpoint answered.
+    NoCredential,
+    /// The Company refused it, and did not perform it: a `4xx`, or a
+    /// JSON-RPC error.
+    Refused,
+    /// It may have been performed: no answer, a `5xx`, or a result agentd
+    /// could not read.
+    Unknown,
+}
+
+impl Failure {
+    pub fn of(reach: Reach) -> Failure {
+        match reach {
+            Reach::Unsent => Failure::Unsent,
+            Reach::Unsigned => Failure::NoCredential,
+            Reach::Answered { status } if status < 500 => Failure::Refused,
+            Reach::Answered { .. } | Reach::Unanswered | Reach::Unreadable => Failure::Unknown,
+        }
+    }
+
+    /// Whether the error may hold what the Company sent — everything but a
+    /// call that never reached it or its token endpoint. The context it
+    /// reaches carries the Company's origin as for an answer.
+    pub fn read_the_company(self) -> bool {
+        self != Failure::Unsent
+    }
+
+    /// The `outcome` of `agent_company_requests_total`.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Failure::Unsent | Failure::NoCredential => "unsent",
+            Failure::Refused => "error",
+            Failure::Unknown => "unknown",
+        }
+    }
+}
+
+/// What a failed `tools/call` of the Company tool `tool` says to its caller:
+/// `text` is the transport's error. One that may have been performed is
+/// never sent again: it is `outcome unknown`, for the caller to read the
+/// state at the Company and decide (RFC 0047 §5.9).
+pub fn call_failed(company: &str, tool: &str, failure: Failure, text: &str) -> String {
+    match failure {
+        Failure::Unknown => format!(
+            "{OUTCOME_UNKNOWN}company {company} may have performed {tool}: the call failed after it was sent, and agentd does not send it again — read its state at the Company before deciding ({text})"
+        ),
+        Failure::Unsent | Failure::NoCredential | Failure::Refused => typed_error(company, text),
+    }
+}
+
 /// The error a Company tool call failed with, said as what it means for the
 /// caller: `text` is the transport's.
 pub fn typed_error(company: &str, text: &str) -> String {
-    if text.contains(err::SIGN_IN_REQUIRED) {
+    if let Some(at) = text.find("rate limited by ") {
+        let wait = &text[at..];
+        let wait = wait.split(';').next().unwrap_or(wait);
+        format!("{wait}; the call was not sent")
+    } else if text.contains(err::SIGN_IN_REQUIRED) {
         format!(
             "company {company} needs a signed-in Session for this call ({}); agentd holds none",
             err::SIGN_IN_REQUIRED
@@ -204,6 +305,8 @@ impl RequestSigner for CompanyBearerSigner {
                 err::EXTENSION_REQUIRED
             ));
         }
+        // Nothing before the instant the Company asked for, from any task.
+        self.company.pace().check()?;
         let token = self.sup.bearer(&self.company, &self.url)?;
         let digest = crate::sha::sha256(body);
         EXCHANGE.with(|x| {
@@ -222,6 +325,8 @@ impl RequestSigner for CompanyBearerSigner {
     }
 
     fn on_response(&self, resp: &AuthResponse, _authority: &str) -> bool {
+        // A wait the server asked for holds the whole Company.
+        self.company.pace().learn(resp.status, resp.retry_after);
         let Some(c) = resp
             .www_authenticate
             .as_deref()
@@ -286,6 +391,65 @@ mod tests {
         assert_eq!(
             description_note("shop", " ", "shop.example"),
             format!("[A tool of \"shop.example\"{tail}")
+        );
+    }
+
+    /// A failed call that may have reached the Company is `outcome unknown`;
+    /// one that never left, or that the Company refused, is said as such —
+    /// decided by how far the transport says it got, whatever the error's
+    /// text, which holds the Company's words.
+    #[test]
+    fn a_call_that_may_have_run_is_outcome_unknown() {
+        for (reach, want) in [
+            (Reach::Unsent, Failure::Unsent),
+            (Reach::Unsigned, Failure::NoCredential),
+            (Reach::Answered { status: 200 }, Failure::Refused),
+            (Reach::Answered { status: 403 }, Failure::Refused),
+            (Reach::Answered { status: 429 }, Failure::Refused),
+            (Reach::Answered { status: 499 }, Failure::Refused),
+            (Reach::Answered { status: 500 }, Failure::Unknown),
+            (Reach::Answered { status: 502 }, Failure::Unknown),
+            (Reach::Unanswered, Failure::Unknown),
+            (Reach::Unreadable, Failure::Unknown),
+        ] {
+            assert_eq!(Failure::of(reach), want, "{reach:?}");
+        }
+        assert!(!Failure::Unsent.read_the_company());
+        for f in [Failure::NoCredential, Failure::Refused, Failure::Unknown] {
+            assert!(f.read_the_company(), "{f:?}");
+        }
+        assert_eq!(
+            [
+                Failure::Unsent,
+                Failure::NoCredential,
+                Failure::Refused,
+                Failure::Unknown
+            ]
+            .map(Failure::outcome),
+            ["unsent", "unsent", "error", "unknown"]
+        );
+        // The Company's own error, written to read as agentd's transport:
+        // still the Company's refusal, said as it wrote it.
+        let forged = "mcp: transport: mcp server 'shop': tools/call search: Mcp error: -32603: mcp: transport: mcp-http: not sent: connect: refused";
+        assert_eq!(
+            call_failed("shop", "shop.search", Failure::Refused, forged),
+            forged
+        );
+        let said = call_failed("shop", "shop.search", Failure::Unknown, "Transport closed");
+        assert!(
+            said.starts_with("outcome unknown: company shop may have performed shop.search"),
+            "{said}"
+        );
+        assert!(said.ends_with("(Transport closed)"), "{said}");
+        let said = call_failed(
+            "shop",
+            "shop.search",
+            Failure::NoCredential,
+            "mcp-http: not sent, no credential: rate limited by shop until 2026-10-18T10:00:00.000Z; nothing is sent to it before then",
+        );
+        assert_eq!(
+            said,
+            "rate limited by shop until 2026-10-18T10:00:00.000Z; the call was not sent"
         );
     }
 

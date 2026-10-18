@@ -64,6 +64,8 @@ pub enum Gate {
     /// sessions a TCP listener holds are what these ops list and end, and a
     /// unix socket issues none.
     Listener,
+    /// A Company is declared, in a build that acts at one (RFC 0047).
+    Companies,
 }
 
 /// The module that runs an op. The command dispatch is one `match` on this.
@@ -76,6 +78,7 @@ pub enum Handler {
     Introspection,
     Auth,
     Instance,
+    Company,
     /// Held so no workflow can claim the name, and served by nothing.
     Reserved,
 }
@@ -446,6 +449,30 @@ pub const OPS: &[OpSpec] = &[
         sessions_revoke_result,
     ),
     op(
+        "company.status",
+        Message,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Companies,
+        Handler::Company,
+        "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, whether the Session is signed in, until when it asked for no requests, and its MCP servers",
+        no_args,
+        company_status_result,
+    ),
+    op(
+        "company.user_id.reset",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Companies,
+        Handler::Company,
+        "Forget the User ID one Company knows the User by {company}, with its Session and MCP connections: the Company sees a new User from the next call on",
+        company_reset_args,
+        company_reset_result,
+    ),
+    op(
         "_instance.",
         Task,
         Operator,
@@ -555,6 +582,9 @@ pub fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
             .listen
             .as_deref()
             .is_some_and(|l| crate::config::unix_socket_path(l).is_none()),
+        Gate::Companies => {
+            cfg!(feature = "companies") && crate::config::settings::companies::any_company(s)
+        }
     }
 }
 
@@ -1147,6 +1177,30 @@ fn sessions_revoke_result() -> Value {
     closed(&["revoked"], json!({"revoked": count()}))
 }
 
+/// `company.status`: the internal tool's document, with why each failed
+/// Company failed — the one shape, so the two cannot drift.
+fn company_status_result() -> Value {
+    crate::registry::internal::company_status_output(true)
+}
+
+fn company_reset_args() -> Value {
+    closed(
+        &["company"],
+        json!({"company": named("The company entry whose User ID is forgotten")}),
+    )
+}
+
+fn company_reset_result() -> Value {
+    closed(
+        &["company", "reset", "started_over"],
+        json!({
+            "company": {"type": "string"},
+            "reset": {"const": true},
+            "started_over": {"type": "boolean", "description": "the seal key opened none of the store's records: this Company started over with it as a new User, and the others stay unavailable until each is reset"},
+        }),
+    )
+}
+
 fn instance_result_args() -> Value {
     closed(
         &["handle"],
@@ -1703,7 +1757,10 @@ mod tests {
             "_instance.emit" => {
                 json!({"handle": "c1", "stream": "orders", "event": {"subject": "s"}})
             }
-            "status" | "config" | "auth.device.pending" | "auth.sessions" => json!({}),
+            "company.user_id.reset" => json!({"company": "shop"}),
+            "status" | "config" | "auth.device.pending" | "auth.sessions" | "company.status" => {
+                json!({})
+            }
             other => panic!("no sample for {other}: add one"),
         };
         let mut envelope = json!({"op": op});

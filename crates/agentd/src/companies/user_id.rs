@@ -22,6 +22,9 @@
 //! new User ID, because a new User ID is a new User at every Company: a
 //! sealed check record says which key the store's records were sealed with,
 //! and a store that holds one with no seal key set is refused the same way.
+//! The operator starts over one Company at a time
+//! ([`UserIds::start_over_at`]); once every Company has, the store takes the
+//! key ([`UserIds::start_over`]).
 
 use std::sync::Arc;
 
@@ -225,6 +228,91 @@ impl UserIds {
         }
     }
 
+    /// Forget the pair's record — its User ID, its secret and its
+    /// `session_id`: the Company sees a new User the next time one is
+    /// needed. Both of the ids it may be kept under are removed.
+    pub fn forget(&self, principal: &str, issuer: &str) -> Result<(), String> {
+        let mut ids = vec![Self::plain_id(issuer, principal)];
+        if let Some((_, idk)) = &self.seal {
+            ids.push(Self::sealed_id(idk, issuer, principal));
+        }
+        for id in ids {
+            self.durable
+                .delete(Kind::Cred, &id)
+                .map_err(|e| format!("company user records: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The id of the record that says the operator started over at the
+    /// company entry `entry` with the current seal key (or with none).
+    fn started_id(&self, entry: &str) -> String {
+        let what = format!("company-start-over|{entry}");
+        match &self.seal {
+            Some((_, idk)) => Self::sealed_id(idk, &what, "check"),
+            None => crate::sha::sha256_hex(what.as_bytes()),
+        }
+    }
+
+    fn started_ad(&self, entry: &str) -> Vec<u8> {
+        associated_data(&[
+            b"company-start-over",
+            self.client_id.as_bytes(),
+            entry.as_bytes(),
+        ])
+    }
+
+    /// Whether the operator started over at the company entry `entry` with
+    /// this seal key while it opened none of the store's records
+    /// ([`Self::start_over_at`]).
+    pub fn started_over(&self, entry: &str) -> bool {
+        let Ok(Some(env)) = self.durable.get(Kind::Cred, &self.started_id(entry)) else {
+            return false;
+        };
+        match &self.seal {
+            Some((key, _)) => {
+                let bytes = b64::url_decode(env.state["sealed"].as_str().unwrap_or_default())
+                    .unwrap_or_default();
+                key.open(&self.started_ad(entry), &bytes).is_ok()
+            }
+            None => env.state["started_over"] == true,
+        }
+    }
+
+    /// The operator starts over at the company entry `entry` with the
+    /// current seal key, which opens none of the store's records
+    /// (`company.user_id.reset`): that Company sees a new User from its next
+    /// call. Every other Company stays unavailable until it is reset too.
+    pub fn start_over_at(&self, entry: &str) -> Result<(), String> {
+        let value = match &self.seal {
+            Some((key, _)) => {
+                let sealed = key.seal(&self.started_ad(entry), b"ok")?;
+                json!({"sealed": b64::url_nopad(&sealed)})
+            }
+            None => json!({"started_over": true}),
+        };
+        self.durable
+            .put(Kind::Cred, &self.started_id(entry), value, None)
+            .map(|_| ())
+            .map_err(|e| format!("company user records: {e}"))
+    }
+
+    /// Every one of `entries` has started over: the store takes the current
+    /// key — its check record sealed again with it, the entries' records of
+    /// starting over removed.
+    pub fn start_over(&self, entries: &[&str]) -> Result<(), String> {
+        self.durable
+            .delete(Kind::Cred, &crate::sha::sha256_hex(b"company-seal-check"))
+            .map_err(|e| format!("company user records: {e}"))?;
+        self.check_seal()?;
+        for e in entries {
+            self.durable
+                .delete(Kind::Cred, &self.started_id(e))
+                .map_err(|e| format!("company user records: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Keep `rec` for the pair, sealed when a seal key is set.
     pub fn save(&self, principal: &str, issuer: &str, rec: &UserRecord) -> Result<(), String> {
         let (id, value): (String, Value) = match &self.seal {
@@ -362,6 +450,61 @@ mod tests {
         .unwrap();
         let e = wrong.check_seal().unwrap_err();
         assert!(e.contains("opens none of the sealed"), "{e}");
+    }
+
+    /// A forgotten pair is a new User the next time. With a key that opens
+    /// none of the store's records, starting over at one Company is that
+    /// Company's alone; once every Company has, the store takes the key.
+    #[test]
+    fn a_reset_forgets_the_user_and_starting_over_takes_the_new_key() {
+        let store = Arc::new(MemoryStore::new());
+        let old = UserIds::new(
+            durable(Arc::clone(&store)),
+            "https://a.example/c.json",
+            Some([1u8; 32]),
+        )
+        .unwrap();
+        old.check_seal().unwrap();
+        let first = old.load_or_mint("operator", "https://as.one").unwrap();
+        old.forget("operator", "https://as.one").unwrap();
+        assert_eq!(old.load("operator", "https://as.one").unwrap(), None);
+        let second = old.load_or_mint("operator", "https://as.one").unwrap();
+        assert_ne!(first.user_id, second.user_id, "a new User");
+        assert_ne!(first.secret, second.secret);
+        let new = UserIds::new(
+            durable(Arc::clone(&store)),
+            "https://a.example/c.json",
+            Some([2u8; 32]),
+        )
+        .unwrap();
+        assert!(new.check_seal().is_err());
+        new.start_over_at("shop").unwrap();
+        assert!(new.started_over("shop"));
+        assert!(!new.started_over("travel"), "another Company's own reset");
+        assert!(
+            !old.started_over("shop"),
+            "said with the key it was made with"
+        );
+        // A record at the id that does not open with the key is not one.
+        new.durable
+            .put(
+                Kind::Cred,
+                &new.started_id("travel"),
+                json!({"sealed": b64::url_nopad(b"not sealed with the key")}),
+                None,
+            )
+            .unwrap();
+        assert!(!new.started_over("travel"), "a record that does not open");
+        assert!(new.check_seal().is_err(), "the store keeps the old key");
+        new.start_over_at("travel").unwrap();
+        new.start_over(&["shop", "travel"]).unwrap();
+        new.check_seal().unwrap();
+        assert!(
+            !new.started_over("shop"),
+            "done with once the store took the key"
+        );
+        assert_eq!(new.load("operator", "https://as.one").unwrap(), None);
+        assert!(old.check_seal().is_err());
     }
 
     #[test]

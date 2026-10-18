@@ -172,9 +172,112 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   every token request, the Bearer token for the MCP server only, nonce
   support, and the same User across a restart. The suite's binary is built
   with `companies`.
+- Acting at Companies, the rest of P1 (RFC 0047). **The strict privacy
+  profile** (`privacy: strict`, the default): a Company's `tools/call`
+  carries its idempotency key keyed with HMAC-SHA256 under the (User,
+  Company) pair's own secret, so a retry keeps its key and no two Companies
+  see one alike, and a trace of its own per (unit of work, Company), so one
+  run calling two Companies sends them two traces, neither the run's — the
+  call's span in agentd's own trace links to it. Nothing else of agentd's:
+  no `agent/instance`, `agent/run_id`, `agent/ctx`, `agent/acting_for`,
+  `agent/labels`, no `tracestate`. A connection's own requests (the
+  handshake, the tool list) carry no trace context and no `clientInfo.title`;
+  no Company request carries an AAuth signature. `privacy: standard` sends
+  agentd's usual correlators, the instance label and the process trace on
+  connection requests included.
+- **The User's gates** (RFC 0047 §5.7): addressed to the configured User — an
+  addressee only code writes — with text fixed in code and a Company's words
+  only quoted beside its verified domain. Only the User answers one: an
+  operator who is not the User is refused, with no override. No judge
+  answers one, whatever `agent.approval` or `agent.ask_human_fallback` say;
+  one nobody can be asked, or that times out, refuses its call. The first is
+  **the cross-Company gate** (§6.2): a Company call's result adds the
+  Company's origin, `company:<issuer>`, to the record of the conversation,
+  run or subagent it reaches, never removed and handed on as outside input
+  is (what it starts, spawns, signals, steers, and results read back); a call
+  to another Company from work holding one asks the User first, holding the
+  call, before any `security.policies` rule — `approve` sends it, `deny`
+  refuses it. Conversations keep the record too (`carries`), and a read-back
+  handed whole gives a conversation the Companies it carries; so does a
+  message — `message.send` or a `message` step — to whatever it reaches: the
+  conversation its turn runs in, the run it wakes, the run it starts. A
+  Company's error is its content as its answer is: any failed call but one
+  that never reached the Company or its token endpoint adds the origin.
+- **Calls that are never repeated blind** (§5.9): a Company `tools/call` that
+  failed after it was sent — no answer in time, a `5xx` (bare or with a
+  JSON-RPC error), a result agentd could not read, the connection lost —
+  answers `outcome unknown: company <c> may have performed <tool>`, and is
+  not sent again, a step's `retry:` included (`step.retry.skipped`); nor by a
+  restart: a step whose Company call was out when the process stopped ends
+  `outcome unknown` (`restore.step.failed`), whatever its `on_replay` but
+  `skip`. How far a call got is the transport's word, never read from the
+  error's text, which holds the Company's. The handshake, the tool list and
+  token requests are safe to repeat: the handshake and the list are sent
+  again on any failure, token requests on no answer or a `5xx`, at most three
+  times in all, backing off 250 ms doubling to 2 s with jitter.
+- **One not-before instant per Company** (§5.9): a `429` or `503` with
+  `Retry-After` from any of its endpoints holds every request to it — every
+  task, every interface — until the wait is over (cut to 5 minutes); a call
+  before it fails at once, unsent: `rate limited by <c> until <time>`. A
+  response `Date` more than 30 s from agentd's clock is logged once
+  (`company.clock_skew`).
+- **The browser guard** (§5.5.9): a call on a server
+  `security.companies.browsers` names is refused unsent when any string
+  argument names a Company's host as a browser reads it — any number of `/`
+  or `\` after the scheme, or none, a backslash or the last `@` ending the
+  host, percent escapes, trailing dots, numeric IPv4 forms, a bare
+  `host/path` — or a host that is not ASCII, which agentd does not compare
+  (`company.browser.refused`). A declared browser's tools are served by the
+  supervisor, in a turn and in a subagent, and an `mcp.tool` step on one is
+  held to the same rule.
+- `company.status`, an internal tool offered where a Company is declared, in
+  the User's work only: each Company as the supervisor knows it now —
+  verified or not, domain, issuer, signed in, the not-before instant, calls in
+  flight, which MCP servers joined. Operator ops `company.status` (the same,
+  with why a failed Company failed) and `company.user_id.reset {company}`,
+  which forgets the User ID, its secret and the `session_id`, drops the
+  Session and the Company's MCP connections, which join again on new MCP
+  sessions, so the Company sees a new User (an audit record). With a seal key
+  that opens none of the store's records, the reset starts that one Company
+  over with the key and the others stay unavailable until each is reset;
+  then the store takes the key.
+- Events `company.rate_limited`, `company.clock_skew`,
+  `company.cross_company.asked` (also an audit record, `company.gate`),
+  `company.browser.refused`, `company.user_id.reset`; metrics
+  `agent_company_requests_total{company,interface,outcome}`,
+  `agent_company_token_requests_total{company,grant,outcome}`,
+  `agent_company_signed_in{company}`,
+  `agent_company_rate_limited_until_seconds{company}` and
+  `agent_company_gates_total{company,kind,answer}` (docs/telemetry-reference.md).
+- `agentd-core`: `companies::carry`, `companies::privacy`, `companies::http::Pace`,
+  `companies::mcp::{Failure, call_failed}`,
+  `Supervisor::{status_of, reset_user, private_meta, secret}`,
+  `registry::internal::company_status_output`, `obs::otel::mcp_span_linked`.
+  `agentd-net`: `http::http_date` is public. The fake Company records, for
+  every MCP request, its `_meta` keys, its trace id, its `clientInfo.title`
+  and a `tools/call`'s idempotency key, and for any request an AAuth
+  signature, a `traceparent` header and a `User-Agent`, and the
+  `Mcp-Session-Id` an MCP request carries; it dates every reply, and its
+  control gains `stall`, `fail` (bare, or with a JSON-RPC `error` or `result`)
+  and `date_skew_s`. The TypeScript
+  client speaks `company.status` and `company.user_id.reset`.
+- Conformance: five more `companies/agent-*` checks — no correlator of
+  agentd's and no trace or key shared by two Companies, nothing sent to one
+  Company for another's content without the User, nothing before a
+  `Retry-After` is over, no call that may have run sent twice, no issued
+  token in agentd's log.
 
 **Changed.**
 
+- `agentd-mcp`: a `RequestSigner`'s `on_response` is also shown a `429` or
+  `503` that carries `Retry-After`, so a signer can hold every request its
+  credential serves (the transport's own per-socket wait is unchanged).
+  `McpClient::call_tool_reaching` (and `RmcpClient::call_tool_reaching`) say
+  of a failed `tools/call` how far it got (`client::Reach`: unsent, unsigned,
+  unanswered, answered with a status, or answered with a result that could
+  not be read), from the transport — an error the transport made up, and a
+  JSON-RPC error that came with a failing status, carry a mark only this
+  process can write.
 - `subagent.kill` ends a child inside a model call or an MCP tool call,
   within about 7 seconds. The kill only sent a cancel, which a child reads
   before its next step: one in a long call ran on, and spent, until the call

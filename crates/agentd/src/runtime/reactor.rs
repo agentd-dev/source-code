@@ -103,13 +103,15 @@ pub enum PendingKind {
         /// call, not a result for it — an approval runs it and the asker gets
         /// its real result, a refusal is an error. Without this the approver's
         /// words came back as the tool's result, and a tool that never ran
-        /// read as one that had.
-        policy: Option<PolicyCall>,
+        /// read as one that had. Boxed: the call is held rarely, and the
+        /// variant is carried by every pending ask.
+        policy: Option<Box<PolicyCall>>,
     },
 }
 
-/// The tool call a `security.policies` `action: ask` gate holds (see
-/// [`PendingKind::Human`]).
+/// The tool call a gate holds (see [`PendingKind::Human`]): a
+/// `security.policies` `action: ask` verdict's, or — with `company` — the
+/// User's gate a Company call opened (RFC 0047 §5.7).
 #[derive(Debug, Clone)]
 pub struct PolicyCall {
     pub tool: String,
@@ -118,6 +120,49 @@ pub struct PolicyCall {
     pub rule: usize,
     /// What the rule said an unanswered gate becomes.
     pub on_timeout: crate::config::settings::PolicyAction,
+    /// Set when the gate is the configured User's, not a rule's: only the
+    /// User answers it, an operator who is not the User included, and an
+    /// unanswered one refuses the call.
+    pub company: Option<CompanyAsk>,
+    /// The gates the call passed before this one asked: an approval runs it
+    /// past them and this one, and every other check again.
+    pub passed: Passed,
+}
+
+/// What a Company gate asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanyAsk {
+    /// The company entry the call goes to.
+    pub company: String,
+    /// The gate's kind: `cross_company`.
+    pub kind: String,
+    /// The issuers of the other Companies whose content the asking work
+    /// holds.
+    pub from: Vec<String>,
+}
+
+/// The gates a tool call has passed: a policy gate's addressee or the User
+/// approved it, so that check is not made again when it runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Passed {
+    pub policy: bool,
+    pub company: bool,
+}
+
+impl Passed {
+    /// These, and the gate `call` holds, approved.
+    pub fn and(self, call: &PolicyCall) -> Passed {
+        match call.company {
+            Some(_) => Passed {
+                company: true,
+                ..self
+            },
+            None => Passed {
+                policy: true,
+                ..self
+            },
+        }
+    }
 }
 
 /// A queued root/conversation turn, waiting for a worker slot and for its
@@ -164,6 +209,9 @@ pub struct TurnJob {
     /// its knowledge retrieval are one span of the trace that delivered the
     /// message.
     pub trace: Option<TraceContext>,
+    /// The Companies whose content the message's sender held: the
+    /// conversation carries them from the message on (RFC 0047 §6.2).
+    pub carries: crate::engine::run::Carries,
 }
 
 impl TurnJob {
@@ -189,6 +237,7 @@ impl TurnJob {
             owner_checked: false,
             route: None,
             trace: None,
+            carries: Default::default(),
         }
     }
     /// The same job, carrying a delivered message's hop depth.
@@ -200,6 +249,12 @@ impl TurnJob {
     /// conversation (or not).
     pub fn owner_checked(mut self, checked: bool) -> TurnJob {
         self.owner_checked = checked;
+        self
+    }
+    /// The same job, its conversation to carry `carries` from the message
+    /// on.
+    pub fn carrying(mut self, carries: crate::engine::run::Carries) -> TurnJob {
+        self.carries = carries;
         self
     }
     /// The same job, as a span of `trace`.
@@ -917,6 +972,7 @@ impl Runtime {
             #[cfg(feature = "mcp-events")]
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
             Event::McpReachable(r) => self.on_mcp_reachable(*r),
+            Event::CompanyRead { into, origin, why } => self.company_read(into, origin, why),
             Event::Background { .. } | Event::Tick => {}
         }
     }
@@ -1337,8 +1393,18 @@ impl Runtime {
         //    message}`) — the reply half of an asynchronous exchange.
         let msg = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                          "text": text, "message_id": ev.payload.get("message_id").cloned()});
-        let woken =
-            self.deliver_a2a_message(&ctx, &wire, &msg, principal.as_deref(), ev.trace.as_ref());
+        // The Companies whose content the sender held (`message.send`, a
+        // `message` step): whichever reader takes the message carries them
+        // (RFC 0047 §6.2).
+        let carried = super::withhold::companies_of(&super::starts::event_carries(&ev.payload));
+        let woken = self.deliver_a2a_message(
+            &ctx,
+            &wire,
+            &msg,
+            principal.as_deref(),
+            &carried,
+            ev.trace.as_ref(),
+        );
         if !woken.is_empty() {
             self.log.in_trace(ev.trace.as_ref()).info(
                 "a2a.message.delivered",
@@ -1348,7 +1414,7 @@ impl Runtime {
         }
         // 2. An `a2a` START node whose command and roles match — a peer or an
         //    operator asking for a workflow rather than a conversation.
-        if self.fire_a2a_start(ev, &ctx) {
+        if self.fire_a2a_start(ev, &ctx, &carried) {
             return "start";
         }
         // 3. Otherwise it is what it looks like: something to answer.
@@ -1365,6 +1431,7 @@ impl Runtime {
             )
             .at_depth(depth)
             .owner_checked(owner_checked)
+            .carrying(carried)
             .in_trace(ev.trace.clone()),
         );
         "turn"
@@ -1373,7 +1440,12 @@ impl Runtime {
     /// Without the `a2a` feature there is no listener to deliver a message, so a
     /// replayed event simply degrades to a turn.
     #[cfg(not(feature = "a2a"))]
-    fn fire_a2a_start(&mut self, _ev: &InboxEvent, _ctx: &str) -> bool {
+    fn fire_a2a_start(
+        &mut self,
+        _ev: &InboxEvent,
+        _ctx: &str,
+        _carried: &super::withhold::Carries,
+    ) -> bool {
         false
     }
 
@@ -1386,7 +1458,12 @@ impl Runtime {
     /// no restriction beyond the authorization the listener already applied:
     /// the start node narrows, it never widens.
     #[cfg(feature = "a2a")]
-    fn fire_a2a_start(&mut self, ev: &InboxEvent, ctx: &str) -> bool {
+    fn fire_a2a_start(
+        &mut self,
+        ev: &InboxEvent,
+        ctx: &str,
+        carried: &super::withhold::Carries,
+    ) -> bool {
         let op = ev.payload.get("parts").and_then(|parts| {
             crate::runtime::a2a_server::command_op(&json!({"parts": parts.clone()}))
         });
@@ -1447,15 +1524,20 @@ impl Runtime {
                 let event_trace = TraceContext::mint();
                 let links: Vec<String> = ev.trace.iter().map(TraceContext::traceparent).collect();
                 let appended = crate::obs::otel::now_unix_nanos();
-                match self.append_event(
-                    stream,
-                    subject,
-                    Some(ctx),
-                    payload,
-                    &id,
-                    &workflow,
-                    Some(&event_trace),
-                ) {
+                // The event carries what the message did, for its consumers.
+                match self
+                    .append_carrying(
+                        stream,
+                        subject,
+                        Some(ctx),
+                        payload,
+                        &id,
+                        &workflow,
+                        Some(carried),
+                        Some(&event_trace),
+                    )
+                    .map_err(|e| e.to_string())
+                {
                     Ok(seq) => {
                         self.log.in_trace(Some(&event_trace)).info(
                             "start.a2a.into",
@@ -1479,14 +1561,15 @@ impl Runtime {
                 json!({"workflow": workflow, "node": node, "conversation": ctx,
                        "command": op, "role": role}),
             );
-            // The run is the message's unit of work, and continues its trace.
-            let _ = self.fire_start_run(
+            // The run is the message's unit of work, and continues its trace;
+            // it carries what the message did.
+            let _ = self.fire_start_carrying(
                 &workflow,
                 &node,
                 &spec,
                 payload,
                 "a2a",
-                None,
+                carried,
                 ev.trace.as_ref(),
             );
             return true;

@@ -37,6 +37,16 @@
 //! every `security.policies` gate is, just times out). Auto answers are marked
 //! as auto in the task, the log and the audit stream — never mistakable for a
 //! human decision.
+//!
+//! **Company gates** (RFC 0047 §5.7) are addressed to the configured User
+//! (`security.companies.user`), an addressee only code writes: no workflow,
+//! document or tool argument can. Their text is fixed here, a Company's words
+//! appear in it only quoted, and only the User answers — an operator who is
+//! not the User is refused like anyone else, with no override, because the
+//! answer is presented to the Company as the User's. No judge answers one,
+//! whatever `agent.approval` or `agent.ask_human_fallback` say; one nobody
+//! can be asked, or that times out, refuses its call. The first is the
+//! cross-Company gate (`runtime::companies`).
 
 use super::reactor::{PendingKind, Runtime, Target};
 use crate::config::settings::AskHumanFallback;
@@ -509,7 +519,7 @@ impl Runtime {
             auto_fired: false,
             schema,
             addressee,
-            policy,
+            policy: policy.map(Box::new),
         })
     }
 
@@ -684,11 +694,14 @@ impl Runtime {
         // A policy gate's answer is neither: it is a decision about the call
         // the gate holds, and the asker is owed that call's own result.
         if let Some(call) = policy {
+            // Only a person's answer approves; the User's gate takes the
+            // User's own, never one stood in for.
             let approved = shaped
                 .as_ref()
                 .and_then(|v| v.get("decision"))
                 .and_then(Value::as_str)
-                == Some(POLICY_APPROVE);
+                == Some(POLICY_APPROVE)
+                && (call.company.is_none() || via == "human");
             self.policy_settle(&p.target, &call, approved, answered_by.unwrap_or(via));
             return;
         }
@@ -714,7 +727,19 @@ impl Runtime {
             .warn("human.ask.failed", json!({"task": task, "err": msg}));
         // A policy gate that ends unanswered refuses its call, and says so in
         // the rule's words: the asker must not read "no answer" as "done".
-        let msg = match policy {
+        let msg = match policy.as_deref() {
+            #[cfg(feature = "companies")]
+            Some(super::reactor::PolicyCall {
+                company: Some(ask),
+                tool,
+                ..
+            }) => {
+                self.company_gate_said(&p.target, ask, tool, "unanswered", None);
+                format!(
+                    "company {}: the User did not approve this call ({msg}) — it was NOT executed",
+                    ask.company
+                )
+            }
             Some(call) => format!(
                 "denied by security.policies[{}]: {msg} — the call was NOT executed",
                 call.rule
@@ -1119,7 +1144,7 @@ impl Runtime {
                     auto_fired: false,
                     schema,
                     addressee,
-                    policy,
+                    policy: policy.map(Box::new),
                 },
                 started_ms: now_ms(),
             });
@@ -1131,7 +1156,7 @@ impl Runtime {
 /// admits ([`POLICY_DENY`]) refuses it.
 pub(crate) const POLICY_APPROVE: &str = "approve";
 /// The answer a policy gate refuses its call with.
-#[cfg(feature = "a2a")]
+#[cfg(any(feature = "a2a", feature = "companies"))]
 pub(crate) const POLICY_DENY: &str = "deny";
 
 /// The shape a policy gate's answer must take: a decision, and nothing a
@@ -1151,24 +1176,48 @@ pub(crate) fn policy_answer_schema() -> Value {
 /// [`policy_call_json`]).
 #[cfg(feature = "a2a")]
 fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
+    let company = match v.get("company") {
+        None => None,
+        // A Company gate is read back whole or not as one: never as a
+        // rule's gate, which an operator could answer.
+        Some(c) => Some(super::reactor::CompanyAsk {
+            company: c.get("company")?.as_str()?.to_string(),
+            kind: c.get("kind")?.as_str()?.to_string(),
+            from: c
+                .get("from")?
+                .as_array()?
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect(),
+        }),
+    };
+    let passed = v.get("passed");
+    let flag = |k: &str| passed.and_then(|p| p.get(k)).and_then(Value::as_bool) == Some(true);
     Some(super::reactor::PolicyCall {
         tool: v.get("tool")?.as_str()?.to_string(),
         args: v.get("args").cloned().unwrap_or(Value::Null),
         rule: usize::try_from(v.get("rule")?.as_u64()?).ok()?,
         // An unreadable fallback is the default one, deny: a restart must
-        // never turn a refusal into an approval.
+        // never turn a refusal into an approval — and a Company gate's is
+        // always deny.
         on_timeout: v
             .get("on_timeout")
             .cloned()
             .and_then(|a| serde_json::from_value(a).ok())
+            .filter(|_| company.is_none())
             .unwrap_or(crate::config::settings::PolicyAction::Deny),
+        company,
+        passed: super::reactor::Passed {
+            policy: flag("policy"),
+            company: flag("company"),
+        },
     })
 }
 
 /// A policy call as the durable wait record of the step it suspends.
 pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
     use crate::config::settings::PolicyAction;
-    json!({
+    let mut v = json!({
         "tool": call.tool,
         "args": call.args,
         "rule": call.rule,
@@ -1178,7 +1227,14 @@ pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
             PolicyAction::Ask => "ask",
             PolicyAction::Shadow => "shadow",
         },
-    })
+    });
+    if let Some(c) = &call.company {
+        v["company"] = json!({"company": c.company, "kind": c.kind, "from": c.from});
+    }
+    if call.passed != super::reactor::Passed::default() {
+        v["passed"] = json!({"policy": call.passed.policy, "company": call.passed.company});
+    }
+    v
 }
 
 /// The auto-judge intel dial: answer `question` on the operator's behalf.
@@ -1397,6 +1453,123 @@ pub(crate) fn shape_answer(text: &str, schema: &Value) -> Value {
             .filter(|t| matches!(*t, "boolean" | "number" | "integer"))
             .and_then(|t| crate::mcp::elicit::coerce(text.trim(), t))
             .unwrap_or_else(|| json!(text)),
+    }
+}
+
+#[cfg(feature = "companies")]
+impl Runtime {
+    /// The configured User, as a gate's addressee: every operator principal
+    /// when the User is `operator` (load refuses that beside two operator
+    /// rules), else the one principal id. Never written by anything but this.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn company_user(&self) -> crate::a2a::principals::Addressee {
+        match self.settings.security.companies.user() {
+            crate::config::settings::companies::OPERATOR => crate::a2a::principals::Addressee {
+                role: Some(crate::config::settings::Role::Operator),
+                ..Default::default()
+            },
+            id => crate::a2a::principals::Addressee {
+                id: Some(id.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Open the User's gate `ask`, holding the call `tool` with `args`
+    /// (RFC 0047 §5.7): on the task of the work that asks, or a gate task of
+    /// its own in unowned work with `agent.ask_human_unowned: gate`, its
+    /// question `question`. Nobody to ask — no listener, unowned work that
+    /// takes the fallback — refuses the call: no fallback answers a Company
+    /// gate.
+    pub(crate) fn company_gate(
+        &mut self,
+        caller: &super::tools::ToolCaller,
+        tool: &str,
+        args: &Value,
+        ask: super::reactor::CompanyAsk,
+        question: String,
+        passed: super::reactor::Passed,
+    ) -> super::tools::ToolOutcome {
+        use super::tools::ToolOutcome;
+        let channel = self.human_channel(caller);
+        #[cfg(feature = "a2a")]
+        {
+            let owned = match &channel {
+                HumanChannel::Owned(t) => Some(Some(t.clone())),
+                HumanChannel::Unowned
+                    if self.settings.agent.ask_human_unowned
+                        == crate::config::settings::AskHumanUnowned::Gate =>
+                {
+                    Some(None)
+                }
+                _ => None,
+            };
+            if let Some(owned) = owned {
+                let held = super::reactor::PolicyCall {
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    rule: 0,
+                    on_timeout: crate::config::settings::PolicyAction::Deny,
+                    company: Some(ask),
+                    passed,
+                };
+                let to = self.company_user();
+                return self.human_gate(
+                    caller,
+                    owned,
+                    question,
+                    now_ms() + ASK_TIMEOUT_MS,
+                    Some(policy_answer_schema()),
+                    Some(to),
+                    Some(held),
+                );
+            }
+        }
+        #[cfg(not(feature = "a2a"))]
+        let _ = (args, question, passed);
+        let why = channel.why_unanswerable();
+        let target = match (caller.node, &caller.run, &caller.step) {
+            (Some(node), _, _) => Target::Child(node, caller.req),
+            (None, Some(run), Some(step)) => Target::Step(run.clone(), step.clone()),
+            _ => Target::Child(crate::supervisor::tree::NodeId(0), caller.req),
+        };
+        self.company_gate_said(&target, &ask, tool, "unreachable", None);
+        ToolOutcome::Ready(
+            Value::String(format!(
+                "company {}: this work holds another Company's content, so the call needs the User's approval, and nobody can be asked ({why}) — it was NOT executed",
+                ask.company
+            )),
+            true,
+        )
+    }
+
+    /// Say how a Company gate ended — `approve`, `deny`, `unanswered` or
+    /// `unreachable` — on the log, the audit stream and the gate metric.
+    pub(crate) fn company_gate_said(
+        &self,
+        target: &Target,
+        ask: &super::reactor::CompanyAsk,
+        tool: &str,
+        answer: &str,
+        by: Option<&str>,
+    ) {
+        let trace = self.target_trace(target);
+        self.log.in_trace(trace.as_ref()).info(
+            &format!("company.{}.asked", ask.kind),
+            json!({"from": ask.from, "to": ask.company, "tool": tool, "answer": answer, "by": by}),
+        );
+        self.audit(super::audit::AuditEvent {
+            action: "company.gate",
+            target: json!({"company": ask.company, "kind": ask.kind, "tool": tool, "from": ask.from}),
+            outcome: answer,
+            principal: by,
+            role: None,
+            request_id: None,
+            sid: None,
+            trace: trace.as_ref(),
+            link: None,
+        });
+        crate::obs::metrics::record_company_gate(&ask.company, &ask.kind, answer);
     }
 }
 

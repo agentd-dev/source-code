@@ -1169,6 +1169,7 @@ impl Runtime {
         wire: &str,
         message: &Value,
         principal: Option<&str>,
+        carried: &super::withhold::Carries,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Vec<String> {
         let sender = self.acting_principal(principal);
@@ -1192,12 +1193,13 @@ impl Runtime {
         }
         // A peer agent's message is another agent's output: the run it wakes
         // carries it (`withhold`), decided now, while who sent it is known.
-        let carries = match &sender {
+        let mut carries = match &sender {
             Some(p) if p.role == crate::config::settings::Role::Agent => {
                 super::withhold::peer_carries(&p.id, "handed a message")
             }
-            _ => Default::default(),
+            _ => super::withhold::Carries::default(),
         };
+        carries.union(carried);
         let mut woken = Vec::with_capacity(hits.len());
         for (rid, sid) in hits {
             self.step_log(&rid, &sid).info(
@@ -1420,6 +1422,12 @@ impl Runtime {
         let mut payload = json!({"text": text, "context_id": ctx, "msg_depth": depth});
         if let Some(p) = parts {
             payload["parts"] = p;
+        }
+        // What the run read of a Company may be in the text: whatever the
+        // message reaches carries those Companies (RFC 0047 §6.2).
+        let carried = super::withhold::companies_of(&self.run_carries(run_id));
+        if !carried.is_empty() {
+            payload["carries"] = json!(carried);
         }
         let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
         // The turn it starts continues the run's trace, under the step's span.

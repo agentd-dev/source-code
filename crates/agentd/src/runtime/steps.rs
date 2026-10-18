@@ -1833,7 +1833,9 @@ impl Runtime {
                     // the run's text in the root transcript: a read-back,
                     // withheld like the note a finished run leaves.
                     let n = self.withhold_text(
-                        &super::withhold::Reader::Conversation,
+                        &super::withhold::Reader::Conversation(Some(
+                            crate::context::ROOT.to_string(),
+                        )),
                         super::withhold::Source::Run(run_id),
                         n.to_string(),
                         "emit note",
@@ -1975,6 +1977,10 @@ impl Runtime {
                 // A templated name the definition check could not see.
                 if self.is_company_server(&server) {
                     let e = crate::config::settings::companies::direct_use_refused(&server);
+                    self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                    return;
+                }
+                if let Some(e) = self.browser_refused(&server, &args) {
                     self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                     return;
                 }
@@ -3092,9 +3098,21 @@ impl Runtime {
                    })}),
         );
         if matches!(status, StepStatus::Failed | StepStatus::Timeout) {
-            // Retry?
+            // Retry? Never a Company call that may have been performed: it
+            // is not sent twice blind (RFC 0047 §5.9).
+            let unknown = error
+                .as_deref()
+                .is_some_and(super::companies::is_outcome_unknown);
+            if unknown && step.retry.is_some() {
+                slog.info(
+                    "step.retry.skipped",
+                    json!({"run": run_id, "step": step_id, "attempt": attempt,
+                           "reason": "outcome unknown"}),
+                );
+            }
             if let Some(retry) = &step.retry
                 && attempt <= retry.max
+                && !unknown
             {
                 // Exponential, with jitter. Without it every step that failed
                 // in the same wave — the usual case, since they usually failed
@@ -3474,7 +3492,7 @@ impl Runtime {
             // The note lands in the root transcript, which is a read-back
             // like any other (`withhold`).
             let note = self.withhold_text(
-                &super::withhold::Reader::Conversation,
+                &super::withhold::Reader::Conversation(Some(crate::context::ROOT.to_string())),
                 super::withhold::Source::Run(run_id),
                 note,
                 "agent.on_workflow_finished",

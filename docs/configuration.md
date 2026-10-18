@@ -613,7 +613,7 @@ All `services` paths are live · op.
 | `services.<name>.allow_private` | bool | `false` | `kind: company` only: admit loopback, private and link-local addresses. |
 | `services.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | `kind: company` only: the Company's interfaces agentd uses. This build uses `mcp`; `agent` and `openapi` are refused. |
 | `services.<name>.mcp_names` | map of an MCP API `url` to a server name | — | `kind: company` only: names the Company's MCP servers when it lists more than one. |
-| `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` the Company's MCP calls carry none of agentd's correlators — no `agent/*` `_meta` key, no idempotency key, no trace context; `standard` sends them, and is logged at boot (`company.privacy.standard`). |
+| `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` a Company sees none of agentd's correlators. Its calls carry their idempotency key keyed under the (User, Company) pair's secret and a trace of their own per unit of work and Company — no other `agent/*` `_meta` key, no `tracestate` — and the handshake and tool list carry no trace context and no `clientInfo.title`. `standard` sends agentd's usual correlators, the instance label and the process trace included, and is logged at boot (`company.privacy.standard`). |
 
 With `security.egress: closed`, every MCP dial, intelligence endpoint
 (top-level and providers; `mock:` aside), A2A peer, `http` step, HTTP store,
@@ -662,6 +662,17 @@ an `mcp.tool` or `mcp.resource` step, a resource wait or a `subscribe` start
 naming a Company's server is refused, and neither an instruction, a workflow
 definition nor the store is read from one.
 
+A Company's answer is its content: the conversation, run or subagent it
+reaches carries the Company's origin from then on, and a call to another
+Company from it waits for the configured User's answer
+([Company gates](human-in-the-loop.md#company-gates)). A call that fails after
+it was sent — no answer in the entry's `timeout`, a `5xx`, a result agentd
+could not read — answers `outcome unknown` and is not sent again, by a step's
+`retry:` or by a restart that finds the step still running. A `429` or `503`
+with `Retry-After` holds every request to the Company until the wait is over.
+`company.status` (a tool, and an operator op) says where each Company stands;
+the operator op `company.user_id.reset` makes the User new at one.
+
 A company entry refuses `auth`, `headers`, `methods` and `breaker`: the
 protocol defines how agentd authenticates there. Its `tags` default to
 `{"*": [untrusted_input, egress]}`. Adding, removing or changing a company
@@ -670,7 +681,10 @@ entry is a restart (`config.reload.restart_required`). It needs
 `none` and `memory` are refused, and a remote store (`mcp`, `http`) needs
 `security.companies.seal_key`. Once the store's User IDs are sealed, every
 Company is unavailable without the key they were sealed with — a removed key
-as much as a wrong one (`company.seal_key.mismatch`).
+as much as a wrong one (`company.seal_key.mismatch`) — until the key is
+restored, or `company.user_id.reset` is run for that Company: it starts over
+there as a new User, the others staying unavailable until each is reset, and
+once every Company has, the store takes the key.
 
 ```yaml
 # fragment: a Company, and who agentd is to it
@@ -1151,7 +1165,7 @@ Every `security` path is restart · op.
 | `security.companies.client.published_key_files` | list of paths | `[]` | Keys whose public halves the key set lists and that are never signed with: the next key before a rotation, the previous one after. |
 | `security.companies.client.serve` | bool | `false` | Serve the document and the key set on the A2A listener, at their URLs' paths. Needs `a2a`, and `a2a.url` the `client_id`'s origin. Otherwise publish what `agentd --print-company-client` writes. |
 | `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the User ID records, so the store cannot read them. Required with a remote store. |
-| `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. |
+| `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. A call on one with any string argument naming a Company's host as a browser reads it — or a host that is not ASCII — is refused unsent (`company.browser.refused`); their tools are served by the supervisor. |
 | `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |
 
 The model these keys enforce is [Security model](security.md); the checklist is

@@ -121,6 +121,7 @@ impl Fake {
             allow_private: true,
             timeout: Duration::from_secs(10),
             servers: vec![(name.into(), None)],
+            pace: Default::default(),
         }
     }
 }
@@ -722,4 +723,287 @@ fn a_company_tool_never_takes_a_bare_name() {
             })
         );
     }
+}
+
+/// Wait until `pred` holds of what the fake recorded, or fail saying `what`.
+fn recorded(f: &Fake, what: &str, pred: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let r = f.record();
+        if pred(&r) {
+            return r;
+        }
+        assert!(Instant::now() < deadline, "never {what}: {r:#?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn count(record: &[Value], method: &str) -> usize {
+    record.iter().filter(|r| r["mcp"] == method).count()
+}
+
+/// A `429` with `Retry-After` from the Company holds every task: the token
+/// endpoint's holds the next connection as much as its own retry, and a
+/// `tools/call`'s holds a second task on a connection of its own, which
+/// sends nothing — not one request reaches the fake before the wait is over
+/// (draft §4.3: "MUST wait at least that long").
+#[test]
+fn two_tasks_send_nothing_before_the_companys_retry_after() {
+    let f = fake(&[Variant::RetryAfter]);
+    let a = agent(&f);
+    let company = a.sup.company("shop").unwrap();
+    let e = agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(10))
+        .err()
+        .expect("the first token request is answered 429");
+    assert!(e.to_string().contains("rate_limited"), "{e}");
+    let until = company.pace().until().expect("the Company's wait is kept");
+    // Another task, at once: refused, unsent.
+    let before = f.record().len();
+    let sup = Arc::clone(&a.sup);
+    let e = std::thread::spawn(move || {
+        agentd::companies::mcp::connect(&sup, "shop", Duration::from_secs(10))
+            .err()
+            .expect("held")
+    })
+    .join()
+    .unwrap();
+    assert!(e.to_string().contains("rate limited by shop until"), "{e}");
+    assert_eq!(f.record().len(), before, "nothing was sent: {e}");
+    let wait = until
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    std::thread::sleep(wait + Duration::from_millis(100));
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(10)).unwrap();
+    // The first `tools/call` is answered 429: a second task's own
+    // connection is refused unsent.
+    let e = client
+        .call_tool("search", Some(json!({"query": "boots"})))
+        .expect_err("429");
+    assert!(e.to_string().contains("429"), "{e}");
+    assert!(company.pace().until().is_some());
+    let before = f.record().len();
+    let sup = Arc::clone(&a.sup);
+    let e = std::thread::spawn(move || {
+        agentd::companies::mcp::connect(&sup, "shop", Duration::from_secs(10))
+            .err()
+            .expect("held")
+    })
+    .join()
+    .unwrap();
+    assert!(e.to_string().contains("rate limited by shop until"), "{e}");
+    assert_eq!(f.record().len(), before, "nothing was sent: {e}");
+    let record = f.record();
+    assert!(
+        record.iter().all(|r| r["early"] != true),
+        "a request reached the fake before its wait was over: {record:#?}"
+    );
+    assert_eq!(count(&record, "tools/call"), 1);
+}
+
+/// The handshake and the tool list are safe to repeat: a `tools/list` that
+/// gets no answer in time is asked again, and the server joins. A
+/// `tools/call` is not: one that got no answer after it was sent, or a
+/// `5xx`, may have been performed — it reaches the fake once, and its
+/// failure reads as `outcome unknown`.
+#[test]
+fn a_list_is_asked_again_and_a_call_that_may_have_run_is_not() {
+    use agentd::companies::mcp::{Failure, call_failed};
+    let f = fake(&[]);
+    let a = agent(&f);
+    f.control(json!({"stall": {"method": "tools/list", "times": 1, "ms": 2500}}));
+    let (client, tools) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(1)).unwrap();
+    assert!(tools.iter().any(|t| t.name == "search"));
+    recorded(&f, "the stalled list and its repeat", |r| {
+        count(r, "tools/list") >= 2
+    });
+    let call = |what: &str| {
+        let e = client
+            .call_tool_reaching("search", Some(json!({"query": "boots"})), json!({}))
+            .expect_err(what);
+        (Failure::of(e.reach), e.error.to_string())
+    };
+    f.control(json!({"stall": {"method": "tools/call", "times": 1, "ms": 2500}}));
+    let (failure, e) = call("no answer in time");
+    assert_eq!(failure, Failure::Unknown, "{e}");
+    let said = call_failed("shop", "shop.search", failure, &e);
+    assert!(
+        said.starts_with("outcome unknown: company shop may have performed shop.search"),
+        "{said}"
+    );
+    std::thread::sleep(Duration::from_millis(3000));
+    assert_eq!(count(&f.record(), "tools/call"), 1, "sent once");
+    f.control(json!({"fail": {"method": "tools/call", "times": 1, "status": 502}}));
+    let (failure, e) = call("a 502");
+    assert_eq!(failure, Failure::Unknown, "{e}");
+    // A JSON-RPC error with a `5xx` may say the call ran; one with a `2xx`
+    // is the Company's refusal — whatever it wrote to look like agentd's
+    // transport — and its words are read.
+    let forged = "not sent: mcp-http: connect: refused (the call never left)";
+    f.control(
+        json!({"fail": {"method": "tools/call", "times": 1, "status": 500,
+                               "error": {"code": -32603, "message": "it broke"}}}),
+    );
+    let (failure, e) = call("a 500 in JSON-RPC");
+    assert_eq!(failure, Failure::Unknown, "{e}");
+    f.control(
+        json!({"fail": {"method": "tools/call", "times": 1, "status": 200,
+                               "error": {"code": -32603, "message": forged}}}),
+    );
+    let (failure, e) = call("a JSON-RPC refusal");
+    assert_eq!(failure, Failure::Refused, "{e}");
+    assert!(failure.read_the_company());
+    assert!(e.contains(forged), "{e}");
+    // A result the client cannot read is one the Company produced.
+    f.control(
+        json!({"fail": {"method": "tools/call", "times": 1, "status": 200,
+                               "result": {"content": "not a list"}}}),
+    );
+    let (failure, e) = call("an unreadable result");
+    assert_eq!(failure, Failure::Unknown, "{e}");
+    assert_eq!(
+        count(&f.record(), "tools/call"),
+        5,
+        "each sent once, none retried"
+    );
+}
+
+/// Under the strict profile a connection's own requests — the handshake and
+/// the tool list — carry no trace context and no `clientInfo.title`, though
+/// this process has both to give; `standard` gives them.
+#[test]
+fn a_strict_connection_carries_none_of_agentds_correlators() {
+    agentd::mcp::set_workload_label("companies-agent-test-instance");
+    agentd::obs::trace::set_process(agentd::obs::trace::TraceContext::mint());
+    let connection =
+        |r: &Value| r["path"] == "/mcp" && r["mcp"].as_str().is_some_and(|m| m != "tools/call");
+    let strict = fake(&[]);
+    let a = agent(&strict);
+    agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(10)).unwrap();
+    let record = strict.record();
+    assert!(count(&record, "tools/list") >= 1, "{record:#?}");
+    for r in record.iter().filter(|r| connection(r)) {
+        assert!(r["trace_id"].is_null(), "{r}");
+        assert!(r["client_title"].is_null(), "{r}");
+        assert!(r["aauth"].is_null() && r["trace_header"].is_null(), "{r}");
+    }
+    let standard = fake(&[]);
+    let dir = tempfile::tempdir().unwrap().keep();
+    let b = agent_on(
+        &standard,
+        &host(),
+        &dir,
+        Arc::default(),
+        ", privacy: standard",
+    );
+    agentd::companies::mcp::connect(&b.sup, "shop", Duration::from_secs(10)).unwrap();
+    let record = standard.record();
+    let listed = record
+        .iter()
+        .find(|r| r["mcp"] == "tools/list")
+        .expect("listed");
+    assert!(listed["trace_id"].is_string(), "{listed}");
+    assert_eq!(
+        listed["client_title"], "companies-agent-test-instance",
+        "{listed}"
+    );
+}
+
+/// An agent acting at `shop` and `travel`, its User ID records sealed with
+/// the key of 32 `byte`s.
+fn sealed_agent(
+    h: &Host,
+    shop: &Fake,
+    travel: &Fake,
+    dir: &Path,
+    store: Arc<agentd::store::memory::MemoryStore>,
+    byte: u8,
+) -> Agent {
+    let key = dir.join(format!("seal-{byte}"));
+    std::fs::write(&key, format!("{byte:02x}").repeat(32)).unwrap();
+    let yaml = format!(
+        "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\"}}\n    seal_key: \"{{{{secret-file:{k}}}}}\"\n\
+         store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
+         services:\n  shop: {{kind: company, endpoint: \"{s}\", allow_private: true}}\n  travel: {{kind: company, endpoint: \"{t}\", allow_private: true}}\n",
+        ca = fixture("ca.pem").display(),
+        h = h.origin,
+        d = dir.display(),
+        k = key.display(),
+        s = shop.origin,
+        t = travel.origin,
+    );
+    let path = dir.join(format!("c-{byte}.yaml"));
+    std::fs::write(&path, yaml).unwrap();
+    let settings =
+        agentd::config::settings::load(&["--config".to_string(), path.display().to_string()], &[])
+            .unwrap_or_else(|e| panic!("{e}"))
+            .0
+            .settings;
+    let durable = Arc::new(agentd::state::Durable::new(
+        store,
+        "t/",
+        "t",
+        agentd::state::Policy::default(),
+        None,
+    ));
+    let sup = Supervisor::build(&settings, durable, &logger())
+        .unwrap()
+        .expect("two Companies are declared");
+    h.publish(&sup.identity);
+    Agent {
+        sup,
+        _dir: dir.to_path_buf(),
+    }
+}
+
+/// A seal key that opens none of the store's records makes every Company
+/// unavailable (RFC 0047 §5.5.3). Resetting one starts that one over as a
+/// new User and leaves the other unavailable until it is reset too; then
+/// the store takes the key, and what was started over is kept.
+#[test]
+fn a_reset_with_another_seal_key_starts_over_one_company_at_a_time() {
+    let (shop, travel) = (fake(&[]), fake(&[]));
+    let dir = tempfile::tempdir().unwrap().keep();
+    let h = host();
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let connect = |a: &Agent, server: &str| {
+        agentd::companies::mcp::connect(&a.sup, server, Duration::from_secs(20)).map(|_| ())
+    };
+    let user = |f: &Fake| {
+        tokens(&f.record())
+            .last()
+            .map(|t| t["assertion"]["sub"].clone())
+            .unwrap()
+    };
+    let first = sealed_agent(&h, &shop, &travel, &dir, Arc::clone(&store), 1);
+    connect(&first, "shop").unwrap();
+    connect(&first, "travel").unwrap();
+    let (shop_user, travel_user) = (user(&shop), user(&travel));
+    drop(first);
+
+    let second = sealed_agent(&h, &shop, &travel, &dir, Arc::clone(&store), 2);
+    for server in ["shop", "travel"] {
+        let e = connect(&second, server).expect_err("a key that opens nothing");
+        assert!(e.to_string().contains("seal_key"), "{server}: {e}");
+    }
+    let company = |name: &str| second.sup.company(name).unwrap();
+    let r = second.sup.reset_user(&company("shop")).unwrap();
+    assert_eq!(r["started_over"], true, "{r}");
+    connect(&second, "shop").unwrap();
+    let new_shop_user = user(&shop);
+    assert_ne!(new_shop_user, shop_user, "a new User at shop");
+    let e = connect(&second, "travel").expect_err("travel is not reset");
+    assert!(e.to_string().contains("seal_key"), "{e}");
+    assert_eq!(user(&travel), travel_user, "nothing was sent to travel");
+    let r = second.sup.reset_user(&company("travel")).unwrap();
+    assert_eq!(r["started_over"], true, "{r}");
+    connect(&second, "travel").unwrap();
+    assert_ne!(user(&travel), travel_user, "a new User at travel");
+    drop(second);
+
+    // The store took the key: a restart with it opens both records.
+    let third = sealed_agent(&h, &shop, &travel, &dir, store, 2);
+    connect(&third, "shop").unwrap();
+    assert_eq!(user(&shop), new_shop_user, "the User started over is kept");
 }

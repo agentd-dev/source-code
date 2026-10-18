@@ -963,7 +963,65 @@ pub fn contracts() -> Vec<Contract> {
         false,
         ALL,
     );
+
+    // ---- companies (RFC 0047): offered where a Company is declared ----
+    c(
+        "company.status",
+        "companies",
+        "The Companies this instance acts at for its User, as it knows them now — nothing is fetched: whether each is verified, its domain, whether the Session there is signed in, until when it asked for no requests, the calls in flight, and which of its MCP servers are connected.",
+        obj(json!({}), &[]),
+        company_status_output(false),
+        true,
+        ALL,
+    );
     v
+}
+
+/// What `company.status` answers — the tool, and with `detail` (why a
+/// failed Company failed, in agentd's words with what its documents said)
+/// the operator op. Closed: nothing else is in it.
+pub fn company_status_output(detail: bool) -> Value {
+    let nullable = |t: &str| json!({"type": [t, "null"]});
+    let mut company = json!({
+        "company": {"type": "string", "description": "the company entry"},
+        "state": {"enum": ["verified", "unverified", "unavailable", "suspended"]},
+        "reason": {"type": ["string", "null"], "description": "why its documents were refused, as one word, while it is unverified"},
+        "domain": nullable("string"),
+        "issuer": nullable("string"),
+        "privacy": {"enum": ["strict", "standard"]},
+        "signed_in": nullable("boolean"),
+        "rate_limited_until": {"type": ["string", "null"], "description": "RFC 3339: nothing is sent to the Company before then"},
+        "in_flight": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1},
+        "servers": arr(obj(
+            json!({"server": {"type": "string"}, "joined": {"type": "boolean"}, "unusable": {"type": "boolean"}}),
+            &["server", "joined", "unusable"],
+        )),
+    });
+    let mut required = vec![
+        "company",
+        "state",
+        "reason",
+        "domain",
+        "issuer",
+        "privacy",
+        "signed_in",
+        "rate_limited_until",
+        "in_flight",
+        "limit",
+        "servers",
+    ];
+    if detail {
+        company["error"] = nullable("string");
+        required.push("error");
+    }
+    obj(
+        json!({
+            "user": s("The User every Company sees this instance act for"),
+            "companies": arr(obj(company, &required)),
+        }),
+        &["user", "companies"],
+    )
 }
 
 /// The contract names, in table order.

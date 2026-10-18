@@ -73,6 +73,15 @@ pub enum Event {
     McpEventHook(Box<super::mcp_events::hook::Arrival>),
     /// A probe of a server down since boot answered (`runtime::join`).
     McpReachable(Box<super::join::Reachable>),
+    /// A Company call's result is about to reach the context `into`: its
+    /// record gains `origin`, `company:<issuer>` (RFC 0047 §6.2). Sent by
+    /// the call's executor thread just before the result itself, so the
+    /// record is written before the result is read.
+    CompanyRead {
+        into: super::companies::Reads,
+        origin: String,
+        why: String,
+    },
     /// The 200 ms tick.
     Tick,
 }

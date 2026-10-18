@@ -2315,6 +2315,11 @@ impl Runtime {
                         json!({"kind": "subagent", "handle": handle})
                     }
                     PendingKind::Think { .. } => json!({"kind": "think"}),
+                    // A sign-in does not outlive this process: a restart that
+                    // finds the step waiting on one ends it `interrupted`.
+                    PendingKind::CompanySignIn { id, company } => {
+                        json!({"kind": "company_sign_in", "sign_in": id, "company": company})
+                    }
                     PendingKind::Run { run, .. } => json!({"kind": "run", "run": run}),
                     PendingKind::Await {
                         condition,

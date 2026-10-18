@@ -609,11 +609,13 @@ All `services` paths are live · op.
 | `services.<name>.rate` | rate | — | Pacing toward the service, shared by every consumer in each process. |
 | `services.<name>.methods` | list | any | `kind: http` only: the methods `http` steps may use. |
 | `services.<name>.breaker` | `{failures, cooldown}` | — | `kind: mcp` only: the default breaker for `mcp.tool` steps against it. |
-| `services.<name>.hosts` | list of host globs | the endpoint's host, the document's `organization.domain`, the subdomains of both, the issuer's host | `kind: company` only: every URL the Company's documents name must be on one of these hosts (`example.com`, `*.example.com`). |
+| `services.<name>.hosts` | list of host globs | the endpoint's host, the document's `organization.domain`, the subdomains of both, the issuer's host | `kind: company` only: every URL the Company's documents name must be on one of these hosts (`example.com`, `*.example.com`), and its host a plain one — no userinfo, and no `\`, which a browser reads as `/`. |
 | `services.<name>.allow_private` | bool | `false` | `kind: company` only: admit loopback, private and link-local addresses. |
 | `services.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | `kind: company` only: the Company's interfaces agentd uses. This build uses `mcp`; `agent` and `openapi` are refused. |
 | `services.<name>.mcp_names` | map of an MCP API `url` to a server name | — | `kind: company` only: names the Company's MCP servers when it lists more than one. |
 | `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` a Company sees none of agentd's correlators. Its calls carry their idempotency key keyed under the (User, Company) pair's secret and a trace of their own per unit of work and Company — no other `agent/*` `_meta` key, no `tracestate` — and the handshake and tool list carry no trace context and no `clientInfo.title`. `standard` sends agentd's usual correlators, the instance label and the process trace included, and is logged at boot (`company.privacy.standard`). |
+| `services.<name>.sign_in` | list of `device \| direct` | `[]` | `kind: company` only: the sign-in types agentd may start with the User, the first the Company offers taken. `direct` needs `security.companies.client.serve`. `mediated` is refused: the User's password would pass through a gate, whose answer agentd keeps in the task's history and hands to the model. Needs `security.companies.seal_key` and `scopes`. |
+| `services.<name>.scopes` | list of scopes | `[]` | `kind: company` only: the most account scopes agentd asks the User for there. A sign-in asks for what is needed within these and what its type grants; a held Account Token is used for no more, and one that grants none of these — or any, once the entry lists no `sign_in` — is not used: requests there are signed out, and the token is kept until the User signs out. |
 
 With `security.egress: closed`, every MCP dial, intelligence endpoint
 (top-level and providers; `mock:` aside), A2A peer, `http` step, HTTP store,
@@ -671,7 +673,23 @@ could not read — answers `outcome unknown` and is not sent again, by a step's
 `retry:` or by a restart that finds the step still running. A `429` or `503`
 with `Retry-After` holds every request to the Company until the wait is over.
 `company.status` (a tool, and an operator op) says where each Company stands;
-the operator op `company.user_id.reset` makes the User new at one.
+the operator op `company.user_id.reset` makes the User new at one, revoking the
+Account Token held there first.
+
+The User signs in at a Company themselves, at a gate agentd opens for them
+([Company gates](human-in-the-loop.md#company-gates)), when an entry lists
+`sign_in` and `scopes`: the model asks with the `company.sign_in` tool, a
+workflow with a `tool` step, the operator with `agentd --login company:<name>`
+([CLI](cli.md)). Device Sign-In shows the User a link and a code to check on the
+Company's page; Direct Sign-In a link to it, which returns to the callback the
+A2A listener serves. Neither ever opens a browser. The Account Token the sign-in
+gives agentd is kept only sealed with `security.companies.seal_key`, read by the
+supervisor alone for each request that uses it, and written back before use
+when the Company rotates it. Every Session after is signed in with it — renewed,
+or started again when the Company ends one — until the Company answers
+`invalid_grant` for it: a disconnect, a revocation, an expiry. Then it is
+forgotten and work goes on signed out. `company.sign_out` and
+`agentd --logout company:<name>` revoke and forget it.
 
 A company entry refuses `auth`, `headers`, `methods` and `breaker`: the
 protocol defines how agentd authenticates there. Its `tags` default to
@@ -699,6 +717,19 @@ services:
     endpoint: https://example.com
     hosts: ["example.com", "*.example.com"]
     allow: ["search*", "order_*"]
+```
+
+```yaml
+# fragment: the User may sign in at the Company with a link and a code
+security:
+  companies:
+    seal_key: "{{secret-file:/run/secrets/agentd-company-seal}}"
+services:
+  shop:
+    kind: company
+    endpoint: https://example.com
+    sign_in: [device]
+    scopes: ["poppy:read", "poppy:write"]
 ```
 
 ## tools
@@ -1163,8 +1194,9 @@ Every `security` path is restart · op.
 | `security.companies.client.jwks_uri` | HTTPS URL | `<client_id origin>/companies/jwks.json` | The key set's URL, on the `client_id`'s host. |
 | `security.companies.client.key_file` | path | `/var/lib/agentd/company-client-key` | The ES256 signing key (PKCS#8), created `0600` when absent. Only the supervisor reads it. |
 | `security.companies.client.published_key_files` | list of paths | `[]` | Keys whose public halves the key set lists and that are never signed with: the next key before a rotation, the previous one after. |
-| `security.companies.client.serve` | bool | `false` | Serve the document and the key set on the A2A listener, at their URLs' paths. Needs `a2a`, and `a2a.url` the `client_id`'s origin. Otherwise publish what `agentd --print-company-client` writes. |
-| `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the User ID records, so the store cannot read them. Required with a remote store. |
+| `security.companies.client.redirect_uri` | HTTPS URL | `<client_id origin>/companies/callback` | Where Direct Sign-In returns the User, on the `client_id`'s host, with no query. Listed in the document's `redirect_uris` when a Company lists `direct`, which is `[]` otherwise. |
+| `security.companies.client.serve` | bool | `false` | Serve the document and the key set on the A2A listener, at their URLs' paths, and the Direct Sign-In callback at `redirect_uri`'s when a Company lists `direct`. Needs `a2a`, and `a2a.url` the `client_id`'s origin. Otherwise publish what `agentd --print-company-client` writes. |
+| `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the Account Tokens a sign-in gives agentd, and the User ID records, so the store cannot read them. Required with any `sign_in`, and with a remote store. |
 | `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. A call on one with any string argument naming a Company's host as a browser reads it — or a host that is not ASCII — is refused unsent (`company.browser.refused`); their tools are served by the supervisor. |
 | `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |
 

@@ -17,8 +17,8 @@
 //!
 //! | Server says | agentd does |
 //! |---|---|
-//! | `401 invalid_token` | renew the Bearer token, re-sign, retry once |
-//! | `403 sign_in_required` | a typed error: the Company needs a signed-in Session |
+//! | `401 invalid_token` | renew the Bearer token — with the Account Token while one is held — re-sign, retry once |
+//! | `403 sign_in_required` | with an Account Token held, the `refresh_token` grant with `session_id` and `resource` signs the current Session in, and the request is sent once more (§6: "The Personal Agent uses its Account Token (4.8), or signs in (4.4) if it has none, and retries"); with none, a typed error: the Company needs a signed-in Session |
 //! | `403 insufficient_scope` | a typed error naming the scopes |
 //! | `403 extension_required` | the server is unusable for this instance (§6: "only to refuse the Personal Agent entirely") |
 //! | `429` / `503` with `Retry-After` | the Company's not-before instant: nothing more is sent to it, by any task, until then (§4.3) |
@@ -238,7 +238,7 @@ pub fn typed_error(company: &str, text: &str) -> String {
         format!("{wait}; the call was not sent")
     } else if text.contains(err::SIGN_IN_REQUIRED) {
         format!(
-            "company {company} needs a signed-in Session for this call ({}); agentd holds none",
+            "company {company} needs a signed-in Session for this call ({}), and agentd holds no Account Token there — company.sign_in asks the User to sign in",
             err::SIGN_IN_REQUIRED
         )
     } else if text.contains(err::INSUFFICIENT_SCOPE) {
@@ -349,6 +349,28 @@ impl RequestSigner for CompanyBearerSigner {
                     _ => false,
                 }
             }),
+            // A Session the Company holds as signed out while the User's
+            // Account Token is held — a token issued before a sign-in, or a
+            // Session the Company signed out: the token is renewed with the
+            // Account Token, which signs this Session in, and the request
+            // sent once more. A disconnect shows here too, and only that
+            // renewal's `invalid_grant` confirms it (RFC 0047 §5.7).
+            (403, Some(e))
+                if e == err::SIGN_IN_REQUIRED && self.sup.holds_account(&self.company) =>
+            {
+                EXCHANGE.with(|x| {
+                    let mut x = x.borrow_mut();
+                    match x.as_mut() {
+                        Some(ex) if !ex.retried => {
+                            ex.retried = true;
+                            self.sup
+                                .session_refused(&self.company, &self.url, &ex.token);
+                            true
+                        }
+                        _ => false,
+                    }
+                })
+            }
             (403, Some(e)) if e == err::EXTENSION_REQUIRED => {
                 self.company.mark_unusable(&self.url);
                 self.sup.log().warn(

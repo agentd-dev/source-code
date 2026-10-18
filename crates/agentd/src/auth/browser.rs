@@ -166,7 +166,7 @@ fn pct(s: &str) -> String {
 }
 
 /// Percent-decode a query component (`+` → space; `%XX` → byte).
-fn pct_decode(s: &str) -> String {
+pub(crate) fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

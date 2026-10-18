@@ -156,6 +156,14 @@ impl A2aBridge {
         declared_when(self.feed.is_some())
     }
 
+    /// Hand a Direct Sign-In callback's `query` to the loop (RFC 0047 §5.7).
+    pub fn company_callback(&self, query: String) {
+        #[cfg(feature = "companies")]
+        let _ = self.events_tx.send(Event::CompanyCallback { query });
+        #[cfg(not(feature = "companies"))]
+        let _ = query;
+    }
+
     /// Post a request to the loop and wait for its reply. Blocking — an async
     /// caller (the A2A ports) runs this on a blocking thread. `active` is what
     /// the request activated ([`Active::NONE`] for a call no request made),
@@ -261,7 +269,7 @@ impl Verb {
 
 // ---- wire helpers ----------------------------------------------------------
 
-fn err_obj(code: i64, msg: &str) -> Value {
+pub(crate) fn err_obj(code: i64, msg: &str) -> Value {
     json!({"_error": {"code": code, "message": msg}})
 }
 

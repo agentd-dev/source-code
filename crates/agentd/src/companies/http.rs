@@ -313,6 +313,7 @@ pub struct Document {
 /// Why a URL was not dialled or a document not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
+    /// Not an HTTPS URL with a plain host.
     NotHttps(String),
     /// A host the entry's `hosts` do not admit.
     Host(String),
@@ -325,7 +326,9 @@ pub enum Refused {
 impl Refused {
     pub fn say(&self, company: &str) -> String {
         match self {
-            Refused::NotHttps(u) => format!("company {company}: {u} is not an HTTPS URL"),
+            Refused::NotHttps(u) => {
+                format!("company {company}: {u} is not an HTTPS URL with a plain host")
+            }
             Refused::Host(h) => format!(
                 "company {company}: {h} is not one of the entry's hosts (services.{company}.hosts)"
             ),
@@ -540,6 +543,11 @@ mod tests {
         );
         assert!(matches!(
             d.admits("http://example.com/"),
+            Err(Refused::NotHttps(_))
+        ));
+        // A browser goes to evil.example.
+        assert!(matches!(
+            d.admits("https://evil.example\\@api.example.com/x"),
             Err(Refused::NotHttps(_))
         ));
         let e = d

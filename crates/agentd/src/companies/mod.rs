@@ -7,10 +7,13 @@
 //! The supervisor — and only the supervisor — discovers and verifies each
 //! one ([`discover`]), presents the one client identity every Company sees
 //! ([`identity`]), keeps the User's pseudonymous ID there ([`user_id`]),
-//! holds a signed-out Session with DPoP-bound tokens ([`session`],
-//! [`token`], [`dpop`]) over requests held to the host rule, the SSRF guard
-//! and the Company's not-before instant ([`http`]), and connects to the
-//! Company's MCP servers with a Bearer token for each ([`mcp`]). No turn
+//! holds a Session with DPoP-bound tokens ([`session`], [`token`],
+//! [`dpop`]) over requests held to the host rule, the SSRF guard and the
+//! Company's not-before instant ([`http`]), and connects to the Company's
+//! MCP servers with a Bearer token for each ([`mcp`]). The Session is signed
+//! out until the User signs in themselves, at a gate agentd opens for them
+//! ([`signin`]); the Account Token that gives agentd is kept sealed, and
+//! only the supervisor ever reads it ([`account`]). No turn
 //! worker, subagent or instance child is handed a Company server to dial, a
 //! key or a token: their calls come back to the supervisor (§5.6). What a
 //! Company is sent carries none of agentd's correlators under the strict
@@ -23,7 +26,11 @@
 //! are — debug builds, or `internal-mocks` — with `oauth` and `tls`.
 
 #[cfg(feature = "companies")]
+pub mod account;
+#[cfg(feature = "companies")]
 pub mod carry;
+#[cfg(all(feature = "companies", feature = "a2a"))]
+pub mod cli;
 #[cfg(feature = "companies")]
 pub mod discover;
 #[cfg(feature = "companies")]
@@ -44,6 +51,8 @@ pub mod mock;
 pub mod privacy;
 #[cfg(feature = "companies")]
 pub mod session;
+#[cfg(feature = "companies")]
+pub mod signin;
 #[cfg(feature = "companies")]
 pub mod token;
 #[cfg(feature = "companies")]
@@ -68,7 +77,11 @@ pub fn print_client(
         .client
         .as_ref()
         .ok_or("security.companies.client is not configured")?;
-    identity::Identity::load(client)?.print(dir)
+    identity::Identity::load(
+        client,
+        crate::config::settings::companies::signs_in_directly(settings),
+    )?
+    .print(dir)
 }
 
 /// A Company-chosen string as agentd's own text shows it (RFC 0047 §5.7):
@@ -98,6 +111,7 @@ mod supervisor {
 
     use serde_json::json;
 
+    use super::account::Accounts;
     use super::discover::{Discovery, Entry, Note, Verified};
     use super::http::Pace;
     use super::identity::Identity;
@@ -238,6 +252,13 @@ mod supervisor {
     pub struct Supervisor {
         pub identity: Identity,
         users: UserIds,
+        /// Where the User's Account Tokens are kept, sealed; none without a
+        /// seal key, which load requires of any `sign_in`.
+        accounts: Option<Accounts>,
+        /// The Direct Sign-Ins waiting for their callback, by `state`.
+        pub(super) direct: Mutex<BTreeMap<String, super::signin::Direct>>,
+        /// The callbacks that named none, as the log has been told of them.
+        pub(super) callbacks_refused: Mutex<crate::obs::quiet::Health>,
         principal: String,
         companies: BTreeMap<String, Arc<Company>>,
         /// Each Company MCP server's entry.
@@ -273,13 +294,17 @@ mod supervisor {
                 .client
                 .as_ref()
                 .ok_or("security.companies.client is required")?;
-            let identity = Identity::load(client)?;
+            let identity = Identity::load(client, cfg::signs_in_directly(settings))?;
             let seal = match &c.seal_key {
                 Some(s) => {
                     let text = crate::sec::secret::resolve(&s.0, &|k| std::env::var(k).ok())
                         .map_err(|e| format!("security.companies.seal_key: {e}"))?;
                     Some(user_id::seal_bytes(&text)?)
                 }
+                None => None,
+            };
+            let accounts = match seal {
+                Some(raw) => Some(Accounts::new(Arc::clone(&durable), &client.id, raw)?),
                 None => None,
             };
             let users = UserIds::new(durable, &client.id, seal)?;
@@ -327,6 +352,9 @@ mod supervisor {
             Ok(Some(Arc::new(Supervisor {
                 identity,
                 users,
+                accounts,
+                direct: Mutex::default(),
+                callbacks_refused: Mutex::new(crate::obs::quiet::Health::new()),
                 principal: c.user().to_string(),
                 companies,
                 servers,
@@ -407,7 +435,18 @@ mod supervisor {
         pub fn signed_in(&self, company: &Company) -> Option<bool> {
             let issuer = company.issuer()?;
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            sessions.get(&issuer).and_then(|s| s.signed_in())
+            sessions.get(&issuer).and_then(|s| s.is_signed_in())
+        }
+
+        /// Whether the User's Account Token at `company` is held — read from
+        /// the store, under the issuer `company` was last verified with.
+        pub fn holds_account(&self, company: &Company) -> bool {
+            match (&self.accounts, company.issuer()) {
+                (Some(a), Some(issuer)) => a
+                    .load(&self.principal, &issuer)
+                    .is_ok_and(|held| held.is_some()),
+                _ => false,
+            }
         }
 
         /// Why `company` is unavailable, when the checks before the first
@@ -526,6 +565,22 @@ mod supervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&issuer);
             Ok(self.said_reset(company, false))
+        }
+
+        /// Take the User's Account Token at `company` out of the store, for
+        /// the caller to revoke: what `company.user_id.reset` does first, so
+        /// no request after it is signed in as the old User. Taken under the
+        /// Session's lock ([`Session::take_account`]); the issuer is the one
+        /// the Company was last verified with, and nothing is fetched.
+        pub fn take_account(
+            &self,
+            company: &Company,
+        ) -> Result<Option<super::account::Account>, String> {
+            let (Some(store), Some(issuer)) = (&self.accounts, company.issuer()) else {
+                return Ok(None);
+            };
+            self.session(&issuer)?
+                .take_account(store, &self.principal, &company.name)
         }
 
         fn said_reset(&self, company: &Company, started_over: bool) -> serde_json::Value {
@@ -664,23 +719,38 @@ mod supervisor {
             Ok(x)
         }
 
+        /// `f`, with the Session at `company` and what its requests are made
+        /// with: the documents verified — fetched again once they expire —
+        /// and the Session made the first time. Unreported, for the caller
+        /// to report as part of its own attempt.
+        pub fn with_session<T>(
+            &self,
+            company: &Company,
+            f: impl FnOnce(&Session, &Env<'_>) -> Result<T, String>,
+        ) -> Result<T, String> {
+            let verified = self.verify(company)?;
+            let session = self.session(&verified.issuer)?;
+            let dialer = verified.dialer(&company.discovery.entry);
+            let env = Env {
+                identity: &self.identity,
+                verified: &verified,
+                dialer: &dialer,
+                users: &self.users,
+                accounts: self.accounts.as_ref(),
+                principal: &self.principal,
+                ceiling: &company.discovery.entry.scopes,
+                log: &self.log,
+            };
+            f(&session, &env)
+        }
+
         /// A Bearer token for `company`'s MCP server at `url`: discovery, the
         /// Session and the token, reported as one outcome for target
         /// `company:<name>`.
         pub fn bearer(&self, company: &Company, url: &str) -> Result<String, String> {
-            let attempt = self.verify(company).and_then(|verified| {
-                let session = self.session(&verified.issuer)?;
-                let dialer = verified.dialer(&company.discovery.entry);
-                let env = Env {
-                    identity: &self.identity,
-                    verified: &verified,
-                    dialer: &dialer,
-                    users: &self.users,
-                    principal: &self.principal,
-                    log: &self.log,
-                };
-                session.open(&env)?;
-                session.bearer(&env, url)
+            let attempt = self.with_session(company, |session, env| {
+                session.open(env)?;
+                session.bearer(env, url)
             });
             self.report(company, attempt)
         }

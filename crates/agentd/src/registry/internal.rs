@@ -974,7 +974,60 @@ pub fn contracts() -> Vec<Contract> {
         true,
         ALL,
     );
+    c(
+        "company.sign_in",
+        "companies",
+        "Ask the User to sign in to their account at a Company, when a call answered sign_in_required (it needs the User's account) or insufficient_scope (it needs more account scopes). The User is asked in their own interface and signs in on the Company's own page; you never see a code, a link or a token, and you wait until they finish. An Account Token already held that covers `scopes` signs the Session in without asking. Answers whether the Session is signed in, with the scopes granted beside those requested — the User may grant fewer — or how it ended: cancelled, denied, expired, account_mismatch (they signed in to another account than before; ask again with new_account to switch) or interrupted.",
+        obj(
+            json!({
+                "company": s("The company entry"),
+                "scopes": {"type": "array", "items": {"type": "string"}, "description": "The account scopes the task needs, e.g. [\"poppy:read\"]; omit for every scope the entry allows"},
+                "new_account": {"type": "boolean", "description": "Sign in to another account than the one signed in before, in a new Session; the old Account Token is revoked once it succeeds"},
+            }),
+            &["company"],
+        ),
+        company_sign_in_output(),
+        true,
+        ALL,
+    );
+    c(
+        "company.sign_out",
+        "companies",
+        "Sign the User out at a Company: the Account Token is revoked there and forgotten here, and every call after is signed out. Answers whether anyone was signed in.",
+        obj(json!({"company": s("The company entry")}), &["company"]),
+        company_sign_out_output(),
+        true,
+        ALL,
+    );
     v
+}
+
+/// What `company.sign_in` answers — the tool, and the result of the op of
+/// the same name. Closed: no code, link or token is ever in it.
+pub fn company_sign_in_output() -> Value {
+    let scopes = || arr(json!({"type": "string"}));
+    obj(
+        json!({
+            "company": {"type": "string"},
+            "outcome": {"enum": ["signed_in", "cancelled", "denied", "expired", "account_mismatch", "interrupted"]},
+            "signed_in": {"type": "boolean"},
+            "scope": scopes(),
+            "requested": scopes(),
+        }),
+        &["company", "outcome", "signed_in"],
+    )
+}
+
+/// What `company.sign_out` answers — the tool, and the op's result.
+pub fn company_sign_out_output() -> Value {
+    obj(
+        json!({
+            "company": {"type": "string"},
+            "signed_out": {"type": "boolean", "description": "an Account Token was held, and is forgotten"},
+            "revoked": {"type": "boolean", "description": "the Company revoked it"},
+        }),
+        &["company", "signed_out", "revoked"],
+    )
 }
 
 /// What `company.status` answers — the tool, and with `detail` (why a

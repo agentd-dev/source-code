@@ -518,7 +518,9 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
             "admin.cancel" => json!({"run": "waiter-1"}),
             "auth.device.approve" => json!({"user_code": "WDJB-MJHT", "as": "greedy"}),
             "auth.device.deny" | "auth.sessions.revoke" => json!({"all": true}),
-            "company.user_id.reset" => json!({"company": "shop"}),
+            "company.user_id.reset" | "company.sign_in" | "company.sign_out" => {
+                json!({"company": "shop"})
+            }
             "_instance.result" => json!({"handle": "c1"}),
             "_instance.emit" => json!({"handle": "c1", "stream": "s", "event": {}}),
             _ => json!({}),

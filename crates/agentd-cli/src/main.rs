@@ -390,6 +390,14 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             );
             exit::SUCCESS
         }
+        // `--login company:<name>`: the running daemon asks the User to sign
+        // in at the Company; this prints where, and how it ended.
+        Ask::Login(target) if target.starts_with("company:") => {
+            company_cli(&loaded.settings, &target, true)
+        }
+        Ask::Logout(target) if target.starts_with("company:") => {
+            company_cli(&loaded.settings, &target, false)
+        }
         // `--login <target>`: the interactive OAuth device flow.
         Ask::Login(target) => {
             #[cfg(feature = "oauth")]
@@ -456,6 +464,42 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             agentd::state::record_config_digest(&loaded.settings);
             agentd::runtime::run(&loaded, args, env)
         }
+    }
+}
+
+/// `--login` / `--logout company:<name>` (`login`): a thin client of the
+/// running daemon, which does the sign-in or sign-out itself.
+fn company_cli(settings: &agentd::config::settings::Settings, target: &str, login: bool) -> i32 {
+    let name = target.trim_start_matches("company:");
+    #[cfg(all(feature = "companies", feature = "a2a"))]
+    {
+        let out = if login {
+            agentd::companies::cli::login(settings, name, &mut std::io::stdout())
+        } else {
+            agentd::companies::cli::logout(settings, name, &mut std::io::stdout())
+        };
+        match out {
+            Ok(_) => exit::SUCCESS,
+            Err(agentd::companies::cli::Failed::Usage(e)) => {
+                eprintln!("agentd: {target}: {e}");
+                exit::USAGE
+            }
+            // What the daemon said last is already on stdout.
+            Err(agentd::companies::cli::Failed::Ended(e)) => {
+                if !e.is_empty() {
+                    eprintln!("agentd: {target}: {e}");
+                }
+                exit::GENERIC
+            }
+        }
+    }
+    #[cfg(not(all(feature = "companies", feature = "a2a")))]
+    {
+        let _ = (settings, name, login);
+        eprintln!(
+            "agentd: {target} needs the companies and a2a features (build with --features companies,a2a)"
+        );
+        exit::USAGE
     }
 }
 

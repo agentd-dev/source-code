@@ -122,6 +122,8 @@ impl Fake {
             timeout: Duration::from_secs(10),
             servers: vec![(name.into(), None)],
             pace: Default::default(),
+            sign_in: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 }
@@ -369,13 +371,22 @@ fn every_published_identity_document_validates_against_the_kit() {
         jwks_uri: None,
         key_file: Some(dir.path().join("key").display().to_string()),
         published_key_files: Vec::new(),
+        redirect_uri: None,
         serve: true,
     };
-    let id = Identity::load(&client).unwrap();
+    let id = Identity::load(&client, false).unwrap();
     let kit = mock::kit::kit();
     kit.validate("client-metadata.schema.json", id.metadata())
         .unwrap();
     assert_eq!(id.metadata()["redirect_uris"], json!([]));
+    // Listing the Direct Sign-In callback, it holds to the kit too.
+    let direct = Identity::load(&client, true).unwrap();
+    kit.validate("client-metadata.schema.json", direct.metadata())
+        .unwrap();
+    assert_eq!(
+        direct.metadata()["redirect_uris"],
+        json!(["https://agent.example/companies/callback"])
+    );
     for (path, body) in id.documents() {
         let v: Value = serde_json::from_slice(&body).unwrap();
         if path.ends_with("client.json") {
@@ -1006,4 +1017,928 @@ fn a_reset_with_another_seal_key_starts_over_one_company_at_a_time() {
     let third = sealed_agent(&h, &shop, &travel, &dir, store, 2);
     connect(&third, "shop").unwrap();
     assert_eq!(user(&shop), new_shop_user, "the User started over is kept");
+}
+
+// ---- Signing in (RFC 0047 P2) ---------------------------------------------
+
+use agentd::companies::signin::{Ask, Outcome, Started};
+use std::sync::atomic::AtomicBool;
+
+/// An agent that may sign the User in at `fake` with the sign-in types
+/// `kinds` and the scopes `scopes` — or, with no `kinds`, may sign nobody
+/// in — its Account Tokens sealed with a seal key in `dir`; `client` adds to
+/// the client identity and `top` to the configuration.
+fn signing_config(
+    host: &Host,
+    fake: &Fake,
+    dir: &Path,
+    kinds: &str,
+    scopes: &str,
+    client: &str,
+    top: &str,
+) -> agentd::config::settings::Settings {
+    std::fs::write(dir.join("seal"), "5e".repeat(32)).unwrap();
+    let signs_in = if kinds.is_empty() {
+        String::new()
+    } else {
+        format!(", sign_in: {kinds}, scopes: {scopes}")
+    };
+    let yaml = format!(
+        "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\"{client}}}\n    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n\
+         store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
+         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{signs_in}}}\n{top}",
+        ca = fixture("ca.pem").display(),
+        h = host.origin,
+        d = dir.display(),
+        o = fake.origin,
+    );
+    let path = dir.join("c.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    agentd::config::settings::load(&["--config".to_string(), path.display().to_string()], &[])
+        .unwrap_or_else(|e| panic!("{e}"))
+        .0
+        .settings
+}
+
+fn supervisor_of(
+    settings: &agentd::config::settings::Settings,
+    store: Arc<agentd::store::memory::MemoryStore>,
+    host: &Host,
+) -> Arc<Supervisor> {
+    let durable = Arc::new(agentd::state::Durable::new(
+        store,
+        "t/",
+        "t",
+        agentd::state::Policy::default(),
+        None,
+    ));
+    let sup = Supervisor::build(settings, durable, &logger())
+        .unwrap()
+        .expect("a Company is declared");
+    host.publish(&sup.identity);
+    sup
+}
+
+/// [`signing_config`]'s agent, on `store`, signing in by Device Sign-In for
+/// `scopes`.
+fn signing_on(
+    fake: &Fake,
+    host: &Host,
+    dir: &Path,
+    store: Arc<agentd::store::memory::MemoryStore>,
+    scopes: &str,
+) -> Agent {
+    let settings = signing_config(host, fake, dir, "[device]", scopes, "", "");
+    Agent {
+        sup: supervisor_of(&settings, store, host),
+        _dir: dir.to_path_buf(),
+    }
+}
+
+const BOTH: &str = "[\"poppy:read\", \"poppy:write\"]";
+
+fn signing(fake: &Fake) -> Agent {
+    let dir = tempfile::tempdir().unwrap().keep();
+    signing_on(fake, &host(), &dir, Arc::default(), BOTH)
+}
+
+fn ask(scopes: &[&str]) -> Ask {
+    Ask {
+        company: "shop".into(),
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        new_account: false,
+    }
+}
+
+/// `s` percent-encoded as a query value (RFC 3986's unreserved pass).
+#[cfg(feature = "a2a")]
+fn pct(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+/// Run the sign-in `ask` to its end as the runtime does, the scripted User
+/// at the fake answering it: the gate's text, when one opened, and the
+/// outcome. A poll still running after 30 s is cancelled, and the outcome
+/// is that it never ended.
+fn sign_in(a: &Agent, ask: &Ask) -> (Option<String>, Outcome) {
+    match a.sup.begin_sign_in(ask, "signin-test", None) {
+        Ok(Started::Held(o)) => (None, o),
+        Ok(Started::Device { question, poll, .. }) => {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (sup, stop) = (Arc::clone(&a.sup), Arc::clone(&cancel));
+            std::thread::spawn(move || {
+                let _ = tx.send(sup.poll_device(poll, &stop));
+            });
+            let outcome = rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Outcome::Failed("the poll never ended".into())
+                });
+            (Some(question), outcome)
+        }
+        Ok(Started::Direct { question, .. }) => panic!("a Direct Sign-In: {question}"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+fn polls(record: &[Value]) -> Vec<&Value> {
+    tokens(record)
+        .into_iter()
+        .filter(|t| t["grant"] == wire::grant::DEVICE_CODE)
+        .collect()
+}
+
+fn refreshes(record: &[Value]) -> Vec<&Value> {
+    tokens(record)
+        .into_iter()
+        .filter(|t| t["grant"] == wire::grant::REFRESH_TOKEN)
+        .collect()
+}
+
+/// Every Account Token the fake issued, in order.
+fn account_tokens(record: &[Value]) -> Vec<String> {
+    record
+        .iter()
+        .filter_map(|r| r["issued"]["refresh_token"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The `session_id` the agent's Bearer tokens were last asked for.
+fn bearer_session(record: &[Value]) -> Value {
+    tokens(record)
+        .into_iter()
+        .rfind(|t| t["resource"].is_string() && t["status"] == 200)
+        .map(|t| t["session_id"].clone())
+        .unwrap_or(Value::Null)
+}
+
+fn order(client: &::mcp::client::McpClient) -> Result<String, String> {
+    match client.call_tool("order_status", Some(json!({"order_id": "o1"}))) {
+        Ok(r) if !r.is_error() => Ok(r.text()),
+        Ok(r) => Err(r.text()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Device Sign-In (draft §4.6), as the fake records it: the device
+/// authorization asks for the scopes with the client assertion and a proof;
+/// the gate's text is agentd's, naming the Company by its quoted name beside
+/// its verified domain, with the link and the code to check; each poll comes
+/// an interval after the last, for the current Session, with a proof; the
+/// verification page is never opened by agentd; and once the User approves,
+/// the Session is signed in — an account call answers.
+#[test]
+fn device_sign_in_keeps_the_interval_and_signs_the_session_in() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    let sid = bearer_session(&f.record());
+    assert!(sid.is_string());
+    let (q, outcome) = sign_in(&a, &ask(&[]));
+    let q = q.expect("a gate");
+    let start = format!(
+        "Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes. Open {}/auth/device/verify?user_code=",
+        f.origin
+    );
+    assert!(q.starts_with(&start), "{q}");
+    assert!(
+        q.contains("and check that the page shows the code \"")
+            && q.ends_with(
+                "This closes by itself once you have signed in there; answer cancel to stop."
+            ),
+        "{q}"
+    );
+    assert_eq!(
+        outcome,
+        Outcome::SignedIn {
+            scope: strs(&["poppy:read", "poppy:write"]),
+            requested: strs(&["poppy:read", "poppy:write"])
+        }
+    );
+    let record = f.record();
+    let issuer = format!("{}/auth", f.origin);
+    let auth = record
+        .iter()
+        .find(|r| r["path"] == "/auth/device")
+        .expect("a device authorization");
+    assert_eq!(auth["status"], 200, "{auth}");
+    assert_eq!(auth["scope"], "poppy:read poppy:write", "{auth}");
+    assert_eq!(auth["client_assertion"]["aud"], issuer.as_str());
+    assert!(auth["proof"].is_object(), "a proof: {auth}");
+    let p = polls(&record);
+    assert_eq!(p.len(), 2, "one pending, one approved: {p:#?}");
+    for poll in &p {
+        assert_eq!(poll["session_id"], sid, "the current Session: {poll}");
+        assert_eq!(poll["dpop"], true, "{poll}");
+    }
+    let at = |r: &Value| r["at_ms"].as_u64().unwrap();
+    assert!(
+        at(p[0]) >= at(auth) + 950,
+        "the first poll an interval after"
+    );
+    assert!(
+        at(p[1]) >= at(p[0]) + 950,
+        "and the next an interval after it"
+    );
+    assert_eq!(p[0]["error"], wire::error::AUTHORIZATION_PENDING);
+    assert_eq!(p[1]["status"], 200);
+    assert!(
+        record.iter().all(|r| r["path"] != "/auth/device/verify"),
+        "agentd opened the User's page"
+    );
+    assert_eq!(a.sup.signed_in(&a.sup.company("shop").unwrap()), Some(true));
+    // The Bearer tokens were the signed-out Session's: the next one is
+    // asked for with the Account Token, and the account call answers.
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let record = f.record();
+    let bearer = refreshes(&record)
+        .into_iter()
+        .find(|t| t["resource"].is_string())
+        .expect("a Bearer token on the Account Token");
+    assert_eq!(bearer["dpop"], false, "{bearer}");
+    assert_eq!(bearer["session_id"], sid, "{bearer}");
+    assert!(
+        record.iter().all(|r| r["account_token_leaked"].is_null()),
+        "{record:#?}"
+    );
+}
+
+/// `slow_down` adds 5 s to the interval (RFC 8628 §3.5): the poll after it
+/// comes six seconds later, and the fake saw no poll too early.
+#[test]
+fn slow_down_adds_five_seconds_to_the_interval() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    f.control(json!({"slow_down": 1, "approver": {"after_polls": 0}}));
+    let (_, outcome) = sign_in(&a, &ask(&[]));
+    assert!(matches!(outcome, Outcome::SignedIn { .. }), "{outcome:?}");
+    let record = f.record();
+    let p = polls(&record);
+    assert_eq!(p.len(), 2, "{p:#?}");
+    assert_eq!(p[0]["error"], wire::error::SLOW_DOWN);
+    let gap = p[1]["at_ms"].as_u64().unwrap() - p[0]["at_ms"].as_u64().unwrap();
+    assert!(gap >= 5950, "the interval and 5 s more: {gap} ms");
+    assert_eq!(p[1]["status"], 200);
+}
+
+/// The poll stops on `access_denied` and on `expired_token` (§4.6: "The
+/// Personal Agent stops asking after either"), and the sign-in says which.
+#[test]
+fn access_denied_and_expired_token_end_the_poll() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    for (decision, want) in [("deny", Outcome::Denied), ("expire", Outcome::Expired)] {
+        f.control(json!({"approver": {"decision": decision, "after_polls": 0}}));
+        let before = polls(&f.record()).len();
+        let (_, outcome) = sign_in(&a, &ask(&[]));
+        assert_eq!(outcome, want);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            polls(&f.record()).len(),
+            before + 1,
+            "{decision}: no poll after it"
+        );
+    }
+    assert!(!a.sup.holds_account(&a.sup.company("shop").unwrap()));
+}
+
+/// The User may approve fewer scopes than asked for (§4.4: "the Personal
+/// Agent checks `scope` before continuing"): both are reported.
+#[test]
+fn a_narrower_grant_is_reported() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    f.control(json!({"approver": {"scope": "poppy:read"}}));
+    let (_, outcome) = sign_in(&a, &ask(&[]));
+    assert_eq!(
+        outcome,
+        Outcome::SignedIn {
+            scope: strs(&["poppy:read"]),
+            requested: strs(&["poppy:read", "poppy:write"])
+        }
+    );
+    assert!(
+        outcome
+            .said("shop")
+            .contains("fewer scopes than asked for: poppy:read of poppy:read poppy:write"),
+        "{}",
+        outcome.said("shop")
+    );
+}
+
+/// A device authorization naming a `verification_uri` off the entry's hosts
+/// is refused before any gate opens, naming the field and the host but
+/// never the URL, whose query may carry the code — and nothing is polled.
+#[test]
+fn an_off_host_verification_uri_opens_no_gate() {
+    let f = fake(&[Variant::OffHostVerificationUri]);
+    let a = signing(&f);
+    let e = match a.sup.begin_sign_in(&ask(&[]), "t", None) {
+        Err(e) => e,
+        Ok(_) => panic!("a gate would have opened"),
+    };
+    assert!(
+        e.contains("the device authorization's verification_uri"),
+        "{e}"
+    );
+    assert!(e.contains("names host localhost"), "{e}");
+    assert!(
+        !e.contains("/device/verify") && !e.contains("user_code"),
+        "{e}"
+    );
+    assert!(polls(&f.record()).is_empty());
+}
+
+/// An Account Token held that covers the scopes signs the Session in with
+/// the `refresh_token` grant and its `session_id`, and no gate opens
+/// (§4.4: "SHOULD check whether it already holds an Account Token that
+/// covers the task").
+#[test]
+fn a_held_account_token_that_covers_the_scopes_opens_no_gate() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    sign_in(&a, &ask(&[]));
+    let before = f.record().len();
+    let (q, outcome) = sign_in(&a, &ask(&["poppy:read"]));
+    assert!(q.is_none(), "{q:?}");
+    assert!(matches!(outcome, Outcome::SignedIn { .. }), "{outcome:?}");
+    let after = f.record()[before..].to_vec();
+    assert!(
+        after.iter().all(|r| r["path"] != "/auth/device"),
+        "{after:#?}"
+    );
+    let r = refreshes(&after);
+    assert_eq!(r.len(), 1, "{after:#?}");
+    assert!(r[0]["session_id"].is_string() && r[0]["dpop"] == true);
+}
+
+/// A sign-in that asks for more than the Account Token grants asks for every
+/// scope it needs, the held ones too (§4.4), and once it succeeds the token
+/// it replaced is revoked (§4.4: "which the Personal Agent SHOULD revoke").
+#[test]
+fn a_scope_upgrade_revokes_the_old_account_token() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    f.control(json!({"approver": {"scope": "poppy:read"}}));
+    sign_in(&a, &ask(&["poppy:read"]));
+    let first = account_tokens(&f.record())[0].clone();
+    f.control(json!({"approver": {"scope": "poppy:read poppy:write"}}));
+    let (q, outcome) = sign_in(&a, &ask(&["poppy:write"]));
+    assert!(q.is_some(), "a sign-in, not the held token");
+    assert_eq!(
+        outcome,
+        Outcome::SignedIn {
+            scope: strs(&["poppy:read", "poppy:write"]),
+            requested: strs(&["poppy:read", "poppy:write"])
+        }
+    );
+    let record = f.record();
+    let auths: Vec<&Value> = record
+        .iter()
+        .filter(|r| r["path"] == "/auth/device")
+        .collect();
+    assert_eq!(auths[1]["scope"], "poppy:read poppy:write");
+    let revoked: Vec<&Value> = record
+        .iter()
+        .filter(|r| r["path"] == "/auth/revoke")
+        .collect();
+    assert_eq!(revoked.len(), 1, "{record:#?}");
+    assert_eq!(revoked[0]["account_token"], presented(&first));
+    assert_eq!(revoked[0]["token_type_hint"], "refresh_token");
+    assert_eq!(revoked[0]["revoked"], true);
+}
+
+/// Signing in to another account than the Session's (§4.4) issues no tokens
+/// and leaves the held Account Token as it was; `new_account` signs in in a
+/// new Session, and revokes the old token once it succeeds.
+#[test]
+fn account_mismatch_changes_nothing_and_a_new_account_starts_a_new_session() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    f.control(json!({"approver": {"scope": "poppy:read"}}));
+    sign_in(&a, &ask(&["poppy:read"]));
+    let first = account_tokens(&f.record())[0].clone();
+    let sid = polls(&f.record())[0]["session_id"].clone();
+    f.control(json!({"approver": {"account": "acct_2", "scope": "poppy:read poppy:write"}}));
+    let (_, outcome) = sign_in(&a, &ask(&["poppy:write"]));
+    assert_eq!(outcome, Outcome::AccountMismatch);
+    assert_eq!(
+        account_tokens(&f.record()),
+        std::slice::from_ref(&first),
+        "no tokens issued"
+    );
+    let company = a.sup.company("shop").unwrap();
+    assert!(a.sup.holds_account(&company), "the held token is kept");
+    let switch = Ask {
+        new_account: true,
+        ..ask(&["poppy:write"])
+    };
+    let (_, outcome) = sign_in(&a, &switch);
+    assert!(matches!(outcome, Outcome::SignedIn { .. }), "{outcome:?}");
+    let record = f.record();
+    let last = polls(&record).last().cloned().unwrap().clone();
+    assert_ne!(last["session_id"], sid, "a new Session: {last}");
+    let revoked: Vec<&Value> = record
+        .iter()
+        .filter(|r| r["path"] == "/auth/revoke")
+        .collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0]["account_token"], presented(&first));
+}
+
+/// `403 sign_in_required` with an Account Token held — a Session the
+/// Company signed out — refreshes into the current Session, with
+/// `session_id` and `resource` and no proof, and the call succeeds.
+#[test]
+fn sign_in_required_refreshes_into_the_current_session() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    sign_in(&a, &ask(&[]));
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let sid = bearer_session(&f.record());
+    f.control(json!({"sign_out_sessions": true}));
+    let before = f.record().len();
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let record = f.record();
+    let after = &record[before..];
+    assert!(
+        after
+            .iter()
+            .any(|r| r["path"] == "/mcp" && r["error"] == wire::error::SIGN_IN_REQUIRED),
+        "{after:#?}"
+    );
+    let r = refreshes(after);
+    assert_eq!(r.len(), 1, "{after:#?}");
+    assert_eq!(r[0]["session_id"], sid, "the current Session");
+    assert_eq!(r[0]["resource"], format!("{}/mcp", f.origin));
+    assert_eq!(r[0]["dpop"], false);
+    assert_eq!(r[0]["status"], 200);
+}
+
+/// With an Account Token held, an `invalid_token` from an expired Session
+/// Token renews with it and keeps it, and an `invalid_session` starts a new
+/// Session already signed in, with no `session_id` (§4.8) — only an
+/// `invalid_grant` forgets the token, after which the Session goes on signed
+/// out.
+#[test]
+fn only_invalid_grant_forgets_the_account_token() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    let company = a.sup.company("shop").unwrap();
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    sign_in(&a, &ask(&[]));
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    // invalid_token: renewed with the Account Token, which is kept.
+    let before = f.record().len();
+    f.control(json!({"refuse_tokens": 1}));
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let after = f.record()[before..].to_vec();
+    assert!(
+        after
+            .iter()
+            .any(|r| r["path"] == "/mcp" && r["error"] == wire::error::INVALID_TOKEN)
+    );
+    assert!(
+        refreshes(&after).iter().all(|t| t["status"] == 200),
+        "{after:#?}"
+    );
+    assert!(a.sup.holds_account(&company));
+    // invalid_session: a new Session, signed in by the Account Token alone.
+    let before = f.record().len();
+    f.control(json!({"end_sessions": true, "refuse_tokens": 1}));
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let after = f.record()[before..].to_vec();
+    let r = refreshes(&after);
+    assert!(
+        r.iter().any(|t| t["error"] == wire::error::INVALID_SESSION),
+        "{after:#?}"
+    );
+    let started = r
+        .iter()
+        .find(|t| t["session_id"].is_null())
+        .expect("a Session started on the Account Token");
+    assert_eq!(started["status"], 200, "{started}");
+    assert!(
+        tokens(&after)
+            .iter()
+            .all(|t| t["grant"] != wire::grant::JWT_BEARER),
+        "never signed out: {after:#?}"
+    );
+    assert!(a.sup.holds_account(&company));
+    // invalid_grant — the User disconnected agentd at the Company: the
+    // token is forgotten, and the Session goes on signed out.
+    f.control(json!({"disconnect": true}));
+    let before = f.record().len();
+    let e = order(&client).expect_err("signed out");
+    assert!(e.contains(wire::error::SIGN_IN_REQUIRED), "{e}");
+    assert!(!a.sup.holds_account(&company));
+    let after = f.record()[before..].to_vec();
+    assert!(
+        refreshes(&after)
+            .iter()
+            .any(|t| t["error"] == wire::error::INVALID_GRANT),
+        "{after:#?}"
+    );
+    assert!(
+        tokens(&after)
+            .iter()
+            .any(|t| t["grant"] == wire::grant::JWT_BEARER && t["status"] == 200),
+        "{after:#?}"
+    );
+    let r = client
+        .call_tool("search", Some(json!({"query": "boots"})))
+        .unwrap();
+    assert!(!r.is_error(), "a signed-out call still answers");
+}
+
+/// Signing out revokes the Account Token (§4.9, RFC 7009) — the fake records
+/// it — and forgets it; the same Session goes on signed out.
+#[test]
+fn signing_out_revokes_and_the_session_goes_on_signed_out() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    let company = a.sup.company("shop").unwrap();
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    sign_in(&a, &ask(&[]));
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let token = account_tokens(&f.record())[0].clone();
+    let sid = bearer_session(&f.record());
+    let out = a.sup.sign_out(&company).unwrap();
+    assert_eq!(
+        out,
+        json!({"company": "shop", "signed_out": true, "revoked": true})
+    );
+    let record = f.record();
+    let revoke = record
+        .iter()
+        .find(|r| r["path"] == "/auth/revoke")
+        .expect("revoked at the Company");
+    assert_eq!(revoke["account_token"], presented(&token));
+    assert_eq!(revoke["token_type_hint"], "refresh_token");
+    assert_eq!(revoke["revoked"], true);
+    assert!(revoke["client_assertion"].is_object());
+    assert!(!a.sup.holds_account(&company));
+    let e = order(&client).expect_err("signed out");
+    assert!(e.contains(wire::error::SIGN_IN_REQUIRED), "{e}");
+    assert_eq!(bearer_session(&f.record()), sid, "the same Session");
+    assert_eq!(
+        a.sup.sign_out(&company).unwrap()["signed_out"],
+        false,
+        "nobody is signed in"
+    );
+}
+
+/// An Account Token the Company rotates is kept before it is used, sealed,
+/// and a restart uses the newest: the fake never sees a spent one. No
+/// Account Token is ever in the store in plaintext.
+#[test]
+fn a_rotated_account_token_survives_a_restart_and_is_kept_sealed() {
+    let f = fake(&[Variant::Rotation]);
+    let h = host();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let first = signing_on(&f, &h, &dir, Arc::clone(&store), BOTH);
+    sign_in(&first, &ask(&[]));
+    let (client, _) =
+        agentd::companies::mcp::connect(&first.sup, "shop", Duration::from_secs(20)).unwrap();
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let issued = account_tokens(&f.record());
+    assert!(issued.len() >= 2, "a sign-in and a rotation: {issued:?}");
+    drop((client, first));
+    let before = f.record().len();
+    let second = signing_on(&f, &h, &dir, Arc::clone(&store), BOTH);
+    let (client, _) =
+        agentd::companies::mcp::connect(&second.sup, "shop", Duration::from_secs(20)).unwrap();
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    let record = f.record();
+    let after = refreshes(&record[before..]);
+    assert_eq!(
+        after[0]["account_token"],
+        presented(issued.last().unwrap()),
+        "the newest token, after the restart"
+    );
+    assert!(
+        refreshes(&record).iter().all(|t| t["status"] == 200),
+        "a spent token was presented: {record:#?}"
+    );
+    use agentd::store::Store;
+    let dump: String = store
+        .dump()
+        .into_iter()
+        .map(|(k, _)| format!("{k} {:?}", store.get(&k, None)))
+        .collect();
+    for t in account_tokens(&record) {
+        assert!(!dump.contains(&t), "an Account Token in the store");
+    }
+}
+
+/// A token granted on an Account Token holding more scopes than the entry
+/// now allows asks for fewer (§4.8: "`scope` MAY ask for fewer scopes than
+/// the Account Token has").
+#[test]
+fn an_account_token_is_used_for_no_more_than_the_entry_allows() {
+    let f = fake(&[]);
+    let h = host();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let first = signing_on(&f, &h, &dir, Arc::clone(&store), BOTH);
+    sign_in(&first, &ask(&[]));
+    drop(first);
+    let before = f.record().len();
+    let narrowed = signing_on(&f, &h, &dir, store, "[\"poppy:read\"]");
+    agentd::companies::mcp::connect(&narrowed.sup, "shop", Duration::from_secs(20)).unwrap();
+    let record = f.record();
+    let r = refreshes(&record[before..]);
+    assert!(!r.is_empty());
+    for t in r {
+        assert_eq!(t["scope"], "poppy:read", "{t}");
+        assert_eq!(t["status"], 200, "{t}");
+    }
+}
+
+/// A held Account Token is not used where the entry admits none of its
+/// scopes, nor at all once the entry signs nobody in: every request there
+/// is signed out — no `refresh_token` grant is sent — and the token is kept
+/// for the User to sign out of.
+#[test]
+fn an_account_token_the_entry_admits_none_of_is_not_used() {
+    let f = fake(&[]);
+    let h = host();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let first = signing_on(&f, &h, &dir, Arc::clone(&store), BOTH);
+    sign_in(&first, &ask(&[]));
+    drop(first);
+    for (kinds, scopes) in [("", ""), ("[device]", "[\"addresses\"]")] {
+        let before = f.record().len();
+        let settings = signing_config(&h, &f, &dir, kinds, scopes, "", "");
+        let a = Agent {
+            sup: supervisor_of(&settings, Arc::clone(&store), &h),
+            _dir: dir.clone(),
+        };
+        let (client, _) =
+            agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+        let e = order(&client).expect_err("signed out");
+        assert!(e.contains(wire::error::SIGN_IN_REQUIRED), "{kinds}: {e}");
+        let record = f.record();
+        let after = &record[before..];
+        assert!(refreshes(after).is_empty(), "{kinds}: {after:#?}");
+        let company = a.sup.company("shop").unwrap();
+        assert!(a.sup.holds_account(&company), "{kinds}: kept");
+    }
+}
+
+/// A Company's `expires_in` and `interval` are only ever added to a clock:
+/// a device authorization naming the largest numbers JSON carries is
+/// followed for `DEVICE_FOR` at most, and its poll ends as asked rather
+/// than overflow.
+#[test]
+fn a_device_authorizations_numbers_never_overflow_the_clock() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    f.control(json!({"device": {"expires_in": u64::MAX, "interval": u64::MAX}}));
+    let poll = match a.sup.begin_sign_in(&ask(&[]), "t", None) {
+        Ok(Started::Device { poll, .. }) => poll,
+        Ok(_) => panic!("a Device Sign-In"),
+        Err(e) => panic!("{e}"),
+    };
+    assert_eq!(poll.expires_in(), agentd::companies::token::DEVICE_FOR);
+    let cancel = AtomicBool::new(true);
+    assert_eq!(a.sup.poll_device(poll, &cancel), Outcome::Cancelled);
+}
+
+/// Start renewing `a`'s Session at `company` with its Account Token, the
+/// fake holding back its answer once the token is rotated: the renewal
+/// holds the Session until then. Returns once the hold has begun.
+fn renewing_slowly(
+    f: &Fake,
+    a: &Agent,
+    company: &Arc<agentd::companies::Company>,
+) -> std::thread::JoinHandle<Result<(bool, Vec<String>), String>> {
+    // The fake's own line for a hold, which `Fake::record` leaves out.
+    let holds = || {
+        get(&format!("{}/_mock/record", f.origin)).1["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["path"] == "/_mock/held")
+            .count()
+    };
+    let before = holds();
+    f.control(json!({"stall": {"method": "token:refresh_token", "times": 1, "ms": 1500}}));
+    let (sup, c) = (Arc::clone(&a.sup), Arc::clone(company));
+    let t = std::thread::spawn(move || sup.with_session(&c, |s, env| s.renew_now(env)));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while holds() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the renewal never reached the fake"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    t
+}
+
+/// A sign-in that ends while a renewal is in flight is ordered after it by
+/// the Session: the renewal's rotated Account Token is kept first, and it
+/// is the one the sign-in's new token replaces — never written over the new
+/// one after.
+#[test]
+fn a_renewal_in_flight_never_undoes_a_sign_in() {
+    let f = fake(&[Variant::Rotation]);
+    let a = signing(&f);
+    let company = a.sup.company("shop").unwrap();
+    sign_in(&a, &ask(&[]));
+    let sid = a
+        .sup
+        .with_session(&company, |s, env| s.session_id(env))
+        .unwrap();
+    let renewal = renewing_slowly(&f, &a, &company);
+    // The User finished signing in again meanwhile.
+    let got = agentd::companies::token::TokenResponse {
+        access_token: "at_signed_in".into(),
+        token_type: "DPoP".into(),
+        expires_in: Duration::from_secs(600),
+        scope: strs(&["poppy:read", "poppy:write"]),
+        session_id: sid,
+        signed_in: true,
+        refresh_token: Some("pat_from_the_new_sign_in".into()),
+        refresh_token_expires_in: None,
+    };
+    let replaced = a
+        .sup
+        .with_session(&company, |s, env| s.signed_in(env, &got, "device"))
+        .unwrap();
+    renewal.join().unwrap().unwrap();
+    let held = a
+        .sup
+        .with_session(&company, |s, env| env.account(&s.issuer))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.token, "pat_from_the_new_sign_in",
+        "the sign-in's token is kept"
+    );
+    assert_eq!(
+        replaced.map(|r| r.token),
+        account_tokens(&f.record()).last().cloned(),
+        "the rotated token is the one replaced"
+    );
+}
+
+/// Signing out while a renewal is in flight revokes the Account Token the
+/// renewal rotated to, not the spent one it started from: none is left good
+/// at the Company.
+#[test]
+fn signing_out_during_a_renewal_revokes_the_rotated_token() {
+    let f = fake(&[Variant::Rotation]);
+    let a = signing(&f);
+    let company = a.sup.company("shop").unwrap();
+    sign_in(&a, &ask(&[]));
+    let renewal = renewing_slowly(&f, &a, &company);
+    let out = a.sup.sign_out(&company).unwrap();
+    renewal.join().unwrap().unwrap();
+    assert_eq!(
+        out,
+        json!({"company": "shop", "signed_out": true, "revoked": true})
+    );
+    let record = f.record();
+    let newest = account_tokens(&record).last().cloned().unwrap();
+    let revoked: Vec<&Value> = record
+        .iter()
+        .filter(|r| r["path"] == "/auth/revoke")
+        .collect();
+    assert_eq!(revoked.len(), 1, "{record:#?}");
+    assert_eq!(revoked[0]["account_token"], presented(&newest));
+    assert_eq!(revoked[0]["revoked"], true);
+    assert!(!a.sup.holds_account(&company));
+}
+
+/// Direct Sign-In (§4.5) through the fake, the test standing in for the
+/// User's browser: the authorization URL carries S256 PKCE, the `state` and
+/// the `redirect_uri` the client metadata lists; the callback's `state` is
+/// spent on first use; and a response whose `iss` is not the Company's
+/// issuer is refused, its code never exchanged.
+#[cfg(feature = "a2a")]
+#[test]
+fn direct_sign_in_spends_its_state_once_and_refuses_another_issuer() {
+    let f = fake(&[]);
+    let h = host();
+    let dir = tempfile::tempdir().unwrap().keep();
+    let top = format!(
+        "a2a:\n  listen: https://127.0.0.1:1\n  url: {}\n  tls: {{cert: {}, key: {}}}\n",
+        h.origin,
+        fixture("server.pem").display(),
+        fixture("server.key").display(),
+    );
+    let settings = signing_config(&h, &f, &dir, "[direct]", BOTH, ", serve: true", &top);
+    let a = Agent {
+        sup: supervisor_of(&settings, Arc::default(), &h),
+        _dir: dir.clone(),
+    };
+    let redirect = format!("{}/companies/callback", h.origin);
+    assert_eq!(
+        a.sup.identity.metadata()["redirect_uris"],
+        json!([redirect.clone()])
+    );
+    // The link the gate shows, followed as the User's browser would.
+    let begin = |a: &Agent, ask: Ask| -> (String, String) {
+        let question = match a.sup.begin_sign_in(&ask, "direct-t", None) {
+            Ok(Started::Direct { question, .. }) => question,
+            Err(e) => panic!("a Direct Sign-In: {e}"),
+            Ok(Started::Held(o)) => panic!("a Direct Sign-In, not held: {o:?}"),
+            Ok(Started::Device { question, .. }) => panic!("a Direct Sign-In, not: {question}"),
+        };
+        assert!(
+            question.starts_with("Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes. Open this link and sign in on the Company's own page: "),
+            "{question}"
+        );
+        let url = question
+            .split("page: ")
+            .nth(1)
+            .and_then(|r| r.split(" — ").next())
+            .unwrap()
+            .to_string();
+        let r = agentd::auth::http::get(
+            &url,
+            &[],
+            Duration::from_secs(10),
+            agentd::auth::http::Dial::Named,
+        )
+        .unwrap();
+        assert_eq!(r.status, 302, "the scripted User answers at once");
+        let back = r.header("location").unwrap().to_string();
+        assert!(back.starts_with(&format!("{redirect}?")), "{back}");
+        (url, back.split_once('?').unwrap().1.to_string())
+    };
+    let (url, query) = begin(&a, ask(&[]));
+    for part in [
+        "response_type=code",
+        "code_challenge_method=S256",
+        &format!("redirect_uri={}", pct(&redirect)),
+    ] {
+        assert!(url.contains(part), "{part} in {url}");
+    }
+    let (id, outcome) = a.sup.direct_callback(&query).expect("its sign-in");
+    assert_eq!(id, "direct-t");
+    assert!(matches!(outcome, Outcome::SignedIn { .. }), "{outcome:?}");
+    assert!(
+        a.sup.direct_callback(&query).is_none(),
+        "the state is spent"
+    );
+    let codes = |r: &[Value]| -> Vec<Value> {
+        tokens(r)
+            .into_iter()
+            .filter(|t| t["grant"] == wire::grant::AUTHORIZATION_CODE)
+            .cloned()
+            .collect()
+    };
+    let exchanged = codes(&f.record());
+    assert_eq!(exchanged.len(), 1, "one exchange for one state");
+    assert_eq!(
+        exchanged[0]["status"], 200,
+        "the same redirect_uri: {:?}",
+        exchanged[0]
+    );
+    assert!(exchanged[0]["session_id"].is_string() && exchanged[0]["dpop"] == true);
+    // Another issuer's response is refused, and its code is not exchanged.
+    let another = Ask {
+        new_account: true,
+        ..ask(&[])
+    };
+    let (_, query) = begin(&a, another);
+    let forged = query.replace(
+        &pct(&format!("{}/auth", f.origin)),
+        &pct("https://127.0.0.1:1/auth"),
+    );
+    assert_ne!(forged, query);
+    let (_, outcome) = a.sup.direct_callback(&forged).expect("its sign-in");
+    let Outcome::Failed(why) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(why.contains("did not come from shop's issuer"), "{why}");
+    assert!(a.sup.direct_callback(&query).is_none(), "spent with it");
+    assert_eq!(
+        codes(&f.record()).len(),
+        1,
+        "the forged code was not exchanged"
+    );
 }

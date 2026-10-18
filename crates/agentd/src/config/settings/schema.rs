@@ -438,8 +438,9 @@ fn companies() -> Value {
                 "jwks_uri": { "type": "string", "description": "the key set's HTTPS URL, on the client_id's host; default <client_id origin>/companies/jwks.json" },
                 "key_file": { "type": "string", "description": "the ES256 signing key (PKCS#8), created 0600 when absent; default /var/lib/agentd/company-client-key" },
                 "published_key_files": { "type": "array", "items": { "type": "string" }, "description": "keys whose public halves are in the key set but are never signed with: the next key before a rotation, the previous one after it" },
-                "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" } } },
-            "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the User ID records, so a store cannot read them. Required with a remote store (mcp, http)" },
+                "redirect_uri": { "type": "string", "description": "where Direct Sign-In returns the User, an HTTPS URL on the client_id's host; default <client_id origin>/companies/callback. Listed in the document's redirect_uris when a Company lists direct" },
+                "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths, and the Direct Sign-In callback when a Company lists direct (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" } } },
+            "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http)" },
             "browsers": { "type": "array", "items": { "type": "string" }, "description": "browser MCP servers to keep off every Company's hosts; each names an mcp.servers entry" },
             "limits": { "type": "object", "additionalProperties": false, "properties": {
                 "in_flight": { "type": "integer", "minimum": 1, "description": "Company calls in flight per Company (default 4); one more is refused until one ends" } } } } })
@@ -687,7 +688,11 @@ fn defs_properties(
                 "allow_private": { "type": "boolean", "description": "`kind: company` only — admit loopback, private and link-local addresses (an on-premises Company); default false" },
                 "interfaces": { "type": "array", "items": { "enum": ["mcp", "agent", "openapi"] }, "description": "`kind: company` only — the Company's interfaces agentd uses; default [mcp], the only one this build uses" },
                 "mcp_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "`kind: company` only — a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry" },
-                "privacy": { "enum": ["strict", "standard"], "description": "`kind: company` only — strict (default) or standard, which sends agentd's usual correlators and is logged at boot" } } }));
+                "privacy": { "enum": ["strict", "standard"], "description": "`kind: company` only — strict (default) or standard, which sends agentd's usual correlators and is logged at boot" },
+                "sign_in": { "type": "array", "items": { "enum": ["device", "direct", "mediated"] },
+                             "description": "`kind: company` only — the sign-in types agentd may start with the User, in the order it tries them: device (a link and a code) or direct (the Company's page, back to the served callback; needs client.serve). mediated is refused. Needs scopes and security.companies.seal_key" },
+                "scopes": { "type": "array", "items": { "type": "string" },
+                            "description": "`kind: company` only — the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants" } } }));
     m.insert("A2aPeer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }, "endpoint": { "type": "string" },
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },

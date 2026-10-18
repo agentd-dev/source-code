@@ -134,6 +134,10 @@ pub struct Opts {
     /// metadata document and key set a Company fetches (RFC 0047 §5.5.2),
     /// when `security.companies.client.serve` says so. Mounted only then.
     pub documents: Vec<(String, Vec<u8>)>,
+    /// The path of the Direct Sign-In callback (RFC 0047 §5.7), when a
+    /// Company may be signed in to directly and the identity is served
+    /// here. Mounted only then.
+    pub callback: Option<String>,
 }
 
 /// How long a Company may cache a served document.
@@ -185,6 +189,7 @@ struct App {
     /// requests are in flight. `None` on a listener with no sessions.
     liveness: Option<Liveness>,
     documents: Vec<(String, Vec<u8>)>,
+    callback: Option<String>,
     log: Logger,
 }
 
@@ -338,6 +343,7 @@ impl App {
             stream_deadline: opts.stream_deadline,
             liveness,
             documents: opts.documents,
+            callback: opts.callback,
             log,
         }
     }
@@ -395,7 +401,35 @@ fn router(app: Arc<App>) -> Router {
             }),
         );
     }
+    // Where Direct Sign-In returns the User's browser: its query goes to the
+    // loop as it came, and the browser is told only that it may close the
+    // page — the `state` it carries is what says whose sign-in it is.
+    if let Some(path) = &app.callback {
+        r = r.route(path, get(company_callback));
+    }
     r.with_state(app)
+}
+
+/// The Direct Sign-In callback: the query handed to the loop, and a page that
+/// says only that it can be closed, never cached and never framed.
+async fn company_callback(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    app.bridge
+        .company_callback(uri.query().unwrap_or_default().to_string());
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
+        "<!doctype html><title>agentd</title><p>You can close this page.</p>",
+    )
+        .into_response()
 }
 
 /// A served public document.
@@ -778,6 +812,7 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             stream_deadline: Duration::from_secs(5),
             documents: Vec::new(),
+            callback: None,
         };
         let mut app = App::new(
             A2aBridge::new(tx, resolver),
@@ -2188,6 +2223,7 @@ mod tests {
                 request_timeout: Duration::from_secs(5),
                 stream_deadline: Duration::from_secs(5),
                 documents: Vec::new(),
+                callback: None,
             },
             A2aBridge::new(tx, resolver),
             None,

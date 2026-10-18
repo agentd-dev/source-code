@@ -282,6 +282,10 @@ fn play() -> Value {
     json!({
         "match": [
             {"when_contains": "holds another Company's content", "echo_tool_result": true},
+            {"when_contains": "signed_in", "echo_tool_result": true},
+            {"when_contains": "is not shown to the User", "echo_tool_result": true},
+            {"when_contains": "shipped", "echo_tool_result": true},
+            {"when_contains": "SIGN-IN-SHOP", "tool_calls": [{"name": "company.sign_in", "arguments": {"company": "shop"}}]},
             {"when_contains": "TRAVEL-NEXT", "tool_calls": [{"name": "travel.search", "arguments": {"query": "flights"}}]},
             {"when_contains": "outcome unknown", "echo_tool_result": true},
             {"when_contains": "rate limited by shop until", "echo_tool_result": true},
@@ -1828,6 +1832,699 @@ mod over_a2a {
                 .any(|e| e["server"] == "shop" && e["reason"] == "user_id_reset"),
             "{l}"
         );
+    }
+
+    /// A seal key in a file of its own, for a configuration that signs in.
+    fn seal_file() -> PathBuf {
+        let p = tempfile::tempdir().unwrap().keep().join("seal");
+        std::fs::write(&p, "5e".repeat(32)).unwrap();
+        p
+    }
+
+    /// The `security.companies` lines a configuration that signs in adds:
+    /// the seal key, and `user` when one is named.
+    fn sealed(user: Option<&str>) -> String {
+        let mut top = format!(
+            "    seal_key: \"{{{{secret-file:{}}}}}\"\n",
+            seal_file().display()
+        );
+        if let Some(u) = user {
+            top.push_str(&format!("    user: \"{u}\"\n"));
+        }
+        top
+    }
+
+    const SIGN_IN: &str = ", sign_in: [device], scopes: [\"poppy:read\", \"poppy:write\"]";
+
+    /// The text of a task's status message.
+    fn status_text(t: &Value) -> String {
+        t["status"]["message"]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every Account Token the fake issued.
+    fn account_tokens(f: &Fake) -> Vec<String> {
+        f.record()
+            .iter()
+            .filter_map(|r| r["issued"]["refresh_token"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Device Sign-In through the model (RFC 0047 §5.7). The gate is the
+    /// User's and its text agentd's; the operator, who is not the User,
+    /// cannot answer it — not even to cancel it — and no judge does, with
+    /// `agent.approval` and the fallback both `auto`. The User signs in at
+    /// the Company and the gate closes by itself; the tool's answer reports
+    /// the scopes granted; an account call is signed in from then on.
+    /// Nothing a worker was sent — the model's whole transcript — holds the
+    /// code, the link's parameter or a token, and no log line or store file
+    /// holds the Account Token. A disconnect at the Company shows at the
+    /// next account call: `invalid_grant` drops the Account Token, said once,
+    /// and the call says a sign-in is needed.
+    #[test]
+    fn the_users_device_sign_in_never_reaches_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"approver": {"after_polls": 4}}));
+        let h = host();
+        let s = setup_with(
+            &h,
+            &sealed(Some("user:dana")),
+            "  approval: auto\n  ask_human_fallback: auto\n",
+            &shop_entry(&f.origin, SIGN_IN),
+            "",
+        );
+        let frames = s.dir.join("frames.jsonl");
+        let (d, addr) = start_listening(
+            &s,
+            "signin",
+            &[("AGENTD_TEST_FRAMES_FILE", &frames.display().to_string())],
+        );
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = common::SendMessage::text("SIGN-IN-SHOP")
+            .bearer(DANA)
+            .context("si")
+            .return_immediately()
+            .result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let t = wait_state(&addr, DANA, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        let q = status_text(&t);
+        assert!(
+            q.starts_with(&format!(
+                "Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes. Open {}/auth/device/verify?user_code=",
+                f.origin
+            )),
+            "{q}"
+        );
+        let code = q
+            .split("shows the code \"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or_else(|| panic!("{q}"))
+            .to_string();
+        let op = common::SendMessage::text("cancel")
+            .bearer(OPERATOR)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert_eq!(op["error"]["code"], -32602, "{op}");
+        assert!(op.to_string().contains("user:dana"), "{op}");
+        assert_eq!(
+            get_task(&addr, DANA, &task)["status"]["state"],
+            "TASK_STATE_INPUT_REQUIRED",
+            "the operator's answer closed the User's gate"
+        );
+        let l = wait_for(&d.log, "the sign-in's answer", |l| {
+            replies(l).iter().any(|r| r.contains("signed_in"))
+        });
+        let reply = replies(&l)
+            .into_iter()
+            .find(|r| r.contains("signed_in"))
+            .unwrap();
+        let said: Value = serde_json::from_str(&reply).unwrap_or(Value::Null);
+        assert_eq!(said["outcome"], "signed_in", "{reply}");
+        assert_eq!(said["scope"], json!(["poppy:read", "poppy:write"]));
+        common::SendMessage::text("CALL-ORDER")
+            .bearer(DANA)
+            .context("o1")
+            .post(&addr);
+        wait_for(&d.log, "the order", |l| {
+            replies(l).iter().any(|r| r.contains("shipped"))
+        });
+        let l = d.read();
+        assert!(events(&l, "human.judge.start").is_empty(), "{l}");
+        let asked = events(&l, "company.sign_in.requested");
+        assert_eq!(asked.len(), 1, "{l}");
+        assert_eq!(asked[0]["kind"], "device");
+        assert_eq!(asked[0]["scopes"], json!(["poppy:read", "poppy:write"]));
+        let signed = events(&l, "company.signed_in");
+        assert_eq!(signed.len(), 1, "{l}");
+        assert_eq!(signed[0]["granted"], json!(["poppy:read", "poppy:write"]));
+        // What the model saw.
+        let sent = std::fs::read_to_string(&frames).unwrap();
+        let accounts = account_tokens(&f);
+        assert!(!accounts.is_empty());
+        let mut secrets = f.issued();
+        secrets.extend(accounts.iter().cloned());
+        secrets.push(code.clone());
+        secrets.push("user_code=".into());
+        for secret in &secrets {
+            assert!(!sent.contains(secret.as_str()), "{secret} reached a worker");
+        }
+        assert!(!l.contains(&code), "the code in the log");
+        for t in &accounts {
+            holds_no(&s.dir, t);
+        }
+        // The User disconnects agentd in their account settings.
+        f.control(json!({"disconnect": true}));
+        common::SendMessage::text("CALL-ORDER")
+            .bearer(DANA)
+            .context("o2")
+            .post(&addr);
+        let l = wait_for(&d.log, "the disconnect said", |l| {
+            replies(l)
+                .iter()
+                .any(|r| r.contains("needs a signed-in Session"))
+        });
+        let dropped = events(&l, "company.account_token.dropped");
+        assert_eq!(dropped.len(), 1, "{l}");
+        assert_eq!(dropped[0]["reason"], "invalid_grant");
+    }
+
+    /// A device authorization that would send the User off the Company's
+    /// hosts (RFC 0047 §5.7 step 3) opens no gate: the task the User's
+    /// message started never asks them anything, the model is told the field
+    /// that was refused, and the log names it.
+    #[test]
+    fn an_off_host_verification_uri_opens_no_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &["off-host-verification-uri"], None);
+        let h = host();
+        let s = setup_with(
+            &h,
+            &sealed(Some("user:dana")),
+            "",
+            &shop_entry(&f.origin, SIGN_IN),
+            "",
+        );
+        let (d, addr) = start_listening(&s, "offhost", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = common::SendMessage::text("SIGN-IN-SHOP")
+            .bearer(DANA)
+            .context("si")
+            .return_immediately()
+            .result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let l = wait_for(&d.log, "the refusal told", |l| {
+            replies(l)
+                .iter()
+                .any(|r| r.contains("is not shown to the User"))
+        });
+        let reply = replies(&l)
+            .into_iter()
+            .find(|r| r.contains("is not shown to the User"))
+            .unwrap();
+        assert!(reply.contains("verification_uri"), "{reply}");
+        assert!(!reply.contains("/device/verify"), "the URL quoted: {reply}");
+        let refused = events(&l, "company.endpoint.refused");
+        assert_eq!(refused.len(), 1, "{l}");
+        assert_eq!(refused[0]["field"], "verification_uri");
+        assert_eq!(refused[0]["host"], "localhost");
+        assert!(events(&l, "company.sign_in.requested").is_empty(), "{l}");
+        let t = wait_state(&addr, DANA, &task, "TASK_STATE_COMPLETED", &d.log);
+        assert!(
+            !t.to_string().contains("TASK_STATE_INPUT_REQUIRED"),
+            "a gate opened: {t}"
+        );
+        assert!(
+            f.record()
+                .iter()
+                .all(|r| r["grant"] != "urn:ietf:params:oauth:grant-type:device_code"),
+            "polled"
+        );
+    }
+
+    /// The User may cancel a sign-in at its gate, and only with `cancel`:
+    /// another answer is refused and the gate stays open; `cancel` closes
+    /// it, the tool answers `cancelled`, and the poll stops.
+    #[test]
+    fn the_user_cancels_a_sign_in_at_its_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"approver": {"after_polls": 100000}}));
+        let h = host();
+        let s = setup_with(
+            &h,
+            &sealed(Some("user:dana")),
+            "",
+            &shop_entry(&f.origin, SIGN_IN),
+            "",
+        );
+        let (d, addr) = start_listening(&s, "cancel", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = common::SendMessage::text("SIGN-IN-SHOP")
+            .bearer(DANA)
+            .context("si")
+            .return_immediately()
+            .result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        wait_state(&addr, DANA, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        let answer = |text: &str| {
+            common::SendMessage::text(text)
+                .bearer(DANA)
+                .task(&task)
+                .return_immediately()
+                .post(&addr)
+        };
+        let v = answer("approve");
+        assert_eq!(v["error"]["code"], -32602, "{v}");
+        assert!(
+            v.to_string().contains("the one answer it takes is cancel"),
+            "{v}"
+        );
+        assert_eq!(
+            get_task(&addr, DANA, &task)["status"]["state"],
+            "TASK_STATE_INPUT_REQUIRED"
+        );
+        let v = answer("cancel");
+        assert!(v.get("error").is_none(), "{v}");
+        let l = wait_for(&d.log, "the model told", |l| {
+            replies(l).iter().any(|r| r.contains("cancelled"))
+        });
+        let failed = events(&l, "company.sign_in.failed");
+        assert_eq!(failed.len(), 1, "{l}");
+        assert_eq!(failed[0]["reason"], "cancelled");
+        let polls = || {
+            f.record()
+                .iter()
+                .filter(|r| r["grant"] == "urn:ietf:params:oauth:grant-type:device_code")
+                .count()
+        };
+        let stopped = polls();
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(polls(), stopped, "polled after the cancel");
+    }
+
+    /// Cancelling the task a sign-in's gate is on ends the sign-in with it
+    /// (RFC 0047 §5.7): the tool answers `cancelled` and the poll stops, so
+    /// nobody can finish it at the Company after the gate is gone.
+    #[test]
+    fn cancelling_a_sign_in_gates_task_ends_the_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"approver": {"after_polls": 100000}}));
+        let h = host();
+        let s = setup_with(
+            &h,
+            &sealed(Some("user:dana")),
+            "",
+            &shop_entry(&f.origin, SIGN_IN),
+            "",
+        );
+        let (d, addr) = start_listening(&s, "cancel-task", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = common::SendMessage::text("SIGN-IN-SHOP")
+            .bearer(DANA)
+            .context("si")
+            .return_immediately()
+            .result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        wait_state(&addr, DANA, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        let v = common::rpc_as(&addr, DANA, 7, "CancelTask", json!({"id": task}));
+        assert_eq!(v["result"]["status"]["state"], "TASK_STATE_CANCELED", "{v}");
+        let l = wait_for(&d.log, "the sign-in ended", |l| {
+            !events(l, "company.sign_in.failed").is_empty()
+        });
+        assert_eq!(
+            events(&l, "company.sign_in.failed")[0]["reason"],
+            "cancelled"
+        );
+        let polls = || {
+            f.record()
+                .iter()
+                .filter(|r| r["grant"] == "urn:ietf:params:oauth:grant-type:device_code")
+                .count()
+        };
+        let stopped = polls();
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(polls(), stopped, "polled after the cancel");
+    }
+
+    /// One gate per task: an ask on the task a sign-in is on — its gate
+    /// open there, or about to be — is refused, never laid over it.
+    #[test]
+    fn a_sign_in_and_an_ask_never_share_a_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"approver": {"after_polls": 100000}}));
+        let h = host();
+        let wf = "workflows:\n  - name: both\n    steps:\n      s: {kind: manual}\n      si: {kind: tool, name: company.sign_in, args: {company: shop}, depends_on: [s]}\n      later: {kind: wait, on: signal, signal: never, timeout: 800ms, on_timeout: ask, depends_on: [s]}\n      ask: {kind: human, question: \"Proceed?\"}\n      f: {kind: finish, depends_on: [si], status: completed}\n";
+        let s = setup_with(&h, &sealed(None), "", &shop_entry(&f.origin, SIGN_IN), wf);
+        let (d, addr) = start_listening(&s, "one-gate", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("both")
+            .bearer(OPERATOR)
+            .return_immediately()
+            .result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let t = wait_state(&addr, OPERATOR, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        assert!(status_text(&t).starts_with("Sign in to"), "{t}");
+        let l = wait_for(&d.log, "the ask refused", |l| {
+            l.contains("an ask is already pending on this task")
+        });
+        assert!(events(&l, "human.ask").is_empty(), "an ask opened: {l}");
+    }
+
+    const SIGNS_IN_THEN_WAITS: &str = "workflows:\n  - name: boot\n    steps:\n      s: {kind: once}\n      si: {kind: tool, name: company.sign_in, args: {company: shop}, depends_on: [s]}\n      park: {kind: wait, on: signal, signal: go, timeout: 60s, depends_on: [si]}\n      f: {kind: finish, depends_on: [park], status: completed, output: \"{{steps.si.output.outcome}}\"}\n";
+
+    /// In work nobody owns, a step's sign-in gate is a task of its run's
+    /// (RFC 0047 §5.7): once the User has signed in it goes back to working
+    /// while the run goes on, and the run's own end settles it.
+    #[test]
+    fn a_steps_sign_in_gate_ends_with_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = setup_with(
+            &h,
+            &sealed(None),
+            "",
+            &shop_entry(&f.origin, SIGN_IN),
+            SIGNS_IN_THEN_WAITS,
+        );
+        // Added once the identity is printed: it needs the listener, which
+        // `start_listening` adds.
+        let cfg = std::fs::read_to_string(&s.cfg).unwrap();
+        std::fs::write(
+            &s.cfg,
+            cfg.replacen("agent:\n", "agent:\n  ask_human_unowned: gate\n", 1),
+        )
+        .unwrap();
+        let (d, addr) = start_listening(&s, "unowned", &[]);
+        let l = wait_for(&d.log, "signed in", |l| {
+            !events(l, "company.signed_in").is_empty()
+        });
+        let task = events(&l, "company.sign_in.requested")[0]["task"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{l}"))
+            .to_string();
+        let t = wait_state(&addr, OPERATOR, &task, "TASK_STATE_WORKING", &d.log);
+        assert!(status_text(&t).starts_with("Signed in at shop"), "{t}");
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            get_task(&addr, OPERATOR, &task)["status"]["state"],
+            "TASK_STATE_WORKING",
+            "settled before its run ended"
+        );
+        let v = common::SendMessage::command("workflow.signal", json!({"name": "go"}))
+            .bearer(OPERATOR)
+            .post(&addr);
+        assert!(v.get("error").is_none(), "{v}");
+        wait_state(&addr, OPERATOR, &task, "TASK_STATE_COMPLETED", &d.log);
+    }
+
+    const SIGNS_IN: &str = "workflows:\n  - name: signin\n    steps:\n      s: {kind: manual}\n      si: {kind: tool, name: company.sign_in, args: {company: shop}, depends_on: [s]}\n      f: {kind: finish, depends_on: [si], status: completed, output: \"{{steps.si.output.outcome}}\"}\n";
+
+    /// A sign-in pending when agentd stops ends `interrupted` at the next
+    /// start (RFC 0047 §5.6): its device code was in memory only. The
+    /// gate's task says so, and the step that asked is answered
+    /// `interrupted`.
+    #[test]
+    fn a_sign_in_pending_at_a_restart_ends_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        f.control(json!({"approver": {"after_polls": 100000}}));
+        let h = host();
+        let s = setup_with(
+            &h,
+            &sealed(None),
+            "",
+            &shop_entry(&f.origin, SIGN_IN),
+            SIGNS_IN,
+        );
+        let (mut d, addr) = start_listening(&s, "pending", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("signin")
+            .bearer(OPERATOR)
+            .return_immediately()
+            .result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let t = wait_state(&addr, OPERATOR, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        assert!(status_text(&t).starts_with("Sign in to"), "{t}");
+        d.stop();
+        let again = start(
+            &s,
+            "restarted",
+            &[
+                ("COMPANIES_E2E_OPERATOR", OPERATOR),
+                ("COMPANIES_E2E_DANA", DANA),
+            ],
+        );
+        let l = wait_for(&again.log, "both ends said", |l| {
+            events(l, "company.sign_in.failed")
+                .iter()
+                .filter(|e| e["reason"] == "interrupted")
+                .count()
+                == 2
+        });
+        let t = wait_state(&addr, OPERATOR, &task, "TASK_STATE_COMPLETED", &again.log);
+        let runs = doc_of(
+            &common::SendMessage::command("workflow.status", json!({}))
+                .bearer(OPERATOR)
+                .result(&addr),
+        );
+        assert_eq!(runs["runs"][0]["output"], "interrupted", "{runs}\n{l}");
+        assert_eq!(
+            status_text(&t),
+            "The sign-in at shop was interrupted: agentd restarted before it finished. Ask again to sign in.",
+            "the gate says so"
+        );
+    }
+
+    /// `agentd --login company:<name>` and `--logout company:<name>` are thin
+    /// clients of the running daemon over its unix A2A listener (RFC 0047
+    /// §5.3): the login prints where to sign in and how it ended, the logout
+    /// revokes the Account Token — the fake records it — and a second logout
+    /// says nobody is signed in.
+    #[test]
+    fn login_and_logout_reach_the_daemon_over_its_unix_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = setup_with(&h, &sealed(None), "", &shop_entry(&f.origin, SIGN_IN), "");
+        // Beside the configuration, not in it: `holds_no` reads every file
+        // there, and a socket is not one.
+        let sock = tempfile::tempdir().unwrap().keep().join("a2a.sock");
+        let cfg = std::fs::read_to_string(&s.cfg).unwrap();
+        std::fs::write(
+            &s.cfg,
+            format!("{cfg}a2a:\n  listen: unix://{}\n", sock.display()),
+        )
+        .unwrap();
+        let d = start(&s, "unix", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let cli = |flag: &str| {
+            Command::new(env!("CARGO_BIN_EXE_agentd"))
+                .args([
+                    "--config",
+                    &s.cfg.display().to_string(),
+                    flag,
+                    "company:shop",
+                ])
+                .output()
+                .unwrap()
+        };
+        let out = cli("--login");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.starts_with("Sign in to \"Fake Company\" (127.0.0.1) for:"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Signed in at shop, for poppy:read poppy:write."),
+            "{stdout}"
+        );
+        let token = account_tokens(&f)[0].clone();
+        // Signed in already: the Account Token held covers it, and no gate
+        // asks the User again.
+        let out = cli("--login");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{stdout}");
+        assert_eq!(
+            stdout.trim(),
+            "Signed in at shop, for poppy:read poppy:write.",
+            "no gate"
+        );
+        let out = cli("--logout");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("Signed out at shop"), "{stdout}");
+        let revoked: Vec<Value> = f
+            .record()
+            .into_iter()
+            .filter(|r| r["path"] == "/auth/revoke")
+            .collect();
+        assert_eq!(revoked.len(), 1, "{revoked:#?}");
+        assert_eq!(revoked[0]["revoked"], true);
+        holds_no(&s.dir, &token);
+        let out = cli("--logout");
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("was not signed in at shop"),
+            "{out:?}"
+        );
+    }
+
+    /// Direct Sign-In through the served callback (RFC 0047 §5.7): the client
+    /// metadata the listener serves lists the callback; the gate shows the
+    /// Company's authorization URL; the User's browser — the test — comes
+    /// back to the callback, which says only that the page can be closed,
+    /// uncached and unframed; the sign-in completes. The same callback a
+    /// second time ends nothing, and the Company saw one code exchange.
+    #[test]
+    fn direct_sign_in_returns_through_the_served_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let s = tempfile::tempdir().unwrap().keep();
+        let cfg = s.join("agent.yaml");
+        let log = s.join("direct.log");
+        let seal = seal_file();
+        let (d, addr) = common::spawn_bound(|port| {
+            std::fs::write(
+                &cfg,
+                format!(
+                    "agent:\n  name: direct\n  instruction: Shop.\n  preflight: never\n\
+                     intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+                     store: {{kind: file, file: {{path: {d}/state}}}}\n\
+                     lifecycle: {{run_until: drained}}\n\
+                     observability: {{log_level: info}}\n\
+                     a2a:\n  listen: https://127.0.0.1:{port}\n  url: https://127.0.0.1:{port}\n  tls: {{cert: {cert}, key: {key}}}\n\
+                     security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"https://127.0.0.1:{port}/companies/client.json\", name: \"Served agent\", key_file: \"{d}/client-key\", serve: true}}\n    seal_key: \"{{{{secret-file:{seal}}}}}\"\n\
+                     services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true, sign_in: [direct], scopes: [\"poppy:read\"]}}\n",
+                    d = s.display(),
+                    cert = fixture("server.pem").display(),
+                    key = fixture("server.key").display(),
+                    ca = fixture("ca.pem").display(),
+                    seal = seal.display(),
+                    o = f.origin,
+                ),
+            )
+            .unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+                .args(["--config", &cfg.display().to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap();
+            (
+                Daemon {
+                    child,
+                    log: log.clone(),
+                },
+                log.display().to_string(),
+            )
+        });
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let origin = format!("https://{addr}");
+        let get = |url: &str| {
+            agentd::auth::http::get(
+                url,
+                &[],
+                Duration::from_secs(10),
+                agentd::auth::http::Dial::Named,
+            )
+            .unwrap_or_else(|e| panic!("GET {url}: {e}"))
+        };
+        let callback = format!("{origin}/companies/callback");
+        let doc: Value =
+            serde_json::from_slice(&get(&format!("{origin}/companies/client.json")).body).unwrap();
+        assert_eq!(doc["redirect_uris"], json!([callback.clone()]));
+        let started = common::SendMessage::command("company.sign_in", json!({"company": "shop"}))
+            .return_immediately()
+            .post_tls(&origin);
+        let task = started["result"]["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let state = |want: &str| -> Value {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let t =
+                    common::rpc_tls(&origin, 9, "GetTask", json!({"id": task}))["result"].clone();
+                if t["status"]["state"] == want {
+                    return t;
+                }
+                assert!(Instant::now() < deadline, "never {want}: {t}\n{}", d.read());
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        };
+        let q = status_text(&state("TASK_STATE_INPUT_REQUIRED"));
+        let url = q
+            .split("page: ")
+            .nth(1)
+            .and_then(|r| r.split(" — ").next())
+            .unwrap_or_else(|| panic!("{q}"))
+            .to_string();
+        let at_company = get(&url);
+        assert_eq!(at_company.status, 302);
+        let back = at_company.header("location").unwrap().to_string();
+        assert!(back.starts_with(&format!("{callback}?")), "{back}");
+        // Only at the redirect URI itself (§4.5: "MUST exactly match").
+        let query = back.split_once('?').unwrap().1;
+        for elsewhere in [
+            format!("{callback}/?{query}"),
+            format!("{callback}x?{query}"),
+        ] {
+            assert_eq!(get(&elsewhere).status, 404, "{elsewhere}");
+        }
+        let page = get(&back);
+        assert_eq!(page.status, 200);
+        assert!(String::from_utf8_lossy(&page.body).contains("You can close this page."));
+        assert_eq!(page.header("cache-control"), Some("no-store"));
+        assert_eq!(
+            page.header("content-security-policy"),
+            Some("frame-ancestors 'none'")
+        );
+        let t = state("TASK_STATE_COMPLETED");
+        assert!(
+            status_text(&t).contains("Signed in at shop, for poppy:read."),
+            "{t}"
+        );
+        // The same callback again: the page, and nothing else — said once
+        // however often it comes.
+        assert_eq!(get(&back).status, 200);
+        wait_for(&d.log, "the second callback refused", |l| {
+            !events(l, "company.sign_in.callback_refused").is_empty()
+        });
+        for _ in 0..3 {
+            assert_eq!(get(&back).status, 200);
+        }
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            let refused = events(&d.read(), "company.sign_in.callback_refused");
+            assert_eq!(
+                refused.len(),
+                1,
+                "said more than once a minute: {refused:?}"
+            );
+            assert_eq!(refused[0]["refused"], 1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let codes = f
+            .record()
+            .into_iter()
+            .filter(|r| r["grant"] == "authorization_code")
+            .count();
+        assert_eq!(codes, 1, "one code exchange");
     }
 
     /// `workflow.run` of the declared workflow `workflow`.

@@ -7,6 +7,11 @@
 //! what reached it, never from agentd, and quotes the sentence of the draft
 //! it holds agentd to ([`QUOTES`], verified verbatim in their sections like
 //! the fake's own checks).
+//!
+//! The sign-in checks give agentd a unix A2A listener to ask the User on and
+//! let the gate of unowned work open (`agent.ask_human_unowned: gate`); the
+//! fake's scripted User signs in at the Company, as a person would, and
+//! nobody answers the gate.
 
 use std::time::{Duration, Instant};
 
@@ -84,6 +89,26 @@ pub fn checks() -> Vec<Check> {
             "companies/agent-keeps-tokens-out-of-its-log",
             "no Session Token or Bearer token the Company issued appears in agentd's log, at debug level with content logging on",
             keeps_tokens_out_of_its_log,
+        ),
+        check(
+            "companies/agent-signs-in-only-as-the-user-does",
+            "a workflow's company.sign_in starts a Device Sign-In that asks for its scopes with the client assertion, never opens the User's verification page itself, polls an interval apart for the current Session, and once the User has approved is signed in: the account call it makes next is answered",
+            signs_in_only_as_the_user_does,
+        ),
+        check(
+            "companies/agent-keeps-account-tokens-secret",
+            "the Account Token a sign-in gave agentd reaches the Company only in the refresh_token member of a token request — never in a URL, a header or another body — and appears in no line of agentd's log and no file of its state",
+            keeps_account_tokens_secret,
+        ),
+        check(
+            "companies/agent-uses-the-newest-account-token",
+            "against the rotation variant, agentd uses each Account Token the Company returns from then on, across a restart: no token request it makes presents a spent one",
+            uses_the_newest_account_token,
+        ),
+        check(
+            "companies/agent-signs-out-by-revoking",
+            "company.sign_out revokes the Account Token at the revocation endpoint (token_type_hint refresh_token, the client assertion), and the Session goes on signed out: the next token is the assertion's",
+            signs_out_by_revoking,
         ),
     ]
 }
@@ -213,6 +238,41 @@ pub const QUOTES: &[Quote] = &[
         "Handling secrets",
         "Keep them out of logs, telemetry, error reports, model context, conversation messages, and URLs.",
     ),
+    spec(
+        "companies/agent-signs-in-only-as-the-user-does",
+        "4.4",
+        "The types work on trust: a Personal Agent MUST use direct or Device Sign-In only when the User signs in themselves.",
+    ),
+    spec(
+        "companies/agent-signs-in-only-as-the-user-does",
+        "4.6",
+        "Every `interval` seconds, the Personal Agent asks the `token_endpoint` whether the User has finished:",
+    ),
+    spec(
+        "companies/agent-signs-in-only-as-the-user-does",
+        "4.6",
+        "Opening the link MUST NOT approve the request by itself.",
+    ),
+    spec(
+        "companies/agent-keeps-account-tokens-secret",
+        "4.8",
+        "Personal Agents MUST store Account Tokens as secrets, and MUST NOT put them in model context, conversation messages, logs, or URLs.",
+    ),
+    spec(
+        "companies/agent-uses-the-newest-account-token",
+        "4.8",
+        "A Company MAY return a new Account Token in `refresh_token`. The Personal Agent then MUST use the new one from then on.",
+    ),
+    spec(
+        "companies/agent-signs-out-by-revoking",
+        "4.9",
+        "Signing out removes the Personal Agent's access to the User's account.",
+    ),
+    spec(
+        "companies/agent-signs-out-by-revoking",
+        "4.9",
+        "Usually those Sessions continue signed out, so a cart or an open conversation carries on: the Personal Agent renews them with its assertion (4.2) and gets signed-out Session Tokens.",
+    ),
 ];
 
 fn verdict(r: Result<(), String>) -> Outcome {
@@ -249,6 +309,11 @@ struct Extra<'a> {
     agent: &'a str,
     /// Configuration after the services: workflows.
     rest: &'a str,
+    /// The entry lets agentd sign the User in: Device Sign-In for both of
+    /// the draft's scopes, the Account Token sealed under a seal key of the
+    /// run's own, a unix A2A listener to ask the User on, and the gate of
+    /// unowned work let open.
+    signs_in: bool,
 }
 
 impl Run {
@@ -321,12 +386,25 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
     let host = Agent::start();
     let dir = tmp.path().display().to_string();
     let cfg = format!("{dir}/agent.yaml");
+    let signs_in = if extra.signs_in {
+        ", sign_in: [device], scopes: [\"poppy:read\", \"poppy:write\"]"
+    } else {
+        ""
+    };
     let entry = |name: &str, origin: &str| {
         format!(
-            "  {name}: {{kind: company, endpoint: \"{origin}\", allow_private: true{}}}\n",
+            "  {name}: {{kind: company, endpoint: \"{origin}\", allow_private: true{signs_in}{}}}\n",
             extra.entry
         )
     };
+    let (mut agent, mut companies, mut listener) =
+        (extra.agent.to_string(), String::new(), String::new());
+    if extra.signs_in {
+        std::fs::write(format!("{dir}/seal"), "5e".repeat(32)).map_err(|e| e.to_string())?;
+        companies = format!("    seal_key: \"{{{{secret-file:{dir}/seal}}}}\"\n");
+        listener = format!("a2a:\n  listen: \"unix://{dir}/a2a.sock\"\n");
+        agent.push_str("  ask_human_unowned: gate\n");
+    }
     let mut services = entry("shop", &company.origin);
     for (name, c) in &more {
         services.push_str(&entry(name, &c.origin));
@@ -339,9 +417,8 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
              store: {{kind: file, file: {{path: \"{dir}/state\"}}}}\n\
              lifecycle: {{run_until: drained}}\n\
              observability: {{log_level: debug, log_content: true}}\n\
-             security:\n  tls_ca: \"{ca}\"\n  companies:\n    client: {{id: \"{o}/companies/client.json\", name: \"agentd conformance\", key_file: \"{dir}/client-key\"}}\n\
-             services:\n{services}{rest}",
-            agent = extra.agent,
+             security:\n  tls_ca: \"{ca}\"\n  companies:\n    client: {{id: \"{o}/companies/client.json\", name: \"agentd conformance\", key_file: \"{dir}/client-key\"}}\n{companies}\
+             services:\n{services}{listener}{rest}",
             ca = tls_fixture("ca.pem").display(),
             o = host.origin,
             rest = extra.rest,
@@ -413,6 +490,50 @@ fn every_second(name: &str, steps: &str, ends: &str) -> String {
     format!(
         "workflows:\n  - name: {name}\n    steps:\n      s: {{kind: schedule, every: 1s}}\n{steps}      f: {{kind: finish, depends_on: [{ends}], status: completed}}\n"
     )
+}
+
+/// A workflow `name` that runs once, at boot, whose `steps` (YAML lines
+/// under `steps:`, each depending on the start `s` or a step) end with
+/// those `ends` names.
+fn once(name: &str, steps: &str, ends: &str) -> String {
+    format!(
+        "workflows:\n  - name: {name}\n    steps:\n      s: {{kind: once}}\n{steps}      f: {{kind: finish, depends_on: [{ends}], status: completed}}\n"
+    )
+}
+
+/// The steps of a workflow that signs the User in and then calls an
+/// account tool.
+const SIGN_IN_THEN_ORDER: &str = "      si: {kind: tool, name: company.sign_in, args: {company: shop}, depends_on: [s]}\n      o: {kind: tool, name: shop.order_status, args: {order_id: o1}, depends_on: [si]}\n";
+
+/// Each Account Token the fake issued.
+fn account_tokens(record: &[Value]) -> Vec<String> {
+    record
+        .iter()
+        .filter_map(|r| r["issued"]["refresh_token"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A sign-in, then an account call that answered: the run's record.
+fn signed_in_and_called(h: &Harness, variants: &[&str], log: Option<&str>) -> Result<Run, String> {
+    let mut run = prepare_with(
+        h,
+        variants,
+        &Extra {
+            signs_in: true,
+            rest: &once("signin", SIGN_IN_THEN_ORDER, "o"),
+            ..Extra::default()
+        },
+    )?;
+    run.daemon = Some(match log {
+        Some(file) => h.spawn_logged(&["--config", &run.cfg], &run.tmp.path().join(file)),
+        None => h.spawn(&["--config", &run.cfg]),
+    });
+    wait(40, "a signed-in account call", || {
+        tools_calls(&run.record())
+            .iter()
+            .any(|c| c["status"] == 200)
+    })?;
+    Ok(run)
 }
 
 fn joined(h: &Harness) -> Result<Run, String> {
@@ -917,5 +1038,165 @@ fn keeps_tokens_out_of_its_log(h: &Harness) -> Outcome {
             Some(_) => Err("a token the Company issued is in agentd's log".into()),
             None => Ok(()),
         }
+    })())
+}
+
+fn signs_in_only_as_the_user_does(h: &Harness) -> Outcome {
+    verdict((|| {
+        let run = signed_in_and_called(h, &[], None)?;
+        let record = run.record();
+        let auth = record
+            .iter()
+            .find(|r| r["path"] == "/auth/device")
+            .ok_or("agentd started no Device Sign-In")?;
+        need(
+            auth["scope"] == "poppy:read poppy:write",
+            format!("the device authorization asked for no scopes, or others: {auth}"),
+        )?;
+        need(
+            auth["client_assertion"].is_object(),
+            format!("the device authorization carried no client assertion: {auth}"),
+        )?;
+        need(
+            record.iter().all(|r| r["path"] != "/auth/device/verify"),
+            "agentd opened the User's verification page itself",
+        )?;
+        let polls: Vec<&Value> = record
+            .iter()
+            .filter(|r| r["grant"] == "urn:ietf:params:oauth:grant-type:device_code")
+            .collect();
+        need(
+            polls.len() >= 2,
+            format!("agentd polled {} times", polls.len()),
+        )?;
+        let at = |r: &Value| r["at_ms"].as_u64().unwrap_or_default();
+        let mut last = at(auth);
+        for p in &polls {
+            need(
+                at(p) + 50 >= last + 1000,
+                format!("a poll came sooner than the interval after the last: {p}"),
+            )?;
+            need(
+                p["session_id"].is_string(),
+                format!("a poll named no Session: {p}"),
+            )?;
+            last = at(p);
+        }
+        need(
+            polls.iter().any(|p| p["status"] == 200),
+            "no poll was answered with the sign-in",
+        )
+    })())
+}
+
+fn keeps_account_tokens_secret(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = signed_in_and_called(h, &[], Some("agentd.log"))?;
+        run.stop();
+        let record = run.record();
+        let issued = account_tokens(&record);
+        need(!issued.is_empty(), "the Company issued no Account Token")?;
+        if let Some(r) = record.iter().find(|r| r["account_token_leaked"] == true) {
+            return Err(format!(
+                "a request carried an Account Token outside a token request's refresh_token: {} {}",
+                r["method"], r["path"]
+            ));
+        }
+        let mut files = Vec::new();
+        let mut dirs = vec![run.tmp.path().to_path_buf()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).map_err(|e| e.to_string())?.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.is_file() {
+                    files.push(p);
+                }
+            }
+        }
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            if issued.iter().any(|t| text.contains(t.as_str())) {
+                return Err(format!(
+                    "an Account Token in the clear in {}",
+                    f.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        Ok(())
+    })())
+}
+
+fn uses_the_newest_account_token(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = signed_in_and_called(h, &["rotation"], None)?;
+        run.stop();
+        let before = run.record().len();
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        wait(40, "the Account Token used after the restart", || {
+            run.record()[before..]
+                .iter()
+                .any(|r| r["grant"] == "refresh_token" && r["status"] == 200)
+        })?;
+        let record = run.record();
+        need(
+            account_tokens(&record).len() >= 3,
+            "the Company rotated the Account Token too few times to tell",
+        )?;
+        match record
+            .iter()
+            .find(|r| r["grant"] == "refresh_token" && r["error"] == "invalid_grant")
+        {
+            Some(r) => Err(format!("a spent Account Token was presented: {r}")),
+            None => Ok(()),
+        }
+    })())
+}
+
+fn signs_out_by_revoking(h: &Harness) -> Outcome {
+    verdict((|| {
+        let mut run = prepare_with(
+            h,
+            &[],
+            &Extra {
+                signs_in: true,
+                rest: &once(
+                    "signout",
+                    "      si: {kind: tool, name: company.sign_in, args: {company: shop}, depends_on: [s]}\n      so: {kind: tool, name: company.sign_out, args: {company: shop}, depends_on: [si]}\n      q: {kind: tool, name: shop.search, args: {query: boots}, depends_on: [so]}\n",
+                    "q",
+                ),
+                ..Extra::default()
+            },
+        )?;
+        run.daemon = Some(h.spawn(&["--config", &run.cfg]));
+        wait(40, "a call after the sign-out", || {
+            let r = run.record();
+            r.iter().any(|x| x["path"] == "/auth/revoke")
+                && tools_calls(&r).iter().any(|c| c["status"] == 200)
+        })?;
+        let record = run.record();
+        let at = record
+            .iter()
+            .position(|r| r["path"] == "/auth/revoke")
+            .ok_or("no revocation")?;
+        let revoke = &record[at];
+        need(
+            revoke["revoked"] == true && revoke["token_type_hint"] == "refresh_token",
+            format!("the revocation did not revoke the Account Token: {revoke}"),
+        )?;
+        need(
+            revoke["client_assertion"].is_object(),
+            format!("the revocation carried no client assertion: {revoke}"),
+        )?;
+        let next = record[at..]
+            .iter()
+            .find(|r| r["path"] == "/auth/token")
+            .ok_or("no token request after the sign-out")?;
+        need(
+            next["grant"] == "urn:ietf:params:oauth:grant-type:jwt-bearer"
+                && next["session_id"].is_string(),
+            format!("the Session was not renewed signed out with its assertion: {next}"),
+        )
     })())
 }

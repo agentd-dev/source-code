@@ -266,6 +266,112 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   Company for another's content without the User, nothing before a
   `Retry-After` is over, no call that may have run sent twice, no issued
   token in agentd's log.
+- Signing the User in at a Company (RFC 0047, P2). A company entry's
+  `sign_in` lists the sign-in types agentd may start there, `device` and
+  `direct`, the first the Company offers taken; `mediated` is refused at
+  load, naming why. `scopes` is the most account scopes agentd asks for.
+  Both need `security.companies.seal_key`, and `direct` the identity served
+  (`client.serve`): the callback is `security.companies.client.redirect_uri`
+  (default `<client_id origin>/companies/callback`), which the client
+  metadata document's `redirect_uris` lists only then. `company.sign_in
+  {company, scopes?, new_account?}` — an internal tool, and an operator op
+  only the configured User may send — signs the Session in with an Account
+  Token already held that covers the scopes, with no gate. Otherwise it opens
+  the User's sign-in gate, a Company gate (addressed to the User, its text
+  fixed in code, no operator override, no judge), which shows the Company's
+  verification link and the code to check there (Device Sign-In), or the
+  Company's authorization URL with S256 PKCE and a single-use `state`
+  (Direct Sign-In). The User signs in on the Company's own page; agentd never
+  opens it. The gate closes by itself when the Company answers, and takes
+  only `cancel`. The device poll keeps `interval`, adds 5 s on `slow_down`
+  and stops on `access_denied` and `expired_token`, and follows a sign-in
+  for 30 minutes at most, whatever `expires_in` says. A device authorization
+  whose `verification_uri` or `verification_uri_complete` is not an HTTPS
+  URL with a plain host on the entry's hosts, in printable ASCII, opens no
+  gate (`company.endpoint.refused`, field `verification_uri`), and the
+  refusal names the field and the host, never the link. A plain host has no
+  userinfo and no `\`, which a browser reads as `/`; every URL a Company's
+  documents name is held to it too. The gate is the one gate on its task:
+  an ask there is refused while it is open, and cancelling its task
+  (`CancelTask`) ends the sign-in. In unowned work a workflow step's gate is
+  a task of the run, which the run settles. A Direct callback
+  is spent at its first use, and one whose `iss` is not the Company's issuer
+  byte for byte is refused, its code never exchanged. The tool call waits,
+  and returns `{signed_in, scope, requested}` — the scopes granted beside
+  those asked for — or `cancelled`, `denied`, `expired`, `account_mismatch`
+  or `interrupted`; the model never sees the code, the link or a token. A
+  sign-in pending when agentd stops ends `interrupted` at the next start,
+  its gate saying so, and a step waiting on it is answered so.
+- **Account Tokens.** The one a sign-in gives agentd is kept only sealed:
+  AES-256-GCM under the seal key, bound to the `client_id`, the issuer and
+  the User, under an id the store cannot map to a Company. The supervisor
+  reads it for each request that uses it, and sends it only in the form body
+  of a token or revocation request. Every token after a sign-in is granted
+  on it, with the `refresh_token` grant and the `session_id` — renewing the
+  Session, signing it in, or starting a new one already signed in when the
+  Company ended it — narrowed to the entry's `scopes`, and for an MCP
+  server's Bearer token without a proof and with `resource`; one that grants
+  none of those scopes, or is held where the entry no longer lists
+  `sign_in`, is not used, and requests there are signed out. One the Company
+  rotates is kept before the response is used, under the Session's lock,
+  which a sign-in and a sign-out take too: a renewal in flight never writes
+  a rotated token over a new sign-in's, nor leaves one good after a
+  sign-out. `403 sign_in_required` with
+  one held signs the current Session in with it and sends the call once
+  more; `401 invalid_token` renews with it. Only `invalid_grant` forgets it
+  (`company.account_token.dropped`), and the Session goes on signed out. A
+  sign-in that replaces it — more scopes, or `new_account`, which signs in in
+  a new Session — revokes the old one; `account_mismatch` issues no tokens
+  and keeps it. `company.sign_out {company}` (a tool, and the User's op)
+  revokes it at the revocation endpoint (RFC 7009, `token_type_hint
+  refresh_token`, the client assertion) and forgets it, and the Session goes
+  on signed out; `company.user_id.reset` revokes and forgets it first.
+- `agentd --login company:<name>` and `--logout company:<name>`: thin
+  clients of the running daemon, which send it the op `company.sign_in` or
+  `company.sign_out` over its unix A2A listener, print what it says — where
+  to sign in and the code to check, then how it ended — and exit 0 when it
+  succeeded, 1 when it ended otherwise or no daemon answered, 2 when the
+  configuration cannot reach it (`a2a.listen` not a unix socket, or
+  `security.companies.user` not `operator`). The sign-in happens in the
+  daemon; the client never holds a code or a token.
+- The A2A listener serves the Direct Sign-In callback, with `client.serve`
+  and a Company listing `direct`, at the redirect URI's path and no other:
+  its query goes to the supervisor, and the page says only that it can be
+  closed (`Cache-Control: no-store`, `Content-Security-Policy:
+  frame-ancestors 'none'`).
+- Events `company.sign_in.requested`, `company.signed_in`,
+  `company.sign_in.failed` (each also an audit record, `company.sign_in`),
+  `company.sign_in.mixup`, `company.sign_in.callback_refused` (at most once
+  a minute, with how many were refused),
+  `company.signed_out` (also an audit record, `company.sign_out`),
+  `company.account_token.rotated`, `.replaced` and `.dropped`;
+  `agent_company_gates_total` counts sign-in gates (`kind: sign_in`) and
+  `agent_company_token_requests_total` the `refresh`, `device_code`,
+  `authorization_code`, `device_authorization` and `revoke` requests.
+- `agentd-core`: `companies::{account, signin, cli}`,
+  `Supervisor::{with_session, begin_sign_in, poll_device, direct_callback,
+  direct_returned, direct_finish, forget_direct, sign_out, revoke_account,
+  take_account, holds_account}`, `signin::Returned`,
+  `Session::{signed_in, take_account}`,
+  `companies::token::{Grant, DeviceAuthorization, DEVICE_FOR,
+  device_authorization, revoke}`, `config::settings::companies::{SignIn, sign_in_of, signs_in,
+  signs_in_directly}`, `Client::redirect_uri`, `Service::{sign_in, scopes}`,
+  `Identity::load` takes whether a Company may be signed in to directly,
+  `a2a::tasks::{SignInGate, Task::sign_in}`, `a2a::serve::Opts::callback`,
+  `mcp::a2a_client::call`, `registry::internal::{company_sign_in_output,
+  company_sign_out_output}`. The fake Company's control gains `slow_down`,
+  `sign_out_sessions`, `disconnect`, `device` (the `expires_in` and
+  `interval` its device authorizations say) and a `stall` of token requests
+  by grant (`token:<grant_type>`), held after they took effect and recorded
+  as `/_mock/held`; its record gains when each request
+  arrived (`at_ms`), a token request's `scope` and the Account Token it was
+  granted on, a device authorization's `scope`, a revocation's Account Token
+  and `token_type_hint`, and whether an Account Token it issued was anywhere
+  in a request but the one form member that may carry it. The TypeScript
+  client speaks `company.sign_in` and `company.sign_out`.
+- Conformance: four more `companies/agent-*` checks — a Device Sign-In only
+  as the User does it, Account Tokens only in a token request's form, the
+  newest Account Token used across a restart, and signing out by revoking.
 
 **Changed.**
 

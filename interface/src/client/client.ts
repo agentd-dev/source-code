@@ -475,6 +475,26 @@ export class AgentdClient {
     return this.data(OPS.companyUserIdReset, { company });
   }
 
+  /**
+   * Ask the User to sign in at a Company. The task is their gate: it shows
+   * where to sign in, takes `cancel`, and ends with how the sign-in ended.
+   * Only the agent's configured User may.
+   */
+  async companySignIn(
+    company: string,
+    opts: { scopes?: string[]; newAccount?: boolean } = {},
+  ): Promise<CommandReply> {
+    const args: Obj = { company };
+    if (opts.scopes) args.scopes = opts.scopes;
+    if (opts.newAccount) args.new_account = true;
+    return this.command(OPS.companySignIn, args, { returnImmediately: true });
+  }
+
+  /** Sign the User out at a Company: its Account Token is revoked. */
+  async companySignOut(company: string): Promise<CommandReply> {
+    return this.command(OPS.companySignOut, { company }, { returnImmediately: true });
+  }
+
   // ---- streams -----------------------------------------------------------
 
   /**

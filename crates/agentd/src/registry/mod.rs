@@ -263,9 +263,13 @@ impl Registry {
                             .iter()
                             .any(|s| s.event_grants.iter().any(|g| g.tools))
                 }
+                // Signing in and out only where a Company lets agentd sign
+                // the User in.
                 "companies" => {
                     cfg!(feature = "companies")
                         && crate::config::settings::companies::any_company(settings)
+                        && (!matches!(c.name, "company.sign_in" | "company.sign_out")
+                            || crate::config::settings::companies::signs_in(settings))
                 }
                 _ => true,
             };

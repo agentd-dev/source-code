@@ -82,6 +82,26 @@ pub enum Event {
         origin: String,
         why: String,
     },
+    /// A Company sign-in moved on (RFC 0047 §5.7): its gate is ready to open,
+    /// or it ended. Sent by the sign-in's own thread.
+    #[cfg(feature = "companies")]
+    CompanySignIn {
+        id: String,
+        step: crate::companies::signin::Step,
+    },
+    /// A Direct Sign-In callback reached the A2A listener: its query, for
+    /// the supervisor to check.
+    #[cfg(feature = "companies")]
+    CompanyCallback { query: String },
+    /// A Company sign-out finished: who is owed its outcome, and the
+    /// outcome.
+    #[cfg(feature = "companies")]
+    CompanySignedOut {
+        owed: super::company_sign_in::Owed,
+        company: String,
+        by: Option<String>,
+        outcome: Result<Value, String>,
+    },
     /// The 200 ms tick.
     Tick,
 }

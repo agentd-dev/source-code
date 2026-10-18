@@ -968,6 +968,10 @@ impl Runtime {
             // ---- companies ----
             #[cfg(feature = "companies")]
             "company.status" => ok(self.company_status(false)),
+            #[cfg(feature = "companies")]
+            "company.sign_in" => self.company_sign_in_tool(caller, &args),
+            #[cfg(feature = "companies")]
+            "company.sign_out" => self.company_sign_out_tool(caller, &args),
             // ---- time ----
             "sleep" => {
                 let d = match crate::config::parse_duration(args["duration"].as_str().unwrap_or(""))
@@ -1848,10 +1852,12 @@ impl Runtime {
                         done.push((t.clone(), v, false));
                     }
                 }
-                // Human gates run their own pass (auto-judge + prune + timeout).
+                // Human gates run their own pass (auto-judge + prune + timeout),
+                // and so do Company sign-ins.
                 PendingKind::Timer { .. }
                 | PendingKind::Think { .. }
-                | PendingKind::Human { .. } => {}
+                | PendingKind::Human { .. }
+                | PendingKind::CompanySignIn { .. } => {}
             }
         }
         for (target, v, e) in done {

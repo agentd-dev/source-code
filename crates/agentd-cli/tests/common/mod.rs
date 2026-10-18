@@ -570,6 +570,40 @@ fn send_and_read(
     Ok(parse_reply(&raw))
 }
 
+/// POST a JSON-RPC body to a listener served over TLS at `origin`
+/// (`https://host:port`), with the spec's headers plus `extra`, trusting the
+/// CA the test process installed: its JSON-RPC envelope.
+#[cfg(feature = "oauth")]
+pub fn a2a_post_tls(origin: &str, body: &str, extra: &[(&str, &str)]) -> Value {
+    let mut headers = vec![
+        ("Content-Type", "application/json"),
+        ("A2A-Version", A2A_VERSION),
+    ];
+    headers.extend_from_slice(extra);
+    let r = agentd::auth::http::send(
+        "POST",
+        &format!("{origin}/"),
+        &headers,
+        body.as_bytes(),
+        REQUEST_BUDGET,
+        agentd::auth::http::Dial::Named,
+    )
+    .unwrap_or_else(|e| panic!("POST to {origin}: {e}"));
+    serde_json::from_slice(&r.body).unwrap_or_else(|e| {
+        panic!(
+            "non-JSON reply ({e}): {} {:?}",
+            r.status,
+            String::from_utf8_lossy(&r.body)
+        )
+    })
+}
+
+/// A JSON-RPC call to a listener served over TLS at `origin`.
+#[cfg(feature = "oauth")]
+pub fn rpc_tls(origin: &str, id: i64, method: &str, params: Value) -> Value {
+    a2a_post_tls(origin, &rpc_body(id, method, params), &[])
+}
+
 /// POST a JSON-RPC body to the listener with the spec's headers plus `extra`.
 pub fn a2a_post(addr: &str, body: &str, extra: &[(&str, &str)]) -> HttpReply {
     try_a2a_post(addr, body, extra).unwrap_or_else(|e| panic!("POST to {addr}: {e}"))
@@ -916,6 +950,17 @@ impl SendMessage {
     /// Send, returning the JSON-RPC envelope — result or error.
     pub fn post(&self, addr: &str) -> Value {
         self.post_raw(addr).json()
+    }
+
+    /// [`Self::post`] to a listener served over TLS at `origin`.
+    #[cfg(feature = "oauth")]
+    pub fn post_tls(&self, origin: &str) -> Value {
+        let headers = self.headers();
+        let extra: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        a2a_post_tls(origin, &self.body(1), &extra)
     }
 
     /// Send a request that must succeed; returns its `result`.

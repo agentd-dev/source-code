@@ -293,6 +293,25 @@ pub fn send(
     }
 }
 
+/// One call of `method` to the A2A peer at `endpoint`, with `params`: its
+/// JSON-RPC `result`, or why there is none. What a thin client of a daemon
+/// on this host asks with (`agentd --login company:<name>`), one request per
+/// connection like every other.
+pub fn call(
+    endpoint: &A2aEndpoint,
+    auth: PeerAuth,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value, String> {
+    match endpoint {
+        A2aEndpoint::Https(url) => {
+            let mut conn = HttpConn::new(HttpEp::parse(url)?, auth);
+            conn.call(method, params, deadline)
+        }
+    }
+}
+
 /// How a streaming attempt resolved: a terminal outcome; a task id whose
 /// terminal state must be RECOVERED over unary `GetTask` (a peer that answered
 /// with one unary final frame rather than a stream, or a stream that broke after

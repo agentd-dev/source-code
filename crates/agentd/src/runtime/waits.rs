@@ -924,6 +924,15 @@ impl Runtime {
                         }
                     }
                     Some("deadline") if timed_out => resolve.push((rid.clone(), sid.clone(), StepStatus::Done, json!({"waited_ms": now.saturating_sub(w["since_ms"].as_u64().unwrap_or(now))}), None)),
+                    // A sign-in this process does not hold was a previous
+                    // life's: its device code or verifier went with it.
+                    #[cfg(feature = "companies")]
+                    Some("company_sign_in") if !self.company_sign_ins.contains_key(w["sign_in"].as_str().unwrap_or_default()) => {
+                        let company = w["company"].as_str().unwrap_or_default();
+                        self.log.info("company.sign_in.failed", json!({"company": company, "reason": "interrupted", "run": rid, "step": sid}));
+                        let out = crate::companies::signin::Outcome::Interrupted.result(company).unwrap_or_default();
+                        resolve.push((rid.clone(), sid.clone(), StepStatus::Done, out, None));
+                    }
                     // Absence IS the branch: an event that never arrives routes
                     // through `on_timeout` like any other deadline, which is
                     // what makes "alert fired, no recovery in ten minutes"

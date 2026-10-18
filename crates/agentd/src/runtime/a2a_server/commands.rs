@@ -219,15 +219,18 @@ impl Runtime {
                 },
                 Err(e) => Answer::Reply(e),
             },
-            Route::Company => match super::company_ops::handle(self, principal, op, data) {
-                Ok(super::company_ops::CompanyAnswer::Doc(doc)) => Answer::Doc(doc),
-                Ok(super::company_ops::CompanyAnswer::Done(text, result)) => Answer::Done {
-                    link: None,
-                    text: Some(text),
-                    result: Some(result),
-                },
-                Err(e) => Answer::Reply(e),
-            },
+            Route::Company => {
+                match super::company_ops::handle(self, principal, op, data, &ctx, message) {
+                    Ok(super::company_ops::CompanyAnswer::Doc(doc)) => Answer::Doc(doc),
+                    Ok(super::company_ops::CompanyAnswer::Done(text, result)) => Answer::Done {
+                        link: None,
+                        text: Some(text),
+                        result: Some(result),
+                    },
+                    Ok(super::company_ops::CompanyAnswer::Task(reply)) => Answer::Reply(reply),
+                    Err(e) => Answer::Reply(e),
+                }
+            }
             Route::Instance(i) => match self.instance_op(principal, i, data) {
                 Ok(text) => Answer::Done {
                     link: None,

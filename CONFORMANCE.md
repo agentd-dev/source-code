@@ -152,6 +152,10 @@ skip.
 | `companies/agent-waits-out-a-companys-retry-after` | against the retry-after variant, whose token endpoint and MCP server each answer 429 with Retry-After, nothing agentd sends reaches the Company before the wait is over, and it joins and calls once it is |
 | `companies/agent-never-repeats-a-call-that-may-have-run` | a tools/call that got no answer in time, or a 502, after it was sent is not sent again — by the transport or by the step's retry: — so no run's call reaches the Company twice: each run's calls go out in one trace of its own there, and no trace id is seen twice |
 | `companies/agent-keeps-tokens-out-of-its-log` | no Session Token or Bearer token the Company issued appears in agentd's log, at debug level with content logging on |
+| `companies/agent-signs-in-only-as-the-user-does` | a workflow's company.sign_in starts a Device Sign-In that asks for its scopes with the client assertion, never opens the User's verification page itself, polls an interval apart for the current Session, and once the User has approved is signed in: the account call it makes next is answered |
+| `companies/agent-keeps-account-tokens-secret` | the Account Token a sign-in gave agentd reaches the Company only in the refresh_token member of a token request — never in a URL, a header or another body — and appears in no line of agentd's log and no file of its state |
+| `companies/agent-uses-the-newest-account-token` | against the rotation variant, agentd uses each Account Token the Company returns from then on, across a restart: no token request it makes presents a spent one |
+| `companies/agent-signs-out-by-revoking` | company.sign_out revokes the Account Token at the revocation endpoint (token_type_hint refresh_token, the client assertion), and the Session goes on signed out: the next token is the assertion's |
 
 ## Running it
 
@@ -193,7 +197,11 @@ request said of its sender beside its credential — its trace, its client's
 title, an AAuth signature, its idempotency key — is what the
 `companies/agent-*` checks count: they declare the fake as agentd's Company,
 host the identity `agentd --print-company-client` writes, and hold the real
-binary to the draft through the fake's record alone. Every
+binary to the draft through the fake's record alone. The sign-in checks give
+the binary a unix A2A listener to ask the User on; the fake's scripted User
+signs in at the Company, as a person would, nobody answers agentd's gate, and
+the fake records when each poll came and whether an Account Token it issued
+was anywhere in a request but the one form member that may carry it. Every
 check quotes the sentence of the draft it tests, and the suite's unit test
 requires each quote to appear verbatim, in its section, in the vendored
 pages. The fake validates every document it sends against the vendored

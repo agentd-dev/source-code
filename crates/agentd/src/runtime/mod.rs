@@ -19,6 +19,8 @@ pub mod audit;
 pub mod breaker;
 pub mod children;
 pub(crate) mod companies; // who reaches a Company's tools, and only through the supervisor (RFC 0047)
+#[cfg(feature = "companies")]
+pub(crate) mod company_sign_in; // the User signs in at a Company, at their own gate (RFC 0047 §5.7)
 #[cfg(feature = "a2a")]
 pub mod conversations;
 pub(crate) mod decide; // deciding nodes + the decide tool (RFC 0046 P2)
@@ -612,6 +614,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         durable,
         #[cfg(feature = "companies")]
         companies,
+        #[cfg(feature = "companies")]
+        company_sign_ins: BTreeMap::new(),
         mcp,
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),
@@ -1217,12 +1221,18 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         let write_timeout = rt.settings.lifecycle.drain_timeout();
         // The client identity, when it is served here rather than hosted.
         #[cfg(feature = "companies")]
-        let documents = match (&rt.companies, &rt.settings.security.companies.client) {
-            (Some(c), Some(client)) if client.serve => c.identity.documents(),
-            _ => Vec::new(),
+        let (documents, callback) = match (&rt.companies, &rt.settings.security.companies.client) {
+            (Some(c), Some(client)) if client.serve => (
+                c.identity.documents(),
+                c.identity
+                    .redirect_uri
+                    .as_deref()
+                    .map(crate::config::settings::companies::path_of),
+            ),
+            _ => (Vec::new(), None),
         };
         #[cfg(not(feature = "companies"))]
-        let documents = Vec::new();
+        let (documents, callback) = (Vec::new(), None);
         match a2a_server::spawn_a2a_listener(
             &rt.settings.a2a,
             rt.events_tx.clone(),
@@ -1232,6 +1242,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             log.clone(),
             opts.launch.clone(),
             documents,
+            callback,
         ) {
             Ok(serving) => {
                 rt.a2a_feed = serving.feed.clone();

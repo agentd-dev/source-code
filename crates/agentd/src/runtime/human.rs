@@ -413,12 +413,18 @@ impl Runtime {
             _ => None,
         };
 
-        // One live gate per task (asks within one unit are sequential anyway).
-        if let Some(t) = &owned
-            && self
-                .pending
+        // One live gate per task (asks within one unit are sequential
+        // anyway): an ask, a policy or Company gate, or a User's sign-in.
+        #[cfg(feature = "companies")]
+        let open = |t: &String| self.gate_open_on(t);
+        #[cfg(not(feature = "companies"))]
+        let open = |t: &String| {
+            self.pending
                 .iter()
                 .any(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == t))
+        };
+        if let Some(t) = &owned
+            && open(t)
         {
             return ToolOutcome::Ready(
                 Value::String("ask_human: an ask is already pending on this task".into()),

@@ -953,6 +953,35 @@ the Personal Agent Protocol draft
   token live in the supervisor. No turn worker, subagent or instance child is
   handed a Company server to dial; their calls to a Company's tools come
   back to the supervisor.
+- **Account Tokens are kept sealed.** The Account Token a sign-in gives
+  agentd is stored only sealed with AES-256-GCM under
+  `security.companies.seal_key`, which load requires of any `sign_in`, bound
+  to the `client_id`, the issuer and the User, under an id the store cannot
+  map to a Company. The supervisor reads it for each request that uses it and
+  holds it for that request alone; it is sent only to the Company's token and
+  revocation endpoints, in the form body, never in a URL, a log line, a
+  model's context or a child's payload. A rotated one is kept before the
+  response that carried it is used, under the Session's lock, which a
+  sign-in or a sign-out takes too: a renewal in flight never writes an old
+  account's token over a new sign-in's, nor leaves a rotated one good after
+  a sign-out. Only `invalid_grant` forgets it — an `invalid_token` or
+  `sign_in_required` renews with it — and signing out revokes it. One that
+  grants none of the entry's `scopes`, or held where the entry no longer
+  lists `sign_in`, is not used: requests there are signed out.
+- **Only the User signs in.** A sign-in is the User's own: the gate is
+  addressed to them, and agentd never opens the Company's page or drives a
+  browser to it. Device Sign-In's `verification_uri` must be an HTTPS URL
+  with a plain host on the entry's hosts, in printable ASCII, or no gate
+  opens — a Company cannot send the User to another Company's page with a
+  code it started there. A plain host has no userinfo and no `\`, which a
+  browser reads as `/`: `https://other.example\@a.example/` is at
+  `other.example` there, so no URL whose host two readers could disagree on
+  is dialled or shown. The refusal names the field and the host, never the
+  link, whose query may carry the code.
+  Direct Sign-In's `state` is single-use and bound to the sign-in, and a
+  callback whose `iss` is not the Company's issuer byte for byte is refused,
+  its code never exchanged. The device code, the PKCE verifier and the
+  `state` are in supervisor memory only.
 - **Company content is untrusted input.** A company entry's tags default to
   `untrusted_input` and `egress`, and fold into check 1 like any server's:
   an instance that declares a Company and a `sensitive` server does not
@@ -981,9 +1010,10 @@ the Personal Agent Protocol draft
   `security.companies.browsers` names is refused when any string argument
   names a Company's host as a browser would read it, or a host that is not
   ASCII.
-- **A reset is a new User.** `company.user_id.reset` drops the Session and
-  the Company's MCP connections with the User ID, so nothing the Company tied
-  to the old User — a token, an MCP session — reaches it again.
+- **A reset is a new User.** `company.user_id.reset` revokes and forgets the
+  Account Token, and drops the Session and the Company's MCP connections with
+  the User ID, so nothing the Company tied to the old User — a token, an MCP
+  session — reaches it again.
 
 What does not:
 
@@ -1003,6 +1033,10 @@ What does not:
 - The `client_id` of a self-hosted single-user agent identifies its person
   to every Company, whatever the User IDs say, and every Company sees the
   same network address.
+- A thief who holds the store, the seal key and the client key is this
+  agent to every Company the User signed in at. Keep the three apart.
+- A sign-out whose revocation fails forgets the Account Token here, and it
+  stays good at the Company until it expires (`company.signed_out` says so).
 
 ## What agentd does not protect against
 
@@ -1045,7 +1079,7 @@ class.
 
 | Tier | Callers | Tools |
 |---|---|---|
-| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status` |
+| all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status`, `company.sign_in`, `company.sign_out` |
 | root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
 | root only | root | `instruction.subscribe`, `workflow.create`, `workflow.update`, `workflow.delete`, `workflow.pause`, `workflow.resume` |
 

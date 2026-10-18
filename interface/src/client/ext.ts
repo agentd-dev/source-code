@@ -95,6 +95,8 @@ export const OPS = Object.freeze({
   authSessionsRevoke: 'auth.sessions.revoke',
   companyStatus: 'company.status',
   companyUserIdReset: 'company.user_id.reset',
+  companySignIn: 'company.sign_in',
+  companySignOut: 'company.sign_out',
 } as const);
 
 /**

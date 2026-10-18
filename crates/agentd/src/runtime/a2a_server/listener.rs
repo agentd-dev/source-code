@@ -100,7 +100,8 @@ pub(crate) fn advertised_url(a2a: &crate::config::settings::A2a, bound: &str) ->
 ///
 /// `documents` are public JSON documents served at their paths to anyone:
 /// the client identity Companies fetch, when `security.companies.client`
-/// says to serve it (RFC 0047 §5.5.2).
+/// says to serve it (RFC 0047 §5.5.2); `callback` the path of the Direct
+/// Sign-In callback served with them.
 ///
 /// Before anything binds, every rule id is recorded in the identity registry
 /// ([`crate::runtime::identities`]), and a `user`-role id that an approved
@@ -116,6 +117,7 @@ pub(crate) fn spawn_a2a_listener(
     log: Logger,
     launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
     documents: Vec<(String, Vec<u8>)>,
+    callback: Option<String>,
 ) -> Result<A2aServing, String> {
     use std::path::Path;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
@@ -227,6 +229,7 @@ pub(crate) fn spawn_a2a_listener(
             request_timeout: bridge.request_timeout,
             stream_deadline: bridge.stream_deadline,
             documents,
+            callback,
         },
         Arc::clone(&bridge),
         feed.clone(),
@@ -312,6 +315,7 @@ mod tests {
             quiet(),
             launch,
             Vec::new(),
+            None,
         )
         .unwrap()
     }

@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 
 use super::http::{Dialer, Pace, Refused};
 use super::wire;
-use crate::config::settings::companies::{host_of, is_https_url};
+use crate::config::settings::companies::{SignIn, host_of, is_https_url};
 
 /// The shortest and longest a verified document is kept.
 pub const MIN_MAX_AGE: Duration = Duration::from_secs(60);
@@ -63,6 +63,10 @@ pub struct Entry {
     pub servers: Vec<(String, Option<String>)>,
     /// The Company's not-before instant, shared by every dial to it.
     pub pace: Arc<Pace>,
+    /// The sign-in types agentd may start there, in order.
+    pub sign_in: Vec<SignIn>,
+    /// The most scopes agentd asks the User for there.
+    pub scopes: Vec<String>,
 }
 
 impl Entry {
@@ -79,6 +83,8 @@ impl Entry {
             timeout: svc.timeout.map(|d| d.0).unwrap_or(timeout),
             servers: crate::config::settings::companies::server_names(name, svc),
             pace: Arc::new(Pace::new(name, None)),
+            sign_in: crate::config::settings::companies::sign_in_of(svc),
+            scopes: svc.scopes.clone().unwrap_or_default(),
         }
     }
 }
@@ -96,6 +102,13 @@ pub struct Verified {
     pub revocation_endpoint: String,
     pub authorization_endpoint: Option<String>,
     pub device_authorization_endpoint: Option<String>,
+    /// The scopes Direct and Device Sign-In can grant (`auth.direct.scopes`,
+    /// `auth.device.scopes`), when the Company offers them.
+    pub direct_scopes: Option<Vec<String>>,
+    pub device_scopes: Option<Vec<String>>,
+    /// What the Company says each of its own scopes is (`auth.custom_scopes`),
+    /// its own words.
+    pub custom_scopes: BTreeMap<String, String>,
     /// The host globs every Company URL must match.
     pub hosts: Vec<String>,
     /// Each of the entry's MCP servers, by name, and its `url`.
@@ -409,6 +422,23 @@ fn verify(entry: &Entry) -> Verification {
             return Err(off_host(field, url));
         }
     }
+    let scopes = |ptr: &str| {
+        poppy.pointer(ptr).and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    };
+    let custom_scopes = poppy
+        .pointer("/auth/custom_scopes")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|d| (k.clone(), d.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     let max_age = lifetime(match (doc.max_age, meta.max_age) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -425,6 +455,9 @@ fn verify(entry: &Entry) -> Verification {
             revocation_endpoint,
             authorization_endpoint,
             device_authorization_endpoint,
+            direct_scopes: scopes("/auth/direct/scopes"),
+            device_scopes: scopes("/auth/device/scopes"),
+            custom_scopes,
             hosts,
             mcp: BTreeMap::new(),
             mcp_urls: mcp_urls.clone(),
@@ -715,6 +748,8 @@ mod tests {
                 .map(|(s, u)| (s.to_string(), u.map(str::to_string)))
                 .collect(),
             pace: Arc::default(),
+            sign_in: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -774,6 +809,9 @@ mod tests {
             revocation_endpoint: format!("{issuer}/revoke"),
             authorization_endpoint: None,
             device_authorization_endpoint: None,
+            direct_scopes: None,
+            device_scopes: None,
+            custom_scopes: BTreeMap::new(),
             hosts: vec!["example.com".into()],
             mcp: BTreeMap::new(),
             mcp_urls: urls(mcp),

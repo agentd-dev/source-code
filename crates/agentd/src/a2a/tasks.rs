@@ -165,6 +165,11 @@ pub struct Task {
     /// question to, never who may answer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_channel: Option<String>,
+    /// The Company sign-in this task's gate is (RFC 0047 §5.7), while it is
+    /// open. Durable with the task: a sign-in does not outlive the process
+    /// that started it, so a restart that finds one ends it `interrupted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInGate>,
     /// The command op that opened this task, when a command did (a built-in
     /// op, or a workflow's declared `a2a` command). What marks the result as
     /// the command vocabulary's data rather than an answer in prose.
@@ -213,12 +218,22 @@ pub struct Task {
     pub unread: bool,
 }
 
+/// A Company sign-in a task's gate is ([`Task::sign_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInGate {
+    /// The company entry the User is signing in at.
+    pub company: String,
+    /// The task exists only for the sign-in: it ends with it.
+    pub standalone: bool,
+}
+
 impl Task {
     pub fn new(id: &str, context_id: &str, principal: Option<&str>, link: Link) -> Task {
         let now = now_ms();
         Task {
             ask_schema: None,
             ask_channel: None,
+            sign_in: None,
             id: id.to_string(),
             context_id: context_id.to_string(),
             conversation: context_id.to_string(),

@@ -107,6 +107,10 @@ pub enum PendingKind {
         /// variant is carried by every pending ask.
         policy: Option<Box<PolicyCall>>,
     },
+    /// A Company sign-in the User is asked to finish (`company.sign_in`,
+    /// RFC 0047 §5.7): its gate and its outcome are the runtime's sign-in
+    /// `id`'s.
+    CompanySignIn { id: String, company: String },
 }
 
 /// The tool call a gate holds (see [`PendingKind::Human`]): a
@@ -463,6 +467,10 @@ pub struct Runtime {
     /// none is declared.
     #[cfg(feature = "companies")]
     pub(crate) companies: Option<Arc<crate::companies::Supervisor>>,
+    /// The Company sign-ins in progress, by id (`runtime::company_sign_in`).
+    /// In memory: a sign-in does not outlive the process that started it.
+    #[cfg(feature = "companies")]
+    pub(crate) company_sign_ins: BTreeMap<String, super::company_sign_in::SignInTrack>,
     pub(crate) mcp_specs: BTreeMap<String, crate::config::McpServerSpec>,
     /// Per server, the subscriptions an owner wants and the live connection
     /// does not hold after a failure that may pass, and when to ask again
@@ -806,6 +814,8 @@ impl Runtime {
             self.dispatch_turns();
             // 8. Pending waits + MCP notifications.
             self.poll_pending();
+            #[cfg(feature = "companies")]
+            self.poll_company_sign_ins();
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
@@ -973,6 +983,17 @@ impl Runtime {
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
             Event::McpReachable(r) => self.on_mcp_reachable(*r),
             Event::CompanyRead { into, origin, why } => self.company_read(into, origin, why),
+            #[cfg(feature = "companies")]
+            Event::CompanySignIn { id, step } => self.on_company_sign_in(&id, step),
+            #[cfg(feature = "companies")]
+            Event::CompanyCallback { query } => self.on_company_callback(query),
+            #[cfg(feature = "companies")]
+            Event::CompanySignedOut {
+                owed,
+                company,
+                by,
+                outcome,
+            } => self.on_company_signed_out(owed, &company, by.as_deref(), outcome),
             Event::Background { .. } | Event::Tick => {}
         }
     }

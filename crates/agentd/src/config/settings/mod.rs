@@ -2254,6 +2254,14 @@ pub struct Service {
     /// `kind: company` only — what agentd's own correlators a Company sees.
     #[serde(default)]
     pub privacy: Option<companies::Privacy>,
+    /// `kind: company` only — the sign-in types agentd may start with the
+    /// User there, in the order it tries them: `device`, `direct`.
+    #[serde(default)]
+    pub sign_in: Option<Vec<companies::SignIn>>,
+    /// `kind: company` only — the most account scopes agentd ever asks the
+    /// User for there.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
 }
 
 /// Which outbound surface a catalog entry describes. Matching is
@@ -14832,6 +14840,8 @@ mod tests {
                 interfaces: None,
                 mcp_names: BTreeMap::new(),
                 privacy: None,
+                sign_in: None,
+                scopes: None,
             },
         );
         let m = ServiceKind::Mcp;

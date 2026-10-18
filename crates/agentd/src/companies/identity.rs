@@ -12,7 +12,10 @@
 //!
 //! The documents are published one of two ways: printed for static hosting
 //! (`agentd --print-company-client <dir>`), or served by the A2A listener at
-//! their URLs' paths (`client.serve`). Before its first Session the
+//! their URLs' paths (`client.serve`). The document's `redirect_uris` lists
+//! `client.redirect_uri` — where Direct Sign-In returns the User, which only
+//! the listener serves — when some Company may be signed in to directly, and
+//! is `[]` otherwise. Before its first Session the
 //! supervisor fetches both from where they are published and requires what
 //! it finds to be what it would print, with the signing key in the set —
 //! the self-check; a Company would refuse its assertions otherwise, and this
@@ -37,6 +40,9 @@ pub const SERVED_MAX_AGE_S: u64 = 300;
 pub struct Identity {
     pub client_id: String,
     pub jwks_uri: String,
+    /// Where Direct Sign-In returns the User, when some Company may be
+    /// signed in to directly.
+    pub redirect_uri: Option<String>,
     key: ClientKey,
     published: Vec<ClientKey>,
     metadata: Value,
@@ -44,8 +50,9 @@ pub struct Identity {
 
 impl Identity {
     /// The identity `client` configures: its key loaded, or created `0600`,
-    /// and each published key likewise.
-    pub fn load(client: &Client) -> Result<Identity, String> {
+    /// and each published key likewise. With `direct`, its `redirect_uri` is
+    /// listed for Direct Sign-In.
+    pub fn load(client: &Client, direct: bool) -> Result<Identity, String> {
         let key = ClientKey::load_or_create(Path::new(client.key_file()))
             .map_err(|e| format!("security.companies.client.key_file: {e}"))?;
         let mut published = Vec::new();
@@ -56,6 +63,7 @@ impl Identity {
             );
         }
         let jwks_uri = client.jwks_uri();
+        let redirect_uri = direct.then(|| client.redirect_uri());
         let mut metadata = json!({
             "client_id": client.id,
             "client_name": client.name,
@@ -63,7 +71,7 @@ impl Identity {
             // Always present: the kit's schema requires the member, and a
             // Company running its validator refuses a document without it.
             // Nothing is listed until a Company may be signed in to directly.
-            "redirect_uris": [],
+            "redirect_uris": redirect_uri.iter().collect::<Vec<_>>(),
             "token_endpoint_auth_method": "private_key_jwt",
         });
         if let Some(l) = &client.logo_uri {
@@ -72,6 +80,7 @@ impl Identity {
         Ok(Identity {
             client_id: client.id.clone(),
             jwks_uri,
+            redirect_uri,
             key,
             published,
             metadata,
@@ -208,6 +217,7 @@ mod tests {
             jwks_uri: None,
             key_file: Some(dir.join("key").display().to_string()),
             published_key_files: vec![dir.join("next").display().to_string()],
+            redirect_uri: None,
             serve: false,
         }
     }
@@ -218,7 +228,7 @@ mod tests {
     #[test]
     fn the_identity_is_its_key_file_and_publishes_public_halves() {
         let dir = tempfile::tempdir().unwrap();
-        let id = Identity::load(&client(dir.path())).unwrap();
+        let id = Identity::load(&client(dir.path()), false).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -228,7 +238,7 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let again = Identity::load(&client(dir.path())).unwrap();
+        let again = Identity::load(&client(dir.path()), false).unwrap();
         assert_eq!(again.kid(), id.kid(), "the same key across loads");
         let jwks = id.jwks();
         let keys = jwks["keys"].as_array().unwrap();
@@ -247,5 +257,17 @@ mod tests {
         let printed = id.print(&dir.path().join("out")).unwrap();
         let doc: Value = serde_json::from_slice(&std::fs::read(&printed[0]).unwrap()).unwrap();
         assert_eq!(&doc, id.metadata());
+        // A Company that may be signed in to directly: the callback is
+        // listed, and only then.
+        let direct = Identity::load(&client(dir.path()), true).unwrap();
+        assert_eq!(
+            direct.metadata()["redirect_uris"],
+            json!(["https://agent.example/companies/callback"])
+        );
+        assert_eq!(
+            direct.redirect_uri.as_deref(),
+            Some("https://agent.example/companies/callback")
+        );
+        assert!(id.redirect_uri.is_none());
     }
 }

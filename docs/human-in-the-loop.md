@@ -368,6 +368,45 @@ tool waits for the User before the call is sent.
   and capped, beside the domain agentd verified; the call's arguments are
   shown as one line of JSON.
 
+### Sign-in gates
+
+The sign-in gate asks the User to sign in at a Company themselves. It opens
+when the model calls `company.sign_in`, a workflow step does, or the operator
+sends the `company.sign_in` op (`agentd --login company:<name>`), and an
+Account Token agentd already holds does not cover the scopes asked for. It is
+a Company gate in every rule above, and differs in what it asks:
+
+- **The User signs in at the Company, not at the gate.** For Device Sign-In
+  the gate shows a link on the Company's page and the code to check there;
+  for Direct Sign-In, a link to the Company's sign-in page. agentd never
+  opens either. The gate closes by itself when the Company says how the
+  sign-in went, and the one answer it takes is `cancel`.
+- **The model never sees it.** The tool call waits while the gate is open and
+  returns how the sign-in ended: `signed_in` with the scopes granted beside
+  those requested, or `cancelled`, `denied`, `expired`, `account_mismatch` or
+  `interrupted`. The code, the link and every token stay in the supervisor.
+- **Its links are checked.** A device authorization whose `verification_uri`
+  is not an HTTPS URL with a plain host on the entry's `hosts`, in printable
+  ASCII, opens no gate: the sign-in is refused, naming the field and the
+  host, never the link (`company.endpoint.refused`). A plain host is a name
+  or address and an optional port, with no `@` or `\` a browser could read
+  another host from. agentd follows a Device Sign-In for 30 minutes at most,
+  whatever its `expires_in` says.
+- **It is the one gate on its task.** An ask, or a policy or Company gate,
+  on a task a sign-in is on is refused, and a sign-in on a task with one
+  open is too. Cancelling the task (`CancelTask`) ends the sign-in: the
+  tool answers `cancelled`, and the poll stops.
+- **Its task follows the work.** In unowned work with
+  `agent.ask_human_unowned: gate`, a workflow step's sign-in gate is a task
+  of the run, which goes back to working once the sign-in ends and is
+  settled by the run; a turn's is a task of its own, which ends with the
+  sign-in.
+- **A restart ends it.** A sign-in pending when agentd stops ends
+  `interrupted` at the next start, and its gate says so.
+
+`company.sign_in.requested` opens one and `company.signed_in` or
+`company.sign_in.failed` ends it, each an audit record (`company.sign_in`).
+
 ## Answer from a client
 
 In the [terminal or web UI](interface.md), an open question shows in the

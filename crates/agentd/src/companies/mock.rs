@@ -67,7 +67,19 @@
 //! them with the bare status `s` after they arrived — or, with `"error": e`
 //! or `"result": r`, with `s` and a JSON-RPC answer carrying that member;
 //! `"date_skew_s": n` sets every reply's `Date` `n` seconds from the fake's
-//! clock.
+//! clock; `"slow_down": n` answers the next `n` device polls `slow_down`, and
+//! adds 5 s to the interval each time, as RFC 8628 has the client do;
+//! `"sign_out_sessions": true` signs every Session out, its Account Token
+//! still good — a Company's own sign-out, after which an account call is
+//! `sign_in_required` until the Session is renewed with the token;
+//! `"disconnect": true` is the User disconnecting the agent in their account
+//! settings: every Account Token is revoked, and the Sessions signed in with
+//! them signed out (§4.9); `"device": {"expires_in": n, "interval": n}` has
+//! the next device authorizations say those numbers, whatever the fake keeps;
+//! and a `stall` whose `method` is `token:<grant_type>` holds the answers to
+//! the next `n` token requests of that grant `t` ms after they took effect
+//! (a rotation already made, say, while its answer is on the way),
+//! recording `/_mock/held` as each hold begins.
 //!
 //! **Its documents cannot drift from the kit.** Every JSON body it sends is
 //! validated against its vendored schema first ([`kit`], patterns and
@@ -87,9 +99,15 @@
 //! the keys of its `_meta` (`meta`), the trace id its `traceparent` names
 //! (`trace_id`), the `clientInfo.title` it carries (`client_title`), the
 //! `Mcp-Session-Id` it carries (`mcp_session`), and for a `tools/call` its
-//! `agent/idempotency_key` (`idempotency_key`); for any
+//! `agent/idempotency_key` (`idempotency_key`); for a token request its
+//! `scope` and, granted on an Account Token, which one (`account_token`, named
+//! as `presented` names tokens), and for a device authorization or a
+//! revocation the same of theirs; for any
 //! request, whether it carried an AAuth signature (`aauth`), a
-//! `traceparent` header (`trace_header`) or a `User-Agent` (`user_agent`);
+//! `traceparent` header (`trace_header`) or a `User-Agent` (`user_agent`),
+//! when it arrived (`at_ms`, from the fake's start), and whether an Account
+//! Token the fake issued was anywhere in it but the one form member that
+//! may carry it to the token or revocation endpoint (`account_token_leaked`);
 //! and `validated`, the vendored schemas what the request carried held to —
 //! and the same objects are read back at `GET /_mock/record`: the server
 //! side's own account of what reached it, which a test counts instead of
@@ -752,6 +770,14 @@ struct State {
     holds: Vec<Hold>,
     /// How far every reply's `Date` is from the fake's clock.
     date_skew_s: i64,
+    /// Device polls still to answer `slow_down`.
+    slow_down: u32,
+    /// What device authorizations say `expires_in` and `interval` are, in
+    /// place of what the fake keeps (`"device"` in the control).
+    device_said: (Option<u64>, Option<u64>),
+    /// Token requests whose answers to hold back after they took effect, by
+    /// grant (`"stall"` with a `method` of `token:<grant_type>`).
+    token_holds: Vec<Hold>,
 }
 
 /// The fake Company.
@@ -764,6 +790,8 @@ struct Company {
     state: Mutex<State>,
     /// A second MCP API listed from now on (`"extra_mcp"` in the control).
     extra_mcp: AtomicBool,
+    /// When the fake started, which every record's `at_ms` counts from.
+    started: Instant,
 }
 
 impl Company {
@@ -798,8 +826,12 @@ impl Company {
                 extension_required: None,
                 holds: Vec::new(),
                 date_skew_s: 0,
+                slow_down: 0,
+                device_said: (None, None),
+                token_holds: Vec::new(),
             }),
             extra_mcp: AtomicBool::new(false),
+            started: Instant::now(),
         }
     }
 
@@ -874,7 +906,11 @@ impl Company {
         if let Some(ua) = req.header("user-agent") {
             record["user_agent"] = json!(ua);
         }
+        record["at_ms"] = json!(self.started.elapsed().as_millis() as u64);
         let mut st = lock(&self.state);
+        if Company::leaks_account_token(req, &st) {
+            record["account_token_leaked"] = json!(true);
+        }
         // A Session Token comes only in `Authorization`, at the API or MCP.
         if let Some((_, token)) = req.header("authorization").and_then(|a| a.split_once(' ')) {
             record["presented"] = json!(presented(token));
@@ -885,6 +921,31 @@ impl Company {
         eprintln!("COMPANY {record}");
         st.records.push(record);
         reply
+    }
+
+    /// Whether an Account Token the fake issued is anywhere in `req` but the
+    /// one place a Personal Agent may send it: the `refresh_token` member of
+    /// a token request's form, or the `token` member of a revocation's
+    /// (§4.8: "Companies MUST accept an Account Token only at their
+    /// `token_endpoint` and `revocation_endpoint`").
+    fn leaks_account_token(req: &Request, st: &State) -> bool {
+        let carried = match req.path.as_str() {
+            "/auth/token" => decode_form(&req.body)
+                .ok()
+                .and_then(|f| f.get("refresh_token").cloned()),
+            "/auth/revoke" => decode_form(&req.body)
+                .ok()
+                .and_then(|f| f.get("token").cloned()),
+            _ => None,
+        };
+        let body = String::from_utf8_lossy(&req.body);
+        st.accounts.keys().any(|t| {
+            let in_body = body.contains(t.as_str()) && carried.as_deref() != Some(t.as_str());
+            in_body
+                || req.query.contains(t.as_str())
+                || req.path.contains(t.as_str())
+                || req.headers.iter().any(|(_, v)| v.contains(t.as_str()))
+        })
     }
 
     /// Whether a newer token of the same kind — DPoP, or Bearer for the same
@@ -1387,11 +1448,34 @@ impl Company {
             Ok(r) => r,
             Err(r) => self.oauth_error(r),
         };
+        let held = {
+            let mut st = lock(&self.state);
+            st.token_holds
+                .iter_mut()
+                .find(|h| h.method.strip_prefix("token:") == Some(g.as_str()) && h.times > 0)
+                .map(|h| {
+                    h.times -= 1;
+                    h.ms
+                })
+        };
+        if let Some(ms) = held {
+            // Said as it begins, so a test knows the request took effect.
+            let begun = json!({"path": "/_mock/held", "grant": g, "ms": ms,
+                               "at_ms": self.started.elapsed().as_millis() as u64});
+            eprintln!("COMPANY {begun}");
+            lock(&self.state).records.push(begun);
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         reply
             .note("grant", json!(g))
             .note("dpop", json!(req.header("dpop").is_some()))
             .note("resource", json!(resource))
             .note("session_id", json!(form.get(wire::param::SESSION_ID)))
+            .note("scope", json!(form.get("scope")))
+            .note(
+                "account_token",
+                json!(form.get("refresh_token").map(|t| presented(t))),
+            )
     }
 
     fn token_inner(
@@ -1749,12 +1833,23 @@ impl Company {
             at.duration_since(last) + Duration::from_millis(250) < Duration::from_secs(d.interval)
         });
         d.last_poll = Some(at);
-        if early {
+        let told = st.slow_down > 0 && !early;
+        if told {
+            st.slow_down -= 1;
+        }
+        let Some(d) = st.devices.get_mut(code) else {
+            return Err(refuse(400, err::INVALID_GRANT, "an unknown device_code"));
+        };
+        if early || told {
             d.interval += 5;
             return Err(refuse(
                 400,
                 err::SLOW_DOWN,
-                "polled faster than the interval",
+                if early {
+                    "polled faster than the interval"
+                } else {
+                    "the Company asks for a slower poll"
+                },
             ));
         }
         d.polls += 1;
@@ -1910,6 +2005,7 @@ impl Company {
                 .map_err(proof_refusal)?;
             let asked = Company::asked_scopes(form.get("scope"))
                 .map_err(|why| refuse(400, err::INVALID_SCOPE, why))?;
+            seen("scope", json!(form.get("scope")));
             let device_code = opaque("dev_");
             let user_code = user_code();
             let at = if self.has(Variant::OffHostVerificationUri) {
@@ -1922,8 +2018,8 @@ impl Company {
                 "user_code": user_code,
                 "verification_uri": at,
                 "verification_uri_complete": format!("{at}?{}", encode_query(&[("user_code", &user_code)])),
-                "expires_in": DEVICE_EXPIRES_S,
-                "interval": DEVICE_INTERVAL_S,
+                "expires_in": st.device_said.0.unwrap_or(DEVICE_EXPIRES_S),
+                "interval": st.device_said.1.unwrap_or(DEVICE_INTERVAL_S),
             });
             let body = match self.conformant("device-authorization-response.schema.json", body) {
                 Ok(b) => b,
@@ -2032,6 +2128,8 @@ impl Company {
             let token = form
                 .get("token")
                 .ok_or_else(|| refuse(400, err::INVALID_REQUEST, "no token"))?;
+            seen("account_token", json!(presented(token)));
+            seen("token_type_hint", json!(form.get("token_type_hint")));
             // A token that is unknown, another client's, already revoked or
             // spent is not revoked, and the answer is the same (RFC 7009
             // §2.2).
@@ -2409,6 +2507,28 @@ impl Company {
         if body["end_sessions"] == true {
             st.sessions.clear();
         }
+        if body["sign_out_sessions"] == true {
+            for s in st.sessions.values_mut() {
+                s.signed_in = false;
+                s.grant = None;
+            }
+        }
+        if body["disconnect"] == true {
+            for a in st.accounts.values_mut() {
+                a.revoked = true;
+            }
+            for s in st.sessions.values_mut() {
+                s.signed_in = false;
+                s.scope.clear();
+                s.grant = None;
+            }
+        }
+        if let Some(n) = body["slow_down"].as_u64() {
+            st.slow_down = u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        if let Some(d) = body.get("device") {
+            st.device_said = (d["expires_in"].as_u64(), d["interval"].as_u64());
+        }
         for (key, fails) in [("stall", false), ("fail", true)] {
             let h = &body[key];
             let Some(method) = h["method"].as_str() else {
@@ -2422,7 +2542,12 @@ impl Company {
             let body = ["error", "result"]
                 .into_iter()
                 .find_map(|k| h.get(k).map(|v| json!({k: v})));
-            st.holds.push(Hold {
+            let to = if method.starts_with("token:") {
+                &mut st.token_holds
+            } else {
+                &mut st.holds
+            };
+            to.push(Hold {
                 method: method.to_string(),
                 times: h["times"]
                     .as_u64()

@@ -459,6 +459,8 @@ op answers with a Task whose `<taskId>.result` artifact carries the result.
 | `auth.sessions.revoke` | task | operator | a TCP listener | `sid`, `name`, or `all: true` |
 | `company.status` | message | operator | a `kind: company` entry | none |
 | `company.user_id.reset` | task | operator | a `kind: company` entry | `company` |
+| `company.sign_in` | task | operator | a `kind: company` entry | `company`; `scopes`, `new_account` |
+| `company.sign_out` | task | operator | a `kind: company` entry | `company` |
 
 Arguments before a semicolon are required. "A grant" means no role reaches
 the op by default and a principal needs a grant naming it. The operator
@@ -486,7 +488,18 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   connections, which join again on new sessions: the Company sees a new
   User. With a seal key that opens none of the store's records it starts
   that Company over with the key (`started_over: true`); the others stay
-  unavailable until each is reset.
+  unavailable until each is reset. The Account Token held there is revoked
+  and forgotten first.
+- **`company.sign_in`** and **`company.sign_out`** are the configured User's
+  alone (`security.companies.user`): any other principal is refused with
+  `PERMISSION_DENIED`, an operator who is not the User included. The task
+  `company.sign_in` answers with is the User's sign-in gate: it goes to
+  `input-required` with where to sign in, takes `cancel`, and ends
+  `completed` with the `company.sign_in` tool's result, `canceled`, or
+  `failed` saying how. An Account Token already held that covers the scopes
+  completes it without a gate. The task `company.sign_out` answers with ends
+  `completed` with `{company, signed_out, revoked}`, or `failed` when the
+  revocation failed — the Account Token forgotten here either way.
 
 **Reserved names.** `_instance.result` and `_instance.emit` are how a child
 instance reports to its parent; they are the operator's and are not listed in

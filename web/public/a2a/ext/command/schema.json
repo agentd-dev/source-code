@@ -396,6 +396,36 @@
           "if": {
             "properties": {
               "op": {
+                "const": "company.sign_in"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/company.sign_in"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "company.sign_out"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/company.sign_out"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
                 "const": "_instance.result"
               }
             },
@@ -733,6 +763,53 @@
           },
           "required": [
             "op"
+          ],
+          "type": "object"
+        },
+        "company.sign_in": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry",
+              "minLength": 1,
+              "type": "string"
+            },
+            "new_account": {
+              "description": "Sign in to another account than before, in a new Session",
+              "type": "boolean"
+            },
+            "op": {
+              "const": "company.sign_in"
+            },
+            "scopes": {
+              "description": "The account scopes to ask for; every scope the entry allows when absent",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "op",
+            "company"
+          ],
+          "type": "object"
+        },
+        "company.sign_out": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry the User signs out at",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "company.sign_out"
+            }
+          },
+          "required": [
+            "op",
+            "company"
           ],
           "type": "object"
         },
@@ -1592,6 +1669,114 @@
             }
           },
           "required": [
+            "revoked"
+          ],
+          "type": "object"
+        }
+      },
+      "company.sign_in": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry",
+              "minLength": 1,
+              "type": "string"
+            },
+            "new_account": {
+              "description": "Sign in to another account than before, in a new Session",
+              "type": "boolean"
+            },
+            "scopes": {
+              "description": "The account scopes to ask for; every scope the entry allows when absent",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "company"
+          ],
+          "type": "object"
+        },
+        "description": "Ask the User to sign in at a Company {company, scopes?, new_account?}: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "signed_in",
+                "cancelled",
+                "denied",
+                "expired",
+                "account_mismatch",
+                "interrupted"
+              ]
+            },
+            "requested": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "signed_in": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "company",
+            "outcome",
+            "signed_in"
+          ],
+          "type": "object"
+        }
+      },
+      "company.sign_out": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry the User signs out at",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "company"
+          ],
+          "type": "object"
+        },
+        "description": "Sign the User out at a Company {company}: the Account Token is revoked there and forgotten here, and the Session continues signed out. The configured User's alone",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "type": "string"
+            },
+            "revoked": {
+              "description": "the Company revoked it",
+              "type": "boolean"
+            },
+            "signed_out": {
+              "description": "an Account Token was held, and is forgotten",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "company",
+            "signed_out",
             "revoked"
           ],
           "type": "object"

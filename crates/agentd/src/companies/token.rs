@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The token endpoint (RFC 0047 §5.5.4, draft §4.2–§4.3): the grants a
-//! signed-out Session needs, the typed token response and the typed error.
+//! The token endpoint (RFC 0047 §5.5.4, draft §4.2–§4.9): every grant a
+//! Session needs, device authorization and revocation, the typed token
+//! response and the typed error.
 //!
 //! | Purpose | Grant | Extra | DPoP |
 //! |---|---|---|---|
 //! | Start a Session | JWT bearer | `assertion` | a proof |
-//! | Renew it | the same | `session_id` | a proof |
-//! | A Bearer token for an MCP server | the same | `session_id`, `resource` = its `url` | none (§4.3: "without the `DPoP` header") |
+//! | Renew a signed-out one | the same | `session_id` | a proof |
+//! | Use the Account Token: sign a Session in, renew it, or start one signed in | `refresh_token` | `refresh_token`, `session_id`?, a narrower `scope`? | a proof |
+//! | A Bearer token for an MCP server | the Session's renew grant | `session_id`, `resource` = its `url` | none (§4.3: "without the `DPoP` header") |
+//! | Device Sign-In's poll | `device_code` | `device_code`, `session_id` | a proof |
+//! | Direct Sign-In's code | `authorization_code` | `code`, `redirect_uri`, `code_verifier`, `session_id` | a proof |
 //!
-//! Every request carries a client assertion (`private_key_jwt`) and a fresh
-//! Session assertion, both with `aud` the issuer as one string; every retry
-//! signs fresh ones (Guides #both-retries). A `use_dpop_nonce` is retried
-//! once with the nonce the Company sent (§4.3: "Personal Agents MUST support
-//! nonces"). A token request is safe to repeat (RFC 0047 §5.9), so one that
-//! got no answer or a `5xx` is sent again, at most [`ATTEMPTS`] times in all,
-//! backing off between — never before the Company's not-before instant,
-//! which refuses it unsent. A response is used only with every member §4.2
-//! requires; one missing any is an error. Bodies are never logged: an error
-//! carries the code the Company gave, and nothing it wrote.
+//! Every request carries a client assertion (`private_key_jwt`), and the JWT
+//! bearer grant a fresh Session assertion, both with `aud` the issuer as one
+//! string; every retry signs fresh ones (Guides #both-retries). The device
+//! authorization request (§4.6) and the revocation request (§4.9) are form
+//! requests to their own endpoints, with the client assertion and — as §4.3
+//! says of every request, though their examples show none — a proof. A
+//! `use_dpop_nonce` is retried once with the nonce the Company sent (§4.3:
+//! "Personal Agents MUST support nonces"). Each request is safe to repeat
+//! (RFC 0047 §5.9), so one that got no answer or a `5xx` is sent again, at
+//! most [`ATTEMPTS`] times in all, backing off between — never before the
+//! Company's not-before instant, which refuses it unsent. A response is used
+//! only with every member §4.2 requires; one missing any is an error. Bodies
+//! are never logged: an error carries the code the Company gave, and nothing
+//! it wrote.
 
 use std::time::Duration;
 
@@ -40,10 +48,42 @@ pub struct Ctx<'a> {
     pub nonces: &'a Nonces,
 }
 
-/// One token request: the Session it renews (none starts one), the
-/// `resource` it is for, and whether it carries a proof.
+/// What a token request is granted on.
+#[derive(Clone, Copy)]
+pub enum Grant<'a> {
+    /// The Personal Agent's Session assertion (§4.2): a signed-out token.
+    Assertion,
+    /// The Account Token (§4.8), and the narrower scopes it is used for.
+    Refresh {
+        token: &'a str,
+        scope: Option<&'a str>,
+    },
+    /// Device Sign-In's device code (§4.6).
+    DeviceCode { device_code: &'a str },
+    /// Direct Sign-In's authorization code (§4.5).
+    Code {
+        code: &'a str,
+        redirect_uri: &'a str,
+        verifier: &'a str,
+    },
+}
+
+impl std::fmt::Debug for Grant<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Grant::Assertion => "Assertion",
+            Grant::Refresh { .. } => "Refresh",
+            Grant::DeviceCode { .. } => "DeviceCode",
+            Grant::Code { .. } => "Code",
+        })
+    }
+}
+
+/// One token request: what it is granted on, the Session it is for (none
+/// starts one), the `resource` it is for, and whether it carries a proof.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
+    pub grant: Grant<'a>,
     pub session_id: Option<&'a str>,
     pub resource: Option<&'a str>,
     pub dpop: bool,
@@ -53,6 +93,7 @@ impl<'a> Request<'a> {
     /// Start a Session: a DPoP Session Token for a new one.
     pub fn start() -> Request<'a> {
         Request {
+            grant: Grant::Assertion,
             session_id: None,
             resource: None,
             dpop: true,
@@ -63,32 +104,68 @@ impl<'a> Request<'a> {
     pub fn renew(session_id: &'a str) -> Request<'a> {
         Request {
             session_id: Some(session_id),
-            resource: None,
-            dpop: true,
+            ..Request::start()
         }
     }
 
     /// A Bearer token for the MCP server at `url`, for `session_id`.
     pub fn bearer(session_id: &'a str, url: &'a str) -> Request<'a> {
         Request {
-            session_id: Some(session_id),
             resource: Some(url),
             dpop: false,
+            ..Request::renew(session_id)
+        }
+    }
+
+    /// The same request granted on the Account Token `token` instead —
+    /// narrowed to `scope` when it names fewer scopes than the token holds.
+    pub fn with_account(self, token: &'a str, scope: Option<&'a str>) -> Request<'a> {
+        Request {
+            grant: Grant::Refresh { token, scope },
+            ..self
+        }
+    }
+
+    /// Device Sign-In's poll of `device_code`, for `session_id`.
+    pub fn device(device_code: &'a str, session_id: &'a str) -> Request<'a> {
+        Request {
+            grant: Grant::DeviceCode { device_code },
+            ..Request::renew(session_id)
+        }
+    }
+
+    /// Direct Sign-In's exchange of `code`, for `session_id`.
+    pub fn code(
+        code: &'a str,
+        redirect_uri: &'a str,
+        verifier: &'a str,
+        session_id: &'a str,
+    ) -> Request<'a> {
+        Request {
+            grant: Grant::Code {
+                code,
+                redirect_uri,
+                verifier,
+            },
+            ..Request::renew(session_id)
         }
     }
 
     /// What the request is for, as `agent_company_token_requests_total`
     /// names it.
     pub fn grant(&self) -> &'static str {
-        match (self.resource, self.session_id) {
-            (Some(_), _) => "bearer",
-            (None, Some(_)) => "renew",
-            (None, None) => "start",
+        match (self.grant, self.resource, self.session_id) {
+            (_, Some(_), _) => "bearer",
+            (Grant::Refresh { .. }, None, _) => "refresh",
+            (Grant::DeviceCode { .. }, None, _) => "device_code",
+            (Grant::Code { .. }, None, _) => "authorization_code",
+            (Grant::Assertion, None, Some(_)) => "renew",
+            (Grant::Assertion, None, None) => "start",
         }
     }
 }
 
-/// A token response (§4.2).
+/// A token response (§4.2, §4.4).
 #[derive(Clone)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -97,6 +174,10 @@ pub struct TokenResponse {
     pub scope: Vec<String>,
     pub session_id: String,
     pub signed_in: bool,
+    /// The Account Token a sign-in issued, or the one a rotation replaced
+    /// the used one with (§4.8).
+    pub refresh_token: Option<String>,
+    pub refresh_token_expires_in: Option<Duration>,
 }
 
 impl std::fmt::Debug for TokenResponse {
@@ -107,6 +188,7 @@ impl std::fmt::Debug for TokenResponse {
             .field("expires_in", &self.expires_in)
             .field("scope", &self.scope)
             .field("signed_in", &self.signed_in)
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
             .finish()
     }
 }
@@ -141,9 +223,14 @@ impl TokenError {
         }
     }
 
+    /// Whether the Company refused with `code`.
+    pub fn is(&self, code: &str) -> bool {
+        self.code() == Some(code)
+    }
+
     /// Whether sending the request again could get another answer: no
     /// answer came, or the Company's server failed (`5xx`).
-    fn repeatable(&self) -> bool {
+    pub fn repeatable(&self) -> bool {
         match self {
             TokenError::Transport(_) => true,
             TokenError::Status(s) | TokenError::Refused { status: s, .. } => *s >= 500,
@@ -184,11 +271,154 @@ impl std::fmt::Display for TokenError {
 /// again after a back-off when no answer came or its server failed, at most
 /// [`ATTEMPTS`] times.
 pub fn request(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
+    let json = repeat(ctx, req.dpop, req.grant(), || {
+        Ok((ctx.token_endpoint.to_string(), fields(ctx, req)?))
+    })?;
+    parse(&json, req)
+}
+
+/// The form a token request sends: the grant's own fields, then the client's.
+fn fields(ctx: &Ctx<'_>, req: Request<'_>) -> Result<Vec<(&'static str, String)>, TokenError> {
+    let mut f: Vec<(&'static str, String)> = Vec::new();
+    match req.grant {
+        Grant::Assertion => {
+            f.push(("grant_type", grant::JWT_BEARER.into()));
+            let assertion = ctx
+                .identity
+                .session_assertion(ctx.user_id, ctx.issuer)
+                .map_err(TokenError::Transport)?;
+            f.push(("assertion", assertion));
+        }
+        Grant::Refresh { token, scope } => {
+            f.push(("grant_type", grant::REFRESH_TOKEN.into()));
+            f.push(("refresh_token", token.into()));
+            if let Some(s) = scope {
+                f.push(("scope", s.into()));
+            }
+        }
+        Grant::DeviceCode { device_code } => {
+            f.push(("grant_type", grant::DEVICE_CODE.into()));
+            f.push(("device_code", device_code.into()));
+        }
+        Grant::Code {
+            code,
+            redirect_uri,
+            verifier,
+        } => {
+            f.push(("grant_type", grant::AUTHORIZATION_CODE.into()));
+            f.push(("code", code.into()));
+            f.push(("redirect_uri", redirect_uri.into()));
+            f.push(("code_verifier", verifier.into()));
+        }
+    }
+    if let Some(s) = req.session_id {
+        f.push((param::SESSION_ID, s.into()));
+    }
+    if let Some(r) = req.resource {
+        f.push((param::RESOURCE, r.into()));
+    }
+    Ok(f)
+}
+
+/// What a device authorization request answered (§4.6).
+#[derive(Clone)]
+pub struct DeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    /// How long the device code lives: `expires_in`, at most
+    /// [`DEVICE_FOR`].
+    pub expires_in: Duration,
+    /// How long to wait between polls: `interval`, or RFC 8628's 5 s — no
+    /// longer than `expires_in`.
+    pub interval: Duration,
+}
+
+impl std::fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuthorization")
+            .field("device_code", &"***")
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+/// RFC 8628 §3.5's poll interval when the Company names none.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+/// The longest agentd follows a Device Sign-In, whatever `expires_in` says.
+pub const DEVICE_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// Ask `endpoint`, the device authorization endpoint, to start a Device
+/// Sign-In for `scope` (§4.6).
+pub fn device_authorization(
+    ctx: &Ctx<'_>,
+    endpoint: &str,
+    scope: &str,
+) -> Result<DeviceAuthorization, TokenError> {
+    let v = repeat(ctx, true, "device_authorization", || {
+        Ok((endpoint.to_string(), vec![("scope", scope.to_string())]))
+    })?;
+    let text = |m: &str| {
+        v[m].as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                TokenError::Malformed(format!("a device authorization response without {m}"))
+            })
+    };
+    let expires_in = v["expires_in"].as_u64().filter(|n| *n > 0).ok_or_else(|| {
+        TokenError::Malformed("a device authorization response without expires_in".into())
+    })?;
+    // Both are the Company's to choose, and only ever added to a clock: held
+    // to what agentd follows, an interval to no longer than the code lives.
+    let expires_in = Duration::from_secs(expires_in).min(DEVICE_FOR);
+    Ok(DeviceAuthorization {
+        device_code: text("device_code")?,
+        user_code: text("user_code")?,
+        verification_uri: text("verification_uri")?,
+        verification_uri_complete: v["verification_uri_complete"].as_str().map(str::to_string),
+        expires_in,
+        interval: v["interval"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .map_or(DEFAULT_INTERVAL, Duration::from_secs)
+            .min(expires_in),
+    })
+}
+
+/// Revoke the Account Token `token` at `endpoint`, the revocation endpoint
+/// (§4.9, RFC 7009): `token_type_hint=refresh_token`, with the client
+/// assertion. RFC 7009 §2.2 answers `200` whether or not the token was
+/// good.
+pub fn revoke(ctx: &Ctx<'_>, endpoint: &str, token: &str) -> Result<(), TokenError> {
+    repeat(ctx, true, "revoke", || {
+        Ok((
+            endpoint.to_string(),
+            vec![
+                ("token", token.to_string()),
+                ("token_type_hint", "refresh_token".to_string()),
+            ],
+        ))
+    })
+    .map(|_| ())
+}
+
+/// Send the form request `build` makes, as [`request`] sends one: once more
+/// with the Company's nonce when it asks for one, and after a back-off when
+/// no answer came or its server failed. `grant` names it in the metrics.
+fn repeat(
+    ctx: &Ctx<'_>,
+    dpop: bool,
+    grant: &'static str,
+    build: impl Fn() -> Result<(String, Vec<(&'static str, String)>), TokenError>,
+) -> Result<Value, TokenError> {
     let (mut nonce, mut attempt) = (false, 1);
     loop {
-        match once(ctx, req) {
+        match once(ctx, dpop, grant, &build) {
             Err(TokenError::Refused { code, .. })
-                if req.dpop && !nonce && code == err::USE_DPOP_NONCE =>
+                if dpop && !nonce && code == err::USE_DPOP_NONCE =>
             {
                 nonce = true;
             }
@@ -203,32 +433,33 @@ pub fn request(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenEr
 
 /// One attempt, with fresh assertions and, when it carries one, a fresh
 /// proof — counted by its outcome once it is sent.
-fn once(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
+fn once(
+    ctx: &Ctx<'_>,
+    dpop: bool,
+    grant: &'static str,
+    build: &impl Fn() -> Result<(String, Vec<(&'static str, String)>), TokenError>,
+) -> Result<Value, TokenError> {
     ctx.dialer.pace.check().map_err(TokenError::Paced)?;
-    let out = attempt(ctx, req);
+    let out = build().and_then(|(url, f)| attempt(ctx, &url, &f, dpop));
     let outcome = match &out {
         Ok(_) => "ok",
         Err(TokenError::Refused { .. }) => "refused",
         Err(TokenError::Paced(_)) => return out,
         Err(_) => "failed",
     };
-    crate::obs::metrics::record_company_token_request(&ctx.dialer.company, req.grant(), outcome);
+    crate::obs::metrics::record_company_token_request(&ctx.dialer.company, grant, outcome);
     out
 }
 
-fn attempt(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError> {
+fn attempt(
+    ctx: &Ctx<'_>,
+    url: &str,
+    fields: &[(&'static str, String)],
+    dpop: bool,
+) -> Result<Value, TokenError> {
     let mut form = crate::auth::oauth2::Form::new();
-    form.field("grant_type", grant::JWT_BEARER);
-    let assertion = ctx
-        .identity
-        .session_assertion(ctx.user_id, ctx.issuer)
-        .map_err(TokenError::Transport)?;
-    form.field("assertion", &assertion);
-    if let Some(s) = req.session_id {
-        form.field(param::SESSION_ID, s);
-    }
-    if let Some(r) = req.resource {
-        form.field(param::RESOURCE, r);
+    for (k, v) in fields {
+        form.field(k, v);
     }
     let client_assertion = ctx
         .identity
@@ -238,17 +469,12 @@ fn attempt(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError>
     form.field("client_assertion_type", ASSERTION_TYPE);
     form.field("client_assertion", &client_assertion);
     let body = form.finish();
-    // Signed at the last moment, once the URL is final. A token request
-    // never has `ath`, even one carrying a credential in its body.
-    let proof = if req.dpop {
+    // Signed at the last moment, once the URL is final. A proof to these
+    // endpoints never has `ath`, even one carrying a credential in its body.
+    let proof = if dpop {
         Some(
             ctx.dpop
-                .proof(
-                    "POST",
-                    ctx.token_endpoint,
-                    None,
-                    ctx.nonces.get(ctx.token_endpoint).as_deref(),
-                )
+                .proof("POST", url, None, ctx.nonces.get(url).as_deref())
                 .map_err(TokenError::Transport)?,
         )
     } else {
@@ -263,10 +489,10 @@ fn attempt(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError>
     }
     let reply = ctx
         .dialer
-        .send("POST", ctx.token_endpoint, &headers, &body)
+        .send("POST", url, &headers, &body)
         .map_err(TokenError::Transport)?;
     if let Some(n) = reply.header(wire::DPOP_NONCE_HEADER) {
-        ctx.nonces.learn(ctx.token_endpoint, n);
+        ctx.nonces.learn(url, n);
     }
     let json: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
     if !reply.is_success() {
@@ -280,7 +506,7 @@ fn attempt(ctx: &Ctx<'_>, req: Request<'_>) -> Result<TokenResponse, TokenError>
             None => TokenError::Status(reply.status),
         });
     }
-    parse(&json, req)
+    Ok(json)
 }
 
 /// A token response, with every member §4.2 requires.
@@ -326,6 +552,13 @@ fn parse(v: &Value, req: Request<'_>) -> Result<TokenResponse, TokenError> {
             .collect(),
         session_id: session_id.to_string(),
         signed_in,
+        refresh_token: v["refresh_token"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        refresh_token_expires_in: v["refresh_token_expires_in"]
+            .as_u64()
+            .map(Duration::from_secs),
     })
 }
 
@@ -354,12 +587,28 @@ mod tests {
         assert!(TokenError::Status(502).repeatable());
         assert!(refused(503).repeatable());
         assert!(!refused(400).repeatable());
+        assert!(refused(400).is(err::INVALID_GRANT));
         assert!(!TokenError::Status(404).repeatable());
         assert!(!TokenError::Paced("rate limited".into()).repeatable());
         assert!(!TokenError::Malformed("x".into()).repeatable());
         assert_eq!(Request::start().grant(), "start");
         assert_eq!(Request::renew("s").grant(), "renew");
         assert_eq!(Request::bearer("s", "https://m/mcp").grant(), "bearer");
+        assert_eq!(
+            Request::renew("s").with_account("pat", None).grant(),
+            "refresh"
+        );
+        assert_eq!(
+            Request::bearer("s", "https://m/mcp")
+                .with_account("pat", None)
+                .grant(),
+            "bearer"
+        );
+        assert_eq!(Request::device("d", "s").grant(), "device_code");
+        assert_eq!(
+            Request::code("c", "https://a/cb", "v", "s").grant(),
+            "authorization_code"
+        );
     }
 
     /// A response missing any member §4.2 requires is an error, not a token.
@@ -368,6 +617,7 @@ mod tests {
         let ok = parse(&good(), Request::start()).unwrap();
         assert_eq!(ok.session_id, "ses_1");
         assert!(!ok.signed_in && ok.scope.is_empty());
+        assert!(ok.refresh_token.is_none());
         assert!(!format!("{ok:?}").contains("\"t\""), "never printed");
         for m in [
             "access_token",
@@ -389,5 +639,20 @@ mod tests {
         let mut b = good();
         b["token_type"] = json!("Bearer");
         assert!(parse(&b, Request::bearer("ses_1", "https://m/mcp")).is_ok());
+        // A sign-in's Account Token comes back with the Session Token, and
+        // is never printed.
+        let mut signed = good();
+        signed["refresh_token"] = json!("pat_one");
+        signed["refresh_token_expires_in"] = json!(2_592_000);
+        signed["signed_in"] = json!(true);
+        signed["scope"] = json!("poppy:read poppy:write");
+        let s = parse(&signed, Request::device("dev", "ses_1")).unwrap();
+        assert_eq!(s.refresh_token.as_deref(), Some("pat_one"));
+        assert_eq!(
+            s.refresh_token_expires_in,
+            Some(Duration::from_secs(2_592_000))
+        );
+        assert_eq!(s.scope, ["poppy:read", "poppy:write"]);
+        assert!(!format!("{s:?}").contains("pat_one"));
     }
 }

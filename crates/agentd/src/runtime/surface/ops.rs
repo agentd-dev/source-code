@@ -473,6 +473,30 @@ pub const OPS: &[OpSpec] = &[
         company_reset_result,
     ),
     op(
+        "company.sign_in",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Companies,
+        Handler::Company,
+        "Ask the User to sign in at a Company {company, scopes?, new_account?}: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
+        company_sign_in_args,
+        company_sign_in_result,
+    ),
+    op(
+        "company.sign_out",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Companies,
+        Handler::Company,
+        "Sign the User out at a Company {company}: the Account Token is revoked there and forgotten here, and the Session continues signed out. The configured User's alone",
+        company_sign_out_args,
+        company_sign_out_result,
+    ),
+    op(
         "_instance.",
         Task,
         Operator,
@@ -1190,6 +1214,33 @@ fn company_reset_args() -> Value {
     )
 }
 
+fn company_sign_in_args() -> Value {
+    closed(
+        &["company"],
+        json!({
+            "company": named("The company entry"),
+            "scopes": {"type": "array", "items": {"type": "string"}, "description": "The account scopes to ask for; every scope the entry allows when absent"},
+            "new_account": {"type": "boolean", "description": "Sign in to another account than before, in a new Session"},
+        }),
+    )
+}
+
+/// The `company.sign_in` tool's answer — the one shape for both.
+fn company_sign_in_result() -> Value {
+    crate::registry::internal::company_sign_in_output()
+}
+
+fn company_sign_out_args() -> Value {
+    closed(
+        &["company"],
+        json!({"company": named("The company entry the User signs out at")}),
+    )
+}
+
+fn company_sign_out_result() -> Value {
+    crate::registry::internal::company_sign_out_output()
+}
+
 fn company_reset_result() -> Value {
     closed(
         &["company", "reset", "started_over"],
@@ -1757,7 +1808,8 @@ mod tests {
             "_instance.emit" => {
                 json!({"handle": "c1", "stream": "orders", "event": {"subject": "s"}})
             }
-            "company.user_id.reset" => json!({"company": "shop"}),
+            "company.user_id.reset" | "company.sign_out" => json!({"company": "shop"}),
+            "company.sign_in" => json!({"company": "shop", "scopes": ["poppy:read"]}),
             "status" | "config" | "auth.device.pending" | "auth.sessions" | "company.status" => {
                 json!({})
             }

@@ -559,6 +559,12 @@ impl Runtime {
         if let Some(t) = self.tasks.get_mut(&id) {
             t.transition(State::Canceled, Some("cancelled".into()));
         }
+        // A sign-in on this task ends with it: its poll stops and its
+        // `state` is spent, so nobody can finish it at the Company after.
+        #[cfg(feature = "companies")]
+        for s in self.sign_ins_on(&id) {
+            self.end_sign_in(&s, crate::companies::signin::Outcome::Cancelled);
+        }
         self.task_persist(&id);
         self.task_sync(&id);
         self.task_value(&id)
@@ -850,6 +856,8 @@ impl Runtime {
             }
         }
         self.rebuild_human_asks();
+        #[cfg(feature = "companies")]
+        self.interrupt_company_sign_ins();
     }
 }
 

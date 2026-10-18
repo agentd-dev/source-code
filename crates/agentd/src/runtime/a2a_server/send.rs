@@ -330,6 +330,15 @@ impl Runtime {
                 .get(tid)
                 .map(|t| (tid.to_string(), t.conversation.clone()))
         });
+        // A Company sign-in's gate on the addressed task: the User signs in
+        // at the Company, and the one answer it takes here is theirs to
+        // cancel it (RFC 0047 §5.7).
+        #[cfg(feature = "companies")]
+        if let Some((tid, _)) = &existing
+            && let Some(id) = self.sign_in_on(tid)
+        {
+            return self.company_sign_in_answer(&id, tid, principal, text, message);
+        }
         // A LIVE human gate on the addressed task: the reply
         // resolves the suspended asker directly — the tool call returns the
         // text to the model, the `human` step completes with it — instead of

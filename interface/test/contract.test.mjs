@@ -123,6 +123,8 @@ const SEND = {
   [OPS.authSessionsRevoke]: (c, e) => c.authSessionsRevoke(e.sid ? { sid: e.sid } : e.name ? { name: e.name } : { all: true }),
   [OPS.companyStatus]: (c) => c.companyStatus(),
   [OPS.companyUserIdReset]: (c, e) => c.companyUserIdReset(e.company),
+  [OPS.companySignIn]: (c, e) => c.companySignIn(e.company, { scopes: e.scopes, newAccount: e.new_account }),
+  [OPS.companySignOut]: (c, e) => c.companySignOut(e.company),
 };
 
 /**
@@ -167,6 +169,9 @@ const MORE = [
   { op: OPS.authSessionsRevoke, all: true },
   { op: OPS.companyStatus },
   { op: OPS.companyUserIdReset, company: 'shop' },
+  { op: OPS.companySignIn, company: 'shop' },
+  { op: OPS.companySignIn, company: 'shop', scopes: ['poppy:read'], new_account: true },
+  { op: OPS.companySignOut, company: 'shop' },
 ];
 
 /** Replace fetch for one test: record each JSON-RPC body, answer `reply(body)` with the echo `echo`. */

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Acting at Companies for a person (RFC 0047 §5.3): `security.companies` —
 //! the one User this instance acts for, its client identity, the seal key —
-//! and the fields a `services` entry of `kind: company` adds. Both are
-//! parsed whatever the build; without the `companies` feature they are
-//! refused by name.
+//! and the fields a `services` entry of `kind: company` adds, among them the
+//! sign-in types agentd may start with the User and the scopes it may ask
+//! for. Both are parsed whatever the build; without the `companies` feature
+//! they are refused by name.
 //!
 //! A company entry declares a Company by the domain whose discovery document
 //! agentd reads. The Company's MCP APIs become MCP servers here, at load:
@@ -23,6 +24,9 @@ pub const OPERATOR: &str = "operator";
 pub const DEFAULT_KEY_FILE: &str = "/var/lib/agentd/company-client-key";
 /// The path of the default key set under the `client_id`'s origin.
 pub const DEFAULT_JWKS_PATH: &str = "/companies/jwks.json";
+/// The path Direct Sign-In returns the User to under the `client_id`'s
+/// origin, when `client.redirect_uri` names none.
+pub const DEFAULT_REDIRECT_PATH: &str = "/companies/callback";
 /// Concurrent Company calls per Company when `limits.in_flight` says none.
 pub const DEFAULT_IN_FLIGHT: u32 = 4;
 
@@ -35,8 +39,9 @@ pub struct Companies {
     pub user: Option<String>,
     /// The client identity every Company sees.
     pub client: Option<Client>,
-    /// 32 random bytes, as a secret reference: when set, the User ID records
-    /// are sealed with it, so a store that holds them cannot read them.
+    /// 32 random bytes, as a secret reference: the Account Tokens are sealed
+    /// with it, and when it is set the User ID records too, so a store that
+    /// holds them cannot read them.
     pub seal_key: Option<Secret>,
     /// Browser MCP servers to keep off every Company's hosts.
     pub browsers: Vec<String>,
@@ -74,7 +79,11 @@ pub struct Client {
     /// next key before a rotation, the previous one after it.
     #[serde(default)]
     pub published_key_files: Vec<String>,
-    /// Serve the document and the key set on the A2A listener.
+    /// Where Direct Sign-In returns the User (draft §4.5).
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// Serve the document and the key set on the A2A listener — and, when a
+    /// Company lists `direct`, the Direct Sign-In callback.
     #[serde(default)]
     pub serve: bool,
 }
@@ -87,6 +96,18 @@ impl Client {
             Some(u) => u.clone(),
             None => format!(
                 "{}{DEFAULT_JWKS_PATH}",
+                origin(&self.id).unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Where Direct Sign-In returns the User: as configured, or
+    /// `/companies/callback` on the `client_id`'s origin.
+    pub fn redirect_uri(&self) -> String {
+        match &self.redirect_uri {
+            Some(u) => u.clone(),
+            None => format!(
+                "{}{DEFAULT_REDIRECT_PATH}",
                 origin(&self.id).unwrap_or_default()
             ),
         }
@@ -112,6 +133,50 @@ pub enum Privacy {
     #[default]
     Strict,
     Standard,
+}
+
+/// A sign-in type (`services.<name>.sign_in`, draft §4.4).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SignIn {
+    /// Device Sign-In (§4.6): the User opens a link on any device and checks
+    /// a code there.
+    Device,
+    /// Direct Sign-In (§4.5): the User signs in on the Company's page and is
+    /// sent back to the callback agentd serves.
+    Direct,
+    /// Mediated Sign-In (§4.7): read only so it is refused by name.
+    Mediated,
+}
+
+impl SignIn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignIn::Device => "device",
+            SignIn::Direct => "direct",
+            SignIn::Mediated => "mediated",
+        }
+    }
+}
+
+/// The sign-in types `svc` lets agentd start, in its order.
+pub fn sign_in_of(svc: &super::Service) -> Vec<SignIn> {
+    svc.sign_in.clone().unwrap_or_default()
+}
+
+/// Whether any Company may be signed in to directly: the callback is then
+/// served, and listed in the client metadata document's `redirect_uris`.
+pub fn signs_in_directly(s: &Settings) -> bool {
+    s.services
+        .values()
+        .any(|v| v.kind == ServiceKind::Company && sign_in_of(v).contains(&SignIn::Direct))
+}
+
+/// Whether any Company lets agentd sign the User in.
+pub fn signs_in(s: &Settings) -> bool {
+    s.services
+        .values()
+        .any(|v| v.kind == ServiceKind::Company && !sign_in_of(v).is_empty())
 }
 
 /// One interface a Company lists that agentd may use.
@@ -149,29 +214,49 @@ pub fn origin(url: &str) -> Option<&str> {
     (end > 0).then(|| &url[..url.len() - rest.len() + end])
 }
 
-/// The host of `url`, lowercased, without its port.
+/// The host of `url`, lowercased, without its port — none unless the
+/// authority is a plain `host[:port]`: a DNS name or IP address, with no
+/// userinfo and nothing else. A browser ends the authority at `\` as at `/`,
+/// so `https://other.example\@a.example/` is at `other.example` there and at
+/// `a.example` to a reader that does not; a URL whose host two readers could
+/// differ on names none.
 pub fn host_of(url: &str) -> Option<String> {
     let o = origin(url)?;
     let authority = &o[o.find("://")? + 3..];
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if authority.starts_with('[') {
-        authority.split(']').next().map(|h| format!("{h}]"))?
-    } else {
-        authority
-            .rsplit_once(':')
-            .filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            .map_or(authority, |(h, _)| h)
-            .to_string()
+    // The host, the port after it, and whether the host is a plain one: an
+    // IPv6 literal in brackets, else a name or IPv4 address.
+    let (host, port, plain) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let end = rest.find(']')?;
+            let literal = &rest[..end];
+            let plain = !literal.is_empty()
+                && literal
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'));
+            (&authority[..end + 2], &authority[end + 2..], plain)
+        }
+        None => {
+            let end = authority.find(':').unwrap_or(authority.len());
+            let name = &authority[..end];
+            let plain = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+            (name, &authority[end..], plain)
+        }
     };
-    Some(host.to_ascii_lowercase())
+    let port = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    (plain && port).then(|| host.to_ascii_lowercase())
 }
 
-/// Whether `url` is an HTTPS URL with a host — the pattern the draft's kit
-/// writes as `^https://[^\s/?#]+`.
+/// Whether `url` is an HTTPS URL with a plain host ([`host_of`]) — the
+/// pattern the draft's kit writes as `^https://[^\s/?#]+`, held to a host
+/// every reader of the URL agrees on.
 pub fn is_https_url(url: &str) -> bool {
-    url.strip_prefix("https://")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|c| !c.is_whitespace() && !matches!(c, '/' | '?' | '#'))
+    url.starts_with("https://") && host_of(url).is_some()
 }
 
 /// Whether `host` matches the host glob `pattern`: `example.com` itself, or
@@ -363,6 +448,8 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             (svc.interfaces.is_some(), "interfaces"),
             (!svc.mcp_names.is_empty(), "mcp_names"),
             (svc.privacy.is_some(), "privacy"),
+            (svc.sign_in.is_some(), "sign_in"),
+            (svc.scopes.is_some(), "scopes"),
         ] {
             if set {
                 err(format!(
@@ -455,6 +542,31 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     for (name, svc) in &entries {
         validate_entry(name, svc, &mut err);
     }
+    // Signing in keeps an Account Token, which is only ever kept sealed
+    // (§4.8: "MUST store Account Tokens as secrets"), and Direct Sign-In
+    // returns the User to a callback only a served identity has.
+    let signing_in: Vec<&str> = entries
+        .iter()
+        .filter(|(_, v)| !sign_in_of(v).is_empty())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if let Some(first) = signing_in.first()
+        && c.seal_key.is_none()
+    {
+        err(format!(
+            "services.{first}.sign_in needs security.companies.seal_key: the Account Token a sign-in gives agentd is kept only sealed with it"
+        ));
+    }
+    let direct = entries
+        .iter()
+        .find(|(_, v)| sign_in_of(v).contains(&SignIn::Direct));
+    if let (Some((name, _)), Some(cl)) = (direct, &c.client)
+        && !cl.serve
+    {
+        err(format!(
+            "services.{name}.sign_in: direct returns the User to the callback at security.companies.client.redirect_uri, which agentd serves only with client.serve: true"
+        ));
+    }
     // What else names a server must not name a Company's: its tools are
     // reached by their own names, through the supervisor alone.
     let named: Vec<(String, &str)> = [
@@ -524,7 +636,22 @@ fn validate_client(s: &Settings, cl: &Client, err: &mut impl FnMut(String)) {
     } else if host_of(&jwks) != home {
         err(format!(
             "security.companies.client.jwks_uri: {jwks:?} is not on the client_id's host ({}); the draft has every published URL on its domain (§4.1)",
+            home.clone().unwrap_or_default()
+        ));
+    }
+    let redirect = cl.redirect_uri();
+    if !is_https_url(&redirect) {
+        err(format!(
+            "security.companies.client.redirect_uri: {redirect:?} is not an HTTPS URL"
+        ));
+    } else if host_of(&redirect) != home {
+        err(format!(
+            "security.companies.client.redirect_uri: {redirect:?} is not on the client_id's host ({}); the draft has every redirect URI on its domain (§4.1)",
             home.unwrap_or_default()
+        ));
+    } else if redirect.contains(['?', '#']) {
+        err(format!(
+            "security.companies.client.redirect_uri: {redirect:?} has a query or a fragment; the Company appends its own query, and must match it exactly (§4.5)"
         ));
     }
     if cl.serve {
@@ -542,15 +669,24 @@ fn validate_client(s: &Settings, cl: &Client, err: &mut impl FnMut(String)) {
         }
         // Served beside the listener's own routes, so on paths of their own.
         let (a, b) = (path_of(&cl.id), path_of(&jwks));
-        for p in [&a, &b] {
-            if p == "/" || p.starts_with("/.well-known/") || p.starts_with("/oauth2/") {
+        let mut served = vec![&a, &b];
+        let callback = path_of(&redirect);
+        if signs_in_directly(s) {
+            served.push(&callback);
+        }
+        for p in &served {
+            if *p == "/" || p.starts_with("/.well-known/") || p.starts_with("/oauth2/") {
                 err(format!(
-                    "security.companies.client.serve: {p} is a path the A2A listener answers itself; publish the client metadata and key set elsewhere"
+                    "security.companies.client.serve: {p} is a path the A2A listener answers itself; publish the client metadata, key set and callback elsewhere"
                 ));
             }
         }
-        if a == b {
-            err("security.companies.client.serve: the client_id and jwks_uri are one URL".into());
+        for (i, p) in served.iter().enumerate() {
+            if served[..i].contains(p) {
+                err(format!(
+                    "security.companies.client.serve: {p} is the path of two of the client_id, jwks_uri and redirect_uri"
+                ));
+            }
         }
     }
 }
@@ -619,6 +755,40 @@ fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)
                 }
             ));
         }
+    }
+    let kinds = sign_in_of(svc);
+    if kinds.contains(&SignIn::Mediated) {
+        err(format!(
+            "{at}.sign_in: mediated is not supported — the User would hand agentd their password through a gate, and a gate's answer is kept in the task's history and given to the model (RFC 0047 decision 5); use device or direct"
+        ));
+    }
+    for (i, k) in kinds.iter().enumerate() {
+        if kinds[..i].contains(k) {
+            err(format!("{at}.sign_in: {} is listed twice", k.as_str()));
+        }
+    }
+    // RFC 6749 §3.3: a scope token is printable ASCII without a space, a
+    // quote or a backslash.
+    for s in svc.scopes.iter().flatten() {
+        if s.is_empty()
+            || !s
+                .bytes()
+                .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+        {
+            err(format!(
+                "{at}.scopes: {s:?} is not a scope (printable ASCII, no space, quote or backslash)"
+            ));
+        }
+    }
+    if !kinds.is_empty() && svc.scopes.as_ref().is_none_or(Vec::is_empty) {
+        err(format!(
+            "{at}.sign_in needs {at}.scopes: the most account scopes agentd may ask the User for there, and a sign-in asks for none outside them"
+        ));
+    }
+    if svc.scopes.is_some() && kinds.is_empty() {
+        err(format!(
+            "{at}.scopes: the scopes agentd may ask for apply when it may sign the User in — list the sign-in types in {at}.sign_in"
+        ));
     }
     let mut seen: Vec<&str> = Vec::new();
     for (url, server) in &svc.mcp_names {
@@ -863,6 +1033,89 @@ mod tests {
         refused(&remote, "needs security.companies.seal_key");
     }
 
+    /// [`load`], with `__DIR__/seal` holding a seal key.
+    #[cfg(feature = "companies")]
+    fn load_sealed(yaml: &str) -> Result<Settings, String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seal"), "ab".repeat(32)).unwrap();
+        let path = dir.path().join("c.yaml");
+        let yaml = yaml.replace("__DIR__", &dir.path().display().to_string());
+        std::fs::write(&path, yaml).unwrap();
+        super::super::load(&["--config".to_string(), path.display().to_string()], &[])
+            .map(|(l, _)| l.settings)
+            .map_err(|e| e.to_string())
+    }
+
+    /// What load refuses about signing in (RFC 0047 §5.3), each named:
+    /// Mediated Sign-In with its reason, a sign-in with no seal key for the
+    /// Account Token, Direct Sign-In with no callback served, a redirect URI
+    /// off the client_id's host, a scope that is not one, and the fields on
+    /// an entry of another kind. And what it takes: the redirect URI is the
+    /// client_id's `/companies/callback` unless one is named.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn what_load_refuses_about_signing_in_and_why() {
+        let sealed = |extra: &str| {
+            company(extra).replace(
+                "name: Agent}",
+                "name: Agent}\n    seal_key: \"{{secret-file:__DIR__/seal}}\"",
+            )
+        };
+        let refused = |yaml: &str, why: &str| {
+            let e = load_sealed(yaml).expect_err(yaml);
+            assert!(e.contains(why), "want {why:?} in:\n{e}");
+        };
+        refused(
+            &sealed(", sign_in: [device, mediated]"),
+            "services.shop.sign_in: mediated is not supported — the User would hand agentd their password through a gate",
+        );
+        refused(
+            &company(", sign_in: [device], scopes: [\"poppy:read\"]"),
+            "services.shop.sign_in needs security.companies.seal_key",
+        );
+        refused(
+            &sealed(", sign_in: [direct], scopes: [\"poppy:read\"]"),
+            "direct returns the User to the callback at security.companies.client.redirect_uri, which agentd serves only with client.serve: true",
+        );
+        refused(
+            &sealed(", sign_in: [device, device]"),
+            "sign_in: device is listed twice",
+        );
+        refused(
+            &sealed(", sign_in: [device], scopes: [\"poppy:read\", \"a b\"]"),
+            "\"a b\" is not a scope",
+        );
+        refused(
+            &sealed(", scopes: [\"poppy:read\"]"),
+            "scopes: the scopes agentd may ask for apply when it may sign the User in",
+        );
+        refused(
+            &sealed(", sign_in: [device]"),
+            "services.shop.sign_in needs services.shop.scopes",
+        );
+        refused(
+            &sealed(", sign_in: [device], scopes: [\"poppy:read\"]").replace(
+                "name: Agent}",
+                "name: Agent, redirect_uri: \"https://elsewhere.example/cb\"}",
+            ),
+            "client.redirect_uri: \"https://elsewhere.example/cb\" is not on the client_id's host",
+        );
+        refused(
+            &format!(
+                "{CLIENT}{STORE}services:\n  m: {{kind: mcp, endpoint: \"https://m.example/mcp\", sign_in: [device]}}\n"
+            ),
+            "`sign_in` applies to `kind: company` entries only",
+        );
+        let s = load_sealed(&sealed(", sign_in: [device], scopes: [\"poppy:read\"]")).unwrap();
+        let cl = s.security.companies.client.as_ref().unwrap();
+        assert_eq!(
+            cl.redirect_uri(),
+            "https://agent.example/companies/callback"
+        );
+        assert!(signs_in(&s) && !signs_in_directly(&s));
+        assert_eq!(sign_in_of(&s.services["shop"]), [SignIn::Device]);
+    }
+
     #[cfg(not(feature = "companies"))]
     #[test]
     fn a_company_needs_the_feature() {
@@ -889,6 +1142,22 @@ mod tests {
             host_of("https://127.0.0.1:9/").as_deref(),
             Some("127.0.0.1")
         );
+        assert_eq!(host_of("https://[::1]:8443/x").as_deref(), Some("[::1]"));
+        // Only a plain host[:port]: none a browser could read otherwise.
+        for url in [
+            "https://other.example\\@a.example/x",
+            "https://other.example\\a.example",
+            "https://user@a.example/x",
+            "https://a.example%2f@b.example/",
+            "https://a.example:/x",
+            "https://a.example:44x/",
+            "https://[]/",
+            "https://[::1/",
+            "https://a example/",
+        ] {
+            assert_eq!(host_of(url), None, "{url}");
+            assert!(!is_https_url(url), "{url}");
+        }
         assert_eq!(origin("https://a.example/x/y?z"), Some("https://a.example"));
         assert!(is_https_url("https://a"));
         assert!(!is_https_url("https:///a"));

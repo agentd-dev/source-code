@@ -147,6 +147,13 @@
 //! operation find other terms under the same revision, which Ops §3.1
 //! forbids; `{"extra_term": key}` adds `key` to every proposal's terms from
 //! then on, and `{"no_terms": true}` leaves them out;
+//! `"openapi": {"rename": {old: new}, "drop": [id], "summary": {id: text},
+//! "add": {path: item}, "max_age": n}` changes its OpenAPI description from
+//! then on — an operation's `operationId` renamed, an operation left out, an
+//! operation's summary replaced, all by the `operationId` the fake gives it,
+//! a path item added as given (an operation the fake answers as it answers
+//! the operation whose template the path fills), and `Cache-Control:
+//! max-age=n` sent with it;
 //! and a `stall` whose `method` is `token:<grant_type>` holds the answers to
 //! the next `n` token requests of that grant `t` ms after they took effect
 //! (a rotation already made, say, while its answer is on the way),
@@ -179,6 +186,8 @@
 //! when it arrived (`at_ms`, from the fake's start), and whether an Account
 //! Token the fake issued was anywhere in it but the one form member that
 //! may carry it to the token or revocation endpoint (`account_token_leaked`);
+//! for an API request, the request as it came (`sent`: its target, its
+//! headers in order, its body, its proof's claims but `jti` and `iat`);
 //! and `validated`, the vendored schemas what the request carried held to —
 //! and the same objects are read back at `GET /_mock/record`: the server
 //! side's own account of what reached it, which a test counts instead of
@@ -882,6 +891,19 @@ struct State {
     operations: BTreeMap<String, Op>,
     /// What the next proposals and confirms meet (`"operations"`).
     ops: OpControl,
+    /// What its OpenAPI description says from now on (`"openapi"`).
+    openapi: OpenapiControl,
+}
+
+/// What the OpenAPI description says (`"openapi"` in the control), each
+/// operation named by the `operationId` the fake gives it.
+#[derive(Default)]
+struct OpenapiControl {
+    rename: BTreeMap<String, String>,
+    drop: BTreeSet<String>,
+    summary: BTreeMap<String, String>,
+    add: BTreeMap<String, Value>,
+    max_age: Option<u64>,
 }
 
 /// What the next proposals and confirms meet (`"operations"` in the
@@ -1011,6 +1033,7 @@ impl Company {
                 writes: BTreeMap::new(),
                 operations: BTreeMap::new(),
                 ops: OpControl::default(),
+                openapi: OpenapiControl::default(),
             }),
             extra_mcp: AtomicBool::new(false),
             started: Instant::now(),
@@ -1326,9 +1349,7 @@ impl Company {
 
     fn openapi(&self) -> Reply {
         let json_of = |schema: Value| json!({"application/json": {"schema": schema}});
-        Reply::json(
-            200,
-            &json!({
+        let mut doc = json!({
                 "openapi": "3.1.0",
                 "info": {"title": "Fake Company", "version": "1"},
                 "servers": [{"url": format!("{}/api", self.origin())}],
@@ -1346,6 +1367,7 @@ impl Company {
                         "get": {
                             "operationId": "getOrder",
                             "summary": "One of the User's orders; needs a signed-in Session with poppy:read",
+                            "parameters": [{"name": "expand", "in": "query", "schema": {"type": "array", "items": {"enum": ["items", "shipping"]}}}],
                             "responses": {"200": {"description": "The order", "content": json_of(json!({"$ref": "#/components/schemas/Order"}))}}
                         }
                     },
@@ -1380,8 +1402,44 @@ impl Company {
                     "securitySchemes": {"dpop": {"type": "http", "scheme": wire::TOKEN_TYPE_DPOP}}
                 },
                 "security": [{"dpop": []}]
-            }),
-        )
+        });
+        // What the control changed, by each operation's own id.
+        let st = lock(&self.state);
+        let c = &st.openapi;
+        for (path, item) in &c.add {
+            doc["paths"][path] = item.clone();
+        }
+        for item in doc["paths"]
+            .as_object_mut()
+            .into_iter()
+            .flat_map(|p| p.values_mut())
+        {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            item.retain(|_, op| {
+                !op["operationId"]
+                    .as_str()
+                    .is_some_and(|id| c.drop.contains(id))
+            });
+            for op in item
+                .values_mut()
+                .filter(|op| op.get("operationId").is_some())
+            {
+                let id = op["operationId"].as_str().unwrap_or_default().to_string();
+                if let Some(text) = c.summary.get(&id) {
+                    op["summary"] = json!(text);
+                }
+                if let Some(new) = c.rename.get(&id) {
+                    op["operationId"] = json!(new);
+                }
+            }
+        }
+        let reply = Reply::json(200, &doc);
+        match c.max_age {
+            Some(n) => reply.with("Cache-Control", &format!("max-age={n}")),
+            None => reply,
+        }
     }
 
     // --- Agent identity (§4.1) -----------------------------------------
@@ -2643,7 +2701,38 @@ impl Company {
             ("POST", "/notes", _) => Reply::json(201, &json!({"note_id": opaque("note_")})),
             _ => Reply::new(404),
         };
-        reply.note("idempotency_key", json!(key)).note("body", body)
+        reply
+            .note("idempotency_key", json!(key))
+            .note("body", body)
+            .note("sent", Company::as_sent(req))
+    }
+
+    /// `req` as it came: its method, its target, every header in the order
+    /// it came and its body — the DPoP proof as its header and claims, its
+    /// `jti` and `iat` aside, which each request has of its own — so a test
+    /// can hold two requests to each other byte for byte.
+    fn as_sent(req: &Request) -> Value {
+        let target = if req.query.is_empty() {
+            req.path.clone()
+        } else {
+            format!("{}?{}", req.path, req.query)
+        };
+        let headers: Vec<Value> = req
+            .headers
+            .iter()
+            .map(|(k, v)| match decode_jws(v).ok().filter(|_| k == "dpop") {
+                Some(mut proof) => {
+                    if let Some(c) = proof.claims.as_object_mut() {
+                        c.remove("jti");
+                        c.remove("iat");
+                    }
+                    json!([k, {"header": proof.header, "claims": proof.claims}])
+                }
+                None => json!([k, v]),
+            })
+            .collect();
+        json!({"method": req.method, "target": target, "headers": headers,
+               "body": String::from_utf8_lossy(&req.body)})
     }
 
     // --- Operations (Operations §3–§7) ---------------------------------
@@ -3877,6 +3966,31 @@ impl Company {
         }
         if let Some(b) = o["no_terms"].as_bool() {
             st.ops.no_terms = b;
+        }
+        let a = &body["openapi"];
+        for (from, to) in a["rename"].as_object().into_iter().flatten() {
+            if let Some(to) = to.as_str() {
+                st.openapi.rename.insert(from.clone(), to.to_string());
+            }
+        }
+        for id in a["drop"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            st.openapi.drop.insert(id.to_string());
+        }
+        for (id, text) in a["summary"].as_object().into_iter().flatten() {
+            if let Some(text) = text.as_str() {
+                st.openapi.summary.insert(id.clone(), text.to_string());
+            }
+        }
+        for (path, item) in a["add"].as_object().into_iter().flatten() {
+            st.openapi.add.insert(path.clone(), item.clone());
+        }
+        if let Some(n) = a["max_age"].as_u64() {
+            st.openapi.max_age = Some(n);
         }
         Reply::json(200, &json!({"ok": true}))
     }

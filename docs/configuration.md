@@ -616,7 +616,8 @@ All `services` paths are live · op.
 | `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` a Company sees none of agentd's correlators. Its calls carry their idempotency key keyed under the (User, Company) pair's secret and a trace of their own per unit of work and Company — no other `agent/*` `_meta` key, no `tracestate` — and the handshake and tool list carry no trace context and no `clientInfo.title`. `standard` sends agentd's usual correlators, the instance label and the process trace included, and is logged at boot (`company.privacy.standard`). |
 | `services.<name>.sign_in` | list of `device \| direct` | `[]` | `kind: company` only: the sign-in types agentd may start with the User, the first the Company offers taken. `direct` needs `security.companies.client.serve`. `mediated` is refused: the User's password would pass through a gate, whose answer agentd keeps in the task's history and hands to the model. Needs `security.companies.seal_key` and `scopes`. |
 | `services.<name>.scopes` | list of scopes | `[]` | `kind: company` only: the most account scopes agentd asks the User for there. A sign-in asks for what is needed within these and what its type grants; a held Account Token is used for no more, and one that grants none of these — or any, once the entry lists no `sign_in` — is not used: requests there are signed out, and the token is kept until the User signs out. |
-| `services.<name>.api_allow` | list of `METHOD /path-template` | none | `kind: company` only: the OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Needs `openapi` in `interfaces`. |
+| `services.<name>.api_allow` | list of `METHOD /path-template` | none | `kind: company` only: the OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, named from its entry ([operation tools](#a-companys-operation-tools)). An operation listed twice, or two entries that make one tool name, are refused. Needs `openapi` in `interfaces`. |
+| `services.<name>.api_names` | map of an OpenAPI API `url` to a server name | — | `kind: company` only: names the server a Company's operation tools are named under, by the URL its OpenAPI API is listed at. Without it the server is named after the entry, which needs the Company to list one OpenAPI API and the entry's name to be free — an entry that also uses `mcp` names one of its servers apart with it or `mcp_names`. Needs `openapi` in `interfaces` and an operation in `api_allow`. |
 | `services.<name>.context` | `{locale, time_zone, share_availability}` | inherits | `kind: company` only: what this Company's conversations share of the User's situation, each field over `security.companies.context`. Needs `agent` in `interfaces`. |
 
 With `security.egress: closed`, every MCP dial, intelligence endpoint
@@ -770,7 +771,8 @@ Session at the first call.
   a status outside `expect` (default 2xx) is an error. A Company's
   `WWW-Authenticate` errors are handled as for its MCP servers.
   **`company.api.describe {company, api?, operation?}`** lists the operations,
-  or gives one's parameters and schemas.
+  or gives one's parameters and schemas; each operation `api_allow` lists
+  names its operation tool.
 - **The `http` step** with `auth: {kind: company, company: <name>}` is a
   `company.api` call made by the workflow: its `url` is the operation's (or
   its path under the API's server URL), with the step's `method`, `query`,
@@ -799,6 +801,84 @@ workflows:
       order: {kind: http, depends_on: [s], url: "https://api.example.com/orders/1042",
               auth: {kind: company, company: shop}}
       f: {kind: finish, depends_on: [ask, order], status: completed}
+```
+
+#### A Company's operation tools
+
+Each operation `api_allow` lists that the Company's description declares is
+a tool of its own (RFC 0047 §9, P5a), offered once the description is read —
+at boot, and for a Company down at boot once it comes up — as a Company's MCP
+tools are offered once its server joins.
+
+- **Its name** is the operator's: its `api_allow` entry in lower case, each
+  run of characters other than `a-z` and `0-9` one `_`, none at either end, at
+  most 64 characters — `GET /orders/{order_id}` is `get_orders_order_id` —
+  under the server named after the entry, or the one `api_names` gives the
+  API: `shop.get_orders_order_id`. The `operationId`, summary and
+  description go into the tool's description, never its name. So the names
+  are known at load, and load refuses a tag key, a `security.policies` rule's
+  `match.tool` or a workflow's `tool` step that names an operation tool the
+  entry does not make, two `api_allow` entries that make one name, and a
+  server name another server has.
+- **Its input schema** is the operation's: its path and query parameters as
+  properties, each with its schema and required as declared — nested under
+  `path` and `query` when one's name is another's, `json` or `expect` — `json`
+  for a JSON body, required as declared, and `expect`; nothing else is taken.
+  Header and cookie parameters are not taken, and an operation that requires
+  one other than `Idempotency-Key` has no tool. Neither has one whose schemas
+  do not resolve within the bounds above, or whose input schema is over
+  16 KiB serialized.
+- **Its description** starts with the note a Company's MCP tools carry — whose
+  words follow — then the operation as `api_allow` lists it, then the
+  Company's `operationId`, summary and description, each quoted, its control
+  characters removed and at most 2000 characters.
+- **A call** is the `company.api` call of the operation: its path parameters
+  filled into the operation's template, its query and `json` as given, and
+  everything after that `company.api`'s — the checks, the DPoP-signed
+  request, the `Idempotency-Key`, `outcome unknown`, `Retry-After`, the
+  privacy profile, the cross-Company gate, an operation the Company proposes.
+  A path the description matches to another operation — a path parameter's
+  value that is a fixed segment of that one's path — is refused unsent.
+- **What holds `company.api` holds it.** A `security.policies` rule judges
+  its call as its own and as `company.api`'s, under that name with
+  `company.api`'s arguments (`{company, api, method, path, query, json,
+  expect}`) as the call fills them and the tool's own tags; the first rule
+  that matches either decides. `tools.disabled` naming `company.api`
+  disables every operation tool, `tools.narrow` on `company.api` adds its
+  tags and note to each, and `agent.tools` offers one to the conversation
+  only where `agent.tools.internal` offers `company.api` and
+  `agent.tools.mcp` offers the tool.
+- **Its tags**, when a key of the entry's `tags` other than `*` names it (its
+  name, or a glob of it), are those of each key that matches its name, `*`
+  included; otherwise every tag the entry lists — with no `tags`,
+  `untrusted_input` and `egress` — as `company.api` carries them. The Rule
+  of Two at load counts all of the entry's tags, as for its servers.
+- A fetch of the description that finds it changed lists the tools again:
+  those that changed replace the old ones in the registry
+  (`company.api.changed`), and a turn planned after sees them. An allowed
+  operation with no tool is logged once (`company.api.not_offered`), and why
+  none can be made at all (`company.api.unavailable`).
+
+They reach turn workers and subagents as a Company's MCP tools do: routed to
+the supervisor, a subagent granted the server handed their definitions.
+
+```yaml
+# fragment: a Company's MCP server, and the tools of its API's operations
+services:
+  shop:
+    kind: company
+    endpoint: https://example.com
+    interfaces: [mcp, openapi]
+    api_allow: ["GET /orders/{order_id}", "POST /orders/{order_id}/exchanges"]
+    api_names: {"https://api.example.com/openapi.json": orders}
+    tags: {"*": [untrusted_input, egress]}
+workflows:
+  - name: order
+    steps:
+      s: {kind: once}
+      read: {kind: tool, name: orders.get_orders_order_id, depends_on: [s],
+             args: {order_id: "1042"}}
+      f: {kind: finish, depends_on: [read], status: completed}
 ```
 
 #### A Company's operations
@@ -922,8 +1002,8 @@ services:
 
 | Path | Type | Default | Class | What it does |
 |---|---|---|---|---|
-| `tools.disabled` | list of tool names | `[]` | live · doc | Tools never registered. |
-| `tools.narrow.<tool>.tags` | list of tags | — | live · doc | Trifecta tags to add to a tool; never removes one. |
+| `tools.disabled` | list of tool names | `[]` | live · doc | Tools never registered. `company.api` here disables a Company's operation tools too. |
+| `tools.narrow.<tool>.tags` | list of tags | — | live · doc | Trifecta tags to add to a tool; never removes one. Narrowing `company.api` narrows a Company's operation tools too. |
 | `tools.narrow.<tool>.describe` | string | — | live · doc | A note appended beneath the tool's description. |
 | `tools.overrides.<tool>.server` | string | — | live · op | Retarget a tool at a declared MCP server. |
 | `tools.overrides.<tool>.tool` | string | — | live · op | The server's tool name. |
@@ -1354,7 +1434,7 @@ Every `security` path is restart · op.
 | `security.tls_ca` | path | the bundled roots only | Extra PEM CA certificates trusted for every outbound `https://` dial, added to the bundled roots. Needs `tls`. |
 | `security.workflows.immutable` | bool | `false` | Refuse `workflow.create`, `update` and `delete` at runtime. |
 | `security.policies[]` | list | `[]` | Ordered verdicts on a tool call; the first match wins, no match is allow. |
-| `security.policies[].match.tool` | glob | every tool | Tool name. |
+| `security.policies[].match.tool` | glob | every tool | Tool name. A Company's operation tool's call also matches as `company.api`'s ([operation tools](#a-companys-operation-tools)). |
 | `security.policies[].match.tags` | list of tags | — | Every listed tag must be on the tool. |
 | `security.policies[].match.caller` | list of `root \| workflow \| subagent` | — | Who is calling. |
 | `security.policies[].match.principal` | glob | — | The principal id, for calls that carry one. |

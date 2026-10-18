@@ -653,6 +653,60 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   again when the terms change, an operation in progress read after its
   `Retry-After`, a confirm retried with the same operation, the User asked
   before a Direct Conversation, and a decline said in the conversation.
+- A Company's OpenAPI operations as tools of their own (RFC 0047, P5a).
+  Each operation `api_allow` lists that the Company's description declares
+  is a tool, offered once the description is read — at boot, and for a
+  Company down at boot once it comes up, with no restart (`company.api.joined`)
+  — under a server named after the entry, or the one the new
+  `services.<name>.api_names` (`{url: name}`, restart-only and operator-only
+  as `mcp_names` is) gives each OpenAPI API. Its name is the operator's,
+  made from the `api_allow` entry: the method and path in lower case, each
+  run of other characters one `_`, none at either end, at most 64 characters
+  (`GET /orders/{order_id}` is `shop.get_orders_order_id`); the
+  `operationId`, summary and description go into its description, after the
+  note of whose words follow, each quoted, control characters removed and
+  capped at 2000 characters. Its input schema is the operation's path and
+  query parameters, required as declared — nested under `path` and `query`
+  when a name is another's, `json` or `expect` — `json` for a JSON body and
+  `expect`, closed to anything else; an operation that requires a header or
+  cookie other than `Idempotency-Key`, whose schemas do not resolve within
+  their bounds, or whose input schema is over 16 KiB has no tool, and an
+  allowed operation the description does not declare has none, each said
+  once (`company.api.not_offered`). A call is `company.api`'s call of the
+  operation, made from the tool's arguments and sent by the same code under
+  every rule `company.api` keeps; a path parameter's value that would make
+  the path another operation's is refused unsent. What holds `company.api`
+  holds the operation tools: a `security.policies` rule judges their calls
+  as `company.api`'s too, with `company.api`'s arguments, the first rule
+  matching either deciding, and `tools.disabled`, `tools.narrow` and
+  `agent.tools` for `company.api` apply to them. A fetch that finds the
+  description changed lists the tools again, and those that changed replace
+  the old ones in the registry (`company.api.changed`). A key of the entry's
+  `tags` other than `*` that names operation tools sets their tags, with
+  `*`'s; one no such key names carries every tag the entry lists, as
+  `company.api` does. The tools reach turn workers and subagents as a
+  Company's MCP tools do. `company.api.describe`
+  names each allowed operation's tool, and `company.status` lists the server
+  among the Company's `servers`, `joined` once its tools are offered. Load
+  refuses an entry whose servers would share a name (one that uses `mcp` and
+  `openapi` names one apart with `api_names` or `mcp_names`), an `api_names`
+  without `openapi` or an operation in `api_allow`, or naming a server that
+  is not one, an operation `api_allow` lists twice, two entries that make one
+  tool name, and a tag key, a policy's `match.tool`, a workflow's `tool`
+  step or a standing permission's `via.tool` that names an operation tool
+  the entry does not make. Events `company.api.{joined, changed,
+  not_offered, unavailable}`. `agentd-core`:
+  `Supervisor::{operation_tools, call_operation}`,
+  `api::{Offered, Shape, as_company_api, operation_input, MAX_INPUT_SCHEMA}`,
+  `sec::policy::Call::also`, `Registry::contract_of`,
+  `Notice::DescriptionChanged`, `config::settings::companies::{operation_name,
+  operations_of, operation_tags, api_server_names, is_api_server,
+  api_tool_names, unknown_operation_tool, MAX_OPERATION_NAME}`,
+  `CompanyServer::interface`, `discover::Entry::apis`,
+  `registry::internal::company_api_output`. The fake Company's control gains
+  `openapi` (`rename`, `drop`, `summary`, `add`, `max_age`), its `getOrder` an
+  `expand` query parameter, and its record each API request as it came
+  (`sent`).
 - Docs: [Act at companies for a person](docs/act-at-companies.md), the guide
   to the `companies` preview, with a Personal Agent Protocol section in
   docs/interoperability.md; and on agentd.dev's landing page a strip of the

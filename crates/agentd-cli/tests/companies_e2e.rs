@@ -308,6 +308,9 @@ fn play() -> Value {
             {"when_contains": "invalid arguments for company.operation", "echo_tool_result": true},
             {"when_contains": "FORGE-CONFIRM", "tool_calls": [{"name": "company.operation.confirm", "arguments": {"company": "shop", "operation_id": "exc_forged", "revision": 1, "approved_by": "user"}}]},
             {"when_contains": "signed_in", "echo_tool_result": true},
+            {"when_contains": "OP-SUBTASK", "tool_calls": [{"name": "shop.get_session", "arguments": {}}]},
+            {"when_contains": "OP-DELEGATE", "tool_calls": [{"name": "subagent.run", "arguments": {"instruction": "OP-SUBTASK: the Session", "servers": ["shop"], "mode": "sync"}}]},
+            {"when_contains": "OP-SESSION", "tool_calls": [{"name": "shop.get_session", "arguments": {}}]},
             {"when_contains": "is not shown to the User", "echo_tool_result": true},
             {"when_contains": "shipped", "echo_tool_result": true},
             {"when_contains": "SIGN-IN-SHOP", "tool_calls": [{"name": "company.sign_in", "arguments": {"company": "shop"}}]},
@@ -510,6 +513,218 @@ fn a_company_down_at_boot_joins_when_it_comes_up() {
         "{l}"
     );
     assert_eq!(events(&l, "company.verified").len(), 1, "{l}");
+}
+
+/// The operation tools of a Company down at boot are offered once it comes
+/// up, with no restart (RFC 0047 §9, P5a): `company.api.joined` names them,
+/// and an allowed operation its description does not declare is said once.
+/// Each carries the tags of the keys of its entry that name it — a policy
+/// refusing `egress` refuses `shop.post_notes` and not `shop.get_session` —
+/// and an argument outside an operation tool's schema is refused, nothing
+/// sent.
+#[test]
+fn operation_tools_join_when_the_company_comes_up_and_carry_their_own_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = common::free_port();
+    let h = host();
+    let looped = |name: &str, step: &str| {
+        format!(
+            "  - name: {name}\n    steps:\n      s: {{kind: loop, interval: 300ms, max_iterations: 400}}\n      {name}: {{{step}, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [{name}], status: completed}}\n"
+        )
+    };
+    let flows = format!(
+        "workflows:\n{}{}{}",
+        looped("a", "kind: tool, name: shop.get_session, args: {}"),
+        looped(
+            "b",
+            "kind: tool, name: shop.post_notes, args: {json: {text: note}}"
+        ),
+        looped("c", "kind: tool, name: shop.get_session, args: {page: 2}"),
+    );
+    let s = setup_with(
+        &h,
+        "  policies:\n    - {match: {tags: [egress]}, action: deny}\n",
+        "",
+        &shop_entry(
+            &format!("https://127.0.0.1:{port}"),
+            ", interfaces: [openapi], api_allow: [\"GET /session\", \"POST /notes\", \"DELETE /orders/{order_id}\"], tags: {\"*\": [untrusted_input], \"shop.get_*\": [untrusted_input], \"shop.post_notes\": [egress]}",
+        ),
+        &flows,
+    );
+    let d = start(&s, "operations", &[]);
+    // The first listing has failed, its own retries spent: the tools come
+    // from a listing tried again later.
+    let l = wait_for(&d.log, "the Company unavailable", |l| {
+        events(l, "auth.unavailable")
+            .iter()
+            .any(|e| e["target"] == "company:shop")
+            && events(l, "company.api.unavailable")
+                .iter()
+                .any(|e| e["server"] == "shop")
+    });
+    assert!(events(&l, "company.api.joined").is_empty(), "{l}");
+    let f = fake(dir.path(), &[], Some(&format!("127.0.0.1:{port}")));
+    let done = |l: &str, step: &str, ok: bool| {
+        events(l, "step.done")
+            .into_iter()
+            .any(|e| e["step"] == step && e["err"].is_null() == ok)
+    };
+    let l = wait_for(&d.log, "each step after the join", |l| {
+        !events(l, "company.api.joined").is_empty()
+            && done(l, "a", true)
+            && events(l, "tool.policy.refused")
+                .iter()
+                .any(|e| e["tool"] == "shop.post_notes")
+            && events(l, "step.done").iter().any(|e| {
+                e["step"] == "c"
+                    && e["err"]
+                        .as_str()
+                        .is_some_and(|x| x.contains("invalid arguments for shop.get_session"))
+            })
+    });
+    let joined = &events(&l, "company.api.joined")[0];
+    assert_eq!(joined["server"], "shop", "{joined}");
+    assert_eq!(joined["tools"], json!(["get_session", "post_notes"]));
+    let unoffered = events(&l, "company.api.not_offered");
+    assert_eq!(unoffered.len(), 1, "said once: {unoffered:#?}");
+    assert_eq!(unoffered[0]["operation"], "DELETE /orders/{order_id}");
+    assert!(
+        events(&l, "tool.policy.refused")
+            .iter()
+            .all(|e| e["tool"] != "shop.get_session"),
+        "only the tool its key names carries egress: {l}"
+    );
+    let record = f.record();
+    let sessions: Vec<&Value> = record
+        .iter()
+        .filter(|r| r["path"] == "/api/session")
+        .collect();
+    assert!(!sessions.is_empty(), "{record:#?}");
+    for r in &sessions {
+        assert_eq!(
+            r["sent"]["target"], "/api/session",
+            "no argument of c's: {r}"
+        );
+    }
+    assert!(
+        record.iter().all(|r| r["path"] != "/api/notes"),
+        "refused unsent"
+    );
+}
+
+/// An operation tool's call is `company.api`'s call of its operation, and a
+/// policy rule on `company.api` holds it as it holds that tool's — by the
+/// name, and with CEL by `company.api`'s own arguments — while an exception
+/// for an operation tool before that rule still applies to it.
+#[test]
+fn a_policy_on_company_api_holds_the_operation_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    let looped = |name: &str, step: &str| {
+        format!(
+            "  - name: {name}\n    steps:\n      s: {{kind: loop, interval: 300ms, max_iterations: 400}}\n      {name}: {{{step}, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [{name}], status: completed}}\n"
+        )
+    };
+    let flows = format!(
+        "workflows:\n{}{}",
+        looped("a", "kind: tool, name: shop.get_session, args: {}"),
+        looped(
+            "b",
+            "kind: tool, name: shop.post_notes, args: {json: {text: note}}"
+        ),
+    );
+    let on_api = if cfg!(feature = "cel") {
+        "{match: {tool: company.api, args: \"args.method == 'POST' && args.path == '/notes' && args.json.text == 'note'\"}, action: deny}"
+    } else {
+        "{match: {tool: company.api}, action: deny}"
+    };
+    let s = setup_with(
+        &h,
+        &format!(
+            "  policies:\n    - {{match: {{tool: shop.get_*}}, action: allow}}\n    - {on_api}\n"
+        ),
+        "",
+        &shop_entry(
+            &f.origin,
+            ", interfaces: [openapi], api_allow: [\"GET /session\", \"POST /notes\"]",
+        ),
+        &flows,
+    );
+    let d = start(&s, "policy", &[]);
+    let l = wait_for(&d.log, "a read sent and a write refused", |l| {
+        events(l, "step.done")
+            .iter()
+            .any(|e| e["step"] == "a" && e["err"].is_null())
+            && events(l, "tool.policy.refused")
+                .iter()
+                .any(|e| e["tool"] == "shop.post_notes")
+    });
+    for e in events(&l, "tool.policy.refused") {
+        assert_eq!(
+            (e["tool"].as_str(), e["rule"].as_u64()),
+            (Some("shop.post_notes"), Some(1)),
+            "{e}"
+        );
+    }
+    let record = f.record();
+    assert!(
+        record.iter().any(|r| r["path"] == "/api/session"),
+        "{record:#?}"
+    );
+    assert!(
+        record.iter().all(|r| r["path"] != "/api/notes"),
+        "refused unsent"
+    );
+}
+
+/// A reload that builds the tool registry again keeps the operation tools
+/// the Company's description gave — they are not read again — so a step
+/// calling one goes on reaching the Company.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_reload_keeps_the_operation_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    const FLOW: &str = "workflows:\n  - name: a\n    steps:\n      s: {kind: loop, interval: 300ms, max_iterations: 400}\n      a: {kind: tool, name: shop.get_session, args: {}, depends_on: [s]}\n      f: {kind: finish, depends_on: [a], status: completed}\n";
+    let s = setup_with(
+        &h,
+        "",
+        "",
+        &shop_entry(
+            &f.origin,
+            ", interfaces: [openapi], api_allow: [\"GET /session\"]",
+        ),
+        FLOW,
+    );
+    let d = start(&s, "reload", &[]);
+    let reached = |l: &str| {
+        events(l, "step.done")
+            .iter()
+            .any(|e| e["step"] == "a" && e["err"].is_null())
+    };
+    wait_for(&d.log, "a call of the operation tool", reached);
+    // A tools change rebuilds the registry.
+    let cfg = std::fs::read_to_string(&s.cfg).unwrap();
+    std::fs::write(&s.cfg, format!("{cfg}tools:\n  disabled: [think]\n")).unwrap();
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    let l = wait_for(&d.log, "the reload, and a call after it", |l| {
+        l.find("\"event\":\"config.reloaded\"")
+            .is_some_and(|at| reached(&l[at..]))
+    });
+    let after = &l[l.find("\"event\":\"config.reloaded\"").unwrap()..];
+    assert!(
+        events(after, "step.done")
+            .iter()
+            .all(|e| e["step"] != "a" || e["err"].is_null()),
+        "no call of it failed after the reload: {after}"
+    );
+    assert_eq!(
+        events(&l, "company.api.joined").len(),
+        1,
+        "the tools were read once: {l}"
+    );
 }
 
 /// A Company whose documents verify while its token endpoint refuses has
@@ -1160,6 +1375,157 @@ mod over_a2a {
         }
     }
 
+    /// A Company's operation tools reach a turn worker and a subagent as its
+    /// MCP server's tools do (RFC 0047 §9, P5a): the turn routes them to the
+    /// supervisor, the subagent granted the server is handed their
+    /// definitions and no route, and each call comes up and is sent by the
+    /// supervisor. A fetch that finds the description changed — an
+    /// `operationId` renamed, an operation gone — lists them again: their
+    /// names stay, the one gone is no longer offered, and both are logged.
+    #[test]
+    fn operation_tools_reach_children_through_the_supervisor_and_follow_the_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = setup_with(
+            &h,
+            "",
+            "",
+            &shop_entry(
+                &f.origin,
+                ", interfaces: [openapi], api_allow: [\"GET /session\", \"POST /notes\", \"DELETE /orders/{order_id}\"]",
+            ),
+            "",
+        );
+        let frames = s.dir.join("frames.jsonl");
+        let (d, addr) = start_listening(
+            &s,
+            "operations",
+            &[
+                ("AGENTD_TEST_COMPANY_MAX_AGE_MS", "500"),
+                ("AGENTD_TEST_FRAMES_FILE", &frames.display().to_string()),
+            ],
+        );
+        wait_for(&d.log, "the operation tools", |l| {
+            !events(l, "company.api.joined").is_empty()
+        });
+        let sessions = || {
+            f.record()
+                .iter()
+                .filter(|r| r["path"] == "/api/session")
+                .count()
+        };
+        let v = ask(&addr, "OP-DELEGATE please");
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(sessions(), 1, "{}", d.read());
+        let frames: Vec<Value> = std::fs::read_to_string(&frames)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let mut child = None;
+        for sp in frames.iter().filter(|f| f["dir"] == "spawn") {
+            let p = &sp["frame"]["payload"];
+            let payload = if p["payload"].is_object() {
+                &p["payload"]
+            } else {
+                p
+            };
+            for spec in payload["mcp_servers"].as_array().into_iter().flatten() {
+                assert_ne!(
+                    spec["name"], "shop",
+                    "a Company server spec crossed: {spec}"
+                );
+            }
+            for routes in [&payload["mcp_routes"], &payload["turn"]["mcp_routes"]] {
+                for (name, _) in routes.as_object().into_iter().flatten() {
+                    assert!(
+                        !name.starts_with("shop."),
+                        "a Company route crossed: {name}"
+                    );
+                }
+            }
+            if payload["gated_tools"]
+                .as_array()
+                .is_some_and(|g| g.iter().any(|t| t == "shop.get_session"))
+            {
+                assert!(
+                    payload["supervisor_tools"]
+                        .as_array()
+                        .is_some_and(|t| t.iter().any(|d| d["name"] == "shop.get_session")),
+                    "the subagent is handed the definition: {payload}"
+                );
+                child = sp["node"].as_u64();
+            }
+        }
+        let node = child.expect("a subagent granted the operation tools");
+        assert!(
+            frames.iter().any(|f| f["node"] == node
+                && f["dir"] == "up"
+                && f["frame"]["name"] == "shop.get_session"),
+            "the subagent's call came up to the supervisor"
+        );
+        // The Company renames an operation and drops another; the next call
+        // reads the description again, which lists the tools again.
+        f.control(
+            json!({"openapi": {"rename": {"getSession": "readSession"}, "drop": ["addNote"]}}),
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        let v = ask(&addr, "OP-SESSION please");
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(sessions(), 2, "the call kept its name: {}", d.read());
+        let l = wait_for(&d.log, "the tools listed again", |l| {
+            !events(l, "company.api.changed").is_empty()
+        });
+        let changed = &events(&l, "company.api.changed")[0];
+        assert_eq!(changed["server"], "shop", "{changed}");
+        assert_eq!(changed["added"], json!([]), "{changed}");
+        assert_eq!(changed["removed"], json!(["post_notes"]), "{changed}");
+        assert_eq!(changed["changed"], json!(["get_session"]), "{changed}");
+        // Each allowed operation with no tool is said once, however often
+        // the tools are listed.
+        let unoffered = |op: &str| {
+            events(&l, "company.api.not_offered")
+                .iter()
+                .filter(|e| e["operation"] == op)
+                .count()
+        };
+        assert_eq!(unoffered("POST /notes"), 1, "{l}");
+        assert_eq!(unoffered("DELETE /orders/{order_id}"), 1, "{l}");
+        // A turn planned after offers the tool under the name it had, routed
+        // to the supervisor, with the Company's new words.
+        let v = ask(&addr, "OP-SESSION again");
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(sessions(), 3, "{}", d.read());
+        let last = std::fs::read_to_string(s.dir.join("frames.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .rfind(|f| f["dir"] == "spawn" && f["frame"]["payload"]["turn"]["internal"].is_array())
+            .unwrap();
+        let turn = &last["frame"]["payload"]["turn"];
+        assert!(
+            turn["internal"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "shop.get_session"),
+            "{turn}"
+        );
+        let tools = turn["tools"].as_array().unwrap();
+        let offered = tools
+            .iter()
+            .find(|t| t["name"] == "shop.get_session")
+            .unwrap();
+        assert!(
+            offered["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("operationId \"readSession\"")),
+            "{offered}"
+        );
+        assert!(tools.iter().all(|t| t["name"] != "shop.post_notes"));
+    }
+
     /// What the supervisor does with each answer a Company's MCP server
     /// gives, seen by the model: `403 sign_in_required` with no Account Token
     /// is a typed tool error; a tool's own error is the Company's words, as
@@ -1611,6 +1977,85 @@ mod over_a2a {
         }
         std::thread::sleep(Duration::from_millis(2500));
         assert_eq!(calls(&f).len(), 4, "each call sent once: {:#?}", f.record());
+    }
+
+    /// An operation tool's write is on its step's record before it leaves,
+    /// as `company.api`'s is: a restart that finds the step running ends it
+    /// `outcome unknown`, and the Company saw the write once (RFC 0047
+    /// §5.9).
+    #[test]
+    fn a_restart_does_not_send_an_operation_tools_write_again() {
+        const NOTED: &str = "workflows:\n\
+            \x20 - name: noted\n    durable: true\n    steps:\n      s: {kind: manual}\n\
+            \x20     t: {kind: tool, name: shop.post_notes, args: {json: {text: once}}, depends_on: [s]}\n\
+            \x20     f: {kind: finish, depends_on: [t], status: completed}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = setup_with(
+            &h,
+            "",
+            "",
+            &shop_entry(
+                &f.origin,
+                ", interfaces: [openapi], api_allow: [\"POST /notes\"]",
+            ),
+            NOTED,
+        );
+        let (mut d, addr) = start_listening(&s, "noted", &[]);
+        wait_for(&d.log, "the operation tools", |l| {
+            !events(l, "company.api.joined").is_empty()
+        });
+        // The note is taken, and its answer held back.
+        f.control(
+            json!({"http_fail": {"method": "POST", "path": "/api/notes", "times": 1, "ms": 30000}}),
+        );
+        let v = run_workflow("noted")
+            .bearer(OPERATOR)
+            .return_immediately()
+            .post(&addr);
+        assert!(v.get("error").is_none(), "{v}");
+        let notes = || {
+            f.record()
+                .iter()
+                .filter(|r| r["path"] == "/api/notes")
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while f.holds() == 0 {
+            assert!(Instant::now() < deadline, "{}", d.read());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe { libc::kill(d.child.id() as i32, libc::SIGKILL) };
+        let _ = d.child.wait();
+        // Reaped: nothing is left for its drop to signal.
+        std::mem::forget(d);
+        let again = start(
+            &s,
+            "restarted",
+            &[
+                ("COMPANIES_E2E_OPERATOR", OPERATOR),
+                ("COMPANIES_E2E_DANA", DANA),
+            ],
+        );
+        let l = wait_for(&again.log, "the step ended", |l| {
+            events(l, "restore.step.failed")
+                .iter()
+                .any(|e| e["step"] == "t" && e["reason"] == "outcome_unknown")
+        });
+        assert_eq!(
+            events(&l, "restore.step.failed")[0]["company"],
+            "shop",
+            "{l}"
+        );
+        wait_for(&again.log, "the tools after the restart", |l| {
+            !events(l, "company.api.joined").is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        // The note taken is still held, its own line not yet written; one
+        // sent again would be answered, and written, at once.
+        assert_eq!(f.holds(), 1);
+        assert_eq!(notes(), 0, "sent again: {:#?}", f.record());
     }
 
     /// A step whose Company call was out when the process died is not

@@ -342,7 +342,7 @@ calls come back to the supervisor. The tools are offered only in work the
 User owns, and, when the User is `operator` or an operator principal, in
 work nobody owns, such as a schedule or a stream. The `company.status` tool
 says where each company stands: verified or not, signed in or not, and its
-MCP servers. The operator's `company.status`
+servers. The operator's `company.status`
 [command op](a2a-reference.md#command-ops) answers the same, with why each
 company that failed failed.
 
@@ -372,7 +372,8 @@ Add `agent` to `interfaces` to talk with the company's own agent, and
   stream `company.<name>`, so a workflow can start from them or wait for
   one. At most `security.companies.limits.conversations` are open at once.
 - **`company.api`** calls one operation of the company's OpenAPI
-  description, and **`company.api.describe`** lists them. Only the
+  description, and **`company.api.describe`** lists them, naming each
+  allowed one's [operation tool](#its-operations-as-tools). Only the
   operations `api_allow` lists are sent, with their parameters and body held
   to the description's schemas; anything else is refused unsent.
 - An **`http` step** with `auth: {kind: company, company: <name>}` is a
@@ -417,6 +418,7 @@ services:
     sign_in: [device]
     scopes: ["poppy:read", "poppy:write"]
     api_allow: ["GET /orders/{order_id}"]
+    api_names: {"https://api.shop.example.com/openapi.json": orders}
 
 workflows:
   - name: order-check
@@ -456,6 +458,69 @@ company's description names. The step takes `method`, `query`, `json` and
 `expect`, and no `headers`, `body`, `sign`, `allow_private` or
 `idempotency`: the credential, the hosts and the idempotency key are
 agentd's.
+
+### Its operations as tools
+
+Each operation `api_allow` lists is also a tool of its own, once agentd has
+read the company's description and found the operation there. Its name is
+the operator's, made from the `api_allow` entry by one rule: the method and
+the path in lower case, each run of other characters one `_`, none at either
+end, at most 64 characters, under a server named after the entry. An entry
+`shop` with `api_allow: ["GET /orders/{order_id}"]` has the tool
+`shop.get_orders_order_id`. The company's `operationId`, summary and
+description go into the tool's description, never its name, so a company
+that renames an operation renames no tool, and what is keyed to the name — a
+policy, a tag, a workflow's `tool` step — keeps applying. Load refuses two
+`api_allow` entries that make one name, and a tag key, a policy or a step
+that names an operation tool the entry does not make.
+
+- **Its arguments** are the operation's: each path and query parameter as
+  declared, `json` for a JSON body, and `expect`, the statuses that are not
+  an error. When a parameter has another's name, or is named `json` or
+  `expect`, the tool takes them as `path` and `query` objects instead. It
+  takes no header and no cookie: an operation that requires one, other than
+  the `Idempotency-Key` agentd sends itself, has no tool. An argument
+  outside its schema is refused, and nothing is sent.
+- **A call** is the `company.api` call of the operation: the same request,
+  sent the same way, with the same answer. It reaches its own operation or
+  none: a path parameter whose value is a fixed segment of another
+  operation's path — `bulk` where the description also declares
+  `POST /orders/bulk/exchanges` — is refused, and nothing is sent.
+- **What holds `company.api` holds them.** A `security.policies` rule judges
+  an operation tool's call as itself and as the `company.api` call it is —
+  under that name, with `company.api`'s arguments (`company`, `api`,
+  `method`, `path`, `query`, `json`, `expect`) as the call fills them — and
+  the first rule that matches either decides, so an `allow` for
+  `shop.get_*` placed before a `deny` for `company.api` still lets the reads
+  through. `tools.disabled` naming `company.api` disables them,
+  `tools.narrow` on `company.api` narrows them, and `agent.tools` offers
+  them to the conversation only where it offers `company.api` (and, as MCP
+  tools, where `agent.tools.mcp` does).
+- **When they appear.** As a company's MCP tools do: once the description is
+  read, every boot included, and for a company down at boot once it comes
+  up (`company.api.joined`). A later fetch that finds the description
+  changed lists them again, and the tools that changed replace the old ones
+  (`company.api.changed`). An allowed operation the description does not
+  declare has no tool, nor has one whose schemas do not resolve within
+  agentd's bounds or make an input schema over 16 KiB; each is logged once
+  (`company.api.not_offered`).
+- **Their tags.** A key of the entry's `tags` other than `*` that names an
+  operation tool — its name such as `shop.post_notes`, or a glob such as
+  `shop.get_*` — gives it the tags of the keys that name it, `*` included.
+  An operation tool no such key names carries every tag the entry lists, as
+  `company.api` does, and with no `tags` that is `untrusted_input` and
+  `egress`; so a key written for the entry's MCP server takes nothing from
+  them. The entry's MCP servers carry every tag it lists, whatever its key.
+- **Turn workers and subagents** reach them as they reach a company's MCP
+  tools: a subagent granted the server is handed their definitions, and its
+  calls come back to the supervisor.
+
+An entry that also uses `mcp` has an MCP server named after the entry, so
+name one of the two apart, as the example above does: `api_names` names the
+server of each OpenAPI API by the URL the company lists it at, as
+`mcp_names` does for its MCP APIs. A company that lists several OpenAPI APIs
+needs it too. With the example's `api_names`, reading an order is the tool
+`orders.get_orders_order_id`, beside the MCP tools `shop.*`.
 
 ### Calls that may have run
 
@@ -642,6 +707,9 @@ gap.
 | `company.sign_in.failed` | `cancelled`, `denied`, `expired`, `account_mismatch`, `interrupted` or `failed` | start the sign-in again; after `account_mismatch`, the User signed in to another account than before: ask with `new_account: true` to switch, which suspends the company's standing permissions until a restart |
 | `company.account_token.dropped` | the company refused the Account Token: a disconnect, a revocation, an expiry | sign in again |
 | `company.issuer_changed` or `company.apis_changed` | the company changed its documents | restart to use them |
+| `` the server its operation tools are named under "shop" has the name of another of its own servers `` at load | the entry uses `mcp` and `openapi`, and both its servers would be named after it | name one apart with `api_names` (or `mcp_names`) |
+| `company.api.not_offered` (warn) | an operation `api_allow` lists has no tool: the description does not declare it, or its schemas cannot be offered | check the operation at the company; a `company.api` call of it is held to the same description |
+| `company.api.unavailable` (warn) | the operation tools could not be made: the company or its description could not be read, or it lists several OpenAPI APIs and `api_names` does not name them | nothing, if the company is down: agentd tries again with backoff; otherwise name the APIs with `api_names` |
 | the trifecta check refuses startup | a company and a `sensitive` server in one instance | split them over [two instances](#what-stays-with-the-supervisor) |
 
 `auth.unavailable` and `auth.recovered` say the same with

@@ -270,6 +270,9 @@ mod supervisor {
         /// A Company asks to talk with the User directly in one of its
         /// conversations (draft §7.10).
         DirectAsked(super::direct::Asked),
+        /// A fetch of the OpenAPI description at this URL found it changed: the
+        /// operation tools made from it are listed again.
+        DescriptionChanged(String),
     }
 
     /// Where notices go: the runtime's loop.
@@ -318,6 +321,12 @@ mod supervisor {
         pub(super) conversation_limit: u32,
         /// The OpenAPI descriptions fetched, by URL.
         pub(super) descriptions: Mutex<BTreeMap<String, Arc<super::api::Description>>>,
+        /// The operations `api_allow` lists that have no tool, and why, by
+        /// server: as the log was last told.
+        pub(super) unoffered: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+        /// Why each server's operation tools could not be made, as the log
+        /// was last told.
+        pub(super) api_failed: Mutex<BTreeMap<String, String>>,
         /// Whether the client metadata document lists the Operations
         /// extension.
         pub(super) operations: bool,
@@ -431,6 +440,8 @@ mod supervisor {
                 sink: Mutex::default(),
                 conversation_limit: c.conversations(),
                 descriptions: Mutex::default(),
+                unoffered: Mutex::default(),
+                api_failed: Mutex::default(),
                 operations: cfg::lists_operations(settings),
                 standing: c
                     .standing

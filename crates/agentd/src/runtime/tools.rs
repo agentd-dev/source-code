@@ -500,6 +500,12 @@ impl Runtime {
         tool: &str,
         args: Value,
     ) -> ToolOutcome {
+        // A Company's operation tool is `company.api` for its operation
+        // (RFC 0047 §9, P5a), and goes the way that tool goes.
+        #[cfg(feature = "companies")]
+        if crate::config::settings::companies::is_api_server(&self.settings, server) {
+            return self.company_operation_call(caller, name, server, tool, args);
+        }
         // Pace calls toward a rated catalog service. A dry bucket answers with
         // a tool error the model can absorb and retry, never a hang.
         if let Err(e) = self.service_rate_take(server) {
@@ -1178,12 +1184,37 @@ impl Runtime {
             .registry
             .tags_of(std::slice::from_ref(&name.to_string()));
         let who = Self::policy_caller(caller);
+        // A Company's operation tool's call is `company.api`'s call of its
+        // operation (RFC 0047 §9, P5a), and is judged as that too: a rule on
+        // `company.api` — its name, its arguments — holds it as it holds
+        // that tool's.
+        #[cfg(feature = "companies")]
+        let view = match self.operation_view(name, args) {
+            Some(Err(e)) => {
+                return Some(ToolOutcome::Ready(
+                    Value::String(format!("{name}: {e}")),
+                    true,
+                ));
+            }
+            v => v.and_then(Result::ok),
+        };
+        #[cfg(not(feature = "companies"))]
+        let view: Option<Value> = None;
+        let as_api = view.as_ref().map(|v| crate::sec::policy::Call {
+            tool: "company.api",
+            tags: &tags,
+            caller: who,
+            principal: caller.principal.as_deref(),
+            args: v,
+            also: None,
+        });
         let call = crate::sec::policy::Call {
             tool: name,
             tags: &tags,
             caller: who,
             principal: caller.principal.as_deref(),
             args,
+            also: as_api.as_ref(),
         };
         let verdict = match crate::sec::policy::evaluate(&self.settings.security.policies, &call) {
             Ok(None) => return None,

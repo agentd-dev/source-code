@@ -71,6 +71,9 @@ pub struct Entry {
     pub interfaces: Vec<Interface>,
     /// The OpenAPI operations agentd may call there, `METHOD /path-template`.
     pub api_allow: Vec<String>,
+    /// The servers the entry's operation tools are named under, by name, with
+    /// the OpenAPI API `url` `api_names` gives.
+    pub apis: Vec<(String, Option<String>)>,
 }
 
 impl Entry {
@@ -91,6 +94,7 @@ impl Entry {
             scopes: svc.scopes.clone().unwrap_or_default(),
             interfaces: crate::config::settings::companies::interfaces_of(svc),
             api_allow: svc.api_allow.clone().unwrap_or_default(),
+            apis: crate::config::settings::companies::api_server_names(name, svc),
         }
     }
 }
@@ -818,6 +822,7 @@ mod tests {
             scopes: Vec::new(),
             interfaces: vec![Interface::Mcp],
             api_allow: Vec::new(),
+            apis: Vec::new(),
         }
     }
 

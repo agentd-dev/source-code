@@ -1126,6 +1126,10 @@ impl Runtime {
                 let _ = f.ack.try_send(appended);
             }
             crate::companies::Notice::DirectAsked(a) => self.on_company_direct_asked(a),
+            // The operation tools made from it are listed again (`join`).
+            crate::companies::Notice::DescriptionChanged(url) => {
+                self.joining.description_changed(&url)
+            }
         }
     }
 

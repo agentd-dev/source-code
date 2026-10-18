@@ -30,6 +30,10 @@ pub struct Call<'a> {
     pub caller: PolicyCaller,
     pub principal: Option<&'a str>,
     pub args: &'a Value,
+    /// The same call as another tool's, when it is one: a Company's
+    /// operation tool's call is `company.api`'s call of its operation (RFC
+    /// 0047 §9, P5a). A rule that matches either is the call's.
+    pub also: Option<&'a Call<'a>>,
 }
 
 /// The verdict, plus which rule produced it (for the log and the audit line —
@@ -112,11 +116,13 @@ pub fn caller_name(c: PolicyCaller) -> &'static str {
 
 /// Evaluate the list. `Ok(None)` means no rule matched (allow);
 /// `Err(rule)` means a rule's argument guard failed to evaluate, which is
-/// fail-closed rather than a pass.
+/// fail-closed rather than a pass. A call that is also another's
+/// ([`Call::also`]) is held by the first rule that matches it as either.
 pub fn evaluate(policies: &[Policy], call: &Call<'_>) -> Result<Option<Verdict>, usize> {
     for (i, p) in policies.iter().enumerate() {
         let mut cel_ok = true;
-        let hit = matches(p, call, &mut cel_ok);
+        let hit = matches(p, call, &mut cel_ok)
+            || (cel_ok && call.also.is_some_and(|a| matches(p, a, &mut cel_ok)));
         if !cel_ok {
             return Err(i);
         }
@@ -210,6 +216,7 @@ mod tests {
             caller,
             principal: None,
             args,
+            also: None,
         }
     }
 
@@ -365,5 +372,47 @@ mod tests {
             PolicyAction::Deny,
         )];
         assert!(evaluate(&rules, &call("t", &[], PolicyCaller::Root, &args)).is_err());
+    }
+
+    /// A call that is also another tool's — a Company's operation tool's is
+    /// `company.api`'s call of its operation — is held by the first rule
+    /// that matches it as either, so a rule on the other tool holds it, and
+    /// an exception for it can still precede that rule.
+    #[test]
+    fn a_call_that_is_another_tools_is_held_by_a_rule_on_either() {
+        let rules = vec![
+            pol(
+                PolicyMatch {
+                    tool: Some("shop_api.get_*".into()),
+                    ..Default::default()
+                },
+                PolicyAction::Allow,
+            ),
+            pol(
+                PolicyMatch {
+                    tool: Some("company.api".into()),
+                    ..Default::default()
+                },
+                PolicyAction::Deny,
+            ),
+        ];
+        let (own, api) = (serde_json::json!({}), serde_json::json!({"method": "POST"}));
+        let judged = |tool: &str, also: bool| {
+            let as_api = call("company.api", &[], PolicyCaller::Root, &api);
+            let c = Call {
+                also: also.then_some(&as_api),
+                ..call(tool, &[], PolicyCaller::Root, &own)
+            };
+            evaluate(&rules, &c).unwrap().map(|v| (v.action, v.rule))
+        };
+        assert_eq!(
+            judged("shop_api.post_notes", true),
+            Some((PolicyAction::Deny, 1))
+        );
+        assert_eq!(
+            judged("shop_api.get_orders", true),
+            Some((PolicyAction::Allow, 0))
+        );
+        assert_eq!(judged("shop_api.post_notes", false), None);
     }
 }

@@ -200,12 +200,36 @@ pub struct Registry {
     /// (`runtime::join`) is added to these, never re-listed beside them — a
     /// server's catalogue changes only at a reload the operator starts.
     built_from: Vec<ServerTools>,
+    /// The servers a Company's operation tools are named under (RFC 0047
+    /// §9, P5a), each tool's call `company.api`'s call of its operation.
+    operation_servers: Vec<String>,
 }
 
 impl Registry {
     /// The server tool lists this registry was built from.
     pub(crate) fn built_from(&self) -> &[ServerTools] {
         &self.built_from
+    }
+
+    /// The contract the call of the tool `name` is when that is another
+    /// tool's: `company.api`, for a Company's operation tool (RFC 0047 §9,
+    /// P5a). Every control on that tool holds it too.
+    pub fn contract_of(&self, name: &str) -> Option<&'static str> {
+        match &self.tools.get(name)?.imp {
+            Impl::Mcp { server, .. } if self.operation_servers.contains(server) => {
+                Some("company.api")
+            }
+            _ => None,
+        }
+    }
+
+    /// The tools whose call is the tool `contract`'s ([`Self::contract_of`]).
+    fn operation_tools(&self, contract: &str) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter(|n| self.contract_of(n) == Some(contract))
+            .cloned()
+            .collect()
     }
 
     /// Build from settings and the connected servers' tool lists.
@@ -219,6 +243,13 @@ impl Registry {
     pub fn build(settings: &Settings, servers: &[ServerTools]) -> Result<Registry, Vec<String>> {
         let mut reg = Registry {
             built_from: servers.to_vec(),
+            operation_servers: settings
+                .mcp
+                .servers
+                .iter()
+                .filter(|s| crate::config::settings::companies::is_api_server(settings, &s.name))
+                .map(|s| s.name.clone())
+                .collect(),
             ..Registry::default()
         };
         let mut errors = Vec::new();
@@ -407,6 +438,17 @@ impl Registry {
                     reg.warnings.push(format!("mcp tool {name:?} of server {:?} collides with an existing tool and is ignored", srv.name));
                     continue;
                 }
+                // A Company's operation tool carries the tags of the entry's
+                // keys that name it (RFC 0047 §9, P5a); any other server's
+                // tool, the server's.
+                let tags = match gate.filter(|g| {
+                    g.company.as_ref().is_some_and(|c| {
+                        c.interface == crate::config::settings::companies::Interface::Openapi
+                    })
+                }) {
+                    Some(g) => crate::config::settings::companies::operation_tags(&g.tags, &name),
+                    None => srv.tags.clone(),
+                };
                 reg.tools.insert(
                     name.clone(),
                     ToolSpec {
@@ -422,7 +464,7 @@ impl Registry {
                         grant: Grant::all(),
                         disabled: false,
                         family: "mcp".into(),
-                        tags: srv.tags.clone(),
+                        tags,
                         server: Some(srv.name.clone()),
                     },
                 );
@@ -447,28 +489,52 @@ impl Registry {
                 Some(t) => t.disabled = true,
                 None => errors.push(format!("tools.disabled names an unknown tool {name:?}")),
             }
+            // An operation tool's call is `company.api`'s call of its
+            // operation: disabling that tool disables them.
+            for op in reg.operation_tools(name) {
+                if let Some(t) = reg.tools.get_mut(&op) {
+                    t.disabled = true;
+                }
+            }
         }
         // 6. Narrow (`:::!override`) — append-only: add trifecta tags, and
         // append an operator annotation beneath the server's own description,
         // never replacing it. Narrowing may only make a tool MORE careful.
         for (name, narrow) in &settings.tools.narrow {
-            let Some(t) = reg.tools.get_mut(name) else {
+            if !reg.tools.contains_key(name) {
                 errors.push(format!("tools.narrow names an unknown tool {name:?}"));
                 continue;
-            };
+            }
             for tag in &narrow.tags {
-                match crate::sec::scope::TrifectaTag::parse(tag) {
-                    Some(tt) if !t.tags.contains(&tt) => t.tags.push(tt),
-                    Some(_) => {}
-                    None => errors.push(format!(
+                if crate::sec::scope::TrifectaTag::parse(tag).is_none() {
+                    errors.push(format!(
                         "tools.narrow {name:?}: unknown trifecta tag {tag:?} (untrusted_input | sensitive | egress)"
-                    )),
+                    ));
                 }
             }
-            if let Some(note) = &narrow.describe {
-                // The server's own description survives verbatim; the operator's
-                // annotation is delimited beneath it, provenance visible.
-                t.description = format!("{}\n\n[operator note]: {note}", t.description.trim_end());
+            // Narrowing `company.api` narrows each operation tool, whose call
+            // is that tool's.
+            let ops = reg.operation_tools(name);
+            for n in std::iter::once(name.clone()).chain(ops) {
+                let Some(t) = reg.tools.get_mut(&n) else {
+                    continue;
+                };
+                for tt in narrow
+                    .tags
+                    .iter()
+                    .filter_map(|tag| crate::sec::scope::TrifectaTag::parse(tag))
+                {
+                    if !t.tags.contains(&tt) {
+                        t.tags.push(tt);
+                    }
+                }
+                if let Some(note) = &narrow.describe {
+                    // The server's own description survives verbatim; the
+                    // operator's annotation is delimited beneath it,
+                    // provenance visible.
+                    t.description =
+                        format!("{}\n\n[operator note]: {note}", t.description.trim_end());
+                }
             }
         }
         if errors.is_empty() {
@@ -841,9 +907,16 @@ impl Registry {
                         sel.internal.allows(&t.name) || sel.internal.allows(&t.family)
                     }
                     ToolClass::Code => sel.code.allows(&t.name),
+                    // An operation tool is offered where the contract its
+                    // call is would be.
                     ToolClass::Mcp => {
-                        sel.mcp.allows(&t.name)
-                            || t.server.as_deref().is_some_and(|s| sel.mcp.allows(s))
+                        (sel.mcp.allows(&t.name)
+                            || t.server.as_deref().is_some_and(|s| sel.mcp.allows(s)))
+                            && self.contract_of(&t.name).is_none_or(|c| {
+                                self.tools.get(c).is_some_and(|ct| {
+                                    sel.internal.allows(&ct.name) || sel.internal.allows(&ct.family)
+                                })
+                            })
                     }
                     // A workflow tool is an operator-declared procedure, not a
                     // surface discovered from a server, so it is not subject

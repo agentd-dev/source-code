@@ -450,6 +450,17 @@ impl Runtime {
                         },
                     })
                 })
+                // A Company's operation tools, as last adopted: its entry
+                // cannot change under a reload (`company_entries_moved`).
+                .chain(self.joining.offered().filter_map(|(server, o)| {
+                    let s = new.mcp.servers.iter().find(|s| s.name == *server)?;
+                    Some(ServerTools {
+                        name: server.clone(),
+                        ns: s.ns.clone(),
+                        tags: Vec::new(),
+                        tools: o.tools.clone(),
+                    })
+                }))
                 .collect();
             Some(Registry::build(new, &server_tools)?)
         } else {

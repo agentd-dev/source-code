@@ -20,6 +20,14 @@
 //! handshake and tool list. A Company that does not answer, or does not
 //! verify, is tried again on the same backoff; one whose server refuses this
 //! agent outright (`extension_required`) is not tried again.
+//!
+//! So do the tools of a Company's OpenAPI operations (RFC 0047 §9, P5a): the
+//! server they are named under joins once the supervisor has read the API's
+//! description and made a tool of each operation `api_allow` lists that it
+//! declares, every boot included, on the same backoff. A fetch that later
+//! finds the description changed has them listed again: tools that changed
+//! replace the server's in the registry as a join's do, and the change is
+//! logged (`company.api.changed`); unchanged, nothing moves.
 
 use super::events::Event;
 use super::reactor::Runtime;
@@ -36,6 +44,69 @@ const BACKOFF_MAX_MS: u64 = 60_000;
 #[derive(Default)]
 pub(crate) struct Joining {
     probes: BTreeMap<String, Probe>,
+    /// The operation tools each Company OpenAPI API offers, as adopted.
+    offered: BTreeMap<String, Operations>,
+    /// The APIs whose description changed since they were adopted: listed
+    /// again.
+    stale: std::collections::BTreeSet<String>,
+    /// The servers being dialled when a description changed: an API among
+    /// them, whose listing may have read it before, is listed once more.
+    again: std::collections::BTreeSet<String>,
+}
+
+/// The tools of a Company OpenAPI API's operations (RFC 0047 §9, P5a): the
+/// description's URL they were made from, each tool, named within its
+/// server, and what each one's call is made of.
+#[derive(Debug, Clone)]
+pub(crate) struct Operations {
+    pub url: String,
+    pub tools: Vec<::mcp::wire::Tool>,
+    #[cfg(feature = "companies")]
+    pub shapes: BTreeMap<String, crate::companies::api::Shape>,
+}
+
+impl Joining {
+    /// Whether the Company OpenAPI API `server` offers its operation tools.
+    pub(crate) fn offers(&self, server: &str) -> bool {
+        self.offered.contains_key(server)
+    }
+
+    /// Each Company OpenAPI API's operation tools, as adopted.
+    pub(crate) fn offered(&self) -> impl Iterator<Item = (&String, &Operations)> {
+        self.offered.iter()
+    }
+
+    /// What the call of the operation tool `tool` of the Company OpenAPI API
+    /// `server` is made of, as adopted.
+    #[cfg(feature = "companies")]
+    pub(crate) fn shape(&self, server: &str, tool: &str) -> Option<&crate::companies::api::Shape> {
+        self.offered.get(server)?.shapes.get(tool)
+    }
+
+    /// The description at `url` changed: the operation tools of each API
+    /// made from it are listed again — after the listing out now, for one
+    /// being listed.
+    #[cfg(feature = "companies")]
+    pub(crate) fn description_changed(&mut self, url: &str) {
+        for (server, p) in &self.probes {
+            if p.out {
+                self.again.insert(server.clone());
+            }
+        }
+        for (server, o) in &self.offered {
+            if o.url == url && !self.again.contains(server) {
+                self.stale.insert(server.clone());
+            }
+        }
+    }
+}
+
+/// What a dial found: a connection and its tools, or a Company OpenAPI API's
+/// operation tools.
+enum Found {
+    Mcp(Box<crate::mcp::client::McpClient>, Vec<::mcp::wire::Tool>),
+    #[cfg_attr(not(feature = "companies"), allow(dead_code))]
+    Operations(Operations),
 }
 
 #[derive(Default)]
@@ -46,11 +117,11 @@ struct Probe {
 }
 
 /// What a dial off the loop came back with: the initialized connection and
-/// its tools, or nothing — and whether the server refused this agent for
-/// good.
+/// its tools, a Company OpenAPI API's operation tools, or nothing — and
+/// whether the server refused this agent for good.
 pub struct Reachable {
     server: String,
-    found: Option<(crate::mcp::client::McpClient, Vec<::mcp::wire::Tool>)>,
+    found: Option<Found>,
     refused: Option<String>,
 }
 
@@ -81,7 +152,10 @@ impl Runtime {
             .servers
             .iter()
             .map(|s| s.name.clone())
-            .filter(|n| !self.mcp.contains_key(n))
+            .filter(|n| {
+                !self.mcp.contains_key(n)
+                    && (!self.joining.offers(n) || self.joining.stale.contains(n))
+            })
             .collect();
         self.joining.probes.retain(|n, _| down.contains(n));
         for name in down {
@@ -106,18 +180,38 @@ impl Runtime {
             let server = name.clone();
             #[cfg(feature = "companies")]
             let companies = self.companies.clone();
+            #[cfg(feature = "companies")]
+            let api = crate::config::settings::companies::is_api_server(&self.settings, &name);
             let spawned = std::thread::Builder::new()
                 .name("agentd-join".into())
                 .spawn(move || {
                     // The dial boot makes, on its own thread: the loop is
                     // never held by a server that does not answer.
                     let (found, refused) = match spec.company {
+                        // A Company's OpenAPI operations: its description,
+                        // read and made into tools.
+                        #[cfg(feature = "companies")]
+                        Some(_) if api => (
+                            companies
+                                .as_ref()
+                                .and_then(|sup| sup.operation_tools(&server).ok())
+                                .map(|o| {
+                                    Found::Operations(Operations {
+                                        url: o.url,
+                                        tools: o.tools,
+                                        shapes: o.shapes,
+                                    })
+                                }),
+                            None,
+                        ),
                         #[cfg(feature = "companies")]
                         Some(_) => match companies
                             .as_ref()
                             .map(|sup| crate::companies::mcp::connect(sup, &server, timeout))
                         {
-                            Some(Ok(found)) => (Some(found), None),
+                            Some(Ok((client, tools))) => {
+                                (Some(Found::Mcp(Box::new(client), tools)), None)
+                            }
                             Some(Err(crate::companies::mcp::Refused::Unusable(e))) => {
                                 (None, Some(e))
                             }
@@ -129,7 +223,9 @@ impl Runtime {
                             crate::mcp::from_spec(&spec, timeout)
                                 .map(super::supervisor_client)
                                 .and_then(|mut c| c.initialize().map(|()| c))
-                                .and_then(|c| c.list_tools().map(|tools| (c, tools)))
+                                .and_then(|c| {
+                                    c.list_tools().map(|tools| Found::Mcp(Box::new(c), tools))
+                                })
                                 .ok(),
                             None,
                         ),
@@ -174,12 +270,16 @@ impl Runtime {
             );
             return;
         }
-        let Some((client, tools)) = found else {
-            probe.failures += 1;
-            probe.due_at = now + backoff(probe.failures);
-            return;
+        let adopted = match found {
+            Some(Found::Mcp(client, tools)) => self.join_adopt(&server, *client, tools),
+            Some(Found::Operations(o)) => self.adopt_operations(&server, o),
+            None => {
+                probe.failures += 1;
+                probe.due_at = now + backoff(probe.failures);
+                return;
+            }
         };
-        if let Err(errors) = self.join_adopt(&server, client, tools) {
+        if let Err(errors) = adopted {
             self.log.warn(
                 "mcp.join.refused",
                 json!({"server": server, "errors": errors}),
@@ -191,17 +291,16 @@ impl Runtime {
         }
     }
 
-    /// Adopt `server`'s connection: its tools beside the others' as last
-    /// built, the installed workflows' tools registered again over them, and
-    /// what lives on the connection restored.
-    fn join_adopt(
-        &mut self,
+    /// The registry with `server`'s tools as `tools`, beside the others' as
+    /// last built, the installed workflows' tools registered again over them.
+    /// `None` when `server` is no longer configured.
+    fn registry_with(
+        &self,
         server: &str,
-        mut client: crate::mcp::client::McpClient,
         tools: Vec<::mcp::wire::Tool>,
-    ) -> Result<(), Vec<String>> {
+    ) -> Result<Option<Registry>, Vec<String>> {
         let Some(s) = self.settings.mcp.servers.iter().find(|s| s.name == server) else {
-            return Ok(()); // no longer configured
+            return Ok(None);
         };
         let mut built: Vec<ServerTools> = self
             .registry
@@ -226,6 +325,79 @@ impl Runtime {
         if !errs.is_empty() {
             return Err(errs);
         }
+        for w in &registry.warnings {
+            self.log.warn("registry.warning", json!({"warning": w}));
+        }
+        Ok(Some(registry))
+    }
+
+    /// Adopt the operation tools `offered` of the Company OpenAPI API
+    /// `server`: the first time, and whenever a listing after a changed
+    /// description finds them changed, they replace the server's tools in
+    /// the registry, said `company.api.joined` or `company.api.changed`;
+    /// unchanged, nothing moves.
+    fn adopt_operations(&mut self, server: &str, offered: Operations) -> Result<(), Vec<String>> {
+        self.joining.stale.remove(server);
+        if self.joining.again.remove(server) {
+            self.joining.stale.insert(server.to_string());
+        }
+        let shape = |tools: &[::mcp::wire::Tool]| -> BTreeMap<String, serde_json::Value> {
+            tools
+                .iter()
+                .map(|t| (t.name.clone(), serde_json::to_value(t).unwrap_or_default()))
+                .collect()
+        };
+        let now = shape(&offered.tools);
+        let was = self.joining.offered.get(server).map(|o| shape(&o.tools));
+        if was.as_ref() == Some(&now) {
+            self.joining.offered.insert(server.to_string(), offered);
+            return Ok(());
+        }
+        let Some(registry) = self.registry_with(server, offered.tools.clone())? else {
+            return Ok(()); // no longer configured
+        };
+        self.registry = registry;
+        let company = self
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.company.as_ref())
+            .map(|c| c.entry.clone());
+        match was {
+            None => self.log.info(
+                "company.api.joined",
+                json!({"company": company, "server": server, "api": offered.url,
+                       "tools": now.keys().collect::<Vec<_>>()}),
+            ),
+            Some(was) => self.log.info(
+                "company.api.changed",
+                json!({"company": company, "server": server, "api": offered.url,
+                       "added": now.keys().filter(|k| !was.contains_key(*k)).collect::<Vec<_>>(),
+                       "removed": was.keys().filter(|k| !now.contains_key(*k)).collect::<Vec<_>>(),
+                       "changed": now.iter().filter(|(k, v)| was.get(*k).is_some_and(|w| w != *v)).map(|(k, _)| k).collect::<Vec<_>>()}),
+            ),
+        }
+        self.joining.offered.insert(server.to_string(), offered);
+        self.log_workflow_tools();
+        Ok(())
+    }
+
+    /// Adopt `server`'s connection: its tools beside the others' as last
+    /// built, the installed workflows' tools registered again over them, and
+    /// what lives on the connection restored.
+    fn join_adopt(
+        &mut self,
+        server: &str,
+        mut client: crate::mcp::client::McpClient,
+        tools: Vec<::mcp::wire::Tool>,
+    ) -> Result<(), Vec<String>> {
+        self.joining.again.remove(server);
+        let count = tools.len();
+        let Some(registry) = self.registry_with(server, tools)? else {
+            return Ok(()); // no longer configured
+        };
         // A Company under the strict privacy profile is sent no run or
         // instance (RFC 0047 §5.10).
         #[cfg(feature = "companies")]
@@ -240,11 +412,7 @@ impl Runtime {
             client.set_tool_meta(crate::mcp::tool_meta(&self.run_id, &self.instance));
         }
         super::report_dropped_tools(&self.log, server, &client);
-        let count = built.last().map_or(0, |t| t.tools.len());
         let protocol = client.protocol_version();
-        for w in &registry.warnings {
-            self.log.warn("registry.warning", json!({"warning": w}));
-        }
         self.registry = registry;
         self.mcp.insert(server.to_string(), Arc::new(client));
         self.log.info(

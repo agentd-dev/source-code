@@ -9,10 +9,14 @@
 //! A company entry declares a Company by the domain whose discovery document
 //! agentd reads. The Company's MCP APIs become MCP servers here, at load:
 //! one named after the entry when the Company lists one MCP API, or one per
-//! `mcp_names` value when it lists several. Their names are known before any
-//! document is read, so the tag fold, the tool grants and every name a
-//! workflow uses see them as they see any server; where each one lives is
-//! learned at discovery, and only the supervisor ever dials one.
+//! `mcp_names` value when it lists several. So do its OpenAPI APIs, for the
+//! operations `api_allow` lists: each such operation is a tool of its own,
+//! named by a fixed rule from its `api_allow` entry ([`operation_name`]),
+//! under a server named after the entry or one per `api_names` value. Their
+//! names are known before any document is read, so the tag fold, the tool
+//! grants and every name a workflow uses see them as they see any server;
+//! where each one lives is learned at discovery, and only the supervisor
+//! ever dials one.
 
 use super::{Diagnostics, McpServer, Secret, ServiceKind, Settings, StoreKind};
 use serde::Deserialize;
@@ -437,13 +441,16 @@ pub fn entry_tags(svc: &super::Service) -> Vec<crate::sec::scope::TrifectaTag> {
     out
 }
 
-/// What makes a synthesized MCP server a Company's: the entry it belongs to
-/// and, when the entry names several MCP APIs, the `url` it stands for.
-/// Never configured; set by [`synthesize`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What makes a synthesized MCP server a Company's: the entry it belongs to,
+/// the interface it stands for — one of the Company's MCP APIs, or one of its
+/// OpenAPI APIs, whose tools are the operations `api_allow` lists — and,
+/// when `mcp_names` or `api_names` names it, the `url` it stands for. Never
+/// configured; set by [`synthesize`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompanyServer {
     pub entry: String,
     pub url: Option<String>,
+    pub interface: Interface,
 }
 
 /// The tags a Company channel carries when its entry declares none: what
@@ -534,12 +541,123 @@ pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<Str
         .collect()
 }
 
+/// The servers a company entry's operation tools are named under, by name,
+/// with the OpenAPI API `url` each one is when `api_names` names them: one
+/// named after the entry, or one per `api_names` value — none unless the
+/// entry uses `openapi` and `api_allow` lists an operation.
+pub fn api_server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<String>)> {
+    if !interfaces_of(svc).contains(&Interface::Openapi)
+        || svc.api_allow.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Vec::new();
+    }
+    if svc.api_names.is_empty() {
+        return vec![(name.to_string(), None)];
+    }
+    svc.api_names
+        .iter()
+        .map(|(url, server)| (server.clone(), Some(url.clone())))
+        .collect()
+}
+
+/// The longest name an operation tool has within its server.
+pub const MAX_OPERATION_NAME: usize = 64;
+
+/// The name, within its server, of the tool for the `api_allow` entry `op`
+/// (`METHOD /path-template`): in lower case, each run of characters other
+/// than `a-z` and `0-9` one `_`, none at either end, at most
+/// [`MAX_OPERATION_NAME`] characters — `GET /orders/{order_id}` is
+/// `get_orders_order_id`. The operator's words, never the Company's: a
+/// Company that renames an `operationId` renames no tool.
+pub fn operation_name(op: &str) -> String {
+    let mut out = String::new();
+    for c in op.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.truncate(MAX_OPERATION_NAME);
+    out.trim_end_matches('_').to_string()
+}
+
+/// Each operation `svc`'s `api_allow` lists, as its tool's name within its
+/// server ([`operation_name`]) and the entry as written, in its order.
+pub fn operations_of(svc: &super::Service) -> Vec<(String, String)> {
+    svc.api_allow
+        .iter()
+        .flatten()
+        .map(|op| (operation_name(op), op.clone()))
+        .collect()
+}
+
+/// The tags the operation tool registered as `tool` (`<server>.<name>`)
+/// carries, from its entry's `tags` (or [`default_tags`]): when a key other
+/// than `*` names it — its name, or a glob matching it — those of each key
+/// that matches it, `*` included; otherwise every tag the entry lists, as
+/// `company.api` and the entry's MCP tools carry them. A key refines only
+/// the tools it names, so one written for another of the entry's servers
+/// takes nothing from the operation tools.
+pub fn operation_tags(
+    tags: &BTreeMap<String, Vec<String>>,
+    tool: &str,
+) -> Vec<crate::sec::scope::TrifectaTag> {
+    let named = tags
+        .keys()
+        .any(|key| key.trim() != "*" && crate::registry::pattern_matches(key, tool));
+    let mut out = Vec::new();
+    for t in tags
+        .iter()
+        .filter(|(key, _)| !named || crate::registry::pattern_matches(key, tool))
+        .flat_map(|(_, t)| t)
+        .filter_map(|t| crate::sec::scope::TrifectaTag::parse(t))
+    {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Whether `server` is one of a Company's OpenAPI APIs, whose tools are the
+/// operations its entry's `api_allow` lists.
+pub fn is_api_server(s: &Settings, server: &str) -> bool {
+    s.mcp.servers.iter().any(|x| {
+        x.name == server
+            && x.company
+                .as_ref()
+                .is_some_and(|c| c.interface == Interface::Openapi)
+    })
+}
+
+/// The registered names of the operation tools of the Company OpenAPI API
+/// `server`, each `<server>.<name>`; none when `server` is no such API.
+pub fn api_tool_names(s: &Settings, server: &str) -> Vec<String> {
+    s.mcp
+        .servers
+        .iter()
+        .find(|x| x.name == server)
+        .and_then(|x| x.company.as_ref())
+        .filter(|c| c.interface == Interface::Openapi)
+        .and_then(|c| s.services.get(&c.entry))
+        .map(|svc| {
+            operations_of(svc)
+                .into_iter()
+                .map(|(n, _)| format!("{server}.{n}"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Add the MCP servers of every company entry to `s.mcp.servers`: named as
 /// [`server_names`] says, `ns` their own name so a Company tool can never
 /// take a bare name, the entry's tags (or [`default_tags`]), `allow`,
 /// `exclude`, `rate` and `timeout`, no AAuth, and no endpoint — the
-/// supervisor learns that at discovery. A name another server already has
-/// is refused, and the server is left out.
+/// supervisor learns that at discovery. Then the servers its operation tools
+/// are named under, as [`api_server_names`] names them, with the entry's
+/// tags and `timeout` alone: `api_allow` is their ceiling. A name another
+/// server already has is refused, and the server is left out.
 ///
 /// An entry that uses `agent`, or any entry once the Operations extension is
 /// listed, gets the stream its conversation events and its operations' final
@@ -560,7 +678,22 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
         if svc.kind != ServiceKind::Company {
             continue;
         }
-        for (server, url) in server_names(entry, svc) {
+        let servers = server_names(entry, svc)
+            .into_iter()
+            .map(|(n, u)| (n, u, Interface::Mcp));
+        let apis = api_server_names(entry, svc)
+            .into_iter()
+            .map(|(n, u)| (n, u, Interface::Openapi));
+        for (server, url, interface) in servers.chain(apis) {
+            let mcp = interface == Interface::Mcp;
+            let (what, names) = if mcp {
+                ("its MCP server", "mcp_names")
+            } else {
+                (
+                    "the server its operation tools are named under",
+                    "api_names",
+                )
+            };
             let taken = s
                 .mcp
                 .servers
@@ -569,12 +702,15 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
                 .find(|x| x.name == server);
             if let Some(other) = taken {
                 errs.push(match &other.company {
+                    Some(c) if c.entry == *entry => format!(
+                        "services.{entry}: {what} {server:?} has the name of another of its own servers — name them apart with api_names or mcp_names"
+                    ),
                     Some(c) => format!(
-                        "services.{entry}: its MCP server {server:?} has the name company entry '{}' gives one of its own — name them apart with mcp_names",
+                        "services.{entry}: {what} {server:?} has the name company entry '{}' gives one of its own — name them apart with {names}",
                         c.entry
                     ),
                     None => format!(
-                        "services.{entry}: its MCP server {server:?} has the name of mcp server '{server}' — rename one (mcp_names names a Company's servers)"
+                        "services.{entry}: {what} {server:?} has the name of mcp server '{server}' — rename one ({names} names a Company's servers)"
                     ),
                 });
                 continue;
@@ -588,12 +724,12 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
                 name: server.clone(),
                 endpoint: String::new(),
                 service: Some(entry.clone()),
-                service_rate: svc.rate.clone(),
+                service_rate: svc.rate.clone().filter(|_| mcp),
                 ns: Some(server.clone()),
                 headers: BTreeMap::new(),
                 tags,
-                allow: svc.allow.clone(),
-                exclude: svc.exclude.clone(),
+                allow: svc.allow.clone().filter(|_| mcp),
+                exclude: if mcp { svc.exclude.clone() } else { Vec::new() },
                 aauth: Some(false),
                 oauth: None,
                 auth: None,
@@ -603,6 +739,7 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
                 company: Some(CompanyServer {
                     entry: entry.clone(),
                     url,
+                    interface,
                 }),
             });
         }
@@ -670,6 +807,15 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
                     direct_use_refused(srv)
                 ));
             }
+            // An operation tool's name is the configuration's, known before
+            // the Company is read.
+            if st.kind == "tool"
+                && let Some(tool) = st.field_str("name")
+                && !tool.contains("{{")
+                && let Some(why) = unknown_operation_tool(s, tool)
+            {
+                out.push(format!("workflow {wf:?} step {id:?}: {why}"));
+            }
             // An `http` step that calls a Company's API names an entry that
             // uses `openapi`; a templated name is held to it when it runs.
             if st.kind == "http"
@@ -699,6 +845,31 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
     out
 }
 
+/// Why the tool name or glob `pattern` is refused, when it names the server
+/// a Company's operation tools are named under (`<server>.…`) and none of
+/// them: their names are the operator's, known at load
+/// ([`operation_name`]).
+pub fn unknown_operation_tool(s: &Settings, pattern: &str) -> Option<String> {
+    s.mcp.servers.iter().find_map(|x| {
+        let c = x.company.as_ref()?;
+        if c.interface != Interface::Openapi || !pattern.starts_with(&format!("{}.", x.name)) {
+            return None;
+        }
+        let tools = api_tool_names(s, &x.name);
+        (!tools
+            .iter()
+            .any(|t| crate::registry::pattern_matches(pattern, t)))
+        .then(|| {
+            format!(
+                "{pattern:?} names no operation tool of company entry {}: each is named after an operation services.{}.api_allow lists ({})",
+                c.entry,
+                c.entry,
+                tools.join(", ")
+            )
+        })
+    })
+}
+
 /// Every check RFC 0047 §5.3 makes at load, on `security.companies` and the
 /// company entries.
 pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
@@ -721,6 +892,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             (svc.allow_private.is_some(), "allow_private"),
             (svc.interfaces.is_some(), "interfaces"),
             (!svc.mcp_names.is_empty(), "mcp_names"),
+            (!svc.api_names.is_empty(), "api_names"),
             (svc.privacy.is_some(), "privacy"),
             (svc.sign_in.is_some(), "sign_in"),
             (svc.scopes.is_some(), "scopes"),
@@ -905,6 +1077,17 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             err(format!(
                 "{at}: {server:?} is a Company's MCP server, whose tools are reached only by their own names"
             ));
+        }
+    }
+    // A rule keyed to an operation tool names one the configuration makes.
+    for (i, p) in s.security.policies.iter().enumerate() {
+        if let Some(why) = p
+            .matcher
+            .tool
+            .as_deref()
+            .and_then(|t| unknown_operation_tool(s, t))
+        {
+            err(format!("security.policies[{i}].match.tool: {why}"));
         }
     }
 }
@@ -1155,6 +1338,85 @@ fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)
         }
         seen.push(server);
     }
+    validate_operations(name, svc, err);
+}
+
+/// The operation tools a company entry's `api_allow` makes, and the servers
+/// `api_names` names them under: each operation listed once, no two named
+/// alike, every server name one, and no key of `tags` naming an operation
+/// tool the entry has not.
+fn validate_operations(name: &str, svc: &super::Service, err: &mut impl FnMut(String)) {
+    let at = format!("services.{name}");
+    let ops: Vec<(String, String)> = operations_of(svc);
+    for (i, (tool, op)) in ops.iter().enumerate() {
+        let Ok((method, template)) = parse_operation(op) else {
+            continue;
+        };
+        for (other_tool, other) in &ops[..i] {
+            if parse_operation(other)
+                .is_ok_and(|(m, t)| m == method && same_template(&t, &template))
+            {
+                err(format!(
+                    "{at}.api_allow: {other:?} and {op:?} name the same operation; list it once"
+                ));
+            } else if other_tool == tool {
+                err(format!(
+                    "{at}.api_allow: {other:?} and {op:?} both make the operation tool name {tool:?} (its method and path, in lower case, each run of other characters one `_`) — list one of them"
+                ));
+            }
+        }
+    }
+    if !svc.api_names.is_empty() {
+        if !interfaces_of(svc).contains(&Interface::Openapi) {
+            err(format!(
+                "{at}.api_names: it names the servers the Company's OpenAPI operation tools are named under, and the entry does not use `openapi` — add it to {at}.interfaces"
+            ));
+        } else if ops.is_empty() {
+            err(format!(
+                "{at}.api_names: {at}.api_allow lists no operation, so there is no operation tool to name a server for"
+            ));
+        }
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for (url, server) in &svc.api_names {
+        if !is_https_url(url) {
+            err(format!(
+                "{at}.api_names: {url:?} is not an HTTPS URL, and an OpenAPI API's url is one"
+            ));
+        }
+        if server.is_empty()
+            || server == "code"
+            || !server
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            err(format!(
+                "{at}.api_names: {server:?} is not a server name ([a-zA-Z0-9_-]+, not `code`)"
+            ));
+        }
+        if seen.contains(&server.as_str()) {
+            err(format!(
+                "{at}.api_names: two OpenAPI APIs are both named {server:?}"
+            ));
+        }
+        seen.push(server);
+    }
+    // A tag keyed to one of the entry's operation tools names one it has.
+    for (server, _) in api_server_names(name, svc) {
+        let tools: Vec<String> = ops.iter().map(|(n, _)| format!("{server}.{n}")).collect();
+        for key in svc.tags.keys() {
+            if key.starts_with(&format!("{server}."))
+                && !tools
+                    .iter()
+                    .any(|t| crate::registry::pattern_matches(key, t))
+            {
+                err(format!(
+                    "{at}.tags: {key:?} names no operation tool of {server:?} — its tools are {}",
+                    tools.join(", ")
+                ));
+            }
+        }
+    }
 }
 
 /// A standing permission (RFC 0047 §5.8.1): spending authority the
@@ -1185,7 +1447,16 @@ fn validate_standing(s: &Settings, at: &str, st: &Standing, err: &mut impl FnMut
                 .into_iter()
                 .map(|(n, _)| n)
                 .collect();
-            if servers.is_empty() {
+            let api = api_server_names(name, svc).into_iter().find(|(a, _)| {
+                operations_of(svc)
+                    .iter()
+                    .any(|(n, _)| crate::registry::pattern_matches(tool, &format!("{a}.{n}")))
+            });
+            if let Some((api, _)) = api {
+                err(format!(
+                    "{at}.via.tool: {tool:?} names operation tools of {api:?}, whose operations are proposed through the Company's API — name the operation with via.api (\"METHOD /path-template\")"
+                ));
+            } else if servers.is_empty() {
                 err(format!(
                     "{at}.via.tool: company {name} uses none of its MCP servers (services.{name}.interfaces lists no mcp)"
                 ));
@@ -1654,7 +1925,12 @@ mod tests {
             s.streams.contains_key("company.shop"),
             "its stream is declared"
         );
-        assert!(company_servers(&s).is_empty(), "no MCP server without mcp");
+        assert_eq!(
+            company_servers(&s),
+            ["shop"],
+            "no MCP server without mcp; the server its operation tools are named under"
+        );
+        assert!(is_api_server(&s, "shop"));
         let ctx = context_of(&s, &s.services["shop"]);
         assert_eq!(ctx.locale.as_deref(), Some("en-US"));
         assert_eq!(
@@ -1930,6 +2206,284 @@ mod tests {
                 "name: Agent, extensions: [operations, operations]}",
             ),
             "client.extensions: operations is listed twice",
+        );
+    }
+
+    /// An operation tool's name is its `api_allow` entry by one fixed rule:
+    /// in lower case, each run of other characters one `_`, none at either
+    /// end, capped — the operator's words, whatever the Company calls it.
+    #[test]
+    fn an_operation_tool_is_named_from_its_api_allow_entry() {
+        for (op, name) in [
+            ("GET /orders/{order_id}", "get_orders_order_id"),
+            (
+                "POST /orders/{order_id}/exchanges",
+                "post_orders_order_id_exchanges",
+            ),
+            ("GET /", "get"),
+            (
+                "DELETE /Orders/{ID}//items.json",
+                "delete_orders_id_items_json",
+            ),
+            ("GET /café-menu", "get_caf_menu"),
+        ] {
+            assert_eq!(operation_name(op), name, "{op}");
+        }
+        let long = format!("GET /{}/x", "a".repeat(70));
+        let capped = operation_name(&long);
+        assert_eq!(capped.len(), MAX_OPERATION_NAME);
+        assert!(capped.starts_with("get_aaa"), "{capped}");
+        let edge = format!("GET /{}/x", "a".repeat(MAX_OPERATION_NAME - 5));
+        assert!(
+            !operation_name(&edge).ends_with('_'),
+            "cut where a `_` falls, it is trimmed: {}",
+            operation_name(&edge)
+        );
+        // A key other than `*` sets the tags of the operation tools it
+        // names, with `*`'s; a tool none names carries every tag the entry
+        // lists, so a key never takes a tag from a tool it does not name.
+        let tags = BTreeMap::from([
+            ("*".to_string(), vec!["untrusted_input".to_string()]),
+            ("shop.post_*".to_string(), vec!["egress".to_string()]),
+            ("shop.get_orders".to_string(), vec!["sensitive".to_string()]),
+            (
+                "shop.get_orders_*".to_string(),
+                vec!["untrusted_input".to_string()],
+            ),
+        ]);
+        use crate::sec::scope::TrifectaTag as T;
+        assert_eq!(
+            operation_tags(&tags, "shop.post_notes"),
+            [T::UntrustedInput, T::Egress]
+        );
+        assert_eq!(
+            operation_tags(&tags, "shop.get_orders_order_id"),
+            [T::UntrustedInput]
+        );
+        assert_eq!(
+            operation_tags(&tags, "shop.delete_notes"),
+            [T::UntrustedInput, T::Sensitive, T::Egress],
+            "named by `*` alone, it carries all the entry's tags"
+        );
+        let for_mcp = BTreeMap::from([(
+            "shop.*".to_string(),
+            vec!["untrusted_input".to_string(), "egress".to_string()],
+        )]);
+        assert_eq!(
+            operation_tags(&for_mcp, "shop_api.post_notes"),
+            [T::UntrustedInput, T::Egress],
+            "a key for the entry's MCP server takes nothing from its operation tools"
+        );
+    }
+
+    /// A company entry that uses `openapi` and lists operations in
+    /// `api_allow` stands for a server they are named under: after the
+    /// entry, or as `api_names` names each OpenAPI API — `ns` its own name,
+    /// the entry's tags, no MCP ceiling, marked as an OpenAPI API's.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn a_company_entry_names_the_server_of_its_operation_tools() {
+        let ops =
+            ", interfaces: [openapi], api_allow: [\"GET /orders/{order_id}\", \"POST /notes\"]";
+        let s = load(&company(ops)).unwrap();
+        let shop = s.mcp.servers.iter().find(|x| x.name == "shop").unwrap();
+        assert_eq!(shop.ns.as_deref(), Some("shop"));
+        assert_eq!(shop.tags, default_tags());
+        assert!(shop.allow.is_none() && shop.exclude.is_empty());
+        assert_eq!(
+            shop.company.as_ref().map(|c| c.interface),
+            Some(Interface::Openapi)
+        );
+        assert!(is_api_server(&s, "shop") && is_company_server(&s, "shop"));
+        assert_eq!(
+            api_tool_names(&s, "shop"),
+            ["shop.get_orders_order_id", "shop.post_notes"]
+        );
+        // With an MCP server of its own, one of them is named apart.
+        let both = ", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"], api_names: {\"https://example.com/openapi.json\": shop_api}";
+        let s = load(&company(both)).unwrap();
+        assert!(!is_api_server(&s, "shop") && is_api_server(&s, "shop_api"));
+        assert_eq!(api_tool_names(&s, "shop_api"), ["shop_api.post_notes"]);
+        assert_eq!(
+            s.mcp
+                .servers
+                .iter()
+                .find(|x| x.name == "shop_api")
+                .and_then(|x| x.company.as_ref())
+                .and_then(|c| c.url.as_deref()),
+            Some("https://example.com/openapi.json")
+        );
+        // Without operations there is no such server.
+        let s = load(&company(", interfaces: [openapi]")).unwrap();
+        assert!(company_servers(&s).is_empty());
+    }
+
+    /// An operation tool's call is `company.api`'s call of its operation, so
+    /// what holds that tool holds it: disabling `company.api` disables it,
+    /// narrowing `company.api` narrows it, and the root conversation is
+    /// offered it only where `agent.tools` offers `company.api`. A key of the
+    /// entry's `tags` written for its MCP server takes no tag from it.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn what_holds_company_api_holds_its_operation_tools() {
+        use crate::registry::{Caller, Registry, ServerTools};
+        use crate::sec::scope::TrifectaTag as T;
+        let entry = company(
+            ", interfaces: [mcp, openapi], api_allow: [\"GET /orders/{order_id}\", \"POST /notes\"], api_names: {\"https://example.com/openapi.json\": shop_api}, tags: {\"shop.*\": [untrusted_input, egress], \"shop_api.get_*\": [untrusted_input]}",
+        );
+        let tool = |n: &str| ::mcp::wire::Tool {
+            name: n.into(),
+            title: None,
+            description: Some(format!("{n}.")),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+        };
+        let built = |extra: &str| {
+            let s = load(&format!("{entry}{extra}")).unwrap();
+            let servers = [ServerTools {
+                name: "shop_api".into(),
+                ns: Some("shop_api".into()),
+                tags: Vec::new(),
+                tools: vec![tool("get_orders_order_id"), tool("post_notes")],
+            }];
+            (Registry::build(&s, &servers).unwrap(), s)
+        };
+        let (post, get) = ("shop_api.post_notes", "shop_api.get_orders_order_id");
+        let (reg, _) = built("");
+        assert_eq!(reg.contract_of(post), Some("company.api"));
+        assert_eq!(reg.contract_of("company.api"), None);
+        assert_eq!(
+            reg.tags_of(&[post.to_string()]),
+            [T::UntrustedInput, T::Egress],
+            "named by no key of its own, it carries all the entry's tags"
+        );
+        assert_eq!(reg.tags_of(&[get.to_string()]), [T::UntrustedInput]);
+        let (reg, _) = built("tools:\n  disabled: [company.api]\n");
+        assert!(!reg.allowed(&Caller::Root, post) && !reg.allowed(&Caller::Workflow, get));
+        let (reg, _) = built(
+            "tools:\n  narrow:\n    company.api: {tags: [sensitive], describe: Ask first.}\n",
+        );
+        for name in [post, get, "company.api"] {
+            let t = reg.get(name).unwrap();
+            assert!(t.tags.contains(&T::Sensitive), "{name}: {:?}", t.tags);
+            assert!(
+                t.description.ends_with("[operator note]: Ask first."),
+                "{name}: {}",
+                t.description
+            );
+        }
+        let offered = |extra: &str| -> Vec<String> {
+            let (reg, s) = built(extra);
+            reg.defs_for(&Caller::Root, Some(&s.agent.tools))
+                .into_iter()
+                .map(|d| d.name)
+                .filter(|n| n.starts_with("shop_api.") || n == "company.api")
+                .collect()
+        };
+        assert_eq!(offered(""), ["company.api", get, post]);
+        assert!(offered("agent:\n  tools: {internal: [status]}\n").is_empty());
+        assert_eq!(
+            offered("agent:\n  tools: {internal: [company.api], mcp: [shop_api]}\n"),
+            ["company.api", get, post]
+        );
+    }
+
+    /// What load refuses about operation tools, each named: a server name
+    /// taken — by the entry's own MCP server, another entry's, a configured
+    /// one — an `api_names` that names nothing or is not one, an operation
+    /// listed twice or two named alike, and a tag, a policy, a workflow step
+    /// or a standing permission naming an operation tool the entry has not.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn what_load_refuses_about_operation_tools_and_why() {
+        let refused = |yaml: &str, why: &str| {
+            let e = load(yaml).expect_err(yaml);
+            assert!(e.contains(why), "want {why:?} in:\n{e}");
+        };
+        let ops = |extra: &str| {
+            company(&format!(
+                ", interfaces: [openapi], api_allow: [\"GET /orders/{{order_id}}\", \"POST /notes\"]{extra}"
+            ))
+        };
+        refused(
+            &company(", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"]"),
+            "services.shop: the server its operation tools are named under \"shop\" has the name of another of its own servers — name them apart with api_names or mcp_names",
+        );
+        refused(
+            &format!(
+                "{}mcp:\n  servers:\n    - {{name: shop, endpoint: \"https://other.example/mcp\"}}\n",
+                ops("")
+            ),
+            "has the name of mcp server 'shop' — rename one (api_names names a Company's servers)",
+        );
+        refused(
+            &company(", interfaces: [mcp], api_names: {\"https://example.com/o.json\": o}"),
+            "services.shop.api_names: it names the servers the Company's OpenAPI operation tools are named under, and the entry does not use `openapi`",
+        );
+        refused(
+            &company(", interfaces: [openapi], api_names: {\"https://example.com/o.json\": o}"),
+            "services.shop.api_names: services.shop.api_allow lists no operation",
+        );
+        refused(
+            &ops(
+                ", api_names: {\"http://example.com/o.json\": o, \"https://example.com/p.json\": code}",
+            ),
+            "is not an HTTPS URL, and an OpenAPI API's url is one",
+        );
+        refused(
+            &ops(", api_names: {\"https://example.com/p.json\": code}"),
+            "services.shop.api_names: \"code\" is not a server name",
+        );
+        refused(
+            &ops(
+                ", api_names: {\"https://example.com/o.json\": o, \"https://example.com/p.json\": o}",
+            ),
+            "services.shop.api_names: two OpenAPI APIs are both named \"o\"",
+        );
+        refused(
+            &company(
+                ", interfaces: [openapi], api_allow: [\"GET /orders/{order_id}\", \"GET /orders/{id}\"]",
+            ),
+            "services.shop.api_allow: \"GET /orders/{order_id}\" and \"GET /orders/{id}\" name the same operation",
+        );
+        refused(
+            &company(", interfaces: [openapi], api_allow: [\"GET /a-b\", \"GET /a_b\"]"),
+            "services.shop.api_allow: \"GET /a-b\" and \"GET /a_b\" both make the operation tool name \"get_a_b\"",
+        );
+        refused(
+            &ops(", tags: {\"*\": [untrusted_input], \"shop.get_order\": [egress]}"),
+            "services.shop.tags: \"shop.get_order\" names no operation tool of \"shop\" — its tools are shop.get_orders_order_id, shop.post_notes",
+        );
+        load(&ops(
+            ", tags: {\"*\": [untrusted_input], \"shop.post_*\": [egress]}",
+        ))
+        .unwrap();
+        refused(
+            &ops("").replace(
+                STORE,
+                &format!(
+                    "  policies:\n    - {{match: {{tool: \"shop.delete_*\"}}, action: deny}}\n{STORE}"
+                ),
+            ),
+            "security.policies[0].match.tool: \"shop.delete_*\" names no operation tool of company entry shop",
+        );
+        let flow = |name: &str| {
+            format!(
+                "{}workflows:\n  - name: w\n    steps:\n      s: {{kind: once}}\n      t: {{kind: tool, name: {name}, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [t], status: completed}}\n",
+                ops("")
+            )
+        };
+        refused(
+            &flow("shop.get_order"),
+            "workflow \"w\" step \"t\": \"shop.get_order\" names no operation tool of company entry shop",
+        );
+        load(&flow("shop.get_orders_order_id")).unwrap();
+        refused(
+            &ops("").replace(
+                "name: Agent}",
+                "name: Agent, extensions: [operations]}\n    standing:\n      - {company: shop, via: {tool: \"shop.post_*\"}, terms: [a], when: \"true\", expires: \"2026-12-31T00:00:00Z\"}",
+            ),
+            "standing[0].via.tool: \"shop.post_*\" names operation tools of \"shop\", whose operations are proposed through the Company's API — name the operation with via.api",
         );
     }
 

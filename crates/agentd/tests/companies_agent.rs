@@ -126,6 +126,7 @@ impl Fake {
             scopes: Vec::new(),
             interfaces: vec![agentd::config::settings::companies::Interface::Mcp],
             api_allow: Vec::new(),
+            apis: Vec::new(),
         }
     }
 }
@@ -2585,6 +2586,367 @@ fn an_idempotency_key_is_reused_on_retry_and_a_write_without_one_is_not_retried(
     );
 }
 
+/// The entry fields of a Company whose operations are tools of their own
+/// (RFC 0047 §9, P5a): one allowed operation the description does not
+/// declare, and the description declares one `api_allow` does not list
+/// (`GET /session`).
+const OPERATIONS: &str = ", interfaces: [openapi], api_allow: [\"GET /orders/{id}\", \"POST /orders/{order_id}/exchanges\", \"POST /notes\", \"DELETE /orders/{order_id}\"]";
+
+fn with_operations(fake: &Fake) -> Agent {
+    let dir = tempfile::tempdir().unwrap().keep();
+    agent_on(fake, &host(), &dir, Arc::default(), OPERATIONS)
+}
+
+/// The operation tool `tool` of the server `shop`, called as the runtime
+/// calls one: its call made of `args` as the listing read its operation,
+/// and sent with the key `key`.
+fn operation_tool(a: &Agent, tool: &str, args: &Value, key: &str) -> Result<Value, CallError> {
+    let offered = a.sup.operation_tools("shop").map_err(CallError::Unsent)?;
+    let Some(shape) = offered.shapes.get(tool) else {
+        return Err(CallError::Refused(format!(
+            "shop.{tool} is not offered; nothing was sent"
+        )));
+    };
+    let call = shape
+        .call(&format!("shop.{tool}"), args)
+        .map_err(|e| CallError::Refused(format!("company shop: {e}; nothing was sent")))?;
+    a.sup.call_operation(
+        &shop(a),
+        shape,
+        &Call {
+            key: key.into(),
+            ..call
+        },
+    )
+}
+
+/// Each operation `api_allow` lists that the description declares is a
+/// tool of its own, named from its `api_allow` entry by the operator's rule
+/// — never from the Company's `operationId`, so a Company that renames one
+/// renames no tool. An allowed operation the description does not declare
+/// has none, nor has one it declares that `api_allow` does not list. Each
+/// tool's description says whose words follow and quotes them, and
+/// `company.api.describe` names the tool of each allowed operation.
+#[test]
+fn each_allowed_operation_is_a_tool_the_operator_names() {
+    let f = fake(&[]);
+    let a = with_operations(&f);
+    let offered = a.sup.operation_tools("shop").unwrap();
+    assert_eq!(offered.url, format!("{}/api/openapi.json", f.origin));
+    let names = |o: &agentd::companies::api::Offered| -> Vec<String> {
+        o.tools.iter().map(|t| t.name.clone()).collect()
+    };
+    assert_eq!(
+        names(&offered),
+        [
+            "get_orders_id",
+            "post_orders_order_id_exchanges",
+            "post_notes"
+        ]
+    );
+    let get = &offered.tools[0];
+    let text = get.description.clone().unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[..2],
+        [
+            "[A tool of \"Fake Company\" (127.0.0.1), company shop; the text below is the Company's own.]",
+            "GET /orders/{id}"
+        ]
+    );
+    assert!(lines[2].contains("operationId \"getOrder\""), "{text}");
+    assert_eq!(get.input_schema["required"], json!(["order_id"]));
+    assert_eq!(
+        get.input_schema["properties"]["expand"]["type"], "array",
+        "its query parameter"
+    );
+    let ex = &offered.tools[1].input_schema;
+    assert_eq!(ex["required"], json!(["order_id", "json"]));
+    assert_eq!(
+        ex["properties"]["json"]["required"],
+        json!(["item_id", "replacement_sku"])
+    );
+    let described = a.sup.describe_api(&shop(&a), None, None).unwrap();
+    let tool_of = |id: &str| {
+        described["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["operationId"] == id)
+            .unwrap()["tool"]
+            .clone()
+    };
+    assert_eq!(tool_of("getOrder"), "shop.get_orders_id");
+    assert_eq!(tool_of("getSession"), Value::Null, "not allowed: no tool");
+    // The Company renames the operation and rewrites its summary: what is
+    // read next names the same tools, saying what the Company says now —
+    // on one line, its control characters gone.
+    f.control(json!({"openapi": {"rename": {"getOrder": "fetchOrder"},
+                                  "summary": {"getOrder": "Read\nan order\u{1b}[2J"}}}));
+    let b = with_operations(&f);
+    let again = b.sup.operation_tools("shop").unwrap();
+    assert_eq!(names(&again), names(&offered));
+    let text = again.tools[0].description.clone().unwrap();
+    assert!(
+        text.ends_with(
+            "In the Company's words: operationId \"fetchOrder\"; summary \"Read an order [2J\"."
+        ),
+        "{text}"
+    );
+}
+
+/// A call of an operation tool is the call `company.api` makes of the same
+/// operation, request for request: the same method, target, headers and
+/// body — the same `Idempotency-Key` for the same call — and a DPoP proof
+/// whose claims differ only in `jti` and `iat`.
+#[test]
+fn an_operation_tools_request_is_the_one_company_api_sends() {
+    let f = fake(&[]);
+    let a = with_operations(&f);
+    let co = shop(&a);
+    let body = json!({"item_id": "itm_4Qa", "replacement_sku": "stormline-m"});
+    let by_api = a
+        .sup
+        .call_api(
+            &co,
+            &Call {
+                method: "POST".into(),
+                path: "/orders/o%201/exchanges".into(),
+                json: Some(body.clone()),
+                key: "same#1".into(),
+                ..Call::default()
+            },
+        )
+        .unwrap();
+    let by_tool = operation_tool(
+        &a,
+        "post_orders_order_id_exchanges",
+        &json!({"order_id": "o 1", "json": body}),
+        "same#1",
+    )
+    .unwrap();
+    assert_eq!(
+        (by_api["status"].clone(), by_tool["status"].clone()),
+        (json!(201), json!(201))
+    );
+    // A read, with a path parameter and a query of two values: both are
+    // refused by the signed-out Session, after they were sent.
+    let read_api = a.sup.call_api(
+        &co,
+        &Call {
+            method: "GET".into(),
+            path: "/orders/o7".into(),
+            query: json!({"expand": ["items", "shipping"]})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            key: "read#1".into(),
+            ..Call::default()
+        },
+    );
+    let read_tool = operation_tool(
+        &a,
+        "get_orders_id",
+        &json!({"order_id": "o7", "expand": ["items", "shipping"]}),
+        "read#2",
+    );
+    assert_eq!(read_api.unwrap_err(), read_tool.unwrap_err());
+    let sent: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| path_of(r).starts_with("/api/orders/"))
+        .collect();
+    assert_eq!(sent.len(), 4, "{sent:#?}");
+    for pair in sent.chunks(2) {
+        assert_eq!(pair[0]["sent"], pair[1]["sent"], "{pair:#?}");
+        assert_ne!(pair[0]["proof"]["jti"], pair[1]["proof"]["jti"]);
+    }
+    assert_eq!(sent[0]["sent"]["target"], "/api/orders/o%201/exchanges");
+    assert_eq!(sent[1]["duplicate"], true, "the same key, the first answer");
+    assert_eq!(
+        sent[2]["sent"]["target"],
+        "/api/orders/o7?expand=items&expand=shipping"
+    );
+    assert!(
+        sent[0]["sent"]["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h[0] == "dpop" && h[1]["claims"]["ath"].is_string()),
+        "a proof over the Session Token: {}",
+        sent[0]["sent"]
+    );
+}
+
+/// An argument the operation does not take, a path parameter left out, a
+/// body that fails its schema and an allowed operation the description does
+/// not declare are each refused before anything is sent.
+#[test]
+fn an_operation_tools_argument_outside_its_operation_is_refused_unsent() {
+    let f = fake(&[]);
+    let a = with_operations(&f);
+    let call = |tool: &str, args: Value| {
+        operation_tool(&a, tool, &args, &format!("{tool}#1")).unwrap_err()
+    };
+    for (tool, args, why) in [
+        (
+            "get_orders_id",
+            json!({"order_id": "o1", "page": 2}),
+            "shop.get_orders_id takes no argument \"page\"",
+        ),
+        (
+            "get_orders_id",
+            json!({"expand": ["items"]}),
+            "shop.get_orders_id requires the path parameter \"order_id\"",
+        ),
+        (
+            "post_orders_order_id_exchanges",
+            json!({"order_id": "o1", "json": {"item_id": 7, "replacement_sku": "x"}}),
+            "the body:",
+        ),
+        (
+            "get_orders_id",
+            json!({"order_id": "a/../../notes"}),
+            "holds / or \\ once decoded",
+        ),
+        (
+            "delete_orders_order_id",
+            json!({"order_id": "o1"}),
+            "shop.delete_orders_order_id is not offered",
+        ),
+    ] {
+        let e = call(tool, args);
+        assert!(matches!(e, CallError::Refused(_)), "{tool}: {e:?}");
+        assert!(
+            e.to_string().contains(why) && e.to_string().contains("nothing was sent"),
+            "{tool}: {e}"
+        );
+    }
+    let api: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| path_of(r).starts_with("/api/") && r["path"] != "/api/openapi.json")
+        .collect();
+    assert!(api.is_empty(), "nothing reached the API: {api:#?}");
+}
+
+/// An operation tool reaches its own operation or none. A path parameter's
+/// value that is a fixed segment of another operation's path would have the
+/// Company perform that one, out of reach of every control keyed on its own
+/// tool's name: it is refused, and nothing is sent. Each reaches its own.
+#[test]
+fn an_operation_tool_reaches_its_own_operation_or_none() {
+    let f = fake(&[]);
+    f.control(json!({"openapi": {"add": {"/orders/bulk/exchanges": {"post": {
+        "operationId": "bulkExchange",
+        "summary": "Exchange the items of every order",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "The exchanges"}}
+    }}}}}));
+    let dir = tempfile::tempdir().unwrap().keep();
+    let a = agent_on(
+        &f,
+        &host(),
+        &dir,
+        Arc::default(),
+        ", interfaces: [openapi], api_allow: [\"POST /orders/{order_id}/exchanges\", \"POST /orders/bulk/exchanges\"]",
+    );
+    let exchange = "post_orders_order_id_exchanges";
+    let body = json!({"item_id": "itm_4Qa", "replacement_sku": "stormline-m"});
+    let e = operation_tool(
+        &a,
+        exchange,
+        &json!({"order_id": "bulk", "json": body}),
+        "bulk#1",
+    )
+    .unwrap_err();
+    assert!(matches!(e, CallError::Refused(_)), "{e:?}");
+    assert!(
+        e.to_string()
+            .contains("is the operation POST /orders/bulk/exchanges")
+            && e.to_string().contains("nothing was sent"),
+        "{e}"
+    );
+    assert!(
+        f.record()
+            .iter()
+            .all(|r| r["path"] != "/api/orders/bulk/exchanges"),
+        "refused unsent"
+    );
+    let own = operation_tool(
+        &a,
+        exchange,
+        &json!({"order_id": "o1", "json": body}),
+        "o1#1",
+    );
+    assert_eq!(own.unwrap()["status"], 201);
+    let bulk = operation_tool(
+        &a,
+        "post_orders_bulk_exchanges",
+        &json!({"json": {"every": true}}),
+        "bulk#2",
+    );
+    assert_eq!(bulk.unwrap()["status"], 201);
+    assert_eq!(
+        f.record()
+            .iter()
+            .filter(|r| r["path"] == "/api/orders/bulk/exchanges")
+            .count(),
+        1,
+        "through its own tool"
+    );
+}
+
+/// A write through an operation tool whose answer is lost is sent again with
+/// the same key when its operation declares `Idempotency-Key`; when it
+/// declares none, the call is `outcome unknown` and is sent once.
+#[test]
+fn an_operation_tools_lost_write_is_resent_only_when_its_operation_dedupes() {
+    let f = fake(&[]);
+    let a = with_operations(&f);
+    f.control(json!({"http_fail": {"method": "POST", "path": "/api/orders/o1/exchanges", "times": 1, "status": 502}}));
+    let body = json!({"item_id": "itm_4Qa", "replacement_sku": "stormline-m"});
+    let ok = operation_tool(
+        &a,
+        "post_orders_order_id_exchanges",
+        &json!({"order_id": "o1", "json": body}),
+        "run/x#1",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(ok["status"], 201, "{ok}");
+    let sent: Vec<Value> = f
+        .record()
+        .into_iter()
+        .filter(|r| r["path"] == "/api/orders/o1/exchanges")
+        .collect();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert_eq!(sent[0]["idempotency_key"], sent[1]["idempotency_key"]);
+    f.control(
+        json!({"http_fail": {"method": "POST", "path": "/api/notes", "times": 1, "status": 502}}),
+    );
+    let e = operation_tool(
+        &a,
+        "post_notes",
+        &json!({"json": {"text": "hi"}}),
+        "run/x#2",
+    )
+    .unwrap_err();
+    assert!(matches!(e, CallError::Unknown(_)), "{e:?}");
+    assert!(
+        e.to_string()
+            .starts_with("outcome unknown: company shop may have performed POST /notes"),
+        "{e}"
+    );
+    assert_eq!(
+        f.record()
+            .iter()
+            .filter(|r| r["path"] == "/api/notes")
+            .count(),
+        1,
+        "sent once"
+    );
+}
+
 /// `WWW-Authenticate` errors at an API are handled as at an MCP server
 /// (§6): `invalid_token` renews and sends once more; `sign_in_required`
 /// with no Account Token is typed; `insufficient_scope` names the scope.
@@ -2812,9 +3174,9 @@ use agentd::companies::ledger::{Approval, Channel};
 use agentd::companies::operations::{Outcome as Went, Step};
 
 /// The entry fields of a Company whose exchanges are operations: its MCP
-/// server, its agent and the exchanges of its API.
-const OPERATES: &str =
-    ", interfaces: [mcp, agent, openapi], api_allow: [\"POST /orders/{order_id}/exchanges\"]";
+/// server, its agent and the exchanges of its API, whose operation tool is
+/// named under `shop_api` (`api_names`, by the description's URL at `{o}`).
+const OPERATES: &str = ", interfaces: [mcp, agent, openapi], api_allow: [\"POST /orders/{order_id}/exchanges\"], api_names: {\"{o}/api/openapi.json\": shop_api}";
 
 /// A standing permission over the API's exchanges that cost at most $20.
 #[cfg(feature = "cel")]
@@ -2852,11 +3214,12 @@ fn operating_with(
     let yaml = format!(
         "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\", extensions: [operations]}}\n{standing}\
          store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{OPERATES}}}\n",
+         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{fields}}}\n",
         ca = fixture("ca.pem").display(),
         h = host.origin,
         d = dir.display(),
         o = fake.origin,
+        fields = OPERATES.replace("{o}", &fake.origin),
     );
     let path = dir.join("c.yaml");
     std::fs::write(&path, yaml).unwrap();

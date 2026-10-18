@@ -2251,6 +2251,11 @@ pub struct Service {
     /// Company lists more than one.
     #[serde(default)]
     pub mcp_names: BTreeMap<String, String>,
+    /// `kind: company` only — a server name for each OpenAPI API `url`, under
+    /// which the tools of the operations `api_allow` lists are named, when
+    /// the Company lists more than one or the entry's name is taken.
+    #[serde(default)]
+    pub api_names: BTreeMap<String, String>,
     /// `kind: company` only — what agentd's own correlators a Company sees.
     #[serde(default)]
     pub privacy: Option<companies::Privacy>,
@@ -14859,6 +14864,7 @@ mod tests {
                 allow_private: None,
                 interfaces: None,
                 mcp_names: BTreeMap::new(),
+                api_names: BTreeMap::new(),
                 privacy: None,
                 sign_in: None,
                 scopes: None,

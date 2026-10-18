@@ -331,7 +331,8 @@ impl Runtime {
     /// tools are listed only once it does (`runtime::join`, every boot
     /// included), so a `tool` step naming one is not refused for it — the
     /// step fails if it runs before the join, as a call to any server that
-    /// is down does.
+    /// is down does. An operation tool's name is known before then, and only
+    /// one the configuration makes is to come.
     pub(crate) fn company_tool_to_come(
         &self,
         tool: &str,
@@ -339,6 +340,12 @@ impl Runtime {
     ) -> bool {
         registry.get(tool).is_none()
             && tool.split_once('.').is_some_and(|(server, _)| {
+                use crate::config::settings::companies as co;
+                if co::is_api_server(&self.settings, server) {
+                    return co::api_tool_names(&self.settings, server)
+                        .iter()
+                        .any(|t| t == tool);
+                }
                 self.is_company_server(server) && !self.mcp.contains_key(server)
             })
     }
@@ -448,10 +455,13 @@ impl Runtime {
         let Some(sup) = &self.companies else {
             return serde_json::json!({"user": self.settings.security.companies.user(), "companies": []});
         };
+        // Its MCP servers connected, and its OpenAPI APIs whose operation
+        // tools are offered.
         let joined: std::collections::BTreeSet<String> = self
             .mcp
             .keys()
             .filter(|s| self.is_company_server(s))
+            .chain(self.joining.offered().map(|(s, _)| s))
             .cloned()
             .collect();
         let companies: Vec<Value> = sup

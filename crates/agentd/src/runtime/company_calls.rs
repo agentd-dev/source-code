@@ -29,6 +29,13 @@
 //! the Company's description that `api_allow` lists, and every rule of the
 //! tool holds — the User's work only, the in-flight limit, the cross-Company
 //! gate, the schemas, the `Idempotency-Key` — its output the tool's.
+//!
+//! **An operation tool** (`<server>.<operation>`, RFC 0047 §9, P5a) is
+//! `company.api` for the one operation it stands for: the same call, made
+//! from the tool's arguments as its tools were adopted (`api::Shape`), and
+//! sent the way `company.api` sends one, under every rule above. A policy
+//! rule judges it as `company.api`'s call as well as its own
+//! ([`Runtime::operation_view`]).
 
 use std::sync::Arc;
 
@@ -36,6 +43,7 @@ use serde_json::{Map, Value, json};
 
 use super::reactor::Runtime;
 use super::tools::{ExecTarget, ToolCaller, ToolOutcome};
+use crate::companies::api::{Call, Shape, as_company_api};
 use crate::companies::conversation::{Delivery, Say};
 use crate::companies::request::CallError;
 use crate::companies::wire::conversation as conv;
@@ -91,17 +99,100 @@ impl Runtime {
         name: &str,
         args: &Value,
     ) -> ToolOutcome {
+        let entry = args["company"].as_str().unwrap_or_default().to_string();
+        self.company_call(caller, name, &entry, args, None)
+    }
+
+    /// The operation tool `name`, `tool` of the Company OpenAPI API `server`:
+    /// the `company.api` call of its operation, as the module says.
+    pub(crate) fn company_operation_call(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> ToolOutcome {
+        match self.operation_call(server, tool, &args) {
+            Ok((entry, shape, call)) => {
+                self.company_call(caller, name, &entry, &args, Some((shape, call)))
+            }
+            Err(e) => ToolOutcome::Ready(Value::String(format!("{name}: {e}")), true),
+        }
+    }
+
+    /// The company entry the operation tool `tool` of the Company OpenAPI
+    /// API `server` acts at, the operation it stands for as its tools were
+    /// adopted, and the `company.api` call it makes of `args` — or why it
+    /// makes none, refused unsent.
+    fn operation_call(
+        &self,
+        server: &str,
+        tool: &str,
+        args: &Value,
+    ) -> Result<(String, Shape, Call), String> {
+        let entry = self
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.company.as_ref())
+            .map(|c| c.entry.clone())
+            .unwrap_or_default();
+        let shape = self.joining.shape(server, tool).ok_or_else(|| {
+            format!("company {entry}: {server}.{tool} is not offered; nothing was sent")
+        })?;
+        let call = shape
+            .call(&format!("{server}.{tool}"), args)
+            .map_err(|e| format!("company {entry}: {e}; nothing was sent"))?;
+        Ok((entry, shape.clone(), call))
+    }
+
+    /// When `name` is a Company's operation tool, its call of `args` as
+    /// `company.api`'s arguments — the call a policy rule keyed on
+    /// `company.api` judges — or why it makes none.
+    pub(crate) fn operation_view(&self, name: &str, args: &Value) -> Option<Result<Value, String>> {
+        let Some(crate::registry::Route::Mcp { server, tool }) = self.registry.route(name) else {
+            return None;
+        };
+        if !crate::config::settings::companies::is_api_server(&self.settings, server) {
+            return None;
+        }
+        Some(
+            self.operation_call(server, tool, args)
+                .map(|(entry, _, call)| as_company_api(&entry, &call, args.get("expect"))),
+        )
+    }
+
+    /// The call of the `company.*` tool `name` at the company entry `entry`,
+    /// or — with `operation`, the operation it stands for and the call it
+    /// makes — of the operation tool `name`.
+    fn company_call(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        entry: &str,
+        args: &Value,
+        operation: Option<(Shape, Call)>,
+    ) -> ToolOutcome {
         let refuse = |e: String| ToolOutcome::Ready(Value::String(format!("{name}: {e}")), true);
         let Some(sup) = self.companies.clone() else {
             return refuse("no Company is declared".into());
         };
-        let entry = args["company"].as_str().unwrap_or_default().to_string();
+        let entry = entry.to_string();
         let Some(company) = sup.company(&entry) else {
             return refuse(format!(
                 "{entry:?} is not a company entry (services.<name>.kind: company)"
             ));
         };
-        let interface = if crate::config::settings::companies::is_conversation_tool(name) {
+        // The contract the call is: an operation tool's is `company.api`'s.
+        let contract = if operation.is_some() {
+            "company.api"
+        } else {
+            name
+        };
+        let interface = if crate::config::settings::companies::is_conversation_tool(contract) {
             "agent"
         } else {
             "openapi"
@@ -121,15 +212,18 @@ impl Runtime {
                 true,
             );
         };
-        let method = args["method"]
-            .as_str()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
+        let method = match &operation {
+            Some((_, call)) => call.method.clone(),
+            None => args["method"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_uppercase(),
+        };
         // A step's API write that may run is on its record before it leaves:
         // a restart that finds the step running does not send it again. A
         // message, a read, a handoff and a close are the same whenever they
         // are sent again, and are sent again.
-        if name == "company.api"
+        if contract == "company.api"
             && !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
             && let (Some(run), Some(step), None) = (&caller.run, &caller.step, &caller.subagent)
             && let Some(r) = self.runs.get_mut(run)
@@ -152,14 +246,14 @@ impl Runtime {
         let call = unit.as_ref().map(crate::obs::trace::TraceContext::child);
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
-        let (name, args) = (name.to_string(), args.clone());
+        let (name, contract, args) = (name.to_string(), contract.to_string(), args.clone());
         std::thread::Builder::new()
             .name(format!("company:{}:{name}", company.name))
             .spawn(move || {
                 let start = crate::obs::otel::now_unix_nanos();
                 // A description is fetched with no credential, and names no
                 // trace.
-                let traced = if name == "company.api.describe" {
+                let traced = if contract == "company.api.describe" {
                     Ok((None, None))
                 } else {
                     sup.request_trace(&company, unit.as_ref(), call.as_ref())
@@ -183,7 +277,7 @@ impl Runtime {
                     })
                 };
                 let cid = text("conversation").unwrap_or_default();
-                let res: Result<Value, CallError> = match name.as_str() {
+                let res: Result<Value, CallError> = match contract.as_str() {
                     "company.converse" => sup.converse(
                         &company,
                         &Say {
@@ -208,25 +302,36 @@ impl Runtime {
                     "company.close" => {
                         sup.conversation_op(&company, &cid, conv::CLOSE, sent.as_ref())
                     }
-                    "company.api" => sup.call_api(
-                        &company,
-                        &crate::companies::api::Call {
-                            api: text("api"),
-                            method,
-                            path: text("path").unwrap_or_default(),
-                            query: args["query"].as_object().cloned().unwrap_or_default(),
-                            json: args.get("json").cloned(),
-                            key,
-                            trace: sent,
-                        },
-                    ),
+                    "company.api" => match &operation {
+                        Some((shape, call)) => sup.call_operation(
+                            &company,
+                            shape,
+                            &Call {
+                                key,
+                                trace: sent,
+                                ..call.clone()
+                            },
+                        ),
+                        None => sup.call_api(
+                            &company,
+                            &Call {
+                                api: text("api"),
+                                method,
+                                path: text("path").unwrap_or_default(),
+                                query: args["query"].as_object().cloned().unwrap_or_default(),
+                                json: args.get("json").cloned(),
+                                key,
+                                trace: sent,
+                            },
+                        ),
+                    },
                     _ => sup.describe_api(
                         &company,
                         text("api").as_deref(),
                         text("operation").as_deref(),
                     ),
                 };
-                let outcome = outcome_of(&name, &args, &res);
+                let outcome = outcome_of(&contract, &args, &res);
                 crate::obs::metrics::record_company_request(slot.company(), interface, outcome);
                 // The Company's content: the context it reaches carries the
                 // Company's origin, written before the answer is read — and

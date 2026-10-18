@@ -350,7 +350,7 @@ its own, addressed to the configured User, `security.companies.user`. The
 first is the cross-Company gate: work that has read one Company's answer —
 or its error, or a message from work that had — and calls another Company's
 tool, its agent (`company.converse`, `.read`, `.handoff`, `.close`) or its API
-(`company.api`, `.api.describe`, an `http` step with `auth: {kind: company}`)
+(`company.api`, `.api.describe`, an operation tool, an `http` step with `auth: {kind: company}`)
 waits for the User before the call is sent.
 
 A Company opens one gate itself: its agent's `user_requested` event, asking

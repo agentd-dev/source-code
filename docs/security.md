@@ -1024,6 +1024,26 @@ the Personal Agent Protocol draft
   values, so a description whose references multiply costs one operation at
   a time. Every API and conversation request carries the User's DPoP Session
   Token with a proof of its own, and no correlator of agentd's.
+- **An operation tool is `company.api` under the operator's name.** Each
+  operation `api_allow` lists that the description declares is a tool of
+  its own, served by the supervisor as a Company's MCP tools are; its call is
+  `company.api`'s call of that operation, sent by the same code under every
+  rule above, and it reaches that operation or none: a path parameter's
+  value that would make the path another operation's is refused unsent.
+  Every control on `company.api` holds it too — a `security.policies` rule
+  judges its call as `company.api`'s as well as its own, and
+  `tools.disabled`, `tools.narrow` and `agent.tools` for `company.api` apply
+  to it — so the tools add no way around a rule written before they
+  existed. Its name is made from the `api_allow` entry, so the Company
+  cannot choose what a tool is called or rename one a policy or a tag is
+  keyed to; a tag key that names it narrows its tags, and one that does not
+  leaves it every tag the entry lists. Its
+  description and input schema reach the model and are the Company's words:
+  the description starts with the note that says so, quotes the Company's
+  `operationId`, summary and description with their control characters
+  removed and capped, and the schema is the operation's own, resolved within
+  the bounds above, at most 16 KiB, and closed to any argument it does not
+  declare. No header or cookie is ever an argument.
 - **Conversations are bounded and the supervisor's.** At most
   `limits.conversations` are open, each read by a thread of the
   supervisor's, which never blocks its loop and stops when the conversation

@@ -968,7 +968,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "company.status",
         "companies",
-        "The Companies this instance acts at for its User, as it knows them now — nothing is fetched: whether each is verified, its domain, whether the Session there is signed in, until when it asked for no requests, the calls in flight, and which of its MCP servers are connected.",
+        "The Companies this instance acts at for its User, as it knows them now — nothing is fetched: whether each is verified, its domain, whether the Session there is signed in, until when it asked for no requests, the calls in flight, and which of its servers have joined — its MCP servers, and those its operation tools are named under.",
         obj(json!({}), &[]),
         company_status_output(false),
         true,
@@ -1079,14 +1079,7 @@ pub fn contracts() -> Vec<Contract> {
             }),
             &["company", "method", "path"],
         ),
-        open_obj(
-            json!({
-                "status": {"type": "integer"},
-                "json": {"description": "the Company's JSON answer, null when it sent none"},
-                "text": {"type": "string", "description": "an answer that is not JSON"},
-            }),
-            &["status"],
-        ),
+        company_api_output(),
         true,
         ALL,
     );
@@ -1154,7 +1147,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "company.api.describe",
         "companies",
-        "Describe a Company's OpenAPI API: with no operation, each operation as `METHOD /path-template` with its operationId, its summary and whether company.api may call it (services.<name>.api_allow); with one — its operationId or `METHOD /path-template` — its parameters, body and response schemas. What it says is the Company's own words.",
+        "Describe a Company's OpenAPI API: with no operation, each operation as `METHOD /path-template` with its operationId, its summary, whether company.api may call it (services.<name>.api_allow) and the tool of its own that calls it; with one — its operationId or `METHOD /path-template` — its parameters, body and response schemas. What it says is the Company's own words.",
         obj(
             json!({
                 "company": s("The company entry"),
@@ -1177,6 +1170,19 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
     v
+}
+
+/// What `company.api` answers, and each operation tool of a Company's
+/// OpenAPI API: the status and the Company's answer.
+pub fn company_api_output() -> Value {
+    open_obj(
+        json!({
+            "status": {"type": "integer"},
+            "json": {"description": "the Company's JSON answer, null when it sent none"},
+            "text": {"type": "string", "description": "an answer that is not JSON"},
+        }),
+        &["status"],
+    )
 }
 
 /// What `company.converse` and `company.read` answer.

@@ -68,6 +68,35 @@ agentd's outbound client run against that SDK's official sample server.
 `-32601`); the gRPC and HTTP+JSON bindings.
 [A2A API reference](a2a-reference.md) has the methods, errors and limits.
 
+## Personal Agent Protocol
+
+The Personal Agent Protocol is how a company publishes what an agent acting
+for one of its customers may use: MCP servers, its own agent and OpenAPI
+APIs. agentd is a **personal agent** under it, for one person, the User. The
+support is a preview: it is not in the release binaries.
+
+| | Support |
+|---|---|
+| Version | draft **0.1**, pinned at the draft repository's commit `95fcbf2`. The draft can change without changing its `protocol_version`, so agentd follows the pinned revision, its JSON Schemas vendored and checked in CI. A discovery document whose major version is not `0` is refused. |
+| Build | the `companies` build feature, which no release binary or image carries; [Build features and crates](features.md) has the build. |
+| Role | the Personal Agent, for one User per instance. Not the Company and not the Company Agent. |
+| Discovery | `/.well-known/poppy.json`, following HTTPS redirects only; the issuer's RFC 8414 metadata, its `issuer` exact and its `poppy_domains` listing the domain; every URL the documents name held to the entry's `hosts`. |
+| Identity | a `client_id` that is the HTTPS URL of a client metadata document, a key set of ES256 keys, and `private_key_jwt` client assertions (RFC 7523) addressed to the issuer. agentd prints the documents for static hosting or serves them on its A2A listener. |
+| User IDs | random, one per User and company, kept in the store and sealed when a seal key is set. |
+| Sessions | started and renewed with the JWT bearer grant (RFC 7523) and a Session assertion; DPoP-bound tokens (RFC 9449, ES256, server nonces) on every API and conversation request; for MCP, a Bearer token per server, requested with an RFC 8707 `resource`. |
+| Sign-in | Device Sign-In (RFC 8628) and Direct Sign-In (authorization code with PKCE and RFC 9207 `iss`), each at the User's own gate. Account Tokens are sealed with AES-256-GCM, rotated when the company rotates them, and revoked on sign-out (RFC 7009). Mediated Sign-In is refused at load. |
+| Interfaces | a company's MCP servers (2025-06-18 or later), each tool as `<server>.<tool>`; its agent, in the `poppy` conversation protocol, read over SSE or by long poll; its OpenAPI 3.0 and 3.1 descriptions (JSON). Direct Conversations, which the User joins at their own gate. |
+| Extensions | Operations, version 1: an operation is confirmed only with the User's approval of its revision, or an operator's standing permission. |
+| Privacy | the strict profile by default: none of agentd's correlators, a keyed idempotency key and a trace of its own per unit of work and company. |
+| Tested against | agentd's own fake company, in the conformance suite's `companies` family. Nothing published tests a personal agent. |
+
+**Not supported:** Mediated Sign-In; joining a browser to a Session; several
+Users per instance or several accounts per User at one company; the Company
+and Company Agent roles; the push and attachments the draft leaves open; any
+revision of the draft but the pinned one.
+[Act at companies for a person](act-at-companies.md) is the guide, and
+[RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md) the design.
+
 ## Model providers
 
 agentd speaks four wire formats, chosen per connection with `dialect`. A
@@ -141,7 +170,7 @@ connection cannot apply is refused when the configuration loads.
 | AWS SigV4: environment, IAM Identity Center (SSO), EC2 instance role, EKS IRSA | yes, and required by `dialect: bedrock` | yes | yes |
 | SPIFFE JWT-SVID as a bearer | yes | yes | yes |
 | SPIFFE X.509-SVID or a client certificate (mTLS) | — | yes | yes |
-| AAuth agent identity: Ed25519 key, RFC 9421 HTTP message signatures (draft) | yes, signed beside the bearer | yes | yes |
+| AAuth agent identity (a draft): Ed25519 key, RFC 9421 HTTP message signatures | yes, signed beside the bearer | yes | yes |
 
 A model connection that needs a custom credential header — an `api-key`
 header, say — sends it through its `headers` map, with the value as a secret
@@ -149,7 +178,12 @@ reference. Interactive OAuth logins run once with
 `agentd --login <target>` and refresh on their own; the targets are
 `intelligence`, `intelligence:<provider>`, `mcp:<name>` and `service:<name>`.
 An A2A peer that needs an interactive login takes its credential from a
-`services:` entry. Secrets are always
+`services:` entry. A company entry (`kind: company`, in the `companies`
+preview) takes no `auth:` block: agentd presents what the
+[Personal Agent Protocol](#personal-agent-protocol) defines —
+`private_key_jwt` assertions signed with ES256, DPoP-bound tokens
+(RFC 9449), Bearer tokens for one MCP server each with an RFC 8707
+`resource`, and RFC 7009 revocation on sign-out. Secrets are always
 `{{secret:NAME}}` or `{{secret-file:PATH}}` references. [Outbound
 credentials](authentication.md) and [AAuth agent identity](aauth.md) have the
 details.
@@ -169,7 +203,8 @@ There are no prebuilt macOS or Windows binaries. A source build needs Rust
 1.96 or newer and a C compiler. The release binaries and the image carry the
 same feature set. It includes the mock model endpoint (`mock:final`,
 `mock:file:<playbook.json>`), for trying an agent or a workflow without a
-model provider; the guarded local command runner (`exec`) is in neither.
+model provider; the guarded local command runner (`exec`) and the
+[`companies` preview](#personal-agent-protocol) are in neither.
 [Build features and crates](features.md) lists every feature.
 
 ## Observability standards
@@ -179,7 +214,7 @@ model provider; the guarded local command runner (`exec`) is in neither.
 | JSON Lines | every log event on stderr, one object per line, with a run id and the trace and span of the unit of work it is about; the result of a one-shot run on stdout |
 | Prometheus text exposition 0.0.4 | `/metrics`, beside `/healthz` and `/readyz`, on the address `observability.metrics_addr` names |
 | OpenTelemetry OTLP/HTTP (JSON) | one tree of spans per trace — the process, each run, each step attempt, each turn (`invoke_agent`, `chat`, `execute_tool`, mapped to the GenAI semantic conventions), each request served (SERVER) and sent for a unit of work (CLIENT, with the span id the request carried; a connection's own MCP requests name the process's span), each `exec` command, each event emitted (PRODUCER), with a line's `link` and `links` as span links — and the log stream with `observability.otel.logs: true`, each record naming its `traceId` and `spanId`, both sent to `observability.otel.endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT` when it is unset) |
-| W3C Trace Context | a trace per unit of work (a run, a conversation turn, an A2A task), continued from what started it: the run that started it, an A2A request's or a webhook's `traceparent` and `tracestate` headers, a stream event's `traceparent` attribute, an MCP Events occurrence's `_meta.traceparent`; a `batch` or `correlate` run and an event appended with `into:` start a trace of their own and record their causes as `links`, and a gate's answer, a callback, a reply or an event that wakes a waiting run, or a message that continues a task, is a `link` on the run or task, which keeps its trace. The process's own continues `--traceparent` or `AGENTD_TRACEPARENT`. A `traceparent`, with the trace's `tracestate` when it has one, is sent on every MCP request (`params._meta`), every model request, A2A request and push notification, `http` step and `forward:` push (HTTP headers), as the CloudEvents distributed-tracing attributes of a stream event produced in a trace (an `emit`, an `into:` append, a child's mirrored event, an MCP Events occurrence that names one, a `_runtime` event: the span its line was in), and as `TRACEPARENT` to an `exec` command; an A2A answer that names a task carries a `traceparent` response header, and a webhook's answer one naming the run it started. The outputs name the trace: a task's annotations (`traceId`, `spanId`), a webhook's answer (`run_id`, `trace_id`), `status`, `run.get`, `workflow.status` and the event feed's run, step, activity and audit events (`trace_id`), a `_runtime` event (`traceparent`). A trace whose upstream is unsampled stays unsampled and exports no spans |
+| W3C Trace Context | a trace per unit of work (a run, a conversation turn, an A2A task), continued from what started it: the run that started it, an A2A request's or a webhook's `traceparent` and `tracestate` headers, a stream event's `traceparent` attribute, an MCP Events occurrence's `_meta.traceparent`; a `batch` or `correlate` run and an event appended with `into:` start a trace of their own and record their causes as `links`, and a gate's answer, a callback, a reply or an event that wakes a waiting run, or a message that continues a task, is a `link` on the run or task, which keeps its trace. The process's own continues `--traceparent` or `AGENTD_TRACEPARENT`. A `traceparent`, with the trace's `tracestate` when it has one, is sent on every MCP request (`params._meta`), every model request, A2A request and push notification, `http` step and `forward:` push (HTTP headers), as the CloudEvents distributed-tracing attributes of a stream event produced in a trace (an `emit`, an `into:` append, a child's mirrored event, an MCP Events occurrence that names one, a `_runtime` event: the span its line was in), and as `TRACEPARENT` to an `exec` command; an A2A answer that names a task carries a `traceparent` response header, and a webhook's answer one naming the run it started. The outputs name the trace: a task's annotations (`traceId`, `spanId`), a webhook's answer (`run_id`, `trace_id`), `status`, `run.get`, `workflow.status` and the event feed's run, step, activity and audit events (`trace_id`), a `_runtime` event (`traceparent`). A trace whose upstream is unsampled stays unsampled and exports no spans. A call to a company under `privacy: strict` (the `companies` preview) is sent a trace of its own per unit of work and company instead, which the call's span links to, and a company's handshake and tool list carry none |
 | Exit codes | a stable table a Kubernetes `podFailurePolicy` can branch on; see [CLI, environment and exit codes](cli.md) |
 
 [Events and metrics reference](telemetry-reference.md) lists every event and

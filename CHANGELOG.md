@@ -653,6 +653,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   again when the terms change, an operation in progress read after its
   `Retry-After`, a confirm retried with the same operation, the User asked
   before a Direct Conversation, and a decline said in the conversation.
+- Docs: [Act at companies for a person](docs/act-at-companies.md), the guide
+  to the `companies` preview, with a Personal Agent Protocol section in
+  docs/interoperability.md; and on agentd.dev's landing page a strip of the
+  protocols and specifications agentd supports, each a link to the docs that
+  cover it, which `web/tools/check-standards.mjs` resolves after every site
+  build.
 
 **Changed.**
 

@@ -39,7 +39,8 @@ It is not a library you write an agent in, and not a hosted service.
   code is an API, and every event is a JSON line on stderr.
 - **Open protocols.** MCP for tools and context, A2A for people and agents,
   OpenAI-compatible, Anthropic and Bedrock model wires, OTLP and Prometheus
-  for telemetry.
+  for telemetry — and, in a preview build, the Personal Agent Protocol draft
+  for [acting at companies for a person](docs/act-at-companies.md).
 
 ## Install
 

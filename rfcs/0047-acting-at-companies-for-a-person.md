@@ -1,6 +1,6 @@
 # RFC 0047: Acting at companies for a person — agentd as a Personal Agent under the Personal Agent Protocol draft 0.1
 
-**Status:** Accepted to build 2026-10-17 (the user: "Build now"); decisions 2–12 are recommended defaults accepted with it and open to revision (§13). Nothing is implemented.
+**Status:** Accepted to build 2026-10-17 (the user: "Build now"); decisions 2–12 are recommended defaults accepted with it and open to revision (§13). P0–P4 implemented 2026-10-18, behind the non-release `companies` feature (§9; the guide is docs/act-at-companies.md); P5 is optional and not built.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-17
 **Extends:** RFC 0031 (endpoint authentication): a `private_key_jwt` client, DPoP-bound tokens, RFC 7009 revocation and RFC 8707 resource indicators. RFC 0037 (service catalog and egress): a new entry kind, `company`, whose endpoints come from a remote document and are bounded by an operator host list.
@@ -235,7 +235,7 @@ Load-time refusals: the feature missing; `store.kind` `none` or `memory` with an
 The CLI:
 
 - `agentd --print-company-client <dir>` writes `client.json` and `jwks.json` for static hosting, creating the key if absent. It dials nothing. Exit 0, or 2.
-- `agentd --login company:<name>` and `--logout company:<name>` are thin clients of the running daemon: they send the operator op `company.sign_in` or `company.sign_out` over the unix A2A listener (peer uid checked, as RFC 0044 P1 does for its enrolment), print what the daemon returns, and wait. They are refused unless `security.companies.user` is `operator`: the unix-socket peer is the operator (docs/a2a.md), and a User who is one operator principal signs in through the TUI or the web UI as that principal. With no daemon running they say so; the protocol work always happens in the daemon.
+- `agentd --login company:<name>` and `--logout company:<name>` are thin clients of the running daemon: they send the operator op `company.sign_in` or `company.sign_out` over the unix A2A listener (peer uid checked, as RFC 0044 P1 does for its enrolment), print what the daemon returns, and wait. They are refused unless `security.companies.user` is `operator`: the unix-socket peer is the operator (docs/a2a.md), and a User who is one operator principal sends the same op from their own A2A client as that principal (the TUI and the web UI have no company sign-in command), while any User can ask the agent, whose `company.sign_in` tool opens the same gate. With no daemon running they say so; the protocol work always happens in the daemon.
 
 ### 5.4 Components
 

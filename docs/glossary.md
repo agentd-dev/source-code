@@ -23,7 +23,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 |---|---|
 | **breaker** | A per-endpoint circuit breaker. After repeated failures it opens, calls skip that endpoint, and it half-opens after a cooldown. See [Models, providers and roles](intelligence.md). |
 | **budget** | A ceiling on tokens or model calls: per run (`limits.run`), per window or lifetime (`intelligence.budget`), per conversation, or per principal. The supervisor enforces it; the model never sees it as a suggestion. See [Control spend with budgets](budgets.md). |
-| **build feature** | A cargo feature that compiles a capability in or out, such as `a2a` or `cel`. Release binaries carry all but `exec` and `internal-mocks`. See [Build features and crates](features.md). |
+| **build feature** | A cargo feature that compiles a capability in or out, such as `a2a` or `cel`. Release binaries carry all but `exec`, `companies` and `internal-mocks`. See [Build features and crates](features.md). |
 
 ## C
 
@@ -31,6 +31,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 |---|---|
 | **checkpoint** | The durable record of a run's state, written to the store before each step's side effect. A restart resumes from it. See [Workflows: how runs work](workflows.md). |
 | **compaction** | Summarising the oldest part of a conversation when it outgrows the model's window, on the `compaction` role. See [How a turn runs](agent-loop.md). |
+| **company** | A business agentd acts at for one person under the Personal Agent Protocol draft, declared as a `services` entry of `kind: company` (the `companies` build feature, a preview). See [Act at companies for a person](act-at-companies.md). |
 | **confidence** | The least sureness a decision is acted on with. For a `noul` it is the distance of the probability from 0.5, doubled. An answer under it is *unsure*. See [Models, providers and roles](intelligence.md). |
 | **conversation** | A thread of messages with the agent's root, identified by an A2A `contextId` and owned by the caller who started it. Each message in it starts one turn. See [How a turn runs](agent-loop.md). |
 | **correlate** | A start node that fires a run when a set of related stream events has arrived within a window: a join over events. See [React to changes and events](react-to-events.md). |
@@ -109,6 +110,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | Term | Meaning |
 |---|---|
 | **peer** | Another A2A agent this one dials, declared under `a2a.peers`. See [Connect agents over A2A](connect-agents.md). |
+| **Personal Agent Protocol** | A draft protocol under which a company publishes the MCP servers, agent and APIs a person's agent may use, and the agent acts there for that person, the User, who signs in and approves actions themselves. agentd supports draft 0.1, pinned, as a preview. See [Act at companies for a person](act-at-companies.md). |
 | **policy** | A `security.policies` rule: a verdict — allow, deny, ask or shadow — on a tool call, matched by tool, tags, caller, principal or arguments. See [Security model](security.md). |
 | **preflight** | Triage of an inbound message before its turn, on the `preflight` role: its intent, risk, whether it needs a plan, and which route to take. See [How a turn runs](agent-loop.md). |
 | **principal** | Who a request is from: an id, a role (`operator`, `user`, `agent` or `anonymous`) and grants, resolved from its credential by `a2a.principals`. Work is owned by and charged to its principal. See [The A2A channel](a2a.md). |

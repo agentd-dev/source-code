@@ -8,9 +8,9 @@
 //! process never holds a device code, a verifier or a token.
 //!
 //! The unix-socket peer is the operator, so both are refused unless
-//! `security.companies.user` is `operator`. The ops are the operator's, so a
-//! User who is an operator principal signs in through the TUI or the web UI
-//! as that principal, and any other User by asking the agent, whose
+//! `security.companies.user` is `operator`. Any other User who is an
+//! operator principal sends the `company.sign_in` op from their own A2A
+//! client as that principal, and any User can ask the agent, whose
 //! `company.sign_in` tool opens the same gate.
 
 use std::io::Write;
@@ -43,7 +43,7 @@ fn daemon(settings: &Settings, name: &str, what: &str) -> Result<A2aEndpoint, St
     let user = settings.security.companies.user();
     if user != OPERATOR {
         return Err(format!(
-            "{what} company:{name} signs in the operator, and security.companies.user is {user}: they sign in from the TUI or the web UI when they are an operator principal, and otherwise by asking the agent (its company.sign_in tool)"
+            "{what} company:{name} signs in the operator, and security.companies.user is {user}: they sign in by asking the agent (its company.sign_in tool), or, when they are an operator principal, by sending the company.sign_in op from their own A2A client"
         ));
     }
     if settings
@@ -58,7 +58,7 @@ fn daemon(settings: &Settings, name: &str, what: &str) -> Result<A2aEndpoint, St
     let listen = settings.a2a.listen.as_deref().unwrap_or_default();
     let Some(path) = crate::config::unix_socket_path(listen) else {
         return Err(format!(
-            "{what} company:{name} reaches the running daemon over its unix A2A listener, and a2a.listen is {}: sign in from the TUI or the web UI instead",
+            "{what} company:{name} reaches the running daemon over its unix A2A listener, and a2a.listen is {}: ask the agent to sign in (its company.sign_in tool), or send the company.sign_in op from the User's own A2A client",
             if listen.is_empty() { "not set" } else { listen }
         ));
     };

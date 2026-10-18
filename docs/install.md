@@ -193,13 +193,14 @@ static musl binaries the releases ship are built with `cross` for the
 repository's `Dockerfile` builds the same static binary into a `scratch`
 image (`docker build --build-arg FEATURES=… .`).
 
-One feature a tutorial needs is never in a release binary:
+Two features a guide needs are never in a release binary:
 
 | Feature | What it adds | Needed by |
 |---|---|---|
 | `exec` | The guarded local command runner, also switched on by `security.exec.enabled` | [Build a coding agent](coding-agent.md) |
+| `companies` | Acting at companies for one person under the Personal Agent Protocol draft, a preview | [Act at companies for a person](act-at-companies.md) |
 
-Add it to the list, for example `--features "a2a,…,mock-models,exec"`.
+Add one to the list, for example `--features "a2a,…,mock-models,exec"`.
 
 Every feature and the configuration that needs it is in [Build features and
 crates](features.md).

@@ -32,7 +32,9 @@ Three features are never in a release binary:
 - `exec`, the local command runner. agentd's default posture is that it runs
   no local code; you opt in at build time and again at run time.
 - `companies`, agentd acting at Companies for one person under the Personal
-  Agent Protocol draft ([RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)).
+  Agent Protocol draft, a preview
+  ([Act at companies for a person](act-at-companies.md),
+  [RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)).
   The draft changes without a version signal, so agentd is pinned to one
   revision of it and the feature stays out of the release set.
 - `internal-mocks`, the test scaffolding: the mock MCP servers and crash
@@ -108,9 +110,9 @@ toolchain of at least 1.96 (edition 2024):
 cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
 ```
 
-Add `exec` for the local command runner, `companies` to act at Companies for
-a person, or `internal-mocks` to keep the test scaffolding in a
-release-profile build. `--no-default-features` drops `tls`;
+Add `exec` for the local command runner, `companies` to
+[act at Companies for a person](act-at-companies.md), or `internal-mocks` to
+keep the test scaffolding in a release-profile build. `--no-default-features` drops `tls`;
 such a binary reaches `https://` only through a TLS-terminating sidecar.
 
 The release profile is `opt-level = "z"`, `lto = true`, `codegen-units = 1`,

@@ -14,7 +14,10 @@
 //! each.
 //!
 //! The pages describe the release binary, so the samples are checked against
-//! a build with the release feature set.
+//! a build with the release feature set. A sample for a feature that set
+//! leaves out — `exec`, `companies` — is skipped there and checked by a
+//! build that adds it (`--features <release set>,companies`, or CI's
+//! `--all-features`).
 #![cfg(all(
     unix,
     feature = "a2a",
@@ -130,11 +133,15 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
         if top.is_empty() || !top.keys().all(|k| keys.contains(k)) {
             continue; // not an agentd configuration
         }
-        // A sample for a build with `exec`, which the release set leaves
-        // out, is checked by a build that has it: this one refuses it.
+        // A sample for a build with `exec` or `companies`, which the
+        // release set leaves out, is checked by a build that has it
+        // (CI's `--all-features`): this one refuses it.
         if !cfg!(feature = "exec")
             && doc.pointer("/security/exec/enabled") == Some(&serde_json::Value::Bool(true))
         {
+            continue;
+        }
+        if !cfg!(feature = "companies") && declares_a_company(&doc) {
             continue;
         }
         let dir = scratch.join(format!("sample-{checked}"));
@@ -173,6 +180,15 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// Whether a sample acts at Companies: a `kind: company` service, or any
+/// `security.companies` key — both refused by a build without `companies`.
+fn declares_a_company(doc: &serde_json::Value) -> bool {
+    doc.pointer("/security/companies").is_some()
+        || doc["services"]
+            .as_object()
+            .is_some_and(|s| s.values().any(|v| v["kind"] == "company"))
 }
 
 /// The files a sample's `# needs:` comment names.

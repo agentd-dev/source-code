@@ -392,6 +392,15 @@ export const DOCS = [
     "blurb": "Build your own binary on agentd-core, with tools written in Rust."
   },
   {
+    "slug": "act-at-companies",
+    "file": "docs/act-at-companies.md",
+    "title": "Act at companies for a person",
+    "group": "guides",
+    "section": "integrate",
+    "blurb": "Act for one person at companies that publish their tools, agent and APIs under the Personal Agent Protocol draft.",
+    "tag": "preview"
+  },
+  {
     "slug": "architecture",
     "file": "docs/architecture.md",
     "title": "Architecture",

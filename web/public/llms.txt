@@ -489,12 +489,14 @@ reports the *configured* surface, what this binary is set up to do, not the
 features it was built with.
 
 In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
-`config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci`, `decrypt`, and `tls`
-(on by default).
+`config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci`, `decrypt`,
+`mcp-events`, `mock-models`, and `tls` (on by default).
 
-**Not** in the release binaries — build from source to get it: `exec`, the
+**Not** in the release binaries — build from source to get them: `exec`, the
 guarded local command runner, which is off at the cargo feature *and* at
-`security.exec.enabled`.
+`security.exec.enabled`; and `companies`, a preview of acting at companies
+for one person under the Personal Agent Protocol draft 0.1
+(https://agentd.dev/docs/act-at-companies/).
 
 ---
 
@@ -548,6 +550,7 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/intelligence/ | endpoints, dialects, failover, budgets |
 | https://agentd.dev/docs/authentication/ | per-endpoint credentials: static, OAuth2, AWS SigV4, SPIFFE |
 | https://agentd.dev/docs/aauth/ | AAuth agent identity |
+| https://agentd.dev/docs/act-at-companies/ | acting at companies for one person (Personal Agent Protocol draft, preview) |
 | https://agentd.dev/docs/security/ | the trifecta gate, tags, secrets, the exec runner |
 | https://agentd.dev/docs/subagents/ | the process tree, narrowing, limits |
 | https://agentd.dev/docs/interface/ | TUI and web UI, the observation feed |

@@ -15,21 +15,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// The device authorization a well-behaved SSO-OIDC server answers.
+const DEVICE: &[u8] = br#"{"deviceCode":"dc","userCode":"WXYZ-1234","verificationUri":"https://device.sso.example","interval":1,"expiresIn":300}"#;
+
 /// A mock AWS SSO-OIDC + portal server serving the four steps.
 fn spawn_mock_sso() -> u16 {
+    spawn_mock_sso_with(DEVICE)
+}
+
+/// [`spawn_mock_sso`], answering the device authorization with `device`.
+fn spawn_mock_sso_with(device: &'static [u8]) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let polls = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for conn in listener.incoming().take(16) {
             let Ok(stream) = conn else { continue };
-            handle(stream, &polls);
+            handle(stream, &polls, device);
         }
     });
     port
 }
 
-fn handle(stream: TcpStream, polls: &Arc<AtomicUsize>) {
+fn handle(stream: TcpStream, polls: &Arc<AtomicUsize>, device: &'static [u8]) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -58,10 +66,7 @@ fn handle(stream: TcpStream, polls: &Arc<AtomicUsize>) {
     let (status, payload): (&str, &[u8]) = if path.ends_with("/client/register") {
         ("200 OK", br#"{"clientId":"cid","clientSecret":"csec"}"#)
     } else if path.ends_with("/device_authorization") {
-        (
-            "200 OK",
-            br#"{"deviceCode":"dc","userCode":"WXYZ-1234","verificationUri":"https://device.sso.example","interval":1,"expiresIn":300}"#,
-        )
+        ("200 OK", device)
     } else if path.ends_with("/token") {
         if polls.fetch_add(1, Ordering::SeqCst) == 0 {
             ("400 Bad Request", br#"{"error":"authorization_pending"}"#)
@@ -169,4 +174,32 @@ fn agentd_login_aws_sso_caches_temporary_credentials() {
 
     std::fs::remove_file(&cfg).ok();
     std::fs::remove_dir_all(&cred_dir).ok();
+}
+
+/// A poll interval the server names is held to the cap every server-named
+/// wait gets: one past what a deadline can hold made the login panic
+/// adding it to the clock.
+#[test]
+fn a_server_named_poll_interval_cannot_crash_the_login() {
+    let port = spawn_mock_sso_with(
+        br#"{"deviceCode":"dc","userCode":"WXYZ-1234","verificationUri":"https://device.sso.example","interval":18446744073709551615,"expiresIn":300}"#,
+    );
+    let cfg = common::unique_path("sso-cfg", "yaml");
+    std::fs::write(&cfg, config()).unwrap();
+    let cred_dir = common::unique_path("sso-creds", "d");
+    std::fs::create_dir_all(&cred_dir).ok();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--login", "mcp:bedrock", "--config", &cfg])
+        .env("AGENTD_CRED_DIR", &cred_dir)
+        .env("AGENTD_SSO_OIDC", format!("http://127.0.0.1:{port}"))
+        .env("AGENTD_SSO_PORTAL", format!("http://127.0.0.1:{port}"))
+        .output()
+        .expect("run agentd --login (aws sso)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("expired"), "{stderr}");
+    let _ = std::fs::remove_file(&cfg);
+    let _ = std::fs::remove_dir_all(&cred_dir);
 }

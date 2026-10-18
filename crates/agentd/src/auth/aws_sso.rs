@@ -111,8 +111,10 @@ pub fn sso_login(
         expires_in: dev.expires_in,
     });
 
-    // 3. Poll the token endpoint until the user authorizes.
-    let mut interval = Duration::from_secs(dev.interval.max(1));
+    // 3. Poll the token endpoint until the user authorizes. The server names
+    // the interval, so it is held to the cap every server-named wait gets.
+    let cap = crate::net::http::RETRY_AFTER_MAX;
+    let mut interval = Duration::from_secs(dev.interval.max(1)).min(cap);
     let deadline =
         Instant::now() + Duration::from_secs(dev.expires_in.unwrap_or(600).clamp(30, 1800));
     let token_body = json!({
@@ -130,7 +132,7 @@ pub fn sso_login(
         }
         match oauth_error(&body).as_deref() {
             Some("authorization_pending") => {}
-            Some("slow_down") => interval += Duration::from_secs(5),
+            Some("slow_down") => interval = (interval + Duration::from_secs(5)).min(cap),
             other => {
                 return Err(format!(
                     "aws sso: token failed: {} (HTTP {status})",
@@ -138,7 +140,7 @@ pub fn sso_login(
                 ));
             }
         }
-        if Instant::now() + interval >= deadline {
+        if deadline.saturating_duration_since(Instant::now()) <= interval {
             return Err("aws sso: device code expired before authorization".into());
         }
         sleep(interval);

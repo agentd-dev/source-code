@@ -510,6 +510,18 @@ mod tests {
         assert_eq!(c.response_types(), ["code"]);
     }
 
+    /// Without the `oauth` feature there is nothing to present the document
+    /// with, and the section is refused by name.
+    #[cfg(not(feature = "oauth"))]
+    #[test]
+    fn without_oauth_the_client_is_refused() {
+        assert_eq!(
+            errors(CLIENT),
+            ["security.client needs the `oauth` feature (build with --features oauth)"]
+        );
+    }
+
+    #[cfg(feature = "oauth")]
     #[test]
     fn a_valid_client_loads_and_a_broken_one_is_named() {
         assert_eq!(errors(CLIENT), Vec::<String>::new());
@@ -547,6 +559,7 @@ mod tests {
 
     /// Served on the A2A listener, on the client_id's origin, at paths of
     /// their own.
+    #[cfg(all(feature = "oauth", feature = "a2a"))]
     #[test]
     fn a_served_document_is_on_the_listeners_origin_at_its_own_path() {
         let listener = "a2a:\n  listen: 127.0.0.1:0\n  url: https://agent.example\n";

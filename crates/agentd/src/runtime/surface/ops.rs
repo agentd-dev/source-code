@@ -66,6 +66,9 @@ pub enum Gate {
     Listener,
     /// A Company is declared, in a build that acts at one (RFC 0047).
     Companies,
+    /// A delegated server or an IdP is declared, in a build that acts for
+    /// an enrolled person (RFC 0044).
+    Delegation,
 }
 
 /// The module that runs an op. The command dispatch is one `match` on this.
@@ -79,6 +82,7 @@ pub enum Handler {
     Auth,
     Instance,
     Company,
+    Delegation,
     /// Held so no workflow can claim the name, and served by nothing.
     Reserved,
 }
@@ -497,6 +501,66 @@ pub const OPS: &[OpSpec] = &[
         company_sign_out_result,
     ),
     op(
+        "delegation.enrol",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "Sign the per-person operator in at an identity provider {idp, grant?} and keep their delegation grant: the task says where to sign in, and how it ended. The per-person operator's alone",
+        delegation_enrol_args,
+        no_result,
+    ),
+    op(
+        "delegation.list",
+        Message,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "The delegation grants this instance holds — never a secret — and the open consent gates, each with its nonce and argument hash for the person who answers it",
+        no_args,
+        delegation_list_result,
+    ),
+    op(
+        "delegation.approve",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone",
+        delegation_answer_args,
+        no_result,
+    ),
+    op(
+        "delegation.deny",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made. The person's alone",
+        delegation_answer_args,
+        no_result,
+    ),
+    op(
+        "delegation.revoke",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "Revoke the grants {target} names — a principal, or idp:<name>#<sub> for every grant of that subject: RFC 7009 at the IdP, then the tombstone, the record and every token",
+        delegation_revoke_args,
+        no_result,
+    ),
+    op(
         "_instance.",
         Task,
         Operator,
@@ -608,6 +672,13 @@ pub fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
             .is_some_and(|l| crate::config::unix_socket_path(l).is_none()),
         Gate::Companies => {
             cfg!(feature = "companies") && crate::config::settings::companies::any_company(s)
+        }
+        Gate::Delegation => {
+            cfg!(feature = "xaa")
+                && (!s.identity.providers.is_empty()
+                    || crate::config::settings::delegation::delegated_servers(s)
+                        .next()
+                        .is_some())
         }
     }
 }
@@ -1205,6 +1276,45 @@ fn sessions_revoke_result() -> Value {
 /// Company failed — the one shape, so the two cannot drift.
 fn company_status_result() -> Value {
     crate::registry::internal::company_status_output(true)
+}
+
+fn delegation_enrol_args() -> Value {
+    closed(
+        &["idp"],
+        json!({
+            "idp": named("The identity.providers entry to sign in at"),
+            "grant": {"enum": ["device", "authorization_code"], "description": "The sign-in grant; the provider's first that its IdP supports when absent"},
+        }),
+    )
+}
+
+fn delegation_answer_args() -> Value {
+    closed(
+        &["gate", "nonce"],
+        json!({
+            "gate": named("The consent gate"),
+            "nonce": named("The gate's nonce, as delegation.list gives it"),
+            "args_hash": string("The hash of the call's canonical arguments, as delegation.list gives it; required to approve"),
+        }),
+    )
+}
+
+fn delegation_revoke_args() -> Value {
+    closed(
+        &["target"],
+        json!({"target": named("A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject")}),
+    )
+}
+
+fn delegation_list_result() -> Value {
+    json!({
+        "type": "object",
+        "required": ["grants", "gates"],
+        "properties": {
+            "grants": {"type": "array", "items": {"type": "object"}},
+            "gates": {"type": "array", "items": {"type": "object"}},
+        },
+    })
 }
 
 fn company_reset_args() -> Value {
@@ -1814,9 +1924,18 @@ mod tests {
             }
             "company.user_id.reset" | "company.sign_out" => json!({"company": "shop"}),
             "company.sign_in" => json!({"company": "shop", "scopes": ["poppy:read"]}),
-            "status" | "config" | "auth.device.pending" | "auth.sessions" | "company.status" => {
-                json!({})
+            "delegation.enrol" => json!({"idp": "okta", "grant": "device"}),
+            "delegation.approve" => {
+                json!({"gate": "consent-1", "nonce": "n0nce", "args_hash": "ab12"})
             }
+            "delegation.deny" => json!({"gate": "consent-1", "nonce": "n0nce"}),
+            "delegation.revoke" => json!({"target": "operator:ada"}),
+            "status"
+            | "config"
+            | "auth.device.pending"
+            | "auth.sessions"
+            | "company.status"
+            | "delegation.list" => json!({}),
             other => panic!("no sample for {other}: add one"),
         };
         let mut envelope = json!({"op": op});

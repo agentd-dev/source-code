@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -3682,6 +3682,136 @@ reserved secret, is refused, directly and through a subagent template. Live inte
 Integrator org with XAA enabled (Integrator Free orgs need Okta Developer Support
 to enable it), against at least one EMA MCP server (for example
 motd.xaa.rocks).
+
+#### P1 as built (2026-10-19)
+
+P1 was built on P0 (§7.0), behind the cargo feature `xaa` and
+`security.experimental.id_jag`, and is not in the release feature set. What
+the text above left to the build, decided:
+
+- **The per-person operator is an `a2a.principals` rule.** `match.uid` (new)
+  names the unix A2A listener's peer by the uid `SO_PEERCRED` gives; the rule
+  needs `role: operator`, an `id` and an exact `idp_subject: {iss, sub}`
+  (new on `Principal`, §5.15), and at most one rule carries a pin. That peer
+  resolves to `operator:<id>` with the typed principal `{source: operator,
+  stable_id: <id>}`; every other unix peer stays the bare `operator`. The
+  grant's credential fingerprint is `unix-uid:<uid>`, compared at every use
+  with the rule as the process read it at start, so a rule restarted with
+  another uid or pin leaves the grant unusable (`not_enrolled`) rather than
+  lent; a reload that changes the rule is refused (`restart_required`).
+  Autonomous work (`identity.autonomous_as`) never runs as the person:
+  naming them there is refused at load.
+- **Templates, as P1 needs them.** `principals` admits `source: operator`
+  alone (oidc, x509 and device principals delegate from P2), with optional
+  `role` and `labels`; `servers.<name>.scopes`, `ttl` (≤ 30d) and `budget`
+  (16/200/12) are built. `clients`, `document_workflows`,
+  `agent_mode_servers`, `unattended*`, `allow_against_idp_guidance`,
+  `subagents` (P1 is `none`: a subagent never acts with the grant, nor does
+  a run its call started — through a workflow tool, `workflow.run` or
+  `workflow.signal` — or a run that one started; a run records the subagent
+  behind it, durably), `approvers` and `peers` are refused as unknown keys
+  until their phase. A grant is held at every call to the ceilings the
+  template that allowed it allows now, so a template narrowed or removed
+  takes effect at the restart that applies it; signing in again keeps a
+  grant only while it is the same — the same identity, unexpired, under the
+  template that admits the person now with the ceilings it allows now — and
+  otherwise replaces it one epoch up. Either way the refresh token a sign-in
+  replaces is revoked at the IdP (RFC 7009).
+- **Enrolment** runs in the supervisor, by the IdP's device grant (allowed:
+  the person is always pinned) or by the authorization code through a
+  loopback callback the supervisor holds for the sign-in, behind a one-time
+  start link and a state-bound `__Host-` cookie. A unix listener has no
+  origin for a callback, which is why P1's start link is on loopback rather
+  than on the listener origin. The CLI follows the op's task and never holds
+  a code or a token.
+- **The consent rules** of §5.13 item 6 reduce, with every touching unit
+  tainted and holding delegated data, to two hard-coded rules: a delegated
+  `sensitive` or `egress` call asks, and any `egress` call from a unit that
+  holds delegated data (the origin `delegated:<server>` on the unit's
+  carries, written before the result is read) asks. A workflow step that
+  sends the run's data out by its own effect is such a call — an `http`
+  step, `a2a.send`, `a2a.delegate`, an `emit` forwarded to a webhook or a
+  peer, an `mcp.tool` or `mcp.resource` step at a server any of whose tools
+  is tagged `egress` — and its gate shows the rendered step; approved, the
+  step runs with that spec, not a fresh render (a restart before it runs
+  asks again). "First use per run and tool" is therefore every use in P1.
+  `security.policies` gains `delegated`, `tainted` and `any_tags`; a
+  user-written `ask` stays a policy gate, addressed and never judged, as
+  before.
+- **The pins are confirmed (§5.6 step 3)** before anything is minted for a
+  delegated server: its RFC 9728 metadata, read from the well-known
+  locations on its endpoint's origin (the path-inserted one first), must
+  describe the pinned `resource` byte for byte and list the pinned
+  `audience` in `authorization_servers`, else the call is `config`. agentd
+  sends a delegated server nothing unauthenticated, so there is no
+  challenge URL to start from. Confirmed once a process: the pins change
+  only with a restart.
+- **A rotation is kept before the ID-JAG is checked**: the refresh token an
+  exchange answers with is stored before the checks run, so an ID-JAG they
+  refuse for one server never leaves the vault holding the token the IdP
+  just spent.
+- **The boundary compares what a reference resolves to** (§5.14.1 item 4):
+  a `{{secret:NAME}}` by its trimmed name, a `{{secret-file:…}}` by its
+  canonical path, and a `*_file` field's value (a `jwt_svid_file` is sent as
+  a bearer token) as a file reference, so no other spelling of a reserved
+  secret reaches a document's server. `exec` is refused beside
+  `identity.providers` or a seal key as well as beside a delegated server:
+  the keys are mounted whenever they are configured.
+- **Every refusal is scrubbed** of the grant's live token values, as an
+  answer is, before the model, the log or `delegation.denied` reads it: a
+  server's error can quote the token it was presented.
+- **Reload.** `identity.providers` and `identity.delegation` are
+  restart-only, templates included (§5.14 asks for reloadable templates and
+  a per-server reconnect of `id_jag` servers): a reload that adds, removes or
+  changes a delegated server, or the per-person operator's `a2a.principals`
+  rule, refuses with `restart_required`, and the restart drops every pooled
+  token. Reloadable templates, with the revocations their removal implies,
+  are P2's.
+- **Step-up** fails the call `step_up`; the person runs `agentd --login
+  idp:<name>` again, and the next mint presents that sign-in's ID token while
+  its `auth_time` meets the `max_age` asked. The step-up gate that resumes
+  the call by itself is P2's, with the display-client login.
+- **What is not built in P1:** `on_revoked: ask` (refused at load; P2);
+  the lease that stops a second supervisor on the same store from starting
+  its delegation machinery (T38 — the single-supervisor constraint is
+  documented, not enforced); and live interop against xaa.dev and an Okta
+  Integrator org with XAA enabled, which needs those accounts. A subagent's
+  `message.send` wakes a turn of the person's conversation, which acts as
+  the person: the root model decides there, as when it reads a subagent's
+  result, and the consent rules hold for that turn.
+
+| P1 exit criterion | Check (`ema` family unless named) |
+|---|---|
+| Byte-exact form fields, both subjects, both client-auth methods | `exchange-form-refresh-token-private-key-jwt`, `exchange-form-id-token-client-secret-basic`; `auth::idjag` unit `an_id_jag_is_held_to_every_pin` |
+| `typ`, `aud`, `client_id`, `iss`, `sub`, `resource` and scope mismatches refused | `id-jag-mismatches-refused` |
+| A `refresh_token` in the exchange: refused with `id_token`, a rotation with `refresh_token` | `refresh-token-in-exchange`, `rotation-kept-when-the-id-jag-is-refused`; unit `an_id_jag_is_held_to_every_pin` |
+| IdP issuer equal to RAS issuer refused | `idp-issuer-equal-to-ras-refused` |
+| Split RFC 8414 / OIDC metadata read correctly | `split-idp-metadata`; unit `the_two_idp_documents_are_merged_as_okta_splits_them` |
+| `invalid_grant` with a live probe: grant intact, only `(grant, server)` held back | `invalid-grant-live-probe` |
+| `invalid_grant` with a dead probe: revoked, tombstoned, purged | `invalid-grant-dead-probe`; vault unit `the_register_refuses_a_revoked_epoch_and_a_rotated_out_token` |
+| RAS `invalid_grant` on a fresh ID-JAG is `resource_fault` | `ras-invalid-grant-is-a-resource-fault` |
+| Rotating IdP, concurrent mints for two servers | `rotating-idp-concurrent-mints` |
+| `insufficient_user_authentication`, then the fresh ID token and its `auth_time` | `step-up-uses-the-fresh-id-token` |
+| Re-presentation, and fallback on RAS rejection | `re-presentation-and-fallback` |
+| The freshness kill-switch | `freshness-kill-switch` |
+| No mint at boot; one catalogue mint per server after enrolment | `no-mint-at-boot` |
+| A slow IdP does not delay unrelated runs | `slow-idp-delays-nothing-else` |
+| No token in a worker payload or environment; none in a prompt | `no-token-reaches-a-worker-or-a-prompt`; unit `a_live_token_never_leaves_in_an_answer` |
+| An unconfigured loopback caller gets `no_delegation` | `loopback-caller-gets-no-delegation` |
+| A timed-out gate with `ask_human_fallback: auto` denies, no judge | `timed-out-gate-never-judged` |
+| One approved delegated write end to end | `approved-write-end-to-end` |
+| A `:::!mcp` fragment with `grant: id_jag` or a reserved secret refused, directly and through a template | `document-may-not-delegate` (another spelling of the secret too); settings unit `a_fragment_may_not_delegate_or_reach_a_reserved_secret` |
+| (P0's deferral) a message into another principal's context mints nothing | `another-principals-work-mints-nothing` |
+| EMA declared on both dialects | `ema-declared-on-both-dialects` |
+| Any egress from work holding delegated data asks — a workflow's own `http` step too (§5.13 item 6) | `egress-from-delegated-data-gates` |
+| A subagent never acts with the grant, nor a run it started (`subagents: none`) | `a-subagents-run-is-not-delegated` |
+| Autonomous runs never use the grant | `autonomous-work-is-not-delegated`; settings unit `a_delegated_server_is_held_to_every_load_rule` |
+| No live token in an error either (§5.13 item 2) | `an-echoed-token-is-scrubbed-from-an-error` |
+| The PRM confirms the pins (§5.6 step 3) | `resource-metadata-confirms-the-pins` |
+| A grant is held to its template as it is now; signing in again replaces an expired or repinned one (§5.5) | `a-narrowed-template-narrows-the-grant`, `enrolling-again-replaces-a-grant` |
+| A reload may not move the per-person operator | e2e `runtime_reload_e2e::a_reload_that_moves_the_enrolled_person_is_a_restart`; unit `the_per_person_rule_moved_by_a_reload_is_named_for_a_restart` |
+| `exec` beside the delegation keys refused (T4) | settings unit `a_delegated_server_is_held_to_every_load_rule` |
+| Live interop: xaa.dev, an Okta Integrator org, an EMA MCP server | **not done**: needs an Okta Integrator org with XAA enabled (Okta Developer Support enables it) and an xaa.dev account, which this build had neither of |
 
 ### P2 — Multi-user delegation and unified sign-in
 

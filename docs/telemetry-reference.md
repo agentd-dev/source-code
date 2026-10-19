@@ -87,6 +87,7 @@ these names, and anything else is refused at load.
 | `config` | Validation, reload and the config file watch |
 | `context` | Conversation compaction |
 | `correlate` | `correlate` start nodes |
+| `delegation` | Acting for an enrolled person through their IdP (the `xaa` feature): enrolment, mints, delegated calls and their refusals, the person's consent gates, liveness and revocation |
 | `drain` | Graceful shutdown |
 | `exec` | The `exec` tool |
 | `freshness` | The instruction freshness watch |
@@ -361,6 +362,32 @@ Company that verifies while its token endpoint refuses has not recovered.
 | `correlate.expired` | info | `correlation`, `node`, `stream`, `window_ms`, `workflow` |  |
 | `correlate.overflow` | warn | `dropped`, `max_pending`, `node`, `stream`, `workflow` | A `correlate` start refused new correlation values past `max_pending`. |
 | `correlate.unkeyed` | warn | `by`, `node`, `stream`, `subject`, `workflow` |  |
+
+### delegation
+
+The `xaa` feature ([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)).
+No field carries a token: an ID-JAG is named by `jti_sha256`, the SHA-256 of
+its `jti`.
+
+| Event | Level | Fields | Notes |
+|---|---|---|---|
+| `delegation.enrolled` | info | `approving_sub`, `expires_ms`, `grant`, `grant_id`, `idp`, `principal`, `servers`, `step_up`, `template` | A sign-in was verified, bound to the pin and kept. `grant` is the sign-in grant; `step_up` the `max_age` it answered, if any. |
+| `delegation.minted` | info | `act?`, `auth_time?`, `exp?`, `grant_id`, `jti_sha256?`, `month_to_date?`, `narrowed?`, `ras_iss`, `resource`, `reused_id_jag`, `run`, `scope_granted?`, `step`, `tool`, `unattended?` | An ID-JAG was exchanged for (`reused_id_jag: false`), or one already held was presented again. `tool` is `tools/list` for the catalogue's mint. |
+| `delegation.used` | info | `grant_id`, `run`, `server`, `step`, `tool` | A delegated call was answered. |
+| `delegation.denied` | info | `code`, `error`, `server?`, `tool?`, `run?`, `step?`, `idp?`, `approving_sub?` | A delegated call or a sign-in was refused; `code` is the RFC 0044 §5.8 code. |
+| `delegation.step_up` | info | `grant_id`, `max_age`, `server`, `tool` | The IdP asked for a fresher sign-in. |
+| `delegation.consent` | info | `gate`, `decision`, `rendered?`, `answer?`, `via?`, `principal?`, `args_hash?` | A consent gate was asked (`decision: asked`), or answered `approved` or `denied` — by the person (`via: operator_self`) or by its deadline (`via: on_timeout`). A workflow step's own egress gates as `tool` its kind (`http`, …) with `args` its rendered spec. |
+| `delegation.revoked` | info | `by`, `grant_id`, `sub`, `principal?`, `why?`, `epoch?`, `at_idp?`, `at_idp_error?`, `tombstoned?` | A grant was revoked: `by: idp` when the refresh token died, `by: enrolment` when a sign-in replaced a grant no longer the same (expired, another identity, template or ceilings), else who revoked it. |
+| `delegation.replaced_token` | info | `grant_id`, `revoked_at_idp`, `at_idp_error?` | A sign-in replaced the grant's refresh token, and the one it replaced was revoked at the IdP (RFC 7009) — or not, said. |
+| `delegation.quota_warn` | info | `day`, `grant_id`, `month`, `per_day`, `per_month`, `resource` | A mint brought a day or a month to 80% of its budget. |
+| `delegation.catalogue` | info | `server`, `tools` | A delegated server's tools joined the registry, listed with a delegated token. |
+| `delegation.catalogue.refused` | warn | `errors`, `server` | The listed tools did not fit the registry. |
+| `delegation.unbound` | warn | `grant_id`, `note`, `server` | An ID-JAG named no resource and `allow_unbound_at` admitted it. |
+| `delegation.probe.failed` | warn | `code`, `err`, `grant_id` | A liveness probe failed; the grant's tokens were dropped. |
+| `delegation.grant.unreadable` | warn | `err`, `grant_id` | A stored grant did not open at start: revoked, older than its latest refresh token, or sealed under another key. |
+| `delegation.quota.unsaved` | warn | `err`, `grant_id` | A mint's count was not written back. |
+| `delegation.revoke.failed` | error | `err`, `grant_id` | A revocation's tombstone was not written. |
+| `delegation.idp.no_id_jag` | warn | `idp`, `note` | The IdP's metadata lists identity-chaining token types without the ID-JAG. |
 
 ### drain
 

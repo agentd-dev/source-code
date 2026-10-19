@@ -13,13 +13,16 @@
 //! as a client of the MCP Skills extension) and
 //! [`companies`] (the fake Company, held to the Personal Agent Protocol
 //! draft by the [`probe`] Personal Agent, and agentd held to it as the
-//! Personal Agent by [`companies_agent`]).
+//! Personal Agent by [`companies_agent`]), and [`ema`] (agentd acting for an
+//! enrolled person through their IdP: ID-JAG and Enterprise-Managed
+//! Authorization).
 
 pub mod a2a_conversation;
 pub mod auth;
 pub mod companies;
 pub mod companies_agent;
 pub mod durability;
+pub mod ema;
 pub mod events;
 pub mod extensions;
 pub mod mcp_auth_core;

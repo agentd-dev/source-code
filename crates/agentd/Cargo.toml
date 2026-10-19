@@ -150,6 +150,14 @@ oci = ["tls", "dep:ring"]
 # `ring` `oauth` already carries, and every Company URL is HTTPS: no new
 # crate. NOT in the release feature set — the draft moves (rfcs/0047 §11).
 companies = ["oauth", "tls"]
+# Acting for one enrolled person at MCP servers through their enterprise IdP
+# (RFC 0044 P1): ID-JAG token exchange (draft-ietf-oauth-identity-assertion-
+# authz-grant-04), RFC 7523 redemption at the server's authorization server,
+# MCP Enterprise-Managed Authorization, the sealed grant vault and the
+# person's own approvals — all held by the supervisor. ES256/RS256 and
+# AES-256-GCM are the `ring` `oauth` already carries: no new crate. NOT in
+# the release feature set — ID-JAG is a draft and the extension moves.
+xaa = ["oauth"]
 # MCP Events (RFC 0045, SEP-3415 — a draft extension): `mcp.servers[].events`
 # bindings and `event_grants`, polled into declared streams. Hand-rolled on the
 # MCP socket; adds no dependency.

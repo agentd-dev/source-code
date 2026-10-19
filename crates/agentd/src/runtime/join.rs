@@ -174,6 +174,9 @@ impl Runtime {
                 !self.mcp.contains_key(n)
                     && (!self.joining.offers(n) || self.joining.stale.contains(n))
             })
+            // A delegated server is never dialled with agentd's own
+            // credential: its connections are the supervisor's pool's.
+            .filter(|n| !self.mcp_specs.get(n).is_some_and(|s| s.delegated))
             .collect();
         self.joining.probes.retain(|n, _| down.contains(n));
         for name in down {
@@ -327,7 +330,7 @@ impl Runtime {
     /// The registry with `server`'s tools as `tools`, beside the others' as
     /// last built, the installed workflows' tools registered again over them.
     /// `None` when `server` is no longer configured.
-    fn registry_with(
+    pub(crate) fn registry_with(
         &self,
         server: &str,
         tools: Vec<::mcp::wire::Tool>,

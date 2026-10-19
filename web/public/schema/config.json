@@ -68,6 +68,17 @@
         "account_id": {
           "type": "string"
         },
+        "allow_unbound_at": {
+          "description": "grant id_jag: accept an ID-JAG that does not name the pinned resource (warned and recorded)",
+          "type": "boolean"
+        },
+        "attribution": {
+          "description": "grant id_jag: what agent/acting_for carries — the ID-JAG's sub (default), or nothing",
+          "enum": [
+            "sub",
+            "none"
+          ]
+        },
         "audience": {
           "type": "string"
         },
@@ -78,6 +89,13 @@
           "additionalProperties": false,
           "description": "how the client authenticates at the token and revocation endpoints; with no client_id, only assertion_aud",
           "properties": {
+            "alg": {
+              "description": "private_key_jwt: the key's algorithm; default ES256",
+              "enum": [
+                "ES256",
+                "RS256"
+              ]
+            },
             "assertion_aud": {
               "enum": [
                 "token_endpoint",
@@ -113,13 +131,33 @@
           "type": "string"
         },
         "grant": {
+          "description": "id_jag (mcp.servers only; needs the xaa feature): an enrolled person's grant, exchanged at their IdP for an ID-JAG and redeemed here — served by the supervisor alone",
           "enum": [
             "device",
             "authorization_code",
-            "client_credentials"
+            "client_credentials",
+            "id_jag"
           ]
         },
         "header": {
+          "type": "string"
+        },
+        "id_jag": {
+          "description": "grant id_jag: require the ID-JAG profile in the authorization server's metadata (default), or assume it",
+          "enum": [
+            "discover",
+            "assume"
+          ]
+        },
+        "id_jag_reuse": {
+          "description": "grant id_jag: present an unexpired ID-JAG again after a 401 (default auto)",
+          "enum": [
+            "auto",
+            "never"
+          ]
+        },
+        "idp": {
+          "description": "grant id_jag: the identity.providers entry the person's grant is at",
           "type": "string"
         },
         "issuer": {
@@ -139,6 +177,20 @@
             "spiffe"
           ]
         },
+        "max_at_age": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "on_revoked": {
+          "description": "grant id_jag: a revoked grant fails the call; ask is P2",
+          "enum": [
+            "fail",
+            "ask"
+          ]
+        },
         "region": {
           "type": "string"
         },
@@ -148,6 +200,13 @@
         },
         "role_name": {
           "type": "string"
+        },
+        "scope_mode": {
+          "description": "grant id_jag: one token per server with the union of scopes (default), or one per distinct scope set",
+          "enum": [
+            "server",
+            "per_tool"
+          ]
         },
         "scopes": {
           "items": {
@@ -185,6 +244,27 @@
         },
         "token_url": {
           "type": "string"
+        },
+        "tool_scopes": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": "grant id_jag: the scopes each tool needs beyond scopes",
+          "type": "object"
+        },
+        "tools_file": {
+          "description": "grant id_jag, tools_from file: a tools/list result",
+          "type": "string"
+        },
+        "tools_from": {
+          "description": "grant id_jag: the tool catalogue from the first delegated connection (default), or tools_file",
+          "enum": [
+            "first_grant",
+            "file"
+          ]
         },
         "value": {
           "description": "a secret — from a file it MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference; env/flag values may be inline",
@@ -598,6 +678,23 @@
           "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$",
           "type": "string"
         },
+        "idp_subject": {
+          "additionalProperties": false,
+          "description": "the one IdP identity this principal is, exact: required to delegate (RFC 0044; needs the xaa feature)",
+          "properties": {
+            "iss": {
+              "type": "string"
+            },
+            "sub": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "iss",
+            "sub"
+          ],
+          "type": "object"
+        },
         "labels": {
           "additionalProperties": {
             "type": "string"
@@ -619,6 +716,11 @@
             },
             "sub": {
               "type": "string"
+            },
+            "uid": {
+              "description": "the unix A2A listener's peer uid (SO_PEERCRED): the per-person operator operator:<id> (RFC 0044; needs the xaa feature)",
+              "minimum": 0,
+              "type": "integer"
             }
           },
           "type": "object"
@@ -3517,11 +3619,251 @@
           "description": "the actor a schedule/webhook/stream firing is attributed to (default `system`); without it the attribution chain is dropped at its first hop",
           "type": "string"
         },
+        "delegation": {
+          "additionalProperties": false,
+          "description": "acting for an enrolled person through their IdP (RFC 0044; needs the xaa feature): the seal key, the token caps and who may enrol for what. Restart-only, operator-only",
+          "properties": {
+            "at_cache_cap": {
+              "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "consent_timeout": {
+              "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "liveness_interval": {
+              "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "seal_key": {
+              "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment",
+              "type": "string"
+            },
+            "seal_key_previous": {
+              "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment",
+              "type": "string"
+            },
+            "templates": {
+              "description": "who may enrol, for what; no matching template, no enrolment",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "budget": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "per_day": {
+                        "description": "mints per day per server; default 16",
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "per_month": {
+                        "description": "mints per month per server; default 200",
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "per_run": {
+                        "description": "mints per run; default 12",
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "idp": {
+                    "description": "the identity.providers entry its principals bind to",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "principals": {
+                    "additionalProperties": false,
+                    "description": "every field named must match",
+                    "properties": {
+                      "labels": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "type": "object"
+                      },
+                      "role": {
+                        "enum": [
+                          "operator",
+                          "user"
+                        ]
+                      },
+                      "source": {
+                        "description": "P1 admits operator alone",
+                        "enum": [
+                          "operator",
+                          "oidc",
+                          "x509",
+                          "device"
+                        ]
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "servers": {
+                    "additionalProperties": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "scopes": {
+                          "description": "the scope ceiling on this server",
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "description": "each grant: id_jag server it allows, by name",
+                    "type": "object"
+                  },
+                  "ttl": {
+                    "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+                    "type": [
+                      "string",
+                      "integer"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "principals",
+                  "idp",
+                  "servers"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
         "labels": {
           "additionalProperties": {
             "type": "string"
           },
           "description": "labels stamped on autonomous work",
+          "type": "object"
+        },
+        "providers": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "client_auth": {
+                "additionalProperties": false,
+                "description": "how the client authenticates at the token and revocation endpoints; with no client_id, only assertion_aud",
+                "properties": {
+                  "alg": {
+                    "description": "private_key_jwt: the key's algorithm; default ES256",
+                    "enum": [
+                      "ES256",
+                      "RS256"
+                    ]
+                  },
+                  "assertion_aud": {
+                    "enum": [
+                      "token_endpoint",
+                      "issuer"
+                    ]
+                  },
+                  "key": {
+                    "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment",
+                    "type": "string"
+                  },
+                  "kid": {
+                    "type": "string"
+                  },
+                  "method": {
+                    "enum": [
+                      "private_key_jwt",
+                      "client_secret_basic",
+                      "client_secret_post"
+                    ]
+                  }
+                },
+                "type": "object"
+              },
+              "client_id": {
+                "description": "agentd's client at the IdP (Okta: the AI agent's client ID)",
+                "type": "string"
+              },
+              "client_secret": {
+                "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment",
+                "type": "string"
+              },
+              "issuer": {
+                "description": "the IdP's issuer, pinned (https; plain http only to a loopback host). Its RFC 8414 and OpenID metadata are both read, and merged",
+                "type": "string"
+              },
+              "jwks_uri": {
+                "description": "the IdP's key set, pinned; default the OpenID metadata's (okta: {issuer}/oauth2/v1/keys)",
+                "type": "string"
+              },
+              "profile": {
+                "description": "okta: ID-JAGs come only from the org authorization server (an /oauth2/<id> issuer is refused), keys at {issuer}/oauth2/v1/keys, subject refresh_token. Default generic",
+                "enum": [
+                  "generic",
+                  "okta"
+                ]
+              },
+              "sign_in": {
+                "additionalProperties": false,
+                "properties": {
+                  "grants": {
+                    "description": "the enrolment grants, in the order tried; default [device]",
+                    "items": {
+                      "enum": [
+                        "device",
+                        "authorization_code"
+                      ]
+                    },
+                    "type": "array"
+                  },
+                  "scopes": {
+                    "description": "default [openid, offline_access]; openid is required",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "subject": {
+                "description": "what the token exchange presents: the sealed refresh token, or a fresh ID token from a refresh with no scope. Default refresh_token under okta, id_token otherwise",
+                "enum": [
+                  "refresh_token",
+                  "id_token"
+                ]
+              },
+              "subjects": {
+                "description": "public (default): an ID-JAG's sub must equal the grant's; pairwise: recorded, not compared",
+                "enum": [
+                  "public",
+                  "pairwise"
+                ]
+              }
+            },
+            "required": [
+              "issuer",
+              "client_id"
+            ],
+            "type": "object"
+          },
+          "description": "the enterprise identity providers agentd is a client of (RFC 0044; needs the xaa feature): where an enrolled person signs in, and where their grant is exchanged for an ID-JAG. Restart-only, operator-only",
           "type": "object"
         }
       },
@@ -4574,6 +4916,17 @@
           },
           "type": "object"
         },
+        "experimental": {
+          "additionalProperties": false,
+          "description": "features built on drafts, each off until turned on",
+          "properties": {
+            "id_jag": {
+              "description": "allow `grant: id_jag` servers (RFC 0044; needs the xaa feature) until ID-JAG reaches IETF working-group last call",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
         "policies": {
           "description": "ordered verdicts on a tool call; first match wins, no match is allow",
           "items": {
@@ -4591,6 +4944,17 @@
               "match": {
                 "additionalProperties": false,
                 "properties": {
+                  "any_tags": {
+                    "description": "at least one listed trifecta tag is on the tool",
+                    "items": {
+                      "enum": [
+                        "untrusted_input",
+                        "sensitive",
+                        "egress"
+                      ]
+                    },
+                    "type": "array"
+                  },
                   "args": {
                     "description": "CEL over `args`, `tool` and `caller` — the only place an ARGUMENT can be judged, since grants are name patterns",
                     "type": "string"
@@ -4604,6 +4968,10 @@
                       ]
                     },
                     "type": "array"
+                  },
+                  "delegated": {
+                    "description": "the call is made with an enrolled person's grant (RFC 0044)",
+                    "type": "boolean"
                   },
                   "principal": {
                     "description": "principal-id glob, for calls carrying one",
@@ -4619,6 +4987,10 @@
                       ]
                     },
                     "type": "array"
+                  },
+                  "tainted": {
+                    "description": "the work holds outside input; until the taint engine, every unit that touched a delegated server",
+                    "type": "boolean"
                   },
                   "tool": {
                     "description": "tool-name glob; absent matches every tool",

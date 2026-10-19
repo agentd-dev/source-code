@@ -1001,6 +1001,105 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   endpoints_on_origin, code_challenge_methods_supported}`,
   `OAuth2Params::{resource, pkce_s256, dial}`; `login::{resolve_params,
   spec_of}`; `CachedCred::{scope, step_up}`; `sec::harden`.
+- Acting for one enrolled person at MCP servers through their enterprise
+  IdP (RFC 0044 P1), behind the new cargo feature `xaa`, which no release
+  binary carries, and `security.experimental.id_jag: true`. An MCP server's
+  `auth` of `grant: id_jag` names its IdP (`identity.providers.<name>`:
+  `issuer`, `client_id`, `client_auth` or `client_secret`, `profile:
+  generic | okta`, `sign_in`, `subject`, `subjects`, `jwks_uri`), its
+  authorization server (`audience`) and itself (`resource`), both required
+  pins, and agentd's client there (`client_id`, `client_auth`). The
+  supervisor exchanges the person's grant at the IdP for an ID-JAG (RFC
+  8693, draft-ietf-oauth-identity-assertion-authz-grant-04), refuses one
+  whose `typ`, `aud`, `client_id`, `iss`, `sub`, `exp`, `resource` or scope
+  is not what it asked for, redeems it with the JWT bearer grant (RFC 7523)
+  and calls the server with the access token, declaring MCP's
+  `io.modelcontextprotocol/enterprise-managed-authorization` extension in
+  `initialize` (2025-11-25) and in every request's `_meta` (2026-07-28), with
+  the ID-JAG's `sub` as `agent/acting_for` and a random handle as
+  `agent/grant`. No worker is handed a delegated server and no call falls
+  back to agentd's own credential; nothing is minted at boot, and each
+  delegated call's answer, and each refusal — a server's error quoting the
+  token it was presented included — reaches the model, the log and
+  `delegation.denied` with every live token value scrubbed. Before anything
+  is minted for a delegated server, its RFC 9728 metadata, read from the
+  well-known locations on its endpoint's origin, must describe the pinned
+  `resource` byte for byte and list the pinned `audience`; otherwise the
+  call is `config`.
+- `agentd --login idp:<name>[/<grant>]`: the running daemon signs the
+  per-person operator in — the unix A2A listener's peer, matched by the new
+  `a2a.principals[].match.uid` and pinned by `idp_subject: {iss, sub}` — by
+  the IdP's device grant or an authorization code with PKCE, `state`,
+  `nonce` and RFC 9207 `iss` through a one-time start link and a state-bound
+  cookie on a loopback callback. The ID token is verified with the IdP's key
+  set (ES256 or RS256), its `iss` and `sub` must be the pin, a template
+  (`identity.delegation.templates[]`) must admit the person, and the refresh
+  token is sealed with AES-256-GCM under `identity.delegation.seal_key`, bound
+  to the grant, the subject, the epoch and the refresh-token version, beside
+  a tombstone register that refuses a revoked epoch or an older record.
+  Enrolment lists each allowed server's tools with one delegated token
+  (`tools_from: first_grant`; `file` pins them). Signing in again keeps a
+  grant only while it is the same — the same identity, unexpired, under the
+  template that admits the person now with the ceilings it allows now — and
+  otherwise replaces it one epoch up; the refresh token a sign-in replaces
+  is revoked at the IdP. A grant is held at every call to the ceilings its
+  template allows now.
+- Renewal and revocation (RFC 0044 §5.8): an access token is used to
+  `exp − 60 s`, at most `identity.delegation.at_cache_cap` (60m) and only
+  within `liveness_interval` (15m) of a proof that the refresh token is
+  alive; a `401` re-presents the cached ID-JAG unless the server's
+  authorization server refused one; one IdP call per grant at a time, a
+  rotation kept with compare-and-swap before use — and before the ID-JAG it
+  came with is checked, so one a check refuses does not leave the vault
+  holding a spent token; `invalid_grant` runs the
+  liveness probe, which revokes a dead grant; `insufficient_user_authentication`
+  is a `step_up` the person answers by signing in again; per-day,
+  per-month and per-run mint budgets with `delegation.quota_warn`.
+  `agentd --delegation-revoke <principal | idp:<name>#<sub>>` revokes at the
+  IdP (RFC 7009), tombstones and purges; `--delegation-list` lists the
+  grants and open gates; `--delegation-lint` prints the Resource connections
+  each IdP must have. Every refusal is a typed `DelegationError` with RFC
+  0044's code, and `delegation.*` events record it.
+- The person's consent (RFC 0044 §5.10, P1): a delegated `sensitive` or
+  `egress` call, and any `egress` call from work that holds delegated data —
+  a workflow step that sends the run's data out by its own effect included:
+  `http`, `a2a.send`, `a2a.delegate`, an `emit` forwarded out, an `mcp.tool`
+  or `mcp.resource` step at a server tagged `egress` — gates for the person,
+  who answers with `agentd --delegation-approve <gate>` or
+  `--delegation-deny <gate>`, bound to the gate's nonce and the hash of its
+  arguments; never an operator, a judge or a message on the task. An
+  approved step runs with the spec the person saw. An unanswered gate
+  denies after `identity.delegation.consent_timeout` (24h). A workflow
+  step's gate survives a restart.
+- A subagent never acts with the person's grant, and neither does a run its
+  call started — through a workflow tool, `workflow.run` or
+  `workflow.signal` — or a run that one started: their delegated calls are
+  `delegation_not_permitted`. A run records the subagent behind it
+  (`RunState::subagent`). Autonomous work never runs as the person:
+  `identity.autonomous_as` naming the per-person operator is refused at load,
+  and `security.exec.enabled` is refused beside `identity.providers` or a
+  seal key as well as beside a delegated server. `security.policies[].match`
+  gains `delegated`, `tainted` and `any_tags`.
+- A mock IdP, resource authorization server and EMA MCP server: the hidden
+  `--internal-mock-xaa` mode of debug and `internal-mocks` builds with `xaa`.
+  The conformance family `ema` (30 checks) drives agentd against it; the
+  suite's binary is built with `xaa`. `--internal-mock-mcp-http --prm
+  <issuer>` serves RFC 9728 metadata naming that authorization server.
+- `agentd-core`: `auth::idjag` (`exchange`, which returns a rotated refresh
+  token beside its checked ID-JAG, `rotation_of`, `redeem`, `refresh`,
+  `check_exchange`, `check_redeemed`, `merge_idp`, `idp_metadata`,
+  `ras_metadata`, `verify_id_token`, `fetch_jwks`) and `auth::idjag::wire`,
+  every identifier the flow puts on the wire;
+  `auth::client_assertion::{RsaClientKey, AnyClientKey}`;
+  `config::settings::delegation`; `delegation` (`Delegation`,
+  `DelegationError`, `Code`, `vault`, `enrol`, `cli`, `lint`, `mock`);
+  `OAuthGrant::IdJag`; `ClientAuth::alg`; `ClientAuthSpec::alg`;
+  `McpServerSpec::delegated`; `OAuth2Params::prompt_only`;
+  `sec::secret::{refs_of, env_refs_of, canonical_ref, canonical_path}`;
+  `auth::challenge::resource_metadata`; `mcp::mock_http::Options::prm`;
+  `RunState::subagent`. `agentd-mcp`:
+  `McpClient::with_extension` and `RmcpBuilder::with_extensions`.
+
 **Changed.**
 
 - A login is cached with the authorization server it was made at — the
@@ -1271,6 +1370,26 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   block's endpoints (`login::resolve_params`); the `mcp.servers[].oauth`
   shortcut's token request goes through `auth::http`, which follows no
   redirect.
+- The document boundary (RFC 0042) as RFC 0044 §5.14.1 amends it: `mcp`
+  straddles it. A served document, a `:::!config` or `:::!mcp` fragment and a
+  subagent template's machinery may still declare MCP servers, but not one of
+  `grant: id_jag`, not `auth.idp`, `.audience`, `.resource`, `.client_auth`,
+  `.tool_scopes`, `.scope_mode`, `.tools_from`, `.tools_file`, `.id_jag`,
+  `.id_jag_reuse`, `.on_revoked`, `.allow_unbound_at`, `.attribution` or
+  `.max_at_age` on any server, and no reference to a secret under
+  `identity.*` or on a delegated server, by any spelling: a reference is
+  compared by what it resolves to (a trimmed name, a canonical path), and a
+  `*_file` field's path as a file reference. A document that declared an MCP
+  server with `auth.audience`, `auth.resource` or `auth.client_auth` now has
+  that server's credential set by the operator.
+- A principal rule with `match.uid` makes the unix listener's peer of that
+  uid `operator:<id>`, owning its tasks and conversations by that id; every
+  other unix peer is `operator`, as before.
+- `identity.providers` and `identity.delegation` are restart-only, and a
+  reload that adds, removes or changes a `grant: id_jag` server, or changes
+  the per-person operator's `a2a.principals` rule, refuses with
+  `config.reload.restart_required`.
+
 **Fixed.**
 
 - A reload that rebuilt the skills catalogue dropped the body of every

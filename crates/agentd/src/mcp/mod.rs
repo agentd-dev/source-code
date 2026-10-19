@@ -174,6 +174,14 @@ pub fn from_spec(
             spec.name
         )));
     }
+    // A delegated server is reached with an enrolled person's minted token,
+    // by the supervisor's pool alone (RFC 0044 §5.7): never here, by anyone.
+    if spec.delegated {
+        return Err(McpError::Transport(format!(
+            "mcp server '{}' is delegated (grant: id_jag), reached only through the supervisor",
+            spec.name
+        )));
+    }
     if spec.endpoint.trim().is_empty() {
         return Err(McpError::Transport(format!(
             "mcp server '{}' has no endpoint",

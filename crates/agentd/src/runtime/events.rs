@@ -85,6 +85,17 @@ pub enum Event {
         origin: String,
         why: String,
     },
+    /// What the delegation supervisor tells the loop (RFC 0044): an audit
+    /// record, a delegated server's tool catalogue.
+    #[cfg(feature = "xaa")]
+    Delegation(Box<crate::delegation::Note>),
+    /// A delegation op's task moved on: an enrolment said where to sign in,
+    /// or an op ended.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    DelegationSaid {
+        task: String,
+        said: crate::delegation::enrol::Said,
+    },
     /// A Company sign-in moved on (RFC 0047 §5.7): its gate is ready to open,
     /// or it ended. Sent by the sign-in's own thread.
     #[cfg(feature = "companies")]

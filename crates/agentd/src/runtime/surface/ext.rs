@@ -945,6 +945,7 @@ mod tests {
             Gate::DeviceGrant => "`a2a.device_grant.enabled`",
             Gate::Listener => "a TCP listener",
             Gate::Companies => "a `kind: company` entry",
+            Gate::Delegation => "an identity provider or a `grant: id_jag` server",
         }
     }
 

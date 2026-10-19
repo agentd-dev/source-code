@@ -426,6 +426,81 @@
           "if": {
             "properties": {
               "op": {
+                "const": "delegation.enrol"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.enrol"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "delegation.list"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.list"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "delegation.approve"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.approve"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "delegation.deny"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.deny"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "delegation.revoke"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.revoke"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
                 "const": "_instance.result"
               }
             },
@@ -917,6 +992,117 @@
           },
           "required": [
             "op"
+          ],
+          "type": "object"
+        },
+        "delegation.approve": {
+          "additionalProperties": false,
+          "properties": {
+            "args_hash": {
+              "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+              "type": "string"
+            },
+            "gate": {
+              "description": "The consent gate",
+              "minLength": 1,
+              "type": "string"
+            },
+            "nonce": {
+              "description": "The gate's nonce, as delegation.list gives it",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "delegation.approve"
+            }
+          },
+          "required": [
+            "op",
+            "gate",
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "delegation.deny": {
+          "additionalProperties": false,
+          "properties": {
+            "args_hash": {
+              "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+              "type": "string"
+            },
+            "gate": {
+              "description": "The consent gate",
+              "minLength": 1,
+              "type": "string"
+            },
+            "nonce": {
+              "description": "The gate's nonce, as delegation.list gives it",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "delegation.deny"
+            }
+          },
+          "required": [
+            "op",
+            "gate",
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "delegation.enrol": {
+          "additionalProperties": false,
+          "properties": {
+            "grant": {
+              "description": "The sign-in grant; the provider's first that its IdP supports when absent",
+              "enum": [
+                "device",
+                "authorization_code"
+              ]
+            },
+            "idp": {
+              "description": "The identity.providers entry to sign in at",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "delegation.enrol"
+            }
+          },
+          "required": [
+            "op",
+            "idp"
+          ],
+          "type": "object"
+        },
+        "delegation.list": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "delegation.list"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "delegation.revoke": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "delegation.revoke"
+            },
+            "target": {
+              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "target"
           ],
           "type": "object"
         },
@@ -2228,6 +2414,140 @@
           ],
           "type": "object"
         }
+      },
+      "delegation.approve": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "args_hash": {
+              "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+              "type": "string"
+            },
+            "gate": {
+              "description": "The consent gate",
+              "minLength": 1,
+              "type": "string"
+            },
+            "nonce": {
+              "description": "The gate's nonce, as delegation.list gives it",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "gate",
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "description": "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone",
+        "reply": "task",
+        "result": false
+      },
+      "delegation.deny": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "args_hash": {
+              "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+              "type": "string"
+            },
+            "gate": {
+              "description": "The consent gate",
+              "minLength": 1,
+              "type": "string"
+            },
+            "nonce": {
+              "description": "The gate's nonce, as delegation.list gives it",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "gate",
+            "nonce"
+          ],
+          "type": "object"
+        },
+        "description": "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made. The person's alone",
+        "reply": "task",
+        "result": false
+      },
+      "delegation.enrol": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "grant": {
+              "description": "The sign-in grant; the provider's first that its IdP supports when absent",
+              "enum": [
+                "device",
+                "authorization_code"
+              ]
+            },
+            "idp": {
+              "description": "The identity.providers entry to sign in at",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "idp"
+          ],
+          "type": "object"
+        },
+        "description": "Sign the per-person operator in at an identity provider {idp, grant?} and keep their delegation grant: the task says where to sign in, and how it ended. The per-person operator's alone",
+        "reply": "task",
+        "result": false
+      },
+      "delegation.list": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "The delegation grants this instance holds — never a secret — and the open consent gates, each with its nonce and argument hash for the person who answers it",
+        "reply": "message",
+        "result": {
+          "properties": {
+            "gates": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "grants": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "grants",
+            "gates"
+          ],
+          "type": "object"
+        }
+      },
+      "delegation.revoke": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "target": {
+              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "description": "Revoke the grants {target} names — a principal, or idp:<name>#<sub> for every grant of that subject: RFC 7009 at the IdP, then the tombstone, the record and every token",
+        "reply": "task",
+        "result": false
       },
       "plan.get": {
         "args": {

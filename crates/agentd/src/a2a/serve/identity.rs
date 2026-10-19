@@ -45,13 +45,14 @@ pub(super) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> Pe
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Peer {
     Tcp(SocketAddr),
-    /// A unix-socket peer, already checked to be the daemon's own uid.
-    Unix,
+    /// A unix-socket peer, already checked to be the daemon's own uid or
+    /// root: the uid the kernel named.
+    Unix(u32),
 }
 
 impl Peer {
     pub(super) fn is_unix(&self) -> bool {
-        matches!(self, Peer::Unix)
+        matches!(self, Peer::Unix(_))
     }
 
     /// The address failures are counted against. A unix peer has none, and
@@ -59,7 +60,7 @@ impl Peer {
     pub(super) fn source(&self) -> Option<IpAddr> {
         match self {
             Peer::Tcp(a) => Some(a.ip()),
-            Peer::Unix => None,
+            Peer::Unix(_) => None,
         }
     }
 }
@@ -90,12 +91,16 @@ pub(super) fn evidence_of(headers: &HeaderMap, peer_id: &PeerId, peer: &Peer) ->
         }),
         local: match peer {
             Peer::Tcp(a) => a.ip().to_canonical().is_loopback(),
-            Peer::Unix => true,
+            Peer::Unix(_) => true,
         },
         // Presence, not value: `Origin: null` is what a `file://` page, a
         // sandboxed iframe or a `data:` URL sends, and it is as much a browser
         // as any named origin.
         origin: headers.contains_key(header::ORIGIN),
+        uid: match peer {
+            Peer::Unix(uid) => Some(*uid),
+            Peer::Tcp(_) => None,
+        },
     }
 }
 

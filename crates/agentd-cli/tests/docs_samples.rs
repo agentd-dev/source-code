@@ -15,8 +15,8 @@
 //!
 //! The pages describe the release binary, so the samples are checked against
 //! a build with the release feature set. A sample for a feature that set
-//! leaves out — `exec`, `companies` — is skipped there and checked by a
-//! build that adds it (`--features <release set>,companies`, or CI's
+//! leaves out — `exec`, `companies`, `xaa` — is skipped there and checked
+//! by a build that adds it (`--features <release set>,companies`, or CI's
 //! `--all-features`).
 #![cfg(all(
     unix,
@@ -144,6 +144,9 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
         if !cfg!(feature = "companies") && declares_a_company(&doc) {
             continue;
         }
+        if !cfg!(feature = "xaa") && delegates(&doc) {
+            continue;
+        }
         let dir = scratch.join(format!("sample-{checked}"));
         std::fs::create_dir_all(&dir).unwrap();
         for need in needs(&body) {
@@ -189,6 +192,18 @@ fn declares_a_company(doc: &serde_json::Value) -> bool {
         || doc["services"]
             .as_object()
             .is_some_and(|s| s.values().any(|v| v["kind"] == "company"))
+}
+
+/// Whether a sample acts for an enrolled person (RFC 0044): an IdP, the
+/// delegation section, the experimental switch or a `grant: id_jag` server —
+/// each refused by a build without `xaa`.
+fn delegates(doc: &serde_json::Value) -> bool {
+    doc.pointer("/identity/providers").is_some()
+        || doc.pointer("/identity/delegation").is_some()
+        || doc.pointer("/security/experimental").is_some()
+        || doc["mcp"]["servers"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|m| m["auth"]["grant"] == "id_jag"))
 }
 
 /// The files a sample's `# needs:` comment names.

@@ -189,6 +189,7 @@ pub(crate) fn resolve_params(
         resource: auth.resource.clone(),
         pkce_s256,
         dial,
+        prompt_only: false,
     })
 }
 
@@ -278,6 +279,14 @@ pub fn tokens_to_cred(t: &oauth2::Tokens) -> CachedCred {
 pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<String, String> {
     let target = &canonical_target(settings, target);
     let auth = resolve_auth(settings, target)?;
+    // A delegated server holds no login of its own: it is reached with the
+    // enrolled person's grant (RFC 0044), which the running daemon keeps.
+    if auth.grant == Some(OAuthGrant::IdJag) {
+        return Err(format!(
+            "{target} is reached with the enrolled person's grant, not a login of its own: run `agentd --login idp:{}`",
+            auth.idp.as_deref().unwrap_or("<name>")
+        ));
+    }
     // AWS IAM Identity Center (SSO): a distinct device flow → temporary AWS creds.
     if auth.kind == AuthKind::Aws {
         if auth.source.as_deref() != Some("sso") {
@@ -442,6 +451,17 @@ mod tests {
             jwt_svid_file: None,
             svid_file: None,
             key_file: None,
+            idp: None,
+            tool_scopes: Default::default(),
+            scope_mode: None,
+            tools_from: None,
+            tools_file: None,
+            id_jag: None,
+            id_jag_reuse: None,
+            on_revoked: None,
+            allow_unbound_at: None,
+            attribution: None,
+            max_at_age: None,
         }
     }
 

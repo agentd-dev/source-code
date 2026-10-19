@@ -835,6 +835,11 @@ impl Runtime {
             inputs,
         );
         run.principal = ev.principal.clone();
+        run.subagent = ev
+            .payload
+            .get("subagent")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         run.parent = ev.payload.get("parent").cloned().filter(|p| !p.is_null());
         // What the run carries, on its own record from the start
         // (`withhold`): what its definition can be handed, and what whoever
@@ -1508,6 +1513,17 @@ impl Runtime {
         {
             st.cache_key = Some(k);
         }
+        // A step whose own effect would send a run's delegated data off the
+        // box waits for the person (RFC 0044 §5.13 item 6); approved, it runs
+        // with the spec they saw.
+        #[cfg(feature = "xaa")]
+        let spec = match self.approved_spec(run_id, step_id) {
+            Some(approved) => approved,
+            None if self.step_consent(run_id, step_id, &step.kind, &spec, &step_caller) => {
+                return;
+            }
+            None => spec,
+        };
         // The circuit breaker (`breaker:` on a remote-effect kind): consulted
         // BEFORE the effect is dispatched, on the loop, so an open circuit
         // costs a map lookup instead of a connection + timeout. A fast-fail is
@@ -2004,6 +2020,51 @@ impl Runtime {
                     self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                     return;
                 }
+                // A delegated server's call goes the delegated way, as its
+                // tool (RFC 0044): the person's consent, a mint, the
+                // supervisor's pool — never a connection of the loop's.
+                #[cfg(feature = "xaa")]
+                if self.is_delegated_server(&server) {
+                    let name = self
+                        .registry
+                        .iter()
+                        .find(|t| {
+                            matches!(&t.imp, crate::registry::Impl::Mcp { server: s, tool: n }
+                                if *s == server && *n == tool)
+                        })
+                        .map(|t| t.name.clone());
+                    // Who the work is for decides before what the catalogue
+                    // holds: work for nobody's delegate is refused as that.
+                    let admitted = self
+                        .delegation
+                        .as_ref()
+                        .map(|d| self.delegation_admit(d, &step_caller, &server).map(|_| ()))
+                        .unwrap_or(Ok(()));
+                    match (name, admitted) {
+                        (_, Err(e)) => self.finish_step(
+                            run_id,
+                            step_id,
+                            StepStatus::Failed,
+                            None,
+                            Some(format!("{server}.{tool}: {e}")),
+                            0,
+                        ),
+                        (Some(name), Ok(())) => {
+                            self.step_tool_call(run_id, step_id, &step_caller, &name, args)
+                        }
+                        (None, Ok(())) => self.finish_step(
+                            run_id,
+                            step_id,
+                            StepStatus::Failed,
+                            None,
+                            Some(format!(
+                                "{server}.{tool} is not in the delegated server's tool catalogue: the person enrols (`agentd --login idp:<name>`), or the operator pins it (auth.tools_from: file)"
+                            )),
+                            0,
+                        ),
+                    }
+                    return;
+                }
                 // Pace calls toward a rated catalog service. A dry bucket fails
                 // the step — a refusal the workflow's `retry:` can absorb —
                 // rather than blocking the single-writer loop.
@@ -2385,6 +2446,12 @@ impl Runtime {
                     PendingKind::CompanyDirect { id, company } => {
                         json!({"kind": "company_direct", "direct": id, "company": company})
                     }
+                    // The person's consent gate travels whole, so a restart
+                    // asks again with the same binding and deadline.
+                    #[cfg(feature = "xaa")]
+                    PendingKind::Consent { id } => self.consent_wait(id),
+                    #[cfg(not(feature = "xaa"))]
+                    PendingKind::Consent { id } => json!({"kind": "consent", "gate": id}),
                     PendingKind::Run { run, .. } => json!({"kind": "run", "run": run}),
                     PendingKind::Await {
                         condition,
@@ -3774,7 +3841,12 @@ impl Runtime {
                 };
                 // The run is handed its caller's text, and so carries what the
                 // caller does (`withhold`) — a workflow tool's run included.
-                let payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx, "msg_depth": caller.msg_depth, "carries": self.caller_carries(caller)});
+                let mut payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx, "msg_depth": caller.msg_depth, "carries": self.caller_carries(caller)});
+                // A subagent's call, or a run one started, starts a run no
+                // delegated call is made for (RFC 0044 P1).
+                if let Some(h) = self.subagent_lineage(caller) {
+                    payload["subagent"] = json!(h);
+                }
                 // The run continues its caller's trace.
                 let trace = self.caller_trace(caller);
                 match self.accept_event(
@@ -4075,7 +4147,17 @@ impl Runtime {
                 let sname = args["name"].as_str().unwrap_or("").to_string();
                 // A run the signal starts continues the sender's trace.
                 let trace = self.caller_trace(caller);
-                let _ = self.accept_event(kinds::SIGNAL, caller.principal.clone(), json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub(), "carries": self.caller_carries(caller)}), trace.as_ref());
+                let mut signal = json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub(), "carries": self.caller_carries(caller)});
+                // A run a subagent's signal starts is no delegated call's.
+                if let Some(h) = self.subagent_lineage(caller) {
+                    signal["subagent"] = json!(h);
+                }
+                let _ = self.accept_event(
+                    kinds::SIGNAL,
+                    caller.principal.clone(),
+                    signal,
+                    trace.as_ref(),
+                );
                 // The signal goes on the durable inbox; waits and `signal`
                 // start nodes are woken when the loop drains it, so no
                 // delivery count is available at this point.
@@ -4086,6 +4168,21 @@ impl Runtime {
             }
             _ => err(format!("unknown workflow tool {name}")),
         }
+    }
+}
+
+impl Runtime {
+    /// The subagent behind `caller`'s work: itself, or the subagent whose call
+    /// started the run it works in, directly or through the runs that one
+    /// started (RFC 0044 P1: a subagent never acts with a person's grant).
+    pub(crate) fn subagent_lineage(&self, caller: &ToolCaller) -> Option<String> {
+        caller.subagent.clone().or_else(|| {
+            caller
+                .run
+                .as_ref()
+                .and_then(|r| self.runs.get(r))
+                .and_then(|r| r.subagent.clone())
+        })
     }
 }
 

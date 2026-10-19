@@ -163,6 +163,29 @@
     "tier": 2
   },
   {
+    "name": "Enterprise-Managed Authorization",
+    "mark": "preview",
+    "full": "MCP Enterprise-Managed Authorization: agentd acts for an enrolled person at an MCP server through their enterprise IdP, a build-from-source preview",
+    "href": "/docs/authentication/#enterprise-managed-authorization",
+    "tier": 2
+  },
+  {
+    "name": "Token Exchange",
+    "version": "RFC 8693",
+    "mark": "preview",
+    "full": "OAuth token exchange: an enrolled person's grant exchanged at their IdP for an ID-JAG, a build-from-source preview",
+    "href": "/docs/authentication/#enterprise-managed-authorization",
+    "tier": 2
+  },
+  {
+    "name": "ID-JAG",
+    "version": "draft -04",
+    "mark": "preview",
+    "full": "Identity Assertion JWT Authorization Grant, checked claim by claim and redeemed with the JWT bearer grant, a build-from-source preview",
+    "href": "/docs/authentication/#enterprise-managed-authorization",
+    "tier": 2
+  },
+  {
     "name": "TLS",
     "version": "1.3",
     "full": "TLS 1.3 (RFC 8446) on every HTTPS connection, in and out",

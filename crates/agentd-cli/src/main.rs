@@ -68,6 +68,32 @@ fn dispatch() -> i32 {
         return mock_company(&argv[2..]);
     }
 
+    // Hidden mock IdP, resource authorization server and EMA MCP server
+    // (tests/conformance, RFC 0044): three loopback listeners, announced
+    // through <addr-file>.
+    #[cfg(all(feature = "xaa", any(feature = "internal-mocks", debug_assertions)))]
+    if argv.get(1).map(String::as_str) == Some("--internal-mock-xaa") {
+        let addr_file = argv
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("/tmp/agentd-mock-xaa.addr");
+        let knobs = match argv.get(3).map(String::as_str) {
+            Some("--knobs") => match argv.get(4).map(|k| serde_json::from_str(k)) {
+                Some(Ok(v)) => v,
+                _ => {
+                    eprintln!("--internal-mock-xaa: --knobs takes a JSON object");
+                    return exit::USAGE;
+                }
+            },
+            Some(other) => {
+                eprintln!("--internal-mock-xaa: unknown argument {other:?}");
+                return exit::USAGE;
+            }
+            None => serde_json::json!({}),
+        };
+        return agentd::delegation::mock::run_with(addr_file, &knobs);
+    }
+
     // Hidden built-in mock LLM (tests):
     // `--internal-mock-llm <addr-file> [final|read|schedule|file:<playbook>]`.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
@@ -100,13 +126,16 @@ fn dispatch() -> i32 {
 
 /// `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]
 /// [--protocol-version <v>] [--events <extension|top-level|none>]
-/// [--hook-ca <pem>] [--listen <addr>] [--tasks-push] [--no-skills]`: the
+/// [--hook-ca <pem>] [--listen <addr>] [--tasks-push] [--no-skills]
+/// [--prm <issuer>]`: the
 /// mock at 2025-11-25 (the `initialize` handshake; the default) or
 /// 2026-07-28 (`server/discover`), its MCP Events declared in SEP-3415's
 /// spelling (the default), the design sketch's, or not at all; its webhook
 /// deliveries trust the CA in `--hook-ca`; its MCP tasks' ends pushed down
 /// a listen that asks for them with `--tasks-push`; the Skills extension
-/// left undeclared with `--no-skills`. Anything else is a usage error.
+/// left undeclared with `--no-skills`; RFC 9728 metadata naming the
+/// authorization server `--prm` names served at its well-known paths.
+/// Anything else is a usage error.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 fn mock_mcp_http(args: &[String]) -> i32 {
     use agentd::mcp::mock_http::{Lifecycle, Options, run_with};
@@ -144,6 +173,7 @@ fn mock_mcp_http(args: &[String]) -> i32 {
             "--listen" => opts.listen = it.next().cloned(),
             "--tasks-push" => opts.tasks_push = true,
             "--no-skills" => opts.skills = false,
+            "--prm" => opts.prm = it.next().cloned(),
             _ => positional.push(arg.as_str()),
         }
     }
@@ -425,6 +455,40 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             );
             exit::SUCCESS
         }
+        // `--login idp:<name>`: the running daemon signs the per-person
+        // operator in at the IdP; this prints where, and how it ended.
+        Ask::Login(target) if target.starts_with("idp:") => {
+            delegation_cli(&loaded.settings, Delegating::Login(target))
+        }
+        Ask::DelegationList => delegation_cli(&loaded.settings, Delegating::List),
+        Ask::DelegationApprove(gate) => {
+            delegation_cli(&loaded.settings, Delegating::Answer(gate, true))
+        }
+        Ask::DelegationDeny(gate) => {
+            delegation_cli(&loaded.settings, Delegating::Answer(gate, false))
+        }
+        Ask::DelegationRevoke(target) => {
+            delegation_cli(&loaded.settings, Delegating::Revoke(target))
+        }
+        Ask::DelegationLint => {
+            #[cfg(feature = "xaa")]
+            {
+                let (report, findings) = agentd::delegation::lint::lint(&loaded.settings);
+                print!("{report}");
+                if findings.iter().any(|f| f.level == "error") {
+                    exit::USAGE
+                } else {
+                    exit::SUCCESS
+                }
+            }
+            #[cfg(not(feature = "xaa"))]
+            {
+                eprintln!(
+                    "agentd: --delegation-lint needs the xaa feature (build with --features xaa)"
+                );
+                exit::USAGE
+            }
+        }
         // `--login company:<name>`: the running daemon asks the User to sign
         // in at the Company; this prints where, and how it ended.
         Ask::Login(target) if target.starts_with("company:") => {
@@ -499,6 +563,57 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             agentd::state::record_config_digest(&loaded.settings);
             agentd::runtime::run(&loaded, args, env)
         }
+    }
+}
+
+/// A delegation command (RFC 0044): what it asks of the running daemon.
+#[cfg_attr(not(all(feature = "xaa", feature = "a2a")), allow(dead_code))]
+enum Delegating {
+    Login(String),
+    List,
+    Answer(String, bool),
+    Revoke(String),
+}
+
+/// `--login idp:<name>`, `--delegation-list`, `--delegation-approve`,
+/// `--delegation-deny` and `--delegation-revoke`: thin clients of the running
+/// daemon over its unix A2A listener.
+fn delegation_cli(settings: &agentd::config::settings::Settings, ask: Delegating) -> i32 {
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    {
+        use agentd::delegation::cli::{self, Failed};
+        let out = &mut std::io::stdout();
+        let (what, done) = match &ask {
+            Delegating::Login(target) => (
+                target.clone(),
+                cli::login(settings, target.trim_start_matches("idp:"), out),
+            ),
+            Delegating::List => ("--delegation-list".to_string(), cli::list(settings, out)),
+            Delegating::Answer(gate, approve) => (
+                format!("gate {gate}"),
+                cli::answer(settings, gate, *approve, out),
+            ),
+            Delegating::Revoke(target) => (target.clone(), cli::revoke(settings, target, out)),
+        };
+        match done {
+            Ok(_) => exit::SUCCESS,
+            Err(Failed::Usage(e)) => {
+                eprintln!("agentd: {what}: {e}");
+                exit::USAGE
+            }
+            Err(Failed::Ended(e)) => {
+                eprintln!("agentd: {what}: {e}");
+                exit::GENERIC
+            }
+        }
+    }
+    #[cfg(not(all(feature = "xaa", feature = "a2a")))]
+    {
+        let _ = (settings, ask);
+        eprintln!(
+            "agentd: delegation commands need the xaa and a2a features (build with --features xaa,a2a)"
+        );
+        exit::USAGE
     }
 }
 

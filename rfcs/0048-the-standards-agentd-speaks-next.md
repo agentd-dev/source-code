@@ -137,6 +137,16 @@ behaves, which only a test tenant answers.
 
 *Size:* large. *Recommendation:* fourth, once the user accepts RFC 0044 (§6, Q1).
 
+*Status (2026-10-19):* accepted; RFC 0044 P0 and P1 implemented. P0 is in
+the release binaries (RFC 8707 everywhere, RFC 9728 at connect, step-up,
+typed principals); P1 — one enrolled person acting through their IdP, the
+ID-JAG exchange and redemption, Enterprise-Managed Authorization, the
+person's consent gates — is behind the feature `xaa`, not in the release
+set, with the `ema` conformance family against agentd's own mocks. Live
+interop against xaa.dev and an Okta Integrator org is not run yet. The strip
+names Enterprise-Managed Authorization, Token Exchange and ID-JAG as
+previews.
+
 ### 5.5 G — AGENTS.md
 
 AGENTS.md is plain Markdown with no fields: the nearest file to the work

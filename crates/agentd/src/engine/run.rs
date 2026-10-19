@@ -244,6 +244,12 @@ pub struct RunState {
     pub task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// The subagent whose call started this run — directly, or through the
+    /// runs it started: work a subagent asked for is never done with an
+    /// enrolled person's delegated grant (RFC 0044 P1, `subagents: none`),
+    /// whatever principal it runs as. Durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -335,6 +341,7 @@ impl RunState {
             error: None,
             task: None,
             principal: None,
+            subagent: None,
             conversation: None,
             children: Vec::new(),
             parent: None,

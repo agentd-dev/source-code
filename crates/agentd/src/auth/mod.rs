@@ -58,6 +58,10 @@ pub mod aws_sso;
 #[cfg(feature = "oauth")]
 pub mod browser;
 
+/// The ID-JAG exchange, its redemption and their checks (RFC 0044).
+#[cfg(feature = "xaa")]
+pub mod idjag;
+
 /// Canonicalize a login/logout target: `mcp:<name>` on a server that references
 /// a service-catalog entry becomes `service:<entry>`, the key the daemon's
 /// connect path actually reads. Every server pointing at that entry shares one

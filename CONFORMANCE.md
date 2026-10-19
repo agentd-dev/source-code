@@ -18,9 +18,10 @@ grouped into families — the process's exit-code table, the security gates, the
 durable store, crash-and-restore durability, the internal tool registry, the
 core A2A surface, the observation feed of the events extension, the extension
 contract itself, the authentication the card declares, agentd as an OAuth
-client, agentd as a client of the MCP Tasks and Skills extensions, and the
+client, agentd as a client of the MCP Tasks and Skills extensions, the
 fake Company agentd is tested against under the Personal Agent Protocol
-draft. Every check is
+draft, and agentd acting for an enrolled person through their IdP
+(Enterprise-Managed Authorization, ID-JAG). Every check is
 registered in [`src/checks/`](crates/agentd-conformance/src/checks) as a
 `Check { id, category, desc, run }`, which both the test harness and the report
 runner pick up; the tables below are those registrations, and a unit test of
@@ -196,6 +197,41 @@ skip.
 | `companies/agent-retries-a-confirm-with-the-same-operation` | a confirm whose answer is lost after the Company took it is sent again with the same operation id and revision, and the tool that proposed the operation is not called again |
 | `companies/agent-asks-the-user-before-a-direct-conversation` | when the Company Agent asks to talk with the User, agentd asks the User at their gate and starts no Direct Conversation until they answer; their answer is the first message, as they wrote it, sender human, with parent_conversation_id the conversation the Company asked in |
 | `companies/agent-says-a-decline-in-the-conversation` | when the User declines to talk with the Company directly, agentd says so in the conversation the Company asked in, once, as the agent, and starts no Direct Conversation |
+
+### `ema`
+
+| Check | What it proves |
+|---|---|
+| `ema/exchange-form-refresh-token-private-key-jwt` | with subject refresh_token and private_key_jwt, the exchange sends exactly grant_type, requested_token_type (id-jag), subject_token, subject_token_type (refresh_token), audience and resource (the pins), scope, client_id and the client assertion; the redemption is the jwt-bearer grant; the MCP server is sent the token, the EMA extension in initialize, and the ID-JAG's sub as agent/acting_for |
+| `ema/exchange-form-id-token-client-secret-basic` | with subject id_token and client_secret_basic, a refresh_token grant with no scope comes first, and the exchange presents its ID token (subject_token_type id_token) with the secret in an Authorization: Basic header and no client assertion |
+| `ema/id-jag-mismatches-refused` | an ID-JAG whose typ, aud, client_id, iss, sub or resource is not the pinned one, or that grants a scope not asked for, is refused and never redeemed |
+| `ema/refresh-token-in-exchange` | a refresh_token in the exchange answer is refused with subject id_token (unexpected_refresh_token), and kept as a rotation with subject refresh_token: the rotated token is the one presented after a restart |
+| `ema/idp-issuer-equal-to-ras-refused` | a delegated server whose authorization server is the IdP itself is refused by --validate-config (ID-JAG §9.3) |
+| `ema/split-idp-metadata` | enrolment reads the IdP's RFC 8414 and OpenID documents, which split jwks_uri and the identity-chaining member as Okta's do, and verifies the ID token with the key set only the OpenID document names |
+| `ema/invalid-grant-live-probe` | invalid_grant from an exchange runs the liveness probe; alive, the grant stays, another server still mints, and only that (grant, server) is held back |
+| `ema/invalid-grant-dead-probe` | invalid_grant from an exchange with a dead probe revokes the grant: tombstoned, purged, and every later call not_enrolled — after a restart too |
+| `ema/ras-invalid-grant-is-a-resource-fault` | invalid_grant from the authorization server on a fresh ID-JAG is resource_fault, held back, and never read as a reuse signal |
+| `ema/rotating-idp-concurrent-mints` | with a rotating IdP that revokes a token family on reuse, two runs minting for two servers at once both succeed, and the grant survives |
+| `ema/step-up-uses-the-fresh-id-token` | insufficient_user_authentication is step_up; after the person signs in again the exchange presents the fresh ID token, and the ID-JAG carries its auth_time |
+| `ema/re-presentation-and-fallback` | a 401 on a token not just minted re-presents the cached ID-JAG with no new exchange; an authorization server that refuses a re-presented one is minted for instead |
+| `ema/freshness-kill-switch` | once the IdP stops answering, no delegated call succeeds after the liveness interval: idp_unavailable, never an old token |
+| `ema/no-mint-at-boot` | enrolment mints once per templated server, to list its tools; a restart mints nothing |
+| `ema/slow-idp-delays-nothing-else` | while a mint waits on a slow IdP, an unrelated run starts and finishes |
+| `ema/no-token-reaches-a-worker-or-a-prompt` | a turn's delegated call answers its worker — and so the prompt — with every live token value scrubbed, and no frame to a child carries a token or the supervisor's reserved variables |
+| `ema/loopback-caller-gets-no-delegation` | a delegated server on a loopback listener with no verifier is refused at load; with one, the operator a bearer names is not the enrolled person, and its run is no_delegation |
+| `ema/timed-out-gate-never-judged` | a consent gate nobody answers denies at its deadline, with ask_human_fallback auto, and no judge is spawned |
+| `ema/approved-write-end-to-end` | a delegated create_issue gates; --delegation-approve, bound to the gate's nonce and arguments, makes the call; --delegation-deny refuses one without making it |
+| `ema/document-may-not-delegate` | a :::!mcp fragment declaring grant id_jag, or referencing a reserved supervisor-only secret by any spelling of it, is refused — in the agent's instruction and through a subagent template |
+| `ema/another-principals-work-mints-nothing` | work for anyone but the enrolled person — the bare operator in a conversation of the person's — mints nothing under the person's grant and is no_delegation |
+| `ema/egress-from-delegated-data-gates` | a workflow's own http POST of what a delegated read returned waits for the person: denied, nothing is sent; approved, it is sent as they saw it |
+| `ema/rotation-kept-when-the-id-jag-is-refused` | with a rotating IdP, the refresh token an exchange answers with is kept even when its ID-JAG fails a check: another server still mints, and the grant survives |
+| `ema/a-subagents-run-is-not-delegated` | a run a subagent starts through a workflow tool granted to it, as the person, makes no delegated call — nor does a run that one starts, or a run its signal starts: delegation_not_permitted, and nothing reaches the server |
+| `ema/autonomous-work-is-not-delegated` | a scheduled firing's delegated step is no_delegation and mints nothing; identity.autonomous_as naming the person is refused at load |
+| `ema/an-echoed-token-is-scrubbed-from-an-error` | a delegated server's error that quotes the token presented reaches the run, the log and delegation.denied with the token scrubbed |
+| `ema/resource-metadata-confirms-the-pins` | a delegated server whose RFC 9728 metadata names another resource, or not the pinned authorization server, is refused (config) before anything is minted for it |
+| `ema/a-narrowed-template-narrows-the-grant` | after a restart under a template that allows less, a grant enrolled under more is held to it: scope_beyond_ceiling, delegation_not_permitted for a server it dropped |
+| `ema/enrolling-again-replaces-a-grant` | an expired grant, or one enrolled under a pin since changed, is replaced by signing in again: a new epoch, the new identity, the old refresh token revoked at the IdP |
+| `ema/ema-declared-on-both-dialects` | the EMA extension is declared in initialize's capabilities at 2025-11-25, and in every request's _meta client capabilities at 2026-07-28 |
 
 ## Running it
 

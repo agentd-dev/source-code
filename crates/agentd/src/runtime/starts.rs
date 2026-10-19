@@ -685,7 +685,9 @@ impl Runtime {
         // Fields the TRIGGER payload carries that belong on the run itself.
         // `msg_depth` is here because a run started by a delivered message
         // continues that chain; a trigger that carries none starts at zero.
-        for k in ["conversation", "task", "msg_depth"] {
+        // `subagent` names the subagent whose signal fired it (RFC 0044 P1);
+        // a payload that claims one only ever takes delegation away.
+        for k in ["conversation", "task", "msg_depth", "subagent"] {
             if let Some(v) = ev["payload"].get(k).filter(|v| !v.is_null()).cloned() {
                 ev[k] = v;
             }
@@ -992,6 +994,7 @@ impl Runtime {
     /// Otherwise a `workflow.signal` grant would be a way round every
     /// `workflow.run:` narrowing. A principal the index has not seen fires
     /// nothing: there are no grants to ask.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_signal_starts(
         &mut self,
         name: &str,
@@ -1000,6 +1003,7 @@ impl Runtime {
         sender: &super::waits::SignalSender,
         carries: &super::withhold::Carries,
         trace: Option<&TraceContext>,
+        subagent: Option<&str>,
     ) -> u64 {
         let (by, may_start) = match sender {
             super::waits::SignalSender::Runtime => (None, None),
@@ -1040,6 +1044,10 @@ impl Runtime {
             // `fire_start` reads the trigger's `principal` as the run's owner.
             if let Some(id) = &by {
                 trigger["principal"] = json!(id);
+            }
+            // The subagent whose work sent it: the run is no delegated call's.
+            if let Some(h) = subagent {
+                trigger["subagent"] = json!(h);
             }
             self.fire_start_carrying(
                 &workflow,

@@ -448,6 +448,9 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
             // Served only with a declared Company, which needs the fake
             // Company: companies_e2e holds its reply to this same schema.
             "company.status" => continue,
+            // Served only where an IdP or a delegated server is declared, in
+            // a build with `xaa`: the `ema` conformance family reads it.
+            "delegation.list" => continue,
             other => panic!("the read {other} needs arguments in this test"),
         };
         run(op, args);

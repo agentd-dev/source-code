@@ -121,6 +121,74 @@ fn scan<'a>(
     on(Piece::Text(rest))
 }
 
+/// Every reference `template` makes, as its token body: `secret:NAME` or
+/// `secret-file:PATH`. A malformed template contributes the references
+/// before the fault.
+pub fn refs_of(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let _ = scan(template, &mut |piece| {
+        if let Piece::Token(token) = piece
+            && (token.starts_with("secret:") || token.starts_with("secret-file:"))
+        {
+            out.push(token.to_string());
+        }
+        Ok(())
+    });
+    out
+}
+
+/// A reference as what it resolves to, so two spellings of one secret
+/// compare equal: `secret:NAME` with the name trimmed, as [`resolve`] reads
+/// it, and `secret-file:PATH` with the path as [`canonical_path`] gives it.
+pub fn canonical_ref(token: &str) -> String {
+    if let Some(path) = token.strip_prefix("secret-file:") {
+        format!("secret-file:{}", canonical_path(path))
+    } else if let Some(name) = token.strip_prefix("secret:") {
+        format!("secret:{}", name.trim())
+    } else {
+        token.to_string()
+    }
+}
+
+/// The file `path` names, trimmed and absolute: the file itself, symbolic
+/// links followed, where it exists; else the path with `.`, `..` and
+/// repeated separators taken out.
+pub fn canonical_path(path: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let p = Path::new(path.trim());
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    if let Ok(c) = std::fs::canonicalize(&abs) {
+        return c.to_string_lossy().into_owned();
+    }
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+/// The `NAME` of every `{{secret:NAME}}` in `template`: the references that
+/// may resolve from the environment.
+pub fn env_refs_of(template: &str) -> Vec<String> {
+    refs_of(template)
+        .into_iter()
+        .filter_map(|r| r.strip_prefix("secret:").map(|n| n.trim().to_string()))
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
 /// Every `NAME` a `{{secret:NAME}}` reference anywhere in `doc` names, sorted
 /// and deduplicated.
 ///

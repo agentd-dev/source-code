@@ -66,11 +66,16 @@ pub enum Category {
     /// The Personal Agent Protocol draft agentd is pinned to: the fake
     /// Company it is tested against, held to the draft's own sentences.
     Companies,
+    /// Enterprise-Managed Authorization (RFC 0044): agentd acting for an
+    /// enrolled person through their IdP — the ID-JAG exchange and its
+    /// checks, the redemption, renewal and revocation, and the person's
+    /// approvals — against a mock IdP, authorization server and MCP server.
+    Ema,
 }
 
 impl Category {
     /// Every family, in report order: the one list the docs are held to.
-    pub const ALL: [Category; 13] = [
+    pub const ALL: [Category; 14] = [
         Category::Supervisor,
         Category::Security,
         Category::Store,
@@ -84,6 +89,7 @@ impl Category {
         Category::McpTasks,
         Category::McpSkills,
         Category::Companies,
+        Category::Ema,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -101,6 +107,7 @@ impl Category {
             Category::McpTasks => "mcp-tasks",
             Category::McpSkills => "mcp-skills",
             Category::Companies => "companies",
+            Category::Ema => "ema",
         }
     }
 }
@@ -194,6 +201,7 @@ pub fn family(category: Category) -> Vec<Check> {
         Category::McpTasks => checks::mcp_tasks::checks(),
         Category::McpSkills => checks::mcp_skills::checks(),
         Category::Companies => checks::companies::checks(),
+        Category::Ema => checks::ema::checks(),
     }
 }
 

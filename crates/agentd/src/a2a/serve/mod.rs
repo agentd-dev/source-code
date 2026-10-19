@@ -701,7 +701,7 @@ async fn accept_loop_unix(listener: tokio::net::UnixListener, router: Router, lo
         let router = router.clone();
         let log = log.clone();
         tokio::spawn(async move {
-            serve_conn(sock, router, PeerId::default(), Peer::Unix, log).await;
+            serve_conn(sock, router, PeerId::default(), Peer::Unix(uid), log).await;
         });
     }
 }

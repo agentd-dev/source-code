@@ -549,7 +549,7 @@ live · doc, except where a row says op.
 | `mcp.servers[].exclude` | list of globs | `[]` | Never admit these; beats `allow`. |
 | `mcp.servers[].timeout` | duration | `mcp.default_timeout` | Per-call timeout for this server. |
 | `mcp.servers[].tasks` | `auto \| off` | `auto` | Whether the server may answer a long tool call with an MCP task (SEP-2663). `auto` declares the extension on 2026-07-28 connections, on the calls that have a time limit (a turn's, a workflow step's, a store adapter's); `off` never does, so the server answers every call inline. See [Long-running tool calls](connect-mcp.md#long-running-tool-calls). |
-| `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). |
+| `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). With `grant: id_jag`, the server is reached with an enrolled person's grant, by the supervisor alone; its fields are under [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization), restart · op, and a served document may set none of them. Needs `xaa`. |
 | `mcp.servers[].oauth` | `{client_id, client_secret, token_url, scope}` | — | An OAuth client-credentials shortcut. Needs `oauth`. |
 | `mcp.servers[].aauth` | bool | `false` | Sign requests with the agent's AAuth identity. Needs `aauth`. |
 | `mcp.servers[].events[]` | list | `[]` | MCP Events bindings (op). |
@@ -1256,6 +1256,8 @@ live · op.
 | `a2a.principals[].match.sub` | glob | — | Matches a verified client certificate's subject CN. |
 | `a2a.principals[].match.bearer_ref` | secret | — | Matches a presented bearer. May not equal `a2a.bearer`, another rule's secret, or start with `agentd_at_`. |
 | `a2a.principals[].match.any` | bool | `false` | Names every caller left; cannot grant `operator`. |
+| `a2a.principals[].match.uid` | int | — | The unix listener's peer, by the uid the kernel names (`SO_PEERCRED`): the per-person operator `operator:<id>`. Alone in its `match`, with `role: operator` and an `id`, on a `unix://` listener. Needs `xaa`. |
+| `a2a.principals[].idp_subject` | `{iss, sub}` | — | The one IdP identity this principal is, exact: required to delegate. On a `match.uid` rule; `iss` is an `identity.providers` issuer. At most one rule carries it. Needs `xaa`. |
 | `a2a.principals[].role` | `operator \| user \| agent \| anonymous` | required | The caller's role. |
 | `a2a.principals[].id` | string | derived | The principal id (`<role>:<id>`), unique across rules; `1..128` of `A-Z a-z 0-9 . _ @ : / + -`. Required on `bearer_ref` and `any` rules; a certificate rule without one is `<role>:cn=<CN>` or `<role>:san=<first SAN>`. |
 | `a2a.principals[].grants` | list of op globs | — | The operations the principal may call. |
@@ -1422,12 +1424,19 @@ Who autonomous work is done for. All paths are live · op.
 
 | Path | Type | Default | What it does |
 |---|---|---|---|
-| `identity.autonomous_as` | string | `system` | The principal a schedule, webhook, stream or `once` firing runs as. |
+| `identity.autonomous_as` | string | `system` | The principal a schedule, webhook, stream or `once` firing runs as. It may not be the per-person operator of a delegation (`operator:<id>`, the `xaa` feature): autonomous work never acts with an enrolled person's grant. |
 | `identity.labels` | map | `{}` | Labels stamped on that work. |
+| `identity.providers.<name>` | object | — | An enterprise IdP agentd is a client of: `issuer`, `client_id` (required), `profile` (`generic \| okta`), `client_auth`, `client_secret`, `sign_in`, `subject`, `subjects`, `jwks_uri`. Restart. Needs `xaa`; see [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization). |
+| `identity.delegation.seal_key`, `.seal_key_previous` | secret reference | — | 32 random bytes, hex or base64, from a mounted file or the startup prompt — never the environment. Every grant's refresh token is sealed with `seal_key`; `seal_key_previous` only opens. Required with a `grant: id_jag` server. Restart. |
+| `identity.delegation.at_cache_cap` | duration | `60m` | The longest an access token is used, whatever `expires_in` says. Restart. |
+| `identity.delegation.liveness_interval` | duration | `15m` | An access token is used only within this of the grant's last proof that its refresh token is alive. Restart. |
+| `identity.delegation.consent_timeout` | duration | `24h` | How long a consent gate waits before it denies. Restart. |
+| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source: operator, role?, labels?}, idp, servers: {<name>: {scopes}}, ttl, budget: {per_day, per_month, per_run}}`. No template matching, no enrolment. Restart. |
 
 The acting principal and its labels reach the run record (`run.start` carries
 `acting_for`), each MCP call's `_meta` (`agent/acting_for`, `agent/labels`) and
-the audit line. A run is charged to the principal it is for, so
+the audit line. A call to a delegated server carries the ID-JAG's `sub` as
+`agent/acting_for` instead, and no labels. A run is charged to the principal it is for, so
 `quotas.budget` covers work a person started, not only their turns. Labels are
 an operator-declared, closed set. This is attribution and quota, not
 multi-tenancy: a caller that needs a different tool surface needs a different
@@ -1473,11 +1482,15 @@ Every `security` path is restart · op.
 | `security.policies[].match.caller` | list of `root \| workflow \| subagent` | — | Who is calling. |
 | `security.policies[].match.principal` | glob | — | The principal id, for calls that carry one. |
 | `security.policies[].match.args` | CEL | — | A predicate over `args`, `tool` and `caller`. Needs `cel`. |
+| `security.policies[].match.delegated` | bool | — | The call is made with an enrolled person's grant. |
+| `security.policies[].match.tainted` | bool | — | The work holds outside input; until the taint engine, every unit that touched a delegated server is tainted. |
+| `security.policies[].match.any_tags` | list of tags | — | At least one listed tag is on the tool. |
 | `security.policies[].action` | `allow \| deny \| ask \| shadow` | required | `shadow` refuses and says the call was held. |
 | `security.policies[].question` | string | — | For `ask`: the question; `{{tool}}`, `{{caller}}` and `{{args}}` are substituted. |
 | `security.policies[].timeout` | duration | — | For `ask`: how long to wait. |
 | `security.policies[].on_timeout` | `allow \| deny \| ask \| shadow` | `deny` | What an unanswered ask becomes. |
 | `security.policies[].to` | `{role: operator, labels}` or `operator` | `{role: operator}` | Who may answer an `ask`. |
+| `security.experimental.id_jag` | bool | `false` | Allow `grant: id_jag` servers until ID-JAG reaches IETF working-group last call. Needs `xaa`. |
 | `security.exec.enabled` | bool | `false` | Run the `exec` tool locally. Needs the `exec` feature, which no release binary carries. |
 | `security.exec.allow` | list | `[]` (deny all) | Allowed command names (`argv[0]`). |
 | `security.exec.workdir` | path | — | The directory commands run in; a requested `cwd` must resolve inside it. |
@@ -1589,7 +1602,9 @@ refuses the reload with `config.reload.restart_required`:
   `observability.health_file`, `observability.events_ring`,
   `observability.traceparent`
 - `security` (every path)
+- `identity.providers`, `identity.delegation`
 - a `services` entry of `kind: company`, added, removed or changed
+- an `mcp.servers` entry of `grant: id_jag`, added, removed or changed
 
 Every other path is applied live, as follows:
 
@@ -1624,7 +1639,12 @@ configuration. It may write only these paths; anything else is refused at load,
 naming the line:
 
 - `workflows`, `streams`, `mcp` (but not `mcp.servers[].events` or
-  `event_grants`), `vars`, `context`, `goal`, `knowledge`, `search`, `memory`,
+  `event_grants`, nor a server of `grant: id_jag` or any of its fields —
+  `auth.idp`, `.audience`, `.resource`, `.client_auth`, `.tool_scopes`,
+  `.scope_mode`, `.tools_from`, `.tools_file`, `.id_jag`, `.id_jag_reuse`,
+  `.on_revoked`, `.allow_unbound_at`, `.attribution`, `.max_at_age` — on any
+  server, nor a reference to a secret under `identity.*` or on a delegated
+  server), `vars`, `context`, `goal`, `knowledge`, `search`, `memory`,
   `limits`
 - `intelligence.model`, `intelligence.models` (a model it declares may not name
   a `provider`), `intelligence.roles.turn`, `.think`, `.decide`, `.preflight`,

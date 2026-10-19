@@ -90,6 +90,11 @@ fn companies_conformance() {
     run_family(Category::Companies);
 }
 
+#[test]
+fn ema_conformance() {
+    run_family(Category::Ema);
+}
+
 /// Every family runs as a test above: one missing here would never run under
 /// `cargo test`, and CI would stay green over it.
 #[test]

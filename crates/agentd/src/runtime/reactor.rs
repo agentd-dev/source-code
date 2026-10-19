@@ -117,6 +117,11 @@ pub enum PendingKind {
     /// The User asked whether to talk with a Company directly
     /// (`company.direct`, §5.8.2).
     CompanyDirect { id: String, company: String },
+    /// The enrolled person is asked to approve a call (RFC 0044 §5.10): the
+    /// gate `id` (`runtime::delegated`), answered only by them, never
+    /// judged, denied when it times out.
+    #[cfg_attr(not(feature = "xaa"), allow(dead_code))]
+    Consent { id: String },
 }
 
 /// The tool call a gate holds (see [`PendingKind::Human`]): a
@@ -142,6 +147,8 @@ pub struct PolicyCall {
     /// that call, so a description changed during the wait cannot send
     /// another request than the one approved.
     pub judged: Option<Value>,
+    /// The gate is the enrolled person's consent (RFC 0044 §5.10).
+    pub consent: bool,
 }
 
 /// What a Company gate asks about.
@@ -162,11 +169,19 @@ pub struct CompanyAsk {
 pub struct Passed {
     pub policy: bool,
     pub company: bool,
+    /// The person approved it (RFC 0044 §5.10).
+    pub consent: bool,
 }
 
 impl Passed {
     /// These, and the gate `call` holds, approved.
     pub fn and(self, call: &PolicyCall) -> Passed {
+        if call.consent {
+            return Passed {
+                consent: true,
+                ..self
+            };
+        }
         match call.company {
             Some(_) => Passed {
                 company: true,
@@ -478,6 +493,17 @@ pub struct Runtime {
     /// none is declared.
     #[cfg(feature = "companies")]
     pub(crate) companies: Option<Arc<crate::companies::Supervisor>>,
+    /// Acting for the enrolled person at delegated servers (RFC 0044).
+    #[cfg(feature = "xaa")]
+    pub(crate) delegation: Option<Arc<crate::delegation::Delegation>>,
+    /// The person's open consent gates, by id.
+    #[cfg(feature = "xaa")]
+    pub(crate) consents: BTreeMap<String, super::delegated::ConsentGate>,
+    /// The specs of workflow steps the person approved, by `run/step`, until
+    /// the step runs again (`delegated::approved_spec`). In memory: a
+    /// restart asks again.
+    #[cfg(feature = "xaa")]
+    pub(crate) consented_steps: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
     /// The Company sign-ins in progress, by id (`runtime::company_sign_in`).
     /// In memory: a sign-in does not outlive the process that started it.
     #[cfg(feature = "companies")]
@@ -840,6 +866,8 @@ impl Runtime {
             self.poll_company_sign_ins();
             #[cfg(feature = "companies")]
             self.poll_company_gates();
+            #[cfg(feature = "xaa")]
+            self.delegation_tick();
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
@@ -1009,6 +1037,10 @@ impl Runtime {
             Event::McpReachable(r) => self.on_mcp_reachable(*r),
             Event::McpTask(n) => self.on_mcp_task(*n),
             Event::CompanyRead { into, origin, why } => self.company_read(into, origin, why),
+            #[cfg(feature = "xaa")]
+            Event::Delegation(n) => self.on_delegation_note(*n),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::DelegationSaid { task, said } => self.delegation_said(&task, said),
             #[cfg(feature = "companies")]
             Event::CompanySignIn { id, step } => self.on_company_sign_in(&id, step),
             #[cfg(feature = "companies")]
@@ -1324,7 +1356,12 @@ impl Runtime {
                             serde_json::from_value::<super::withhold::Carries>(c.clone()).ok()
                         })
                         .unwrap_or_default();
-                    let delivered = self.deliver_signal(
+                    let subagent = ev
+                        .payload
+                        .get("subagent")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let delivered = self.deliver_signal_from(
                         &name,
                         payload,
                         target.as_deref(),
@@ -1332,6 +1369,7 @@ impl Runtime {
                         &sender,
                         &carries,
                         ev.trace.as_ref(),
+                        subagent.as_deref(),
                     );
                     self.log.in_trace(ev.trace.as_ref()).info(
                         "signal.received",

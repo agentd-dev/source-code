@@ -31,6 +31,8 @@ pub mod cel; // CEL expression seam (feature `cel`; always compiled, fail-closed
 pub mod companies; // agentd as a Personal Agent at Companies, and the fake Company it is tested against (RFC 0047)
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup; config::{file,yaml,paths,watch}
 pub mod context; // durable transcripts, plan, memory, compaction, skills
+#[cfg(feature = "xaa")]
+pub mod delegation; // acting for one enrolled person at MCP servers through their IdP: ID-JAG, EMA (RFC 0044)
 pub mod engine; // workflow engine: graph model, templates, durable runs + scheduler
 pub mod exit; // the public exit-code table + terminal-status -> code map
 pub mod governor; // token governor: windowed durable budgets + shedding tactics

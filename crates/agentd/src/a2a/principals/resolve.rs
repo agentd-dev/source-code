@@ -59,6 +59,8 @@ pub struct Evidence {
     /// which is what a `file://` page, a sandboxed iframe or a `data:` URL
     /// sends. It came from a browser.
     pub origin: bool,
+    /// The unix socket peer's uid, as the kernel names it (`SO_PEERCRED`).
+    pub uid: Option<u32>,
 }
 
 /// Which evidence named the caller.
@@ -223,8 +225,30 @@ impl Resolver {
         unix: bool,
         sessions: Option<&dyn SessionVerifier>,
     ) -> Resolution {
-        // 0. The kernel already named this peer: the daemon's own uid.
+        // 0. The kernel already named this peer: the daemon's own uid, or
+        // root. A rule naming that uid makes it the per-person operator
+        // `operator:<id>` (RFC 0044); any other admitted peer is the operator.
         if unix {
+            if let Some(c) = self
+                .rules
+                .iter()
+                .find(|c| c.matcher.uid.is_some() && c.matcher.uid == ev.uid)
+                && let Some(id) = &c.id
+            {
+                return Resolution::Named(
+                    Principal {
+                        id: format!("operator:{id}"),
+                        role: Role::Operator,
+                        grants: vec!["*".into()],
+                        rate: None,
+                        budget: None,
+                        labels: c.labels.clone(),
+                        session: None,
+                        typed: Some(PrincipalRef::local(Source::Operator, id)),
+                    },
+                    Via::Unix,
+                );
+            }
             return Resolution::Named(operator(), Via::Unix);
         }
         // 1. A bearer decides whenever it is presented to a listener that can
@@ -567,6 +591,46 @@ mod tests {
                 SessionCheck::Invalid
             }
         }
+    }
+
+    /// A unix peer of the uid a rule names is that rule's per-person operator
+    /// (RFC 0044); any other admitted unix peer is the operator, as before.
+    #[test]
+    fn a_unix_peer_of_the_named_uid_is_the_per_person_operator() {
+        let settings = a2a(json!({
+            "listen": "unix:///run/agentd/a.sock",
+            "principals": [{"match": {"uid": 1000}, "role": "operator", "id": "alice",
+                            "idp_subject": {"iss": "https://acme.okta.com", "sub": "00u1alice"}}]
+        }));
+        let r = Resolver::build(&settings, &secrets).unwrap();
+        let unix = |uid: u32| {
+            r.resolve(
+                &Evidence {
+                    uid: Some(uid),
+                    local: true,
+                    ..Default::default()
+                },
+                true,
+                None,
+            )
+        };
+        let alice = unix(1000);
+        assert_eq!(named(&alice), ("operator:alice", Via::Unix));
+        let Resolution::Named(p, _) = &alice else {
+            unreachable!()
+        };
+        assert!(p.is_operator());
+        assert_eq!(
+            p.typed,
+            Some(PrincipalRef::local(Source::Operator, "alice")),
+            "the typed principal names the person, never the display string"
+        );
+        assert_eq!(named(&unix(0)), ("operator", Via::Unix));
+        // A TCP request never matches a uid rule.
+        assert!(!matches!(
+            r.resolve(&ev(None, None), false, None),
+            Resolution::Named(ref p, _) if p.id == "operator:alice"
+        ));
     }
 
     /// The principals known before anyone presents anything are the operator

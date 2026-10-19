@@ -86,6 +86,7 @@ enum Route {
     Auth,
     Instance(crate::runtime::instances::InstanceOp),
     Company,
+    Delegation,
 }
 
 /// The row and route of `op`, or `None` for an op nothing serves. The ONE
@@ -123,6 +124,7 @@ fn route(op: &str) -> Option<(&'static surface::OpSpec, Route)> {
         Handler::Auth => Some(Route::Auth),
         Handler::Instance => InstanceOp::of(op).map(Route::Instance),
         Handler::Company => Some(Route::Company),
+        Handler::Delegation => Some(Route::Delegation),
         Handler::Reserved => None,
     };
     route.map(|r| (spec, r))
@@ -228,6 +230,15 @@ impl Runtime {
                         result: Some(result),
                     },
                     Ok(super::company_ops::CompanyAnswer::Task(reply)) => Answer::Reply(reply),
+                    Err(e) => Answer::Reply(e),
+                }
+            }
+            Route::Delegation => {
+                match super::delegation_ops::handle(self, principal, op, data, &ctx, message) {
+                    Ok(super::delegation_ops::DelegationAnswer::Doc(doc)) => Answer::Doc(doc),
+                    Ok(super::delegation_ops::DelegationAnswer::Task(reply)) => {
+                        Answer::Reply(reply)
+                    }
                     Err(e) => Answer::Reply(e),
                 }
             }

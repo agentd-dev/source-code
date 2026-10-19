@@ -25,6 +25,7 @@ agentd over MCP.
 | MCP Events | the draft extension SEP-3415, on 2026-07-28 connections: bindings into durable streams, runtime subscriptions inside an operator's grant, poll and webhook delivery. In the release binaries; agentd says at load that it tracks a draft. |
 | [MCP Tasks](connect-mcp.md#long-running-tool-calls) | the extension SEP-2663 (`io.modelcontextprotocol/tasks`), on 2026-07-28 connections, as a client: a tool call a server answers with a task is followed to its end — a workflow step's as a durable wait that survives a restart, a model's within the call and then with `mcp.task.get` — polled at the server's interval or pushed on `subscriptions/listen`, cancelled with `tasks/cancel`. `mcp.servers[].tasks: off` refuses a server's tasks. In the release binaries. |
 | [MCP Skills](connect-mcp.md#load-skills-from-a-server) | the extension SEP-2640 (`io.modelcontextprotocol/skills`), on 2026-07-28 connections that declare it, as a client: `skills/list` (every page), `skills/get` for a skill no listing names, `resources/directory/read` where the server declares `directoryRead`. Every file is checked against its entry's `sha256:` digest and size, and `SKILL.md`'s frontmatter against the entry's; a skill is named by its server and URI. In the release binaries. |
+| [Enterprise-Managed Authorization](authentication.md#enterprise-managed-authorization) | the extension `io.modelcontextprotocol/enterprise-managed-authorization`, as a client, on servers of `grant: id_jag`: declared in `initialize`'s capabilities at 2025-11-25 and in every request's `_meta` at 2026-07-28; the server is reached with an access token its authorization server issued for an ID-JAG from the person's IdP, once its RFC 9728 metadata has confirmed the pinned resource and authorization server. A preview: the `xaa` feature, not in the release binaries. |
 | Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). Client registration in the order 2026-07-28 gives: a configured `client_id`, else agentd's [Client ID Metadata Document](authentication.md#client-id-metadata-document) where the authorization server advertises one; dynamic client registration, which that revision deprecates, is not implemented. |
 
 **Not supported:** `sampling` and `roots` (agentd declares no client
@@ -209,6 +210,7 @@ connection cannot apply is refused when the configuration loads.
 | SPIFFE JWT-SVID as a bearer | yes | yes | yes |
 | SPIFFE X.509-SVID or a client certificate (mTLS) | — | yes | yes |
 | AAuth agent identity (a draft): Ed25519 key, RFC 9421 HTTP message signatures | yes, signed beside the bearer | yes | yes |
+| An enrolled person's grant (`grant: id_jag`, the `xaa` preview): an ID-JAG (draft -04) from their IdP by RFC 8693 token exchange, redeemed by the JWT bearer grant (RFC 7523) for an access token — Enterprise-Managed Authorization | — | yes | — |
 
 A model connection that needs a custom credential header — an `api-key`
 header, say — sends it through its `headers` map, with the value as a secret
@@ -229,12 +231,14 @@ details.
 ## Internet standards
 
 The IETF RFCs agentd implements, and where. The release binaries implement
-all of them except the last, which only the `companies` preview uses.
-OAuth discovery also reads OpenID Connect Discovery 1.0 metadata, after
-RFC 8414. One OAuth Working Group draft is implemented too, in the release
-binaries: the [Client ID Metadata Document](authentication.md#client-id-metadata-document),
+all of them except the last two, which only the `companies` and `xaa`
+previews use. OAuth discovery also reads OpenID Connect Discovery 1.0
+metadata, after RFC 8414. Two OAuth Working Group drafts are implemented
+too: in the release binaries, the [Client ID Metadata Document](authentication.md#client-id-metadata-document),
 draft-ietf-oauth-client-id-metadata-document-02, agentd's client where it
-has no registration.
+has no registration; in the `xaa` preview, the Identity Assertion JWT
+Authorization Grant ([ID-JAG](authentication.md#enterprise-managed-authorization)),
+draft-ietf-oauth-identity-assertion-authz-grant-04.
 
 | RFC | What | Where agentd uses it |
 |---|---|---|
@@ -245,12 +249,13 @@ has no registration.
 | RFC 9728 | Protected resource metadata | finding an MCP server's authorization server, its `resource` matched byte for byte |
 | RFC 8707 | Resource indicators | every authorization, token, refresh and client-credentials request to an MCP server's authorization server; the Bearer token for a company's MCP server |
 | RFC 9207 | `iss` in authorization responses | browser logins |
-| RFC 7523 | JWT client assertions (`private_key_jwt`) | client authentication at a token endpoint |
+| RFC 7523 | JWT client assertions (`private_key_jwt`), and the JWT bearer grant | client authentication at a token endpoint; redeeming an ID-JAG (the `xaa` preview) |
 | RFC 7009 | Token revocation | `agentd --logout` |
 | RFC 9421 | HTTP Message Signatures | every request agentd signs with [AAuth](aauth.md) |
 | RFC 7748, RFC 7516 | X25519 and JWE Compact | encrypted instruction documents |
 | RFC 8446 | TLS 1.3 | every HTTPS connection, in and out |
 | RFC 9449 | DPoP | requests to a company (the `companies` preview) |
+| RFC 8693 | Token exchange | exchanging an enrolled person's grant at their IdP for an ID-JAG (the `xaa` preview) |
 
 ## Platforms and distribution
 

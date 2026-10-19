@@ -421,6 +421,12 @@ pub struct McpServerSpec {
     /// payload carries its spec, and [`crate::mcp::from_spec`] refuses one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company: Option<String>,
+    /// A delegated server (`grant: id_jag`, RFC 0044): reached only through
+    /// the supervisor's pool, with an enrolled person's minted token. No
+    /// spawn payload carries its spec, and [`crate::mcp::from_spec`] refuses
+    /// one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated: bool,
     /// Whether the connection declares the MCP Tasks extension (RFC 0050).
     /// Travels in the spawn payload, so a worker's connection declares what
     /// the supervisor's does.
@@ -559,6 +565,9 @@ pub struct ClientAuthSpec {
     /// `issuer`, or unset for the token endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assertion_aud: Option<String>,
+    /// `RS256`, or unset for `ES256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alg: Option<String>,
 }
 
 /// AAuth agent-identity settings, which the root's `aauth::setup` reads. The

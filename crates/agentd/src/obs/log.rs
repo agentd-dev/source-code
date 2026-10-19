@@ -278,6 +278,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "config",
     "context",
     "correlate",
+    "delegation",
     "drain",
     "exec",
     "freshness",

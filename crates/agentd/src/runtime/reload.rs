@@ -124,6 +124,11 @@ impl Runtime {
         // A company entry keys the Sessions, the User IDs and the servers
         // made from it, so adding, removing or changing one is a restart.
         restart.extend(company_entries_moved(&self.settings, &loaded.settings));
+        // A delegated server's pins, client and catalogue are the delegation
+        // supervisor's, built at start (RFC 0044): in P1 a change to one is
+        // a restart, which purges every pooled token with the process.
+        restart.extend(delegated_servers_moved(&self.settings, &loaded.settings));
+        restart.extend(person_moved(&self.settings, &loaded.settings));
         if !restart.is_empty() {
             return Err(ReloadRefused::RestartRequired(restart));
         }
@@ -338,6 +343,11 @@ impl Runtime {
                 }
                 continue;
             }
+            // A delegated server has no connection of the loop's to carry:
+            // its pool is the delegation supervisor's (RFC 0044).
+            if spec.delegated {
+                continue;
+            }
             // Unchanged means everything the dial reads: the endpoint and
             // headers, and also the credential (`auth`, `oauth`, `aauth`),
             // the `service` its cached login is keyed by, its `rate` and its
@@ -451,6 +461,15 @@ impl Runtime {
                         },
                     })
                 })
+                // A delegated server's catalogue, as last adopted: the server
+                // cannot change under a reload (`delegated_servers_moved`).
+                .chain(
+                    self.registry
+                        .built_from()
+                        .iter()
+                        .filter(|t| specs.get(&t.name).is_some_and(|sp| sp.delegated))
+                        .cloned(),
+                )
                 // A Company's operation tools, as last adopted: its entry
                 // cannot change under a reload (`company_entries_moved`).
                 .chain(self.joining.offered().filter_map(|(server, o)| {
@@ -1062,6 +1081,50 @@ fn company_entries_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String
     moved
 }
 
+/// The delegated servers (`grant: id_jag`) a reload adds, removes or
+/// changes, named as restart-only paths.
+fn delegated_servers_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String> {
+    let delegated = |s: &cfg::Settings| -> Vec<cfg::McpServer> {
+        cfg::delegation::delegated_servers(s).cloned().collect()
+    };
+    let (a, b) = (delegated(old), delegated(new));
+    let mut moved: Vec<String> = a
+        .iter()
+        .filter(|m| !b.contains(m))
+        .chain(b.iter().filter(|m| !a.iter().any(|o| o.name == m.name)))
+        .map(|m| format!("mcp.servers.{} (a delegated server)", m.name))
+        .collect();
+    // A server that stops being delegated while keeping its name.
+    moved.extend(
+        a.iter()
+            .filter(|m| {
+                new.mcp
+                    .servers
+                    .iter()
+                    .any(|n| n.name == m.name && !cfg::delegation::is_delegated(n))
+            })
+            .map(|m| format!("mcp.servers.{} (no longer delegated)", m.name)),
+    );
+    moved.sort();
+    moved.dedup();
+    moved
+}
+
+/// The per-person operator's `a2a.principals` rule a reload changes while
+/// the running process delegates (RFC 0044 P1): the delegation supervisor
+/// holds every grant to the rule as it read it at start — the uid, the
+/// `idp_subject` pin, the id and the labels — so a change to it is a
+/// restart, after which a grant enrolled under the old rule is unusable
+/// (`not_enrolled`) rather than lent to whoever the new one names.
+fn person_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String> {
+    let delegates = cfg::delegation::delegated_servers(old).next().is_some()
+        || !old.identity.providers.is_empty();
+    if !delegates || cfg::delegation::person(old) == cfg::delegation::person(new) {
+        return Vec::new();
+    }
+    vec!["a2a.principals (the per-person operator's rule)".to_string()]
+}
+
 /// A spec with its tags cleared: what dialing a server reads.
 fn untagged(spec: &crate::config::McpServerSpec) -> crate::config::McpServerSpec {
     crate::config::McpServerSpec {
@@ -1240,6 +1303,64 @@ mod dial_tests {
             "{shop}{crm}  mall: {{kind: company, endpoint: \"https://mall.example\"}}\n"
         ));
         assert_eq!(company_entries_moved(&base, &added), ["services.mall"]);
+    }
+
+    /// A reload that changes the per-person operator's rule — its uid, its
+    /// pin, its id — while the process delegates is a restart; any other
+    /// principal rule, or the same rule moved in the list, is the reload's.
+    #[test]
+    fn the_per_person_rule_moved_by_a_reload_is_named_for_a_restart() {
+        let settings = |rules: &str| {
+            cfg::Settings::from_document(
+                crate::config::yaml::parse(&format!(
+                    "identity:\n  providers:\n    okta: {{issuer: \"https://acme.okta.example\", client_id: c}}\na2a:\n  principals:\n{rules}"
+                ))
+                .unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        let person = |uid: u32, sub: &str| {
+            format!(
+                "    - {{match: {{uid: {uid}}}, role: operator, id: alice, idp_subject: {{iss: \"https://acme.okta.example\", sub: {sub}}}}}\n"
+            )
+        };
+        let other = "    - {match: {bearer_ref: \"{{secret:B}}\"}, role: user, id: bob}\n";
+        let base = settings(&format!("{}{other}", person(1000, "00u1alice")));
+        assert!(person_moved(&base, &base).is_empty());
+        let reordered = settings(&format!("{other}{}", person(1000, "00u1alice")));
+        assert!(person_moved(&base, &reordered).is_empty());
+        let other_moved = settings(&format!(
+            "{}    - {{match: {{bearer_ref: \"{{{{secret:B}}}}\"}}, role: operator, id: bob}}\n",
+            person(1000, "00u1alice")
+        ));
+        assert!(person_moved(&base, &other_moved).is_empty());
+        for moved in [
+            person(0, "00u1alice"),
+            person(1000, "00u2bob"),
+            String::new(),
+        ] {
+            assert_eq!(
+                person_moved(&base, &settings(&format!("{moved}{other}"))),
+                ["a2a.principals (the per-person operator's rule)"],
+                "{moved}"
+            );
+        }
+        // A process that delegates nothing holds no grant to a rule.
+        let plain = |rules: &str| {
+            cfg::Settings::from_document(
+                crate::config::yaml::parse(&format!("a2a:\n  principals:\n{rules}")).unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        assert!(
+            person_moved(
+                &plain(&person(1000, "00u1alice")),
+                &plain(&person(0, "00u1alice"))
+            )
+            .is_empty()
+        );
     }
 }
 

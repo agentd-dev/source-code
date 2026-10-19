@@ -27,7 +27,7 @@ a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,m
 can try an agent or a workflow in the released agentd with no provider
 account.
 
-Three features are never in a release binary:
+Four features are never in a release binary:
 
 - `exec`, the local command runner. agentd's default posture is that it runs
   no local code; you opt in at build time and again at run time.
@@ -37,10 +37,17 @@ Three features are never in a release binary:
   [RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)).
   The draft changes without a version signal, so agentd is pinned to one
   revision of it and the feature stays out of the release set.
+- `xaa`, agentd acting for one enrolled person at MCP servers through their
+  enterprise IdP — ID-JAG and Enterprise-Managed Authorization, a preview
+  ([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization),
+  [RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)). ID-JAG is
+  an IETF draft and the MCP extension is young, so the feature stays out of
+  the release set.
 - `internal-mocks`, the test scaffolding: the mock MCP servers and crash
   points the test suites drive, and, with `oauth` (and the default `tls`),
   the fake Company that `agentd-conformance` holds to the Personal Agent
-  Protocol draft. It includes `mock-models`.
+  Protocol draft, and, with `xaa`, the mock IdP, authorization server and
+  EMA MCP server its `ema` family drives. It includes `mock-models`.
   Debug builds carry it automatically, so `cargo run` and the test suites
   need no flag.
 
@@ -64,18 +71,19 @@ Three features are never in a release binary:
 | `mcp-events` | no | yes | none | MCP Events: bindings, grants, `wait` subscriptions, the `events.*` tools and instruction updates by event. The extension is a draft (SEP-3415). |
 | `exec` | no | **no** | none | The guarded local `exec` tool, also gated by `security.exec.enabled`. |
 | `companies` | no | **no** | none new (reuses `ring`) | `services` entries of `kind: company` and `security.companies`: a Session at each declared Company, its MCP tools held by the supervisor under the strict privacy profile, the User's cross-Company gate, Device and Direct Sign-In at the User's own gate with each Account Token kept sealed — up to eight accounts at a Company, each by a label and in a Session of its own — conversations with a Company's agent (followed by readers into the stream `company.<name>`) and calls of its OpenAPI APIs, each allowed operation a tool of its own, operations confirmed only with the User's approval or a standing permission (`client.extensions: [operations]`), Direct Conversations the User joins at their own gate, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe`, `company.operation.get`, `company.operation.confirm`, `company.operation.cancel`, `company.direct`, the `http` step's `auth: {kind: company}`, `agentd --print-company-client`, `agentd --login`/`--logout company:<name>[/<label>]` (with `a2a`). Implies `oauth` and `tls`. |
+| `xaa` | no | **no** | none new (reuses `ring`) | `identity.providers`, `identity.delegation`, `security.experimental.id_jag`, `grant: id_jag` on an MCP server, and `a2a.principals[]` `match.uid` and `idp_subject`: the ID-JAG exchange at the person's IdP and its redemption at the server's authorization server, every check an ID-JAG is held to, the sealed grant vault, renewal, step-up and revocation, the person's consent gates, `agentd --login idp:<name>`, `--delegation-list`, `--delegation-approve`, `--delegation-deny`, `--delegation-revoke` (with `a2a`) and `--delegation-lint`. Implies `oauth`. |
 | `mock-models` | no | yes | none | The mock model endpoint: `mock:final` and `mock:file:<playbook.json>`, scripted chat and decision answers. |
 | `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers, crash points and, with `oauth` (and the default `tls`), the fake Company. Implies `mock-models`. |
 
-Of the eighteen features, fifteen add no crate of their own: they gate code
+Of the nineteen features, sixteen add no crate of their own: they gate code
 written in this repository, or reuse `ring`, which every build already links.
 Beyond the default `tls`, the dependency cost of the release set comes from
 `a2a` and `cel`; see [Crate counts](#crate-counts).
 
 ## Configuration that needs a feature
 
-A release binary carries everything in this table except `exec` and
-`companies`. In a build
+A release binary carries everything in this table except `exec`,
+`companies` and `xaa`. In a build
 from source, the right-hand column is what you
 see when the feature is missing.
 
@@ -97,6 +105,7 @@ see when the feature is missing.
 | `mcp.servers[].events`, `event_grants`, `agent.instruction.mcp.events`, `wait {on: event, subscribe:}` | `mcp-events` | refused at load: `mcp.servers[0]: MCP Events bindings and grants require building with --features mcp-events` |
 | `security.exec.enabled: true` | `exec` | refused at load: `security.exec.enabled needs the exec build feature, …` |
 | a `services` entry of `kind: company`, `security.companies`, `agentd --print-company-client` | `companies` | refused at load: ``services.shop: `kind: company` needs the `companies` feature (build with --features companies)`` |
+| `identity.providers`, `identity.delegation`, `security.experimental.id_jag`, `grant: id_jag`, `a2a.principals[]` `match.uid` or `idp_subject` | `xaa` | refused at load: ``identity.providers, identity.delegation, security.experimental.id_jag, `grant: id_jag` and a2a.principals idp_subject/uid need the `xaa` feature (build with --features xaa)`` |
 | `mock:` endpoints | `mock-models` (or a debug build) | refused at load: `mock: intelligence needs a build with --features mock-models` |
 
 Every path and its feature is in the [Configuration reference](configuration.md).

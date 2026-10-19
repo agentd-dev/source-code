@@ -242,6 +242,8 @@ jobs:
           - "--features mock-models" # the mock model endpoint — in the release set
           - "--features companies" # acting at Companies for a person (RFC 0047, a draft protocol) — NOT in the release set
           - "--features companies,a2a" # …with the listener that serves its identity
+          - "--features xaa" # acting for one enrolled person through their IdP (RFC 0044, ID-JAG is a draft) — NOT in the release set
+          - "--features xaa,a2a" # …with the unix listener its enrolment and approvals arrive on
           - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models" # the release-artifact set, exactly (pinned by release_matrix.rs)
           - "--all-features"
     steps:

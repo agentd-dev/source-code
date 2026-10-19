@@ -1291,6 +1291,25 @@ impl Runtime {
         carries: &super::withhold::Carries,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> u64 {
+        self.deliver_signal_from(
+            name, payload, target_run, from_run, sender, carries, trace, None,
+        )
+    }
+
+    /// [`Runtime::deliver_signal`], for a signal a subagent's work sent: a
+    /// run it starts records `subagent` (RFC 0044 P1).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deliver_signal_from(
+        &mut self,
+        name: &str,
+        payload: Value,
+        target_run: Option<&str>,
+        from_run: Option<&str>,
+        sender: &SignalSender,
+        carries: &super::withhold::Carries,
+        trace: Option<&crate::obs::trace::TraceContext>,
+        subagent: Option<&str>,
+    ) -> u64 {
         let mut delivered = 0u64;
         let mut hits: Vec<(String, String)> = Vec::new();
         for (rid, run) in &self.runs {
@@ -1344,8 +1363,15 @@ impl Runtime {
         }
         // Signal start nodes.
         // A run a signal starts continues the signal's trace.
-        delivered +=
-            self.fire_signal_starts(name, &payload, target_run.is_none(), sender, carries, trace);
+        delivered += self.fire_signal_starts(
+            name,
+            &payload,
+            target_run.is_none(),
+            sender,
+            carries,
+            trace,
+            subagent,
+        );
         // When this signal is the configured `lifecycle.until_signal` it is the
         // retirement trigger: stop admitting, drain live runs, exit cleanly.
         // Delivery to whatever was parked on the signal happens first (above),
@@ -1587,7 +1613,11 @@ impl Runtime {
             }
         };
         let cascade = spec.get("cascade").and_then(Value::as_bool).unwrap_or(true);
-        let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0), "carries": self.run_carries(run_id)});
+        let mut payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0), "carries": self.run_carries(run_id)});
+        // A subagent's run hands that on to the runs it starts.
+        if let Some(h) = self.runs.get(run_id).and_then(|r| r.subagent.clone()) {
+            payload["subagent"] = json!(h);
+        }
         // The child run continues the parent's trace, under the step's span.
         let trace = self.step_trace(run_id, step_id);
         match self.accept_event(

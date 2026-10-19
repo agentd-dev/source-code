@@ -1181,8 +1181,8 @@ pub(crate) fn policy_answer_schema() -> Value {
 
 /// A policy call as a durable wait record carries it (the inverse of
 /// [`policy_call_json`]).
-#[cfg(feature = "a2a")]
-fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
+#[cfg(any(feature = "a2a", feature = "xaa"))]
+pub(crate) fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
     let company = match v.get("company") {
         None => None,
         // A Company gate is read back whole or not as one: never as a
@@ -1217,8 +1217,10 @@ fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
         passed: super::reactor::Passed {
             policy: flag("policy"),
             company: flag("company"),
+            consent: flag("consent"),
         },
         judged: v.get("judged").cloned(),
+        consent: v.get("consent").and_then(Value::as_bool) == Some(true),
     })
 }
 
@@ -1240,10 +1242,14 @@ pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
         v["company"] = json!({"company": c.company, "kind": c.kind, "from": c.from});
     }
     if call.passed != super::reactor::Passed::default() {
-        v["passed"] = json!({"policy": call.passed.policy, "company": call.passed.company});
+        v["passed"] = json!({"policy": call.passed.policy, "company": call.passed.company,
+                             "consent": call.passed.consent});
     }
     if let Some(judged) = &call.judged {
         v["judged"] = judged.clone();
+    }
+    if call.consent {
+        v["consent"] = json!(true);
     }
     v
 }
@@ -1524,6 +1530,7 @@ impl Runtime {
                     company: Some(ask),
                     passed,
                     judged: self.judged_call(tool, args),
+                    consent: false,
                 };
                 let to = self.company_user();
                 return self.human_gate(
@@ -1657,6 +1664,7 @@ mod decision_tests {
             company: None,
             passed: super::super::reactor::Passed::default(),
             judged: Some(json!({"company": "shop", "method": "GET", "path": "/orders/ord_1"})),
+            consent: false,
         };
         let back = policy_call_of(&policy_call_json(&call)).unwrap();
         assert_eq!(back.judged, call.judged);

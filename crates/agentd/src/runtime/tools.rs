@@ -345,6 +345,15 @@ impl Runtime {
         {
             return outcome;
         }
+        // The enrolled person's consent, after every rule the operator wrote
+        // (RFC 0044 §5.10): a delegated sensitive or egress call, or an
+        // egress call from work that holds delegated data, waits for them.
+        #[cfg(feature = "xaa")]
+        if !passed.consent
+            && let Some(outcome) = self.consent_check(caller, name, &args, passed)
+        {
+            return outcome;
+        }
         let route = self.registry.route(name).map(|r| match r {
             Route::Internal => RouteKind::Internal,
             Route::Mapped(m) => RouteKind::Mapped(m.clone()),
@@ -423,6 +432,10 @@ impl Runtime {
         };
         if let Some(e) = self.browser_refused(&m.server, &mcp_args) {
             return ToolOutcome::Ready(Value::String(e), true);
+        }
+        #[cfg(feature = "xaa")]
+        if self.is_delegated_server(&m.server) {
+            return self.delegated_call(caller, name, &m.server, &m.tool, mcp_args);
         }
         if let Err(e) = self.service_rate_take(&m.server) {
             return ToolOutcome::Ready(Value::String(e), true);
@@ -503,6 +516,12 @@ impl Runtime {
         #[cfg(feature = "companies")]
         if crate::config::settings::companies::is_api_server(&self.settings, server) {
             return self.company_operation_call(caller, name, server, tool, args);
+        }
+        // A delegated server's call is the supervisor's, with the enrolled
+        // person's minted token (RFC 0044).
+        #[cfg(feature = "xaa")]
+        if self.is_delegated_server(server) {
+            return self.delegated_call(caller, name, server, tool, args);
         }
         // Pace calls toward a rated catalog service. A dry bucket answers with
         // a tool error the model can absorb and retry, never a hang.
@@ -1375,6 +1394,7 @@ impl Runtime {
                     company: None,
                     passed,
                     judged: self.judged_call(name, args),
+                    consent: false,
                 };
                 let question = format!(
                     "{question}\n\nAnswer `{}` to run this call or `{}` to refuse it.",
@@ -1478,7 +1498,7 @@ impl Runtime {
 
     /// Run the call an approved gate held, past that gate and those it had
     /// passed already, and hand the asker its outcome.
-    fn run_approved(&mut self, target: &Target, call: &super::reactor::PolicyCall) {
+    pub(crate) fn run_approved(&mut self, target: &Target, call: &super::reactor::PolicyCall) {
         if let Some(judged) = &call.judged
             && self.judged_call(&call.tool, &call.args).as_ref() != Some(judged)
         {
@@ -1978,7 +1998,8 @@ impl Runtime {
                 | PendingKind::Human { .. }
                 | PendingKind::CompanySignIn { .. }
                 | PendingKind::CompanyOperation { .. }
-                | PendingKind::CompanyDirect { .. } => {}
+                | PendingKind::CompanyDirect { .. }
+                | PendingKind::Consent { .. } => {}
             }
         }
         for (target, v, e) in done {

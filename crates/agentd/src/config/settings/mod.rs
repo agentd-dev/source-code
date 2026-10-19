@@ -14,6 +14,7 @@
 
 pub mod client;
 pub mod companies;
+pub mod delegation;
 pub mod events;
 pub mod schema;
 
@@ -1026,7 +1027,12 @@ pub const DOCUMENT_MAY_WRITE: &[&str] = &[
     // `:::!stream` and `:::!mcp`: one document can define an agent.
     "workflows",
     "streams",
-    "mcp",
+    // `mcp` straddles the boundary (RFC 0044 §5.14.1, amending RFC 0042): a
+    // document may declare a server, never one an enrolled person's grant
+    // reaches — the delegation fields of `mcp.servers[].auth` below are the
+    // operator's, a delegated `grant` is refused (`delegation::document_declared`).
+    "mcp.servers",
+    "mcp.default_timeout",
     "vars",
     // How it thinks, remembers and bounds itself.
     "context",
@@ -1147,6 +1153,23 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "services",
     // Who work is done on behalf of.
     "identity",
+    // The pins and the client authentication a delegated server is reached
+    // with, inside each `mcp.servers` element (RFC 0044 §5.14.1): a document
+    // that set them could point a person's grant at a server of its choosing.
+    "mcp.servers[].auth.idp",
+    "mcp.servers[].auth.audience",
+    "mcp.servers[].auth.resource",
+    "mcp.servers[].auth.client_auth",
+    "mcp.servers[].auth.tool_scopes",
+    "mcp.servers[].auth.scope_mode",
+    "mcp.servers[].auth.tools_from",
+    "mcp.servers[].auth.tools_file",
+    "mcp.servers[].auth.id_jag",
+    "mcp.servers[].auth.id_jag_reuse",
+    "mcp.servers[].auth.on_revoked",
+    "mcp.servers[].auth.allow_unbound_at",
+    "mcp.servers[].auth.attribution",
+    "mcp.servers[].auth.max_at_age",
     // Who may talk to THIS agent and as what, over which socket, with which
     // credential. Enumerated rather than taken as a section, because
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
@@ -2693,6 +2716,7 @@ impl McpServer {
             rate: self.service_rate.clone(),
             first_request: None,
             company: self.company.as_ref().map(|c| c.entry.clone()),
+            delegated: delegation::is_delegated(self),
             tasks: self.tasks,
         })
     }
@@ -2797,6 +2821,37 @@ pub struct Auth {
     pub svid_file: Option<String>,
     #[serde(default)]
     pub key_file: Option<String>,
+    // --- grant: id_jag (RFC 0044) ---
+    /// The `identity.providers` entry the enrolled person's grant is at.
+    #[serde(default)]
+    pub idp: Option<String>,
+    /// The scopes each tool needs beyond `scopes`.
+    #[serde(default)]
+    pub tool_scopes: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub scope_mode: Option<delegation::ScopeMode>,
+    /// Where the server's tool catalogue comes from: its first delegated
+    /// connection, or `tools_file`.
+    #[serde(default)]
+    pub tools_from: Option<delegation::ToolsFrom>,
+    #[serde(default)]
+    pub tools_file: Option<String>,
+    #[serde(default)]
+    pub id_jag: Option<delegation::IdJagMode>,
+    #[serde(default)]
+    pub id_jag_reuse: Option<delegation::IdJagReuse>,
+    #[serde(default)]
+    pub on_revoked: Option<delegation::OnRevoked>,
+    /// Accept an ID-JAG that does not name the pinned resource; warned about
+    /// and recorded on every call.
+    #[serde(default)]
+    pub allow_unbound_at: Option<bool>,
+    #[serde(default)]
+    pub attribution: Option<delegation::Attribution>,
+    /// A cap on an access token's use stricter than
+    /// `identity.delegation.at_cache_cap`.
+    #[serde(default)]
+    pub max_at_age: Option<Dur>,
 }
 
 impl Auth {
@@ -2816,6 +2871,7 @@ impl Auth {
                     OAuthGrant::Device => "device",
                     OAuthGrant::AuthorizationCode => "authorization_code",
                     OAuthGrant::ClientCredentials => "client_credentials",
+                    OAuthGrant::IdJag => "id_jag",
                 }
                 .to_string()
             }),
@@ -2838,6 +2894,7 @@ impl Auth {
                     AssertionAud::TokenEndpoint => None,
                     AssertionAud::Issuer => Some("issuer".to_string()),
                 },
+                alg: c.alg.map(|a| a.as_str().to_string()),
             }),
             client_id_metadata_document: false,
             scopes: self.scopes.clone(),
@@ -2896,6 +2953,9 @@ pub struct ClientAuth {
     /// `private_key_jwt`: what the assertion's `aud` names.
     #[serde(default)]
     pub assertion_aud: AssertionAud,
+    /// `private_key_jwt`: the key's algorithm, `ES256` (default) or `RS256`.
+    #[serde(default)]
+    pub alg: Option<delegation::KeyAlg>,
 }
 
 /// How a client authenticates.
@@ -2932,6 +2992,10 @@ pub enum OAuthGrant {
     AuthorizationCode,
     /// The headless machine-to-machine grant.
     ClientCredentials,
+    /// The enrolled person's grant, exchanged at their IdP for an ID-JAG
+    /// and redeemed at the server's authorization server (RFC 0044): served
+    /// by the supervisor alone. Needs the `xaa` feature.
+    IdJag,
 }
 
 /// An `auth:` block's `resource` (RFC 8707).
@@ -3676,6 +3740,15 @@ pub struct Identity {
     /// Labels stamped on autonomous work, the same way a principal's are.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// The enterprise identity providers agentd is a client of (RFC 0044):
+    /// where an enrolled person signs in, and where their grant is exchanged
+    /// for an ID-JAG. Needs the `xaa` feature.
+    #[serde(default)]
+    pub providers: BTreeMap<String, delegation::Provider>,
+    /// The seal key, the token caps and the templates that say who may enrol
+    /// for what (RFC 0044 §5.5). Needs the `xaa` feature.
+    #[serde(default)]
+    pub delegation: delegation::Delegation,
 }
 
 impl Identity {
@@ -4030,6 +4103,10 @@ pub struct Principal {
     /// for labels, relocated into the manifest.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// The one IdP identity this principal is (RFC 0044 §5.2): exact, checked
+    /// at enrolment and at every delegated call. Needs the `xaa` feature.
+    #[serde(default)]
+    pub idp_subject: Option<delegation::IdpSubject>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -4039,6 +4116,9 @@ pub struct PrincipalMatch {
     pub sub: Option<String>,
     pub bearer_ref: Option<String>,
     pub any: bool,
+    /// The unix A2A listener's peer, by the uid the kernel names
+    /// (`SO_PEERCRED`): the per-person operator `operator:<id>` (RFC 0044).
+    pub uid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4192,6 +4272,8 @@ pub struct Security {
     /// Acting at Companies for one User (RFC 0047): who the User is, the
     /// client identity every Company sees, and the seal key.
     pub companies: companies::Companies,
+    /// Features built on drafts, each off until the operator turns it on.
+    pub experimental: delegation::Experimental,
 }
 
 /// One rule: what it matches, and what happens.
@@ -4245,6 +4327,13 @@ pub struct PolicyMatch {
     /// feature; a build without it refuses the config rather than evaluating
     /// an argument guard to "no match".
     pub args: Option<String>,
+    /// Whether the call is made with an enrolled person's grant (RFC 0044).
+    pub delegated: Option<bool>,
+    /// Whether the work holds outside input. Until the taint engine, every
+    /// unit that has touched a delegated server is tainted.
+    pub tainted: Option<bool>,
+    /// At least one listed trifecta tag is on the tool.
+    pub any_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -4562,13 +4651,19 @@ pub fn substitute_config_vars(
 impl Settings {
     /// The environment variables only the supervisor reads: every
     /// `{{secret:NAME}}` a supervisor-only secret is named by — the seal key
-    /// of the companies preview's store. No child process is started with
-    /// them (`sec::harden`).
+    /// of the companies preview's store, and every secret under `identity.*`
+    /// or on a delegated server (RFC 0044 §5.13). No child process is started
+    /// with them (`sec::harden`).
     pub fn supervisor_only_env(&self) -> std::collections::BTreeSet<String> {
         let mut held = Vec::new();
         if let Some(Secret(s)) = &self.security.companies.seal_key {
             held.push(Value::String(s.clone()));
         }
+        held.extend(
+            delegation::reserved_refs(self)
+                .into_iter()
+                .map(|r| Value::String(format!("{{{{{r}}}}}"))),
+        );
         crate::sec::secret::secret_env_names(&Value::Array(held))
             .into_iter()
             .collect()
@@ -5090,6 +5185,18 @@ impl Settings {
                         return Err(format!(
                             "{source}: the instruction's :::!config writes {} — operator configuration is not a document's to set (§6 rule 4). A document that could grant itself capabilities, relax a security gate, or re-point its own source would be deciding the terms it is judged by.",
                             forbidden.join(", ")
+                        ));
+                    }
+                    // No delegated server, no delegation pin and no secret the
+                    // operator's delegation or identity sections reference.
+                    let delegating = delegation::document_declared(
+                        &ex.config,
+                        &delegation::reserved_refs_of_doc(&doc),
+                    );
+                    if !delegating.is_empty() {
+                        return Err(format!(
+                            "{source}: the instruction declares {} — a server an enrolled person's grant reaches, its pins and client authentication, and every secret identity.* or a delegated server references are the operator's (RFC 0044 §5.14.1)",
+                            delegating.join(", ")
                         ));
                     }
                     let events = events::document_declared(&ex.config);
@@ -5819,6 +5926,18 @@ pub enum Ask {
     /// Metadata Document and key set (RFC 0052) into `dir`, for static
     /// hosting, creating the signing key when absent. Dials nothing.
     PrintClientMetadata(String),
+    /// `--delegation-list`: the running daemon's delegation grants and open
+    /// consent gates (RFC 0044).
+    DelegationList,
+    /// `--delegation-approve <gate>` / `--delegation-deny <gate>`: the
+    /// per-person operator's answer to one consent gate.
+    DelegationApprove(String),
+    DelegationDeny(String),
+    /// `--delegation-revoke <principal | idp:<name>#<sub>>`.
+    DelegationRevoke(String),
+    /// `--delegation-lint`: the Resource connections each IdP must have,
+    /// from the configuration alone. Dials nothing.
+    DelegationLint,
 }
 
 /// The ask a flag makes, when it makes one: the flags that want something
@@ -5840,6 +5959,11 @@ fn ask_flag(flag: &str) -> Option<Ask> {
         "--extensions" => Ask::Extensions,
         "--print-company-client" => Ask::PrintCompanyClient(String::new()),
         "--print-client-metadata" => Ask::PrintClientMetadata(String::new()),
+        "--delegation-list" => Ask::DelegationList,
+        "--delegation-approve" => Ask::DelegationApprove(String::new()),
+        "--delegation-deny" => Ask::DelegationDeny(String::new()),
+        "--delegation-revoke" => Ask::DelegationRevoke(String::new()),
+        "--delegation-lint" => Ask::DelegationLint,
         _ => return None,
     })
 }
@@ -6020,6 +6144,27 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                 Ask::PrintClientMetadata(_) => {
                     Ask::PrintClientMetadata(it.next().cloned().ok_or_else(|| {
                         usage("--print-client-metadata requires a directory to write into".into())
+                    })?)
+                }
+                Ask::DelegationApprove(_) => {
+                    Ask::DelegationApprove(it.next().cloned().ok_or_else(|| {
+                        usage(
+                            "--delegation-approve requires a consent gate (see --delegation-list)"
+                                .into(),
+                        )
+                    })?)
+                }
+                Ask::DelegationDeny(_) => {
+                    Ask::DelegationDeny(it.next().cloned().ok_or_else(|| {
+                        usage(
+                            "--delegation-deny requires a consent gate (see --delegation-list)"
+                                .into(),
+                        )
+                    })?)
+                }
+                Ask::DelegationRevoke(_) => {
+                    Ask::DelegationRevoke(it.next().cloned().ok_or_else(|| {
+                        usage("--delegation-revoke requires a principal or idp:<name>#<sub>".into())
                     })?)
                 }
                 other => other,
@@ -7037,6 +7182,11 @@ fn validate_auth_block(
                         ));
                     }
                 }
+                // Its pins and client are `delegation::validate`'s.
+                OAuthGrant::IdJag if !mcp => out.push(format!(
+                    "{ctx}: grant id_jag is for mcp.servers[].auth: an enrolled person's grant is exchanged for an MCP server's authorization server"
+                )),
+                OAuthGrant::IdJag => {}
             }
         }
     }
@@ -7981,6 +8131,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // `security.companies` and the company entries.
     client::validate(s, &mut d);
     companies::validate(s, &mut d);
+    // `identity.providers`, `identity.delegation` and the delegated servers.
+    delegation::validate(s, &mut d);
 
     // mcp servers
     let mut names = std::collections::HashSet::new();
@@ -9188,6 +9340,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             m.sub.is_some(),
             m.bearer_ref.is_some(),
             m.any,
+            // The unix listener's peer (RFC 0044): its own rules are
+            // `delegation::validate`'s.
+            m.uid.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
@@ -9195,7 +9350,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         if set == 0 {
             err(
                 &mut d,
-                format!("a2a.principals[{i}]: match needs one of san | sub | bearer_ref | any"),
+                format!(
+                    "a2a.principals[{i}]: match needs one of san | sub | bearer_ref | any | uid"
+                ),
             );
         } else if m.any && set > 1 {
             // Every field a rule names must match, and `any` names everyone:
@@ -10136,6 +10293,13 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "observability.events_ring",
     "observability.traceparent",
     "security",
+    // The IdPs a grant is held at and the key it is sealed with (RFC 0044):
+    // a grant sealed under one key, or bound to one issuer, is never moved
+    // under another by a reload. Templates are restart-only in P1 too, so a
+    // narrowed or removed template never leaves a grant it no longer allows
+    // in use until the restart that applies it.
+    "identity.providers",
+    "identity.delegation",
 ];
 
 /// Every configuration path that a reload APPLIES, as the counterpart to
@@ -10385,6 +10549,13 @@ pub fn help_text() -> String {
          \x20                            into <dir>, creating the signing key; dials nothing (needs oauth)\n\
          \x20 --print-company-client <dir>  write the client metadata document + key set Companies fetch\n\
          \x20                            into <dir>, creating the signing key; dials nothing (needs companies)\n\
+         \x20 --login idp:<name>[/<grant>]  the running daemon signs the per-person operator in at an IdP and\n\
+         \x20                            keeps their delegation grant (needs xaa; unix A2A listener)\n\
+         \x20 --delegation-list          the running daemon's delegation grants and open consent gates (needs xaa)\n\
+         \x20 --delegation-approve <gate> / --delegation-deny <gate>\n\
+         \x20                            the per-person operator's answer to one consent gate (needs xaa)\n\
+         \x20 --delegation-revoke <principal|idp:<name>#<sub>>  revoke grants: RFC 7009 at the IdP, then here\n\
+         \x20 --delegation-lint          the Resource connections each IdP must have; dials nothing (needs xaa)\n\
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
          \x20 --env <FILE>               load a dotenv file into this process's environment (repeatable; real env wins, later files win)\n\
          \x20 -h, --help / -V, --version\n\
@@ -10680,6 +10851,10 @@ mod tests {
                             "company": "shop", "via": {"tool": "shop.x"}, "terms": ["a"],
                             "when": "true", "expires": "2026-12-31T00:00:00Z"
                         }]),
+                        "identity.delegation.templates" => json!([{
+                            "name": "t", "principals": {"source": "operator"}, "idp": "okta",
+                            "servers": {"linear": {"scopes": ["read"]}}
+                        }]),
                         other => panic!("no sample for object list {other}"),
                     },
                     paths::Kind::Enum(vs) => json!([vs[0]]),
@@ -10703,6 +10878,10 @@ mod tests {
                     "security.aauth" => json!({"provider": "https://apd"}),
                     "lifecycle.exit_code_map" => json!({"3": 0}),
                     "agent.gate_channels" => json!({"w": {"approve": "@channel/ops"}}),
+                    "identity.providers" => {
+                        json!({"okta": {"issuer": "https://acme.okta.com", "client_id": "c"}})
+                    }
+                    p if p.ends_with(".tool_scopes") => json!({"create_issue": ["write"]}),
                     _ => json!({"k": "v"}),
                 },
                 paths::Kind::Any => match b.path.as_str() {
@@ -10717,7 +10896,10 @@ mod tests {
                         || p.ends_with("deadline")
                         || p.ends_with("_grace")
                         || p.ends_with("ttl")
-                        || p.ends_with("every") =>
+                        || p.ends_with("every")
+                        || p.ends_with("_cap")
+                        || p.ends_with("_interval")
+                        || p.ends_with("_age") =>
                     {
                         json!("10s")
                     }
@@ -11486,6 +11668,37 @@ mod tests {
             .collect();
         assert!(both.is_empty(), "classified as both: {both:?}");
 
+        // A path inside an array element (`mcp.servers[].auth.idp`, RFC 0044
+        // §5.14.1) is resolved through the element's own schema.
+        let element_path = |path: &str| -> bool {
+            let mut node = &schema;
+            for key in path.split('.') {
+                let (key, items) = match key.strip_suffix("[]") {
+                    Some(k) => (k, true),
+                    None => (key, false),
+                };
+                node = &node["properties"][key];
+                if items {
+                    node = &node["items"];
+                }
+                if let Some(name) = node["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+                    node = &schema["$defs"][name];
+                }
+                if node.is_null() {
+                    return false;
+                }
+            }
+            true
+        };
+        // Every delegation field of a server's `auth` is the operator's.
+        for f in super::delegation::SERVER_AUTH_OPERATOR_ONLY {
+            let p = format!("mcp.servers[].auth.{f}");
+            assert!(
+                OPERATOR_ONLY.contains(&p.as_str()) && element_path(&p),
+                "{p} is a delegation field of an MCP server's auth (RFC 0044 §5.14.1) and must be an OPERATOR_ONLY path the schema has"
+            );
+        }
+
         // A stale entry in either list — a field renamed or removed — silently
         // weakens the check above, so every entry must name a real path.
         for (list, which) in [
@@ -11495,11 +11708,12 @@ mod tests {
             let stale: Vec<&&str> = list
                 .iter()
                 .filter(|e| {
-                    !paths.iter().any(|p| {
-                        super::path_covered(p, &[*e])
-                            || e.strip_prefix(&format!("{p}."))
-                                .is_some_and(|f| fields_of(p).iter().any(|x| x == f))
-                    })
+                    !(e.contains("[].") && element_path(e))
+                        && !paths.iter().any(|p| {
+                            super::path_covered(p, &[*e])
+                                || e.strip_prefix(&format!("{p}."))
+                                    .is_some_and(|f| fields_of(p).iter().any(|x| x == f))
+                        })
                 })
                 .collect();
             assert!(
@@ -15399,6 +15613,7 @@ mod tests {
                 key: Some("{{secret-file:/run/k.pem}}".into()),
                 kid: Some("k1".into()),
                 assertion_aud: Some("issuer".into()),
+                alg: None,
             })
         );
         for (extra, want) in [

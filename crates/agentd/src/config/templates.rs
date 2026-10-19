@@ -423,6 +423,19 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
             forbidden.join(", ")
         )));
     }
+    // One hop is no way round the delegation boundary either (RFC 0044
+    // §5.14.1): a template's machinery declares no delegated server and
+    // references no secret only the supervisor reads.
+    let delegating = crate::config::settings::delegation::document_declared(
+        &ex.config,
+        &crate::config::settings::delegation::reserved_refs(s),
+    );
+    if !delegating.is_empty() {
+        errs.push(at(format!(
+            "machinery declares {} — a server an enrolled person's grant reaches, its pins and client authentication, and every secret identity.* or a delegated server references are the operator's (RFC 0044 §5.14.1)",
+            delegating.join(", ")
+        )));
+    }
     // An instance child's subscriptions would be the model's to make by
     // spawning children, and a mirrored stream would start one run per child
     // for each occurrence (RFC 0045 §5.11.6).

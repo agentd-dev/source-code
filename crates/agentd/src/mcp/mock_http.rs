@@ -128,6 +128,9 @@ pub struct Options {
     pub tasks_push: bool,
     /// Declare and serve the Skills extension (2026-07-28 edge).
     pub skills: bool,
+    /// Serve RFC 9728 protected-resource metadata naming this authorization
+    /// server, for the URL a request reaches it at.
+    pub prm: Option<String>,
 }
 
 impl Options {
@@ -144,6 +147,7 @@ impl Options {
             listen: None,
             tasks_push: false,
             skills: true,
+            prm: None,
         }
     }
 }
@@ -208,6 +212,9 @@ struct State {
     tasks_push: bool,
     /// Whether it declares and serves the Skills extension.
     skills: bool,
+    /// The authorization server its RFC 9728 metadata names, when it serves
+    /// any.
+    prm: Option<String>,
     /// Its webhook delivery.
     #[cfg(all(feature = "mcp-events", feature = "tls"))]
     hooks: Arc<super::mock_hooks::Hooks>,
@@ -305,6 +312,7 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         tasks: Default::default(),
         tasks_push: opts.tasks_push,
         skills: opts.skills,
+        prm: opts.prm.clone(),
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -319,6 +327,19 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let Some(http) = read_http(&stream) else {
         return;
     };
+    // RFC 9728 metadata, where it was asked for: the resource is the URL the
+    // request reached, its authorization server the one `prm` names.
+    if let Some(issuer) = &state.prm
+        && http.is_get()
+        && let Some(path) = http.line.split_whitespace().nth(1)
+        && let Some(rest) = path.strip_prefix("/.well-known/oauth-protected-resource")
+    {
+        let host = http.header("host").unwrap_or_default();
+        let v =
+            json!({"resource": format!("http://{host}{rest}"), "authorization_servers": [issuer]});
+        write_json(&mut stream, 200, &v, None);
+        return;
+    }
     match state.lifecycle {
         Lifecycle::Initialize => serve_initialize(&mut stream, &http, &state),
         Lifecycle::Discover => serve_discover(&mut stream, &http, &state),

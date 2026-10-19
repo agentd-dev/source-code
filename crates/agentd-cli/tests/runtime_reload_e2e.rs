@@ -219,3 +219,122 @@ fn a_reload_rereads_a_workflow_file_and_reports_only_a_real_change() {
     let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_file(&wf_path);
 }
+
+/// RFC 0044 P1: the enrolled person's `a2a.principals` rule is the
+/// delegation supervisor's, read at start, and every grant is held to it. A
+/// reload that moves it — the rule now names another uid — is refused with
+/// `restart_required`, naming `a2a.principals`, and the daemon keeps the
+/// configuration it runs: no grant is lent to whoever the new rule names.
+#[cfg(all(feature = "xaa", feature = "a2a"))]
+#[test]
+fn a_reload_that_moves_the_enrolled_person_is_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    for f in ["idp.pem", "ras.pem"] {
+        std::fs::write(dir.path().join(f), "x").unwrap();
+    }
+    std::fs::write(dir.path().join("seal"), "ab".repeat(32)).unwrap();
+    /// What the test started, killed when it ends — a failed one included.
+    struct Reap(Vec<std::process::Child>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let mock_llm_addr = common::unique_path("mock-llm-person", "addr");
+    let _ = std::fs::remove_file(&mock_llm_addr);
+    let llm = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--internal-mock-llm", &mock_llm_addr, "final"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut procs = Reap(vec![llm]);
+    let llm_uri = format!("http://{}", common::read_addr_file(&mock_llm_addr));
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let config = |uid: u32| {
+        format!(
+            r#"agent: {{name: ema, preflight: never}}
+intelligence: {{endpoints: "{llm_uri}", model: mock}}
+store: {{kind: memory}}
+observability: {{log_level: info}}
+a2a:
+  listen: "unix://{d}/a.sock"
+  principals:
+    - {{match: {{uid: {uid}}}, role: operator, id: alice, idp_subject: {{iss: "https://acme.okta.com", sub: 00u1alice}}}}
+security:
+  experimental: {{id_jag: true}}
+identity:
+  providers:
+    okta:
+      issuer: https://acme.okta.com
+      client_id: agentd-idp
+      client_auth: {{method: private_key_jwt, key: "{{{{secret-file:{d}/idp.pem}}}}"}}
+  delegation:
+    seal_key: "{{{{secret-file:{d}/seal}}}}"
+    templates:
+      - {{name: eng, principals: {{source: operator}}, idp: okta, servers: {{linear: {{scopes: ["issues:read"]}}}}}}
+mcp:
+  servers:
+    - name: linear
+      endpoint: https://mcp.linear.example/mcp
+      tags: {{"*": [sensitive]}}
+      auth: {{kind: oauth2, grant: id_jag, idp: okta, audience: https://auth.linear.example, resource: https://mcp.linear.example/mcp, client_id: agentd-at-linear, client_auth: {{method: private_key_jwt, key: "{{{{secret-file:{d}/ras.pem}}}}"}}}}
+workflows:
+  - name: idle
+    steps:
+      s: {{kind: manual}}
+      f: {{kind: finish, depends_on: [s]}}
+"#
+        )
+    };
+    let cfg_path = dir.path().join("c.yaml");
+    std::fs::write(&cfg_path, config(uid)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", cfg_path.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd");
+    let pid = child.id() as i32;
+    let stderr = child.stderr.take().unwrap();
+    procs.0.push(child);
+    let child = procs.0.last_mut().unwrap();
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    wait_event(&rx, "proc.ready", Duration::from_secs(20));
+    std::fs::write(&cfg_path, config(uid.wrapping_add(4242))).unwrap();
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let refused = wait_event(
+        &rx,
+        "config.reload.restart_required",
+        Duration::from_secs(20),
+    );
+    assert!(
+        refused["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|p| p.starts_with("a2a.principals"))),
+        "{refused}"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "still running");
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "no exit after SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = reader.join();
+}

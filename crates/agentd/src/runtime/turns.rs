@@ -221,6 +221,16 @@ impl Runtime {
         if self.company_work_admitted(owner).is_err() {
             defs.retain(|d| !self.is_company_tool(&d.name));
         }
+        // A delegated server's tools act with the enrolled person's grant
+        // (RFC 0044): offered only in work for that person while the grant
+        // is usable, and never to a subagent.
+        #[cfg(feature = "xaa")]
+        defs.retain(|d| match self.registry.get(&d.name).map(|t| &t.imp) {
+            Some(crate::registry::Impl::Mcp { server, .. }) if self.is_delegated_server(server) => {
+                !matches!(caller, Caller::Subagent { .. }) && self.delegation_usable(owner, server)
+            }
+            _ => true,
+        });
         // Which policy caller this plan is being built for. A plan is per
         // turn, so this is fixed for every call the child will make.
         let who = match caller {
@@ -250,6 +260,14 @@ impl Runtime {
                 // hosts (RFC 0047 §5.5.9).
                 Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, .. }))
                     if self.is_company_server(server) || self.is_browser_server(server) =>
+                {
+                    internal.push(d.name.clone())
+                }
+                // A delegated server's calls come back to the supervisor: no
+                // worker is handed it to dial (RFC 0044 §5.7).
+                #[cfg(feature = "xaa")]
+                Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, .. }))
+                    if self.is_delegated_server(server) =>
                 {
                     internal.push(d.name.clone())
                 }

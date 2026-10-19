@@ -507,6 +507,225 @@ with `Retry-After` (seconds or an HTTP date) is not asked again before the
 wait is over, five minutes at most: a refresh in that time fails at once,
 naming the wait, and a device-login poll waits it out.
 
+## Enterprise-managed authorization
+
+**A preview, not in the release binaries**: build with `--features xaa,a2a`,
+and set `security.experimental.id_jag: true`. ID-JAG is an IETF draft
+(draft-ietf-oauth-identity-assertion-authz-grant-04) and MCP's
+Enterprise-Managed Authorization extension is young; agentd follows both as
+they stand ([RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)).
+
+With it, agentd acts **for one enrolled person** at an MCP server, with a
+token whose subject is that person, issued because their enterprise IdP —
+Okta's Cross App Access, or any IdP that issues ID-JAGs — says agentd may.
+agentd's own credential is never used at such a server, and nothing falls
+back to it.
+
+How a call is made:
+
+1. The person enrols once: `agentd --login idp:<name>` signs them in at the
+   IdP. The daemon runs the sign-in, verifies the ID token with the IdP's
+   keys, requires its `iss` and `sub` to be the person's exact pin, and keeps
+   the refresh token sealed (AES-256-GCM, `identity.delegation.seal_key`).
+   Then it lists each allowed server's tools, with one delegated token per
+   server.
+2. At a call, the supervisor exchanges the grant at the IdP for an ID-JAG
+   (RFC 8693): `audience` is the server's authorization server and
+   `resource` the server, both pinned in the configuration. It checks the
+   ID-JAG — `typ`, `aud`, `client_id`, `iss`, `sub`, `exp`, the `resource` it
+   names and the scope it grants — and redeems it at the authorization server
+   (RFC 7523, the JWT bearer grant) for an access token for that server.
+3. The call goes to the server with that token, declaring the
+   `io.modelcontextprotocol/enterprise-managed-authorization` extension, and
+   `agent/acting_for` set to the ID-JAG's `sub`.
+
+```yaml
+# needs: ./okta-agent-key.pem, ./linear-ras-key.pem, ./delegation-seal
+agent: {name: assistant}
+intelligence: {endpoints: "mock:final", model: m}
+a2a:
+  listen: unix:///run/agentd/a2a.sock
+  principals:
+    # The per-person operator: the unix listener's peer, by its uid.
+    - match: {uid: 1000}
+      role: operator
+      id: alice
+      idp_subject: {iss: https://acme.okta.com, sub: 00u1alice}
+security:
+  experimental: {id_jag: true}
+identity:
+  providers:
+    okta:
+      issuer: https://acme.okta.com
+      profile: okta
+      client_id: 0oa9agentdXAA
+      client_auth:
+        method: private_key_jwt
+        key: "{{secret-file:./okta-agent-key.pem}}"
+        kid: agentd-2026-10
+      sign_in: {grants: [device], scopes: [openid, offline_access]}
+  delegation:
+    seal_key: "{{secret-file:./delegation-seal}}"
+    templates:
+      - name: eng-tools
+        principals: {source: operator}
+        idp: okta
+        servers:
+          linear: {scopes: ["issues:read", "issues:write"]}
+mcp:
+  servers:
+    - name: linear
+      endpoint: https://mcp.linear.example/mcp
+      tags: {"*": [sensitive, egress]}
+      auth:
+        kind: oauth2
+        grant: id_jag
+        idp: okta
+        audience: https://auth.linear.example
+        resource: https://mcp.linear.example/mcp
+        client_id: agentd-at-linear
+        client_auth:
+          method: private_key_jwt
+          key: "{{secret-file:./linear-ras-key.pem}}"
+          kid: agentd-ras-1
+        scopes: ["issues:read"]
+        tool_scopes: {create_issue: ["issues:write"]}
+```
+
+```sh
+agentd --login idp:okta --config agentd.yaml
+```
+
+```text
+Open https://acme.okta.com/activate and enter the code WDJB-MJHT (it expires in 600s)
+operator:alice is enrolled at okta as 00u1alice (template eng-tools): agentd acts as them on linear until 2026-11-18; listed linear (12 tools)
+```
+
+**Who may delegate.** In this preview, one person: the `a2a.principals` rule
+that matches the unix A2A listener's peer by `uid` and carries an exact
+`idp_subject` pin. That caller is `operator:<id>`; its runs, and nobody
+else's, use the grant. A run started by a schedule, a webhook, another
+operator or anyone else fails `no_delegation` at a delegated server, and a
+delegated server's tools are not offered at all in work for someone without
+a usable grant; `identity.autonomous_as` may not name the person. A
+subagent's call is `delegation_not_permitted`, and so is a call in a run a
+subagent's call started — through a workflow tool, `workflow.run` or
+`workflow.signal` — or in a run that one started. A reload that changes the
+person's rule is refused (`restart_required`). A sign-in whose `iss` and
+`sub` are not the pin keeps nothing (`binding_mismatch`). Signing in again
+keeps the grant while it is the same — the same identity, unexpired, under
+the template that admits the person now with the ceilings it allows now —
+and otherwise replaces it, revoking the refresh token it held at the IdP:
+that is how an expired grant, or one enrolled before the pin changed, is
+renewed. A grant is held at every call to the ceilings its template allows
+now. The IdP's device grant shows `verification_uri` and
+`user_code` only; `sign_in.grants: [authorization_code]` uses PKCE, `state`,
+`nonce` and RFC 9207's `iss`, through a one-time start link on a loopback
+callback the daemon holds for the sign-in: the link sets a cookie bound to
+the sign-in, and the callback is taken only with it, so an IdP URL forwarded
+to someone else never completes.
+
+**The person's approvals.** Until the taint engine, every unit of work that
+touches a delegated server is treated as tainted and as holding delegated
+data, so a delegated call to a `sensitive` or `egress` tool, and any `egress`
+call from work that holds delegated data, waits for the person — a workflow
+step that sends the run's data out by its own effect too: an `http` step,
+`a2a.send`, `a2a.delegate`, an `emit` forwarded to a webhook or a peer, an
+`mcp.tool` or `mcp.resource` step at a server tagged `egress`. The call
+gates, `agentd --delegation-list` shows it — server, tool, the full
+arguments, the scopes the token carries, the run — and the person answers
+with `agentd --delegation-approve <gate>` or `--delegation-deny <gate>`, over
+the unix listener. An answer is bound to the gate's nonce and the hash of its
+arguments, and an approved step runs with the spec the person saw. No
+operator answers for the person, no judge answers whatever
+`agent.ask_human_fallback` says, and an unanswered gate denies after
+`identity.delegation.consent_timeout` (24 hours by default).
+
+**Pins, not discovery.** `audience` (the authorization server's issuer) and
+`resource` are required, and discovery only confirms them: before anything
+is minted for the server, its RFC 9728 metadata, read from the well-known
+locations on its endpoint's origin, must describe the pinned `resource` byte
+for byte and list the pinned `audience` (otherwise the call is `config`), and
+the authorization server's metadata must list the JWT bearer grant and the
+`urn:ietf:params:oauth:grant-profile:id-jag` profile (`auth.id_jag: assume`
+for one that takes it unlisted). The IdP's metadata is read from its own
+issuer only — both the RFC 8414 and the OpenID document, merged, since Okta
+splits `jwks_uri` and the identity-chaining member between them. An IdP
+whose issuer is the server's authorization server is refused (ID-JAG §9.3),
+and so, under `profile: okta`, is an `/oauth2/<id>` issuer.
+
+**Renewal.** An access token is used until `exp − 60 s`, at most
+`identity.delegation.at_cache_cap` (60 minutes) whatever `expires_in` says,
+and only while the grant's refresh token was proved alive within
+`identity.delegation.liveness_interval` (15 minutes): a stale proof is renewed
+first by a plain `refresh_token` grant, and an IdP that does not answer then
+is `idp_unavailable` — never a success on an old token. A `401` on a token
+that was not just minted re-presents the unexpired ID-JAG (no new mint)
+unless `id_jag_reuse: never`, or the authorization server refused a
+re-presented one before; a `401` right after a mint is the server's fault
+(`delegation_rejected_by_resource`), backed off. A rotated refresh token is
+kept, compare-and-swap on its version, before it is used — and before the
+ID-JAG it came with is checked, so a refused ID-JAG never leaves the spent
+token in the vault; one IdP call per
+grant runs at a time, so two servers minting at once never present one
+rotating token twice. `insufficient_user_authentication` is `step_up`: the
+person runs `agentd --login idp:<name>` again, and the next mint presents
+that fresh ID token. Mints are budgeted per day and month per server
+(`templates[].budget`, 16 and 200 by default, 80% of Okta's 250 a month) and
+per run (12); `delegation.quota_warn` fires at 80%.
+
+**Revocation.** `agentd --delegation-revoke operator:alice`, or
+`--delegation-revoke idp:okta#00u1alice` for every grant of that IdP
+subject, revokes the refresh token at the IdP (RFC 7009, retried), writes the
+tombstone, deletes the sealed record and drops every token. An
+`invalid_grant` from an exchange runs the liveness probe: if the refresh
+token is dead too, the grant is revoked the same way; if it is alive, the
+error is that server's alone and is backed off. `agentd --delegation-lint`
+prints, from the configuration alone, the Resource connections each IdP must
+have — exactly those: the IdP's list, not the template, is the real ceiling.
+
+**What a worker never holds.** Delegated servers are the supervisor's: no
+worker, subagent or instance is handed one to dial, every call comes back to
+the supervisor, and its answer — or its refusal, a server's error quoting the
+token included — reaches the model, the log and `delegation.denied` with
+every live token value — the refresh token, ID tokens, ID-JAGs and access
+tokens, as they are, base64- and percent-encoded — replaced by
+`[redacted]`. A secret under
+`identity.*` or on a delegated server is read from a mounted file
+(`{{secret-file:…}}`) or entered at the startup prompt, never from the
+environment, and no child is started with the variables one names. A served
+document may not declare a delegated server, set any of its pins or its
+client authentication, or reference any of those secrets by any spelling —
+a reference is compared by what it resolves to, and a `*_file` field's path
+as a file (RFC 0042, as RFC 0044 §5.14.1 amends it). `security.exec.enabled`
+is refused beside `identity.providers` or a seal key, as beside a delegated
+server.
+
+**What this preview does not do yet** (RFC 0044 P2 and later): several
+people, an IdP-federated display-client login, device and certificate
+principals that delegate, the taint engine, CIBA, unattended runs,
+same-domain token exchange (`grant: token_exchange`), and live interop
+against an Okta Integrator org or xaa.dev.
+
+### Fields
+
+| Field | Under | Meaning |
+|---|---|---|
+| `issuer`, `client_id` | `identity.providers.<name>` | the IdP, pinned; agentd's client there (required) |
+| `profile` | `identity.providers.<name>` | `generic` (default) or `okta`: keys at `{issuer}/oauth2/v1/keys`, subject `refresh_token`, no `/oauth2/<id>` issuer |
+| `client_auth`, `client_secret` | `identity.providers.<name>` | `private_key_jwt` with an ES256 or RS256 (`alg`) PKCS#8 key, or a secret; a public client is refused |
+| `sign_in` | `identity.providers.<name>` | `grants` (`device`, `authorization_code`), `scopes` (default `[openid, offline_access]`) |
+| `subject`, `subjects`, `jwks_uri` | `identity.providers.<name>` | what the exchange presents; whether an ID-JAG's `sub` must be the person's; the key set's pin |
+| `seal_key`, `seal_key_previous` | `identity.delegation` | 32 bytes, hex or base64, as a secret reference |
+| `at_cache_cap`, `liveness_interval`, `consent_timeout` | `identity.delegation` | `60m`, `15m`, `24h` |
+| `templates` | `identity.delegation` | `{name, principals: {source: operator}, idp, servers: {<name>: {scopes}}, ttl, budget}` |
+| `grant: id_jag`, `idp`, `audience`, `resource`, `client_id` | `mcp.servers[].auth` | the delegated server's IdP, its authorization server, itself, and agentd's client there (all required) |
+| `client_auth`, `client_secret` | `mcp.servers[].auth` | agentd's authentication at the authorization server; never the IdP's key |
+| `scopes`, `tool_scopes`, `scope_mode` | `mcp.servers[].auth` | baseline and per-tool scopes; one token per server with their union (`server`, default) or per scope set (`per_tool`) |
+| `tools_from`, `tools_file` | `mcp.servers[].auth` | `first_grant` (default) or `file` |
+| `id_jag`, `id_jag_reuse`, `allow_unbound_at`, `attribution`, `max_at_age` | `mcp.servers[].auth` | `discover`/`assume`; `auto`/`never`; accept an ID-JAG that names no resource; `sub`/`none`; a stricter cap |
+| `uid`, `idp_subject` | `a2a.principals[]` | the per-person operator: the unix peer's uid, and their exact IdP identity |
+
 ## AWS SigV4
 
 An endpoint behind AWS IAM, such as an API Gateway in front of an MCP server

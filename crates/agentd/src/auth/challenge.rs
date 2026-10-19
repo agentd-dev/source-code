@@ -87,6 +87,24 @@ pub fn discover_issuer(
     }
 }
 
+/// The RFC 9728 metadata of the server at `endpoint`, read from the
+/// well-known locations on its own origin — the suffix inserted before its
+/// path, then the root — with no request to the server itself: what a
+/// delegated server's pins are confirmed against (RFC 0044 §5.6), before
+/// agentd has sent it anything a challenge could answer. The first document
+/// found, or why none was.
+pub fn resource_metadata(endpoint: &str, timeout: Duration) -> Result<ResourceMetadata, String> {
+    let urls = well_known_urls(endpoint);
+    urls.iter()
+        .find_map(|u| get_json::<ResourceMetadata>(u, timeout))
+        .ok_or_else(|| {
+            format!(
+                "no RFC 9728 protected-resource metadata at {}",
+                urls.join(" or ")
+            )
+        })
+}
+
 /// How a URL a server chose — the authorization server RFC 9728 metadata
 /// names, or an endpoint that server's metadata names — may be dialled for
 /// a client of `resource`, the server the operator configured. On

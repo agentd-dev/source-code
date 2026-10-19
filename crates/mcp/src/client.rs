@@ -165,6 +165,9 @@ pub struct McpClient {
     /// Declare the MCP Tasks extension where the revision defines it
     /// ([`Self::with_tasks`]). Kept, so a re-dial declares it too.
     tasks: bool,
+    /// Extensions declared on every request ([`Self::with_extension`]).
+    /// Kept, so a re-dial declares them too.
+    extensions: Vec<String>,
 }
 
 impl McpClient {
@@ -213,7 +216,20 @@ impl McpClient {
             first: FirstRequest::Discover,
             listen_idle: crate::rmcp_client::LISTEN_IDLE,
             tasks: false,
+            extensions: Vec::new(),
         })
+    }
+
+    /// Declare the extension `id` with no settings — in `initialize`'s
+    /// `capabilities.extensions` at 2025-11-25, and in every request's
+    /// `_meta` client capabilities from 2026-07-28 — whatever the server
+    /// says it supports. Enterprise-Managed Authorization is declared this
+    /// way (`io.modelcontextprotocol/enterprise-managed-authorization`).
+    pub fn with_extension(mut self, id: &str) -> Self {
+        if !self.extensions.iter().any(|e| e == id) {
+            self.extensions.push(id.to_string());
+        }
+        self
     }
 
     /// Declare the MCP Tasks extension (SEP-2663) on the requests that may
@@ -390,7 +406,8 @@ impl McpClient {
                 .with_client_info(self.client_info.clone())
                 .start_with(first)
                 .with_listen_idle(self.listen_idle)
-                .with_tasks(self.tasks);
+                .with_tasks(self.tasks)
+                .with_extensions(&self.extensions);
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
         }

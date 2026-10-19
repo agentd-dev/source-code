@@ -30,6 +30,8 @@ pub(crate) mod company_sign_in; // the User signs in at a Company, at their own 
 #[cfg(feature = "a2a")]
 pub mod conversations;
 pub(crate) mod decide; // deciding nodes + the decide tool (RFC 0046 P2)
+#[cfg(feature = "xaa")]
+pub(crate) mod delegated; // delegated servers' calls and the person's consent gates (RFC 0044)
 pub(crate) mod drain; // the graceful drain: what runs on, what it stops, what it parks
 pub mod env; // system-prompt data + the default template
 pub mod events;
@@ -398,6 +400,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             mcp_specs.insert(s.name.clone(), spec);
             continue;
         }
+        // A delegated server is dialled only by the supervisor's pool, with
+        // an enrolled person's minted token: never at boot, and never with
+        // agentd's own credential (RFC 0044 §5.7).
+        if spec.delegated {
+            mcp_specs.insert(s.name.clone(), spec);
+            continue;
+        }
         let per_timeout = s.timeout.map(|d| d.0).unwrap_or(mcp_timeout);
         match crate::mcp::from_spec(&spec, per_timeout)
             .map(supervisor_client)
@@ -502,6 +511,40 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                 "msg": "durable state is on the local filesystem; it survives a restart of this process but not a move to another host — use store.kind mcp|http for a fleet",
             }),
         );
+    }
+
+    // Acting for the enrolled person (RFC 0044): the grants loaded, nothing
+    // minted. A delegated server's tools come from its catalogue — the
+    // operator's file, or what its first delegated connection listed.
+    #[cfg(feature = "xaa")]
+    let delegation =
+        match crate::delegation::Delegation::build(&settings, Arc::clone(&durable), &log) {
+            Ok(d) => d,
+            Err(e) => {
+                log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+                return crate::exit::USAGE;
+            }
+        };
+    #[cfg(feature = "xaa")]
+    if let Some(d) = &delegation {
+        for s in settings
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| d.is_delegated(&s.name))
+        {
+            if let Some(tools) = d.catalogue(&s.name) {
+                server_tools.push(ServerTools {
+                    name: s.name.clone(),
+                    ns: s.ns.clone(),
+                    tags: mcp_specs
+                        .get(&s.name)
+                        .map(|sp: &crate::config::McpServerSpec| sp.tags.clone())
+                        .unwrap_or_default(),
+                    tools,
+                });
+            }
+        }
     }
 
     // The tool registry. Overrides are validated against the servers that
@@ -611,6 +654,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         company_operations: BTreeMap::new(),
         #[cfg(feature = "companies")]
         company_directs: BTreeMap::new(),
+        #[cfg(feature = "xaa")]
+        delegation,
+        #[cfg(feature = "xaa")]
+        consents: BTreeMap::new(),
+        #[cfg(feature = "xaa")]
+        consented_steps: BTreeMap::new(),
         mcp,
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),
@@ -1221,6 +1270,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // events handed to the loop for the stream `company.<name>`.
     #[cfg(feature = "companies")]
     rt.resume_company_conversations();
+    // The delegation supervisor's notes reach the loop, and each workflow
+    // step suspended on the person's consent asks again.
+    #[cfg(feature = "xaa")]
+    {
+        rt.delegation_wire();
+        rt.rebuild_consents();
+    }
     // The A2A transport: the HTTPS listener for conversations,
     // command DataParts, and durable tasks. A bind/TLS/principals failure at
     // startup is fatal — the daemon cannot serve its only external channel.
@@ -2585,7 +2641,9 @@ impl Runtime {
     /// whatever servers its step or spawn names (RFC 0047 §5.6).
     pub(crate) fn spawn_spec(&self, name: &str) -> Option<crate::config::McpServerSpec> {
         let mut spec = self.mcp_specs.get(name)?.clone();
-        if spec.company.is_some() {
+        // Nor for a delegated server: only the supervisor's pool reaches it
+        // (RFC 0044 §5.7).
+        if spec.company.is_some() || spec.delegated {
             return None;
         }
         spec.first_request = self.mcp.get(name).and_then(|c| c.first_request());

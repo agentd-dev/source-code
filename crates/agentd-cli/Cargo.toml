@@ -49,6 +49,8 @@ mcp-events = ["agentd/mcp-events"]
 decrypt = ["sign", "agentd/decrypt"]
 # Acting at Companies for a person (RFC 0047); not in the release set.
 companies = ["oauth", "tls", "agentd/companies"]
+# Acting for one enrolled person through their IdP (RFC 0044); not in the release set.
+xaa = ["oauth", "agentd/xaa"]
 internal-mocks = ["agentd/internal-mocks"]
 mock-models = ["agentd/mock-models"]
 

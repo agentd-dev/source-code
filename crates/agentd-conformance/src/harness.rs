@@ -50,13 +50,15 @@ fn binary() -> &'static PathBuf {
         // `--release` conformance run still ships the mocks. `oauth` is the
         // interactive login the `mcp-auth-core` checks drive, and what the
         // fake Company needs to verify ES256; `companies` is agentd as the
-        // Personal Agent the `companies` family holds to the draft.
+        // Personal Agent the `companies` family holds to the draft; `xaa`
+        // is agentd acting for an enrolled person, which the `ema` family
+        // drives against its mock IdP, authorization server and MCP server.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "a2a,cron,internal-mocks,oauth,companies",
+            "a2a,cron,internal-mocks,oauth,companies,xaa",
         ]);
         let agentd = target_dir().join("agentd");
         assert!(
@@ -137,7 +139,20 @@ impl Harness {
         revision: &str,
         log: &Path,
     ) -> ConfServer {
-        let args: Vec<&Path> = vec![
+        self.spawn_mock_mcp_with(addr_file, uri, revision, log, &[])
+    }
+
+    /// [`Harness::spawn_mock_mcp_at`], with the mock's further `options`
+    /// (`--prm <issuer>`, …).
+    pub fn spawn_mock_mcp_with(
+        &self,
+        addr_file: &Path,
+        uri: &str,
+        revision: &str,
+        log: &Path,
+        options: &[&str],
+    ) -> ConfServer {
+        let mut args: Vec<&Path> = vec![
             Path::new("--internal-mock-mcp-http"),
             addr_file,
             Path::new(uri),
@@ -145,6 +160,7 @@ impl Harness {
             Path::new("--protocol-version"),
             Path::new(revision),
         ];
+        args.extend(options.iter().map(Path::new));
         let _ = std::fs::remove_file(addr_file);
         let child = Command::new(&self.agentd)
             .args(&args)

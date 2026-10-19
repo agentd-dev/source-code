@@ -1233,6 +1233,88 @@ What does not:
 - The User ID is one per User per Company, so a Company can tell that the
   accounts the User holds there are one person's.
 
+## Acting for an enrolled person
+
+With the `xaa` feature agentd acts for one enrolled person at MCP servers
+through their enterprise IdP: ID-JAG and MCP's Enterprise-Managed
+Authorization ([RFC 0044](../rfcs/0044-enterprise-managed-authorization.md),
+[Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)).
+What holds:
+
+- **Supervisor-only credentials.** The person's refresh token, ID tokens,
+  ID-JAGs and access tokens, and the IdP and authorization-server client
+  keys, live only in the supervisor. No turn worker, subagent or instance is
+  handed a delegated server to dial — `mcp::from_spec` refuses one — and
+  their calls come back to the supervisor. What a delegated call returns,
+  and every refusal of one, reaches them, the log and the audit record with
+  every live token value replaced by `[redacted]`: the value itself, its
+  base64 and percent-encoded forms, and a long prefix of it. A key or seal key under `identity.*` or on a delegated server is read
+  from a mounted file or the startup prompt — `--validate-config` refuses one
+  that would resolve from the environment
+  (`delegation_secret_in_environment`) — and no child is started with the
+  variables such a secret names. A mounted file stays readable by a
+  same-uid worker until workers run under another uid (RFC 0044 P2), which
+  is why `security.exec.enabled` beside a delegated server, `identity.providers`
+  or a seal key is refused.
+- **Authority from the transport.** The person is the unix listener's peer
+  the kernel names by uid, on a rule with an exact `idp_subject` pin. A run's
+  authority is set by the transport that started it; a model, a tool
+  argument, a document or a payload never names it. Work for anyone else —
+  autonomous work, another operator, a bearer-named operator on a TCP
+  listener — is `no_delegation` at a delegated server, which also never
+  offers it its tools; `identity.autonomous_as` may not name the person. A
+  subagent's work — its own calls, a run its call started, directly or
+  through other runs — is `delegation_not_permitted`. The rule is the one
+  the process read at start: a reload that changes it is refused. Nothing
+  falls back to agentd's own credential.
+- **The grant is sealed and bound.** The refresh token is kept sealed with
+  AES-256-GCM under `identity.delegation.seal_key`, the associated data
+  binding the grant id, the IdP, the subject, the epoch and the
+  refresh-token version. A tombstone register, written only upward, refuses a
+  revoked epoch and a record older than the latest refresh token — a store
+  restored from a backup — so a rotated-out token is never presented. A
+  writer of the store itself can truncate the register too. A rotation is
+  kept before the ID-JAG it came with is checked. Signing in again replaces
+  a grant that is no longer the same — expired, another identity, another
+  template or ceilings — one epoch up, and the refresh token a sign-in
+  replaces is revoked at the IdP.
+- **Pins bound every mint.** The `audience` and `resource` of every exchange
+  come from the configuration; discovery may confirm, never supply them, and
+  the server's RFC 9728 metadata must confirm both before anything is minted
+  for it. The scopes are the configured ones within the template's ceiling
+  as it is now, then whatever the IdP narrows them to. An ID-JAG for another authorization
+  server, client, issuer, subject or resource, one that grants a scope not
+  asked for, or one that names no resource, is refused and never redeemed.
+- **Freshness.** A delegated success is a live exchange, or a token agentd
+  minted within `at_cache_cap` for a grant whose refresh token was proved
+  alive within `liveness_interval`. An IdP that stops answering stops
+  delegated calls within that interval; a refresh token the IdP revoked is
+  noticed at the next probe or mint, and the grant is revoked, tombstoned and
+  purged.
+- **Consent from the person.** A delegated `sensitive` or `egress` call, and
+  any `egress` call from work holding delegated data — a workflow step that
+  sends the run's data out by its own effect too (`http`, `a2a.send`,
+  `a2a.delegate`, a forwarded `emit`, an `mcp.tool` or `mcp.resource` step at
+  an `egress` server) — gates for the person; an approved step runs with the
+  spec they saw.
+  Only they answer, over the unix listener, bound to the gate's nonce and
+  argument hash; no operator answers for them, no judge answers whatever
+  `agent.ask_human_fallback` says, a message on the asking task is no
+  answer, and an unanswered gate denies.
+- **Documents cannot configure authority.** A served document, a
+  `:::!config` or `:::!mcp` fragment and a subagent template's machinery may
+  not declare a delegated server, set its pins or its client
+  authentication, or reference a secret under `identity.*` or on a delegated
+  server, by any spelling of it — a reference is compared by what it
+  resolves to, a `*_file` field's path as a file (RFC 0042, as RFC 0044
+  §5.14.1 amends it).
+
+What this preview does not do: it acts for one person; there is no taint
+engine, so every unit that touches a delegated server counts as tainted; a
+grant held by a person stays usable after the IdP removes a Resource
+connection until the next mint (at most `at_cache_cap`); and the vault's
+key file is readable by any same-uid process.
+
 ## What agentd does not protect against
 
 Stated plainly, so you size the surrounding environment correctly.

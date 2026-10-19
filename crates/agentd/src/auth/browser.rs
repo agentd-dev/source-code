@@ -161,7 +161,11 @@ fn check_id_token(
 /// request went to, byte for byte, and one without it is refused when the
 /// server's metadata declares it always sends one. With endpoints pinned and
 /// no `issuer` configured there is nothing to compare an `iss` with.
-fn check_iss(got: Option<&str>, issuer: Option<&str>, declared: bool) -> Result<(), String> {
+pub(crate) fn check_iss(
+    got: Option<&str>,
+    issuer: Option<&str>,
+    declared: bool,
+) -> Result<(), String> {
     match (got, issuer) {
         (Some(got), Some(want)) if got != want => Err(format!(
             "oauth: the authorization response names the issuer {got:?}, not {want:?} (a mix-up, RFC 9207) — aborted"
@@ -236,7 +240,7 @@ fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<Callba
 // --- encoders (dependency-free) --------------------------------------------
 
 /// Percent-encode a query component (unreserved set passes through).
-fn pct(s: &str) -> String {
+pub(crate) fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {

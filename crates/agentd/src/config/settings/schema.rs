@@ -387,7 +387,9 @@ fn top_level_properties(
                 "description": "who work is done ON BEHALF OF — including work nobody typed",
                 "properties": {
                 "autonomous_as": { "type": "string", "description": "the actor a schedule/webhook/stream firing is attributed to (default `system`); without it the attribution chain is dropped at its first hop" },
-                "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "labels stamped on autonomous work" } } }));
+                "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "labels stamped on autonomous work" },
+                "providers": { "type": "object", "additionalProperties": provider(), "description": "the enterprise identity providers agentd is a client of (RFC 0044; needs the xaa feature): where an enrolled person signs in, and where their grant is exchanged for an ID-JAG. Restart-only, operator-only" },
+                "delegation": delegation() } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
                 "policies": { "type": "array", "description": "ordered verdicts on a tool call; first match wins, no match is allow", "items": {
@@ -397,7 +399,10 @@ fn top_level_properties(
                             "tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "every listed trifecta tag must be present on the tool" },
                             "caller": { "type": "array", "items": { "enum": ["root", "workflow", "subagent"] } },
                             "principal": { "type": "string", "description": "principal-id glob, for calls carrying one" },
-                            "args": { "type": "string", "description": "CEL over `args`, `tool` and `caller` — the only place an ARGUMENT can be judged, since grants are name patterns" } } },
+                            "args": { "type": "string", "description": "CEL over `args`, `tool` and `caller` — the only place an ARGUMENT can be judged, since grants are name patterns" },
+                            "delegated": { "type": "boolean", "description": "the call is made with an enrolled person's grant (RFC 0044)" },
+                            "tainted": { "type": "boolean", "description": "the work holds outside input; until the taint engine, every unit that touched a delegated server" },
+                            "any_tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "at least one listed trifecta tag is on the tool" } } },
                         "action": { "enum": ["allow", "deny", "ask", "shadow"], "description": "shadow refuses and says the call was held; it never fabricates a result" },
                         "question": { "type": "string", "description": "the question put to a person for `ask`; {{tool}}, {{caller}} and {{args}} are substituted" },
                         "on_timeout": { "enum": ["allow", "deny", "ask", "shadow"], "description": "what an unanswered `ask` becomes (default deny)" },
@@ -423,7 +428,88 @@ fn top_level_properties(
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
                 "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" },
                 "client": client(),
-                "companies": companies() } }));
+                "companies": companies(),
+                "experimental": { "type": "object", "additionalProperties": false, "description": "features built on drafts, each off until turned on",
+                    "properties": { "id_jag": { "type": "boolean", "description": "allow `grant: id_jag` servers (RFC 0044; needs the xaa feature) until ID-JAG reaches IETF working-group last call" } } } } }));
+}
+
+/// The `private_key_jwt` / client-secret client authentication an IdP or a
+/// resource's authorization server knows agentd by.
+fn client_auth_schema(secret: &Value) -> Value {
+    json!({ "type": "object", "additionalProperties": false,
+        "description": "how the client authenticates at the token and revocation endpoints; with no client_id, only assertion_aud", "properties": {
+        "method": { "enum": ["private_key_jwt", "client_secret_basic", "client_secret_post"] },
+        "key": secret, "kid": { "type": "string" },
+        "assertion_aud": { "enum": ["token_endpoint", "issuer"] },
+        "alg": { "enum": ["ES256", "RS256"], "description": "private_key_jwt: the key's algorithm; default ES256" } } })
+}
+
+/// The fields an `auth` block of `grant: id_jag` adds (RFC 0044).
+fn auth_delegation_properties(duration: &Value) -> Map<String, Value> {
+    let v = json!({
+        "idp": { "type": "string", "description": "grant id_jag: the identity.providers entry the person's grant is at" },
+        "tool_scopes": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "grant id_jag: the scopes each tool needs beyond scopes" },
+        "scope_mode": { "enum": ["server", "per_tool"], "description": "grant id_jag: one token per server with the union of scopes (default), or one per distinct scope set" },
+        "tools_from": { "enum": ["first_grant", "file"], "description": "grant id_jag: the tool catalogue from the first delegated connection (default), or tools_file" },
+        "tools_file": { "type": "string", "description": "grant id_jag, tools_from file: a tools/list result" },
+        "id_jag": { "enum": ["discover", "assume"], "description": "grant id_jag: require the ID-JAG profile in the authorization server's metadata (default), or assume it" },
+        "id_jag_reuse": { "enum": ["auto", "never"], "description": "grant id_jag: present an unexpired ID-JAG again after a 401 (default auto)" },
+        "on_revoked": { "enum": ["fail", "ask"], "description": "grant id_jag: a revoked grant fails the call; ask is P2" },
+        "allow_unbound_at": { "type": "boolean", "description": "grant id_jag: accept an ID-JAG that does not name the pinned resource (warned and recorded)" },
+        "attribution": { "enum": ["sub", "none"], "description": "grant id_jag: what agent/acting_for carries — the ID-JAG's sub (default), or nothing" },
+        "max_at_age": duration
+    });
+    match v {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    }
+}
+
+/// `identity.providers.<name>` (RFC 0044): an enterprise IdP.
+fn provider() -> Value {
+    let secret = json!({ "type": "string", "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment" });
+    json!({ "type": "object", "additionalProperties": false, "required": ["issuer", "client_id"], "properties": {
+        "issuer": { "type": "string", "description": "the IdP's issuer, pinned (https; plain http only to a loopback host). Its RFC 8414 and OpenID metadata are both read, and merged" },
+        "profile": { "enum": ["generic", "okta"], "description": "okta: ID-JAGs come only from the org authorization server (an /oauth2/<id> issuer is refused), keys at {issuer}/oauth2/v1/keys, subject refresh_token. Default generic" },
+        "client_id": { "type": "string", "description": "agentd's client at the IdP (Okta: the AI agent's client ID)" },
+        "client_auth": client_auth_schema(&secret),
+        "client_secret": secret,
+        "sign_in": { "type": "object", "additionalProperties": false, "properties": {
+            "grants": { "type": "array", "items": { "enum": ["device", "authorization_code"] }, "description": "the enrolment grants, in the order tried; default [device]" },
+            "scopes": { "type": "array", "items": { "type": "string" }, "description": "default [openid, offline_access]; openid is required" } } },
+        "subject": { "enum": ["refresh_token", "id_token"], "description": "what the token exchange presents: the sealed refresh token, or a fresh ID token from a refresh with no scope. Default refresh_token under okta, id_token otherwise" },
+        "subjects": { "enum": ["public", "pairwise"], "description": "public (default): an ID-JAG's sub must equal the grant's; pairwise: recorded, not compared" },
+        "jwks_uri": { "type": "string", "description": "the IdP's key set, pinned; default the OpenID metadata's (okta: {issuer}/oauth2/v1/keys)" } } })
+}
+
+/// `identity.delegation` (RFC 0044 §5.5).
+fn delegation() -> Value {
+    let duration = json!({ "type": ["string", "integer"], "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds" });
+    let secret = json!({ "type": "string", "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment" });
+    json!({ "type": "object", "additionalProperties": false,
+        "description": "acting for an enrolled person through their IdP (RFC 0044; needs the xaa feature): the seal key, the token caps and who may enrol for what. Restart-only, operator-only",
+        "properties": {
+            "seal_key": secret,
+            "seal_key_previous": secret,
+            "at_cache_cap": duration,
+            "liveness_interval": duration,
+            "consent_timeout": duration,
+            "templates": { "type": "array", "description": "who may enrol, for what; no matching template, no enrolment",
+                "items": { "type": "object", "additionalProperties": false, "required": ["name", "principals", "idp", "servers"], "properties": {
+                    "name": { "type": "string" },
+                    "principals": { "type": "object", "additionalProperties": false, "description": "every field named must match", "properties": {
+                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "P1 admits operator alone" },
+                        "role": { "enum": ["operator", "user"] },
+                        "labels": { "type": "object", "additionalProperties": { "type": "string" } } } },
+                    "idp": { "type": "string", "description": "the identity.providers entry its principals bind to" },
+                    "servers": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "the scope ceiling on this server" } } },
+                        "description": "each grant: id_jag server it allows, by name" },
+                    "ttl": duration,
+                    "budget": { "type": "object", "additionalProperties": false, "properties": {
+                        "per_day": { "type": "integer", "minimum": 1, "description": "mints per day per server; default 16" },
+                        "per_month": { "type": "integer", "minimum": 1, "description": "mints per month per server; default 200" },
+                        "per_run": { "type": "integer", "minimum": 1, "description": "mints per run; default 12" } } } } } } } })
 }
 
 /// `security.client` (RFC 0052): agentd's OAuth client where it has no
@@ -568,12 +654,8 @@ fn defs_properties(
                 "issuer": { "type": "string" }, "token_url": { "type": "string" },
                 "device_authorization_url": { "type": "string" }, "authorization_url": { "type": "string" },
                 "client_id": { "type": "string", "description": "the registered client; unset, agentd's Client ID Metadata Document (security.client) is the client, where the issuer's metadata advertises it" }, "client_secret": secret,
-                "client_auth": { "type": "object", "additionalProperties": false,
-                    "description": "how the client authenticates at the token and revocation endpoints; with no client_id, only assertion_aud", "properties": {
-                    "method": { "enum": ["private_key_jwt", "client_secret_basic", "client_secret_post"] },
-                    "key": secret, "kid": { "type": "string" },
-                    "assertion_aud": { "enum": ["token_endpoint", "issuer"] } } },
-                "grant": { "enum": ["device", "authorization_code", "client_credentials"] },
+                "client_auth": client_auth_schema(secret),
+                "grant": { "enum": ["device", "authorization_code", "client_credentials", "id_jag"], "description": "id_jag (mcp.servers only; needs the xaa feature): an enrolled person's grant, exchanged at their IdP for an ID-JAG and redeemed here — served by the supervisor alone" },
                 "scopes": { "type": "array", "items": { "type": "string" } }, "audience": { "type": "string" },
                 "resource": { "type": "string", "description": "oauth2: the RFC 8707 resource every authorization, token, refresh and client-credentials request carries — auto (the endpoint, canonical), omit, or a URI; unset, auto on an MCP server or MCP catalog entry and omit elsewhere" },
                 "token": secret, "header": { "type": "string" }, "value": secret,
@@ -582,6 +664,15 @@ fn defs_properties(
                 "sso_start_url": { "type": "string" }, "account_id": { "type": "string" }, "role_name": { "type": "string" },
                 "svid": { "enum": ["jwt", "x509"] }, "jwt_svid_file": { "type": "string" },
                 "svid_file": { "type": "string" }, "key_file": { "type": "string" } } }));
+    // Beside the rest, rather than in the literal above: that `json!` sits at
+    // the macro's recursion limit.
+    if let Some(p) = m
+        .get_mut("Auth")
+        .and_then(|a| a.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+    {
+        p.extend(auth_delegation_properties(duration));
+    }
     m.insert("ToolOverride".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["server", "tool"], "properties": {
                 "server": { "type": "string" }, "tool": { "type": "string" },
                 "args": { "type": "string", "description": "a JSON template or `CEL: …` producing the MCP tool arguments from `args`/`ctx`" },
@@ -665,7 +756,11 @@ fn defs_properties(
     m.insert("Principal".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["match", "role"], "properties": {
                 "id": { "type": "string", "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$", "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules. Required for bearer_ref and any rules; without it a certificate rule derives <role>:cn=<CN> or <role>:san=<first SAN>" },
                 "match": { "type": "object", "additionalProperties": false, "properties": {
-                    "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "any": { "type": "boolean" } } },
+                    "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "any": { "type": "boolean" },
+                    "uid": { "type": "integer", "minimum": 0, "description": "the unix A2A listener's peer uid (SO_PEERCRED): the per-person operator operator:<id> (RFC 0044; needs the xaa feature)" } } },
+                "idp_subject": { "type": "object", "additionalProperties": false, "required": ["iss", "sub"],
+                    "description": "the one IdP identity this principal is, exact: required to delegate (RFC 0044; needs the xaa feature)",
+                    "properties": { "iss": { "type": "string" }, "sub": { "type": "string" } } },
                 "role": { "enum": ["operator", "user", "agent", "anonymous"] },
                 "grants": { "type": "array", "items": { "type": "string" } },
                 "quotas": { "type": "object", "additionalProperties": false, "properties": {

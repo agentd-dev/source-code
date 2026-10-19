@@ -63,6 +63,10 @@ pub struct OAuth2Params {
     /// How the endpoints are dialled: by name when the operator configured
     /// the issuer, through the SSRF guard when a server named it.
     pub dial: Dial,
+    /// Resolve the client's key and secret from a mounted file or the
+    /// startup prompt alone, never the environment: a delegation client's
+    /// (RFC 0044 §5.13 item 1).
+    pub prompt_only: bool,
 }
 
 /// How a client authenticates at the token and revocation endpoints.
@@ -81,6 +85,8 @@ pub enum ClientAuth {
         key: String,
         kid: Option<String>,
         aud: AssertionAud,
+        /// `RS256`, or `None` for ES256.
+        alg: Option<String>,
     },
 }
 
@@ -109,6 +115,7 @@ impl ClientAuth {
                         ));
                     }
                 },
+                alg: spec.alg.clone(),
             }),
             other => Err(format!(
                 "auth.client_auth method '{other}' (want private_key_jwt|client_secret_basic|client_secret_post)"
@@ -138,7 +145,7 @@ impl OAuth2Params {
     /// the server's `error` code and status, and — for an `invalid_client`
     /// from a server that was given agentd's Client ID Metadata Document —
     /// where the document it could not accept is published.
-    fn refused(&self, reply: &Reply) -> String {
+    pub(crate) fn refused(&self, reply: &Reply) -> String {
         let mut out = oauth_error(reply);
         if self.client_id_metadata_document
             && parse_error(&reply.body).as_deref() == Some("invalid_client")
@@ -168,8 +175,9 @@ impl OAuth2Params {
 
     /// Add this client's authentication to a token or revocation request:
     /// form fields, and the headers to send with it.
-    fn authenticate(&self, form: &mut Form) -> Result<Vec<(String, String)>, String> {
-        let env = |k: &str| std::env::var(k).ok();
+    pub(crate) fn authenticate(&self, form: &mut Form) -> Result<Vec<(String, String)>, String> {
+        let prompt_only = self.prompt_only;
+        let env = |k: &str| (!prompt_only).then(|| std::env::var(k).ok()).flatten();
         let secret = || -> Result<Option<String>, String> {
             self.client_secret
                 .as_deref()
@@ -191,9 +199,10 @@ impl OAuth2Params {
                     format!("Basic {}", crate::b64::std_pad(pair.as_bytes())),
                 )])
             }
-            ClientAuth::PrivateKeyJwt { key, kid, aud } => {
+            ClientAuth::PrivateKeyJwt { key, kid, aud, alg } => {
                 let pem = crate::sec::secret::resolve(key, &env)?;
-                let mut signer = super::client_assertion::ClientKey::from_pem(&pem)?;
+                let mut signer =
+                    super::client_assertion::AnyClientKey::from_pem(&pem, alg.as_deref())?;
                 if let Some(kid) = kid {
                     signer = signer.with_kid(kid);
                 }
@@ -694,7 +703,7 @@ fn form_encode(s: &str) -> String {
 
 /// POST a form to a token, device or revocation endpoint, with `headers`,
 /// dialled as `dial` says.
-fn post_form(
+pub(crate) fn post_form(
     url: &str,
     form: Form,
     headers: &[(String, String)],
@@ -924,6 +933,7 @@ mod tests {
                 key: format!("{{{{secret-file:{}}}}}", path.display()),
                 kid: None,
                 aud: AssertionAud::TokenEndpoint,
+                alg: None,
             },
             ..Default::default()
         };

@@ -33,6 +33,8 @@ ROWS=(
   "--features mock-models"
   "--features companies"
   "--features companies,a2a"
+  "--features xaa"
+  "--features xaa,a2a"
   "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
   "--all-features"
 )

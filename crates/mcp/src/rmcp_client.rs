@@ -434,6 +434,9 @@ pub struct RmcpBuilder {
     listen_extension: Option<ListenExtensionFn>,
     /// Declare the Tasks extension; see [`Self::with_tasks`].
     tasks: bool,
+    /// Extensions declared in the client capabilities; see
+    /// [`Self::with_extensions`].
+    extensions: Vec<String>,
 }
 
 /// Decides, from the server's `capabilities` as it sent them, what an
@@ -466,7 +469,16 @@ impl RmcpBuilder {
             listen_idle: LISTEN_IDLE,
             listen_extension: None,
             tasks: false,
+            extensions: Vec::new(),
         }
+    }
+
+    /// Declare each of `ids` in the client capabilities' `extensions`, with
+    /// no settings: `initialize` carries them at 2025-11-25, and every
+    /// request's `_meta` from 2026-07-28.
+    pub fn with_extensions(mut self, ids: &[String]) -> Self {
+        self.extensions = ids.to_vec();
+        self
     }
 
     /// Declare the MCP Tasks extension (SEP-2663) on the requests that may
@@ -551,6 +563,14 @@ impl RmcpBuilder {
         let mut caps = ClientCapabilities::default();
         if self.elicitation.is_some() {
             caps.elicitation = Some(ElicitationCapability::new());
+        }
+        if !self.extensions.is_empty() {
+            caps.extensions = Some(
+                self.extensions
+                    .iter()
+                    .map(|id| (id.clone(), serde_json::Map::new()))
+                    .collect(),
+            );
         }
 
         // Notifications arrive on the `listen` subscription, not through the

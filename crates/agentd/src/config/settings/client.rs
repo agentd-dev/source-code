@@ -90,7 +90,7 @@ impl Client {
             .map(|g| match g {
                 OAuthGrant::Device => DEVICE_CODE,
                 OAuthGrant::AuthorizationCode => "authorization_code",
-                OAuthGrant::ClientCredentials => "client_credentials",
+                OAuthGrant::ClientCredentials | OAuthGrant::IdJag => "client_credentials",
             })
             .collect();
         if self
@@ -230,6 +230,7 @@ impl Settings {
                 key: Some(format!("{{{{secret-file:{}}}}}", c.key_file())),
                 kid: None,
                 assertion_aud: spec.client_auth.and_then(|a| a.assertion_aud),
+                alg: None,
             });
             spec.client_id_metadata_document = true;
         }
@@ -303,6 +304,7 @@ fn grant_name(g: OAuthGrant) -> &'static str {
         OAuthGrant::Device => "device",
         OAuthGrant::AuthorizationCode => "authorization_code",
         OAuthGrant::ClientCredentials => "client_credentials",
+        OAuthGrant::IdJag => "id_jag",
     }
 }
 

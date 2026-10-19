@@ -3,7 +3,8 @@
 //! Core §9): the client proves who it is at an authorization server by a
 //! short-lived JWT signed with its own key, instead of sending a secret the
 //! server could leak. ES256 on `ring`'s ECDSA P-256 — the crypto rustls
-//! already links, so no new crate.
+//! already links, so no new crate — and RS256 on its RSA signer, for an
+//! identity provider that registers an RSA key ([`RsaClientKey`]).
 //!
 //! The key is PKCS#8 (`-----BEGIN PRIVATE KEY-----`, or the DER it wraps).
 //! Its `kid` is the RFC 7638 thumbprint of its public JWK unless the
@@ -172,6 +173,149 @@ impl ClientKey {
     }
 }
 
+/// The DER inside a PKCS#8 PEM block, or of base64 text.
+fn pkcs8_der(text: &str) -> Result<Vec<u8>, String> {
+    let t = text.trim();
+    let body = match t.strip_prefix("-----BEGIN PRIVATE KEY-----") {
+        Some(rest) => rest
+            .split("-----END PRIVATE KEY-----")
+            .next()
+            .unwrap_or_default(),
+        None if t.starts_with("-----BEGIN") => {
+            return Err(
+                "client key: not a PKCS#8 `BEGIN PRIVATE KEY` block (convert it with `openssl pkcs8 -topk8 -nocrypt`)"
+                    .to_string(),
+            );
+        }
+        None => t,
+    };
+    let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    b64::std_decode(&b64).map_err(|e| format!("client key: {e}"))
+}
+
+/// An RS256 signing key (RFC 7518 §3.3, RSASSA-PKCS1-v1_5 with SHA-256),
+/// named by its `kid` or the RFC 7638 thumbprint of its public JWK.
+pub struct RsaClientKey {
+    pair: ring::signature::RsaKeyPair,
+    jwk: Value,
+    kid: String,
+}
+
+impl RsaClientKey {
+    /// The key in `text`, a PKCS#8 PEM block of an RSA key of 2048 bits or
+    /// more.
+    pub fn from_pem(text: &str) -> Result<RsaClientKey, String> {
+        let der = pkcs8_der(text)?;
+        let pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
+            .map_err(|e| format!("client key: not a PKCS#8 RSA key ({e})"))?;
+        let parts = ring::rsa::PublicKeyComponents::<Vec<u8>>::from(pair.public());
+        let jwk = json!({
+            "kty": "RSA",
+            "n": b64::url_nopad(&parts.n),
+            "e": b64::url_nopad(&parts.e),
+        });
+        let kid = jwk::thumbprint(&jwk)?;
+        Ok(RsaClientKey { pair, jwk, kid })
+    }
+
+    pub fn with_kid(mut self, kid: &str) -> RsaClientKey {
+        self.kid = kid.to_string();
+        self
+    }
+
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    /// The public JWK, with its `kid`, `alg` and `use`.
+    pub fn public_jwk(&self) -> Value {
+        let mut j = self.jwk.clone();
+        j["kid"] = json!(self.kid);
+        j["alg"] = json!("RS256");
+        j["use"] = json!("sig");
+        j
+    }
+
+    /// A compact JWS over `claims` with `alg: RS256` and this key's `kid`.
+    pub fn sign_jwt(&self, mut header: Value, claims: &Value) -> Result<String, String> {
+        header["alg"] = json!("RS256");
+        header["kid"] = json!(self.kid);
+        let input = format!(
+            "{}.{}",
+            b64::url_nopad(header.to_string().as_bytes()),
+            b64::url_nopad(claims.to_string().as_bytes())
+        );
+        let rng = ring::rand::SystemRandom::new();
+        let mut sig = vec![0u8; self.pair.public().modulus_len()];
+        self.pair
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &rng,
+                input.as_bytes(),
+                &mut sig,
+            )
+            .map_err(|_| "client key: signing failed".to_string())?;
+        Ok(format!("{input}.{}", b64::url_nopad(&sig)))
+    }
+}
+
+/// A `private_key_jwt` key of either algorithm.
+pub enum AnyClientKey {
+    Es256(ClientKey),
+    Rs256(RsaClientKey),
+}
+
+impl AnyClientKey {
+    /// The key in `text` for `alg` (`ES256` when `None`).
+    pub fn from_pem(text: &str, alg: Option<&str>) -> Result<AnyClientKey, String> {
+        match alg.unwrap_or("ES256") {
+            "ES256" => ClientKey::from_pem(text).map(AnyClientKey::Es256),
+            "RS256" => RsaClientKey::from_pem(text).map(AnyClientKey::Rs256),
+            other => Err(format!("client key: alg {other:?} (want ES256 or RS256)")),
+        }
+    }
+
+    pub fn with_kid(self, kid: &str) -> AnyClientKey {
+        match self {
+            AnyClientKey::Es256(k) => AnyClientKey::Es256(k.with_kid(kid)),
+            AnyClientKey::Rs256(k) => AnyClientKey::Rs256(k.with_kid(kid)),
+        }
+    }
+
+    pub fn kid(&self) -> &str {
+        match self {
+            AnyClientKey::Es256(k) => k.kid(),
+            AnyClientKey::Rs256(k) => k.kid(),
+        }
+    }
+
+    pub fn sign_jwt(&self, header: Value, claims: &Value) -> Result<String, String> {
+        match self {
+            AnyClientKey::Es256(k) => k.sign_jwt(header, claims),
+            AnyClientKey::Rs256(k) => k.sign_jwt(header, claims),
+        }
+    }
+
+    /// A `private_key_jwt` client assertion, as [`ClientKey::client_assertion`]
+    /// makes one, signed with this key.
+    pub fn client_assertion(&self, client_id: &str, aud: &str) -> Result<String, String> {
+        let iat = crate::auth::cache::now_ms() / 1000;
+        let jti = crate::sec::random::b64url_token(16)
+            .map_err(|e| format!("client assertion: no OS randomness for its jti: {e}"))?;
+        self.sign_jwt(
+            json!({"typ": "JWT"}),
+            &json!({
+                "iss": client_id,
+                "sub": client_id,
+                "aud": aud,
+                "iat": iat,
+                "exp": iat + LIFETIME_S,
+                "jti": jti,
+            }),
+        )
+    }
+}
+
 /// A PKCS#8 document as a PEM block.
 pub fn pem(der: &[u8]) -> String {
     let b = b64::std_pad(der);
@@ -269,6 +413,50 @@ mod tests {
         assert_eq!(pub_jwk["kid"], key.kid());
         assert!(pub_jwk.get("d").is_none());
         assert_eq!(key.with_kid("k-2026").kid(), "k-2026");
+    }
+
+    /// An RS256 assertion verifies with `ring`'s RSA verifier over the
+    /// public JWK's modulus and exponent alone, and names its key by the
+    /// RFC 7638 thumbprint of that JWK.
+    #[test]
+    fn an_rs256_assertion_verifies_with_the_public_jwk() {
+        let pem = include_str!("../../tests/fixtures/rsa2048-test-key.pem");
+        let key = AnyClientKey::from_pem(pem, Some("RS256")).unwrap();
+        let AnyClientKey::Rs256(rsa) = &key else {
+            panic!("an RSA key")
+        };
+        let jwk = rsa.public_jwk();
+        assert_eq!(rsa.kid(), jwk::thumbprint(&jwk).unwrap());
+        let jwt = key
+            .client_assertion("0oa-agent", "https://acme.okta.com/oauth2/v1/token")
+            .unwrap();
+        assert_eq!(part(&jwt, 0)["alg"], "RS256");
+        assert_eq!(part(&jwt, 0)["kid"], rsa.kid());
+        let (input, sig) = jwt.rsplit_once('.').unwrap();
+        let components = ring::signature::RsaPublicKeyComponents {
+            n: b64::url_decode(jwk["n"].as_str().unwrap()).unwrap(),
+            e: b64::url_decode(jwk["e"].as_str().unwrap()).unwrap(),
+        };
+        components
+            .verify(
+                &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                input.as_bytes(),
+                &b64::url_decode(sig).unwrap(),
+            )
+            .expect("the signature verifies");
+        assert!(
+            components
+                .verify(
+                    &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                    format!("{input}x").as_bytes(),
+                    &b64::url_decode(sig).unwrap(),
+                )
+                .is_err()
+        );
+        assert_eq!(part(&jwt, 1)["iss"], "0oa-agent");
+        // The algorithm the configuration names, and no other.
+        assert!(AnyClientKey::from_pem(pem, Some("ES256")).is_err());
+        assert!(AnyClientKey::from_pem(pem, Some("HS256")).is_err());
     }
 
     #[test]

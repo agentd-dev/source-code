@@ -42,10 +42,17 @@
     "tier": 1
   },
   {
-    "name": "Instruction Specification",
+    "name": "instruction.md",
     "version": "1",
-    "full": "Instruction Specification version 1",
+    "full": "instruction.md, the Instruction Specification, version 1 (revision 1.1)",
     "href": "/docs/instruction-documents/",
+    "tier": 1
+  },
+  {
+    "name": "Workflows",
+    "mark": "agentd",
+    "full": "agentd's own workflow language: steps, triggers and CEL guards",
+    "href": "/docs/workflow-language/",
     "tier": 1
   },
   {
@@ -62,6 +69,20 @@
     "mark": "preview",
     "full": "DPoP-bound tokens at companies: a build-from-source preview",
     "href": "/docs/interoperability/#personal-agent-protocol",
+    "tier": 2
+  },
+  {
+    "name": "IETF RFCs",
+    "full": "The internet standards agentd implements, by RFC number",
+    "href": "/docs/interoperability/#internet-standards",
+    "tier": 2
+  },
+  {
+    "name": "OpenAPI",
+    "version": "3.0 · 3.1",
+    "mark": "preview",
+    "full": "A company's OpenAPI operations as tools: a build-from-source preview",
+    "href": "/docs/act-at-companies/#its-operations-as-tools",
     "tier": 2
   },
   {
@@ -94,6 +115,20 @@
     "version": "RFC 9421",
     "full": "RFC 9421 HTTP Message Signatures, on every request agentd signs with AAuth",
     "href": "/docs/aauth/#on-the-wire",
+    "tier": 2
+  },
+  {
+    "name": "JSON-RPC",
+    "version": "2.0",
+    "full": "JSON-RPC 2.0, the wire of MCP and A2A",
+    "href": "/docs/interoperability/#agent2agent-a2a",
+    "tier": 2
+  },
+  {
+    "name": "JSON Schema",
+    "version": "2020-12",
+    "full": "JSON Schema 2020-12 (a subset): workflow inputs, output schemas and command arguments",
+    "href": "/docs/interoperability/#documents-webhooks-and-other-formats",
     "tier": 2
   },
   {
@@ -130,6 +165,12 @@
     "name": "CEL",
     "full": "Common Expression Language",
     "href": "/docs/workflow-language/#cel",
+    "tier": 2
+  },
+  {
+    "name": "PID 1",
+    "full": "Runs as PID 1: the init process of a container or a device",
+    "href": "/docs/pid-1/",
     "tier": 2
   }
 ]

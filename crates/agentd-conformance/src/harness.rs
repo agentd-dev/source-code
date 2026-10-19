@@ -126,6 +126,35 @@ impl Harness {
         ConfServer::spawn_http(&self.agentd, &args, addr_file, "http")
     }
 
+    /// [`Harness::spawn_mock_mcp`] at the MCP revision `revision`
+    /// (`2026-07-28` reaches it with `server/discover`, where the mock serves
+    /// the MCP Tasks extension), its stderr — the server's own record of each
+    /// request that reached it — written to `log`.
+    pub fn spawn_mock_mcp_at(
+        &self,
+        addr_file: &Path,
+        uri: &str,
+        revision: &str,
+        log: &Path,
+    ) -> ConfServer {
+        let args: Vec<&Path> = vec![
+            Path::new("--internal-mock-mcp-http"),
+            addr_file,
+            Path::new(uri),
+            Path::new("--no-emit"),
+            Path::new("--protocol-version"),
+            Path::new(revision),
+        ];
+        let _ = std::fs::remove_file(addr_file);
+        let child = Command::new(&self.agentd)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(log).expect("a log file for the mock"))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", self.agentd.display()));
+        ConfServer::announced(child, addr_file, "http")
+    }
+
     /// Launch the built-in fake Company (`--internal-mock-company`): HTTPS on
     /// loopback with the test PKI's server identity ([`tls_fixture`]),
     /// trusting the test CA for the documents it fetches, and departing from
@@ -252,7 +281,26 @@ pub struct ConfServer {
 impl ConfServer {
     fn spawn_http(bin: &Path, args: &[&Path], addr_file: &Path, scheme: &str) -> ConfServer {
         let _ = std::fs::remove_file(addr_file);
-        let child = Self::launch(bin, args, addr_file);
+        let child = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
+        Self::announced(child, addr_file, scheme)
+    }
+
+    /// Block until `child` announces its address in `addr_file`, and hold it.
+    fn announced(child: Child, addr_file: &Path, scheme: &str) -> ConfServer {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !addr_file.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "conformance mcp server never became ready: {}",
+                addr_file.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let addr = std::fs::read_to_string(addr_file)
             .unwrap_or_else(|e| panic!("read mock addr-file {}: {e}", addr_file.display()));
         ConfServer {
@@ -260,27 +308,6 @@ impl ConfServer {
             path: addr_file.to_path_buf(),
             endpoint: format!("{scheme}://{}", addr.trim()),
         }
-    }
-
-    /// Spawn `bin` and block until `ready_path` exists (the unix socket bound /
-    /// the loopback address announced).
-    fn launch(bin: &Path, args: &[&Path], ready_path: &Path) -> Child {
-        let child = Command::new(bin)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready_path.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "conformance mcp server never became ready: {}",
-                ready_path.display()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        child
     }
 
     /// The endpoint agentd connects to (`unix:<socket>` or `http://<addr>`).

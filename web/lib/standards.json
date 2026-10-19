@@ -56,6 +56,13 @@
     "tier": 1
   },
   {
+    "name": "MCP Tasks",
+    "version": "SEP-2663",
+    "full": "MCP Tasks, the MCP extension for long tool calls: agentd follows a server's tasks to their end",
+    "href": "/docs/connect-mcp/#long-running-tool-calls",
+    "tier": 2
+  },
+  {
     "name": "MCP Events",
     "version": "SEP-3415",
     "mark": "draft",

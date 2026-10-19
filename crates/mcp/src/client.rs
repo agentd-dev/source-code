@@ -162,6 +162,9 @@ pub struct McpClient {
     /// How long a listen stream may stay silent before it is cut and opened
     /// again; see [`crate::rmcp_client::LISTEN_IDLE`].
     listen_idle: Duration,
+    /// Declare the MCP Tasks extension where the revision defines it
+    /// ([`Self::with_tasks`]). Kept, so a re-dial declares it too.
+    tasks: bool,
 }
 
 impl McpClient {
@@ -209,7 +212,21 @@ impl McpClient {
             },
             first: FirstRequest::Discover,
             listen_idle: crate::rmcp_client::LISTEN_IDLE,
+            tasks: false,
         })
+    }
+
+    /// Declare the MCP Tasks extension (SEP-2663) on the requests that may
+    /// create or follow a task, at a revision that defines it (2026-07-28
+    /// on). A server may then answer a bounded `tools/call` with a task:
+    /// [`Self::call_tool_with_meta_within`] follows it to its end inside the
+    /// call's bound and cancels it there, and [`Self::call_tool_called`]
+    /// hands it back for a host that follows it itself. A call with no bound
+    /// never declares it: nothing could end its follow. Off (the default),
+    /// no request declares it.
+    pub fn with_tasks(mut self, on: bool) -> Self {
+        self.tasks = on;
+        self
     }
 
     /// Let a listen stream stay silent for `idle` (never less than the
@@ -372,7 +389,8 @@ impl McpClient {
                 .with_http(http)
                 .with_client_info(self.client_info.clone())
                 .start_with(first)
-                .with_listen_idle(self.listen_idle);
+                .with_listen_idle(self.listen_idle)
+                .with_tasks(self.tasks);
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
         }
@@ -503,7 +521,8 @@ impl McpClient {
     /// and a server may stop mid-call to ask the operator a question
     /// (elicitation), whose answer takes a human's time, not a transport's.
     /// A caller with a deadline of its own says so through
-    /// [`Self::call_tool_with_meta_within`].
+    /// [`Self::call_tool_with_meta_within`]. Unbounded, it never declares the
+    /// MCP Tasks extension, so the server answers inline.
     pub fn call_tool(
         &self,
         name: &str,
@@ -543,6 +562,10 @@ impl McpClient {
     /// counts against it — an operator answering an elicitation included —
     /// so a fixed default passed as a bound cuts off live calls: a slow tool,
     /// and a server whose own `timeout` was set longer than the default.
+    ///
+    /// On a connection that declares the MCP Tasks extension, the call does:
+    /// a task it becomes is followed here to its end, and cancelled with
+    /// `tasks/cancel` if it is still open at the bound.
     pub fn call_tool_with_meta_within(
         &self,
         name: &str,
@@ -578,6 +601,11 @@ impl McpClient {
             .map_err(|f| f.error)
     }
 
+    /// Only a bounded call declares the MCP Tasks extension: a task it
+    /// becomes is followed here, to its end or the call's bound
+    /// ([`Self::follow_task`]). Its outcome is the call's, and a task still
+    /// open at the bound is cancelled and reported as a call that may have
+    /// acted.
     fn call_reaching(
         &self,
         name: &str,
@@ -585,18 +613,299 @@ impl McpClient {
         extra_meta: Option<Value>,
         bound: Option<Duration>,
     ) -> Result<CallToolResult, CallFailed> {
+        let started = Instant::now();
+        let called =
+            self.call_tool_called(name, arguments, extra_meta.clone(), bound, bound.is_some())?;
+        let (task, bound) = match (called, bound) {
+            (crate::wire::Called::Result(r), _) => return Ok(r),
+            (crate::wire::Called::Task(t), Some(b)) => (t, b),
+            // Not declared, so never handed back: the SDK refuses a task
+            // here itself.
+            (crate::wire::Called::Task(_), None) => {
+                return Err(CallFailed {
+                    error: McpError::Transport(format!(
+                        "mcp server '{}': tools/call {name}: a task this call did not declare",
+                        self.name
+                    )),
+                    reach: Reach::Unreadable,
+                });
+            }
+        };
+        let trace = trace_meta(extra_meta.as_ref());
+        let tracker = crate::tasks::Tracker::new(task, unix_ms());
+        let op = format!("tools/call {name}");
+        match self.follow_task(tracker, Some(started + bound), trace.clone(), &|| false) {
+            Ok(crate::tasks::Followed::Ended(t)) => task_outcome(&self.name, &op, &t.task),
+            Ok(crate::tasks::Followed::Open(t)) => {
+                let _ = self.cancel_task(&t.task.task_id, trace, crate::tasks::REQUEST_BOUND);
+                Err(CallFailed {
+                    error: McpError::Transport(format!(
+                        "mcp server '{}': {op}: the task was still {} at the call's bound ({} ms); tasks/cancel sent",
+                        self.name,
+                        t.task.status.as_str(),
+                        bound.as_millis()
+                    )),
+                    reach: Reach::Unanswered,
+                })
+            }
+            Err(lost) => Err(CallFailed {
+                error: McpError::Transport(format!("mcp server '{}': {op}: {lost}", self.name)),
+                reach: Reach::Unanswered,
+            }),
+        }
+    }
+
+    /// `tools/call`, handed back as the server answered it: the tool's
+    /// result, or — when `tasks` and the connection declares the extension —
+    /// the task it became, for a host that follows it itself. `extra_meta`
+    /// and `bound` as for [`Self::call_tool_with_meta_within`].
+    pub fn call_tool_called(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        extra_meta: Option<Value>,
+        bound: Option<Duration>,
+        tasks: bool,
+    ) -> Result<crate::wire::Called, CallFailed> {
         let meta = merge_meta(self.tool_meta.as_ref(), extra_meta.as_ref());
         let sdk = self.sdk().map_err(|error| CallFailed {
             error,
             reach: Reach::Unsent,
         })?;
-        let raw = sdk
-            .call_tool_reaching(name, arguments, meta, bound)
-            .map_err(|(error, reach)| CallFailed { error, reach })?;
-        serde_json::from_value(raw).map_err(|e| CallFailed {
-            error: McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name)),
-            reach: Reach::Unreadable,
-        })
+        sdk.call_tool_called(name, arguments, meta, bound, tasks)
+            .map_err(|(error, reach)| CallFailed { error, reach })
+    }
+
+    /// Does the live connection declare the MCP Tasks extension? Only when
+    /// [`Self::with_tasks`] asked for it and the server was reached at a
+    /// revision that defines it.
+    pub fn declares_tasks(&self) -> bool {
+        self.sdk().is_ok_and(|c| c.declares_tasks())
+    }
+
+    /// `tasks/get`; see [`crate::rmcp_client::RmcpClient::get_task`].
+    pub fn get_task(
+        &self,
+        task_id: &str,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Duration,
+    ) -> Result<Result<crate::wire::Task, rpc::RpcError>, McpError> {
+        self.sdk()?.get_task(task_id, meta, bound)
+    }
+
+    /// `tasks/update`; see [`crate::rmcp_client::RmcpClient::update_task`].
+    pub fn update_task(
+        &self,
+        task_id: &str,
+        responses: serde_json::Map<String, Value>,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Duration,
+    ) -> Result<Result<(), rpc::RpcError>, McpError> {
+        self.sdk()?.update_task(task_id, responses, meta, bound)
+    }
+
+    /// `tasks/cancel`; see [`crate::rmcp_client::RmcpClient::cancel_task`].
+    pub fn cancel_task(
+        &self,
+        task_id: &str,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Duration,
+    ) -> Result<Result<(), rpc::RpcError>, McpError> {
+        self.sdk()?.cancel_task(task_id, meta, bound)
+    }
+
+    /// Ask the live connection's listen for pushes about `ids`; see
+    /// [`crate::rmcp_client::RmcpClient::listen_tasks`].
+    pub fn listen_tasks(
+        &self,
+        ids: std::collections::BTreeSet<String>,
+        bound: Duration,
+    ) -> Result<std::collections::BTreeSet<String>, McpError> {
+        self.sdk()?.listen_tasks(ids, bound)
+    }
+
+    /// Follow a task on this connection until it ends, `until` passes, or
+    /// `stop` says the caller no longer waits (checked at least every
+    /// [`STOP_CHECK`]): `tasks/get` at the task's own interval
+    /// ([`crate::tasks::Tracker::interval`]), each input request answered as
+    /// the same request sent directly would be ([`crate::tasks`]) and sent
+    /// back with `tasks/update`, and a failed poll tried again after a pause
+    /// that doubles from 1 s to 5 min. `meta` rides every `tasks/*` request
+    /// (a trace context).
+    ///
+    /// A form elicitation goes to this connection's elicitation handler —
+    /// the host's person — and waits for them no longer than `until`; a key
+    /// still being asked when it passes is left unanswered, for whoever
+    /// follows the task next. No poll goes out while a person decides.
+    /// Without a handler, or for a URL elicitation, the answer is `decline`.
+    /// A request this client never declares cancels the task.
+    ///
+    /// A task handed back open has every answer it was given sent, or its
+    /// key released ([`crate::tasks::Tracker::release_unsent`]). A task
+    /// given up for its TTL or a failed request is cancelled with
+    /// `tasks/cancel` first, as the server may still be running it; one the
+    /// server does not know is not.
+    pub fn follow_task(
+        &self,
+        tracker: crate::tasks::Tracker,
+        until: Option<Instant>,
+        meta: Option<serde_json::Map<String, Value>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<crate::tasks::Followed, crate::tasks::Lost> {
+        use crate::tasks::{Followed, Lost};
+        let id = tracker.task.task_id.clone();
+        match self.follow(tracker, until, &meta, stop) {
+            Ok(Followed::Open(mut t)) => {
+                // One last try for what the server has not acknowledged.
+                let _ = self.send_answers(&mut t, &meta);
+                t.release_unsent();
+                Ok(Followed::Open(t))
+            }
+            Err(lost @ (Lost::Expired | Lost::Failed(_))) => {
+                let _ = self.cancel_task(&id, meta, crate::tasks::REQUEST_BOUND);
+                Err(lost)
+            }
+            other => other,
+        }
+    }
+
+    fn follow(
+        &self,
+        mut tracker: crate::tasks::Tracker,
+        until: Option<Instant>,
+        meta: &Option<serde_json::Map<String, Value>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<crate::tasks::Followed, crate::tasks::Lost> {
+        use crate::tasks::{Followed, Lost};
+        let id = tracker.task.task_id.clone();
+        let mut failures: u32 = 0;
+        // The seed may already be asking.
+        let mut asks = tracker.observe(tracker.task.clone()).asks;
+        loop {
+            self.answer_asks(&mut tracker, std::mem::take(&mut asks), until, meta, stop)?;
+            if tracker.ended() {
+                return Ok(Followed::Ended(tracker));
+            }
+            if tracker.expired(unix_ms()) {
+                return Err(Lost::Expired);
+            }
+            let wait = match failures {
+                0 => tracker.interval(),
+                n => Duration::from_secs(1u64 << (n - 1).min(8)).min(Duration::from_secs(300)),
+            };
+            let bound = match until {
+                Some(u) => {
+                    let left = u.saturating_duration_since(Instant::now());
+                    if left <= wait {
+                        pause(left, stop);
+                        return Ok(Followed::Open(tracker));
+                    }
+                    left - wait
+                }
+                None => crate::tasks::REQUEST_BOUND,
+            };
+            if !pause(wait, stop) {
+                return Ok(Followed::Open(tracker));
+            }
+            match self.get_task(&id, meta.clone(), bound.min(crate::tasks::REQUEST_BOUND)) {
+                Ok(Ok(task)) => {
+                    failures = 0;
+                    asks = tracker.observe(task).asks;
+                }
+                Ok(Err(e)) if e.code == rpc::INVALID_PARAMS => {
+                    return Err(Lost::Unknown(e.message));
+                }
+                // An internal error is the server's or the transport's, and
+                // may pass.
+                Ok(Err(e)) if e.code == rpc::INTERNAL_ERROR => failures += 1,
+                Ok(Err(e)) => {
+                    return Err(Lost::Failed(format!(
+                        "tasks/get: {} ({})",
+                        e.message, e.code
+                    )));
+                }
+                Err(_) => failures += 1,
+            }
+        }
+    }
+
+    /// Answer `asks`, then send every answer not yet acknowledged in one
+    /// `tasks/update`. Asking ends early when `until` passes or `stop` says
+    /// so: the keys not reached are left unanswered.
+    fn answer_asks(
+        &self,
+        tracker: &mut crate::tasks::Tracker,
+        asks: Vec<crate::tasks::Ask>,
+        until: Option<Instant>,
+        meta: &Option<serde_json::Map<String, Value>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(), crate::tasks::Lost> {
+        use crate::tasks::{Ask, Lost};
+        let id = tracker.task.task_id.clone();
+        for ask in asks {
+            let response = match &ask {
+                Ask::Unsupported { method, .. } => {
+                    let _ = self.cancel_task(&id, meta.clone(), crate::tasks::REQUEST_BOUND);
+                    return Err(Lost::Unsupported(method.clone()));
+                }
+                Ask::Decline { .. } => serde_json::json!({"action": "decline"}),
+                Ask::Elicit {
+                    message,
+                    requested_schema,
+                    ..
+                } => match &self.elicitation {
+                    None => serde_json::json!({"action": "decline"}),
+                    Some(handler) => {
+                        // On a plain thread, for the reason the SDK's own
+                        // elicitation runs on one: a person's wait holds
+                        // nothing, and one past `until` is abandoned.
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let handler = Arc::clone(handler);
+                        let req = inbound::Inbound::Elicit {
+                            message: message.clone(),
+                            requested_schema: requested_schema.clone(),
+                        };
+                        std::thread::spawn(move || {
+                            let _ = tx.send(handler.handle(req));
+                        });
+                        match wait_for(&rx, until, stop) {
+                            Some(answer) => crate::tasks::elicit_result(answer.as_ref()),
+                            None => break,
+                        }
+                    }
+                },
+            };
+            tracker.answer(ask.key(), response);
+        }
+        self.send_answers(tracker, meta)
+    }
+
+    /// Send what [`crate::tasks::Tracker::unsent`] holds, in one
+    /// `tasks/update`: a server may refuse a partial set. What the server
+    /// did not acknowledge stays, for the next try: the person is never
+    /// asked again for it.
+    fn send_answers(
+        &self,
+        tracker: &mut crate::tasks::Tracker,
+        meta: &Option<serde_json::Map<String, Value>>,
+    ) -> Result<(), crate::tasks::Lost> {
+        if tracker.unsent.is_empty() {
+            return Ok(());
+        }
+        let responses: serde_json::Map<String, Value> = tracker
+            .unsent
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let id = tracker.task.task_id.clone();
+        match self.update_task(&id, responses, meta.clone(), crate::tasks::REQUEST_BOUND) {
+            Ok(Ok(())) => tracker.unsent.clear(),
+            Ok(Err(e)) if e.code == rpc::INVALID_PARAMS => {
+                return Err(crate::tasks::Lost::Unknown(e.message));
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+        Ok(())
     }
 
     /// `resources/list`, following cursor pagination to completion. `meta`
@@ -733,6 +1042,127 @@ impl McpClient {
         self.sdk()
             .map(|c| c.drain_listen_events())
             .unwrap_or_default()
+    }
+}
+
+/// The trace keys of a call's own `_meta`, which the requests that follow
+/// its task carry too: they are spans of the same call.
+fn trace_meta(meta: Option<&Value>) -> Option<serde_json::Map<String, Value>> {
+    let m: serde_json::Map<String, Value> = meta
+        .and_then(Value::as_object)?
+        .iter()
+        .filter(|(k, _)| *k == "traceparent" || *k == "tracestate")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!m.is_empty()).then_some(m)
+}
+
+/// Milliseconds since the Unix epoch.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How often a follower that sleeps, or waits for a person, looks at its
+/// caller's stop.
+pub const STOP_CHECK: Duration = Duration::from_millis(100);
+
+/// Sleep `d`, cut short when `stop` says so: whether it slept all of it.
+fn pause(d: Duration, stop: &dyn Fn() -> bool) -> bool {
+    let end = Instant::now() + d;
+    loop {
+        if stop() {
+            return false;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(STOP_CHECK));
+    }
+}
+
+/// A person's answer from `rx`: `None` when `until` passed or `stop` said so
+/// first, `Some(None)` when nobody answered.
+fn wait_for(
+    rx: &std::sync::mpsc::Receiver<Option<inbound::Answer>>,
+    until: Option<Instant>,
+    stop: &dyn Fn() -> bool,
+) -> Option<Option<inbound::Answer>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        if stop() {
+            return None;
+        }
+        let slice = match until {
+            Some(u) => {
+                let left = u.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                left.min(STOP_CHECK)
+            }
+            None => STOP_CHECK,
+        };
+        match rx.recv_timeout(slice) {
+            Ok(a) => return Some(a),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Some(None),
+        }
+    }
+}
+
+/// What a task that ended means for the call it answers: a completed one's
+/// result is the call's (an `isError` result included), a failed one's
+/// JSON-RPC error is the call's error, and a cancelled one is an error the
+/// server chose.
+pub fn task_outcome(
+    server: &str,
+    op: &str,
+    task: &crate::wire::Task,
+) -> Result<CallToolResult, CallFailed> {
+    use crate::wire::TaskStatus;
+    let failed = |error: McpError| CallFailed {
+        error,
+        reach: Reach::Answered { status: 200 },
+    };
+    match task.status {
+        TaskStatus::Completed => match task.tool_result() {
+            Some(Ok(r)) => Ok(r),
+            Some(Err(e)) => Err(CallFailed {
+                error: McpError::Transport(format!("mcp server '{server}': {op}: {e}")),
+                reach: Reach::Unreadable,
+            }),
+            None => Err(CallFailed {
+                error: McpError::Transport(format!(
+                    "mcp server '{server}': {op}: a completed task without its result"
+                )),
+                reach: Reach::Unreadable,
+            }),
+        },
+        TaskStatus::Failed => {
+            let e = task.error.clone().unwrap_or(Value::Null);
+            Err(failed(McpError::Transport(format!(
+                "mcp server '{server}': {op}: the task failed: {} ({})",
+                e["message"].as_str().unwrap_or("no message"),
+                e["code"]
+            ))))
+        }
+        TaskStatus::Cancelled => Err(failed(McpError::Transport(format!(
+            "mcp server '{server}': {op}: the task was cancelled{}",
+            task.status_message
+                .as_deref()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        )))),
+        TaskStatus::Working | TaskStatus::InputRequired => Err(CallFailed {
+            error: McpError::Transport(format!(
+                "mcp server '{server}': {op}: the task has not ended"
+            )),
+            reach: Reach::Unanswered,
+        }),
     }
 }
 

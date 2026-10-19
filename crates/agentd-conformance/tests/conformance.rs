@@ -76,6 +76,11 @@ fn mcp_auth_core_conformance() {
 }
 
 #[test]
+fn mcp_tasks_conformance() {
+    run_family(Category::McpTasks);
+}
+
+#[test]
 fn companies_conformance() {
     run_family(Category::Companies);
 }

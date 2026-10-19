@@ -102,7 +102,7 @@ these names, and anything else is refused at load.
 | `lifecycle` | Idle exit and the retirement signal |
 | `limit` | Reserved; nothing writes it |
 | `loop` | A subagent's agentic loop |
-| `mcp` | MCP connections, listens, subscriptions and MCP Events |
+| `mcp` | MCP connections, listens, subscriptions, MCP Events and MCP Tasks |
 | `message` | The message-depth guard |
 | `metrics` | The probe and scrape listener |
 | `nested` | Fan-out bodies |
@@ -556,6 +556,18 @@ Company that verifies while its token endpoint refuses has not recovered.
 | `mcp.listen.narrowed` | warn | `server`, `dropped` | A re-listen came back without some URIs; they are asked for again. |
 | `mcp.listen.resumed` | info | `server` |  |
 | `mcp.listen.unavailable` | warn | `server`, `reason`, `retry_ms` | The standing listen failed or was refused. |
+| `mcp.task.cancelled` | info | `server`, `task`, `reason` | `tasks/cancel` was sent for an MCP task — its step timed out, its run was cancelled, its step no longer waits, the run its `agent` step handed it over in ended, or `mcp.task.cancel` — or the server cancelled it. `task` is agentd's handle (`mt_…`), never the server's id. |
+| `mcp.task.completed` | info | `server`, `task`, `is_error` | An MCP task completed; `is_error` is the tool's own. |
+| `mcp.task.created` | info | `server`, `tool`, `task`, `status`, `ttl_ms`, `poll_interval_ms`, `run`, `step` | A workflow step's tool call became an MCP task; the step waits on it. |
+| `mcp.task.expired` | warn | `server`, `task`, `reason`, `detail?` | `unknown` (the server answered `-32602`), `ttl` (open 30 s past its `ttlMs`; `tasks/cancel` is sent), or `unread` (a turn's ended task nobody read within a day, or before its run ended). |
+| `mcp.task.failed` | warn | `server`, `task`, `code?`, `reason?`, `detail?` | The task failed, asked for a request agentd never declares, or a request about it failed for good (then `tasks/cancel` is sent). |
+| `mcp.task.handed_over` | info | `server`, `task`, `ctx`, `run` | A turn's tool call became a task still running at the call's bound; the supervisor follows it for `mcp.task.get`. |
+| `mcp.task.input.declined` | warn | `server`, `task`, `key`, `method`, `reason` | A task the supervisor follows asked for input; it was answered `decline`. |
+| `mcp.task.input.requested` | info | `server`, `task`, `key`, `method` | That input request, as the server made it. |
+| `mcp.task.listen.unavailable` | info | `server`, `err` | A listen asking for a server's task notifications failed; its tasks are polled. |
+| `mcp.task.poll.fail` | warn | `server`, `task`, `err`, `retry_ms` | A `tasks/get`, or the `tasks/update` declining a task's questions (`err` starts `tasks/update:`), failed in a way that may pass; retried after `retry_ms`, which doubles from 1 s to 5 min. |
+| `mcp.task.resumed` | info | `server`, `task`, `status` | A restart read an MCP task back; it is polled again. |
+| `mcp.task.status` | info | `server`, `task`, `from`, `to`, `status_message?` | An MCP task moved; `status_message` is the server's, tamed. |
 | `mcp.tool.dropped` | warn | `reason`, `server`, `tool` | A tool the server listed was dropped by the client and cannot be called. |
 | `mcp.tools_changed` | info | `note`, `server` | A server said its tool list changed. |
 | `mcp.tools_refresh_failed` | warn | `err` |  |
@@ -1019,6 +1031,16 @@ Use the log events for anything a series below does not cover.
 The MCP Events families take `server` and `event` from the operator's
 bindings (at most 256). A family past 512 series folds the rest into one
 series whose labels all read `other`.
+
+### MCP Tasks
+
+| Metric | Type | Labels | Status | Meaning |
+|---|---|---|---|---|
+| `agent_mcp_tasks_open` | gauge | `server` | live | MCP tasks the supervisor follows that have not ended: a workflow step's, and a turn's it took over |
+| `agent_mcp_tasks_total` | counter | `server`, `outcome` | live | Tasks the supervisor followed to their end: `completed`, `failed`, `cancelled`, `expired` |
+
+A task a turn worker or a store adapter follows inside its call is not
+counted.
 
 ### Companies
 

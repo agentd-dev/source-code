@@ -1178,7 +1178,7 @@ class.
 | Tier | Callers | Tools |
 |---|---|---|
 | all | root, workflows, subagents | `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `knowledge.*`, `search.*`, `ask_human`, `think`, `decide`, `sleep`, `await`, `context.compact`, `instruction.read`, `message.send`, `exec`, `workflow.list`, `workflow.status`, `workflow.signal`, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe`, `company.operation.get`, `company.operation.confirm`, `company.operation.cancel`, `company.direct` |
-| root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
+| root and workflows | root, workflows | `subagent.*`, `code.run`, `events.*`, `mcp.task.*`, `workflow.run`, `workflow.cancel`, `workflow.wait` |
 | root only | root | `instruction.subscribe`, `workflow.create`, `workflow.update`, `workflow.delete`, `workflow.pause`, `workflow.resume` |
 
 `finish` is granted to root and subagents, not to workflows, which end with

@@ -46,6 +46,7 @@ pub(crate) mod intel; // intelligence connections + model resolution (RFC 0046)
 pub mod join; // servers down at boot join when they come up
 #[cfg(feature = "mcp-events")]
 pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
+pub mod mcp_tasks; // MCP Tasks (RFC 0050): a step's or a turn's task, followed to its end
 pub mod nested;
 pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
 pub mod reactor;
@@ -632,6 +633,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         release_due_ms: 0,
         #[cfg(feature = "mcp-events")]
         mcp_events: Default::default(),
+        mcp_tasks: Default::default(),
         joining: Default::default(),
         registry,
         contexts: Contexts::new(model_window),
@@ -1202,6 +1204,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // a wait that can never be woken fails its step, and failing a step
     // resolves it against the definition its run started with.
     rt.resubscribe_waits(&|_, _| true, "boot");
+    // The MCP tasks a previous life followed are polled again, each from
+    // its record; a step that waits on one is still suspended on it.
+    rt.restore_mcp_tasks();
     // A restored `wait on: webhook` is served its callback again.
     #[cfg(feature = "a2a")]
     rt.restore_webhook_callbacks();
@@ -2319,9 +2324,13 @@ impl Runtime {
         #[cfg(feature = "mcp-events")]
         let mut events_changed: Vec<String> = Vec::new();
         let mut resource_updates: Vec<(String, String)> = Vec::new();
+        let mut task_pushes: Vec<(String, Value)> = Vec::new();
         for (name, c) in &self.mcp {
             for n in c.drain_notifications() {
                 match n.method.as_str() {
+                    ::mcp::wire::method::NOTIFY_TASKS => {
+                        task_pushes.push((name.clone(), n.params.unwrap_or(Value::Null)))
+                    }
                     ::mcp::wire::method::NOTIFY_RESOURCES_UPDATED => {
                         let uri = n
                             .params
@@ -2351,6 +2360,9 @@ impl Runtime {
         for (server, uri) in resource_updates {
             self.on_resource_updated(&server, &uri); // `wait` steps
             self.on_subscribe_resource(&server, &uri); // `subscribe` start nodes
+        }
+        for (server, params) in task_pushes {
+            self.mcp_task_pushed(&server, &params);
         }
         for s in tools_changed {
             self.log.info("mcp.tools_changed", json!({"server": s, "note": "recorded only; the tool catalogue is rebuilt at the next config reload"}));

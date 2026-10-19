@@ -537,6 +537,7 @@ live · doc, except where a row says op.
 | `mcp.servers[].allow` | list of globs | all | Admit only the advertised tools that match. |
 | `mcp.servers[].exclude` | list of globs | `[]` | Never admit these; beats `allow`. |
 | `mcp.servers[].timeout` | duration | `mcp.default_timeout` | Per-call timeout for this server. |
+| `mcp.servers[].tasks` | `auto \| off` | `auto` | Whether the server may answer a long tool call with an MCP task (SEP-2663). `auto` declares the extension on 2026-07-28 connections, on the calls that have a time limit (a turn's, a workflow step's, a store adapter's); `off` never does, so the server answers every call inline. See [Long-running tool calls](connect-mcp.md#long-running-tool-calls). |
 | `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). |
 | `mcp.servers[].oauth` | `{client_id, client_secret, token_url, scope}` | — | An OAuth client-credentials shortcut. Needs `oauth`. |
 | `mcp.servers[].aauth` | bool | `false` | Sign requests with the agent's AAuth identity. Needs `aauth`. |

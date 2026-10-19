@@ -18,8 +18,8 @@ grouped into families — the process's exit-code table, the security gates, the
 durable store, crash-and-restore durability, the internal tool registry, the
 core A2A surface, the observation feed of the events extension, the extension
 contract itself, the authentication the card declares, agentd as an OAuth
-client, and the fake Company agentd is tested against under the Personal
-Agent Protocol draft. Every check is
+client, agentd as a client of the MCP Tasks extension, and the fake Company
+agentd is tested against under the Personal Agent Protocol draft. Every check is
 registered in [`src/checks/`](crates/agentd-conformance/src/checks) as a
 `Check { id, category, desc, run }`, which both the test harness and the report
 runner pick up; the tables below are those registrations, and a unit test of
@@ -113,6 +113,14 @@ skip.
 | `mcp-auth-core/as-issuer-must-match` | metadata naming another issuer than the configured one, by a trailing slash, is refused: --login fails and sends no device or token request |
 | `mcp-auth-core/resource-metadata-path-inserted-first` | with no issuer configured, --login asks the MCP server, then reads its RFC 9728 metadata at the well-known URL with the suffix inserted before the server's path, before the root, and uses the issuer it names |
 | `mcp-auth-core/logout-revokes-at-the-server` | --logout after a login revokes the refresh token at the revocation_endpoint the metadata names (RFC 7009: token and token_type_hint=refresh_token) |
+
+### `mcp-tasks`
+
+| Check | What it proves |
+|---|---|
+| `mcp-tasks/a-step-follows-its-task-to-the-result` | a workflow step whose tools/call becomes a task finishes with the task's result |
+| `mcp-tasks/the-step-timeout-cancels-the-task` | a step's timeout ends its wait for a task and sends tasks/cancel |
+| `mcp-tasks/off-refuses-a-server-that-requires-tasks` | with tasks: off, a server that requires the extension fails the call with an error naming it |
 
 ### `companies`
 
@@ -235,6 +243,12 @@ The `mcp-auth-core` family covers the OAuth client pieces agentd builds once
 for both the Personal Agent and enterprise-managed MCP authorization: RFC 8414
 and RFC 9728 metadata at the path-inserted well-known URLs, the byte-equal
 issuer, and RFC 7009 revocation on `--logout`.
+
+The `mcp-tasks` family holds agentd to SEP-2663 as a client, against the
+built-in mock at MCP 2026-07-28, which makes a task only for a call that
+declares the extension and refuses a `tasks/*` request without `Mcp-Name`
+or the extension. What agentd did is read from its own log and from the
+mock's record of each request that reached it.
 
 ## Beside the suite
 

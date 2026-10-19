@@ -86,6 +86,7 @@ invalid response. Older revisions (2025-11-25's experimental core tasks) are
 not implemented: the extension replaced them.
 
 *Size:* medium. *Depends on:* nothing new. *Recommendation:* build first.
+*Built:* [RFC 0050](0050-mcp-tasks.md), 2026-10-19.
 
 ### 5.2 S — Skills: the Skills extension and SKILL.md
 

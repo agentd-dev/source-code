@@ -2614,6 +2614,11 @@ pub struct McpServer {
     pub auth: Option<Auth>,
     #[serde(default)]
     pub timeout: Option<Dur>,
+    /// Whether this server may answer a call with an MCP task (RFC 0050):
+    /// `auto` declares the Tasks extension where the revision defines it,
+    /// `off` never does. Part of the dial spec: a change re-dials.
+    #[serde(default)]
+    pub tasks: super::TasksMode,
     /// MCP Events bindings (RFC 0045 §5.2). Not part of the dial spec: a
     /// change to one never re-dials the server.
     #[serde(default)]
@@ -2673,6 +2678,7 @@ impl McpServer {
             rate: self.service_rate.clone(),
             first_request: None,
             company: self.company.as_ref().map(|c| c.entry.clone()),
+            tasks: self.tasks,
         })
     }
 }
@@ -11459,6 +11465,7 @@ mod tests {
             }),
             auth: None,
             timeout: None,
+            tasks: crate::config::TasksMode::Auto,
             events: Vec::new(),
             event_grants: Vec::new(),
             company: None,

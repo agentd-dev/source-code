@@ -55,6 +55,10 @@ pub enum Category {
     /// authorization server's metadata, the issuer it insists on, and what
     /// it revokes (RFC 0044's family, opened by RFC 0047 P0).
     McpAuthCore,
+    /// agentd as a client of the MCP Tasks extension (RFC 0050): a step's
+    /// task followed to its result, its timeout's `tasks/cancel`, and
+    /// `tasks: off` against a server that requires it.
+    McpTasks,
     /// The Personal Agent Protocol draft agentd is pinned to: the fake
     /// Company it is tested against, held to the draft's own sentences.
     Companies,
@@ -62,7 +66,7 @@ pub enum Category {
 
 impl Category {
     /// Every family, in report order: the one list the docs are held to.
-    pub const ALL: [Category; 11] = [
+    pub const ALL: [Category; 12] = [
         Category::Supervisor,
         Category::Security,
         Category::Store,
@@ -73,6 +77,7 @@ impl Category {
         Category::Extensions,
         Category::Auth,
         Category::McpAuthCore,
+        Category::McpTasks,
         Category::Companies,
     ];
 
@@ -88,6 +93,7 @@ impl Category {
             Category::Extensions => "extensions",
             Category::Auth => "auth",
             Category::McpAuthCore => "mcp-auth-core",
+            Category::McpTasks => "mcp-tasks",
             Category::Companies => "companies",
         }
     }
@@ -179,6 +185,7 @@ pub fn family(category: Category) -> Vec<Check> {
         Category::Extensions => checks::extensions::checks(),
         Category::Auth => checks::auth::checks(),
         Category::McpAuthCore => checks::mcp_auth_core::checks(),
+        Category::McpTasks => checks::mcp_tasks::checks(),
         Category::Companies => checks::companies::checks(),
     }
 }

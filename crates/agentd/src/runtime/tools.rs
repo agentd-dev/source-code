@@ -105,6 +105,13 @@ impl Runtime {
         let Some(caller) = self.child_caller(node, id) else {
             return;
         };
+        // A turn worker handing over the MCP task its call left open: the
+        // worker's own request, never a tool the model can name.
+        if name == super::mcp_tasks::HAND_OVER {
+            let outcome = self.mcp_task_hand_over(&caller, args);
+            self.child_tool_outcome(node, id, name, outcome);
+            return;
+        }
         self.child_log(node).info("tool.request", json!({"node": node.0, "req": id, "tool": name, "caller": caller.label(), "args": if self.log.content_capture() { args.clone() } else { Value::Null }}));
         let outcome = self.execute_tool(&caller, name, args);
         self.child_tool_outcome(node, id, name, outcome);
@@ -611,6 +618,13 @@ impl Runtime {
         };
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
+        // Only a workflow step's call may declare the extension: its task
+        // becomes a durable wait (RFC 0050).
+        let calling = match &target {
+            ExecTarget::Step { .. } => self.mcp_task_slot(server),
+            ExecTarget::Tool { .. } => None,
+        };
+        let tasks = calling.is_some();
         let server = server.to_string();
         // The call as an operation it proposes would name it (RFC 0047
         // §5.8.1): its registered name and its arguments.
@@ -661,7 +675,41 @@ impl Runtime {
                 };
                 #[cfg(not(feature = "companies"))]
                 let link: Option<crate::obs::trace::TraceContext> = None;
-                let res = client.call_tool_reaching(&tool, Some(args), meta);
+                // A workflow step's call that becomes a task makes the step
+                // a durable wait on it (RFC 0050); any other caller's call
+                // follows its task inside the call.
+                let res = match &target {
+                    ExecTarget::Step { run, step } => {
+                        match client.call_tool_called(&tool, Some(args), Some(meta), None, tasks) {
+                            Ok(::mcp::wire::Called::Result(r)) => Ok(r),
+                            Ok(::mcp::wire::Called::Task(task)) => {
+                                crate::obs::otel::mcp_span(
+                                    call.as_ref(),
+                                    "tools/call",
+                                    &tool,
+                                    &server,
+                                    true,
+                                    start,
+                                );
+                                let _ = tx.send(Event::McpTask(Box::new(
+                                    super::mcp_tasks::Note::Created {
+                                        run: run.clone(),
+                                        step: step.clone(),
+                                        server,
+                                        tool,
+                                        task,
+                                        trace: call,
+                                        registry: true,
+                                        calling,
+                                    },
+                                )));
+                                return;
+                            }
+                            Err(f) => Err(f),
+                        }
+                    }
+                    ExecTarget::Tool { .. } => client.call_tool_reaching(&tool, Some(args), meta),
+                };
                 // A Company's answer is its content: the context it reaches
                 // carries the Company's origin from then on, written before
                 // the answer is read — and so does a failure whose error may
@@ -1159,6 +1207,8 @@ impl Runtime {
             "events.list" | "events.subscribe" | "events.unsubscribe" | "events.subscriptions" => {
                 self.events_tool(caller, name, args)
             }
+            // ---- MCP Tasks (RFC 0050) ----
+            "mcp.task.get" | "mcp.task.cancel" => self.mcp_task_tool(caller, name, args),
             // ---- guarded local command runner (default-OFF) ----
             #[cfg(feature = "exec")]
             "exec" => self.exec_tool(caller, args),

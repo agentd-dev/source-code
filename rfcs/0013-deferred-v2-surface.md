@@ -25,6 +25,12 @@
 > all**. D7b's v2 server work is thus the gateway's concern, not a deferred agentd
 > surface; see RFC 0020 §8. (D7a inbound HTTP-client reactivity is untouched.)
 
+> **MCP Tasks (RFC 0050, 2026-10-19).** D1's client half is built, against
+> the MCP Tasks extension of 2026-07-28 (SEP-2663), which replaced the
+> 2025-11-25 core tasks D1 describes: agentd declares the extension, follows
+> a server's tasks, and serves none (ADR 0001). The 2025-11-25 core tasks
+> stay unbuilt.
+
 ---
 
 ## 1. Problem / Context

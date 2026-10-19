@@ -109,13 +109,14 @@ struct Handler {
 /// takes off a stream itself (ahead of a `tools/list` answer, see
 /// [`crate::rmcp_transport::AgentdHttp::with_notifications`]) is queued only if
 /// it is one of these, as the handler would have queued it.
-pub(crate) const QUEUED_NOTIFICATIONS: [&str; 6] = [
+pub(crate) const QUEUED_NOTIFICATIONS: [&str; 7] = [
     method::NOTIFY_RESOURCES_UPDATED,
     method::NOTIFY_RESOURCES_LIST_CHANGED,
     method::NOTIFY_TOOLS_LIST_CHANGED,
     method::NOTIFY_PROMPTS_LIST_CHANGED,
     method::NOTIFY_MESSAGE,
     method::NOTIFY_PROGRESS,
+    method::NOTIFY_TASKS,
 ];
 
 /// Queue `v` — a message taken off a stream outside the SDK — for the host,
@@ -153,6 +154,55 @@ fn declined() -> ElicitResult {
     ElicitResult::new(ElicitationAction::Decline)
 }
 
+/// Answer one elicitation through the host's `handler`, as a server's direct
+/// `elicitation/create` and an MRTR round's are answered alike.
+async fn answer_elicitation(
+    handler: Option<Arc<dyn inbound::Handler>>,
+    params: ElicitRequestParams,
+) -> ElicitResult {
+    // Only the form flavour asks for structured input; a URL elicitation
+    // has nothing for `ask_human` to answer, so it is declined honestly.
+    let (message, requested_schema) = match &params {
+        ElicitRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } => (
+            message.clone(),
+            serde_json::to_value(requested_schema).unwrap_or_else(|_| json!({})),
+        ),
+        _ => return declined(),
+    };
+    let Some(handler) = handler else {
+        return declined();
+    };
+    // The host answers synchronously and may wait minutes for a human.
+    // Run on the runtime, that wait would hold its one worker — and with
+    // it the timer of a bounded call, which could then fire only after the
+    // human had answered and the answer was on its way to the server. On a
+    // plain thread it holds nothing: a bound fires on time, and an answer
+    // for a call abandoned meanwhile lands on a closed channel. Not the
+    // blocking pool either — the runtime waits for that pool when it is
+    // dropped, so an unanswered question would hold the client's drop.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(handler.handle(inbound::Inbound::Elicit {
+            message,
+            requested_schema,
+        }));
+    });
+    let answer = rx.await.ok().flatten();
+    match answer {
+        Some(inbound::Answer::Accept(content)) => {
+            ElicitResult::new(ElicitationAction::Accept).with_content(content)
+        }
+        Some(inbound::Answer::Decline) => declined(),
+        // Nothing could ask: cancel is the honest outcome, and it is not an
+        // error.
+        _ => ElicitResult::new(ElicitationAction::Cancel),
+    }
+}
+
 impl ClientHandler for Handler {
     fn get_info(&self) -> ClientConfig {
         self.info.clone()
@@ -163,48 +213,20 @@ impl ClientHandler for Handler {
         params: ElicitRequestParams,
         _ctx: rmcp::service::RequestContext<RoleClient>,
     ) -> Result<ElicitResult, rmcp::ErrorData> {
-        // Only the form flavour asks for structured input; a URL elicitation
-        // has nothing for `ask_human` to answer, so it is declined honestly.
-        let (message, requested_schema) = match &params {
-            ElicitRequestParams::FormElicitationParams {
-                message,
-                requested_schema,
-                ..
-            } => (
-                message.clone(),
-                serde_json::to_value(requested_schema).unwrap_or_else(|_| json!({})),
-            ),
-            _ => return Ok(declined()),
-        };
-        let Some(handler) = &self.elicitation else {
-            return Ok(declined());
-        };
-        // The host answers synchronously and may wait minutes for a human.
-        // Run on the runtime, that wait would hold its one worker — and with
-        // it the timer of a bounded call, which could then fire only after the
-        // human had answered and the answer was on its way to the server. On a
-        // plain thread it holds nothing: a bound fires on time, and an answer
-        // for a call abandoned meanwhile lands on a closed channel. Not the
-        // blocking pool either — the runtime waits for that pool when it is
-        // dropped, so an unanswered question would hold the client's drop.
-        let handler = Arc::clone(handler);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(handler.handle(inbound::Inbound::Elicit {
-                message,
-                requested_schema,
-            }));
-        });
-        let answer = rx.await.ok().flatten();
-        Ok(match answer {
-            Some(inbound::Answer::Accept(content)) => {
-                ElicitResult::new(ElicitationAction::Accept).with_content(content)
-            }
-            Some(inbound::Answer::Decline) => declined(),
-            // Nothing could ask: cancel is the honest outcome, and it is not an
-            // error.
-            _ => ElicitResult::new(ElicitationAction::Cancel),
-        })
+        Ok(answer_elicitation(self.elicitation.clone(), params).await)
+    }
+
+    // A task's state pushed outside a listen (on a call's own stream): the
+    // host's to apply, as one taken off the listen is.
+    async fn on_task_status(
+        &self,
+        params: rmcp::model::TaskStatusNotificationParams,
+        _ctx: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.queue(
+            method::NOTIFY_TASKS,
+            serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
+        );
     }
 
     // ---- notifications: the reactive wake path ----
@@ -347,6 +369,9 @@ pub struct RmcpClient {
     /// Set once the server refused a listen that asked for its
     /// `list_changed` notifications ([`ListenEvent::FlagsRefused`]).
     flags_refused: std::sync::atomic::AtomicBool,
+    /// Set once a listen asking for task notifications failed or was
+    /// refused: every task on this connection stays on polling.
+    tasks_refused: std::sync::atomic::AtomicBool,
     /// The tool names the server's `tools/list` answers named during the
     /// current list (recorded by the transport, taken by the list).
     tools_seen: ToolNames,
@@ -365,6 +390,16 @@ pub struct RmcpClient {
     /// An extension's part of every listen on this connection, as decided
     /// from the server's capabilities (see [`RmcpBuilder::with_listen_extension`]).
     listen_extension: Arc<Mutex<Option<crate::rmcp_transport::ListenExtension>>>,
+    /// Whether this connection may declare the Tasks extension
+    /// ([`RmcpBuilder::with_tasks`]); it does only at a revision that defines
+    /// it ([`Self::declares_tasks`]).
+    tasks: bool,
+    /// The host's elicitation answerer, for the MRTR rounds of a call this
+    /// connection drives itself ([`Self::call_tool_called`]).
+    elicitation: Option<Arc<dyn inbound::Handler>>,
+    /// The tasks this connection's listen asks to hear about, and the ones
+    /// its last acknowledgment took ([`Self::listen_tasks`]).
+    task_listen: Arc<Mutex<crate::rmcp_transport::TaskListen>>,
 }
 
 /// Where [`RmcpClient::call_raw`]'s request ids start.
@@ -397,6 +432,8 @@ pub struct RmcpBuilder {
     /// What an extension adds to this connection's listen, given the server's
     /// capabilities as it sent them; see [`Self::with_listen_extension`].
     listen_extension: Option<ListenExtensionFn>,
+    /// Declare the Tasks extension; see [`Self::with_tasks`].
+    tasks: bool,
 }
 
 /// Decides, from the server's `capabilities` as it sent them, what an
@@ -428,7 +465,18 @@ impl RmcpBuilder {
             first: FirstRequest::Discover,
             listen_idle: LISTEN_IDLE,
             listen_extension: None,
+            tasks: false,
         }
+    }
+
+    /// Declare the MCP Tasks extension (SEP-2663) on the requests that may
+    /// create or follow a task — `tools/call`, `tasks/*`, and a listen that
+    /// asks for task notifications — at a revision that defines it
+    /// (2026-07-28 on). Off, no request declares it, so a server must answer
+    /// every call inline.
+    pub fn with_tasks(mut self, on: bool) -> Self {
+        self.tasks = on;
+        self
     }
 
     /// Let an extension add to the connection's listen: once the server's
@@ -531,12 +579,14 @@ impl RmcpBuilder {
         };
         let listen_extension: Arc<Mutex<Option<crate::rmcp_transport::ListenExtension>>> =
             Arc::default();
+        let task_listen: Arc<Mutex<crate::rmcp_transport::TaskListen>> = Arc::default();
         let start = Start {
             endpoint: self.endpoint.clone(),
             socket: Arc::clone(&socket),
             timeout: self.timeout,
             listen_idle: self.listen_idle,
             listen_extension: Arc::clone(&listen_extension),
+            task_listen: Arc::clone(&task_listen),
             handler: Handler {
                 queue: Arc::clone(&notifications),
                 // Replaced per attempt: `initialize` carries the revision it
@@ -601,12 +651,16 @@ impl RmcpBuilder {
             listen_events: Arc::default(),
             idle_cuts,
             flags_refused: std::sync::atomic::AtomicBool::new(false),
+            tasks_refused: std::sync::atomic::AtomicBool::new(false),
             tools_seen,
             tools_reported: Mutex::default(),
             tools_dropped: Mutex::default(),
             own_meta,
             raw_ids: std::sync::atomic::AtomicI64::new(RAW_ID_BASE),
             listen_extension: Arc::clone(&listen_extension),
+            tasks: self.tasks,
+            elicitation: self.elicitation.clone(),
+            task_listen,
         };
         // rmcp sends a tool's `Mcp-Param-*` headers only for tools whose
         // schema it has cached on this connection from a `tools/list` — and a
@@ -737,6 +791,8 @@ struct Start {
     /// The extension's part of every listen, filled once the capabilities
     /// are known.
     listen_extension: Arc<Mutex<Option<crate::rmcp_transport::ListenExtension>>>,
+    /// The tasks every listen asks to hear about.
+    task_listen: Arc<Mutex<crate::rmcp_transport::TaskListen>>,
 }
 
 /// A started connection: the service, the server's capabilities as sent, the
@@ -767,7 +823,8 @@ impl Start {
         let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&self.socket), self.timeout)
             .with_listen_idle(self.listen_idle)
             .with_notifications(Arc::clone(&self.handler.queue))
-            .with_listen_extension(Arc::clone(&self.listen_extension));
+            .with_listen_extension(Arc::clone(&self.listen_extension))
+            .with_task_listen(Arc::clone(&self.task_listen));
         // The caller's headers are the socket's, never the SDK's too: the SDK
         // hands its custom headers to the socket on every request, so a copy
         // here put each one — `Authorization` included — on the wire twice.
@@ -1152,6 +1209,42 @@ impl RmcpClient {
         meta: Option<serde_json::Map<String, Value>>,
         bound: Option<Duration>,
     ) -> Result<Value, (McpError, crate::client::Reach)> {
+        match self.call_tool_called(name, args, meta, bound, false)? {
+            crate::wire::Called::Result(r) => serde_json::to_value(&r).map_err(|e| {
+                (
+                    rpc_err(&self.name, "tools/call", e),
+                    crate::client::Reach::Unreadable,
+                )
+            }),
+            // Not declared, so never handed back: the SDK refuses a task
+            // here itself.
+            crate::wire::Called::Task(_) => Err((
+                rpc_err(&self.name, "tools/call", "a task this call did not declare"),
+                crate::client::Reach::Unreadable,
+            )),
+        }
+    }
+
+    /// `tools/call`, answered with the tool's result or — when `tasks` and
+    /// the connection declares the extension ([`Self::declares_tasks`]) — a
+    /// task. `bound` covers every round of the call, as for
+    /// [`Self::call_tool`].
+    ///
+    /// A declaring call is driven here rather than by the SDK's helper,
+    /// which refuses a task: one request per round, each carrying the
+    /// connection's capabilities with the extension added, and an MRTR
+    /// `input_required` round answered as the helper answers it — an
+    /// elicitation through the host's handler, anything else a failure of
+    /// the call, a state-only round after a short pause — up to the SDK's
+    /// round cap.
+    pub fn call_tool_called(
+        &self,
+        name: &str,
+        args: Option<Value>,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Option<Duration>,
+        tasks: bool,
+    ) -> Result<crate::wire::Called, (McpError, crate::client::Reach)> {
         let arguments = match args {
             Some(Value::Object(m)) => m,
             _ => serde_json::Map::new(),
@@ -1159,7 +1252,17 @@ impl RmcpClient {
         let mut param = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
         param.meta = meta.map(RequestMetaObject::from);
         let op = format!("tools/call {name}");
-        let call = self.service.call_tool(param);
+        let declaring = tasks && self.declares_tasks();
+        let call = async {
+            if declaring {
+                self.call_tool_declaring(param).await
+            } else {
+                self.service
+                    .call_tool(param)
+                    .await
+                    .map(rmcp::model::CallToolResponse::Complete)
+            }
+        };
         let res = match bound {
             Some(bound) => self
                 .rt
@@ -1178,12 +1281,242 @@ impl RmcpClient {
             None => self.rt.block_on(call),
         }
         .map_err(|e| self.call_failed(&op, e))?;
-        serde_json::to_value(&res).map_err(|e| {
+        let unreadable = |e: String| {
             (
-                rpc_err(&self.name, "tools/call", e),
+                rpc_err(&self.name, &op, e),
                 crate::client::Reach::Unreadable,
             )
-        })
+        };
+        match res {
+            rmcp::model::CallToolResponse::Complete(r) => serde_json::to_value(&r)
+                .and_then(serde_json::from_value)
+                .map(crate::wire::Called::Result)
+                .map_err(|e| unreadable(e.to_string())),
+            // A seed: the base task only, in any status.
+            rmcp::model::CallToolResponse::Task(t) => serde_json::to_value(&t)
+                .map_err(|e| e.to_string())
+                .and_then(|v| crate::wire::Task::seed(&v))
+                .map(crate::wire::Called::Task)
+                .map_err(unreadable),
+            // The declaring path answers its own rounds, and the SDK's helper
+            // never hands one back.
+            _ => Err(unreadable("an input_required round left unanswered".into())),
+        }
+    }
+
+    /// One declaring `tools/call`, its MRTR rounds included.
+    async fn call_tool_declaring(
+        &self,
+        mut params: CallToolRequestParams,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ServiceError> {
+        use rmcp::model::{CallToolRequest, CallToolResponse, ClientRequest, InputRequest};
+        let max = rmcp::model::DEFAULT_MRTR_MAX_ROUNDS;
+        let mut state_only = 0u32;
+        for _ in 0..max {
+            let answer = self
+                .service
+                .peer()
+                .send_request_with_option(
+                    ClientRequest::CallToolRequest(CallToolRequest::new(params.clone())),
+                    rmcp::service::PeerRequestOptions::no_options().with_meta(self.tasks_meta()),
+                )
+                .await?
+                .await_response()
+                .await?;
+            let round = match answer {
+                rmcp::model::ServerResult::CallToolResult(r) => {
+                    return Ok(CallToolResponse::Complete(r));
+                }
+                rmcp::model::ServerResult::CreateTaskResult(t) => {
+                    return Ok(CallToolResponse::Task(t));
+                }
+                rmcp::model::ServerResult::InputRequiredResult(r) => r,
+                _ => return Err(rmcp::ServiceError::UnexpectedResponse),
+            };
+            let requests = round.input_requests.unwrap_or_default();
+            if requests.is_empty() && round.request_state.is_none() {
+                return Err(rmcp::ServiceError::UnexpectedResponse);
+            }
+            let mut responses = rmcp::model::InputResponses::new();
+            for (key, request) in &requests {
+                let InputRequest::Elicitation(e) = request else {
+                    // Sampling and roots are never declared: the call fails,
+                    // as the SDK's helper fails it.
+                    return Err(rmcp::ServiceError::McpError(rmcp::ErrorData::new(
+                        ErrorCode::METHOD_NOT_FOUND,
+                        format!(
+                            "input request {key:?} asks for a capability this client does not declare"
+                        ),
+                        None,
+                    )));
+                };
+                let answer = answer_elicitation(self.elicitation.clone(), e.params.clone()).await;
+                responses.insert(
+                    key.clone(),
+                    serde_json::to_value(answer).unwrap_or_else(|_| json!({"action": "cancel"})),
+                );
+            }
+            if requests.is_empty() {
+                // A state-only round: a short pause, longer each time.
+                let ms = (50u64 << state_only.min(3)).min(250);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                state_only += 1;
+            } else {
+                state_only = 0;
+            }
+            params.input_responses = (!responses.is_empty()).then_some(responses);
+            params.request_state = round.request_state;
+        }
+        Err(rmcp::ServiceError::InputRequiredRoundsExceeded { max_rounds: max })
+    }
+
+    /// Does this connection declare the Tasks extension? Only when the host
+    /// asked for it and the revision defines it — 2026-07-28 on, the
+    /// revisions without an `initialize`.
+    pub fn declares_tasks(&self) -> bool {
+        self.tasks && self.listens()
+    }
+
+    /// The `_meta` that declares the Tasks extension on one request: the
+    /// connection's own capabilities with the extension added. A request's
+    /// own `_meta` wins over the connection's key by key, so the whole
+    /// capabilities object is replaced, never merged.
+    fn tasks_meta(&self) -> RequestMetaObject {
+        let mut caps = self.own_meta["clientCapabilities"].clone();
+        if let Some(c) = caps.as_object_mut()
+            && let Value::Object(ext) = c.entry("extensions").or_insert_with(|| json!({}))
+        {
+            ext.insert(crate::wire::TASKS_EXTENSION.into(), json!({}));
+        }
+        let mut meta = serde_json::Map::new();
+        meta.insert("io.modelcontextprotocol/clientCapabilities".into(), caps);
+        RequestMetaObject::from(meta)
+    }
+
+    /// `tasks/get`: the task as the server has it now, or the server's
+    /// refusal (`-32602` for a task it does not know). `meta` keys ride the
+    /// request's `_meta` (a trace context). An answer about another task is
+    /// no answer about this one, and fails as an unreadable one does.
+    pub fn get_task(
+        &self,
+        task_id: &str,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Duration,
+    ) -> Result<Result<crate::wire::Task, rpc::RpcError>, McpError> {
+        let mut params = rmcp::model::GetTaskParams::new(task_id);
+        params.meta = meta.map(RequestMetaObject::from);
+        let request =
+            rmcp::model::ClientRequest::GetTaskRequest(rmcp::model::GetTaskRequest::new(params));
+        match self.task_request(method::TASKS_GET, request, bound)? {
+            Ok(rmcp::model::ServerResult::GetTaskResult(r)) => serde_json::to_value(&r.task)
+                .map_err(|e| e.to_string())
+                .and_then(|v| crate::wire::Task::read(&v))
+                .and_then(|t| {
+                    if t.task_id == task_id {
+                        Ok(t)
+                    } else {
+                        Err("an answer about another task".into())
+                    }
+                })
+                .map(Ok)
+                .map_err(|e| rpc_err(&self.name, method::TASKS_GET, e)),
+            Ok(_) => Err(rpc_err(
+                &self.name,
+                method::TASKS_GET,
+                "an answer that is not a task",
+            )),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    /// `tasks/update`: answers to a task's input requests, by key. The
+    /// server's acknowledgment is empty; the task shows the answers later.
+    pub fn update_task(
+        &self,
+        task_id: &str,
+        responses: serde_json::Map<String, Value>,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Duration,
+    ) -> Result<Result<(), rpc::RpcError>, McpError> {
+        let mut params =
+            rmcp::model::UpdateTaskParams::new(task_id, responses.into_iter().collect());
+        params.meta = meta.map(RequestMetaObject::from);
+        let request = rmcp::model::ClientRequest::UpdateTaskRequest(
+            rmcp::model::UpdateTaskRequest::new(params),
+        );
+        self.task_ack(method::TASKS_UPDATE, request, bound)
+    }
+
+    /// `tasks/cancel`: ask the server to stop a task. Acknowledged at once;
+    /// the server decides whether and when the task stops.
+    pub fn cancel_task(
+        &self,
+        task_id: &str,
+        meta: Option<serde_json::Map<String, Value>>,
+        bound: Duration,
+    ) -> Result<Result<(), rpc::RpcError>, McpError> {
+        let mut params = rmcp::model::CancelTaskParams::new(task_id);
+        params.meta = meta.map(RequestMetaObject::from);
+        let request = rmcp::model::ClientRequest::CancelTaskRequest(
+            rmcp::model::CancelTaskRequest::new(params),
+        );
+        self.task_ack(method::TASKS_CANCEL, request, bound)
+    }
+
+    fn task_ack(
+        &self,
+        op: &str,
+        request: rmcp::model::ClientRequest,
+        bound: Duration,
+    ) -> Result<Result<(), rpc::RpcError>, McpError> {
+        match self.task_request(op, request, bound)? {
+            Ok(
+                rmcp::model::ServerResult::TaskAckResult(_)
+                | rmcp::model::ServerResult::EmptyResult(_),
+            ) => Ok(Ok(())),
+            Ok(_) => Err(rpc_err(
+                &self.name,
+                op,
+                "an answer that is not an acknowledgment",
+            )),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    /// One `tasks/*` request, declaring the extension, bounded by `bound`:
+    /// the server's answer, or its JSON-RPC refusal. The SDK sets `Mcp-Name`
+    /// to the request's `taskId`, as the extension requires on Streamable
+    /// HTTP. Refused with nothing sent where the connection does not declare
+    /// the extension: a server answers that with `-32021`.
+    fn task_request(
+        &self,
+        op: &str,
+        request: rmcp::model::ClientRequest,
+        bound: Duration,
+    ) -> Result<Result<rmcp::model::ServerResult, rpc::RpcError>, McpError> {
+        if !self.declares_tasks() {
+            return Err(McpError::Capability(format!(
+                "mcp server '{}': {op}: this connection does not declare the MCP Tasks extension",
+                self.name
+            )));
+        }
+        let peer = self.service.peer().clone();
+        let options = rmcp::service::PeerRequestOptions::no_options().with_meta(self.tasks_meta());
+        let sent = self.bounded(Some(bound), op, async move {
+            peer.send_request_with_option(request, options)
+                .await?
+                .await_response()
+                .await
+        })?;
+        match sent {
+            Ok(r) => Ok(Ok(r)),
+            Err(rmcp::ServiceError::McpError(d)) => Ok(Err(rpc::RpcError {
+                code: i64::from(d.code.0),
+                message: d.message.to_string(),
+                data: d.data.clone(),
+            })),
+            Err(e) => Err(self.fail(op, e)),
+        }
     }
 
     /// [`Self::fail`] for a `tools/call`, with how far it got: the
@@ -1196,6 +1529,25 @@ impl RmcpClient {
             rmcp::ServiceError::McpError(mut d) => {
                 let reach = crate::rmcp_transport::unmark(&mut d.data)
                     .unwrap_or(Reach::Answered { status: 200 });
+                // A server that will not answer without the Tasks extension:
+                // said as that, so the host can name what kept it out.
+                if d.code == ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+                    && d.data
+                        .as_ref()
+                        .and_then(|v| v.pointer("/requiredCapabilities/extensions"))
+                        .and_then(Value::as_object)
+                        .is_some_and(|x| x.contains_key(crate::wire::TASKS_EXTENSION))
+                {
+                    return (
+                        McpError::Capability(format!(
+                            "mcp server '{}': {op}: the server requires the MCP Tasks extension ({}), which this call did not declare ({})",
+                            self.name,
+                            crate::wire::TASKS_EXTENSION,
+                            d.code.0
+                        )),
+                        reach,
+                    );
+                }
                 (rmcp::ServiceError::McpError(d), reach)
             }
             e @ (rmcp::ServiceError::UnexpectedResponse
@@ -1520,6 +1872,59 @@ impl RmcpClient {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some()
+            || !self
+                .task_listen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ids
+                .is_empty()
+    }
+
+    /// Ask this connection's listen for `notifications/tasks` about `ids`
+    /// (the Tasks extension's `notifications.taskIds`), replacing the set it
+    /// asked for before, and return the ones the server's acknowledgment
+    /// took: those it will push, which the host may then poll less. The
+    /// listen is opened again with the new set — the old one is hung up only
+    /// once the new one is acknowledged, as a subscribe's is — and its
+    /// pushes reach the host's queue as `notifications/tasks`.
+    ///
+    /// Nothing is sent at a revision without listens, on a connection that
+    /// does not declare the extension, or for an unchanged set; a server
+    /// that refused a listen asking for tasks is not asked again, and every
+    /// task stays on polling.
+    pub fn listen_tasks(
+        &self,
+        ids: std::collections::BTreeSet<String>,
+        bound: Duration,
+    ) -> Result<std::collections::BTreeSet<String>, McpError> {
+        if !self.declares_tasks() || self.tasks_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Default::default());
+        }
+        let _one = self.subscribing.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut l = self.task_listen.lock().unwrap_or_else(|e| e.into_inner());
+            if l.ids == ids {
+                return Ok(l.acked.clone());
+            }
+            l.ids = ids;
+            l.acked.clear();
+        }
+        let held = self.subscribed_set();
+        if let Err(e) = self.listen_on(&held, Some(bound), None) {
+            // Polling carries every task without pushes: a listen that will
+            // not take them is not asked for them again, so it cannot keep
+            // failing the listen that carries everything else.
+            self.tasks_refused
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.task_listen.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+            return Err(e);
+        }
+        Ok(self
+            .task_listen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acked
+            .clone())
     }
 
     /// The filter of a listen on `uris`, with the `list_changed` flags when
@@ -1617,12 +2022,22 @@ impl RmcpClient {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .take();
+                    // So are the tasks a listen asks about.
+                    let tasks = std::mem::take(
+                        &mut *self.task_listen.lock().unwrap_or_else(|p| p.into_inner()),
+                    );
                     let retried = self.bounded(bound, "subscriptions/listen", peer.listen(plain));
-                    if !matches!(retried, Ok(Ok(_))) {
+                    if matches!(retried, Ok(Ok(_))) {
+                        if !tasks.ids.is_empty() {
+                            self.tasks_refused
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    } else {
                         *self
                             .listen_extension
                             .lock()
                             .unwrap_or_else(|p| p.into_inner()) = extension;
+                        *self.task_listen.lock().unwrap_or_else(|p| p.into_inner()) = tasks;
                     }
                     match retried? {
                         Ok(s) => {

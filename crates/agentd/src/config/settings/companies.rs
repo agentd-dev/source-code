@@ -761,6 +761,9 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
                 oauth: None,
                 auth: None,
                 timeout: svc.timeout,
+                // A Company's server is dialled through the User's Session,
+                // which declares no Tasks extension.
+                tasks: crate::config::TasksMode::Off,
                 events: Vec::new(),
                 event_grants: Vec::new(),
                 company: Some(CompanyServer {

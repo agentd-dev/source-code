@@ -81,6 +81,149 @@ pub mod method {
     pub const NOTIFY_CANCELLED: &str = "notifications/cancelled";
     pub const NOTIFY_PROGRESS: &str = "notifications/progress";
     pub const NOTIFY_MESSAGE: &str = "notifications/message";
+
+    // The Tasks extension (SEP-2663).
+    pub const TASKS_GET: &str = "tasks/get";
+    pub const TASKS_UPDATE: &str = "tasks/update";
+    pub const TASKS_CANCEL: &str = "tasks/cancel";
+    /// A task's full state, pushed on a listen that asked for its id.
+    pub const NOTIFY_TASKS: &str = "notifications/tasks";
+}
+
+/// The MCP Tasks extension's identifier (SEP-2663): declared under
+/// `clientCapabilities.extensions` on a request that may create or follow a
+/// task. The 2025-11-25 core `tasks` capability is a different thing, and
+/// declaring it is not declaring this.
+pub const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
+
+// ---- tasks ----
+
+/// Where a task is (SEP-2663). `completed`, `failed` and `cancelled` are
+/// final; a task moves between `working` and `input_required` until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Working,
+    InputRequired,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskStatus::Working => "working",
+            TaskStatus::InputRequired => "input_required",
+            TaskStatus::Completed => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A task as the server last described it: the seed a `CreateTaskResult`
+/// carries, a `tasks/get` answer, or a `notifications/tasks` push — one
+/// shape, its status-specific member inlined (`inputRequests`, `result`,
+/// `error`). [`Task::read`] reads a `tasks/get` answer or a push, and refuses
+/// one whose status lacks the member it needs; [`Task::seed`] reads a
+/// `CreateTaskResult`, which never carries one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub task_id: String,
+    pub status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub last_updated_at: String,
+    /// How long the server keeps the task, from its creation; `None` (sent
+    /// as `null`) is unlimited. It may change while the task runs.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    /// How often the server asks to be polled. It may change too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    /// `input_required`: the server's requests, by key. Each key is unique
+    /// over the task's life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_requests: Option<serde_json::Map<String, Value>>,
+    /// `completed`: the original request's result — for `tools/call`, a
+    /// `CallToolResult`, `isError: true` ones included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// `failed`: the JSON-RPC error the request ended with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+}
+
+impl Task {
+    /// Read a task from a `tasks/get` result or a `notifications/tasks`
+    /// push. A `resultType` beside it is not the task's and is ignored here;
+    /// which one a method may carry is its caller's to check.
+    pub fn read(v: &Value) -> Result<Task, String> {
+        let task = Task::seed(v)?;
+        match task.missing() {
+            Some(member) => Err(format!(
+                "a {} task without its {member}",
+                task.status.as_str()
+            )),
+            None => Ok(task),
+        }
+    }
+
+    /// Read the task a `CreateTaskResult` seeds. A seed is the base task
+    /// only (`CreateTaskResult = Result & Task`), so it may be in any status
+    /// without the member that status carries elsewhere — a job that
+    /// finished at once says `completed` and nothing more. Its follower
+    /// learns the rest from `tasks/get` ([`Task::missing`]).
+    pub fn seed(v: &Value) -> Result<Task, String> {
+        let task: Task =
+            serde_json::from_value(v.clone()).map_err(|e| format!("not a task: {e}"))?;
+        if task.task_id.is_empty() {
+            return Err("not a task: an empty taskId".into());
+        }
+        Ok(task)
+    }
+
+    /// The member this task's status carries that it lacks: `inputRequests`
+    /// for `input_required`, `result` for `completed`, `error` for `failed`.
+    /// Only a seed lacks one.
+    pub fn missing(&self) -> Option<&'static str> {
+        match self.status {
+            TaskStatus::InputRequired if self.input_requests.is_none() => Some("inputRequests"),
+            TaskStatus::Completed if !self.result.as_ref().is_some_and(Value::is_object) => {
+                Some("result")
+            }
+            TaskStatus::Failed if !self.error.as_ref().is_some_and(Value::is_object) => {
+                Some("error")
+            }
+            _ => None,
+        }
+    }
+
+    /// A completed task's tool result.
+    pub fn tool_result(&self) -> Option<Result<CallToolResult, String>> {
+        let r = self.result.as_ref()?;
+        Some(serde_json::from_value(r.clone()).map_err(|e| format!("a task result: {e}")))
+    }
+}
+
+/// What a `tools/call` came back with: the tool's result, or a task that
+/// will produce it.
+#[derive(Debug, Clone)]
+pub enum Called {
+    Result(CallToolResult),
+    Task(Task),
 }
 
 // ---- lifecycle ----

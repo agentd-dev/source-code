@@ -476,6 +476,42 @@ pub fn contracts() -> Vec<Contract> {
         ROOT_WF,
     );
 
+    // ---- MCP Tasks (RFC 0050): a tool call that became a task still
+    // running when the call's time ran out; offered where a server may
+    // answer with one (`registry::build`) ----
+    c(
+        "mcp.task.get",
+        "tasks",
+        "Read an MCP task one of your tool calls became: its status, and once it has ended its result (or error). The result is handed over once.",
+        obj(
+            json!({"task": s("The task's handle, as the tool call's result named it")}),
+            &["task"],
+        ),
+        open_obj(
+            // The tool's own result, as the call would have answered: no
+            // run's or child's, so no read-back edge (`read_back`).
+            json!({"task": {"type": "string"}, "server": {"type": "string"}, "tool": {"type": "string"}, "status": {"enum": ["working", "input_required", "completed", "failed", "cancelled"]}, "status_message": {"type": "string"}, "tool_result": any(), "is_error": {"type": "boolean"}, "error": {"type": "string"}}),
+            &["task", "status"],
+        ),
+        true,
+        ROOT_WF,
+    );
+    c(
+        "mcp.task.cancel",
+        "tasks",
+        "Ask the server to cancel an MCP task one of your tool calls became. The server decides whether it stops; its result is not read after this.",
+        obj(
+            json!({"task": s("The task's handle, as the tool call's result named it")}),
+            &["task"],
+        ),
+        open_obj(
+            json!({"task": {"type": "string"}, "cancelled": {"type": "boolean"}, "status": {"type": "string"}}),
+            &["task", "cancelled"],
+        ),
+        true,
+        ROOT_WF,
+    );
+
     // ---- workflows ----
     c(
         "workflow.run",

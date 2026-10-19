@@ -23,13 +23,16 @@ agentd over MCP.
 | Completions | the `mcp.resource` step with `op: complete`. |
 | Elicitation | supported: a server's question becomes a human approval gate in every attached client; an answer that cannot match the requested schema, or none within 300 s, is returned as `cancel`. |
 | MCP Events | the draft extension SEP-3415, on 2026-07-28 connections: bindings into durable streams, runtime subscriptions inside an operator's grant, poll and webhook delivery. In the release binaries; agentd says at load that it tracks a draft. |
+| [MCP Tasks](connect-mcp.md#long-running-tool-calls) | the extension SEP-2663 (`io.modelcontextprotocol/tasks`), on 2026-07-28 connections, as a client: a tool call a server answers with a task is followed to its end — a workflow step's as a durable wait that survives a restart, a model's within the call and then with `mcp.task.get` — polled at the server's interval or pushed on `subscriptions/listen`, cancelled with `tasks/cancel`. `mcp.servers[].tasks: off` refuses a server's tasks. In the release binaries. |
 | Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). |
 
-**Not supported:** `sampling`, `roots` and `tasks` (agentd declares no client
+**Not supported:** `sampling` and `roots` (agentd declares no client
 capability for them, so a server's request is dropped rather than answered);
+the experimental core tasks of MCP 2025-11-25 (a connection at that
+revision gets every answer inline);
 the `logging` capability; the stdio transport (run a bridge for a stdio-only
-server); acting as an MCP server. A `resources/read` that answers
-`input_required` fails.
+server); acting as an MCP server, or serving any MCP extension. A
+`resources/read` that answers `input_required` fails.
 
 [MCP support reference](mcp-reference.md) has the probe rules, the
 capability matrix and the known limits.

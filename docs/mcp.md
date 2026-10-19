@@ -27,6 +27,7 @@ The tools agentd does ship act on the agent, never on the world:
 | Reasoning | `think`, `decide`, `context.compact`, `skills.*` | the agent's own model calls and context |
 | Control | `ask_human`, `sleep`, `await`, `finish`, `status`, `instruction.*` | the agent's lifecycle and its operator |
 | Events | `events.*` | subscriptions inside an operator's grant (offered only where a grant allows it) |
+| Tasks | `mcp.task.get`, `mcp.task.cancel` | an MCP task one of the conversation's own tool calls became, still running when the call's time ran out |
 
 Four families are contracts with no built-in implementation:
 `knowledge.*`, `search.*` and `code.run` resolve only when you map them to a
@@ -143,11 +144,18 @@ can continue.
 - At 2026-07-28 the question arrives inside the tool call's answer, and
   agentd calls the tool again with the person's answer.
 
-agentd offers no `roots`, `sampling` or `tasks`. A server request with no
-declared capability behind it is dropped, not answered. There is no
-`roots/list` to reveal a filesystem layout, and no `sampling/createMessage`
-that would turn the agent's model into someone else's. Apart from
-elicitation, agentd only reads notifications from a server.
+agentd offers no `roots` or `sampling`. A server request with no declared
+capability behind it is dropped, not answered. There is no `roots/list` to
+reveal a filesystem layout, and no `sampling/createMessage` that would turn
+the agent's model into someone else's. Apart from elicitation, agentd only
+reads notifications from a server.
+
+A server may also answer a long tool call with an MCP task, which agentd
+follows until the work ends: a workflow step waits for it durably, and a
+model follows one still running with `mcp.task.get`. A task's questions are
+the same questions an elicitation asks, put to a person the same way, and
+only where an elicitation could be. [Connect MCP servers](connect-mcp.md#long-running-tool-calls)
+has the details.
 
 ## Results and errors
 

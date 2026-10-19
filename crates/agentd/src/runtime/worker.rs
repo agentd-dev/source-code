@@ -39,6 +39,9 @@ pub const SCHEMA_REASKS: u32 = 2;
 pub const LOOP_REPEATS: usize = 4;
 /// Longest a single MCP tool call may take inside a turn.
 pub const TOOL_CALL_CAP: Duration = Duration::from_secs(600);
+/// How long before a call's bound its MCP task is handed over (half the
+/// bound when that is shorter), so the model still has time to act on it.
+pub const TASK_MARGIN: Duration = Duration::from_secs(30);
 
 /// A budget grant as the worker sees it.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,10 +142,46 @@ pub trait McpCaller {
         meta: Value,
         timeout: Duration,
     ) -> Result<(Value, bool), String>;
+
+    /// [`Self::call`], where a call that became an MCP task still open at
+    /// `timeout` comes back as that task, for the supervisor to keep. So
+    /// does one still open when `stop` says the turn no longer waits.
+    fn call_or_task(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+        meta: Value,
+        timeout: Duration,
+        _stop: &dyn Fn() -> bool,
+    ) -> Result<Answered, String> {
+        self.call(server, tool, args, meta, timeout)
+            .map(|(v, e)| Answered::Done(v, e))
+    }
+
+    /// Ask `server` to cancel the task `task_id` this caller's call made.
+    fn cancel_task(&self, _server: &str, _task_id: &str) {}
+}
+
+/// What one MCP call came to inside a turn.
+pub enum Answered {
+    /// The tool's result, and whether it is a tool error.
+    Done(Value, bool),
+    /// The call became a task still running at the call's bound.
+    Open(Box<::mcp::tasks::Tracker>),
 }
 
 /// The connected MCP clients as an [`McpCaller`].
 pub struct McpClients<'a>(pub &'a [McpClient]);
+
+impl McpClients<'_> {
+    fn client(&self, server: &str) -> Result<&McpClient, String> {
+        self.0
+            .iter()
+            .find(|c| c.name() == server)
+            .ok_or_else(|| format!("mcp server {server:?} is not connected"))
+    }
+}
 
 impl McpCaller for McpClients<'_> {
     fn call(
@@ -153,19 +192,72 @@ impl McpCaller for McpClients<'_> {
         meta: Value,
         timeout: Duration,
     ) -> Result<(Value, bool), String> {
+        match self.call_or_task(server, tool, args, meta, timeout, &|| false)? {
+            Answered::Done(v, e) => Ok((v, e)),
+            Answered::Open(t) => {
+                self.cancel_task(server, &t.task.task_id);
+                Err(format!(
+                    "mcp server '{server}': tools/call {tool}: the task was still {} at the call's bound; tasks/cancel sent",
+                    t.task.status.as_str()
+                ))
+            }
+        }
+    }
+
+    /// A call that becomes a task is followed on this worker's connection
+    /// until the call's bound or `stop`, an input request put to a person
+    /// through the connection's elicitation bridge as a direct one would be
+    /// (RFC 0050).
+    fn call_or_task(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+        meta: Value,
+        timeout: Duration,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Answered, String> {
         // Pace the call against the server's rate bucket before dialing out.
         // The registry is per-process, seeded when THIS process connected its
         // clients, so a worker only paces the calls it makes itself.
         crate::mcp::pace::take(server)?;
-        let c = self
-            .0
-            .iter()
-            .find(|c| c.name() == server)
-            .ok_or_else(|| format!("mcp server {server:?} is not connected"))?;
-        let res = c
-            .call_tool_with_meta_within(tool, Some(args), meta, timeout)
-            .map_err(|e| e.to_string())?;
-        Ok((tool_result_value(&res), res.is_error()))
+        let c = self.client(server)?;
+        let started = Instant::now();
+        let trace = meta.as_object().map(|m| {
+            m.iter()
+                .filter(|(k, _)| *k == "traceparent" || *k == "tracestate")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<String, Value>>()
+        });
+        let task = match c
+            .call_tool_called(tool, Some(args), Some(meta), Some(timeout), true)
+            .map_err(|f| f.error.to_string())?
+        {
+            ::mcp::wire::Called::Result(res) => {
+                return Ok(Answered::Done(tool_result_value(&res), res.is_error()));
+            }
+            ::mcp::wire::Called::Task(t) => t,
+        };
+        let tracker = ::mcp::tasks::Tracker::new(task, crate::state::now_ms());
+        // Followed until a margin before the call's bound, so a task handed
+        // over leaves the model time to act on its handle.
+        let margin = (timeout / 2).min(TASK_MARGIN);
+        match c.follow_task(tracker, Some(started + timeout - margin), trace, stop) {
+            Ok(::mcp::tasks::Followed::Ended(t)) => {
+                match ::mcp::client::task_outcome(server, &format!("tools/call {tool}"), &t.task) {
+                    Ok(res) => Ok(Answered::Done(tool_result_value(&res), res.is_error())),
+                    Err(f) => Err(f.error.to_string()),
+                }
+            }
+            Ok(::mcp::tasks::Followed::Open(t)) => Ok(Answered::Open(Box::new(t))),
+            Err(lost) => Err(format!("mcp server '{server}': tools/call {tool}: {lost}")),
+        }
+    }
+
+    fn cancel_task(&self, server: &str, task_id: &str) {
+        if let Ok(c) = self.client(server) {
+            let _ = c.cancel_task(task_id, None, ::mcp::tasks::REQUEST_BOUND);
+        }
     }
 }
 
@@ -973,8 +1065,22 @@ fn execute_call(
         if let (Some(m), Some(c)) = (meta.as_object_mut(), call) {
             m.extend(c.meta());
         }
-        return match mcp.call(server, tool, tc.arguments.clone(), meta, timeout) {
-            Ok(r) => r,
+        let answered = mcp.call_or_task(server, tool, tc.arguments.clone(), meta, timeout, &|| {
+            bridge.cancelled()
+        });
+        return match answered {
+            Ok(Answered::Done(v, e)) => (v, e),
+            // Cancelled while its task ran: nothing will read the task.
+            Ok(Answered::Open(tracker)) if bridge.cancelled() => {
+                mcp.cancel_task(server, &tracker.task.task_id);
+                (
+                    Value::String(format!(
+                        "{tool}: the turn was cancelled while its MCP task ran; tasks/cancel sent"
+                    )),
+                    true,
+                )
+            }
+            Ok(Answered::Open(tracker)) => hand_over(server, tool, *tracker, call, mcp, bridge),
             Err(e) => (Value::String(format!("tool transport error: {e}")), true),
         };
     }
@@ -985,6 +1091,55 @@ fn execute_call(
         };
     }
     (Value::String(format!("error: no such tool '{name}'")), true)
+}
+
+/// How long the supervisor gets to take a task over.
+const HAND_OVER_BOUND: Duration = Duration::from_secs(30);
+
+/// A call's task still running at the call's bound: handed to the
+/// supervisor, which follows it from then on, and the model told its handle
+/// and the tools that follow it (RFC 0050). A task the supervisor cannot take
+/// is cancelled, and the call is an error.
+fn hand_over(
+    server: &str,
+    tool: &str,
+    tracker: ::mcp::tasks::Tracker,
+    call: Option<&crate::obs::trace::TraceContext>,
+    mcp: &dyn McpCaller,
+    bridge: &mut dyn Bridge,
+) -> (Value, bool) {
+    let task = tracker.task.clone();
+    let args = json!({"server": server, "tool": tool, "tracker": tracker, "trace": call});
+    match bridge.tool_request(
+        super::mcp_tasks::HAND_OVER,
+        &args,
+        Instant::now() + HAND_OVER_BOUND,
+    ) {
+        Some((kept, false)) => {
+            let mut out = json!({"task": kept["task"], "server": server, "status": task.status.as_str(),
+                                 "note": super::mcp_tasks::STILL_RUNNING});
+            if let Some(m) = &task.status_message {
+                out["status_message"] = json!(m);
+            }
+            (out, false)
+        }
+        refused => {
+            mcp.cancel_task(server, &task.task_id);
+            let why = match refused {
+                Some((v, _)) => v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string()),
+                None => "no answer from the supervisor".into(),
+            };
+            (
+                Value::String(format!(
+                    "{tool}: the call became an MCP task still running at the call's bound, which could not be kept ({why}); tasks/cancel sent"
+                )),
+                true,
+            )
+        }
+    }
 }
 
 /// Parse a model's JSON answer tolerantly (fences, prose around the object).
@@ -1571,6 +1726,101 @@ mod tests {
                 if content.as_str().unwrap_or_default().contains("not executed")),
             "the sealed result says the call did not happen: {:?}",
             r.messages[3]
+        );
+    }
+
+    #[test]
+    fn a_turn_cancelled_while_its_task_runs_cancels_the_task_and_hands_nothing_over() {
+        use std::sync::Mutex;
+        // The supervisor's cancel lands while the call follows its task.
+        struct Flag(Arc<AtomicBool>, Vec<String>);
+        impl Bridge for Flag {
+            fn tool_request(&mut self, n: &str, _a: &Value, _d: Instant) -> Option<(Value, bool)> {
+                self.1.push(n.to_string());
+                Some((json!({"task": "mt_kept"}), false))
+            }
+            fn budget_request(&mut self, _e: u64, _d: Instant) -> Option<BudgetReply> {
+                None
+            }
+            fn cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        struct Following {
+            cancel: Arc<AtomicBool>,
+            stopped: AtomicBool,
+            cancels: Mutex<Vec<String>>,
+        }
+        impl McpCaller for Following {
+            fn call(
+                &self,
+                _s: &str,
+                _t: &str,
+                _a: Value,
+                _m: Value,
+                _d: Duration,
+            ) -> Result<(Value, bool), String> {
+                unreachable!("a turn's call may become a task")
+            }
+            fn call_or_task(
+                &self,
+                _s: &str,
+                _t: &str,
+                _a: Value,
+                _m: Value,
+                _d: Duration,
+                stop: &dyn Fn() -> bool,
+            ) -> Result<Answered, String> {
+                self.cancel.store(true, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !stop() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.stopped.store(stop(), Ordering::SeqCst);
+                let task = ::mcp::wire::Task::read(
+                    &json!({"taskId": "t-1", "status": "working", "ttlMs": null}),
+                )
+                .unwrap();
+                Ok(Answered::Open(Box::new(::mcp::tasks::Tracker::new(
+                    task, 0,
+                ))))
+            }
+            fn cancel_task(&self, _s: &str, task_id: &str) {
+                self.cancels.lock().unwrap().push(task_id.to_string());
+            }
+        }
+        let intel = mock_intel(&json!({"turns": [
+            {"tool_calls": [{"name": "fs.read", "arguments": {"path": "/x"}}]},
+            {"content": "unused"}
+        ]}));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mcp = Following {
+            cancel: Arc::clone(&cancel),
+            stopped: AtomicBool::new(false),
+            cancels: Mutex::new(vec![]),
+        };
+        let mut bridge = Flag(cancel, vec![]);
+        let r = run_turn(
+            &spec(TurnKind::Turn),
+            &limits(),
+            &intel,
+            &mcp,
+            &mut bridge,
+            &log(),
+        );
+        assert_eq!(r.status, "cancelled", "{:?}", r.error);
+        assert!(
+            mcp.stopped.load(Ordering::SeqCst),
+            "the follow's stop is the turn's cancel"
+        );
+        assert_eq!(*mcp.cancels.lock().unwrap(), ["t-1"]);
+        assert!(
+            !bridge
+                .1
+                .iter()
+                .any(|n| n == super::super::mcp_tasks::HAND_OVER),
+            "a cancelled turn hands nothing over: {:?}",
+            bridge.1
         );
     }
 

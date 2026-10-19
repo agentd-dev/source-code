@@ -46,6 +46,12 @@
 //! `mock.publish` edits `mock://instruction` (`… Edition <n>.`) and pushes
 //! nothing, so a test decides how the consumer hears of it.
 //!
+//! On the 2026-07-28 edge it also serves the MCP Tasks extension
+//! (`mock_tasks`): `mock.job` becomes a task for a call that declares it,
+//! `tasks/*` follow it, each held to the extension's rules (`Mcp-Name` the
+//! `taskId`, the extension declared), and with [`Options::tasks_push`] a
+//! listen that asks for its tasks' ids is pushed each one's end.
+//!
 //! It can also **restart** without exiting: `mock.restart` forgets every
 //! session it issued (a request still carrying one is answered `404`, as
 //! Streamable HTTP has a server say "no such session") and closes its open
@@ -108,6 +114,10 @@ pub struct Options {
     pub hook_ca: Option<String>,
     /// Where it listens (`127.0.0.1:0`, a free port, when unset).
     pub listen: Option<String>,
+    /// Take the task ids a listen asks for, and push each task's state down
+    /// the listen once it ends (`notifications/tasks`). Off, a listen's
+    /// `taskIds` are left out of its acknowledgment, and tasks are polled.
+    pub tasks_push: bool,
 }
 
 impl Options {
@@ -122,6 +132,7 @@ impl Options {
             events: super::mock_events::Spelling::Extension,
             hook_ca: None,
             listen: None,
+            tasks_push: false,
         }
     }
 }
@@ -180,6 +191,10 @@ struct State {
     /// The MCP Events surface (2026-07-28 edge), and how it is declared.
     events: Arc<super::mock_events::Events>,
     events_spelling: super::mock_events::Spelling,
+    /// The MCP Tasks surface (2026-07-28 edge), and whether a listen is
+    /// pushed its tasks' ends.
+    tasks: super::mock_tasks::Tasks,
+    tasks_push: bool,
     /// Its webhook delivery.
     #[cfg(all(feature = "mcp-events", feature = "tls"))]
     hooks: Arc<super::mock_hooks::Hooks>,
@@ -274,6 +289,8 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
             hooks
         },
         events_spelling: opts.events,
+        tasks: Default::default(),
+        tasks_push: opts.tasks_push,
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -378,6 +395,19 @@ fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
             write_json(stream, 200, &payload, None);
         }
         "subscriptions/listen" => serve_listen(stream, &id, &body, state),
+        // MCP Tasks (SEP-2663): only for a request that declares it.
+        m if m.starts_with("tasks/") => {
+            let answered = if super::mock_tasks::declares(&body["params"]) {
+                super::mock_tasks::handle(&state.tasks, m, &body["params"])
+            } else {
+                Err(super::mock_tasks::missing_capability())
+            };
+            let payload = match answered {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+            };
+            write_json(stream, 200, &payload, None);
+        }
         // MCP Events (SEP-3415): only where it is declared [SEP L94].
         m if m.starts_with("events/")
             && state.events_spelling != super::mock_events::Spelling::None =>
@@ -496,6 +526,10 @@ fn stateless_refusal(http: &Http, body: &Value) -> Option<(i64, String, Option<V
     let name = match called {
         method::TOOLS_CALL | method::PROMPTS_GET => params["name"].as_str(),
         method::RESOURCES_READ => params["uri"].as_str(),
+        // A task's requests are routed by its id (SEP-2663).
+        method::TASKS_GET | method::TASKS_UPDATE | method::TASKS_CANCEL => {
+            params["taskId"].as_str()
+        }
         _ => None,
     };
     if let Some(name) = name
@@ -544,6 +578,7 @@ fn discover_result(state: &State) -> Value {
         "prompts": {"listChanged": true}
     });
     super::mock_events::declare(&mut capabilities, state.events_spelling);
+    capabilities["extensions"][super::mock_tasks::EXTENSION] = json!({});
     json!({
         "resultType": "complete",
         "supportedVersions": [DISCOVER_PROTOCOL_VERSION],
@@ -612,6 +647,7 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                         {"name": "mock.fault", "description": "fail the next N state.* calls", "inputSchema": {"type": "object"}},
                         {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
                         {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
+                        {"name": "mock.job", "description": "a job that becomes an MCP task where the call declares the extension", "inputSchema": {"type": "object"}},
                         {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
                         {"name": "mock.publish", "description": "edit mock://instruction, pushing nothing", "inputSchema": {"type": "object"}},
                         {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
@@ -975,6 +1011,20 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
             state.fail_next.store(n, Ordering::SeqCst);
             tool_ok(req.id, json!({"ok": true, "count": n}))
         }
+        // A job that becomes an MCP task where the call declares the
+        // extension, on the 2026-07-28 edge (`mock_tasks`); answered inline
+        // otherwise.
+        Some("mock.job") => match state.lifecycle {
+            Lifecycle::Discover => match super::mock_tasks::job(&state.tasks, &params) {
+                Ok(Some(created)) => Response::ok(req.id, created),
+                Ok(None) => tool_ok(req.id, json!({"inline": true})),
+                Err(e) => Response {
+                    error: serde_json::from_value(e).ok(),
+                    ..Response::err(req.id, json::INTERNAL_ERROR, "")
+                },
+            },
+            Lifecycle::Initialize => tool_ok(req.id, json!({"inline": true})),
+        },
         // A live tool that takes its time: nothing on the wire until it
         // answers, the way a JSON-answering server computes before it replies.
         Some("mock.slow") => {
@@ -1301,6 +1351,21 @@ fn serve_listen(stream: &mut TcpStream, id: &Value, body: &Value, state: &State)
     {
         f.remove("eventsListChanged");
     }
+    // Task ids are taken — the ones the mock holds — only where it pushes
+    // their ends; otherwise a client that asked keeps polling them.
+    let mut pushing: Vec<String> = Vec::new();
+    if let Some(f) = filter.as_object_mut()
+        && let Some(asked) = f.remove("taskIds")
+        && state.tasks_push
+    {
+        let took = super::mock_tasks::known(&state.tasks, asked.as_array().map_or(&[], |a| a));
+        pushing = took
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        f.insert("taskIds".into(), Value::Array(took));
+    }
     let tools = filter["toolsListChanged"] == true;
     let events = filter["eventsListChanged"] == true;
     let meta = json!({SUBSCRIPTION_ID: id});
@@ -1351,7 +1416,21 @@ fn serve_listen(stream: &mut TcpStream, id: &Value, body: &Value, state: &State)
             });
         }
     }
-    let how = hold(stream, state, generation, |_| true);
+    // Each task the acknowledgment took is pushed once, when it ends, under
+    // the registry's lock so its frame never interleaves with another.
+    let how = hold(stream, state, generation, |socket| {
+        pushing.retain(|task| {
+            let Some(mut ended) = super::mock_tasks::ended(&state.tasks, task) else {
+                return true;
+            };
+            ended["_meta"] = json!({SUBSCRIPTION_ID: id});
+            let note = json::Notification::new(method::NOTIFY_TASKS, Some(ended));
+            let _open = lock(&state.open);
+            eprintln!("MOCK_TASK_PUSH {task}");
+            !send_frame(socket, &note)
+        });
+        true
+    });
     lock(&state.open).retain(|o| o.id != open_id);
     let _ = stream.shutdown(Shutdown::Both);
     eprintln!("MOCK_LISTEN_CLOSED {how}");

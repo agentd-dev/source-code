@@ -535,6 +535,13 @@
           },
           "type": "object"
         },
+        "tasks": {
+          "description": "whether the server may answer a tool call with an MCP task (the Tasks extension, SEP-2663): auto (default) declares the extension on 2026-07-28 connections, on the calls that have a bound (a turn's, a workflow step's, a store adapter's), off never does, so the server must answer every call inline (RFC 0050)",
+          "enum": [
+            "auto",
+            "off"
+          ]
+        },
         "timeout": {
           "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
           "type": [

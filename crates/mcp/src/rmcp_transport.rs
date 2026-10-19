@@ -167,6 +167,16 @@ pub struct ListenExtension {
     pub methods: Vec<String>,
 }
 
+/// The tasks a connection's listen asks to hear about (the Tasks extension's
+/// `notifications.taskIds`), and the ones the server's last acknowledgment
+/// took. A listen that asks for any declares the extension, as the server
+/// requires of it, and its `notifications/tasks` go to the host's queue.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskListen {
+    pub ids: std::collections::BTreeSet<String>,
+    pub acked: std::collections::BTreeSet<String>,
+}
+
 /// The SDK's transport, backed by agentd's authenticated HTTP.
 #[derive(Clone)]
 pub struct AgentdHttp {
@@ -201,6 +211,8 @@ pub struct AgentdHttp {
     /// An extension's part of every listen (see [`ListenExtension`]), set
     /// once the server's capabilities are known.
     listen_extension: Arc<Mutex<Option<ListenExtension>>>,
+    /// The tasks every listen asks to hear about ([`TaskListen`]).
+    task_listen: Arc<Mutex<TaskListen>>,
 }
 
 impl AgentdHttp {
@@ -215,7 +227,16 @@ impl AgentdHttp {
             tools_seen: Arc::default(),
             notifications: None,
             listen_extension: Arc::default(),
+            task_listen: Arc::default(),
         }
+    }
+
+    /// Ask every listen on this connection for `notifications/tasks` about
+    /// the tasks `listen` names, and keep there what each acknowledgment
+    /// took. Read per listen, as [`Self::with_listen_extension`] is.
+    pub fn with_task_listen(mut self, listen: Arc<Mutex<TaskListen>>) -> AgentdHttp {
+        self.task_listen = listen;
+        self
     }
 
     /// Add `extension`'s members to every listen on this connection, and take
@@ -489,12 +510,22 @@ impl StreamableHttpClient for AgentdHttp {
         // An extension's part of a listen: its filter members in the body, and
         // its notifications diverted to the host as they arrive.
         let mut divert: Vec<String> = Vec::new();
+        let extension = self
+            .listen_extension
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let task_ids: Vec<String> = self
+            .task_listen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ids
+            .iter()
+            .cloned()
+            .collect();
+        let asks_tasks = listen_idle.is_some() && !task_ids.is_empty();
         if listen_idle.is_some()
-            && let Some(ext) = self
-                .listen_extension
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
+            && (extension.is_some() || asks_tasks)
             && self.notifications.is_some()
         {
             let mut v: Value = serde_json::from_slice(&body)
@@ -503,15 +534,35 @@ impl StreamableHttpClient for AgentdHttp {
                 .pointer_mut("/params/notifications")
                 .and_then(Value::as_object_mut)
             {
-                filter.extend(ext.members);
-                body = serde_json::to_vec(&v)
-                    .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
-                divert = ext.methods;
+                if let Some(ext) = extension {
+                    filter.extend(ext.members);
+                    divert = ext.methods;
+                }
+                if asks_tasks {
+                    filter.insert("taskIds".into(), Value::from(task_ids.clone()));
+                    divert.push(crate::wire::method::NOTIFY_TASKS.into());
+                }
             }
+            // A listen for task notifications declares the extension: a
+            // server answers one that does not with -32021.
+            if asks_tasks
+                && let Some(caps) = v
+                    .pointer_mut("/params/_meta/io.modelcontextprotocol~1clientCapabilities")
+                    .and_then(Value::as_object_mut)
+                && let Value::Object(ext) = caps
+                    .entry("extensions")
+                    .or_insert_with(|| serde_json::json!({}))
+            {
+                ext.insert(crate::wire::TASKS_EXTENSION.into(), serde_json::json!({}));
+            }
+            body = serde_json::to_vec(&v)
+                .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
         }
         let diverted = (!divert.is_empty())
             .then(|| self.notifications.clone())
             .flatten();
+        // What the acknowledgment of a listen that asked for tasks took.
+        let task_acks = asks_tasks.then(|| Arc::clone(&self.task_listen));
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
@@ -555,6 +606,20 @@ impl StreamableHttpClient for AgentdHttp {
                 timeout,
                 &refs,
                 |n| {
+                    if let Some(listen) = &task_acks
+                        && n.get("method").and_then(Value::as_str)
+                            == Some(crate::wire::method::NOTIFY_SUBSCRIPTIONS_ACKNOWLEDGED)
+                    {
+                        let took = n
+                            .pointer("/params/notifications/taskIds")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        listen.lock().unwrap_or_else(|e| e.into_inner()).acked = took;
+                    }
                     if let Some(queue) = &diverted
                         && let Some(method) = n.get("method").and_then(Value::as_str)
                         && divert.iter().any(|m| m == method)

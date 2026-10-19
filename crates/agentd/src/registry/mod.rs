@@ -293,6 +293,12 @@ impl Registry {
             // build that has MCP Events; the company tools only where a
             // Company is declared, in a build that can act at one.
             let offered = match c.family {
+                // Only where a server may answer a call with a task.
+                "tasks" => settings
+                    .mcp
+                    .servers
+                    .iter()
+                    .any(|s| s.tasks.is_auto() && s.company.is_none()),
                 "events" => {
                     cfg!(feature = "mcp-events")
                         && settings

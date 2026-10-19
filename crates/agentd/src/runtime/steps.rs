@@ -2054,19 +2054,26 @@ impl Runtime {
                     );
                 let tx = self.events_tx.clone();
                 let (r, s) = (run_id.to_string(), step_id.to_string());
+                // A call that becomes a task makes the step a durable wait on
+                // it (RFC 0050) — unless the server's open tasks and the
+                // declaring calls still out to it already reach the limit,
+                // when the call goes out without the extension.
+                let calling = self.mcp_task_slot(&server);
+                let tasks = calling.is_some();
                 self.executing
                     .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
                 std::thread::Builder::new()
                     .name(format!("step:{server}.{tool}"))
                     .spawn(move || {
                         let start = crate::obs::otel::now_unix_nanos();
-                        let (output, is_error, error) = match client.call_tool_with_meta_within(
+                        let (output, is_error, error) = match client.call_tool_called(
                             &tool,
                             Some(args),
-                            meta,
-                            timeout,
+                            Some(meta),
+                            Some(timeout),
+                            tasks,
                         ) {
-                            Ok(res) => {
+                            Ok(::mcp::wire::Called::Result(res)) => {
                                 let v = super::worker::tool_result_value(&res);
                                 if res.is_error() {
                                     (v.clone(), true, Some(res.text()))
@@ -2074,7 +2081,34 @@ impl Runtime {
                                     (v, false, None)
                                 }
                             }
-                            Err(e) => (Value::Null, true, Some(format!("transport error: {e}"))),
+                            Ok(::mcp::wire::Called::Task(task)) => {
+                                crate::obs::otel::mcp_span(
+                                    call.as_ref(),
+                                    "tools/call",
+                                    &tool,
+                                    &server,
+                                    true,
+                                    start,
+                                );
+                                let _ = tx.send(super::events::Event::McpTask(Box::new(
+                                    super::mcp_tasks::Note::Created {
+                                        run: r,
+                                        step: s,
+                                        server,
+                                        tool,
+                                        task,
+                                        trace: call,
+                                        registry: false,
+                                        calling,
+                                    },
+                                )));
+                                return;
+                            }
+                            Err(f) => (
+                                Value::Null,
+                                true,
+                                Some(format!("transport error: {}", f.error)),
+                            ),
                         };
                         crate::obs::otel::mcp_span(
                             call.as_ref(),

@@ -202,7 +202,7 @@ Run it inside a container or VM with its own limits.
 
 | Not supported | Instead |
 |---|---|
-| MCP `sampling`, `roots`, `tasks` and `logging` | none; a server's request is dropped |
+| MCP `sampling`, `roots` and `logging`, and the experimental core tasks of MCP 2025-11-25 | none; a server's request is dropped (MCP Tasks, the 2026-07-28 extension, is supported) |
 | MCP over stdio | a bridge that serves Streamable HTTP |
 | agentd as an MCP server | reach it over A2A |
 | A2A 0.3, and the A2A gRPC and HTTP+JSON bindings | the A2A 1.0 JSON-RPC binding |

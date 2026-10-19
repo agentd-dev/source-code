@@ -94,6 +94,7 @@ Each entry under `mcp.servers` is one connection. `name` and either
 | `allow`, `exclude`, `ns` | [Choose which tools the agent sees](#choose-which-tools-the-agent-sees). |
 | `tags` | [Mark what the server can do](#mark-what-the-server-can-do) for the trifecta check. |
 | `timeout` | Bound each silence on this connection; see [Set timeouts](#set-timeouts). |
+| `tasks` | Let the server answer a long call with an MCP task (`auto`, the default) or not (`off`); see [Long-running tool calls](#long-running-tool-calls). |
 | `events`, `event_grants` | Bind upstream events to streams; see [React to changes and events](react-to-events.md). |
 
 agentd refuses a bad declaration at load, before any side effect, and exits
@@ -346,6 +347,52 @@ and follows its `retry` policy.
 
 A call abandoned at its bound does not block other calls on the same
 connection.
+
+## Long-running tool calls
+
+A server that cannot finish a tool call in one answer can answer with an
+MCP *task* instead: a handle agentd follows until the work ends (the MCP
+Tasks extension, SEP-2663). agentd offers this on connections that reached
+MCP 2026-07-28, for calls that have a time limit, and what it does with a
+task depends on what made the call:
+
+| The call came from | What agentd does |
+|---|---|
+| a workflow `tool` or `mcp.tool` step | The step waits for the task, durably: a restart polls it again, and the step finishes with the task's result as it would with the call's. The step's `timeout` bounds the wait; at it, or when the run is cancelled, agentd sends `tasks/cancel`. |
+| a model, in a turn | agentd follows the task while the call has time. If it is still running, the model gets the task's handle and status, and follows it with `mcp.task.get` and `mcp.task.cancel`. A task a workflow's `agent` step handed over is cancelled when its run ends, and a turn that is cancelled cancels its task. |
+| the store (a `kind: mcp` store adapter) | The call follows its task inside its own bound, and cancels it there. |
+| a subagent, a mapped contract, or another call with no time limit of its own | agentd does not offer a task: the server answers inline, or refuses with `-32021`. |
+
+- A completed task's result is the call's result, a tool error included. A
+  failed one's error is the call's error.
+- agentd polls at the interval the server asks for, never more often than
+  every 250 ms nor less often than every 10 minutes. A server that pushes a
+  task's state on its `subscriptions/listen` stream is polled only as a
+  backstop.
+- A task that asks a question is treated as the same question asked
+  directly. In a turn it opens the human gate an elicitation opens. The
+  supervisor's own connections declare no elicitation, so a workflow step's
+  task that asks is declined; put a `human` step before it instead.
+- agentd cancels a task it gives up while the server may still be running
+  it: one still open 30 s past its `ttlMs`, or one whose `tasks/get` the
+  server refuses with an error that will not pass.
+- The supervisor keeps at most 32 open tasks on one server, its calls still
+  waiting for an answer counted. Past that, its new calls to the server go
+  out without the extension until one ends.
+
+To make a server answer every call inline, set `tasks: off`:
+
+```yaml
+# fragment: under mcp.servers:
+- name: builds
+  endpoint: https://builds.example.com/mcp
+  tasks: off
+```
+
+A server that requires tasks then fails the call with an error that names
+the extension (`io.modelcontextprotocol/tasks`, `-32021`). The log lines are
+`mcp.task.*`; the [MCP support reference](mcp-reference.md#mcp-tasks-reference)
+lists them and every limit.
 
 ## When a server is down
 

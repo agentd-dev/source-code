@@ -500,6 +500,8 @@ pub struct Runtime {
     /// MCP Events bindings (RFC 0045).
     #[cfg(feature = "mcp-events")]
     pub(crate) mcp_events: super::mcp_events::Events,
+    /// The MCP tasks the supervisor follows (RFC 0050).
+    pub(crate) mcp_tasks: super::mcp_tasks::Tasks,
     /// Servers down at boot, probed until they answer (`runtime::join`).
     pub(crate) joining: super::join::Joining,
     /// When [`Runtime::release_unowned_subscriptions`] next looks.
@@ -841,6 +843,7 @@ impl Runtime {
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
+            self.mcp_tasks_tick();
             self.join_tick();
             // 9. Children maintenance.
             for (node, health) in self.children.tick() {
@@ -1004,6 +1007,7 @@ impl Runtime {
             #[cfg(feature = "mcp-events")]
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
             Event::McpReachable(r) => self.on_mcp_reachable(*r),
+            Event::McpTask(n) => self.on_mcp_task(*n),
             Event::CompanyRead { into, origin, why } => self.company_read(into, origin, why),
             #[cfg(feature = "companies")]
             Event::CompanySignIn { id, step } => self.on_company_sign_in(&id, step),
@@ -2056,6 +2060,11 @@ impl Runtime {
             || self
                 .forwards_in_flight
                 .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            || self
+                .mcp_tasks
+                .cancels
+                .load(std::sync::atomic::Ordering::SeqCst)
                 > 0;
         if busy {
             self.idle_since = None;
@@ -2499,6 +2508,10 @@ impl Runtime {
         }
         if !self.pending.is_empty() || !self.turn_queue.is_empty() {
             soonest = soonest.min(now + 50);
+        }
+        // An MCP task's next poll, at the interval its server asked for.
+        if let Some(due) = self.mcp_tasks.next_due() {
+            soonest = soonest.min(due);
         }
         Duration::from_millis(soonest.saturating_sub(now).max(5))
     }

@@ -201,7 +201,10 @@ pub fn from_spec(
             version: crate::VERSION.into(),
             title: WORKLOAD.get().cloned(),
         })
-        .with_request_meta(std::sync::Arc::new(process_request_meta));
+        .with_request_meta(std::sync::Arc::new(process_request_meta))
+        // A server may answer a call with an MCP task unless the operator
+        // said `tasks: off` (RFC 0050).
+        .with_tasks(spec.tasks.is_auto());
     // SPIFFE X.509-SVID mTLS: set the transport client identity from the
     // SPIRE-written cert + key when the server declares `auth: {kind: spiffe,
     // svid: x509}`. Needs `--features tls` (mTLS); a JWT-SVID rides the signer seam.
@@ -272,6 +275,8 @@ pub mod mock_events;
 pub mod mock_hooks;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
+#[cfg(any(feature = "internal-mocks", debug_assertions))]
+pub mod mock_tasks;
 
 // agentd-as-A2A-client: the remote-A2A-agent delegation backend. Reads a
 // declared peer's card, sends the objective, follows the task to a terminal

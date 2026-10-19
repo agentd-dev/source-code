@@ -26,4 +26,6 @@ pub mod rmcp_client;
 /// agentd's credentialed socket under the SDK's transport trait.
 pub mod rmcp_transport;
 pub mod rpc;
+/// Following an MCP task (the Tasks extension): the state one task needs.
+pub mod tasks;
 pub mod wire;

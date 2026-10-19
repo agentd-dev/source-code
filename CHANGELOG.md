@@ -775,6 +775,51 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   protocols and specifications agentd supports, each a link to the docs that
   cover it, which `web/tools/check-standards.mjs` resolves after every site
   build.
+- MCP Tasks (RFC 0050): agentd is a client of the Tasks extension,
+  `io.modelcontextprotocol/tasks` (SEP-2663), on MCP 2026-07-28
+  connections. It declares the extension on a `tools/call` that has a bound
+  (a turn's, a workflow step's, a store adapter's; a call with none, such as
+  a subagent's or a mapped contract's, is answered inline), on `tasks/get`,
+  `tasks/update` and `tasks/cancel`, and on a listen that asks for task ids,
+  and refuses a `CreateTaskResult` on any other method. A seed that is not
+  `working` is fetched with `tasks/get` at once for its result. A workflow
+  `tool` or `mcp.tool` step whose call becomes a task waits on it durably:
+  the task is kept in the store under a handle (`mt_` and 16 hex digits,
+  which is all a log line names), polled again after a restart, and its
+  outcome finishes the step as the call's answer would. The step's `timeout`, a cancelled
+  run, or a step that no longer waits sends `tasks/cancel`, and so does
+  giving a task up while the server may still run it. A turn's call
+  follows its task, its questions put to the gate a direct elicitation
+  opens, and hands one still running near the call's bound to the
+  supervisor; the model then follows it with the internal tools
+  `mcp.task.get` and `mcp.task.cancel`. A turn cancelled while it follows
+  its task cancels it, and a task a workflow's `agent` step handed over is
+  cancelled when its run ends. Polling honours `pollIntervalMs` between
+  250 ms and 10 minutes; a server that takes a listen's `taskIds` pushes
+  `notifications/tasks`, and the task is then polled every 10 minutes as a
+  backstop; the supervisor keeps at most 32 open tasks on a server, its
+  declaring calls in flight counted. A question a task asks on a connection
+  that declares no elicitation is declined, a round's keys in one
+  `tasks/update`; a decline the server refuses waits as a failed poll does.
+  `mcp.servers[].tasks: auto | off` (default
+  `auto`) refuses a server's tasks, and a server that then requires the
+  extension fails the call with an error that names it. Events
+  `mcp.task.*`; metrics `agent_mcp_tasks_open{server}` and
+  `agent_mcp_tasks_total{server, outcome}`.
+- `agentd-mcp`: `wire::{Task, TaskStatus, Called, TASKS_EXTENSION}` and
+  the `tasks/*` method names; `tasks` (`Tracker`, `Ask`, `Followed`, `Lost`,
+  `poll_interval` and the poll bounds); `McpClient::{with_tasks,
+  declares_tasks, call_tool_called, get_task, update_task, cancel_task,
+  follow_task, listen_tasks}`, `client::task_outcome` and
+  `client::STOP_CHECK`; `rmcp_client::RmcpBuilder::with_tasks`;
+  `rmcp_transport::TaskListen`. `call_tool_with_meta_within` follows a task
+  to its end inside its bound and cancels it there; a `call_tool*` with no
+  bound does not declare the extension. `follow_task` takes the caller's
+  stop. `agentd-core`: `runtime::mcp_tasks::handle`, and
+  `runtime::worker::McpCaller::{call_or_task, cancel_task}`.
+- The mock MCP server's `mock.job`, a job that becomes an MCP task where
+  the call declares the extension (its `seed`, `update_error` and
+  `get_error` shape the seed and refuse requests), and `--tasks-push`.
 
 **Changed.**
 

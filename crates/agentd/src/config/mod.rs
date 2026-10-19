@@ -420,6 +420,29 @@ pub struct McpServerSpec {
     /// payload carries its spec, and [`crate::mcp::from_spec`] refuses one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company: Option<String>,
+    /// Whether the connection declares the MCP Tasks extension (RFC 0050).
+    /// Travels in the spawn payload, so a worker's connection declares what
+    /// the supervisor's does.
+    #[serde(default, skip_serializing_if = "TasksMode::is_auto")]
+    pub tasks: TasksMode,
+}
+
+/// `mcp.servers[].tasks` (RFC 0050): whether agentd lets a server answer its
+/// tool calls with MCP tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TasksMode {
+    /// Declare the Tasks extension wherever the revision defines it.
+    #[default]
+    Auto,
+    /// Never declare it: the server must answer every call inline.
+    Off,
+}
+
+impl TasksMode {
+    pub fn is_auto(&self) -> bool {
+        *self == TasksMode::Auto
+    }
 }
 
 /// The runtime shape of an MCP server's OAuth 2.1 client-credentials config.

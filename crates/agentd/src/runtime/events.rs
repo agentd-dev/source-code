@@ -73,6 +73,9 @@ pub enum Event {
     McpEventHook(Box<super::mcp_events::hook::Arrival>),
     /// A probe of a server down since boot answered (`runtime::join`).
     McpReachable(Box<super::join::Reachable>),
+    /// An MCP task moved on: a step's call became one, a poll answered, a
+    /// listen took its ids (`runtime::mcp_tasks`).
+    McpTask(Box<super::mcp_tasks::Note>),
     /// A Company call's result is about to reach the context `into`: its
     /// record gains `origin`, `company:<issuer>` (RFC 0047 §6.2). Sent by
     /// the call's executor thread just before the result itself, so the

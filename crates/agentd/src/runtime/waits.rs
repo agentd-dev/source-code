@@ -951,7 +951,10 @@ impl Runtime {
                     // through `on_timeout` like any other deadline, which is
                     // what makes "alert fired, no recovery in ten minutes"
                     // expressible without a polling loop.
-                    Some("resource") | Some("signal") | Some("message") | Some("human") | Some("child_run") | Some("event") if timed_out => {
+                    // A step's MCP task past the step's timeout: the step
+                    // ends `timeout`, and the task, which nothing waits for
+                    // then, is cancelled (`mcp_tasks_tick`).
+                    Some("resource") | Some("signal") | Some("message") | Some("human") | Some("child_run") | Some("event") | Some("mcp_task") if timed_out => {
                         resolve.push((rid.clone(), sid.clone(), StepStatus::Timeout, json!({"timed_out": true}), Some("wait timed out".into())));
                     }
                     _ => {}

@@ -441,6 +441,38 @@ pub fn record_mcp_events_request(server: &str, method: &str, outcome: &str) {
     let _ = (server, method, outcome);
 }
 
+/// The MCP tasks the supervisor follows that have not ended, by server
+/// (`agent_mcp_tasks_open{server}`), replaced whole.
+pub fn set_mcp_tasks_open(by_server: Vec<(String, u64)>) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_replace(
+        "agent_mcp_tasks_open",
+        by_server
+            .into_iter()
+            .map(|(server, n)| (vec![server], n))
+            .collect(),
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = by_server;
+}
+
+/// One MCP task the supervisor followed to its end
+/// (`agent_mcp_tasks_total{server,outcome}`): `outcome` ∈
+/// `completed`\|`failed`\|`cancelled`\|`expired`.
+pub fn record_mcp_task(server: &str, outcome: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.event_add(
+        "agent_mcp_tasks_total",
+        vec![
+            server.into(),
+            imp::closed_label(outcome, &["completed", "failed", "cancelled", "expired"]).into(),
+        ],
+        1,
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = (server, outcome);
+}
+
 /// A gap a binding saw (`agent_mcp_event_gaps_total{server,event,cause}`):
 /// `cause` ∈ `truncated`\|`no_replay`.
 pub fn record_mcp_event_gap(server: &str, event: &str, cause: &str) {
@@ -981,6 +1013,19 @@ mod imp {
             "gauge",
             "Append time minus the occurrence's server-reported timestamp (ms).",
             &["server", "event"],
+        ),
+        // --- MCP Tasks (RFC 0050): `server` is a configured server's name.
+        (
+            "agent_mcp_tasks_open",
+            "gauge",
+            "MCP tasks the supervisor follows that have not ended, by server.",
+            &["server"],
+        ),
+        (
+            "agent_mcp_tasks_total",
+            "counter",
+            "MCP tasks the supervisor followed to their end, by how they ended.",
+            &["server", "outcome"],
         ),
         // --- Companies (RFC 0047 §7): `company` is a company entry's name,
         // `account` the label of one of the User's accounts there — agentd's

@@ -105,7 +105,7 @@ pub enum Event {
         owed: super::company_sign_in::Owed,
         company: String,
         by: Option<String>,
-        outcome: Result<Value, String>,
+        outcome: Result<Value, crate::companies::signin::SignOutError>,
     },
     /// A confirm of a Company's operation moved on (RFC 0047 §5.8.1): the
     /// User is to be asked, a standing permission approved it, the confirm

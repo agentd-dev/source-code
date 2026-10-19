@@ -66,6 +66,10 @@ pub(crate) struct DirectTrack {
     /// The User cancelled the task while it was: the Direct Conversation
     /// it starts is closed.
     pub closing: bool,
+    /// The label of the User's account the model's `company.direct` named:
+    /// the one the conversation it follows belongs to, or — when that one
+    /// belongs to none yet — the one it goes in.
+    pub account: Option<String>,
 }
 
 /// What a Direct Conversation's thread hands back to the loop.
@@ -164,6 +168,15 @@ impl Runtime {
         if !crate::companies::conversation::is_id(&parent) {
             return refuse(format!("{parent:?} is not a conversation id"));
         }
+        // A Direct Conversation goes in the account of the one it follows,
+        // or the one named while that belongs to none: an account it cannot
+        // go in is refused before the User is asked.
+        let account = args["account"].as_str().map(str::to_string);
+        if let Some(c) = sup.company(&name)
+            && let Err(e) = sup.may_follow_in(&c, &parent, account.as_deref())
+        {
+            return refuse(e);
+        }
         let channel = self.human_channel(caller);
         #[cfg(feature = "a2a")]
         let askable = match &channel {
@@ -195,6 +208,9 @@ impl Runtime {
         let target = Self::target_of(caller);
         if !self.open_direct_gate(&id, &name, &parent, None, None, Some(target)) {
             return refuse("no A2A listener to ask the User on".into());
+        }
+        if let Some(t) = self.company_directs.get_mut(&id) {
+            t.account = account;
         }
         ToolOutcome::Deferred(PendingKind::CompanyDirect { id, company: name })
     }
@@ -282,6 +298,7 @@ impl Runtime {
                     joined: None,
                     joining: false,
                     closing: false,
+                    account: None,
                 },
             );
             self.log.info(
@@ -437,12 +454,13 @@ impl Runtime {
             return;
         };
         let tx = self.events_tx.clone();
+        let account = self.company_directs.get(id).and_then(|t| t.account.clone());
         let (id, key, parent) = (id.to_string(), format!("direct/{task}"), parent.to_string());
         std::thread::Builder::new()
             .name(format!("company-direct:{}", c.name))
             .spawn(move || {
                 let joined = sup
-                    .join_direct(&c, &parent, &words, &key)
+                    .join_direct(&c, &parent, account.as_deref(), &words, &key)
                     .map_err(|e| e.to_string());
                 let _ = tx.send(super::events::Event::CompanyDirect {
                     id,
@@ -576,6 +594,7 @@ impl Runtime {
                             let _ = sup.conversation_op(
                                 &c,
                                 &cid,
+                                None,
                                 crate::companies::wire::conversation::CLOSE,
                                 None,
                             );
@@ -829,6 +848,7 @@ impl Runtime {
                                 let _ = sup.conversation_op(
                                     &c,
                                     &cid,
+                                    None,
                                     crate::companies::wire::conversation::CLOSE,
                                     None,
                                 );
@@ -974,6 +994,7 @@ impl Runtime {
                             joined: Some(cid),
                             joining: false,
                             closing: false,
+                            account: None,
                         },
                     );
                 }
@@ -994,6 +1015,7 @@ impl Runtime {
                             joined: None,
                             joining: true,
                             closing: false,
+                            account: None,
                         },
                     );
                     self.log.info(

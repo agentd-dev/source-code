@@ -769,13 +769,19 @@
         "company.sign_in": {
           "additionalProperties": false,
           "properties": {
+            "account": {
+              "description": "The label of the User's account at the Company to act with (1 to 32 of a-z, 0-9, _ and -), as company.status lists them; omit it when the User holds one there, or none",
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
             "company": {
               "description": "The company entry",
               "minLength": 1,
               "type": "string"
             },
             "new_account": {
-              "description": "Sign in to another account than before, in a new Session",
+              "description": "Sign in to another account than the one the label names, in a new Session",
               "type": "boolean"
             },
             "op": {
@@ -798,6 +804,12 @@
         "company.sign_out": {
           "additionalProperties": false,
           "properties": {
+            "account": {
+              "description": "The label of the User's account at the Company to act with (1 to 32 of a-z, 0-9, _ and -), as company.status lists them; omit it when the User holds one there, or none",
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
             "company": {
               "description": "The company entry the User signs out at",
               "minLength": 1,
@@ -1678,13 +1690,19 @@
         "args": {
           "additionalProperties": false,
           "properties": {
+            "account": {
+              "description": "The label of the User's account at the Company to act with (1 to 32 of a-z, 0-9, _ and -), as company.status lists them; omit it when the User holds one there, or none",
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
             "company": {
               "description": "The company entry",
               "minLength": 1,
               "type": "string"
             },
             "new_account": {
-              "description": "Sign in to another account than before, in a new Session",
+              "description": "Sign in to another account than the one the label names, in a new Session",
               "type": "boolean"
             },
             "scopes": {
@@ -1700,11 +1718,18 @@
           ],
           "type": "object"
         },
-        "description": "Ask the User to sign in at a Company {company, scopes?, new_account?}: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
+        "description": "Ask the User to sign in at a Company {company, account?, scopes?, new_account?} — to the account `account` labels, the only one held, else `default`: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
         "reply": "task",
         "result": {
           "additionalProperties": false,
           "properties": {
+            "account": {
+              "description": "the label of the account it signs in to, once known",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "company": {
               "type": "string"
             },
@@ -1736,6 +1761,7 @@
           },
           "required": [
             "company",
+            "account",
             "outcome",
             "signed_in"
           ],
@@ -1746,6 +1772,12 @@
         "args": {
           "additionalProperties": false,
           "properties": {
+            "account": {
+              "description": "The label of the User's account at the Company to act with (1 to 32 of a-z, 0-9, _ and -), as company.status lists them; omit it when the User holds one there, or none",
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
             "company": {
               "description": "The company entry the User signs out at",
               "minLength": 1,
@@ -1757,11 +1789,18 @@
           ],
           "type": "object"
         },
-        "description": "Sign the User out at a Company {company}: the Account Token is revoked there and forgotten here, and the Session continues signed out. The configured User's alone",
+        "description": "Sign the User out of one account at a Company {company, account?} — the one `account` labels, or the only one held: its Account Token is revoked there and forgotten here, and every other account stays signed in. The configured User's alone",
         "reply": "task",
         "result": {
           "additionalProperties": false,
           "properties": {
+            "account": {
+              "description": "the label of the account signed out of; null when none was held",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "company": {
               "type": "string"
             },
@@ -1776,6 +1815,7 @@
           },
           "required": [
             "company",
+            "account",
             "signed_out",
             "revoked"
           ],
@@ -1789,7 +1829,7 @@
           "required": [],
           "type": "object"
         },
-        "description": "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, whether the Session is signed in, until when it asked for no requests, and its MCP servers",
+        "description": "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, the User's accounts there by label and whether the Session its MCP servers act with is signed in, until when it asked for no requests, and its MCP servers",
         "reply": "message",
         "result": {
           "additionalProperties": false,
@@ -1798,6 +1838,53 @@
               "items": {
                 "additionalProperties": false,
                 "properties": {
+                  "accounts": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "account": {
+                          "description": "its label, agentd's own word",
+                          "type": "string"
+                        },
+                        "expires_at": {
+                          "description": "RFC 3339: when its Account Token stops being good, if the Company said",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "kind": {
+                          "description": "how the User signed in: device or direct",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "scope": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "signed_in": {
+                          "description": "whether its Session is signed in, once one is open",
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "account",
+                        "scope",
+                        "expires_at",
+                        "kind",
+                        "signed_in"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
                   "company": {
                     "description": "the company entry",
                     "type": "string"
@@ -1872,6 +1959,7 @@
                     "type": "array"
                   },
                   "signed_in": {
+                    "description": "whether the Session its MCP servers act with — the account labelled default, or the only one held, else the signed-out Session — is signed in, once one is open",
                     "type": [
                       "boolean",
                       "null"
@@ -1894,6 +1982,7 @@
                   "issuer",
                   "privacy",
                   "signed_in",
+                  "accounts",
                   "rate_limited_until",
                   "in_flight",
                   "limit",

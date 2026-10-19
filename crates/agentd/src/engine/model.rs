@@ -2117,8 +2117,9 @@ fn parse_step(
     {
         errs.push(format!("{at}: output_schema: {}", e.join("; ")));
     }
-    // `auth: {kind: company, company: <entry>}` makes an `http` step a call
-    // of a Company's API (RFC 0047 §5.5.8): the credential, the hosts and the
+    // `auth: {kind: company, company: <entry>, account?: <label>}` makes an
+    // `http` step a call of a Company's API (RFC 0047 §5.5.8) in the User's
+    // account the label names (§9, P5b): the credential, the hosts and the
     // `Idempotency-Key` are agentd's, so a step names none of its own.
     if kind == "http"
         && let Some(auth) = spec.get("auth")
@@ -2126,11 +2127,13 @@ fn parse_step(
         let ok = auth.as_object().is_some_and(|o| {
             o.get("kind").and_then(Value::as_str) == Some("company")
                 && o.get("company").is_some_and(Value::is_string)
-                && o.keys().all(|k| k == "kind" || k == "company")
+                && o.get("account").is_none_or(Value::is_string)
+                && o.keys()
+                    .all(|k| k == "kind" || k == "company" || k == "account")
         });
         if !ok {
             errs.push(format!(
-                "{at}: http auth takes {{kind: company, company: <entry>}}"
+                "{at}: http auth takes {{kind: company, company: <entry>, account: <label>}}, account optional"
             ));
         }
         for field in ["sign", "allow_private", "idempotency", "body"] {

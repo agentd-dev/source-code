@@ -930,7 +930,7 @@ impl Runtime {
                     Some("company_sign_in") if !self.company_sign_ins.contains_key(w["sign_in"].as_str().unwrap_or_default()) => {
                         let company = w["company"].as_str().unwrap_or_default();
                         self.log.info("company.sign_in.failed", json!({"company": company, "reason": "interrupted", "run": rid, "step": sid}));
-                        let out = crate::companies::signin::Outcome::Interrupted.result(company).unwrap_or_default();
+                        let out = crate::companies::signin::Outcome::Interrupted.result(company, None).unwrap_or_default();
                         resolve.push((rid.clone(), sid.clone(), StepStatus::Done, out, None));
                     }
                     // A confirm this process does not hold was a previous

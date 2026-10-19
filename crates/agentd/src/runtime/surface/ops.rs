@@ -456,7 +456,7 @@ pub const OPS: &[OpSpec] = &[
         Scope::Instance,
         Gate::Companies,
         Handler::Company,
-        "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, whether the Session is signed in, until when it asked for no requests, and its MCP servers",
+        "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, the User's accounts there by label and whether the Session its MCP servers act with is signed in, until when it asked for no requests, and its MCP servers",
         no_args,
         company_status_result,
     ),
@@ -480,7 +480,7 @@ pub const OPS: &[OpSpec] = &[
         Scope::Instance,
         Gate::Companies,
         Handler::Company,
-        "Ask the User to sign in at a Company {company, scopes?, new_account?}: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
+        "Ask the User to sign in at a Company {company, account?, scopes?, new_account?} — to the account `account` labels, the only one held, else `default`: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
         company_sign_in_args,
         company_sign_in_result,
     ),
@@ -492,7 +492,7 @@ pub const OPS: &[OpSpec] = &[
         Scope::Instance,
         Gate::Companies,
         Handler::Company,
-        "Sign the User out at a Company {company}: the Account Token is revoked there and forgotten here, and the Session continues signed out. The configured User's alone",
+        "Sign the User out of one account at a Company {company, account?} — the one `account` labels, or the only one held: its Account Token is revoked there and forgotten here, and every other account stays signed in. The configured User's alone",
         company_sign_out_args,
         company_sign_out_result,
     ),
@@ -1219,8 +1219,9 @@ fn company_sign_in_args() -> Value {
         &["company"],
         json!({
             "company": named("The company entry"),
+            "account": crate::registry::internal::company_account_arg(),
             "scopes": {"type": "array", "items": {"type": "string"}, "description": "The account scopes to ask for; every scope the entry allows when absent"},
-            "new_account": {"type": "boolean", "description": "Sign in to another account than before, in a new Session"},
+            "new_account": {"type": "boolean", "description": "Sign in to another account than the one the label names, in a new Session"},
         }),
     )
 }
@@ -1233,7 +1234,10 @@ fn company_sign_in_result() -> Value {
 fn company_sign_out_args() -> Value {
     closed(
         &["company"],
-        json!({"company": named("The company entry the User signs out at")}),
+        json!({
+            "company": named("The company entry the User signs out at"),
+            "account": crate::registry::internal::company_account_arg(),
+        }),
     )
 }
 

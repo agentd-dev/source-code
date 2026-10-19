@@ -19,6 +19,11 @@
 //! | `401 invalid_dpop_proof` | a typed error |
 //! | `429` / `503` with `Retry-After` | the Company's not-before instant: nothing more is sent to it, by any task, until then |
 //!
+//! A request is made in the Session of the User's account it names
+//! ([`Signed::account`]), or the signed-out Session: its Account Token is the
+//! only one a renewal there is granted on, and the account's label is never
+//! sent.
+//!
 //! A request made for a unit of work names the span the privacy profile
 //! gives it in its `traceparent` header ([`Supervisor::request_trace`]), and
 //! one that belongs to none — a reader's, a decline's — the process's trace
@@ -68,6 +73,9 @@ pub enum Repeat {
 
 /// One request.
 pub struct Signed<'a> {
+    /// The label of the account whose Session it is made in; none for the
+    /// signed-out Session. Never sent: the label is agentd's own word.
+    pub account: Option<&'a str>,
     pub method: &'a str,
     pub url: &'a str,
     /// Its headers beside the credential.
@@ -187,7 +195,7 @@ impl Supervisor {
         req: &Signed<'_>,
         stream: Option<std::time::Duration>,
     ) -> Result<Answer, CallError> {
-        match self.with_session(company, |session, env| {
+        match self.with_session(company, req.account, |session, env| {
             Ok(signed_with(session, env, req, stream))
         }) {
             Ok(answer) => answer,
@@ -303,7 +311,7 @@ fn signed_with(
             (403, Some(e))
                 if e == err::SIGN_IN_REQUIRED
                     && !renewed
-                    && env.account(&session.issuer).ok().flatten().is_some() =>
+                    && session.held(env).ok().flatten().is_some() =>
             {
                 renewed = true;
                 session.refused_dpop(&token);
@@ -406,6 +414,7 @@ mod tests {
     #[test]
     fn an_unanswered_write_is_outcome_unknown_and_a_read_is_not() {
         let req = |repeat| Signed {
+            account: None,
             method: "POST",
             url: "https://api.example/x",
             headers: &[],

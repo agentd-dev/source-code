@@ -90,6 +90,12 @@ pub struct Conversation {
     /// User's own, which only their relayed words are sent to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_of: Option<String>,
+    /// The label of the User's account it belongs to: the one it began in,
+    /// or — begun signed out — the first one it used (§7.2: "Once it uses
+    /// the User's account, it belongs to that account instead"). Every
+    /// request on it is made in that account's Session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// One operation a Company proposed, as agentd keeps it (RFC 0047 §5.8.1):
@@ -102,6 +108,11 @@ pub struct Operation {
     /// The `session_id` of the Session it was proposed in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The label of the User's account whose Session proposed it; none for
+    /// the signed-out Session. It is read, confirmed and cancelled in that
+    /// Session alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// Its latest revision, as the Company last said.
     pub revision: u64,
     pub state: String,
@@ -274,14 +285,16 @@ impl Book {
         minted(&mut self.writes, key, uuid_v4)
     }
 
-    /// Keep `id` as an open conversation at `company`, unless it is kept.
-    pub fn open(&mut self, id: &str, company: &str) {
+    /// Keep `id` as an open conversation at `company`, in the account
+    /// `account` names — none, signed out — unless it is kept.
+    pub fn open(&mut self, id: &str, company: &str, account: Option<&str>) {
         self.conversations
             .entry(id.to_string())
             .or_insert_with(|| Conversation {
                 company: company.to_string(),
                 open: true,
                 opened_ms: crate::state::now_ms(),
+                account: account.map(str::to_string),
                 ..Conversation::default()
             });
     }
@@ -598,17 +611,22 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let l = ledger(&store, Some(7));
         l.update("user:dana", "https://as.one", |b| {
-            b.open("cnv_secret_one", "shop");
+            b.open("cnv_secret_one", "shop", Some("work"));
             Ok(())
         })
         .unwrap();
         let d = dump(&store);
         assert!(
-            !d.contains("cnv_secret_one") && !d.contains("as.one"),
+            !d.contains("cnv_secret_one") && !d.contains("as.one") && !d.contains("work"),
             "{d}"
         );
         let book = l.load("user:dana", "https://as.one").unwrap();
         assert!(book.conversations["cnv_secret_one"].open);
+        assert_eq!(
+            book.conversations["cnv_secret_one"].account.as_deref(),
+            Some("work"),
+            "the account it began in"
+        );
         assert!(
             ledger(&store, Some(8))
                 .load("user:dana", "https://as.one")
@@ -621,7 +639,7 @@ mod tests {
             .update("operator", "https://as", |b| {
                 for i in 0..CLOSED + 3 {
                     let id = format!("cnv_{i}");
-                    b.open(&id, "shop");
+                    b.open(&id, "shop", None);
                     b.conversations.get_mut(&id).unwrap().opened_ms = i as u64;
                     b.close(&id);
                 }

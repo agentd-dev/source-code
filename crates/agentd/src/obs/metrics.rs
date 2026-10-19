@@ -540,17 +540,18 @@ pub fn record_company_token_request(company: &str, grant: &str, outcome: &str) {
     let _ = (company, grant, outcome);
 }
 
-/// Whether agentd's Session at a Company is signed in
-/// (`agent_company_signed_in{company}`, 0 or 1).
-pub fn set_company_signed_in(company: &str, signed_in: bool) {
+/// Whether the Session of the User's account `account` at a Company — by
+/// its label, agentd's own word — is signed in
+/// (`agent_company_signed_in{company, account}`, 0 or 1).
+pub fn set_company_signed_in(company: &str, account: &str, signed_in: bool) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.event_set(
         "agent_company_signed_in",
-        vec![company.into()],
+        vec![company.into(), account.into()],
         u64::from(signed_in),
     );
     #[cfg(not(feature = "metrics"))]
-    let _ = (company, signed_in);
+    let _ = (company, account, signed_in);
 }
 
 /// The instant before which nothing is sent to a Company, in seconds since
@@ -982,7 +983,9 @@ mod imp {
             &["server", "event"],
         ),
         // --- Companies (RFC 0047 §7): `company` is a company entry's name,
-        // and no label carries a User ID, a session or a conversation.
+        // `account` the label of one of the User's accounts there — agentd's
+        // own word, never the Company's — and no label carries a User ID, a
+        // session or a conversation.
         (
             "agent_company_requests_total",
             "counter",
@@ -998,8 +1001,8 @@ mod imp {
         (
             "agent_company_signed_in",
             "gauge",
-            "Whether agentd's Session at the Company is signed in (0 or 1).",
-            &["company"],
+            "Whether the Session of the User's account at the Company, by its label, is signed in (0 or 1).",
+            &["company", "account"],
         ),
         (
             "agent_company_rate_limited_until_seconds",

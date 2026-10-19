@@ -956,8 +956,8 @@ the Personal Agent Protocol draft
 - **Account Tokens are kept sealed.** The Account Token a sign-in gives
   agentd is stored only sealed with AES-256-GCM under
   `security.companies.seal_key`, which load requires of any `sign_in`, bound
-  to the `client_id`, the issuer and the User, under an id the store cannot
-  map to a Company. The supervisor reads it for each request that uses it and
+  to the `client_id`, the issuer, the User and the label of the account it
+  is for, under an id the store cannot map to a Company or an account. The supervisor reads it for each request that uses it and
   holds it for that request alone; it is sent only to the Company's token and
   revocation endpoints, in the form body, never in a URL, a log line, a
   model's context or a child's payload. A rotated one is kept before the
@@ -1058,10 +1058,17 @@ the Personal Agent Protocol draft
   `security.companies.browsers` names is refused when any string argument
   names a Company's host as a browser would read it, or a host that is not
   ASCII.
+- **One Session per account.** Each of the User's accounts at a Company has
+  its own Account Token and its own Session, with a DPoP key of its own; a
+  request is made in the Session of the account it names, a conversation or
+  an operation in the one it belongs to, and none falls back to another
+  account's. The account's label is agentd's own word: no request sent to a
+  Company carries it.
 - **A reset is a new User.** `company.user_id.reset` revokes and forgets the
-  Account Token, and drops the Session and the Company's MCP connections with
-  the User ID, so nothing the Company tied to the old User — a token, an MCP
-  session — reaches it again.
+  Account Token of every account the User holds there, and drops the
+  Sessions and the Company's MCP connections with the User ID, so nothing
+  the Company tied to the old User — a token, an MCP session — reaches it
+  again.
 - **Only the User approves an operation.** With the Operations extension
   listed, an action a Company proposes is confirmed only with the User's
   `approve` of the revision confirmed, at their own gate — never a judge's,
@@ -1118,8 +1125,16 @@ What does not:
   recognised as the same: the draft gives an operation no kind of action, and
   a standing permission binds to the channel that proposed it for the same
   reason. Nor does the draft name the account a Session is signed in to, so
-  a standing permission covers the account connected when it was declared; a
-  sign-in to a new account suspends it until a restart.
+  a standing permission covers the accounts its labels named when it was
+  declared — without `accounts`, the one labelled `default` alone. A label
+  is held to its account by its Session: a sign-in to it again goes there,
+  where the Company takes only the same account. A sign-in that goes in a
+  new Session may be to another account — one with `new_account`, or one
+  under a label whose account was signed out of, reset or lost with its
+  Session — and suspends the permissions covering the label until a
+  restart, which takes the account the label then holds as the one meant.
+- The User ID is one per User per Company, so a Company can tell that the
+  accounts the User holds there are one person's.
 
 ## What agentd does not protect against
 

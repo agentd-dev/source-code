@@ -102,6 +102,24 @@ pub struct Standing {
     /// How many confirms it covers; none limits it to `expires` alone.
     #[serde(default)]
     pub uses: Option<u32>,
+    /// The labels of the User's accounts at the Company it covers; none
+    /// covers the account labelled [`DEFAULT_ACCOUNT`] alone — and the
+    /// signed-out Session — so a second account is never covered unlisted.
+    #[serde(default)]
+    pub accounts: Option<Vec<String>>,
+}
+
+/// The label of the account a sign-in names none for (RFC 0047 §9, P5b).
+pub const DEFAULT_ACCOUNT: &str = "default";
+
+/// Whether `label` is one a User's account at a Company may be named by: 1
+/// to 32 of `a`–`z`, `0`–`9`, `_` and `-`. agentd's own word, never sent to
+/// the Company.
+pub fn is_account_label(label: &str) -> bool {
+    (1..=32).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
 /// A standing permission's channel: one of the Company's MCP tools, by a
@@ -841,6 +859,20 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
                     "workflow {wf:?} step {id:?}: auth.company {name:?} is not a company entry that uses `openapi` (services.<name>.interfaces)"
                 ));
             }
+            // The User's account it acts with, by label; a templated one is
+            // held to the label's form when it runs.
+            if st.kind == "http"
+                && let Some(account) = st
+                    .field("auth")
+                    .and_then(|a| a.get("account"))
+                    .and_then(serde_json::Value::as_str)
+                && !account.contains("{{")
+                && !is_account_label(account)
+            {
+                out.push(format!(
+                    "workflow {wf:?} step {id:?}: auth.account {account:?} is not an account label (1 to 32 of a-z, 0-9, _ and -)"
+                ));
+            }
             if let Some(b) = &st.body {
                 walk(s, wf, &b.steps, out);
             }
@@ -1532,6 +1564,22 @@ fn validate_standing(s: &Settings, at: &str, st: &Standing, err: &mut impl FnMut
             "{at}.uses: 0 would never apply; at least 1, or leave it out to bound it by expires alone"
         ));
     }
+    if let Some(accounts) = &st.accounts {
+        if accounts.is_empty() {
+            err(format!(
+                "{at}.accounts: an empty list covers no account; list the labels it covers, or leave it out to cover {DEFAULT_ACCOUNT:?} alone"
+            ));
+        }
+        for (i, a) in accounts.iter().enumerate() {
+            if !is_account_label(a) {
+                err(format!(
+                    "{at}.accounts: {a:?} is not an account label (1 to 32 of a-z, 0-9, _ and -)"
+                ));
+            } else if accounts[..i].contains(a) {
+                err(format!("{at}.accounts: {a:?} is listed twice"));
+            }
+        }
+    }
 }
 
 /// The HTTP methods an OpenAPI operation may have (OpenAPI 3.1 §4.8.9).
@@ -2042,6 +2090,18 @@ mod tests {
             "url: \"https://example.com/api/orders/o1\", auth: {kind: company, company: shop}",
         ))
         .unwrap();
+        // In the account a label names; a label agentd would never keep is
+        // refused at load.
+        load(&flow(
+            "url: \"https://example.com/api/orders/o1\", auth: {kind: company, company: shop, account: work}",
+        ))
+        .unwrap();
+        refused(
+            &flow(
+                "url: \"https://example.com/api/orders/o1\", auth: {kind: company, company: shop, account: \"Work Account\"}",
+            ),
+            "auth.account \"Work Account\" is not an account label",
+        );
         refused(
             &flow(
                 "url: \"https://example.com/api/orders/o1\", auth: {kind: company, company: other}",
@@ -2050,7 +2110,7 @@ mod tests {
         );
         refused(
             &flow("url: \"https://example.com/x\", auth: {kind: bearer, company: shop}"),
-            "http auth takes {kind: company, company: <entry>}",
+            "http auth takes {kind: company, company: <entry>, account: <label>}",
         );
         refused(
             &flow(
@@ -2199,6 +2259,43 @@ mod tests {
             &with(listed, &rule(", via: {tool: \"shop.x\"}, uses: 0"), ""),
             "standing[0].uses: 0 would never apply",
         );
+        // The accounts it covers, by label: none listed covers `default`.
+        refused(
+            &with(listed, &rule(", via: {tool: \"shop.x\"}, accounts: []"), ""),
+            "standing[0].accounts: an empty list covers no account",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}, accounts: [Work]"),
+                "",
+            ),
+            "standing[0].accounts: \"Work\" is not an account label",
+        );
+        refused(
+            &with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}, accounts: [work, work]"),
+                "",
+            ),
+            "standing[0].accounts: \"work\" is listed twice",
+        );
+        if cfg!(feature = "cel") {
+            let s = load(&with(
+                listed,
+                &rule(", via: {tool: \"shop.x\"}, accounts: [default, work]"),
+                "",
+            ))
+            .unwrap();
+            assert_eq!(
+                s.security.companies.standing[0].accounts.as_deref(),
+                Some(&["default".to_string(), "work".to_string()][..])
+            );
+            assert_eq!(
+                load(&ok).unwrap().security.companies.standing[0].accounts,
+                None
+            );
+        }
         if cfg!(feature = "cel") {
             refused(
                 &with(

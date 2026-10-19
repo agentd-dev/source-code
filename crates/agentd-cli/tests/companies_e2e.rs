@@ -2460,7 +2460,7 @@ mod over_a2a {
         let q = status_text(&t);
         assert!(
             q.starts_with(&format!(
-                "Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes. Open {}/auth/device/verify?user_code=",
+                "Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes; agentd calls this account \"default\". Open {}/auth/device/verify?user_code=",
                 f.origin
             )),
             "{q}"
@@ -2849,7 +2849,10 @@ mod over_a2a {
     /// clients of the running daemon over its unix A2A listener (RFC 0047
     /// §5.3): the login prints where to sign in and how it ended, the logout
     /// revokes the Account Token — the fake records it — and a second logout
-    /// says nobody is signed in.
+    /// says nobody is signed in. `company:<name>/<label>` names one of the
+    /// User's several accounts there (§9, P5b): each is signed in to and out
+    /// of on its own, a logout naming none while several are held is refused,
+    /// and the label reaches the Company in nothing agentd sends.
     #[test]
     fn login_and_logout_reach_the_daemon_over_its_unix_listener() {
         let dir = tempfile::tempdir().unwrap();
@@ -2867,17 +2870,13 @@ mod over_a2a {
         .unwrap();
         let d = start(&s, "unix", &[]);
         wait_for(&d.log, "joined", |l| joined(l, "shop"));
-        let cli = |flag: &str| {
+        let cli_at = |flag: &str, target: &str| {
             Command::new(env!("CARGO_BIN_EXE_agentd"))
-                .args([
-                    "--config",
-                    &s.cfg.display().to_string(),
-                    flag,
-                    "company:shop",
-                ])
+                .args(["--config", &s.cfg.display().to_string(), flag, target])
                 .output()
                 .unwrap()
         };
+        let cli = |flag: &str| cli_at(flag, "company:shop");
         let out = cli("--login");
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(
@@ -2890,7 +2889,9 @@ mod over_a2a {
             "{stdout}"
         );
         assert!(
-            stdout.contains("Signed in at shop, for poppy:read poppy:write."),
+            stdout.contains(
+                "Signed in at shop, as the account \"default\", for poppy:read poppy:write."
+            ),
             "{stdout}"
         );
         let token = account_tokens(&f)[0].clone();
@@ -2901,20 +2902,48 @@ mod over_a2a {
         assert!(out.status.success(), "{stdout}");
         assert_eq!(
             stdout.trim(),
-            "Signed in at shop, for poppy:read poppy:write.",
+            "Signed in at shop, as the account \"default\", for poppy:read poppy:write.",
             "no gate"
+        );
+        // A second account, named by its label.
+        let work = "lbl-work-z3";
+        f.control(json!({"approver": {"account": "acct_2"}}));
+        let out = cli_at("--login", &format!("company:shop/{work}"));
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains(&format!("agentd calls this account \"{work}\""))
+                && stdout.contains(&format!("Signed in at shop, as the account \"{work}\"")),
+            "{stdout}"
+        );
+        let out = cli("--logout");
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .contains("several accounts here (default, lbl-work-z3)"),
+            "{out:?}"
+        );
+        let out = cli_at("--logout", &format!("company:shop/{work}"));
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains(&format!("Signed out of the account \"{work}\" at shop")),
+            "{stdout}"
         );
         let out = cli("--logout");
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(out.status.success(), "{stdout}");
-        assert!(stdout.contains("Signed out at shop"), "{stdout}");
+        assert!(
+            stdout.contains("Signed out of the account \"default\" at shop"),
+            "{stdout}"
+        );
         let revoked: Vec<Value> = f
             .record()
             .into_iter()
             .filter(|r| r["path"] == "/auth/revoke")
             .collect();
-        assert_eq!(revoked.len(), 1, "{revoked:#?}");
-        assert_eq!(revoked[0]["revoked"], true);
+        assert_eq!(revoked.len(), 2, "{revoked:#?}");
+        assert!(revoked.iter().all(|r| r["revoked"] == true), "{revoked:#?}");
         holds_no(&s.dir, &token);
         let out = cli("--logout");
         assert!(out.status.success());
@@ -2922,6 +2951,14 @@ mod over_a2a {
             String::from_utf8_lossy(&out.stdout).contains("was not signed in at shop"),
             "{out:?}"
         );
+        let out = cli_at("--login", "company:shop/Work Account");
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("\"Work Account\" is not one"),
+            "{out:?}"
+        );
+        let seen = serde_json::to_string(&f.record()).unwrap();
+        assert!(!seen.contains(work), "the label reached the Company");
     }
 
     /// Direct Sign-In through the served callback (RFC 0047 §5.7): the client
@@ -3037,7 +3074,8 @@ mod over_a2a {
         );
         let t = state("TASK_STATE_COMPLETED");
         assert!(
-            status_text(&t).contains("Signed in at shop, for poppy:read."),
+            status_text(&t)
+                .contains("Signed in at shop, as the account \"default\", for poppy:read."),
             "{t}"
         );
         // The same callback again: the page, and nothing else — said once
@@ -3085,7 +3123,19 @@ mod over_a2a {
     /// [`setup_with`]'s configuration, its client listing the Operations
     /// extension and its audit records on the log.
     fn operating_setup(h: &Host, f: &Fake, agent: &str, entry: &str, rest: &str) -> Setup {
-        let s = setup_with(h, OPERATING, agent, &shop_entry(&f.origin, entry), rest);
+        operating_setup_with(h, f, OPERATING, agent, entry, rest)
+    }
+
+    /// [`operating_setup`], with `top` the `security.companies` lines.
+    fn operating_setup_with(
+        h: &Host,
+        f: &Fake,
+        top: &str,
+        agent: &str,
+        entry: &str,
+        rest: &str,
+    ) -> Setup {
+        let s = setup_with(h, top, agent, &shop_entry(&f.origin, entry), rest);
         let cfg = std::fs::read_to_string(&s.cfg)
             .unwrap()
             .replace("key_file: \"", "extensions: [operations], key_file: \"")
@@ -3236,6 +3286,88 @@ mod over_a2a {
                 .any(|r| r["outcome"] == "not_addressed" && r["principal"] == "operator"),
             "the operator's answer is on the record too: {records:#?}"
         );
+    }
+
+    /// An exchange proposed in the account a run signed the User in to, by
+    /// its label: the User's gate names the account, and every record of
+    /// the operation — the question, the answer, the confirm, each event and
+    /// audit record — carries the label, which nothing sent to the Company
+    /// does.
+    #[test]
+    fn an_operations_records_name_the_account_it_is_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        const WORK: &str = "lbl-work-z3";
+        let signed = EXCHANGES.replace(
+            "      p: {kind: tool, name: shop.exchange_item,",
+            &format!("      si: {{kind: tool, name: company.sign_in, args: {{company: shop, account: {WORK}}}, depends_on: [s]}}\n      p: {{kind: tool, name: shop.exchange_item,"),
+        )
+        .replace("replacement_sku: stormline-insulated-m}, depends_on: [s]}", "replacement_sku: stormline-insulated-m}, depends_on: [si]}");
+        assert!(signed.contains("depends_on: [si]"), "{signed}");
+        let s = operating_setup_with(&h, &f, &sealed(Some("user:dana")), "", SIGN_IN, &signed);
+        f.control(json!({"approver": {"account": "acct_2"}}));
+        let (d, addr) = start_listening(&s, "labelled", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("exchange").bearer(DANA).result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let t = get_task(&addr, DANA, &task);
+            if t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+                && status_text(&t).contains("asks you to approve this")
+            {
+                let q = status_text(&t);
+                assert!(
+                    q.contains(&format!("for your account \"{WORK}\" at 127.0.0.1")),
+                    "{q}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "{t}\n{}", d.read());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let ok = common::SendMessage::text("approve")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        wait_state(&addr, DANA, &task, "TASK_STATE_COMPLETED", &d.log);
+        let l = d.read();
+        let records = audited(&l, "company.operation");
+        for o in ["asked", "approved", "confirmed"] {
+            let r = records
+                .iter()
+                .find(|r| r["outcome"] == o)
+                .unwrap_or_else(|| panic!("no {o} record: {records:#?}"));
+            assert_eq!(r["target"]["account"], WORK, "{r}");
+        }
+        for e in [
+            "company.operation.proposed",
+            "company.operation.asked",
+            "company.operation.approved",
+            "company.operation.confirmed",
+        ] {
+            let said = events(&l, e);
+            assert!(!said.is_empty(), "no {e}: {l}");
+            assert!(said.iter().all(|x| x["account"] == WORK), "{e}: {said:#?}");
+        }
+        let confirmed: Vec<Value> = f
+            .record()
+            .into_iter()
+            .filter(|r| {
+                r["operation_request"] == true
+                    && r["path"].as_str().unwrap_or_default().ends_with("/confirm")
+            })
+            .collect();
+        assert_eq!(confirmed.len(), 1, "{confirmed:#?}");
+        assert_eq!(confirmed[0]["token_account"], "acct_2");
+        let seen = serde_json::to_string(&f.record()).unwrap();
+        assert!(!seen.contains(WORK), "the label reached the Company");
     }
 
     /// The model passes neither a revision nor an approval: a confirm that

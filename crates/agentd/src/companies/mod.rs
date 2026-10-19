@@ -18,7 +18,9 @@
 //! the User ID ([`ledger`]). The Session is signed
 //! out until the User signs in themselves, at a gate agentd opens for them
 //! ([`signin`]); the Account Token that gives agentd is kept sealed, and
-//! only the supervisor ever reads it ([`account`]). An action a Company
+//! only the supervisor ever reads it ([`account`]). The User may hold several
+//! accounts at one Company, each named by a label of agentd's own and signed
+//! in to in a Session of its own. An action a Company
 //! proposes is confirmed only with the User's approval of its terms, or a
 //! standing permission the operator declared ([`operations`]), and the User
 //! talks with the Company themselves only when they choose to
@@ -132,7 +134,7 @@ mod supervisor {
 
     use serde_json::json;
 
-    use super::account::Accounts;
+    use super::account::{Accounts, DEFAULT_LABEL, is_label};
     use super::discover::{Discovery, Entry, Note, Verified};
     use super::http::Pace;
     use super::identity::Identity;
@@ -291,6 +293,10 @@ mod supervisor {
         Failed(String),
     }
 
+    /// The Sessions, by issuer and the label of the account each is signed
+    /// in to — none for the signed-out Session.
+    type Sessions = BTreeMap<(String, Option<String>), Arc<Session>>;
+
     /// The supervisor's Personal Agent: the identity, the User IDs, the
     /// Companies and their Sessions.
     pub struct Supervisor {
@@ -298,7 +304,7 @@ mod supervisor {
         users: UserIds,
         /// Where the User's Account Tokens are kept, sealed; none without a
         /// seal key, which load requires of any `sign_in`.
-        accounts: Option<Accounts>,
+        pub(super) accounts: Option<Accounts>,
         /// The Direct Sign-Ins waiting for their callback, by `state`.
         pub(super) direct: Mutex<BTreeMap<String, super::signin::Direct>>,
         /// The callbacks that named none, as the log has been told of them.
@@ -307,9 +313,11 @@ mod supervisor {
         companies: BTreeMap<String, Arc<Company>>,
         /// Each Company MCP server's entry.
         servers: BTreeMap<String, String>,
-        /// The Sessions, by issuer: several domains naming one issuer are one
-        /// Company (draft §3.2).
-        sessions: Mutex<BTreeMap<String, Arc<Session>>>,
+        /// The Sessions, by issuer and the label of the account each is
+        /// signed in to — none for the signed-out Session: several domains
+        /// naming one issuer are one Company (draft §3.2), and a Session is
+        /// signed in to at most one account (§4.4).
+        sessions: Mutex<Sessions>,
         /// Whether the seal key and the published identity have checked out.
         ready: Mutex<Ready>,
         /// The Companies that started over with a seal key that opens none
@@ -337,9 +345,9 @@ mod supervisor {
         pub(super) operations: bool,
         /// The standing permissions, as configured.
         pub(super) standing: Vec<super::operations::Rule>,
-        /// The Companies whose standing permissions are suspended until a
-        /// restart.
-        pub(super) standing_suspended: Mutex<BTreeSet<String>>,
+        /// The Companies and account labels whose standing permissions are
+        /// suspended until a restart.
+        pub(super) standing_suspended: Mutex<BTreeSet<(String, String)>>,
         /// Wakes each Company's operations tracker.
         pub(super) track_wake: (Mutex<u64>, Condvar),
         /// This process's own: a confirm's lock names it, so a lock another
@@ -511,7 +519,7 @@ mod supervisor {
         /// called off the loop.
         pub fn secret(&self, company: &Company) -> Result<String, String> {
             let verified = self.verify(company)?;
-            self.session(&verified.issuer)?
+            self.session(&verified.issuer, None)?
                 .secret(&self.users, &self.principal)
         }
 
@@ -583,21 +591,118 @@ mod supervisor {
                 .flatten()
         }
 
-        /// Whether the Session at `company` is signed in, once one is open.
-        pub fn signed_in(&self, company: &Company) -> Option<bool> {
+        /// Whether the Session of the account `account` names at `company` —
+        /// or the signed-out Session — is signed in, once one is open.
+        pub fn signed_in(&self, company: &Company, account: Option<&str>) -> Option<bool> {
             let issuer = company.issuer()?;
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            sessions.get(&issuer).and_then(|s| s.is_signed_in())
+            sessions
+                .get(&(issuer, account.map(str::to_string)))
+                .and_then(|s| s.is_signed_in())
         }
 
-        /// Whether the User's Account Token at `company` is held — read from
-        /// the store, under the issuer `company` was last verified with.
+        /// The labels of the accounts the User holds at the Company `issuer`
+        /// names, as the store keeps them now.
+        fn labels_at(&self, issuer: &str) -> Result<Vec<String>, String> {
+            match &self.accounts {
+                Some(a) => a.labels(&self.principal, issuer),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        /// The labels of the accounts the User holds at `company`, under the
+        /// issuer it was last verified with; none before it was.
+        pub fn accounts_at(&self, company: &Company) -> Vec<String> {
+            company
+                .issuer()
+                .and_then(|i| self.labels_at(&i).ok())
+                .unwrap_or_default()
+        }
+
+        /// The account the Company's MCP servers act with, whose schemas are
+        /// the Company's and take no account: the one labelled
+        /// [`DEFAULT_LABEL`] when it is held, else the only one held, else
+        /// none — the signed-out Session.
+        pub fn mcp_account(&self, issuer: &str) -> Option<String> {
+            let labels = self.labels_at(issuer).ok()?;
+            if labels.iter().any(|l| l == DEFAULT_LABEL) {
+                return Some(DEFAULT_LABEL.to_string());
+            }
+            match labels.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            }
+        }
+
+        /// Whether the Session `company`'s MCP servers act with holds an
+        /// Account Token — under the issuer it was last verified with.
         pub fn holds_account(&self, company: &Company) -> bool {
-            match (&self.accounts, company.issuer()) {
-                (Some(a), Some(issuer)) => a
-                    .load(&self.principal, &issuer)
-                    .is_ok_and(|held| held.is_some()),
-                _ => false,
+            company
+                .issuer()
+                .is_some_and(|i| self.mcp_account(&i).is_some())
+        }
+
+        /// Which of the User's accounts at `company` a call that acts with
+        /// one goes in (RFC 0047 §9, P5b): `named`, when it names one that is
+        /// held; else the only one held; else, with none held, the signed-out
+        /// Session (`None`). A label not held, or none named while several
+        /// are, is refused — nothing is sent.
+        pub fn account_for(
+            &self,
+            company: &Company,
+            named: Option<&str>,
+        ) -> Result<Option<String>, String> {
+            let name = &company.name;
+            if let Some(l) = named.filter(|l| !is_label(l)) {
+                return Err(format!(
+                    "company {name}: {}; nothing was sent",
+                    super::account::label_refused(l)
+                ));
+            }
+            let issuer = self
+                .verify(company)
+                .map_err(|e| format!("company {name} is unavailable: {e}"))?
+                .issuer
+                .clone();
+            let held = self.labels_at(&issuer)?;
+            pick(name, &held, named)
+        }
+
+        /// The account `kept` at the Company `issuer` names, held: a call
+        /// kept in it goes on in it — refused unsent once its Account Token is
+        /// no longer held — and one that names another account is refused.
+        /// Kept in none, the one `named`, as [`Self::account_for`] picks it.
+        /// Nothing is fetched.
+        pub(super) fn kept_account(
+            &self,
+            company: &Company,
+            issuer: &str,
+            kept: Option<&str>,
+            named: Option<&str>,
+            what: &str,
+        ) -> Result<Option<String>, String> {
+            let name = &company.name;
+            match (kept, named) {
+                (Some(k), Some(n)) if k != n => Err(format!(
+                    "company {name}: {what} belongs to the account {k:?}, not {n:?}; nothing was sent"
+                )),
+                (Some(k), _) => {
+                    if !self.labels_at(issuer)?.iter().any(|l| l == k) {
+                        return Err(format!(
+                            "company {name}: {what} belongs to the account {k:?}, which is not signed in here — company.sign_in with account {k:?} signs the User in to it again; nothing was sent"
+                        ));
+                    }
+                    Ok(Some(k.to_string()))
+                }
+                (None, named) => {
+                    if let Some(l) = named.filter(|l| !is_label(l)) {
+                        return Err(format!(
+                            "company {name}: {}; nothing was sent",
+                            super::account::label_refused(l)
+                        ));
+                    }
+                    pick(name, &self.labels_at(issuer)?, named)
+                }
             }
         }
 
@@ -654,6 +759,12 @@ mod supervisor {
                     json!({"server": server, "joined": joined.contains(server), "unusable": unusable})
                 })
                 .collect();
+            let mcp = company.issuer().and_then(|i| self.mcp_account(&i));
+            let accounts: Vec<serde_json::Value> = self
+                .accounts_at(company)
+                .into_iter()
+                .map(|label| self.account_status(company, &label))
+                .collect();
             let mut doc = json!({
                 "company": company.name,
                 "state": state,
@@ -664,7 +775,8 @@ mod supervisor {
                     Privacy::Strict => "strict",
                     Privacy::Standard => "standard",
                 },
-                "signed_in": self.signed_in(company),
+                "signed_in": self.signed_in(company, mcp.as_deref()),
+                "accounts": accounts,
                 "rate_limited_until": company
                     .pace()
                     .until()
@@ -677,6 +789,28 @@ mod supervisor {
                 doc["error"] = json!(error);
             }
             doc
+        }
+
+        /// One account `company.status` lists: its label, the scopes its
+        /// Account Token grants and when it stops being good, how the User
+        /// signed in and whether its Session is signed in — never a token or
+        /// a Session's id.
+        fn account_status(&self, company: &Company, label: &str) -> serde_json::Value {
+            let held = match (&self.accounts, company.issuer()) {
+                (Some(a), Some(i)) => a.load(&self.principal, &i, label).ok().flatten(),
+                _ => None,
+            };
+            json!({
+                "account": label,
+                "scope": held.as_ref().map(|a| a.scope.clone()).unwrap_or_default(),
+                "expires_at": held
+                    .as_ref()
+                    .and_then(|a| a.expires_at_ms)
+                    .and_then(|ms| std::time::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+                    .map(crate::obs::log::rfc3339_millis),
+                "kind": held.as_ref().map(|a| a.kind.clone()),
+                "signed_in": self.signed_in(company, Some(label)),
+            })
         }
 
         /// `company.user_id.reset`: forget the User ID agentd keeps for the
@@ -726,28 +860,37 @@ mod supervisor {
             self.sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&issuer);
+                .retain(|(i, _), _| *i != issuer);
             Ok(self.said_reset(company, false))
         }
 
-        /// Take the User's Account Token at `company` out of the store, for
-        /// the caller to revoke: what `company.user_id.reset` does first, so
-        /// no request after it is signed in as the old User. Taken under the
-        /// Session's lock ([`Session::take_account`]); the issuer is the one
-        /// the Company was last verified with, and nothing is fetched.
-        pub fn take_account(
+        /// Take every Account Token the User holds at `company` out of the
+        /// store, by its account's label, for the caller to revoke: what
+        /// `company.user_id.reset` does first, so no request after it is
+        /// signed in as the old User. Each is taken under its Session's lock
+        /// ([`Session::take_account`]); the issuer is the one the Company was
+        /// last verified with, and nothing is fetched.
+        pub fn take_accounts(
             &self,
             company: &Company,
-        ) -> Result<Option<super::account::Account>, String> {
+        ) -> Result<Vec<(String, super::account::Account)>, String> {
             let (Some(store), Some(issuer)) = (&self.accounts, company.issuer()) else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
-            self.session(&issuer)?
-                .take_account(store, &self.principal, &company.name)
+            let mut taken = Vec::new();
+            for label in self.labels_at(&issuer)? {
+                if let Some(a) = self.session(&issuer, Some(&label))?.take_account(
+                    store,
+                    &self.principal,
+                    &company.name,
+                )? {
+                    taken.push((label, a));
+                }
+            }
+            Ok(taken)
         }
 
         fn said_reset(&self, company: &Company, started_over: bool) -> serde_json::Value {
-            crate::obs::metrics::set_company_signed_in(&company.name, false);
             self.log.info(
                 "company.user_id.reset",
                 json!({"company": company.name, "started_over": started_over}),
@@ -881,28 +1024,64 @@ mod supervisor {
             }
         }
 
-        /// The Session at `issuer`, made with a new DPoP key the first time.
-        fn session(&self, issuer: &str) -> Result<Arc<Session>, String> {
+        /// The Session at `issuer` of the account `account` names — or the
+        /// signed-out Session — made with a new DPoP key the first time.
+        fn session(&self, issuer: &str, account: Option<&str>) -> Result<Arc<Session>, String> {
             let mut s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(x) = s.get(issuer) {
+            let key = (issuer.to_string(), account.map(str::to_string));
+            if let Some(x) = s.get(&key) {
                 return Ok(Arc::clone(x));
             }
-            let x = Arc::new(Session::new(issuer)?);
-            s.insert(issuer.to_string(), Arc::clone(&x));
+            let x = Arc::new(Session::new(issuer, account)?);
+            s.insert(key, Arc::clone(&x));
             Ok(x)
         }
 
-        /// `f`, with the Session at `company` and what its requests are made
+        /// The Session of the account `account` names at `company` is
+        /// forgotten: its account was signed out of, and a sign-in to it
+        /// again starts a Session of its own, with a DPoP key of its own.
+        pub(super) fn drop_session(&self, company: &Company, account: &str) {
+            if let Some(issuer) = company.issuer() {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&(issuer, Some(account.to_string())));
+            }
+        }
+
+        /// The Session `session_id` names at the Company `issuer` names —
+        /// the last account's, signed out of — is the signed-out Session from
+        /// now on, kept with the User ID: it goes on signed out, renewed with
+        /// the assertion (draft §4.9: "Usually those Sessions continue signed
+        /// out, so a cart or an open conversation carries on").
+        pub(super) fn go_on_signed_out(
+            &self,
+            issuer: &str,
+            session_id: &str,
+        ) -> Result<(), String> {
+            let mut rec = self.users.load_or_mint(&self.principal, issuer)?;
+            rec.session_id = Some(session_id.to_string());
+            self.users.save(&self.principal, issuer, &rec)?;
+            self.sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(issuer.to_string(), None));
+            Ok(())
+        }
+
+        /// `f`, with the Session at `company` of the account `account`
+        /// names — or the signed-out Session — and what its requests are made
         /// with: the documents verified — fetched again once they expire —
         /// and the Session made the first time. Unreported, for the caller
         /// to report as part of its own attempt.
         pub fn with_session<T>(
             &self,
             company: &Company,
+            account: Option<&str>,
             f: impl FnOnce(&Session, &Env<'_>) -> Result<T, String>,
         ) -> Result<T, String> {
             let verified = self.verify(company)?;
-            let session = self.session(&verified.issuer)?;
+            let session = self.session(&verified.issuer, account)?;
             let dialer = verified.dialer(&company.discovery.entry);
             let env = Env {
                 identity: &self.identity,
@@ -917,22 +1096,36 @@ mod supervisor {
             f(&session, &env)
         }
 
-        /// A Bearer token for `company`'s MCP server at `url`: discovery, the
+        /// A Bearer token for `company`'s MCP server at `url`, of the Session
+        /// its MCP servers act with ([`Self::mcp_account`]): discovery, the
         /// Session and the token, reported as one outcome for target
         /// `company:<name>`.
         pub fn bearer(&self, company: &Company, url: &str) -> Result<String, String> {
-            let attempt = self.with_session(company, |session, env| {
-                session.open(env)?;
-                session.bearer(env, url)
+            let attempt = self.verify(company).and_then(|v| {
+                let account = self.mcp_account(&v.issuer);
+                self.with_session(company, account.as_deref(), |session, env| {
+                    session.open(env)?;
+                    session.bearer(env, url)
+                })
             });
             self.report(company, attempt)
         }
 
-        /// `url` refused `token`: the next request gets a new one.
+        /// `url` refused `token`: the next request gets a new one, whichever
+        /// Session it was of.
         pub fn session_refused(&self, company: &Company, url: &str, token: &str) {
-            if let Ok(v) = self.verify(company)
-                && let Ok(s) = self.session(&v.issuer)
-            {
+            let Some(issuer) = company.issuer() else {
+                return;
+            };
+            let sessions: Vec<Arc<Session>> = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|((i, _), _)| *i == issuer)
+                .map(|(_, s)| Arc::clone(s))
+                .collect();
+            for s in sessions {
                 s.refused(url, token);
             }
         }
@@ -981,9 +1174,63 @@ mod supervisor {
         }
     }
 
+    /// The account a call that names `named` goes in at `company`, where the
+    /// User holds the accounts `held`: the one it names, when held; with none
+    /// named, the only one held, or — with none held — the signed-out Session.
+    /// Otherwise why none, naming what is held.
+    fn pick(company: &str, held: &[String], named: Option<&str>) -> Result<Option<String>, String> {
+        match (named, held) {
+            (Some(n), _) if held.iter().any(|l| l == n) => Ok(Some(n.to_string())),
+            (Some(n), []) => Err(format!(
+                "company {company}: the User holds no account {n:?} here — none is signed in; company.sign_in with account {n:?} signs them in to it; nothing was sent"
+            )),
+            (Some(n), _) => Err(format!(
+                "company {company}: the User holds no account {n:?} here (the accounts signed in are {}); company.sign_in with account {n:?} signs them in to it; nothing was sent",
+                held.join(", ")
+            )),
+            (None, []) => Ok(None),
+            (None, [only]) => Ok(Some(only.clone())),
+            (None, several) => Err(format!(
+                "company {company}: the User holds several accounts here ({}): name the one to act with as account; nothing was sent",
+                several.join(", ")
+            )),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A call goes in the account it names when that is held; naming
+        /// none, in the only one held, or the signed-out Session while none
+        /// is — and naming none while several are, or one not held, is
+        /// refused, naming what is held.
+        #[test]
+        fn a_call_goes_in_the_account_it_names_or_the_only_one() {
+            let held = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert_eq!(pick("shop", &[], None), Ok(None), "signed out");
+            assert_eq!(
+                pick("shop", &held(&["work"]), None),
+                Ok(Some("work".into()))
+            );
+            assert_eq!(
+                pick("shop", &held(&["default", "work"]), Some("work")),
+                Ok(Some("work".into()))
+            );
+            let e = pick("shop", &held(&["default", "work"]), None).unwrap_err();
+            assert!(
+                e.contains("several accounts here (default, work)")
+                    && e.ends_with("nothing was sent"),
+                "{e}"
+            );
+            let e = pick("shop", &held(&["default"]), Some("home")).unwrap_err();
+            assert!(
+                e.contains("no account \"home\" here (the accounts signed in are default)"),
+                "{e}"
+            );
+            let e = pick("shop", &[], Some("home")).unwrap_err();
+            assert!(e.contains("none is signed in"), "{e}");
+        }
 
         /// At most `limits.in_flight` calls are in flight at a Company: one
         /// more is refused until one ends.

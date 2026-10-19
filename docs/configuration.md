@@ -676,8 +676,8 @@ could not read — answers `outcome unknown` and is not sent again, by a step's
 `retry:` or by a restart that finds the step still running. A `429` or `503`
 with `Retry-After` holds every request to the Company until the wait is over.
 `company.status` (a tool, and an operator op) says where each Company stands;
-the operator op `company.user_id.reset` makes the User new at one, revoking the
-Account Token held there first.
+the operator op `company.user_id.reset` makes the User new at one, revoking
+every Account Token held there first.
 
 The User signs in at a Company themselves, at a gate agentd opens for them
 ([Company gates](human-in-the-loop.md#company-gates)), when an entry lists
@@ -688,11 +688,15 @@ Company's page; Direct Sign-In a link to it, which returns to the callback the
 A2A listener serves. Neither ever opens a browser. The Account Token the sign-in
 gives agentd is kept only sealed with `security.companies.seal_key`, read by the
 supervisor alone for each request that uses it, and written back before use
-when the Company rotates it. Every Session after is signed in with it — renewed,
-or started again when the Company ends one — until the Company answers
-`invalid_grant` for it: a disconnect, a revocation, an expiry. Then it is
-forgotten and work goes on signed out. `company.sign_out` and
-`agentd --logout company:<name>` revoke and forget it.
+when the Company rotates it. Its account's Session is signed in with it —
+renewed, or started again when the Company ends one — until the Company
+answers `invalid_grant` for it: a disconnect, a revocation, an expiry. Then it
+is forgotten and work goes on signed out. `company.sign_out` and
+`agentd --logout company:<name>` revoke and forget it. The User may hold up
+to eight accounts at one Company, each named by a label a sign-in gives it
+(`account`; `agentd --login company:<name>/<label>`) and each with an Account
+Token and a Session of its own; the label never reaches the Company
+([Several accounts](act-at-companies.md#several-accounts)).
 
 #### A Company's agent and its APIs
 
@@ -712,7 +716,7 @@ no unit of work — a reader's — names the process trace under `standard`, and
 none under `strict`. Such a Company is verified at boot too, and opens its
 Session at the first call.
 
-- **`company.converse {company, conversation?, text?, data?, wait?}`** sends a
+- **`company.converse {company, conversation?, account?, text?, data?, wait?}`** sends a
   message: with no `conversation` it starts one and answers its id. The
   message's id is `msg_` and 128 random bits, kept for the call before it is
   sent, so every send of the call — the transport's retry, and a workflow
@@ -723,7 +727,7 @@ Session at the first call.
   new. Its `sender` is always `agent`, and its `context` holds only what
   `security.companies.context` (or the entry's own `context`) shares. With
   `wait`, at most 30 s, the reply is read too.
-- **`company.read {company, conversation, wait?}`** answers the events since
+- **`company.read {company, conversation, account?, wait?}`** answers the events since
   the model's last read, waiting up to `wait` (default 30) while there are
   none; **`company.handoff`** asks for a person at the Company;
   **`company.close`** closes the conversation. A read asked to `wait` is
@@ -755,7 +759,7 @@ Session at the first call.
   conversation: the User is not available for a direct conversation. An
   operation a Company message carries is kept as one the conversation
   proposed ([A Company's operations](#a-companys-operations)).
-- **`company.api {company, api?, method, path, query?, json?, expect?}`**
+- **`company.api {company, api?, method, path, query?, json?, expect?, account?}`**
   calls one operation of an OpenAPI 3.0 or 3.1 description (JSON, at most
   1 MiB; an operation's `$ref`s are followed when it is called or described,
   within the description, at most 16 deep and to at most 20 000 values).
@@ -776,9 +780,15 @@ Session at the first call.
 - **The `http` step** with `auth: {kind: company, company: <name>}` is a
   `company.api` call made by the workflow: its `url` is the operation's (or
   its path under the API's server URL), with the step's `method`, `query`,
-  `json` and `expect`. It takes no `headers`, `body`, `sign`,
-  `allow_private` or `idempotency`: the credential, the body, the hosts and
-  the key are agentd's.
+  `json` and `expect`, and `auth.account` the label of the User's account it
+  acts with, when they hold several there. It takes no `headers`, `body`,
+  `sign`, `allow_private` or `idempotency`: the credential, the body, the
+  hosts and the key are agentd's.
+- **The User's accounts.** Each of these tools, the operation tools and
+  `company.operation.*` take an optional `account`, the label of the User's
+  account to act with ([Several accounts](act-at-companies.md#several-accounts));
+  a call naming none while several are held is refused unsent, and a
+  conversation or an operation goes on in the account it belongs to.
 
 ```yaml
 # fragment: a Company's agent and one of its APIs
@@ -822,8 +832,9 @@ tools are offered once its server joins.
   server name another server has.
 - **Its input schema** is the operation's: its path and query parameters as
   properties, each with its schema and required as declared — nested under
-  `path` and `query` when one's name is another's, `json` or `expect` — `json`
-  for a JSON body, required as declared, and `expect`; nothing else is taken.
+  `path` and `query` when one's name is another's, `json`, `expect` or `account` — `json`
+  for a JSON body, required as declared, `expect`, and `account`, the User's
+  account it acts with; nothing else is taken.
   Header and cookie parameters are not taken, and an operation that requires
   one other than `Idempotency-Key` has no tool. Neither has one whose schemas
   do not resolve within the bounds above, or whose input schema is over
@@ -842,7 +853,7 @@ tools are offered once its server joins.
 - **What holds `company.api` holds it.** A `security.policies` rule judges
   its call as its own and as `company.api`'s, under that name with
   `company.api`'s arguments (`{company, api, method, path, query, json,
-  expect}`) as the call fills them and the tool's own tags; the first rule
+  expect, account}`) as the call fills them and the tool's own tags; the first rule
   that matches either decides. `tools.disabled` naming `company.api`
   disables every operation tool, `tools.narrow` on `company.api` adds its
   tags and note to each, and `agent.tools` offers one to the conversation
@@ -893,9 +904,9 @@ the request that proposed it, and does nothing with it until it is confirmed.
 Every company entry has the stream `company.<name>` then, where an
 operation's final state is appended.
 
-- **`company.operation.get {company, operation_id}`** reads it at the
+- **`company.operation.get {company, operation_id, account?}`** reads it at the
   Company's operations endpoint; **`company.operation.cancel`** cancels it.
-- **`company.operation.confirm {company, operation_id}`** confirms it, and
+- **`company.operation.confirm {company, operation_id, account?}`** confirms it, and
   takes nothing else: the model passes no revision and no approval. agentd
   reads the operation again and confirms its current revision only with the
   User's `approve` at their gate ([Operation approvals](human-in-the-loop.md#operation-approvals))
@@ -932,9 +943,14 @@ lock, so two calls racing for the last use confirm once; it is spent once
 the Company records a confirmation by the permission, and given back when
 the Company refuses the confirm, answers it without taking it, or the
 operation ends with none — a cancel after a confirm it took gives nothing
-back. A sign-in to a new account suspends the Company's standing
-permissions until a restart. They are restart-only and operator-only, like
-every `security.companies` path.
+back. A permission covers the User's accounts its `accounts` lists, by the
+labels sign-ins gave them, and without the list the account labelled
+`default` alone, and the signed-out Session: a second account is never
+covered unlisted. A sign-in that may change the account under a label —
+one with `new_account`, or one under a label whose account was signed out
+of or otherwise given up, which goes in a new Session — suspends the
+permissions covering that label until a restart. They are restart-only and
+operator-only, like every `security.companies` path.
 
 ```yaml
 # fragment: operations, and the exchanges agentd may confirm on its own
@@ -1470,6 +1486,7 @@ Every `security` path is restart · op.
 | `security.companies.standing[].when` | CEL | required | A predicate over `terms` and `summary`; a term it reads that is missing is no match. |
 | `security.companies.standing[].expires` | RFC 3339 time | required | When it stops applying. |
 | `security.companies.standing[].uses` | int ≥ 1 | no limit | How many confirms it covers: each reserved with the confirm, spent once the Company records a confirmation by it, and given back when the Company does not take the confirm or the operation ends unconfirmed. Counted per permission as written: one changed starts its count again. |
+| `security.companies.standing[].accounts` | list of account labels | `default` alone | The User's accounts at the Company it covers, by the labels sign-ins gave them (`[a-z0-9_-]{1,32}`; [Several accounts](act-at-companies.md#several-accounts)): an operation proposed in another account's Session asks the User. Without it, the account labelled `default` and the signed-out Session alone, so signing in to a second account never widens it. |
 | `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the Account Tokens a sign-in gives agentd, and the User ID records, so the store cannot read them. Required with any `sign_in`, and with a remote store. |
 | `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. A call on one with any string argument naming a Company's host as a browser reads it — or a host that is not ASCII — is refused unsent (`company.browser.refused`); their tools are served by the supervisor. |
 | `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |

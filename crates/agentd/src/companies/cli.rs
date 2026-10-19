@@ -12,6 +12,13 @@
 //! operator principal sends the `company.sign_in` op from their own A2A
 //! client as that principal, and any User can ask the agent, whose
 //! `company.sign_in` tool opens the same gate.
+//!
+//! The User's account at the Company is named after a `/`:
+//! `company:<name>/<label>` (RFC 0047 §9, P5b), and without one the op's
+//! own default holds — the only account held, else `default`. The label
+//! rides in the one target argument `--login` already takes, so no flag is
+//! added that every other invocation would have to refuse; and `/` is in
+//! neither an entry's name nor a label, so the target splits one way only.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -145,18 +152,44 @@ fn status_text(task: &Value) -> String {
         .join("\n")
 }
 
-/// `--login company:<name>`: the daemon asks the User — the operator — to
-/// sign in at `name`, and this prints where and how, then how it ended.
-pub fn login(settings: &Settings, name: &str, out: &mut dyn Write) -> Result<String, Failed> {
-    let endpoint = daemon(settings, name, "--login").map_err(Failed::Usage)?;
-    follow(&endpoint, "company.sign_in", json!({"company": name}), out).map_err(Failed::Ended)
+/// The company entry and the label of the User's account there that
+/// `target` — what follows `company:` — names: `<name>` or
+/// `<name>/<label>`, a label refused unless agentd would keep one by it.
+pub fn target_of(target: &str) -> Result<(&str, Option<&str>), String> {
+    match target.split_once('/') {
+        None => Ok((target, None)),
+        Some((name, label)) if super::account::is_label(label) => Ok((name, Some(label))),
+        Some((_, label)) => Err(format!(
+            "company:<name>/<label> names an account by a label of 1 to 32 of a-z, 0-9, _ and -, and {label:?} is not one"
+        )),
+    }
 }
 
-/// `--logout company:<name>`: the daemon revokes and forgets the Account
-/// Token held at `name`.
-pub fn logout(settings: &Settings, name: &str, out: &mut dyn Write) -> Result<String, Failed> {
-    let endpoint = daemon(settings, name, "--logout").map_err(Failed::Usage)?;
-    follow(&endpoint, "company.sign_out", json!({"company": name}), out).map_err(Failed::Ended)
+/// The op `op`'s arguments for `target`.
+fn args_of(settings: &Settings, target: &str, what: &str) -> Result<(A2aEndpoint, Value), String> {
+    let (name, label) = target_of(target)?;
+    let endpoint = daemon(settings, name, what)?;
+    let mut args = json!({"company": name});
+    if let Some(l) = label {
+        args["account"] = json!(l);
+    }
+    Ok((endpoint, args))
+}
+
+/// `--login company:<name>[/<label>]`: the daemon asks the User — the
+/// operator — to sign in at `name`, to the account `label` names, and this
+/// prints where and how, then how it ended.
+pub fn login(settings: &Settings, target: &str, out: &mut dyn Write) -> Result<String, Failed> {
+    let (endpoint, args) = args_of(settings, target, "--login").map_err(Failed::Usage)?;
+    follow(&endpoint, "company.sign_in", args, out).map_err(Failed::Ended)
+}
+
+/// `--logout company:<name>[/<label>]`: the daemon revokes and forgets the
+/// Account Token of the account `label` names at `name` — or the only one
+/// held.
+pub fn logout(settings: &Settings, target: &str, out: &mut dyn Write) -> Result<String, Failed> {
+    let (endpoint, args) = args_of(settings, target, "--logout").map_err(Failed::Usage)?;
+    follow(&endpoint, "company.sign_out", args, out).map_err(Failed::Ended)
 }
 
 #[cfg(test)]
@@ -201,5 +234,26 @@ mod tests {
         ));
         let e = daemon(&dana, "shop", "--logout").unwrap_err();
         assert!(e.contains("security.companies.user is user:dana"), "{e}");
+    }
+
+    /// The target names the entry, and after a `/` the label of the User's
+    /// account there, which rides to the daemon as the op's `account`.
+    #[test]
+    fn the_target_names_the_account_after_a_slash() {
+        assert_eq!(target_of("shop"), Ok(("shop", None)));
+        assert_eq!(target_of("shop/work"), Ok(("shop", Some("work"))));
+        let e = target_of("shop/Work Account").unwrap_err();
+        assert!(e.contains("\"Work Account\" is not one"), "{e}");
+        assert!(target_of("shop/").is_err());
+        let unix = settings(&format!(
+            "{}a2a: {{listen: \"unix:///run/agentd/a2a.sock\"}}\n",
+            BASE.replace("__USER__", "")
+        ));
+        let (_, args) = args_of(&unix, "shop/work", "--login").unwrap();
+        assert_eq!(args, json!({"company": "shop", "account": "work"}));
+        let (_, args) = args_of(&unix, "shop", "--logout").unwrap();
+        assert_eq!(args, json!({"company": "shop"}));
+        let e = args_of(&unix, "travel/work", "--login").unwrap_err();
+        assert!(e.contains("\"travel\" is not a company entry"), "{e}");
     }
 }

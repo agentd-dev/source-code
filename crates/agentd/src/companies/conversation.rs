@@ -53,6 +53,16 @@
 //! A Direct Conversation is the User's: its reader relays what the Company
 //! says there to the User, and nothing but the User's own words is sent to
 //! it — `company.converse` and `company.handoff` refuse one.
+//!
+//! **Which account.** A conversation belongs to the User's account it began
+//! in (`account`, as the ledger keeps it; RFC 0047 §9, P5b), and every
+//! request on it — the model's, the reader's, agentd's own — is made in
+//! that account's Session; one that names another account is refused
+//! unsent, and so is every request once its account is signed out of. One
+//! begun signed out belongs to the first account a request of the model's
+//! uses there (§7.2: "Once it uses the User's account, it belongs to that
+//! account instead"), and agentd's own requests on it go in the signed-out
+//! Session until then.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -96,6 +106,8 @@ pub const DECLINED: &str = "The user declined a direct conversation.";
 pub struct Say {
     /// The conversation it goes to; none starts one.
     pub conversation: Option<String>,
+    /// The label of the User's account the call names, if it names one.
+    pub account: Option<String>,
     pub text: Option<String>,
     pub data: Option<Value>,
     /// What the message's `context` holds: the fields the configuration
@@ -361,6 +373,81 @@ impl Supervisor {
         })
     }
 
+    /// The account a request of the model's on `cid` is made in, held: the
+    /// one it belongs to — and none other, `named` naming another refused —
+    /// or, begun signed out, the one the call picks ([`Supervisor::account_for`]),
+    /// which it belongs to from then on.
+    pub(super) fn in_account(
+        &self,
+        company: &Company,
+        issuer: &str,
+        cid: &str,
+        named: Option<&str>,
+    ) -> Result<Option<String>, CallError> {
+        let kept = self.kept(company, issuer, cid)?.account;
+        let what = format!("the conversation {cid}");
+        let account = self
+            .kept_account(company, issuer, kept.as_deref(), named, &what)
+            .map_err(CallError::Unsent)?;
+        if kept.is_none()
+            && let Some(l) = &account
+        {
+            self.bind(company, issuer, cid, l)?;
+        }
+        Ok(account)
+    }
+
+    /// `cid`, begun signed out, belongs to the account `label` from now on —
+    /// kept before a request in it is sent. One that another call bound to
+    /// another account meanwhile is refused unsent: it goes on in that one
+    /// alone.
+    fn bind(
+        &self,
+        company: &Company,
+        issuer: &str,
+        cid: &str,
+        label: &str,
+    ) -> Result<(), CallError> {
+        let held = self
+            .ledger
+            .update(self.principal(), issuer, |b| {
+                Ok(b.conversations
+                    .get_mut(cid)
+                    .map(|c| c.account.get_or_insert_with(|| label.to_string()).clone()))
+            })
+            .map_err(CallError::Unsent)?;
+        match held {
+            Some(k) if k != label => Err(CallError::Unsent(format!(
+                "company {}: the conversation {cid} belongs to the account {k:?}, not {label:?}; nothing was sent",
+                company.name
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The account agentd's own requests on `cid` — the reader's, a
+    /// decline's — are made in: the one it belongs to, while it is held, or
+    /// the signed-out Session while it belongs to none.
+    pub(super) fn own_account(
+        &self,
+        company: &Company,
+        issuer: &str,
+        cid: &str,
+    ) -> Result<Option<String>, CallError> {
+        match self.kept(company, issuer, cid)?.account {
+            None => Ok(None),
+            Some(k) => self
+                .kept_account(
+                    company,
+                    issuer,
+                    Some(&k),
+                    None,
+                    &format!("the conversation {cid}"),
+                )
+                .map_err(CallError::Unsent),
+        }
+    }
+
     /// A place for a new conversation, while fewer than the limit are open.
     fn opening(&self) -> Result<Opening<'_>, CallError> {
         let mut r = self.readers_lock();
@@ -405,6 +492,14 @@ impl Supervisor {
                 None
             }
         };
+        // A new conversation begins in the account the call picks; one under
+        // way goes on in its own.
+        let account = match &say.conversation {
+            None => self
+                .account_for(company, say.account.as_deref())
+                .map_err(CallError::Unsent)?,
+            Some(cid) => self.in_account(company, &issuer, cid, say.account.as_deref())?,
+        };
         let id = self
             .ledger
             .update(self.principal(), &issuer, |b| b.message_id(&say.key))
@@ -438,6 +533,7 @@ impl Supervisor {
         let reply = self.send_signed(
             company,
             &Signed {
+                account: account.as_deref(),
                 method: "POST",
                 url: &url,
                 headers: &headers,
@@ -483,13 +579,13 @@ impl Supervisor {
                     .to_string();
                 self.ledger
                     .update(self.principal(), &issuer, |b| {
-                        b.open(&cid, &company.name);
+                        b.open(&cid, &company.name, account.as_deref());
                         Ok(())
                     })
                     .map_err(CallError::Unsent)?;
                 self.log().info(
                     "company.conversation.opened",
-                    json!({"company": company.name}),
+                    json!({"company": company.name, "account": account}),
                 );
                 self.log().debug(
                     "company.conversation.id",
@@ -503,6 +599,7 @@ impl Supervisor {
         let mut out = json!({
             "company": company.name,
             "conversation": cid,
+            "account": account,
             "status": answer["status"],
             "responder": answer["responder"],
             "events": [],
@@ -522,7 +619,7 @@ impl Supervisor {
                 out["notes"] = json!(notes);
             }
             (None, Some(w)) if w > 0 => {
-                let read = self.read(company, &cid, w, say.trace.as_ref())?;
+                let read = self.read(company, &cid, None, w, say.trace.as_ref())?;
                 out["events"] = read["events"].clone();
                 out["notes"] = read["notes"].clone();
                 out["status"] = read["status"].clone();
@@ -534,18 +631,21 @@ impl Supervisor {
         Ok(out)
     }
 
-    /// `company.read`: the events of `cid` after the model's last read, the
+    /// `company.read`: the events of `cid` after the model's last read, in
+    /// the account it belongs to — `named` naming another is refused — the
     /// Company holding the read up to `wait` seconds while there are none;
     /// each request names `trace` ([`Supervisor::request_trace`]).
     pub fn read(
         self: &Arc<Self>,
         company: &Arc<Company>,
         cid: &str,
+        named: Option<&str>,
         wait: u32,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<Value, CallError> {
         let (v, ep) = self.conversation_endpoint(company)?;
         let issuer = v.issuer.clone();
+        let account = self.in_account(company, &issuer, cid, named)?;
         let mut cursor = self.kept(company, &issuer, cid)?.read_cursor;
         let (mut events, mut notes) = (Vec::new(), Vec::new());
         let (mut status, mut responder) = (Value::Null, Value::Null);
@@ -562,6 +662,7 @@ impl Supervisor {
             let reply = self.send_signed(
                 company,
                 &Signed {
+                    account: account.as_deref(),
                     method: "GET",
                     url: &url,
                     headers: &[("Accept", "application/json".to_string())],
@@ -607,6 +708,7 @@ impl Supervisor {
         let mut out = json!({
             "company": company.name,
             "conversation": cid,
+            "account": account,
             "status": status,
             "responder": responder,
             "events": events,
@@ -617,12 +719,14 @@ impl Supervisor {
     }
 
     /// `company.handoff` (§7.9) and `company.close` (§7.12): `{}` posted to
-    /// the conversation's `tail`, naming `trace`; a closed conversation's
+    /// the conversation's `tail` in the account it belongs to — `named`
+    /// naming another is refused — naming `trace`; a closed conversation's
     /// reader stops.
     pub fn conversation_op(
         self: &Arc<Self>,
         company: &Arc<Company>,
         cid: &str,
+        named: Option<&str>,
         tail: &str,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<Value, CallError> {
@@ -631,11 +735,13 @@ impl Supervisor {
         if self.kept(company, &issuer, cid)?.direct_of.is_some() && tail == conv::HANDOFF {
             return Err(CallError::Unsent(direct_refused(&company.name, cid)));
         }
+        let account = self.in_account(company, &issuer, cid, named)?;
         let url = url_of(&ep, cid, tail, None, None);
         let what = format!("the {tail} request");
         let reply = self.send_signed(
             company,
             &Signed {
+                account: account.as_deref(),
                 method: "POST",
                 url: &url,
                 headers: &[
@@ -666,6 +772,7 @@ impl Supervisor {
         Ok(json!({
             "company": company.name,
             "conversation": cid,
+            "account": account,
             "status": answer["status"],
             "responder": answer["responder"],
         }))
@@ -726,8 +833,11 @@ impl Supervisor {
     ) -> Option<String> {
         let id = e["id"].as_str()?;
         let kind = e["type"].as_str()?;
+        // The account the conversation belongs to, when it belongs to one.
+        let kept = self.kept(company, issuer, cid).ok()?.account;
         // An operation a Company message carries (Operations §4.3): kept as
-        // one a conversation proposed, whichever read sees it.
+        // one a conversation proposed, in the conversation's account,
+        // whichever read sees it.
         if kind == event::MESSAGE
             && e["message"]["role"] == wire::ROLE_COMPANY
             && let Some(op) = e["message"].get(wire::operations::MEMBER)
@@ -736,6 +846,7 @@ impl Supervisor {
                 super::ledger::Channel::Conversation {
                     conversation: cid.to_string(),
                 },
+                kept.as_deref(),
                 None,
                 op,
             )
@@ -814,26 +925,41 @@ impl Supervisor {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        let held = self
-            .with_session(company, |_, env| env.account(issuer))
-            .ok()
-            .flatten();
+        // The account the conversation belongs to, or — begun signed out —
+        // the only one the User holds here, which it belongs to once its
+        // Account Token answers the Company.
+        let labels = self.accounts_at(company);
+        let label = kept.clone().or_else(|| match labels.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        });
+        let held = label.as_deref().and_then(|l| {
+            self.with_session(company, Some(l), |s, env| s.held(env))
+                .ok()
+                .flatten()
+        });
         let covers = held.as_ref().is_some_and(|a| a.covers(&needed));
-        if covers {
-            // The User's Account Token covers what the Company asks for:
-            // the Session is renewed with it, which signs it in, and the
+        if let (true, Some(l)) = (covers, &label) {
+            // The account's Account Token covers what the Company asks for:
+            // its Session is renewed with it, which signs it in, and the
             // conversation goes on with the new token (§7.11).
             let renewed = if first {
-                self.with_session(company, |s, env| s.renew_now(env))
+                (if kept.is_none() {
+                    self.bind(company, issuer, cid, l)
+                        .map_err(|e| e.to_string())
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| self.with_session(company, Some(l), |s, env| s.renew_now(env)))
             } else {
                 Ok((true, Vec::new()))
             };
             return Some(match renewed {
                 Ok(_) => format!(
-                    "company {name} asked for the User's account ({error}); agentd signed the Session in with the Account Token it holds, and the conversation goes on with the new token"
+                    "company {name} asked for the User's account ({error}); agentd signed the Session of the account {l:?} in with the Account Token it holds, and the conversation goes on in it with the new token"
                 ),
                 Err(e) => format!(
-                    "company {name} asked for the User's account ({error}); agentd could not sign the Session in with the Account Token it holds: {e}"
+                    "company {name} asked for the User's account ({error}); agentd could not sign the Session of the account {l:?} in with the Account Token it holds: {e}"
                 ),
             });
         }
@@ -842,6 +968,12 @@ impl Supervisor {
         } else {
             format!(" with the scopes {}", super::quoted(&needed.join(" "), 128))
         };
+        if kept.is_none() && labels.len() > 1 {
+            return Some(format!(
+                "company {name} asks for the User's account ({error}){scopes}, and the User holds several accounts here ({}): the next company.converse names the one this conversation goes on in, as account — or company.sign_in asks the User to sign in",
+                labels.join(", ")
+            ));
+        }
         Some(format!(
             "company {name} asks for the User's account ({error}){scopes}, and agentd holds no Account Token that covers it: company.sign_in asks the User to sign in, and the conversation goes on with the new token"
         ))
@@ -869,10 +1001,14 @@ impl Supervisor {
             return;
         }
         let sent = self
-            .ledger
-            .update(self.principal(), issuer, |b| b.message_id(key))
-            .map_err(CallError::Unsent)
-            .and_then(|id| {
+            .own_account(company, issuer, cid)
+            .and_then(|account| {
+                self.ledger
+                    .update(self.principal(), issuer, |b| b.message_id(key))
+                    .map(|id| (account, id))
+                    .map_err(CallError::Unsent)
+            })
+            .and_then(|(account, id)| {
                 let body = serde_json::to_vec(&json!({"message": {
                     "id": id, "sender": wire::SENDER_AGENT, "text": text,
                 }}))
@@ -880,6 +1016,7 @@ impl Supervisor {
                 self.send_signed(
                     company,
                     &Signed {
+                        account: account.as_deref(),
                         method: "POST",
                         url: &url_of(&ep, cid, conv::MESSAGES, None, None),
                         headers: &[
@@ -1192,6 +1329,7 @@ impl Supervisor {
         if !kept.open {
             return Ok(true);
         }
+        let account = self.own_account(company, issuer, cid)?;
         let mut headers = vec![(
             "Accept",
             format!("{}, application/json", conv::EVENT_STREAM),
@@ -1214,6 +1352,7 @@ impl Supervisor {
         let answer = self.open_signed(
             company,
             &Signed {
+                account: account.as_deref(),
                 method: "GET",
                 url: &url,
                 headers: &headers,

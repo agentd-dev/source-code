@@ -455,7 +455,8 @@ fn companies() -> Value {
                     "terms": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "every term key it covers: a revision with a key outside them, or with no terms, asks the User" },
                     "when": { "type": "string", "description": "a CEL predicate over terms and summary; a term it reads that is missing is no match" },
                     "expires": { "type": "string", "description": "an RFC 3339 time it stops applying at" },
-                    "uses": { "type": "integer", "minimum": 1, "description": "how many confirms it covers, each reserved before the confirm and given back when the Company refuses it; default no limit but expires" } } } } } })
+                    "uses": { "type": "integer", "minimum": 1, "description": "how many confirms it covers, each reserved before the confirm and given back when the Company refuses it; default no limit but expires" },
+                    "accounts": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z0-9_-]{1,32}$" }, "description": "the labels of the User's accounts at the Company it covers, as a sign-in names them (agentd's own words, never sent); default the account labelled default alone, and the signed-out Session — so signing in to a second account never widens it" } } } } } })
 }
 
 /// A conversation's `context` (RFC 0047 §5.5.7): `security.companies.context`

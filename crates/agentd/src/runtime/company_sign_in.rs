@@ -28,12 +28,17 @@
 //! `interrupted` at the next start, and its gate says so: its device code
 //! or verifier was in memory only.
 //!
+//! **Which account.** Each names the User's account at the Company it is
+//! for by the label agentd keeps it under (`account`, RFC 0047 §9, P5b) —
+//! `agentd --login company:<name>/<label>` — and the gate's text names it.
+//!
 //! **Signing out** (`company.sign_out`, the op, `agentd --logout
-//! company:<name>`) revokes and forgets the Account Token; every request
-//! after it is signed out.
+//! company:<name>`) revokes and forgets one account's Account Token; the
+//! others stay signed in.
 //!
 //! Sign-ins and sign-outs are audit records (`company.sign_in`,
-//! `company.sign_out`) naming who asked and how each ended.
+//! `company.sign_out`) naming who asked, the account by its label, and how
+//! each ended.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,10 +80,9 @@ pub(crate) struct SignInTrack {
     pub deadline_ms: Option<u64>,
     /// Who asked.
     pub principal: Option<String>,
-    /// It signs in to another account than the one before: one that
-    /// succeeds suspends the Company's standing permissions until a restart
-    /// (RFC 0047 §5.8.1).
-    pub new_account: bool,
+    /// The label of the account it signs in to, once the supervisor knows
+    /// it.
+    pub account: Option<String>,
 }
 
 /// The shape a sign-in gate's answer takes: the User signs in at the
@@ -118,6 +122,7 @@ impl Runtime {
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect(),
+            account: args["account"].as_str().map(str::to_string),
             new_account: args["new_account"].as_bool().unwrap_or(false),
         })
     }
@@ -278,7 +283,6 @@ impl Runtime {
         principal: Option<String>,
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
-        let new_account = ask.new_account;
         // A gate task made for a workflow step's sign-in is the run's task,
         // which the run's completion settles; the op's own task, and one
         // made for a turn, end with the sign-in.
@@ -300,7 +304,7 @@ impl Runtime {
                 requested: Vec::new(),
                 deadline_ms: None,
                 principal,
-                new_account,
+                account: None,
             },
         );
         let Some(sup) = self.companies.clone() else {
@@ -318,7 +322,13 @@ impl Runtime {
                         step,
                     });
                 };
-                let step = match sup.begin_sign_in(&ask, &id, unanswerable) {
+                let started = sup
+                    .begin_sign_in(&ask, &id, unanswerable)
+                    .map(|(label, s)| {
+                        send(Step::Account(label));
+                        s
+                    });
+                let step = match started {
                     Err(e) => Step::Done(Outcome::Failed(e)),
                     Ok(Started::Held(o)) => Step::Done(o),
                     Ok(Started::Direct {
@@ -352,6 +362,11 @@ impl Runtime {
     /// A sign-in moved on: its gate opens, or it ended.
     pub(crate) fn on_company_sign_in(&mut self, id: &str, step: Step) {
         match step {
+            Step::Account(label) => {
+                if let Some(t) = self.company_sign_ins.get_mut(id) {
+                    t.account = Some(label);
+                }
+            }
             Step::Done(outcome) => self.end_sign_in(id, outcome),
             Step::Gate {
                 question,
@@ -473,14 +488,18 @@ impl Runtime {
             return;
         };
         tr.gate = Some(task.clone());
-        let (kind, requested) = (tr.kind.map(SignIn::as_str), tr.requested.clone());
+        let (kind, requested, account) = (
+            tr.kind.map(SignIn::as_str),
+            tr.requested.clone(),
+            tr.account.clone(),
+        );
         self.log.info(
             "company.sign_in.requested",
-            json!({"company": company, "kind": kind, "scopes": requested, "task": task}),
+            json!({"company": company, "account": account, "kind": kind, "scopes": requested, "task": task}),
         );
         self.audit(super::audit::AuditEvent {
             action: "company.sign_in",
-            target: json!({"company": company, "kind": kind, "task": task}),
+            target: json!({"company": company, "account": account, "kind": kind, "task": task}),
             outcome: "requested",
             principal: principal.as_deref(),
             role: None,
@@ -502,7 +521,8 @@ impl Runtime {
             sup.forget_direct(id);
         }
         let company = track.company.clone();
-        let result = outcome.result(&company);
+        let account = track.account.as_deref();
+        let result = outcome.result(&company, account);
         // The gate closes, and a task of its own ends with it.
         #[cfg(feature = "a2a")]
         {
@@ -515,6 +535,7 @@ impl Runtime {
                 self.close_sign_in_task(
                     &task,
                     &company,
+                    account,
                     track.standalone,
                     &outcome,
                     result.as_ref().ok(),
@@ -522,28 +543,20 @@ impl Runtime {
             }
         }
         let kind = track.kind.map(SignIn::as_str);
-        // The standing permissions were declared for the account connected
-        // before.
-        if track.new_account
-            && matches!(outcome, Outcome::SignedIn { .. })
-            && let Some(sup) = &self.companies
-        {
-            sup.suspend_standing(&company);
-        }
         match &outcome {
             Outcome::SignedIn { scope, requested } => self.log.info(
                 "company.signed_in",
-                json!({"company": company, "kind": kind, "requested": requested, "granted": scope}),
+                json!({"company": company, "account": account, "kind": kind, "requested": requested, "granted": scope}),
             ),
             other => self.log.info(
                 "company.sign_in.failed",
-                json!({"company": company, "kind": kind, "reason": other.word(),
+                json!({"company": company, "account": account, "kind": kind, "reason": other.word(),
                        "error": match other { Outcome::Failed(e) => Some(e.as_str()), _ => None }}),
             ),
         }
         self.audit(super::audit::AuditEvent {
             action: "company.sign_in",
-            target: json!({"company": company, "kind": kind}),
+            target: json!({"company": company, "account": account, "kind": kind}),
             outcome: outcome.word(),
             principal: track.principal.as_deref(),
             role: None,
@@ -572,6 +585,7 @@ impl Runtime {
         &mut self,
         task: &str,
         company: &str,
+        account: Option<&str>,
         standalone: bool,
         outcome: &Outcome,
         result: Option<&Value>,
@@ -582,7 +596,7 @@ impl Runtime {
         };
         t.sign_in = None;
         t.ask_schema = None;
-        let said = outcome.said(company);
+        let said = outcome.said(company, account);
         if t.state.is_terminal() {
             // Its work ended first: nothing to move on.
         } else if standalone {
@@ -736,7 +750,14 @@ impl Runtime {
             })
             .collect();
         for (task, standalone, company) in open {
-            self.close_sign_in_task(&task, &company, standalone, &Outcome::Interrupted, None);
+            self.close_sign_in_task(
+                &task,
+                &company,
+                None,
+                standalone,
+                &Outcome::Interrupted,
+                None,
+            );
             self.log.info(
                 "company.sign_in.failed",
                 json!({"company": company, "reason": Outcome::Interrupted.word(), "task": task}),
@@ -769,6 +790,7 @@ impl Runtime {
         by: Option<String>,
     ) -> Result<(), String> {
         let name = args["company"].as_str().unwrap_or_default().to_string();
+        let account = args["account"].as_str().map(str::to_string);
         let sup = self
             .companies
             .clone()
@@ -780,7 +802,7 @@ impl Runtime {
         std::thread::Builder::new()
             .name(format!("company-sign-out:{name}"))
             .spawn(move || {
-                let outcome = sup.sign_out(&company);
+                let outcome = sup.sign_out(&company, account.as_deref());
                 let _ = tx.send(super::events::Event::CompanySignedOut {
                     owed,
                     company: name,
@@ -799,23 +821,31 @@ impl Runtime {
         owed: Owed,
         company: &str,
         by: Option<&str>,
-        outcome: Result<Value, String>,
+        outcome: Result<Value, crate::companies::signin::SignOutError>,
     ) {
+        use crate::companies::signin::SignOutError;
         let (word, revoked) = match &outcome {
             Ok(v) if v["signed_out"] == true => ("signed_out", true),
             Ok(_) => ("not_signed_in", false),
-            Err(_) => ("revocation_failed", false),
+            Err(SignOutError::Unrevoked { .. }) => ("revocation_failed", false),
+            Err(SignOutError::Refused(_)) => ("refused", false),
         };
-        if word != "not_signed_in" {
+        let account = match &outcome {
+            Ok(v) => v["account"].as_str().map(str::to_string),
+            Err(SignOutError::Unrevoked { account, .. }) => Some(account.clone()),
+            Err(SignOutError::Refused(_)) => None,
+        };
+        let outcome = outcome.map_err(|e| e.to_string());
+        if matches!(word, "signed_out" | "revocation_failed") {
             self.log.info(
                 "company.signed_out",
-                json!({"company": company, "by": by, "revoked": revoked,
+                json!({"company": company, "account": account, "by": by, "revoked": revoked,
                        "error": outcome.as_ref().err()}),
             );
         }
         self.audit(super::audit::AuditEvent {
             action: "company.sign_out",
-            target: json!({"company": company}),
+            target: json!({"company": company, "account": account}),
             outcome: word,
             principal: by,
             role: None,
@@ -836,12 +866,19 @@ impl Runtime {
                     match &outcome {
                         Ok(v) => {
                             t.set_result(v.clone());
-                            let said = if v["signed_out"] == true {
-                                format!(
+                            let said = match (v["signed_out"] == true, account.as_deref()) {
+                                (true, Some(l)) => format!(
+                                    "Signed out of the account {l:?} at {company}: its Account Token is revoked there and forgotten here."
+                                ),
+                                (true, None) => format!(
                                     "Signed out at {company}: the Account Token is revoked there and forgotten here."
-                                )
-                            } else {
-                                format!("The User was not signed in at {company}.")
+                                ),
+                                (false, Some(l)) => format!(
+                                    "The User was not signed in to the account {l:?} at {company}."
+                                ),
+                                (false, None) => {
+                                    format!("The User was not signed in at {company}.")
+                                }
                             };
                             t.transition(State::Completed, Some(said));
                         }

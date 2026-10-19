@@ -73,6 +73,11 @@ const ASK_FOR_MS: u64 = 24 * 3600 * 1000;
 pub(crate) struct OperationTrack {
     pub company: String,
     pub operation: String,
+    /// The label of the User's account the operation belongs to — none, the
+    /// signed-out Session's — once the supervisor read it; before, the one
+    /// the call names, if any: the operation's own, or the call is refused.
+    /// What every record of the confirm names.
+    pub account: Option<String>,
     /// Who is owed the outcome: the tool call.
     pub target: Target,
     /// The task the gate opens on — the asker's own — or none, when a task
@@ -166,8 +171,9 @@ impl Runtime {
         }
         let reads = self.reads_of(caller);
         let unit = self.caller_trace(caller);
+        let account = args["account"].as_str().map(str::to_string);
         if name == "company.operation.confirm" {
-            return self.start_confirm(caller, company.name.clone(), id, reads, unit);
+            return self.start_confirm(caller, company.name.clone(), id, account, reads, unit);
         }
         let Some(slot) = crate::companies::Company::enter(&company) else {
             crate::obs::metrics::record_company_request(&company.name, "operations", "unsent");
@@ -191,9 +197,9 @@ impl Runtime {
                     }
                 };
                 let res = if name == "company.operation.cancel" {
-                    sup.cancel_operation(&company, &id, sent.as_ref())
+                    sup.cancel_operation(&company, &id, account.as_deref(), sent.as_ref())
                 } else {
-                    sup.get_operation(&company, &id, sent.as_ref())
+                    sup.get_operation(&company, &id, account.as_deref(), sent.as_ref())
                 };
                 let outcome = match &res {
                     Ok(_) => "ok",
@@ -225,6 +231,7 @@ impl Runtime {
         caller: &ToolCaller,
         company: String,
         id: String,
+        account: Option<String>,
         reads: Option<super::companies::Reads>,
         trace: Option<crate::obs::trace::TraceContext>,
     ) -> ToolOutcome {
@@ -263,6 +270,7 @@ impl Runtime {
             OperationTrack {
                 company: company.clone(),
                 operation: id.clone(),
+                account,
                 target,
                 on: on.clone().flatten(),
                 gate: None,
@@ -304,6 +312,7 @@ impl Runtime {
         t.running = true;
         let stop = Arc::clone(&t.stop);
         let unit = t.trace.clone();
+        let account = t.account.clone();
         let tx = self.events_tx.clone();
         let track = track.to_string();
         std::thread::Builder::new()
@@ -326,7 +335,15 @@ impl Runtime {
                     Ok((sent, _)) => sent,
                     Err(e) => return send(Step::Done(Err(e))),
                 };
-                sup.confirm_operation(&company, &id, given, sent.as_ref(), &stop, &send);
+                sup.confirm_operation(
+                    &company,
+                    &id,
+                    account.as_deref(),
+                    given,
+                    sent.as_ref(),
+                    &stop,
+                    &send,
+                );
                 drop(slot);
             })
             .ok();
@@ -341,7 +358,9 @@ impl Runtime {
         let (company, op, principal) =
             (t.company.clone(), t.operation.clone(), t.principal.clone());
         let trace = t.trace.clone();
+        let account = t.account.clone();
         match step {
+            Step::Account(a) => t.account = a,
             Step::Ask {
                 question,
                 revision,
@@ -382,11 +401,11 @@ impl Runtime {
             } => {
                 self.log.in_trace(trace.as_ref()).info(
                     "company.standing.used",
-                    json!({"company": company, "rule": rule, "operation_id": op, "revision": revision, "uses_left": uses_left}),
+                    json!({"company": company, "account": account, "rule": rule, "operation_id": op, "revision": revision, "uses_left": uses_left}),
                 );
                 self.audit(super::audit::AuditEvent {
                     action: "company.standing",
-                    target: json!({"company": company, "rule": rule, "operation_id": op, "revision": revision, "uses_left": uses_left}),
+                    target: json!({"company": company, "account": account, "rule": rule, "operation_id": op, "revision": revision, "uses_left": uses_left}),
                     outcome: "used",
                     principal: Some(crate::companies::wire::operations::APPROVED_BY_STANDING),
                     role: None,
@@ -397,7 +416,7 @@ impl Runtime {
                 });
                 self.log.in_trace(trace.as_ref()).info(
                     "company.operation.approved",
-                    json!({"company": company, "operation_id": op, "revision": revision,
+                    json!({"company": company, "operation_id": op, "account": account, "revision": revision,
                            "approved_by": crate::companies::wire::operations::APPROVED_BY_STANDING}),
                 );
             }
@@ -421,10 +440,10 @@ impl Runtime {
                     .map(|(_, task)| task.clone());
                 self.log.in_trace(trace.as_ref()).info(
                     "company.operation.confirmed",
-                    json!({"company": company, "operation_id": op, "revision": revision,
+                    json!({"company": company, "operation_id": op, "account": account, "revision": revision,
                            "approved_by": approved_by, "outcome": outcome.audit(), "state": state, "error": error}),
                 );
-                let mut target = json!({"company": company, "operation_id": op, "revision": revision,
+                let mut target = json!({"company": company, "operation_id": op, "account": account, "revision": revision,
                                         "approved_by": approved_by, "state": state, "error": error});
                 if let Some(task) = asked_on {
                     target["task"] = json!(task);
@@ -495,11 +514,11 @@ impl Runtime {
         let _ = said;
         self.log.in_trace(t.trace.as_ref()).info(
             "company.operation.withdrawn",
-            json!({"company": t.company, "operation_id": t.operation, "revision": revision, "confirmed": confirmed}),
+            json!({"company": t.company, "operation_id": t.operation, "account": t.account, "revision": revision, "confirmed": confirmed}),
         );
         self.audit(super::audit::AuditEvent {
             action: "company.operation",
-            target: json!({"company": t.company, "operation_id": t.operation, "revision": revision,
+            target: json!({"company": t.company, "operation_id": t.operation, "account": t.account, "revision": revision,
                            "cancel": confirmed}),
             outcome: "withdrawn",
             principal: t.principal.as_deref(),
@@ -518,7 +537,7 @@ impl Runtime {
         let Some(company) = sup.company(&t.company) else {
             return;
         };
-        let (id, unit, log) = (t.operation, t.trace, self.log.clone());
+        let (id, account, unit, log) = (t.operation, t.account, t.trace, self.log.clone());
         std::thread::Builder::new()
             .name(format!("company-withdraw:{}", company.name))
             .spawn(move || {
@@ -526,12 +545,13 @@ impl Runtime {
                     .request_trace(&company, unit.as_ref(), None)
                     .ok()
                     .and_then(|(s, _)| s);
-                let cancelled = sup.cancel_operation(&company, &id, sent.as_ref());
+                let cancelled =
+                    sup.cancel_operation(&company, &id, account.as_deref(), sent.as_ref());
                 log.in_trace(unit.as_ref()).info(
                     "company.operation.cancelled",
                     match &cancelled {
-                        Ok(v) => json!({"company": company.name, "operation_id": id, "state": v["state"]}),
-                        Err(e) => json!({"company": company.name, "operation_id": id, "error": e.to_string()}),
+                        Ok(v) => json!({"company": company.name, "operation_id": id, "account": account, "state": v["state"]}),
+                        Err(e) => json!({"company": company.name, "operation_id": id, "account": account, "error": e.to_string()}),
                     },
                 );
             })
@@ -558,6 +578,7 @@ impl Runtime {
             t.principal.clone(),
             t.trace.clone(),
         );
+        let account = t.account.clone();
         let earlier = t.asked.last().cloned();
         let (task, standalone) = match &earlier {
             None => (
@@ -612,11 +633,11 @@ impl Runtime {
         }
         self.log.in_trace(trace.as_ref()).info(
             "company.operation.asked",
-            json!({"company": company, "operation_id": op, "revision": revision, "task": task}),
+            json!({"company": company, "operation_id": op, "account": account, "revision": revision, "task": task}),
         );
         self.audit(super::audit::AuditEvent {
             action: "company.operation",
-            target: json!({"company": company, "operation_id": op, "revision": revision, "task": task}),
+            target: json!({"company": company, "operation_id": op, "account": account, "revision": revision, "task": task}),
             outcome: "asked",
             principal: principal.as_deref(),
             role: None,
@@ -742,9 +763,10 @@ impl Runtime {
                 "this approval has ended",
             );
         };
-        let (company, op, asked, trace, questions) = (
+        let (company, op, account, asked, trace, questions) = (
             t.company.clone(),
             t.operation.clone(),
+            t.account.clone(),
             t.revision.clone(),
             t.trace.clone(),
             t.asked.clone(),
@@ -758,7 +780,7 @@ impl Runtime {
             );
             self.audit(super::audit::AuditEvent {
                 action: "company.operation",
-                target: json!({"company": company, "operation_id": op, "revision": revision, "task": task}),
+                target: json!({"company": company, "operation_id": op, "account": account, "revision": revision, "task": task}),
                 outcome: "not_addressed",
                 principal: Some(&principal.id),
                 role: None,
@@ -813,13 +835,13 @@ impl Runtime {
             } else {
                 "company.operation.declined"
             },
-            json!({"company": company, "operation_id": op, "revision": revision,
+            json!({"company": company, "operation_id": op, "account": account, "revision": revision,
                    "approved_by": (decision == APPROVE).then_some(crate::companies::wire::operations::APPROVED_BY_USER),
                    "by": principal.id}),
         );
         self.audit(super::audit::AuditEvent {
             action: "company.operation",
-            target: json!({"company": company, "operation_id": op, "revision": revision, "task": task}),
+            target: json!({"company": company, "operation_id": op, "account": account, "revision": revision, "task": task}),
             outcome: if decision == APPROVE { "approved" } else { "declined" },
             principal: Some(&principal.id),
             role: None,
@@ -879,7 +901,7 @@ impl Runtime {
                     .request_trace(&company, unit.as_ref(), None)
                     .ok()
                     .and_then(|(s, _)| s);
-                let cancelled = sup.cancel_operation(&company, &id, sent.as_ref());
+                let cancelled = sup.cancel_operation(&company, &id, None, sent.as_ref());
                 let said = match &cancelled {
                     Ok(v) => format!(
                         "company {}: the User declined operation {id} — it was NOT confirmed, and agentd cancelled it at the Company (it is {})",
@@ -1114,7 +1136,7 @@ impl Runtime {
                 self.audit(super::audit::AuditEvent {
                     action: "company.operation",
                     target: json!({"company": f.company, "operation_id": f.operation_id,
-                                   "revision": f.revision, "state": f.state}),
+                                   "account": f.account, "revision": f.revision, "state": f.state}),
                     outcome: "final",
                     principal: None,
                     role: None,

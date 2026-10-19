@@ -384,8 +384,10 @@ call `company.sign_in`.
 The sign-in gate asks the User to sign in at a Company themselves. It opens
 when the model calls `company.sign_in`, a workflow step does, or the operator
 sends the `company.sign_in` op (`agentd --login company:<name>`), and an
-Account Token agentd already holds does not cover the scopes asked for. It is
-a Company gate in every rule above, and differs in what it asks:
+Account Token agentd already holds for the account asked for does not cover
+the scopes asked for. Its text names the account by the label agentd keeps it
+under ([Several accounts](act-at-companies.md#several-accounts)). It is a
+Company gate in every rule above, and differs in what it asks:
 
 - **The User signs in at the Company, not at the gate.** For Device Sign-In
   the gate shows a link on the Company's page and the code to check there;
@@ -428,8 +430,9 @@ revision it confirms — or a standing permission the operator declared
 approval gate is a Company gate in every rule above:
 
 - **It shows the terms.** The Company by its quoted name beside its verified
-  domain, the account (`for your account at example.com`, or the signed-out
-  Session), the revision's summary as the Company wrote it, its terms
+  domain, the account that proposed it by its label (`for your account
+  "work" at example.com`, or the signed-out Session), the revision's
+  summary as the Company wrote it, its terms
   flattened beside it (`"price_difference.amount": "70.00"`), the revision,
   when it expires, and what changed from the revision before. Every Company
   string is quoted and capped, its control characters gone.
@@ -473,7 +476,7 @@ revision.
 ### Direct Conversations
 
 When a Company asks to talk with the User (`user_requested`), or the model
-asks with `company.direct {company, conversation}`, the User decides whether
+asks with `company.direct {company, conversation, account?}`, the User decides whether
 to talk with the Company themselves, in a Direct Conversation linked to the
 one the agent is having there:
 

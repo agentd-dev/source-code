@@ -95,7 +95,9 @@
 //! `acct_1`, granting every scope asked for, after one `authorization_pending`
 //! poll. `POST /_mock/control {"approver": {"decision": "approve|deny|expire",
 //! "account": …, "after_polls": n, "scope": "…"}, "expires_in": n}` changes
-//! what it does next, and how long Session Tokens last. The same control
+//! what it does next, and how long Session Tokens last — `account` names the
+//! account every sign-in from then on signs in to, so a User with several
+//! accounts here signs in to each in turn. The same control
 //! steers what a Personal Agent is tested against mid-run: `"refuse_tokens":
 //! n` answers the next `n` MCP requests `401 invalid_token`;
 //! `"refuse_grants": n` answers the next `n` token requests `401
@@ -171,9 +173,11 @@
 //! method, path, status, the error code, the grant, whether it carried a
 //! proof and a `resource`, the tokens it issued; for a request carrying a
 //! Session Token, `presented` (the first eight characters of the token's
-//! base64url SHA-256) and `superseded` (whether a newer token of its kind
+//! base64url SHA-256), `superseded` (whether a newer token of its kind
 //! had been issued for its Session, which the Personal Agent was to use
-//! instead, §4.3); for a token request the claims of each assertion and
+//! instead, §4.3), `token_session` (the Session it belongs to) and
+//! `token_account` (the account that Session is signed in to now, or null);
+//! for a token request the claims of each assertion and
 //! proof it carried (`client_assertion`, `assertion`, `proof`, the proof's
 //! key thumbprint as `jkt`), never their signatures; for every MCP request,
 //! the keys of its `_meta` (`meta`), the trace id its `traceparent` names
@@ -188,8 +192,9 @@
 //! when it arrived (`at_ms`, from the fake's start), and whether an Account
 //! Token the fake issued was anywhere in it but the one form member that
 //! may carry it to the token or revocation endpoint (`account_token_leaked`);
-//! for an API request, the request as it came (`sent`: its target, its
-//! headers in order, its body, its proof's claims but `jti` and `iat`);
+//! for every request, the request as it came (`sent`: its target, its
+//! headers in order, its body, its proof's claims but `jti` and `iat`) —
+//! read back, and printed for an API request alone;
 //! and `validated`, the vendored schemas what the request carried held to —
 //! and the same objects are read back at `GET /_mock/record`: the server
 //! side's own account of what reached it, which a test counts instead of
@@ -1137,9 +1142,23 @@ impl Company {
             record["presented"] = json!(presented(token));
             if let Some(a) = st.access.get(token) {
                 record["superseded"] = json!(Company::superseded(a, &st));
+                // The Session the token belongs to, and the account it is
+                // signed in to now.
+                record["token_session"] = json!(a.session_id);
+                record["token_account"] = json!(
+                    st.sessions
+                        .get(&a.session_id)
+                        .and_then(|s| s.account.clone())
+                        .filter(|_| Company::signed_in_now(a, &st))
+                );
             }
         }
         eprintln!("COMPANY {record}");
+        // Every request as it came, read back but not printed: a test holds
+        // it to what nothing agentd sends may carry.
+        if record.get("sent").is_none() {
+            record["sent"] = Company::as_sent(req);
+        }
         st.records.push(record);
         reply
     }

@@ -67,9 +67,10 @@ const MAX_TEXT: usize = 64 * 1024;
 /// The longest summary or description `company.api.describe` shows, and an
 /// operation tool's description quotes.
 const MAX_SUMMARY: usize = 2_000;
-/// The arguments an operation tool takes beside the operation's parameters:
-/// a parameter of either name is nested under `path` or `query`.
-const RESERVED: [&str; 2] = ["json", "expect"];
+/// The arguments an operation tool takes beside the operation's parameters
+/// — its body, the statuses it expects, and the User's account it acts with:
+/// a parameter of any of these names is nested under `path` or `query`.
+const RESERVED: [&str; 3] = ["json", "expect", "account"];
 
 /// One parameter of an operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +135,9 @@ pub struct Description {
 pub struct Call {
     /// The description's URL, when the Company lists several.
     pub api: Option<String>,
+    /// The label of the User's account the call names, if it names one
+    /// ([`Supervisor::account_for`]).
+    pub account: Option<String>,
     pub method: String,
     /// The path under the API's server URL, or the whole URL.
     pub path: String,
@@ -661,8 +665,18 @@ impl Shape {
             .filter(|(k, _)| declared("query", k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let account = match args.get("account") {
+            None => None,
+            Some(Value::String(a)) => Some(a.clone()),
+            Some(_) => {
+                return Err(format!(
+                    "{tool}'s account is the label of an account, a string"
+                ));
+            }
+        };
         Ok(Call {
             api: Some(self.api.clone()),
+            account,
             method: self.method.clone(),
             path: filled(&self.template, &params),
             query,
@@ -679,6 +693,9 @@ impl Shape {
 pub fn as_company_api(company: &str, call: &Call, expect: Option<&Value>) -> Value {
     let mut out = json!({"company": company, "api": call.api, "method": call.method,
                          "path": call.path});
+    if let Some(a) = &call.account {
+        out["account"] = json!(a);
+    }
     if !call.query.is_empty() {
         out["query"] = Value::Object(call.query.clone());
     }
@@ -710,8 +727,8 @@ fn nests(detail: &Detail) -> bool {
 /// The input schema of the tool of the operation `detail` describes, or why
 /// it has none: its path and query parameters as properties, each with its
 /// schema and required as declared — nested as `path` and `query` objects
-/// when [`nests`] says so — `json` for a JSON body, required as declared, and
-/// `expect`. Nothing else is taken. A header or cookie parameter is not
+/// when [`nests`] says so — `json` for a JSON body, required as declared,
+/// `expect` and `account`. Nothing else is taken. A header or cookie parameter is not
 /// offered, and an operation that requires one agentd does not send — any
 /// but the `Idempotency-Key` it sends itself — has no tool; nor has one whose
 /// input schema is more than [`MAX_INPUT_SCHEMA`] bytes.
@@ -768,6 +785,10 @@ pub fn operation_input(detail: &Detail) -> Result<Value, String> {
         "expect".into(),
         json!({"type": "array", "items": {"type": "integer", "minimum": 100, "maximum": 599},
                "description": "The statuses that are not an error; default any 2xx"}),
+    );
+    props.insert(
+        "account".into(),
+        crate::registry::internal::company_account_arg(),
     );
     let schema = object((props, required));
     let size = serde_json::to_vec(&schema).map_or(usize::MAX, |b| b.len());
@@ -1128,6 +1149,11 @@ impl Supervisor {
         // Held to what the Company published: the refusal may quote it.
         let refused =
             |why: String| CallError::Refused(format!("company {name}: {why}; nothing was sent"));
+        // The account it acts with — the one it names, or the only one held —
+        // before anything is fetched for it.
+        let account = self
+            .account_for(company, call.account.as_deref())
+            .map_err(CallError::Unsent)?;
         let api = self.api_of(company, call.api.as_deref())?;
         let desc = self.description(company, &api)?;
         let method = call.method.to_ascii_uppercase();
@@ -1187,11 +1213,11 @@ impl Supervisor {
         })?;
         let query = checked(&detail, &params, call).map_err(|e| refused(e.join("; ")))?;
         // The request that proposed an operation that is not final is not
-        // sent again (Operations §6).
+        // sent again in the same account (Operations §6).
         let path_sent = filled(&op.template, &params);
         let digest = super::operations::api_digest(&method, &path_sent, &query, call.json.as_ref());
         if writes(&method)
-            && let Some(why) = self.repeats(company, &digest)
+            && let Some(why) = self.repeats(company, account.as_deref(), &digest)
         {
             return Err(CallError::Unsent(why));
         }
@@ -1231,6 +1257,7 @@ impl Supervisor {
         let reply = self.send_signed(
             company,
             &Signed {
+                account: account.as_deref(),
                 method: &method,
                 url: &url,
                 headers: &headers,
@@ -1243,6 +1270,9 @@ impl Supervisor {
             },
         )?;
         let mut out = json!({"status": reply.status});
+        if let Some(a) = &account {
+            out["account"] = json!(a);
+        }
         match serde_json::from_slice::<Value>(&reply.body) {
             Ok(j) => {
                 // An operation the Company proposes in place of performing
@@ -1255,6 +1285,7 @@ impl Supervisor {
                             method: method.clone(),
                             template: op.template.clone(),
                         },
+                        account.as_deref(),
                         Some(digest.clone()),
                         proposal,
                     )
@@ -1616,9 +1647,11 @@ mod tests {
                 "order_id": {"type": "string"},
                 "expand": {"type": "boolean"},
                 "expect": get["properties"]["expect"],
+                "account": crate::registry::internal::company_account_arg(),
             }})
         );
         assert_eq!(get["properties"]["expect"]["items"]["maximum"], 599);
+        assert_eq!(get["properties"]["account"]["type"], "string");
         // The body, resolved and required as declared; the Idempotency-Key
         // header agentd sends itself is no argument.
         let ex = operation_input(&d.detail(op(&d, "exchange")).unwrap()).unwrap();
@@ -1686,6 +1719,16 @@ mod tests {
                 .unwrap_err(),
             "t takes no argument \"page\""
         );
+        // The account it names is the call's, and company.api's argument.
+        let call = get
+            .call("t", &json!({"order_id": "o1", "account": "work"}))
+            .unwrap();
+        assert_eq!(call.account.as_deref(), Some("work"));
+        assert_eq!(as_company_api("shop", &call, None)["account"], "work");
+        assert!(
+            get.call("t", &json!({"order_id": "o1", "account": 7}))
+                .is_err()
+        );
     }
 
     /// A parameter named like another, or like `json` or `expect`, has the
@@ -1735,6 +1778,22 @@ mod tests {
             expect_named["properties"]["query"].is_object(),
             "{expect_named}"
         );
+        // A parameter named as the account a call acts with is nested too,
+        // and the account stays agentd's argument.
+        let account_named = operation_input(&detail(vec![param("account", "path", true)])).unwrap();
+        assert_eq!(
+            account_named["required"],
+            json!(["path"]),
+            "{account_named}"
+        );
+        assert_eq!(
+            account_named["properties"]["path"]["properties"]["account"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            account_named["properties"]["account"],
+            crate::registry::internal::company_account_arg()
+        );
         // Headers and cookies are never arguments.
         let optional = operation_input(&detail(vec![
             param("X-Trace", "header", false),
@@ -1748,7 +1807,7 @@ mod tests {
                 .unwrap()
                 .keys()
                 .collect::<Vec<_>>(),
-            ["expect", "json"]
+            ["account", "expect", "json"]
         );
         let e = operation_input(&detail(vec![param("X-Tenant", "header", true)])).unwrap_err();
         assert_eq!(

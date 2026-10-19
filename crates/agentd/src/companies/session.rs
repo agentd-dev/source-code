@@ -1,33 +1,46 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The supervisor's Session table (RFC 0047 §5.6): one Session per (User,
-//! Company issuer), shared by every task and every interface, and the only
-//! place a Session Token or a Bearer token is held — in memory, for its
+//! The supervisor's Session table (RFC 0047 §5.6): the Sessions agentd holds
+//! at each Company issuer, shared by every task and every interface, and the
+//! only place a Session Token or a Bearer token is held — in memory, for its
 //! lifetime, never written anywhere.
 //!
-//! A Session starts signed out with the JWT bearer grant and a DPoP proof
-//! (draft §4.2). Its `session_id` is kept with the User ID, so after a
-//! restart the same Session is renewed — with this process's new DPoP key,
-//! which re-binds its Session Token (§4.3 lets a key change per Session) —
-//! and only when the Company says it has ended (`invalid_session`) is a new
-//! one started and kept instead. A Bearer token for an MCP server is the
-//! Session's renew grant without a proof and with `resource` the server's
-//! `url` (§4.3); it is used only there. The DPoP Session Token is what every
-//! API and conversation request carries, with a proof of its own signed for
-//! it ([`Session::proof`]); an endpoint the Company lists with a `resource`
-//! gets the renew grant with a proof and that `resource` instead.
+//! A Session is signed in to at most one account (draft §4.4: "A User with
+//! two accounts at the same Company … has an Account Token for each and uses
+//! separate Sessions for them"). So agentd holds one Session per account the
+//! User holds there, named by the account's label ([`super::account`]), each
+//! with a DPoP key of its own, and one **signed-out Session**, which no
+//! Account Token is ever used in: what work does while the User holds no
+//! account there. Every Session is the same User to the Company — the User
+//! ID is one per (User, Company), draft §4.2 — so the Company can tell that
+//! the accounts are one person's.
 //!
-//! While the User's Account Token is held ([`super::account`]) every token
-//! is granted on it (§4.8): the Session is renewed, or signed in, with it and
+//! A Session starts signed out with the JWT bearer grant and a DPoP proof
+//! (draft §4.2). Its `session_id` is kept — the signed-out Session's with
+//! the User ID, an account's with its Account Token — so after a restart the
+//! same Session is renewed, with this process's new DPoP key, which re-binds
+//! its Session Token (§4.3 lets a key change per Session), and only when the
+//! Company says it has ended (`invalid_session`) is a new one started and
+//! kept instead. A Bearer token for an MCP server is the Session's renew
+//! grant without a proof and with `resource` the server's `url` (§4.3); it is
+//! used only there. The DPoP Session Token is what every API and
+//! conversation request carries, with a proof of its own signed for it
+//! ([`Session::proof`]); an endpoint the Company lists with a `resource` gets
+//! the renew grant with a proof and that `resource` instead.
+//!
+//! While an account's Account Token is held every token of its Session is
+//! granted on it (§4.8): the Session is renewed, or signed in, with it and
 //! its `session_id`, and a Session the Company ended is started again with it
 //! and no `session_id` — "a new Session that is already signed in" — so no
 //! renewal turns a signed-in Session into a signed-out one behind the User's
 //! back. A token the entry's `scopes` admit none of is not used. A token the
 //! Company rotates is kept before the response is used, under the Session's
-//! lock, which a sign-in and a sign-out take to change the held token too.
-//! Only `invalid_grant` for the Account Token says it is no longer good (a
-//! disconnect, an expiry, a revocation): it is forgotten
+//! lock, which a sign-in and a sign-out of the account take to change the
+//! held token too. Only `invalid_grant` for the Account Token says it is no
+//! longer good (a disconnect, an expiry, a revocation): it is forgotten
 //! (`company.account_token.dropped`) and the same request is made again
-//! signed out — the draft's "The Session continues signed out" (§4.8).
+//! signed out — the draft's "The Session continues signed out" (§4.8) — and
+//! a sign-in to the account again goes in that Session, where the Company
+//! signs in that account alone ([`Session::bound_session_id`]).
 //!
 //! Renewal is on demand and single-flight: a request that finds its token in
 //! the last fifth of its lifetime, or past it, renews first, holding the
@@ -73,7 +86,7 @@ impl Held {
 }
 
 /// What a Session's requests are made with: the identity, the verified
-/// Company, where its User ID and Account Token are kept, and the most
+/// Company, where its User ID and Account Tokens are kept, and the most
 /// scopes agentd may use there.
 pub struct Env<'a> {
     pub identity: &'a Identity,
@@ -91,11 +104,12 @@ pub struct Env<'a> {
 }
 
 impl Env<'_> {
-    /// The User's Account Token here, if one is held.
-    pub fn account(&self, issuer: &str) -> Result<Option<Account>, String> {
-        match self.accounts {
-            Some(a) => a.load(self.principal, issuer),
-            None => Ok(None),
+    /// The User's Account Token for the account `label` here, if one is
+    /// held; the signed-out Session (`None`) holds none.
+    pub fn account(&self, issuer: &str, label: Option<&str>) -> Result<Option<Account>, String> {
+        match (self.accounts, label) {
+            (Some(a), Some(l)) => a.load(self.principal, issuer, l),
+            _ => Ok(None),
         }
     }
 }
@@ -103,6 +117,9 @@ impl Env<'_> {
 /// One Session.
 pub struct Session {
     pub issuer: String,
+    /// The label of the User's account it is the Session of; none for the
+    /// signed-out Session.
+    pub account: Option<String>,
     dpop: DpopKey,
     nonces: Nonces,
     state: Mutex<State>,
@@ -111,6 +128,13 @@ pub struct Session {
 #[derive(Default)]
 struct State {
     record: Option<UserRecord>,
+    /// Its `session_id`, once read from where it is kept — `Some(None)`
+    /// while it has none.
+    sid: Option<Option<String>>,
+    /// That `session_id` has been signed in to the account — the Company
+    /// signs it in again to that account alone (§4.4) — whether it is signed
+    /// in now or goes on signed out.
+    bound: bool,
     session: Option<Held>,
     signed_in: bool,
     /// The account scopes the Session's latest token carries.
@@ -132,10 +156,12 @@ impl State {
 }
 
 impl Session {
-    /// A Session at `issuer` with a new DPoP key.
-    pub fn new(issuer: &str) -> Result<Session, String> {
+    /// A Session at `issuer` with a new DPoP key: the Session of the account
+    /// `account` names, or the signed-out one.
+    pub fn new(issuer: &str, account: Option<&str>) -> Result<Session, String> {
         Ok(Session {
             issuer: issuer.to_string(),
+            account: account.map(str::to_string),
             dpop: DpopKey::generate()?,
             nonces: Nonces::default(),
             state: Mutex::new(State::default()),
@@ -159,6 +185,11 @@ impl Session {
         }
     }
 
+    /// The Account Token this Session is signed in with, if it is held.
+    pub fn held(&self, env: &Env<'_>) -> Result<Option<Account>, String> {
+        env.account(&self.issuer, self.account.as_deref())
+    }
+
     /// The User's record here, read from the store or minted the first time.
     fn record(&self, env: &Env<'_>, st: &mut State) -> Result<UserRecord, String> {
         match st.record.clone() {
@@ -171,10 +202,59 @@ impl Session {
         }
     }
 
-    /// One token request, `base`: granted on the Account Token while one is
-    /// held, else on the assertion. A token the Company rotated is kept
-    /// before the answer is used; an `invalid_grant` for the Account Token
-    /// forgets it, and the request is made again signed out.
+    /// The Session's `session_id`, as it is kept: the signed-out Session's
+    /// with the User ID, an account's with its Account Token.
+    fn sid(&self, env: &Env<'_>, st: &mut State) -> Result<Option<String>, String> {
+        if let Some(s) = &st.sid {
+            return Ok(s.clone());
+        }
+        let s = match &self.account {
+            None => self.record(env, st)?.session_id,
+            Some(_) => {
+                let s = self.held(env)?.and_then(|a| a.session_id);
+                // Kept with its Account Token: signed in with it.
+                st.bound = s.is_some();
+                s
+            }
+        };
+        st.sid = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Keep `sid` as the Session's `session_id`, where it is kept.
+    fn keep_sid(&self, env: &Env<'_>, st: &mut State, sid: &str) -> Result<(), String> {
+        match &self.account {
+            None => {
+                let mut rec = self.record(env, st)?;
+                rec.session_id = Some(sid.to_string());
+                env.users.save(env.principal, &self.issuer, &rec)?;
+                st.record = Some(rec);
+            }
+            Some(label) => {
+                if let (Some(store), Some(mut a)) = (env.accounts, self.held(env)?)
+                    && a.session_id.as_deref() != Some(sid)
+                {
+                    a.session_id = Some(sid.to_string());
+                    store.keep(env.principal, &self.issuer, label, &a)?;
+                }
+            }
+        }
+        st.sid = Some(Some(sid.to_string()));
+        Ok(())
+    }
+
+    /// Whether `signed_in` is said of this Session on the gauge: an
+    /// account's alone, the signed-out Session never being signed in.
+    fn say_signed_in(&self, company: &str, signed_in: bool) {
+        if let Some(label) = &self.account {
+            crate::obs::metrics::set_company_signed_in(company, label, signed_in);
+        }
+    }
+
+    /// One token request, `base`: granted on the account's Account Token
+    /// while it is held, else on the assertion. A token the Company rotated
+    /// is kept before the answer is used; an `invalid_grant` for the Account
+    /// Token forgets it, and the request is made again signed out.
     fn request(
         &self,
         env: &Env<'_>,
@@ -182,11 +262,11 @@ impl Session {
         base: Request<'_>,
     ) -> Result<TokenResponse, TokenError> {
         let company = &env.verified.company;
-        let account = env.account(&self.issuer).map_err(TokenError::Transport)?;
+        let account = self.held(env).map_err(TokenError::Transport)?;
         // A token the entry now admits none of is not used: the request is
         // made signed out, and the token kept for the User to sign out of.
         let usable = account.and_then(|a| narrowed(&a.scope, env.ceiling).map(|n| (a, n)));
-        if let Some((a, narrower)) = usable {
+        if let (Some((a, narrower)), Some(label)) = (usable, self.account.as_deref()) {
             let req = base.with_account(&a.token, narrower.as_deref());
             match token::request(&self.ctx(env, user_id), req) {
                 Ok(got) => {
@@ -200,29 +280,31 @@ impl Session {
                         // Company may have spent the old Account Token.
                         if let Some(store) = env.accounts {
                             store
-                                .keep(env.principal, &self.issuer, &next)
+                                .keep(env.principal, &self.issuer, label, &next)
                                 .map_err(|e| {
                                     TokenError::Transport(format!(
                                         "the rotated Account Token could not be kept, so its answer is not used: {e}"
                                     ))
                                 })?;
                         }
-                        env.log
-                            .info("company.account_token.rotated", json!({"company": company}));
+                        env.log.info(
+                            "company.account_token.rotated",
+                            json!({"company": company, "account": label}),
+                        );
                     }
                     return Ok(got);
                 }
                 Err(e) if e.is(err::INVALID_GRANT) => {
                     if let Some(store) = env.accounts {
                         store
-                            .forget(env.principal, &self.issuer)
+                            .forget(env.principal, &self.issuer, label)
                             .map_err(TokenError::Transport)?;
                     }
                     env.log.info(
                         "company.account_token.dropped",
-                        json!({"company": company, "reason": err::INVALID_GRANT}),
+                        json!({"company": company, "account": label, "reason": err::INVALID_GRANT}),
                     );
-                    crate::obs::metrics::set_company_signed_in(company, false);
+                    self.say_signed_in(company, false);
                 }
                 Err(e) => return Err(e),
             }
@@ -231,8 +313,8 @@ impl Session {
     }
 
     /// The Session open: a DPoP Session Token that is fresh, renewed or
-    /// started as needed. Its `session_id`, when it changes, is kept with
-    /// the User ID.
+    /// started as needed. Its `session_id`, when it changes, is kept where
+    /// the Session's is.
     pub fn open(&self, env: &Env<'_>) -> Result<(), String> {
         let mut st = self.lock();
         self.open_locked(env, &mut st)
@@ -242,16 +324,16 @@ impl Session {
         if st.session.as_ref().is_some_and(Held::fresh) {
             return Ok(());
         }
-        let rec = self.record(env, st)?;
+        let user_id = self.record(env, st)?.user_id;
         let company = &env.verified.company;
-        let renewed = match rec.session_id.as_deref() {
-            Some(sid) => match self.request(env, &rec.user_id, Request::renew(sid)) {
+        let renewed = match self.sid(env, st)? {
+            Some(sid) => match self.request(env, &user_id, Request::renew(&sid)) {
                 // Ended — or, with an Account Token, signed in to another
                 // account than the token's (§4.4): either way a new Session.
                 Err(e) if e.is(err::INVALID_SESSION) || e.is(err::ACCOUNT_MISMATCH) => {
                     env.log.info(
                         "company.session.ended",
-                        json!({"company": company, "reason": e.code()}),
+                        json!({"company": company, "account": self.account, "reason": e.code()}),
                     );
                     None
                 }
@@ -261,14 +343,14 @@ impl Session {
         };
         let (got, started) = match renewed {
             Some(r) => (r, false),
-            None => (self.request(env, &rec.user_id, Request::start()), true),
+            None => (self.request(env, &user_id, Request::start()), true),
         };
         let got = got.map_err(|e| format!("company {company}: {e}"))?;
         self.adopt(env, st, &got, started)
     }
 
     /// Take `got`, a DPoP Session Token, as the Session's: its `session_id`
-    /// kept with the User ID before it is used.
+    /// kept before it is used.
     fn adopt(
         &self,
         env: &Env<'_>,
@@ -277,19 +359,19 @@ impl Session {
         started: bool,
     ) -> Result<(), String> {
         let company = &env.verified.company;
-        let mut rec = self.record(env, st)?;
-        if rec.session_id.as_deref() != Some(got.session_id.as_str()) {
-            rec.session_id = Some(got.session_id.clone());
+        let changed = self.sid(env, st)?.as_deref() != Some(got.session_id.as_str());
+        if changed {
             // Kept before the token is used: a restart renews this Session.
-            env.users
-                .save(env.principal, &self.issuer, &rec)
+            self.keep_sid(env, st, &got.session_id)
                 .map_err(|e| format!("company {company}: {e}"))?;
-            st.record = Some(rec);
             // Tokens for one resource belong to the Session they were issued
             // for.
             st.drop_scoped();
         }
-        let line = json!({"company": company, "signed_in": got.signed_in});
+        // A new Session is bound to an account once it is signed in; one
+        // renewed stays bound to the one it was.
+        st.bound = got.signed_in || (st.bound && !started && !changed);
+        let line = json!({"company": company, "account": self.account, "signed_in": got.signed_in});
         if started {
             env.log.info("company.session.started", line);
         } else {
@@ -297,7 +379,7 @@ impl Session {
         }
         env.log.debug(
             "company.session.id",
-            json!({"company": company, "session_id": got.session_id}),
+            json!({"company": company, "account": self.account, "session_id": got.session_id}),
         );
         if st.signed_in != got.signed_in {
             // Tokens issued before reflect the Session as it was (§4.4).
@@ -305,7 +387,7 @@ impl Session {
         }
         st.signed_in = got.signed_in;
         st.scope = got.scope.clone();
-        crate::obs::metrics::set_company_signed_in(company, got.signed_in);
+        self.say_signed_in(company, got.signed_in);
         st.session = Some(Held::of(got));
         Ok(())
     }
@@ -364,25 +446,20 @@ impl Session {
         if let Some(h) = held.get(resource).filter(|h| h.fresh()) {
             return Ok(h.token.clone());
         }
-        if st
-            .record
-            .as_ref()
-            .and_then(|r| r.session_id.as_ref())
-            .is_none()
-        {
+        if self.sid(env, st)?.is_none() {
             self.open_locked(env, st)?;
         }
         let company = &env.verified.company;
         let what = if dpop { "A DPoP" } else { "A Bearer" };
         for attempt in 0..2 {
-            let rec = st.record.clone().ok_or("no User record")?;
-            let sid = rec.session_id.clone().unwrap_or_default();
+            let user_id = self.record(env, st)?.user_id;
+            let sid = self.sid(env, st)?.unwrap_or_default();
             let req = if dpop {
                 Request::resource(&sid, resource)
             } else {
                 Request::bearer(&sid, resource)
             };
-            match self.request(env, &rec.user_id, req) {
+            match self.request(env, &user_id, req) {
                 Ok(got) => {
                     if got.session_id != sid {
                         return Err(format!(
@@ -396,7 +473,7 @@ impl Session {
                         st.scope = got.scope.clone();
                         st.session = None;
                         st.drop_scoped();
-                        crate::obs::metrics::set_company_signed_in(company, got.signed_in);
+                        self.say_signed_in(company, got.signed_in);
                     }
                     let token = got.access_token.clone();
                     let into = if dpop {
@@ -413,12 +490,10 @@ impl Session {
                 {
                     env.log.info(
                         "company.session.ended",
-                        json!({"company": company, "reason": e.code()}),
+                        json!({"company": company, "account": self.account, "reason": e.code()}),
                     );
                     st.session = None;
-                    if let Some(r) = st.record.as_mut() {
-                        r.session_id = None;
-                    }
+                    st.sid = Some(None);
                     self.open_locked(env, st)?;
                 }
                 Err(e) => return Err(format!("company {company}: {e}")),
@@ -434,8 +509,7 @@ impl Session {
     pub fn session_id(&self, env: &Env<'_>) -> Result<String, String> {
         let mut st = self.lock();
         self.open_locked(env, &mut st)?;
-        let rec = self.record(env, &mut st)?;
-        rec.session_id
+        self.sid(env, &mut st)?
             .ok_or_else(|| format!("company {}: no Session", env.verified.company))
     }
 
@@ -445,10 +519,10 @@ impl Session {
         Ok(self.record(env, &mut st)?.user_id)
     }
 
-    /// Renew the Session now with the held Account Token, which signs it
-    /// in when it was signed out (§4.8: "With `session_id`, it gets a token
-    /// for that Session, signing it in if it was signed out"): whether it is
-    /// signed in, and with which scopes.
+    /// Renew the Session now with the account's Account Token, which signs
+    /// it in when it was signed out (§4.8: "With `session_id`, it gets a
+    /// token for that Session, signing it in if it was signed out"): whether
+    /// it is signed in, and with which scopes.
     pub fn renew_now(&self, env: &Env<'_>) -> Result<(bool, Vec<String>), String> {
         let mut st = self.lock();
         st.session = None;
@@ -456,10 +530,29 @@ impl Session {
         Ok((st.signed_in, st.scope.clone()))
     }
 
-    /// A new signed-out Session, never the shared one: what a sign-in to
-    /// another account than the held Account Token's starts in (§4.4, "The
-    /// User then signs in again in a new Session"). Its `session_id`; the
-    /// shared Session takes it only once the sign-in succeeds.
+    /// The Session's `session_id`, opened first, when it has been signed in
+    /// to its account — signed in now, or gone on signed out since its
+    /// Account Token was lost (§4.8: "The Session continues signed out, and
+    /// the User signs in again when a task needs the account"): a sign-in in
+    /// it is to that account or `account_mismatch` (§4.4). None when it has
+    /// no `session_id`, or the Company ended the one it had since.
+    pub fn bound_session_id(&self, env: &Env<'_>) -> Result<Option<String>, String> {
+        let mut st = self.lock();
+        if self.sid(env, &mut st)?.is_none() {
+            return Ok(None);
+        }
+        self.open_locked(env, &mut st)?;
+        if !st.bound {
+            return Ok(None);
+        }
+        self.sid(env, &mut st)
+    }
+
+    /// A new signed-out Session at the Company, never one held: what a
+    /// sign-in to an account not held yet, or to another account than the
+    /// held Account Token's, starts in (§4.4, "The User then signs in again
+    /// in a new Session"). Its `session_id`; this Session takes it only once
+    /// the sign-in succeeds.
     pub fn fresh_session_id(&self, env: &Env<'_>) -> Result<String, String> {
         let user_id = self.user_id(env)?;
         token::request(&self.ctx(env, &user_id), Request::start())
@@ -467,10 +560,11 @@ impl Session {
             .map_err(|e| format!("company {}: {e}", env.verified.company))
     }
 
-    /// A sign-in's answer, `got`, signed `got.session_id` in: its Account
-    /// Token kept sealed — before anything else of the answer is used — and
-    /// its Session Token taken as the Session's, every Bearer token dropped.
-    /// The Account Token it replaced, if another was held.
+    /// A sign-in's answer, `got`, signed `got.session_id` in to this
+    /// Session's account: its Account Token kept sealed with that
+    /// `session_id` — before anything else of the answer is used — and its
+    /// Session Token taken as the Session's, every Bearer token dropped. The
+    /// Account Token it replaced, if another was held.
     ///
     /// Under the Session's lock, as every request that may rotate the held
     /// token is: one in flight writes its rotated token back first, and that
@@ -482,6 +576,9 @@ impl Session {
         kind: &str,
     ) -> Result<Option<Account>, String> {
         let company = &env.verified.company;
+        let label = self.account.as_deref().ok_or_else(|| {
+            format!("company {company}: the signed-out Session signs in to no account")
+        })?;
         let rt = got.refresh_token.clone().ok_or_else(|| {
             format!("company {company}: the sign-in's answer carries no Account Token")
         })?;
@@ -489,44 +586,52 @@ impl Session {
             format!("company {company}: no seal key to keep an Account Token with")
         })?;
         let mut st = self.lock();
-        let old = store.load(env.principal, &self.issuer)?;
+        let old = store.load(env.principal, &self.issuer, label)?;
         store.keep(
             env.principal,
             &self.issuer,
+            label,
             &Account {
                 token: rt.clone(),
                 scope: got.scope.clone(),
                 expires_at_ms: expires_at(got),
                 kind: kind.to_string(),
+                session_id: Some(got.session_id.clone()),
             },
         )?;
+        st.sid = Some(Some(got.session_id.clone()));
+        st.bound = true;
         st.drop_scoped();
         self.adopt(env, &mut st, got, false)?;
         Ok(old.filter(|o| o.token != rt))
     }
 
-    /// Give up the User's Account Token here: taken out of `store` and the
-    /// Session signed out — every token held for it dropped, so the next
-    /// request renews it signed out. The token it was, for the caller to
-    /// revoke. Under the Session's lock, so a renewal in flight writes its
-    /// rotated token back first and that is the one taken — none is left
-    /// behind good at the Company.
+    /// Give up the account's Account Token here: taken out of `store` and
+    /// the Session signed out — every token held for it dropped. The token it
+    /// was, for the caller to revoke. Under the Session's lock, so a renewal
+    /// in flight writes its rotated token back first and that is the one
+    /// taken — none is left behind good at the Company.
     pub fn take_account(
         &self,
         store: &Accounts,
         principal: &str,
         company: &str,
     ) -> Result<Option<Account>, String> {
+        let Some(label) = self.account.as_deref() else {
+            return Ok(None);
+        };
         let mut st = self.lock();
-        let held = store.load(principal, &self.issuer)?;
+        let held = store.load(principal, &self.issuer, label)?;
         if held.is_some() {
-            store.forget(principal, &self.issuer)?;
+            store.forget(principal, &self.issuer, label)?;
         }
         st.session = None;
+        st.sid = None;
+        st.bound = false;
         st.drop_scoped();
         st.signed_in = false;
         st.scope.clear();
-        crate::obs::metrics::set_company_signed_in(company, false);
+        self.say_signed_in(company, false);
         Ok(held)
     }
 

@@ -712,6 +712,63 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `openapi` (`rename`, `drop`, `summary`, `add`, `max_age`), its `getOrder` an
   `expand` query parameter, and its record each API request as it came
   (`sent`).
+- Several accounts per User at one Company (RFC 0047, P5b). Each account is
+  named by a label the User's side gives it at sign-in — `account`,
+  `[a-z0-9_-]{1,32}`, `default` when a sign-in names none — that is
+  agentd's own word and reaches the Company in nothing agentd sends. Each
+  has its own Account Token, sealed under an id of `issuer|principal|label`
+  with associated data naming the label, and its own Session, with a DPoP
+  key and Session Token of its own; work done while no account is held goes
+  in one signed-out Session per Company. At most eight accounts are held at
+  one Company. `company.sign_in` and `company.sign_out` take `account`, as
+  do the command ops of the same names and `agentd --login` and `--logout`
+  after a `/` (`company:<name>/<label>`); the sign-in gate names the label.
+  A sign-in to a label holding a token that covers the scopes opens no gate,
+  one to a label not held starts a Session of its own, `new_account`
+  replaces the label's account in a new Session that takes the label only
+  on success, and `account_mismatch` is the label's alone. Signing out of
+  one account revokes its token alone. `company.api`, the operation tools
+  (nesting their parameters when one is named `account`), `company.converse`
+  starting a conversation, `company.direct`, `company.operation.*` and the
+  `http` step's `auth.account` name the account to act with: with one held
+  and none named, that one; with several and none named, or one not held,
+  the call is refused unsent. A conversation belongs to the account it began
+  in — or, begun signed out, the first one it uses, two calls racing to bind
+  it binding it to the first and the other refused unsent — and every
+  request on it, its reader's too, is made there; `company.direct` is
+  refused before the User is asked when the account its conversation goes
+  in cannot be used. An operation is read, confirmed and cancelled in the
+  Session that proposed it, and its approval gate names the account. A Company's MCP tools, whose schemas are the Company's, act with
+  the account labelled `default`, or the only one held, and signed out with
+  several held and none `default`. `security.companies.standing[].accounts`
+  lists the labels a standing permission covers; without it, it covers
+  `default` alone, so a second account never widens it. A sign-in that goes
+  in a new Session may be to another account than the label held, so one
+  with `new_account`, or one under a label whose account was signed out of,
+  reset or lost with its Session, suspends the permissions covering that
+  label until a restart; which labels were given up is kept sealed, so a
+  restart between the sign-out and the sign-in changes nothing. A label
+  whose token the Company stopped taking (`invalid_grant`) signs in again in
+  its own Session, where the Company takes only the same account, and stays
+  covered. `company.status`
+  lists each Company's `accounts` by label, with their scopes, expiry,
+  sign-in kind and whether their Session is signed in — never a token. The
+  User ID stays one per User per Company, so a Company can tell that the
+  accounts are one person's. Events about an account carry `account` — the
+  `company.operation.*` and `company.standing.*` events among them —
+  `agent_company_signed_in` gains the label `account`, and the
+  `company.sign_in`, `company.sign_out`, `company.operation` and
+  `company.standing` audit records name it; a sign-in whose token cannot be
+  kept revokes it (`company.account_token.unkept`). `agentd-core`:
+  `companies::account::{DEFAULT_LABEL, MAX_ACCOUNTS, GONE_KEPT, is_label,
+  label_refused, full}`, `Accounts::{labels, given_up}`,
+  `Supervisor::{account_for, accounts_at, mcp_account, take_accounts}`,
+  `signin::{Step::Account, SignOutError}`, `operations::Step::Account`,
+  `operations::Final::account`, `Session::{held, bound_session_id}` and its
+  `account`, `config::settings::companies::{DEFAULT_ACCOUNT,
+  is_account_label}`, `registry::internal::company_account_arg`. The fake
+  Company's record gains each request's `token_session` and `token_account`,
+  and every request as it came (`sent`), not only an API's.
 - Docs: [Act at companies for a person](docs/act-at-companies.md), the guide
   to the `companies` preview, with a Personal Agent Protocol section in
   docs/interoperability.md; and on agentd.dev's landing page a strip of the
@@ -902,6 +959,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   and `retry_after`; `http::HttpError` has `Refused(http::Challenge)` and
   `RetryAfter { status, wait, sent }`; `http::Challenge::parse` reads a
   `WWW-Authenticate` value. A breaking change to the crate's public API.
+- Acting at Companies (the `companies` preview, RFC 0047 P5b): a sign-in
+  signs in to an account's own Session, a new one for an account not held
+  yet, never the signed-out Session; signing out of the last account held
+  leaves its Session going on signed out, as the signed-out Session from
+  then on, and the Session of one signed out of while others are held is no
+  longer used. The sign-in gate's text and the sign-in and sign-out
+  answers name the account by its label (`Signed in at shop, as the account
+  "default", for …`; `Signed out of the account "default" at shop: …`), the
+  sign-out answer carries `account`, and `agent_company_signed_in` is by
+  `company` and `account`. An Account Token kept by a build from before
+  labels is under the earlier record id and is not read: sign the User in
+  again after upgrading. Conversations and operations kept before carry no
+  account and are taken as begun, or proposed, signed out.
 
 **Fixed.**
 

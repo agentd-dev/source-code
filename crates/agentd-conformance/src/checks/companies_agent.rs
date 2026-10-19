@@ -96,7 +96,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check(
             "companies/agent-signs-in-only-as-the-user-does",
-            "a workflow's company.sign_in starts a Device Sign-In that asks for its scopes with the client assertion, never opens the User's verification page itself, polls an interval apart for the current Session, and once the User has approved is signed in: the account call it makes next is answered",
+            "a workflow's company.sign_in starts a Device Sign-In that asks for its scopes with the client assertion, never opens the User's verification page itself, polls an interval apart for the Session it signs in — a new one of the account's own — and once the User has approved is signed in: the account call it makes next is answered",
             signs_in_only_as_the_user_does,
         ),
         check(

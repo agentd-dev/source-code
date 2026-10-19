@@ -21,6 +21,10 @@
 //! Company's words. Nothing else is sent to it: the model's `company.converse`
 //! and `company.handoff` refuse a Direct Conversation, and no summary,
 //! paraphrase or translation is ever `human` (§7.8).
+//!
+//! A Direct Conversation goes in the User's account the conversation it
+//! follows belongs to (RFC 0047 §9, P5b) — or, when that one belongs to none
+//! yet, the one `company.direct` names, which both belong to from then on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,13 +169,48 @@ impl Supervisor {
         }
     }
 
+    /// Whether a Direct Conversation after `parent` may be asked for naming
+    /// the account `named`, checked before the User is asked, so their words
+    /// are never refused after they wrote them: it goes in `parent`'s
+    /// account, while that is held — a Direct Conversation goes in the
+    /// account of the conversation it follows — or, while `parent` belongs to
+    /// none, in the one `named`, else the only one held
+    /// ([`Supervisor::account_for`]). Nothing is fetched; a Company not
+    /// verified yet is checked as the join begins.
+    pub fn may_follow_in(
+        &self,
+        company: &Company,
+        parent: &str,
+        named: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(issuer) = company.issuer() else {
+            return Ok(());
+        };
+        let book = self.ledger.load(self.principal(), &issuer)?;
+        let kept = book
+            .conversations
+            .get(parent)
+            .and_then(|c| c.account.clone());
+        self.kept_account(
+            company,
+            &issuer,
+            kept.as_deref(),
+            named,
+            &format!("the conversation {parent}, which a Direct Conversation after it follows,"),
+        )
+        .map(|_| ())
+    }
+
     /// Start the User's Direct Conversation after `parent`, their `words` its
-    /// first message — `sender: human`, under the message id kept for `key`.
-    /// The new conversation's id; its reader starts.
+    /// first message — `sender: human`, under the message id kept for `key` —
+    /// in the account `parent` belongs to, or the one `named`
+    /// ([`Supervisor::account_for`]) when it belongs to none yet, which both
+    /// belong to from then on. The new conversation's id; its reader starts.
     pub fn join_direct(
         self: &Arc<Self>,
         company: &Arc<Company>,
         parent: &str,
+        named: Option<&str>,
         words: &str,
         key: &str,
     ) -> Result<String, CallError> {
@@ -179,6 +218,7 @@ impl Supervisor {
         let issuer = v.issuer.clone();
         self.may_follow(company, parent)
             .map_err(CallError::Unsent)?;
+        let account = self.in_account(company, &issuer, parent, named)?;
         let id = self
             .ledger
             .update(self.principal(), &issuer, |b| b.message_id(key))
@@ -191,6 +231,7 @@ impl Supervisor {
         let reply = self.send_signed(
             company,
             &Signed {
+                account: account.as_deref(),
                 method: "POST",
                 url: &ep.url,
                 headers: &[
@@ -229,7 +270,7 @@ impl Supervisor {
             .to_string();
         self.ledger
             .update(self.principal(), &issuer, |b| {
-                b.open(&cid, &company.name);
+                b.open(&cid, &company.name, account.as_deref());
                 if let Some(c) = b.conversations.get_mut(&cid) {
                     c.direct_of = Some(parent.to_string());
                 }
@@ -238,7 +279,7 @@ impl Supervisor {
             .map_err(CallError::Unsent)?;
         self.log().info(
             "company.conversation.opened",
-            json!({"company": company.name, "direct": true}),
+            json!({"company": company.name, "account": account, "direct": true}),
         );
         self.follow(company, &issuer, &cid);
         Ok(cid)
@@ -268,6 +309,7 @@ impl Supervisor {
                 )));
             }
         }
+        let account = self.own_account(company, &issuer, cid)?;
         let id = self
             .ledger
             .update(self.principal(), &issuer, |b| b.message_id(key))
@@ -279,6 +321,7 @@ impl Supervisor {
         let reply = self.send_signed(
             company,
             &Signed {
+                account: account.as_deref(),
                 method: "POST",
                 url: &format!("{}/{cid}/{}", ep.url.trim_end_matches('/'), conv::MESSAGES),
                 headers: &[

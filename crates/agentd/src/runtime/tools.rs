@@ -631,7 +631,11 @@ impl Runtime {
                 #[cfg(feature = "companies")]
                 if let (Some(slot), Some(sup), Some((_, digest))) = (&company, &sup, &proposing)
                     && let Some(c) = sup.company(slot.company())
-                    && let Some(why) = sup.repeats(&c, digest)
+                    && let Some(why) = sup.repeats(
+                        &c,
+                        c.issuer().and_then(|i| sup.mcp_account(&i)).as_deref(),
+                        digest,
+                    )
                 {
                     crate::obs::metrics::record_company_request(slot.company(), "mcp", "unsent");
                     target.send(&tx, Value::String(why), true);
@@ -692,9 +696,12 @@ impl Runtime {
                             .and_then(|s| s.get(crate::companies::wire::operations::MEMBER))
                         && let Some(c) = sup.company(slot.company())
                     {
+                        // In the account the Company's MCP servers act with.
+                        let account = c.issuer().and_then(|i| sup.mcp_account(&i));
                         sup.recognise(
                             &c,
                             crate::companies::ledger::Channel::Tool { name: name.clone() },
+                            account.as_deref(),
                             Some(digest.clone()),
                             op,
                         );

@@ -277,11 +277,13 @@ impl Runtime {
                     })
                 };
                 let cid = text("conversation").unwrap_or_default();
+                let account = text("account");
                 let res: Result<Value, CallError> = match contract.as_str() {
                     "company.converse" => sup.converse(
                         &company,
                         &Say {
                             conversation: text("conversation"),
+                            account: account.clone(),
                             text: text("text"),
                             data: args.get("data").filter(|d| d.is_object()).cloned(),
                             context,
@@ -293,15 +295,24 @@ impl Runtime {
                     "company.read" => sup.read(
                         &company,
                         &cid,
+                        account.as_deref(),
                         wait(crate::companies::conversation::MAX_WAIT),
                         sent.as_ref(),
                     ),
-                    "company.handoff" => {
-                        sup.conversation_op(&company, &cid, conv::HANDOFF, sent.as_ref())
-                    }
-                    "company.close" => {
-                        sup.conversation_op(&company, &cid, conv::CLOSE, sent.as_ref())
-                    }
+                    "company.handoff" => sup.conversation_op(
+                        &company,
+                        &cid,
+                        account.as_deref(),
+                        conv::HANDOFF,
+                        sent.as_ref(),
+                    ),
+                    "company.close" => sup.conversation_op(
+                        &company,
+                        &cid,
+                        account.as_deref(),
+                        conv::CLOSE,
+                        sent.as_ref(),
+                    ),
                     "company.api" => match &operation {
                         Some((shape, call)) => sup.call_operation(
                             &company,
@@ -316,6 +327,7 @@ impl Runtime {
                             &company,
                             &Call {
                                 api: text("api"),
+                                account,
                                 method,
                                 path: text("path").unwrap_or_default(),
                                 query: args["query"].as_object().cloned().unwrap_or_default(),
@@ -376,11 +388,15 @@ impl Runtime {
         caller: &ToolCaller,
         spec: &Map<String, Value>,
     ) {
+        let auth = spec.get("auth");
         let mut args = json!({
-            "company": spec.get("auth").and_then(|a| a.get("company")).cloned().unwrap_or(Value::Null),
+            "company": auth.and_then(|a| a.get("company")).cloned().unwrap_or(Value::Null),
             "method": spec.get("method").and_then(Value::as_str).unwrap_or("GET"),
             "path": spec.get("url").cloned().unwrap_or(Value::Null),
         });
+        if let Some(a) = auth.and_then(|a| a.get("account")).filter(|a| !a.is_null()) {
+            args["account"] = a.clone();
+        }
         for k in ["query", "json", "expect"] {
             if let Some(v) = spec.get(k).filter(|v| !v.is_null()) {
                 args[k] = v.clone();

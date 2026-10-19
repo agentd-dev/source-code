@@ -4386,6 +4386,15 @@
               "items": {
                 "additionalProperties": false,
                 "properties": {
+                  "accounts": {
+                    "description": "the labels of the User's accounts at the Company it covers, as a sign-in names them (agentd's own words, never sent); default the account labelled default alone, and the signed-out Session — so signing in to a second account never widens it",
+                    "items": {
+                      "pattern": "^[a-z0-9_-]{1,32}$",
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
                   "company": {
                     "description": "the company entry",
                     "type": "string"

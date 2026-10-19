@@ -13,7 +13,11 @@
 //!
 //! The signer asks the Session for the token at each request, so a token is
 //! renewed in the last fifth of its life and a request whose token cannot be
-//! produced is not sent (`fa63a997`). What the server answers:
+//! produced is not sent (`fa63a997`). The Session is the one of the User's
+//! account labelled `default`, else of the only account held, else the
+//! signed-out Session ([`Supervisor::mcp_account`]): a Company's tool
+//! schemas are its own, so its MCP tools take no `account` (RFC 0047 §9,
+//! P5b). What the server answers:
 //!
 //! | Server says | agentd does |
 //! |---|---|

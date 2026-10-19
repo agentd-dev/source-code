@@ -1141,6 +1141,7 @@ fn ask(scopes: &[&str]) -> Ask {
     Ask {
         company: "shop".into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        account: None,
         new_account: false,
     }
 }
@@ -1167,7 +1168,11 @@ fn strs(v: &[&str]) -> Vec<String> {
 /// outcome. A poll still running after 30 s is cancelled, and the outcome
 /// is that it never ended.
 fn sign_in(a: &Agent, ask: &Ask) -> (Option<String>, Outcome) {
-    match a.sup.begin_sign_in(ask, "signin-test", None) {
+    match a
+        .sup
+        .begin_sign_in(ask, "signin-test", None)
+        .map(|(_, s)| s)
+    {
         Ok(Started::Held(o)) => (None, o),
         Ok(Started::Device { question, poll, .. }) => {
             let cancel = Arc::new(AtomicBool::new(false));
@@ -1211,6 +1216,23 @@ fn account_tokens(record: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// The Bearer token the fake issued last, as its record names a token.
+fn last_bearer(record: &[Value]) -> Option<String> {
+    tokens(record)
+        .into_iter()
+        .rfind(|t| t["resource"].is_string() && t["status"] == 200)
+        .and_then(|t| t["issued"]["access_token"].as_str().map(presented))
+}
+
+/// The last `tools/call` that reached the fake's MCP server.
+fn last_call(record: &[Value]) -> Value {
+    record
+        .iter()
+        .rfind(|r| r["mcp"] == "tools/call")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 /// The `session_id` the agent's Bearer tokens were last asked for.
 fn bearer_session(record: &[Value]) -> Value {
     tokens(record)
@@ -1232,21 +1254,22 @@ fn order(client: &::mcp::client::McpClient) -> Result<String, String> {
 /// authorization asks for the scopes with the client assertion and a proof;
 /// the gate's text is agentd's, naming the Company by its quoted name beside
 /// its verified domain, with the link and the code to check; each poll comes
-/// an interval after the last, for the current Session, with a proof; the
-/// verification page is never opened by agentd; and once the User approves,
-/// the Session is signed in — an account call answers.
+/// an interval after the last, for a new Session of the account's own —
+/// never the signed-out one — with a proof; the verification page is never
+/// opened by agentd; and once the User approves, the account's Session is
+/// signed in — an account call answers in it.
 #[test]
 fn device_sign_in_keeps_the_interval_and_signs_the_session_in() {
     let f = fake(&[]);
     let a = signing(&f);
     let (client, _) =
         agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
-    let sid = bearer_session(&f.record());
-    assert!(sid.is_string());
+    let signed_out = bearer_session(&f.record());
+    assert!(signed_out.is_string());
     let (q, outcome) = sign_in(&a, &ask(&[]));
     let q = q.expect("a gate");
     let start = format!(
-        "Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes. Open {}/auth/device/verify?user_code=",
+        "Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes; agentd calls this account \"default\". Open {}/auth/device/verify?user_code=",
         f.origin
     );
     assert!(q.starts_with(&start), "{q}");
@@ -1276,8 +1299,13 @@ fn device_sign_in_keeps_the_interval_and_signs_the_session_in() {
     assert!(auth["proof"].is_object(), "a proof: {auth}");
     let p = polls(&record);
     assert_eq!(p.len(), 2, "one pending, one approved: {p:#?}");
+    let sid = p[0]["session_id"].clone();
+    assert!(
+        sid.is_string() && sid != signed_out,
+        "a new Session: {p:#?}"
+    );
     for poll in &p {
-        assert_eq!(poll["session_id"], sid, "the current Session: {poll}");
+        assert_eq!(poll["session_id"], sid, "the account's Session: {poll}");
         assert_eq!(poll["dpop"], true, "{poll}");
     }
     let at = |r: &Value| r["at_ms"].as_u64().unwrap();
@@ -1295,9 +1323,14 @@ fn device_sign_in_keeps_the_interval_and_signs_the_session_in() {
         record.iter().all(|r| r["path"] != "/auth/device/verify"),
         "agentd opened the User's page"
     );
-    assert_eq!(a.sup.signed_in(&a.sup.company("shop").unwrap()), Some(true));
+    assert_eq!(
+        a.sup
+            .signed_in(&a.sup.company("shop").unwrap(), Some("default")),
+        Some(true)
+    );
     // The Bearer tokens were the signed-out Session's: the next one is
-    // asked for with the Account Token, and the account call answers.
+    // asked for in the account's Session with its Account Token, and the
+    // account call answers.
     assert_eq!(order(&client).as_deref(), Ok("shipped"));
     let record = f.record();
     let bearer = refreshes(&record)
@@ -1368,10 +1401,10 @@ fn a_narrower_grant_is_reported() {
     );
     assert!(
         outcome
-            .said("shop")
+            .said("shop", Some("default"))
             .contains("fewer scopes than asked for: poppy:read of poppy:read poppy:write"),
         "{}",
-        outcome.said("shop")
+        outcome.said("shop", Some("default"))
     );
 }
 
@@ -1604,7 +1637,9 @@ fn only_invalid_grant_forgets_the_account_token() {
 }
 
 /// Signing out revokes the Account Token (§4.9, RFC 7009) — the fake records
-/// it — and forgets it; the same Session goes on signed out.
+/// it — and forgets it; the account's Session goes on signed out (§4.9:
+/// "Usually those Sessions continue signed out, so a cart … carries on"),
+/// renewed with the assertion, as the signed-out Session from then on.
 #[test]
 fn signing_out_revokes_and_the_session_goes_on_signed_out() {
     let f = fake(&[]);
@@ -1612,14 +1647,16 @@ fn signing_out_revokes_and_the_session_goes_on_signed_out() {
     let company = a.sup.company("shop").unwrap();
     let (client, _) =
         agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    let signed_out = last_bearer(&f.record()).expect("a signed-out Bearer token");
     sign_in(&a, &ask(&[]));
     assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    assert_ne!(last_call(&f.record())["presented"], signed_out.as_str());
+    let sid = last_call(&f.record())["token_session"].clone();
     let token = account_tokens(&f.record())[0].clone();
-    let sid = bearer_session(&f.record());
-    let out = a.sup.sign_out(&company).unwrap();
+    let out = a.sup.sign_out(&company, None).unwrap();
     assert_eq!(
         out,
-        json!({"company": "shop", "signed_out": true, "revoked": true})
+        json!({"company": "shop", "account": "default", "signed_out": true, "revoked": true})
     );
     let record = f.record();
     let revoke = record
@@ -1631,11 +1668,21 @@ fn signing_out_revokes_and_the_session_goes_on_signed_out() {
     assert_eq!(revoke["revoked"], true);
     assert!(revoke["client_assertion"].is_object());
     assert!(!a.sup.holds_account(&company));
+    let before = f.record().len();
     let e = order(&client).expect_err("signed out");
     assert!(e.contains(wire::error::SIGN_IN_REQUIRED), "{e}");
-    assert_eq!(bearer_session(&f.record()), sid, "the same Session");
+    let call = last_call(&f.record());
+    assert_eq!(call["token_session"], sid, "the same Session: {call:#}");
+    assert!(call["token_account"].is_null(), "signed out: {call:#}");
+    let renewed = tokens(&f.record()[before..])
+        .into_iter()
+        .find(|t| t["resource"].is_string())
+        .cloned()
+        .expect("a Bearer token for the Session, signed out");
+    assert_eq!(renewed["grant"], wire::grant::JWT_BEARER, "{renewed:#}");
+    assert_eq!(renewed["session_id"], sid, "{renewed:#}");
     assert_eq!(
-        a.sup.sign_out(&company).unwrap()["signed_out"],
+        a.sup.sign_out(&company, None).unwrap()["signed_out"],
         false,
         "nobody is signed in"
     );
@@ -1750,7 +1797,7 @@ fn a_device_authorizations_numbers_never_overflow_the_clock() {
     let f = fake(&[]);
     let a = signing(&f);
     f.control(json!({"device": {"expires_in": u64::MAX, "interval": u64::MAX}}));
-    let poll = match a.sup.begin_sign_in(&ask(&[]), "t", None) {
+    let poll = match a.sup.begin_sign_in(&ask(&[]), "t", None).map(|(_, s)| s) {
         Ok(Started::Device { poll, .. }) => poll,
         Ok(_) => panic!("a Device Sign-In"),
         Err(e) => panic!("{e}"),
@@ -1780,7 +1827,9 @@ fn renewing_slowly(
     let before = holds();
     f.control(json!({"stall": {"method": "token:refresh_token", "times": 1, "ms": 1500}}));
     let (sup, c) = (Arc::clone(&a.sup), Arc::clone(company));
-    let t = std::thread::spawn(move || sup.with_session(&c, |s, env| s.renew_now(env)));
+    let t = std::thread::spawn(move || {
+        sup.with_session(&c, Some("default"), |s, env| s.renew_now(env))
+    });
     let deadline = Instant::now() + Duration::from_secs(20);
     while holds() == before {
         assert!(
@@ -1804,7 +1853,7 @@ fn a_renewal_in_flight_never_undoes_a_sign_in() {
     sign_in(&a, &ask(&[]));
     let sid = a
         .sup
-        .with_session(&company, |s, env| s.session_id(env))
+        .with_session(&company, Some("default"), |s, env| s.session_id(env))
         .unwrap();
     let renewal = renewing_slowly(&f, &a, &company);
     // The User finished signing in again meanwhile.
@@ -1820,12 +1869,14 @@ fn a_renewal_in_flight_never_undoes_a_sign_in() {
     };
     let replaced = a
         .sup
-        .with_session(&company, |s, env| s.signed_in(env, &got, "device"))
+        .with_session(&company, Some("default"), |s, env| {
+            s.signed_in(env, &got, "device")
+        })
         .unwrap();
     renewal.join().unwrap().unwrap();
     let held = a
         .sup
-        .with_session(&company, |s, env| env.account(&s.issuer))
+        .with_session(&company, Some("default"), |s, env| s.held(env))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1849,11 +1900,11 @@ fn signing_out_during_a_renewal_revokes_the_rotated_token() {
     let company = a.sup.company("shop").unwrap();
     sign_in(&a, &ask(&[]));
     let renewal = renewing_slowly(&f, &a, &company);
-    let out = a.sup.sign_out(&company).unwrap();
+    let out = a.sup.sign_out(&company, None).unwrap();
     renewal.join().unwrap().unwrap();
     assert_eq!(
         out,
-        json!({"company": "shop", "signed_out": true, "revoked": true})
+        json!({"company": "shop", "account": "default", "signed_out": true, "revoked": true})
     );
     let record = f.record();
     let newest = account_tokens(&record).last().cloned().unwrap();
@@ -1896,14 +1947,14 @@ fn direct_sign_in_spends_its_state_once_and_refuses_another_issuer() {
     );
     // The link the gate shows, followed as the User's browser would.
     let begin = |a: &Agent, ask: Ask| -> (String, String) {
-        let question = match a.sup.begin_sign_in(&ask, "direct-t", None) {
+        let question = match a.sup.begin_sign_in(&ask, "direct-t", None).map(|(_, s)| s) {
             Ok(Started::Direct { question, .. }) => question,
             Err(e) => panic!("a Direct Sign-In: {e}"),
             Ok(Started::Held(o)) => panic!("a Direct Sign-In, not held: {o:?}"),
             Ok(Started::Device { question, .. }) => panic!("a Direct Sign-In, not: {question}"),
         };
         assert!(
-            question.starts_with("Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes. Open this link and sign in on the Company's own page: "),
+            question.starts_with("Sign in to \"Fake Company\" (127.0.0.1) for: view your account information, make changes; agentd calls this account \"default\". Open this link and sign in on the Company's own page: "),
             "{question}"
         );
         let url = question
@@ -2170,7 +2221,7 @@ fn the_reader_skips_unknown_events_hands_on_no_delta_and_reconnects_after_the_la
         "{reads:#?}"
     );
     // The model's read, as JSON, is held to the same rules.
-    let read = a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    let read = a.sup.read(&shop(&a), &cid, None, 0, None).unwrap();
     let said = read["events"].to_string();
     assert!(
         said.contains("You said: boots in size 9")
@@ -2181,7 +2232,7 @@ fn the_reader_skips_unknown_events_hands_on_no_delta_and_reconnects_after_the_la
     assert_eq!(read["status"], "idle");
     // Read again, it has nothing new.
     assert_eq!(
-        a.sup.read(&shop(&a), &cid, 0, None).unwrap()["events"],
+        a.sup.read(&shop(&a), &cid, None, 0, None).unwrap()["events"],
         json!([])
     );
 }
@@ -2272,7 +2323,7 @@ fn cursor_expired_reads_again_from_the_start_and_says_part_is_missing() {
             .iter()
             .any(|i| i.data.to_string().contains("You said: hello"))
     });
-    a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    a.sup.read(&shop(&a), &cid, None, 0, None).unwrap();
     f.control(json!({"expire_events": true}));
     a.sup
         .converse(&shop(&a), &say(Some(&cid), "after the gap", "k#2"))
@@ -2283,7 +2334,7 @@ fn cursor_expired_reads_again_from_the_start_and_says_part_is_missing() {
             .iter()
             .any(|i| i.subject == "cursor_expired")
     });
-    let read = a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    let read = a.sup.read(&shop(&a), &cid, None, 0, None).unwrap();
     assert!(
         read["notes"]
             .to_string()
@@ -2309,7 +2360,7 @@ fn cursor_expired_reads_again_from_the_start_and_says_part_is_missing() {
         "read again from the start: {reads:#?}"
     );
     assert!(
-        !a.sup.read(&shop(&a), &cid, 0, None).unwrap()["notes"]
+        !a.sup.read(&shop(&a), &cid, None, 0, None).unwrap()["notes"]
             .to_string()
             .contains("missing"),
         "said once"
@@ -3042,7 +3093,7 @@ fn the_conversation_limit_holds_and_closing_frees_a_place() {
     assert!(e.to_string().contains("1 conversations are open"), "{e}");
     let closed = a
         .sup
-        .conversation_op(&shop(&a), &cid, "close", None)
+        .conversation_op(&shop(&a), &cid, None, "close", None)
         .unwrap();
     assert_eq!(closed["status"], "closed");
     assert_eq!(a.sup.conversations_open(), 0);
@@ -3076,11 +3127,11 @@ fn a_held_read_outlasts_the_entrys_timeout() {
         .as_str()
         .unwrap()
         .to_string();
-    a.sup.read(&shop(&a), &cid, 0, None).unwrap();
+    a.sup.read(&shop(&a), &cid, None, 0, None).unwrap();
     let begun = Instant::now();
     let read = a
         .sup
-        .read(&shop(&a), &cid, 2, None)
+        .read(&shop(&a), &cid, None, 2, None)
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(read["events"], json!([]), "{read}");
     assert!(begun.elapsed() >= Duration::from_secs(2), "it was held");
@@ -3272,10 +3323,15 @@ fn propose(a: &Agent, item: &str, sku: &str, key: &str) -> String {
 /// Confirm `id`, `given` the User's approval or none: every step, in order.
 fn confirm(a: &Agent, id: &str, given: Option<Approval>) -> Vec<Step> {
     let steps = Mutex::new(Vec::new());
-    a.sup
-        .confirm_operation(&shop(a), id, given, None, &AtomicBool::new(false), &|s| {
-            steps.lock().unwrap().push(s)
-        });
+    a.sup.confirm_operation(
+        &shop(a),
+        id,
+        None,
+        given,
+        None,
+        &AtomicBool::new(false),
+        &|s| steps.lock().unwrap().push(s),
+    );
     steps.into_inner().unwrap()
 }
 
@@ -3553,9 +3609,15 @@ fn two_calls_racing_for_a_permissions_last_use_confirm_once() {
         let (sup, company) = (Arc::clone(&a.sup), shop(&a));
         std::thread::spawn(move || {
             let steps = Mutex::new(Vec::new());
-            sup.confirm_operation(&company, &id, None, None, &AtomicBool::new(false), &|s| {
-                steps.lock().unwrap().push(s)
-            });
+            sup.confirm_operation(
+                &company,
+                &id,
+                None,
+                None,
+                None,
+                &AtomicBool::new(false),
+                &|s| steps.lock().unwrap().push(s),
+            );
             steps.into_inner().unwrap()
         })
     };
@@ -3603,7 +3665,7 @@ fn an_operation_proposed_in_a_conversation_never_matches_a_standing_permission()
     let read = if out["events"].to_string().contains("operation_id") {
         out
     } else {
-        a.sup.read(&shop(&a), &cid, 5, None).unwrap()
+        a.sup.read(&shop(&a), &cid, None, 5, None).unwrap()
     };
     let notes = read["notes"].to_string();
     assert!(
@@ -3676,7 +3738,7 @@ fn in_progress_is_read_again_after_retry_after_across_a_restart() {
         first - answered
     );
     assert_eq!(*finals.lock().unwrap(), [format!("{id}:succeeded")]);
-    let read = b.sup.get_operation(&shop(&b), &id, None).unwrap();
+    let read = b.sup.get_operation(&shop(&b), &id, None, None).unwrap();
     assert_eq!(read["state"], "succeeded");
     assert_eq!(read["reading"], false);
     b.sup.stop_readers();
@@ -3750,6 +3812,7 @@ fn after_a_confirm_timeout_nothing_proposes_the_same_action_until_it_is_final() 
                 name: "shop.exchange_item".into(),
             },
             None,
+            None,
             &r.structured_content.unwrap()["operation"],
         )
         .unwrap();
@@ -3767,7 +3830,7 @@ fn after_a_confirm_timeout_nothing_proposes_the_same_action_until_it_is_final() 
     // Once it is final, both let go.
     until("the operation final", || {
         a.sup
-            .get_operation(&shop(&a), &id, None)
+            .get_operation(&shop(&a), &id, None, None)
             .is_ok_and(|v| v["state"] == "succeeded")
     });
     let steps = confirm(&a, &other, None);
@@ -3793,7 +3856,7 @@ fn only_the_users_relayed_words_carry_sender_human() {
     let words = "  Hi — it's Dana. Can I swap the size?\n";
     let direct = a
         .sup
-        .join_direct(&shop(&a), &parent, words, "direct/1")
+        .join_direct(&shop(&a), &parent, None, words, "direct/1")
         .unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(direct, parent);
     a.sup
@@ -3952,7 +4015,7 @@ fn a_refused_confirm_gives_its_use_back_and_approves_nothing_more() {
     assert!(standing_used(&steps), "{steps:?}");
     assert_eq!(went(&steps), [Went::Refused], "{steps:?}");
     assert!(done(&steps).is_err());
-    let view = a.sup.get_operation(&shop(&a), &x, None).unwrap();
+    let view = a.sup.get_operation(&shop(&a), &x, None, None).unwrap();
     assert!(view["approved_by"].is_null(), "no approval is kept: {view}");
     let y = propose(&a, "itm_2", "stormline-m", "y#1");
     let steps = confirm(&a, &y, None);
@@ -3985,7 +4048,7 @@ fn a_standing_approval_is_asked_again_at_each_confirm() {
     let e = done(&steps).unwrap_err();
     assert!(e.starts_with("outcome unknown: "), "{e}");
     assert_eq!(confirms(&f).len(), 3, "the transport's attempts");
-    a.sup.suspend_standing("shop");
+    a.sup.suspend_standing("shop", "default");
     let steps = confirm(&a, &x, None);
     assert!(
         asked(&steps).is_some() && !standing_used(&steps),
@@ -4023,9 +4086,9 @@ fn a_permissions_use_follows_what_the_company_says_of_its_operation() {
     // Both uses are held for them.
     let y = propose(&a, "itm_3", "stormline-m", "y#1");
     assert!(asked(&confirm(&a, &y, None)).is_some());
-    let out = a.sup.cancel_operation(&shop(&a), &x, None).unwrap();
+    let out = a.sup.cancel_operation(&shop(&a), &x, None, None).unwrap();
     assert_eq!(out["state"], "cancelled", "{out}");
-    let out = a.sup.cancel_operation(&shop(&a), &z, None).unwrap();
+    let out = a.sup.cancel_operation(&shop(&a), &z, None, None).unwrap();
     assert_eq!(
         out["state"], "in_progress",
         "confirmed, so not stopped: {out}"
@@ -4108,10 +4171,10 @@ fn an_approval_covers_what_the_gate_showed_of_its_revision() {
     let approved = approve(&a, &other);
     f.control(json!({"operations": {"drop": 3}}));
     assert!(done(&confirm(&a, &other, Some(approved))).is_err());
-    let view = a.sup.get_operation(&shop(&a), &other, None).unwrap();
+    let view = a.sup.get_operation(&shop(&a), &other, None, None).unwrap();
     assert_eq!(view["approved_by"], "user", "{view}");
     f.control(json!({"operations": {"rewrite": 1}}));
-    let view = a.sup.get_operation(&shop(&a), &other, None).unwrap();
+    let view = a.sup.get_operation(&shop(&a), &other, None, None).unwrap();
     assert!(view["approved_by"].is_null(), "{view}");
 }
 
@@ -4134,6 +4197,7 @@ fn a_confirm_whose_answer_is_not_kept_is_outcome_unknown() {
         sup.confirm_operation(
             &company,
             &cid,
+            None,
             Some(given),
             None,
             &AtomicBool::new(false),
@@ -4170,7 +4234,7 @@ fn a_confirm_whose_answer_is_not_kept_is_outcome_unknown() {
         !finals.lock().unwrap().is_empty()
     });
     assert_eq!(*finals.lock().unwrap(), ["succeeded"]);
-    let view = a.sup.get_operation(&shop(&a), &id, None).unwrap();
+    let view = a.sup.get_operation(&shop(&a), &id, None, None).unwrap();
     assert_eq!(view["state"], "succeeded");
     assert_eq!(confirms(&f).len(), 1);
     a.sup.stop_readers();
@@ -4200,7 +4264,7 @@ fn a_request_to_talk_in_a_direct_conversation_asks_nothing_and_says_nothing() {
         .to_string();
     let direct = a
         .sup
-        .join_direct(&shop(&a), &parent, "Hi, it's Dana.", "direct/1")
+        .join_direct(&shop(&a), &parent, None, "Hi, it's Dana.", "direct/1")
         .unwrap();
     for askable in [false, true] {
         a.sup.set_direct_askable(askable);
@@ -4213,7 +4277,7 @@ fn a_request_to_talk_in_a_direct_conversation_asks_nothing_and_says_nothing() {
                 &format!("relay/{askable}"),
             )
             .unwrap();
-        let read = a.sup.read(&shop(&a), &direct, 5, None).unwrap();
+        let read = a.sup.read(&shop(&a), &direct, None, 5, None).unwrap();
         assert!(
             read["notes"]
                 .to_string()
@@ -4252,11 +4316,11 @@ fn a_first_message_sent_again_starts_no_other_direct_conversation() {
     let words = "Hi, it's Dana.";
     let one = a
         .sup
-        .join_direct(&shop(&a), &parent, words, "direct/task-1")
+        .join_direct(&shop(&a), &parent, None, words, "direct/task-1")
         .unwrap();
     let again = a
         .sup
-        .join_direct(&shop(&a), &parent, words, "direct/task-1")
+        .join_direct(&shop(&a), &parent, None, words, "direct/task-1")
         .unwrap();
     assert_eq!(one, again);
     let firsts: Vec<Value> = conversation_requests(&f)
@@ -4266,4 +4330,844 @@ fn a_first_message_sent_again_starts_no_other_direct_conversation() {
     assert_eq!(firsts.len(), 2);
     assert_eq!(firsts[0]["message_id"], firsts[1]["message_id"]);
     assert_eq!(firsts[1]["duplicate"], true, "{:#?}", firsts[1]);
+}
+
+// ---- Several accounts at one Company (RFC 0047 §9, P5b) -------------------
+
+/// Two labels of the User's accounts: agentd's own words, which no request
+/// it sends may carry.
+const HOME: &str = "lbl-home-q7";
+const WORK: &str = "lbl-work-z3";
+
+/// Sign the User in at `a`'s Company to the account agentd calls `label`,
+/// the scripted User picking the Company's account `account` there.
+fn sign_in_to(a: &Agent, f: &Fake, label: &str, account: &str) -> (Option<String>, Outcome) {
+    f.control(json!({"approver": {"account": account, "after_polls": 0}}));
+    sign_in(
+        a,
+        &Ask {
+            account: Some(label.into()),
+            ..ask(&[])
+        },
+    )
+}
+
+/// `GET /orders/o1` through `company.api`, in the account `account` names.
+fn order_in(a: &Agent, account: Option<&str>, key: &str) -> Result<Value, CallError> {
+    a.sup.call_api(
+        &shop(a),
+        &Call {
+            method: "GET".into(),
+            path: "/orders/o1".into(),
+            account: account.map(str::to_string),
+            key: key.into(),
+            ..Call::default()
+        },
+    )
+}
+
+/// The requests that reached the fake at `path`.
+fn at_path(f: &Fake, path: &str) -> Vec<Value> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["path"] == path)
+        .collect()
+}
+
+/// What reached the fake since its `from`th request, but the reads
+/// `reader` says are a conversation reader's, which go on beside a test.
+fn sent_since(f: &Fake, from: usize, reader: impl Fn(&Value) -> bool) -> Vec<Value> {
+    f.record()
+        .into_iter()
+        .skip(from)
+        .filter(|r| !(r["method"] == "GET" && path_of(r).ends_with("/events") && reader(r)))
+        .collect()
+}
+
+/// Every token the fake issued: Session, Bearer and Account Tokens.
+fn issued(record: &[Value]) -> Vec<String> {
+    record
+        .iter()
+        .flat_map(|r| {
+            ["access_token", "refresh_token"]
+                .into_iter()
+                .filter_map(|k| r["issued"][k].as_str().map(str::to_string))
+        })
+        .collect()
+}
+
+/// The User holds two accounts at one Company at once, each in a Session of
+/// its own (draft §4.4: "uses separate Sessions for them"): each sign-in
+/// starts a Session of its own, with a DPoP key of its own, and each call
+/// is made in the Session of the account it names — a different Session and
+/// key at the fake, signed in to a different account. Naming none while
+/// both are held, or one not held, is refused before anything is sent;
+/// `company.status` lists both by label, with their scopes and no token;
+/// and the labels reach the Company in nothing agentd sends.
+#[test]
+fn two_accounts_are_held_at_once_each_in_its_own_session() {
+    let f = fake(&[]);
+    let a = talking_signed(&f);
+    let (q, home) = sign_in_to(&a, &f, HOME, "acct_1");
+    assert!(
+        q.as_deref()
+            .is_some_and(|q| q.contains(&format!("agentd calls this account \"{HOME}\""))),
+        "the gate names the label: {q:?}"
+    );
+    assert!(matches!(home, Outcome::SignedIn { .. }), "{home:?}");
+    let (_, work) = sign_in_to(&a, &f, WORK, "acct_2");
+    assert!(matches!(work, Outcome::SignedIn { .. }), "{work:?}");
+    // Two sign-ins, each in a new Session with a key of its own.
+    let approved: Vec<Value> = polls(&f.record())
+        .into_iter()
+        .filter(|p| p["status"] == 200)
+        .cloned()
+        .collect();
+    assert_eq!(approved.len(), 2, "{approved:#?}");
+    assert_ne!(approved[0]["session_id"], approved[1]["session_id"]);
+    assert_ne!(approved[0]["jkt"], approved[1]["jkt"]);
+    // Each call in the Session of the account it names.
+    assert_eq!(order_in(&a, Some(HOME), "o#1").unwrap()["status"], 200);
+    assert_eq!(order_in(&a, Some(WORK), "o#2").unwrap()["status"], 200);
+    let gets = at_path(&f, "/api/orders/o1");
+    assert_eq!(gets.len(), 2, "{gets:#?}");
+    assert_eq!(gets[0]["token_account"], "acct_1", "{:#?}", gets[0]);
+    assert_eq!(gets[1]["token_account"], "acct_2", "{:#?}", gets[1]);
+    assert_eq!(gets[0]["token_session"], approved[0]["session_id"]);
+    assert_eq!(gets[1]["token_session"], approved[1]["session_id"]);
+    assert_ne!(gets[0]["jkt"], gets[1]["jkt"], "a DPoP key each");
+    // None named while both are held, or one not held: refused unsent.
+    let before = f.record().len();
+    let e = order_in(&a, None, "o#3").unwrap_err();
+    assert!(matches!(e, CallError::Unsent(_)), "{e:?}");
+    assert!(
+        e.to_string()
+            .contains(&format!("several accounts here ({HOME}, {WORK})")),
+        "{e}"
+    );
+    let e = order_in(&a, Some("lbl-other"), "o#4").unwrap_err();
+    assert!(
+        matches!(e, CallError::Unsent(_)) && e.to_string().contains("no account \"lbl-other\""),
+        "{e:?}"
+    );
+    let e = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "c#1"))
+        .unwrap_err();
+    assert!(e.to_string().contains("several accounts here"), "{e}");
+    assert_eq!(f.record().len(), before, "nothing was sent");
+    // The status lists both, by label, with their scopes — and no token.
+    let st = a
+        .sup
+        .status_of(&shop(&a), &std::collections::BTreeSet::new(), false);
+    let listed: Vec<&str> = st["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["account"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, [HOME, WORK], "{st}");
+    assert_eq!(
+        st["accounts"][0]["scope"],
+        json!(["poppy:read", "poppy:write"])
+    );
+    assert!(st["accounts"][1]["expires_at"].is_string(), "{st}");
+    agentd::jsonschema::validate(
+        &agentd::registry::internal::company_status_output(false),
+        &json!({"user": "operator", "companies": [st.clone()]}),
+    )
+    .unwrap_or_else(|e| panic!("{e:?}: {st}"));
+    let said = st.to_string();
+    for t in issued(&f.record()) {
+        assert!(!said.contains(t.as_str()), "a token in the status: {said}");
+    }
+    // A conversation in one, and a sign-out of the other.
+    a.sup
+        .converse(
+            &shop(&a),
+            &Say {
+                account: Some(HOME.into()),
+                ..say(None, "hello", "c#2")
+            },
+        )
+        .unwrap();
+    a.sup.sign_out(&shop(&a), Some(WORK)).unwrap();
+    // The labels are agentd's: nothing that reached the Company names them,
+    // in any request — its target, headers or body.
+    let seen = serde_json::to_string(&f.record()).unwrap();
+    assert!(
+        f.record().iter().all(|r| r["sent"]["headers"].is_array()),
+        "every request is recorded whole"
+    );
+    for label in [HOME, WORK] {
+        assert!(!seen.contains(label), "{label} reached the Company");
+    }
+}
+
+/// A conversation belongs to the account it began in (draft §7.2): every
+/// request on it — the model's and the reader's — is made in that
+/// account's Session, one naming another account is refused unsent, and
+/// one begun signed out belongs to the first account a call of the model's
+/// uses there.
+#[test]
+fn a_conversation_goes_on_in_its_account_and_refuses_another() {
+    let f = fake(&[]);
+    let a = talking_signed(&f);
+    let _ = stream_of(&a);
+    // Begun signed out, it goes on in the first account it uses.
+    let early = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "c#0"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sign_in_to(&a, &f, HOME, "acct_1");
+    sign_in_to(&a, &f, WORK, "acct_2");
+    let named = |cid: &str, account: &str, key: &str| Say {
+        account: Some(account.into()),
+        ..say(Some(cid), "about an order", key)
+    };
+    a.sup
+        .converse(&shop(&a), &named(&early, WORK, "c#1"))
+        .unwrap();
+    let e = a
+        .sup
+        .converse(&shop(&a), &named(&early, HOME, "c#2"))
+        .unwrap_err();
+    assert!(
+        matches!(e, CallError::Unsent(_))
+            && e.to_string().contains(&format!(
+                "belongs to the account \"{WORK}\", not \"{HOME}\""
+            )),
+        "{e:?}"
+    );
+    // Begun in an account, it goes on in it when a call names none.
+    let cid = a
+        .sup
+        .converse(
+            &shop(&a),
+            &Say {
+                account: Some(HOME.into()),
+                ..say(None, "hello again", "c#3")
+            },
+        )
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    a.sup
+        .converse(&shop(&a), &say(Some(&cid), "and another thing", "c#4"))
+        .unwrap();
+    let session_of = |label: &str| {
+        a.sup
+            .with_session(&shop(&a), Some(label), |s, env| s.session_id(env))
+            .unwrap()
+    };
+    let (home, work) = (session_of(HOME), session_of(WORK));
+    let before = f.record().len();
+    let e = a
+        .sup
+        .read(&shop(&a), &cid, Some(WORK), 0, None)
+        .unwrap_err();
+    assert!(matches!(e, CallError::Unsent(_)), "{e:?}");
+    let e = a
+        .sup
+        .conversation_op(&shop(&a), &cid, Some(WORK), "close", None)
+        .unwrap_err();
+    assert!(matches!(e, CallError::Unsent(_)), "{e:?}");
+    let sent = sent_since(&f, before, |r| {
+        (r["conversation"] == cid.as_str() && r["token_session"] == home.as_str())
+            || (r["conversation"] == early.as_str() && r["token_session"] == work.as_str())
+    });
+    assert!(sent.is_empty(), "nothing was sent: {sent:#?}");
+    a.sup.read(&shop(&a), &cid, Some(HOME), 0, None).unwrap();
+    // The reader of each reads in its account's Session too.
+    let read_in = |c: &str, session: &str| {
+        conversation_requests(&f).iter().any(|x| {
+            x["conversation"] == c
+                && path_of(x).ends_with("/events")
+                && x["token_session"] == session
+        })
+    };
+    until("the readers' reads in each account", || {
+        read_in(&early, &work) && read_in(&cid, &home)
+    });
+    // At the fake: every request on the one begun in an account in its
+    // Session, and none on either in the other's.
+    for r in conversation_requests(&f) {
+        if r["conversation"] == cid.as_str() {
+            assert_eq!(r["token_session"], home.as_str(), "{r:#}");
+        }
+        if r["conversation"] == early.as_str() {
+            assert_ne!(r["token_session"], home.as_str(), "{r:#}");
+        }
+    }
+}
+
+/// Calls racing on a conversation begun signed out, each naming another of
+/// the User's accounts, bind it to one: the first to bind goes on in its
+/// account, and the other is refused unsent — none is sent in an account
+/// the conversation does not belong to.
+#[test]
+fn calls_racing_on_a_conversation_begun_signed_out_bind_it_to_one_account() {
+    let f = fake(&[]);
+    let a = talking_signed(&f);
+    let _ = stream_of(&a);
+    let begun: Vec<String> = (0..8)
+        .map(|n| {
+            a.sup
+                .converse(&shop(&a), &say(None, "hello", &format!("c#{n}")))
+                .unwrap()["conversation"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    sign_in_to(&a, &f, HOME, "acct_1");
+    sign_in_to(&a, &f, WORK, "acct_2");
+    for cid in &begun {
+        let both = Arc::new(std::sync::Barrier::new(2));
+        let racing: Vec<_> = [HOME, WORK]
+            .into_iter()
+            .map(|label| {
+                let (sup, company, cid) = (Arc::clone(&a.sup), shop(&a), cid.clone());
+                let both = Arc::clone(&both);
+                std::thread::spawn(move || {
+                    both.wait();
+                    sup.read(&company, &cid, Some(label), 0, None)
+                })
+            })
+            .collect();
+        let got: Vec<Result<Value, CallError>> =
+            racing.into_iter().map(|t| t.join().unwrap()).collect();
+        let refused: Vec<&CallError> = got.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(refused.len(), 1, "{cid}: {got:?}");
+        assert!(
+            matches!(refused[0], CallError::Unsent(e) if e.contains("belongs to the account")),
+            "{cid}: {got:?}"
+        );
+    }
+}
+
+/// A Direct Conversation goes in the account of the conversation it
+/// follows, or the one named while that belongs to none — and one it cannot
+/// go in is refused before the User is asked, sending nothing: several held
+/// and none named, a label not held, another than the one it belongs to, or
+/// one signed out of since.
+#[test]
+fn a_direct_conversations_account_is_known_before_the_user_is_asked() {
+    let f = fake(&[]);
+    let a = talking_signed(&f);
+    let _ = stream_of(&a);
+    let parent = a
+        .sup
+        .converse(&shop(&a), &say(None, "hello", "c#0"))
+        .unwrap()["conversation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sign_in_to(&a, &f, HOME, "acct_1");
+    sign_in_to(&a, &f, WORK, "acct_2");
+    // Its reader reads beside the test; nothing else is sent.
+    let unsent = |from: usize| {
+        let sent = sent_since(&f, from, |_| true);
+        assert!(sent.is_empty(), "nothing was sent: {sent:#?}");
+    };
+    let before = f.record().len();
+    let refused = |named: Option<&str>, says: &str| {
+        let e = a
+            .sup
+            .may_follow_in(&shop(&a), &parent, named)
+            .expect_err(says);
+        assert!(e.contains(says), "{named:?}: {e}");
+    };
+    refused(None, "several accounts here");
+    refused(Some("lbl-other"), "no account \"lbl-other\"");
+    refused(Some("Work"), "is not an account label");
+    a.sup.may_follow_in(&shop(&a), &parent, Some(HOME)).unwrap();
+    unsent(before);
+    a.sup
+        .converse(
+            &shop(&a),
+            &Say {
+                account: Some(HOME.into()),
+                ..say(Some(&parent), "about an order", "c#1")
+            },
+        )
+        .unwrap();
+    let before = f.record().len();
+    a.sup.may_follow_in(&shop(&a), &parent, None).unwrap();
+    refused(Some(WORK), &format!("belongs to the account \"{HOME}\""));
+    unsent(before);
+    a.sup.sign_out(&shop(&a), Some(HOME)).unwrap();
+    let before = f.record().len();
+    refused(None, "which is not signed in here");
+    unsent(before);
+}
+
+/// An agent that lists the Operations extension at `fake` and may sign the
+/// User in there, with the standing permissions `standing` (lines of a YAML
+/// list).
+fn operating_signed(fake: &Fake, standing: &str) -> Agent {
+    let (h, dir) = (host(), tempfile::tempdir().unwrap().keep());
+    operating_signed_on(fake, &h, &dir, Arc::default(), standing)
+}
+
+/// [`operating_signed`]'s agent, its client published at `h`, its files in
+/// `dir` and its records on `store`: the same agent again after a restart.
+fn operating_signed_on(
+    fake: &Fake,
+    h: &Host,
+    dir: &Path,
+    store: Arc<agentd::store::memory::MemoryStore>,
+    standing: &str,
+) -> Agent {
+    std::fs::write(dir.join("seal"), "5e".repeat(32)).unwrap();
+    let standing = if standing.is_empty() {
+        String::new()
+    } else {
+        format!("    standing:\n{standing}")
+    };
+    let yaml = format!(
+        "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\", extensions: [operations]}}\n    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n{standing}\
+         store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
+         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true, sign_in: [device], scopes: {BOTH}{fields}}}\n",
+        ca = fixture("ca.pem").display(),
+        h = h.origin,
+        d = dir.display(),
+        o = fake.origin,
+        fields = OPERATES.replace("{o}", &fake.origin),
+    );
+    let path = dir.join("c.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let settings =
+        agentd::config::settings::load(&["--config".to_string(), path.display().to_string()], &[])
+            .unwrap_or_else(|e| panic!("{e}"))
+            .0
+            .settings;
+    Agent {
+        sup: supervisor_of(&settings, store, h),
+        _dir: dir.to_path_buf(),
+    }
+}
+
+/// Propose exchanging `item` for `sku` through the API in the account
+/// `account` names, as call `key`: the operation's id.
+fn propose_in(a: &Agent, account: &str, item: &str, sku: &str, key: &str) -> String {
+    let out = a
+        .sup
+        .call_api(
+            &shop(a),
+            &Call {
+                method: "POST".into(),
+                path: "/orders/ord_7Hk2/exchanges".into(),
+                json: Some(json!({"item_id": item, "replacement_sku": sku})),
+                account: Some(account.into()),
+                key: key.into(),
+                ..Call::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out["status"], 202, "{out}");
+    assert_eq!(out["account"], account, "{out}");
+    out["json"]["operation"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// An operation belongs to the account whose Session proposed it: the
+/// User's gate names that account, the confirm is sent in its Session —
+/// the one the proposal came in — and a read, confirm or cancel naming
+/// another account is refused unsent.
+#[test]
+fn an_operation_is_confirmed_in_the_session_that_proposed_it() {
+    let f = fake(&[]);
+    let a = operating_signed(&f, "");
+    sign_in_to(&a, &f, HOME, "acct_1");
+    sign_in_to(&a, &f, WORK, "acct_2");
+    let id = propose_in(&a, WORK, "itm_4Qa", "stormline-m", "p#1");
+    let proposed = at_path(&f, "/api/orders/ord_7Hk2/exchanges");
+    assert_eq!(proposed[0]["token_account"], "acct_2", "{proposed:#?}");
+    let steps = confirm(&a, &id, None);
+    assert_eq!(
+        steps.first(),
+        Some(&Step::Account(Some(WORK.into()))),
+        "what its records name: {steps:?}"
+    );
+    let (q, _) = asked(&steps).expect("the User is asked");
+    assert!(
+        q.contains(&format!("for your account \"{WORK}\" at 127.0.0.1")),
+        "{q}"
+    );
+    assert!(confirms(&f).is_empty(), "nothing is confirmed unasked");
+    // Another account named: refused, and nothing sent.
+    let before = f.record().len();
+    let e = a
+        .sup
+        .get_operation(&shop(&a), &id, Some(HOME), None)
+        .unwrap_err();
+    assert!(
+        matches!(e, CallError::Unsent(_))
+            && e.to_string()
+                .contains(&format!("operation {id} belongs to the account \"{WORK}\"")),
+        "{e:?}"
+    );
+    let steps = {
+        let steps = Mutex::new(Vec::new());
+        a.sup.confirm_operation(
+            &shop(&a),
+            &id,
+            Some(HOME),
+            None,
+            None,
+            &AtomicBool::new(false),
+            &|s| steps.lock().unwrap().push(s),
+        );
+        steps.into_inner().unwrap()
+    };
+    assert!(done(&steps).is_err(), "{steps:?}");
+    assert!(
+        a.sup
+            .cancel_operation(&shop(&a), &id, Some(HOME), None)
+            .is_err()
+    );
+    assert_eq!(f.record().len(), before, "nothing was sent");
+    // The User's approval: the confirm goes in the Session that proposed it.
+    let given = approve(&a, &id);
+    let steps = confirm(&a, &id, Some(given));
+    let out = done(&steps).unwrap();
+    assert_eq!(out["account"], WORK, "{out}");
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    assert_eq!(sent[0]["token_account"], "acct_2", "{:#?}", sent[0]);
+    assert_eq!(sent[0]["token_session"], proposed[0]["token_session"]);
+}
+
+/// A standing permission covers the accounts it lists — and without a
+/// list, the account labelled `default` alone — so the User signing in to a
+/// second account never widens the spending authority the operator gave:
+/// the same exchange proposed in the other account asks the User.
+#[cfg(feature = "cel")]
+#[test]
+fn a_standing_permission_without_accounts_never_confirms_for_a_second_account() {
+    let f = fake(&[]);
+    let unlisted = operating_signed(&f, &cheap_exchanges(""));
+    sign_in_to(&unlisted, &f, "default", "acct_1");
+    sign_in_to(&unlisted, &f, WORK, "acct_2");
+    let first = propose_in(&unlisted, "default", "itm_4Qa", "stormline-m", "p#1");
+    let steps = confirm(&unlisted, &first, None);
+    assert!(standing_used(&steps), "the default account: {steps:?}");
+    let second = propose_in(&unlisted, WORK, "itm_4Qb", "stormline-l", "p#2");
+    let steps = confirm(&unlisted, &second, None);
+    assert!(!standing_used(&steps), "{steps:?}");
+    assert!(asked(&steps).is_some(), "the User is asked: {steps:?}");
+    let sent = confirms(&f);
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    assert_eq!(sent[0]["token_account"], "acct_1");
+    // Listed, it covers that account — and no other.
+    let listed = operating_signed(&f, &cheap_exchanges(&format!(", accounts: [{WORK}]")));
+    sign_in_to(&listed, &f, "default", "acct_1");
+    sign_in_to(&listed, &f, WORK, "acct_2");
+    let third = propose_in(&listed, WORK, "itm_4Qc", "stormline-m", "p#3");
+    assert!(standing_used(&confirm(&listed, &third, None)));
+    let fourth = propose_in(&listed, "default", "itm_4Qd", "stormline-m", "p#4");
+    let steps = confirm(&listed, &fourth, None);
+    assert!(
+        !standing_used(&steps) && asked(&steps).is_some(),
+        "{steps:?}"
+    );
+}
+
+/// A label signed out of may be signed in to again as another account at
+/// the Company — a new Session, which no account holds to the one it was —
+/// so the standing permissions covering it cover nothing there until a
+/// restart takes the account it then holds as the one meant. agentd keeps
+/// that the label was given up, sealed: a restart between the sign-out and
+/// the sign-in changes nothing.
+#[cfg(feature = "cel")]
+#[test]
+fn a_label_signed_out_of_is_covered_again_only_after_a_restart() {
+    let f = fake(&[]);
+    let (h, dir) = (host(), tempfile::tempdir().unwrap().keep());
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let standing = cheap_exchanges("");
+    let on = || operating_signed_on(&f, &h, &dir, Arc::clone(&store), &standing);
+    let a = on();
+    sign_in_to(&a, &f, "default", "acct_1");
+    let first = propose_in(&a, "default", "itm_4Qa", "stormline-m", "p#1");
+    assert!(
+        standing_used(&confirm(&a, &first, None)),
+        "acct_1 is covered"
+    );
+    a.sup.sign_out(&shop(&a), Some("default")).unwrap();
+    let (_, o) = sign_in_to(&a, &f, "default", "acct_2");
+    assert!(matches!(o, Outcome::SignedIn { .. }), "{o:?}");
+    assert!(a.sup.standing_suspended("shop", "default"));
+    let second = propose_in(&a, "default", "itm_4Qb", "stormline-m", "p#2");
+    let steps = confirm(&a, &second, None);
+    assert!(
+        !standing_used(&steps) && asked(&steps).is_some(),
+        "acct_2 asks the User: {steps:?}"
+    );
+    // A restart takes the account the label holds as the one meant.
+    drop(a);
+    let b = on();
+    let third = propose_in(&b, "default", "itm_4Qc", "stormline-m", "p#3");
+    assert!(
+        standing_used(&confirm(&b, &third, None)),
+        "acct_2, after it"
+    );
+    // Signed out of before a restart, and in to another account after it.
+    b.sup.sign_out(&shop(&b), Some("default")).unwrap();
+    drop(b);
+    let c = on();
+    sign_in_to(&c, &f, "default", "acct_3");
+    assert!(c.sup.standing_suspended("shop", "default"));
+    let fourth = propose_in(&c, "default", "itm_4Qd", "stormline-m", "p#4");
+    let steps = confirm(&c, &fourth, None);
+    assert!(!standing_used(&steps), "{steps:?}");
+    let sent: Vec<Value> = confirms(&f)
+        .into_iter()
+        .map(|c| c["token_account"].clone())
+        .collect();
+    assert_eq!(sent, [json!("acct_1"), json!("acct_2")]);
+}
+
+/// An Account Token the Company stops taking (`invalid_grant`, a
+/// disconnect) leaves its label's Session going on signed out (§4.8), and a
+/// sign-in to the label goes in it: the Company signs that account in again
+/// there and refuses another (`account_mismatch`, §4.4), so the standing
+/// permissions covering the label go on covering it.
+#[cfg(feature = "cel")]
+#[test]
+fn a_label_whose_token_was_lost_signs_in_again_in_its_own_session() {
+    let f = fake(&[]);
+    let a = operating_signed(&f, &cheap_exchanges(""));
+    sign_in_to(&a, &f, "default", "acct_1");
+    let approved = || {
+        polls(&f.record())
+            .into_iter()
+            .filter(|p| p["status"] == 200)
+            .map(|p| p["session_id"].clone())
+            .collect::<Vec<_>>()
+    };
+    let session = approved()[0].clone();
+    f.control(json!({"disconnect": true}));
+    let (_, o) = sign_in_to(&a, &f, "default", "acct_2");
+    assert_eq!(o, Outcome::AccountMismatch);
+    assert!(a.sup.accounts_at(&shop(&a)).is_empty(), "lost");
+    let record = f.record();
+    assert_eq!(
+        polls(&record).last().unwrap()["session_id"],
+        session,
+        "in the label's own Session"
+    );
+    let (_, o) = sign_in_to(&a, &f, "default", "acct_1");
+    assert!(matches!(o, Outcome::SignedIn { .. }), "{o:?}");
+    assert_eq!(approved(), [session.clone(), session]);
+    assert!(!a.sup.standing_suspended("shop", "default"));
+    let id = propose_in(&a, "default", "itm_4Qa", "stormline-m", "p#1");
+    assert!(standing_used(&confirm(&a, &id, None)));
+}
+
+/// Signing out of one account revokes its Account Token alone (§4.9): the
+/// other account stays signed in and its calls answer, and a call naming
+/// the one signed out of is refused unsent.
+#[test]
+fn signing_out_of_one_account_leaves_the_other() {
+    let f = fake(&[]);
+    let a = talking_signed(&f);
+    sign_in_to(&a, &f, HOME, "acct_1");
+    sign_in_to(&a, &f, WORK, "acct_2");
+    let tokens = account_tokens(&f.record());
+    assert_eq!(tokens.len(), 2);
+    let e = a.sup.sign_out(&shop(&a), None).unwrap_err();
+    assert!(
+        matches!(&e, agentd::companies::signin::SignOutError::Refused(e) if e.contains("several accounts here")),
+        "{e:?}"
+    );
+    assert!(at_path(&f, "/auth/revoke").is_empty(), "nothing taken");
+    let out = a.sup.sign_out(&shop(&a), Some(HOME)).unwrap();
+    assert_eq!(
+        out,
+        json!({"company": "shop", "account": HOME, "signed_out": true, "revoked": true})
+    );
+    let revoked = at_path(&f, "/auth/revoke");
+    assert_eq!(revoked.len(), 1, "{revoked:#?}");
+    assert_eq!(revoked[0]["account_token"], presented(&tokens[0]));
+    assert_eq!(a.sup.accounts_at(&shop(&a)), [WORK]);
+    let before = f.record().len();
+    let e = order_in(&a, Some(HOME), "o#1").unwrap_err();
+    assert!(matches!(e, CallError::Unsent(_)), "{e:?}");
+    assert_eq!(
+        f.record().len(),
+        before,
+        "nothing was sent: {:#?}",
+        &f.record()[before..]
+    );
+    // The one left is the only one: a call naming none goes in it.
+    assert_eq!(order_in(&a, None, "o#2").unwrap()["status"], 200);
+    let gets = at_path(&f, "/api/orders/o1");
+    assert_eq!(gets.last().unwrap()["token_account"], "acct_2");
+}
+
+/// At most eight accounts are held at one Company: a sign-in to a ninth is
+/// refused before anything is sent, saying so, while one to a label held
+/// still signs in.
+#[test]
+fn at_most_eight_accounts_are_held_at_one_company() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    for n in 0..agentd::companies::account::MAX_ACCOUNTS {
+        let (_, o) = sign_in_to(&a, &f, &format!("lbl-{n}"), &format!("acct_{n}"));
+        assert!(matches!(o, Outcome::SignedIn { .. }), "{n}: {o:?}");
+    }
+    let before = f.record().len();
+    let e = match a.sup.begin_sign_in(
+        &Ask {
+            account: Some("lbl-one-more".into()),
+            ..ask(&[])
+        },
+        "t",
+        None,
+    ) {
+        Err(e) => e,
+        Ok((label, _)) => panic!("a sign-in to {label} began"),
+    };
+    assert!(e.contains("holds 8 accounts there already"), "{e}");
+    assert_eq!(f.record().len(), before, "nothing was sent");
+    let (_, again) = sign_in_to(&a, &f, "lbl-3", "acct_3");
+    assert!(matches!(again, Outcome::SignedIn { .. }), "{again:?}");
+}
+
+/// After a restart each account's Account Token and Session are the ones
+/// it had: its Session renewed with its own token and `session_id`, in the
+/// account it was.
+#[test]
+fn a_restart_keeps_each_accounts_token_and_session() {
+    let f = fake(&[]);
+    let (h, dir) = (host(), tempfile::tempdir().unwrap().keep());
+    let store: Arc<agentd::store::memory::MemoryStore> = Arc::default();
+    let fields = format!("{BOTH}{TALKS}");
+    let first = signing_on(&f, &h, &dir, Arc::clone(&store), &fields);
+    sign_in_to(&first, &f, HOME, "acct_1");
+    sign_in_to(&first, &f, WORK, "acct_2");
+    let tokens = account_tokens(&f.record());
+    let sessions: Vec<Value> = polls(&f.record())
+        .into_iter()
+        .filter(|p| p["status"] == 200)
+        .map(|p| p["session_id"].clone())
+        .collect();
+    drop(first);
+    let before = f.record().len();
+    let second = signing_on(&f, &h, &dir, store, &fields);
+    assert_eq!(
+        second.sup.accounts_at(&shop(&second)),
+        Vec::<String>::new(),
+        "not verified yet"
+    );
+    for (i, label) in [HOME, WORK].into_iter().enumerate() {
+        assert_eq!(
+            order_in(&second, Some(label), &format!("o#{i}")).unwrap()["status"],
+            200
+        );
+    }
+    let record = f.record();
+    let renewed = refreshes(&record[before..]);
+    assert_eq!(renewed.len(), 2, "{renewed:#?}");
+    for (i, r) in renewed.iter().enumerate() {
+        assert_eq!(r["account_token"], presented(&tokens[i]), "{r:#}");
+        assert_eq!(r["session_id"], sessions[i], "its own Session: {r:#}");
+    }
+    let gets = at_path(&f, "/api/orders/o1");
+    assert_eq!(gets[0]["token_account"], "acct_1");
+    assert_eq!(gets[1]["token_account"], "acct_2");
+    assert_eq!(second.sup.accounts_at(&shop(&second)), [HOME, WORK]);
+}
+
+/// The Company's MCP tools, whose schemas are the Company's, act with the
+/// account labelled `default` when it is held, else with the only one held
+/// — and signed out while several are held and none is `default`.
+#[test]
+fn the_companys_mcp_tools_act_in_the_default_account_or_the_only_one() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    let (client, _) =
+        agentd::companies::mcp::connect(&a.sup, "shop", Duration::from_secs(20)).unwrap();
+    sign_in_to(&a, &f, WORK, "acct_2");
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    assert_eq!(
+        last_call(&f.record())["token_account"],
+        "acct_2",
+        "the only one"
+    );
+    sign_in_to(&a, &f, "default", "acct_1");
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    assert_eq!(last_call(&f.record())["token_account"], "acct_1", "default");
+    sign_in_to(&a, &f, HOME, "acct_3");
+    assert_eq!(order(&client).as_deref(), Ok("shipped"));
+    assert_eq!(
+        last_call(&f.record())["token_account"],
+        "acct_1",
+        "default still"
+    );
+    a.sup.sign_out(&shop(&a), Some("default")).unwrap();
+    let e = order(&client).expect_err("signed out");
+    assert!(e.contains(wire::error::SIGN_IN_REQUIRED), "{e}");
+    assert!(
+        last_call(&f.record())["token_account"].is_null(),
+        "two held, none default: signed out"
+    );
+}
+
+/// Each label is signed in to as P2 signs in the one account (§4.4): a held
+/// token that covers the scopes opens no gate; `new_account` replaces the
+/// label's account in a new Session, which takes the label once it succeeds,
+/// revoking the label's old token alone; and another account than the
+/// label's is `account_mismatch`, which changes nothing.
+#[test]
+fn each_label_is_signed_in_to_on_its_own() {
+    let f = fake(&[]);
+    let a = signing(&f);
+    sign_in_to(&a, &f, HOME, "acct_1");
+    sign_in_to(&a, &f, WORK, "acct_2");
+    let tokens = account_tokens(&f.record());
+    let session = |label: &str| {
+        a.sup
+            .with_session(&shop(&a), Some(label), |s, env| s.session_id(env))
+            .unwrap()
+    };
+    let in_label = |scopes: &[&str], new_account: bool| Ask {
+        account: Some(HOME.into()),
+        new_account,
+        ..ask(scopes)
+    };
+    // Held, and covering what is asked: no gate.
+    let (q, held) = sign_in_to(&a, &f, HOME, "acct_1");
+    assert!(q.is_none(), "no gate: {q:?}");
+    assert!(matches!(held, Outcome::SignedIn { .. }), "{held:?}");
+    // Another account under the label, in a new Session.
+    let (home, work) = (session(HOME), session(WORK));
+    f.control(json!({"approver": {"account": "acct_3", "scope": "poppy:read"}}));
+    let (_, o) = sign_in(&a, &in_label(&["poppy:read"], true));
+    assert!(matches!(o, Outcome::SignedIn { .. }), "{o:?}");
+    let revoked = at_path(&f, "/auth/revoke");
+    assert_eq!(revoked.len(), 1, "{revoked:#?}");
+    assert_eq!(revoked[0]["account_token"], presented(&tokens[0]));
+    let replaced = session(HOME);
+    assert_ne!(replaced, home, "a new Session takes the label");
+    assert_eq!(session(WORK), work, "the other account's is as it was");
+    // A sign-in under the label to yet another account: account_mismatch.
+    f.control(json!({"approver": {"account": "acct_9", "scope": "poppy:read poppy:write"}}));
+    let (_, o) = sign_in(&a, &in_label(&["poppy:write"], false));
+    assert_eq!(o, Outcome::AccountMismatch);
+    assert_eq!(
+        a.sup.accounts_at(&shop(&a)),
+        [HOME, WORK],
+        "nothing changed"
+    );
+    assert_eq!(session(HOME), replaced);
+    assert_eq!(at_path(&f, "/auth/revoke").len(), 1, "nothing more revoked");
 }

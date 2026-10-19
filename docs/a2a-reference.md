@@ -459,8 +459,8 @@ op answers with a Task whose `<taskId>.result` artifact carries the result.
 | `auth.sessions.revoke` | task | operator | a TCP listener | `sid`, `name`, or `all: true` |
 | `company.status` | message | operator | a `kind: company` entry | none |
 | `company.user_id.reset` | task | operator | a `kind: company` entry | `company` |
-| `company.sign_in` | task | operator | a `kind: company` entry | `company`; `scopes`, `new_account` |
-| `company.sign_out` | task | operator | a `kind: company` entry | `company` |
+| `company.sign_in` | task | operator | a `kind: company` entry | `company`; `account`, `scopes`, `new_account` |
+| `company.sign_out` | task | operator | a `kind: company` entry | `company`; `account` |
 
 Arguments before a semicolon are required. "A grant" means no role reaches
 the op by default and a principal needs a grant naming it. The operator
@@ -488,18 +488,28 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   connections, which join again on new sessions: the Company sees a new
   User. With a seal key that opens none of the store's records it starts
   that Company over with the key (`started_over: true`); the others stay
-  unavailable until each is reset. The Account Token held there is revoked
-  and forgotten first.
+  unavailable until each is reset. The Account Token of every account the
+  User holds there is revoked and forgotten first. `company.status` lists
+  each Company's `accounts`: the User's accounts there by label, each with
+  the scopes it grants, when its token expires, how the User signed in and
+  whether its Session is signed in — never a token.
 - **`company.sign_in`** and **`company.sign_out`** are the configured User's
   alone (`security.companies.user`): any other principal is refused with
-  `PERMISSION_DENIED`, an operator who is not the User included. The task
+  `PERMISSION_DENIED`, an operator who is not the User included. Each is for
+  one of the User's accounts at the Company, by the label `account` gives it
+  (`[a-z0-9_-]{1,32}`, agentd's own word, never sent to the Company):
+  without one, `company.sign_in` signs in to the only account held, or to
+  `default` while none is, and `company.sign_out` signs out of the only one
+  held; with several held and none named, either fails saying which are
+  ([Several accounts](act-at-companies.md#several-accounts)). The task
   `company.sign_in` answers with is the User's sign-in gate: it goes to
   `input-required` with where to sign in, takes `cancel`, and ends
   `completed` with the `company.sign_in` tool's result, `canceled`, or
-  `failed` saying how. An Account Token already held that covers the scopes
-  completes it without a gate. The task `company.sign_out` answers with ends
-  `completed` with `{company, signed_out, revoked}`, or `failed` when the
-  revocation failed — the Account Token forgotten here either way.
+  `failed` saying how. An Account Token already held under the label that
+  covers the scopes completes it without a gate. The task `company.sign_out`
+  answers with ends `completed` with `{company, account, signed_out,
+  revoked}`, or `failed` when nothing was taken or the revocation failed —
+  the Account Token forgotten here in the second case.
 
 **Reserved names.** `_instance.result` and `_instance.emit` are how a child
 instance reports to its parent; they are the operator's and are not listed in

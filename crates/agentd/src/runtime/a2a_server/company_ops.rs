@@ -8,15 +8,17 @@
 //! `company.status` is the `company.status` tool's document with why each
 //! failed Company failed. `company.user_id.reset` answers open issue #11's
 //! request that a User be able to start over at a Company: it revokes and
-//! forgets the Account Token, forgets the User ID, its secret and the
-//! `session_id`, and drops the Session, so the Company sees a new User — and
+//! forgets the Account Token of every account the User holds there, forgets
+//! the User ID, its secret and every `session_id`, and drops the Sessions,
+//! so the Company sees a new User — and
 //! loses the cart and conversations it kept for the old one. The Company's
 //! MCP connections were the old User's, sessions and all, so each is dialled
 //! afresh before anything more is sent to it. It is an audit record.
 //!
 //! `company.sign_in` and `company.sign_out` are what `agentd --login` and
-//! `--logout company:<name>` send, and what a TUI or web UI the User signs
-//! in to sends: only the configured User may, and their task is the
+//! `--logout company:<name>[/<label>]` send, and what a TUI or web UI the
+//! User signs in to sends — each for one of the User's accounts there, by
+//! its `account` label: only the configured User may, and their task is the
 //! sign-in's gate and says how it ended (`runtime::company_sign_in`).
 
 use super::commands::refusal;
@@ -69,26 +71,34 @@ pub(super) fn handle(
                     "{op}: {name:?} is not a company entry (services.<name>.kind: company)"
                 )));
             };
-            // The old User's Account Token first: nothing after the reset is
-            // signed in as them. Revoked off the loop — whatever the reset
-            // comes to, since once taken it is no longer held here.
-            let taken = sup.take_account(&company);
+            // The old User's Account Tokens first — every account's: nothing
+            // after the reset is signed in as them. Revoked off the loop —
+            // whatever the reset comes to, since once taken they are no
+            // longer held here.
+            let taken = sup.take_accounts(&company);
             let reset = taken
                 .as_ref()
                 .map_err(Clone::clone)
                 .and_then(|_| sup.reset_user(&company));
-            if let Ok(Some(account)) = taken {
+            if let Ok(accounts) = taken
+                && !accounts.is_empty()
+            {
                 let log = rt.log.clone();
                 let (sup, company) = (std::sync::Arc::clone(&sup), std::sync::Arc::clone(&company));
                 std::thread::Builder::new()
                     .name(format!("company-revoke:{name}"))
                     .spawn(move || {
-                        let revoked = sup.revoke_account(&company, &account);
-                        log.info(
-                            "company.signed_out",
-                            serde_json::json!({"company": company.name, "by": "company.user_id.reset",
-                                               "revoked": revoked.is_ok(), "error": revoked.err()}),
-                        );
+                        for (label, account) in accounts {
+                            // The Sessions are gone with the old User: revoked
+                            // from the signed-out one.
+                            let revoked = sup.revoke_account(&company, None, &account);
+                            log.info(
+                                "company.signed_out",
+                                serde_json::json!({"company": company.name, "account": label,
+                                                   "by": "company.user_id.reset",
+                                                   "revoked": revoked.is_ok(), "error": revoked.err()}),
+                            );
+                        }
                     })
                     .ok();
             }

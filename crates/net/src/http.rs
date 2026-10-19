@@ -349,12 +349,12 @@ fn read_response<R: BufRead>(r: &mut R) -> io::Result<Response> {
         .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
 
     let body = if chunked {
-        read_chunked(r)?
+        read_chunked(r, MAX_RESPONSE)?
     } else if let Some(n) = content_length {
-        read_exact_capped(r, n)?
+        read_exact_capped(r, n, MAX_RESPONSE)?
     } else {
         // Connection: close — read to EOF, capped.
-        read_to_end_capped(r)?
+        read_to_end_capped(r, MAX_RESPONSE)?
     };
 
     Ok(Response {
@@ -377,8 +377,8 @@ fn parse_status(line: &str) -> io::Result<u16> {
         })
 }
 
-fn read_exact_capped<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
-    if n > MAX_RESPONSE {
+fn read_exact_capped<R: Read>(r: &mut R, n: usize, cap: usize) -> io::Result<Vec<u8>> {
+    if n > cap {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "response exceeds cap",
@@ -389,10 +389,10 @@ fn read_exact_capped<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn read_to_end_capped<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+fn read_to_end_capped<R: Read>(r: &mut R, cap: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    r.take(MAX_RESPONSE as u64 + 1).read_to_end(&mut buf)?;
-    if buf.len() > MAX_RESPONSE {
+    r.take(cap as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > cap {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "response exceeds cap",
@@ -401,7 +401,7 @@ fn read_to_end_capped<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
+fn read_chunked<R: BufRead>(r: &mut R, cap: usize) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
@@ -423,7 +423,7 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
         }
         // The declared size is peer-controlled and unverified until the bytes
         // actually arrive, so it must never be trusted with arithmetic OR with
-        // an allocation. `size > MAX_RESPONSE` is checked first and the running
+        // an allocation. `size > cap` is checked first and the running
         // total uses `saturating_add`: the plain `body.len() + size` this
         // replaces wrapped on a size near `usize::MAX` — panicking the process
         // in debug, and in release wrapping *below* the cap so the check passed
@@ -431,7 +431,7 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
         // remotely reachable: `runtime::mod` dials every configured MCP server
         // at startup, so a hostile server could kill the daemon at connect time,
         // defeating the "a down server is only logged" containment.
-        if size > MAX_RESPONSE || body.len().saturating_add(size) > MAX_RESPONSE {
+        if size > cap || body.len().saturating_add(size) > cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "chunked response exceeds cap",
@@ -492,8 +492,14 @@ impl<S: Read + Write> StreamingResponse<S> {
     pub fn is_event_stream(&self) -> bool {
         self.content_type() == Some("text/event-stream")
     }
-    /// Buffer the whole body (capped), honoring `Content-Length`/`chunked`/close.
-    pub fn into_body(mut self) -> io::Result<Vec<u8>> {
+    /// Buffer the whole body (capped at [`MAX_RESPONSE`]), honoring
+    /// `Content-Length`/`chunked`/close.
+    pub fn into_body(self) -> io::Result<Vec<u8>> {
+        self.into_body_within(MAX_RESPONSE)
+    }
+    /// [`Self::into_body`], capped at `cap` bytes: for a response the caller
+    /// knows may be larger.
+    pub fn into_body_within(mut self, cap: usize) -> io::Result<Vec<u8>> {
         let content_length = self
             .headers
             .iter()
@@ -504,16 +510,20 @@ impl<S: Read + Write> StreamingResponse<S> {
             .iter()
             .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
         if chunked {
-            read_chunked(&mut self.reader)
+            read_chunked(&mut self.reader, cap)
         } else if let Some(n) = content_length {
-            read_exact_capped(&mut self.reader, n)
+            read_exact_capped(&mut self.reader, n, cap)
         } else {
-            read_to_end_capped(&mut self.reader)
+            read_to_end_capped(&mut self.reader, cap)
         }
     }
     /// Consume into an [`SseReader`] to pump `text/event-stream` events.
     pub fn sse(self) -> SseReader<BufReader<S>> {
         SseReader::new(self.reader)
+    }
+    /// [`Self::sse`], each event capped at `cap` bytes.
+    pub fn sse_within(self, cap: usize) -> SseReader<BufReader<S>> {
+        SseReader::within(self.reader, cap)
     }
 
     /// Consume into the raw body reader — for a response that turned out NOT to
@@ -582,14 +592,20 @@ pub struct SseEvent {
 /// A blocking, line-based SSE reader. `next_event` accumulates `field: value`
 /// lines and emits one [`SseEvent`] per blank-line separator (multiple `data:`
 /// lines join with `\n`), returning `Ok(None)` at end of stream. Bounded per
-/// event by [`MAX_RESPONSE`] so a hostile stream cannot exhaust memory.
+/// event by [`MAX_RESPONSE`] (or the cap it was made [`within`](Self::within))
+/// so a hostile stream cannot exhaust memory.
 pub struct SseReader<R: BufRead> {
     r: R,
+    cap: usize,
 }
 
 impl<R: BufRead> SseReader<R> {
     pub fn new(r: R) -> SseReader<R> {
-        SseReader { r }
+        SseReader::within(r, MAX_RESPONSE)
+    }
+    /// A reader whose every event is capped at `cap` bytes.
+    pub fn within(r: R, cap: usize) -> SseReader<R> {
+        SseReader { r, cap }
     }
 
     /// Read the next event, or `Ok(None)` at EOF. Comment lines (`:` prefix) and
@@ -606,7 +622,7 @@ impl<R: BufRead> SseReader<R> {
                 return Ok(if saw_field { Some(ev) } else { None });
             }
             total += n;
-            if total > MAX_RESPONSE {
+            if total > self.cap {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SSE event exceeds cap",
@@ -867,5 +883,36 @@ mod tests {
         let ev = sse.next_event().unwrap().expect("one event");
         assert!(ev.data.contains("\"id\":1"));
         assert!(sse.next_event().unwrap().is_none());
+    }
+    /// A body or an event past the cap fails; a caller that knows a response
+    /// may be larger reads it within its own cap, in every framing.
+    #[test]
+    fn a_body_and_an_event_are_read_within_the_callers_cap() {
+        let respond = |head: &str, body: &[u8]| {
+            let mut raw = format!("HTTP/1.1 200 OK\r\n{head}\r\n").into_bytes();
+            raw.extend_from_slice(body);
+            let stream = FakeStream {
+                resp: Cursor::new(raw),
+                sink: Vec::new(),
+            };
+            send_streaming(stream, "h", "POST", "/mcp", &[], b"{}").unwrap()
+        };
+        let body = vec![b'x'; 64];
+        let chunked = format!("40\r\n{}\r\n0\r\n\r\n", "x".repeat(64));
+        for (head, bytes) in [
+            ("Content-Length: 64\r\n", body.clone()),
+            ("", body.clone()),
+            ("Transfer-Encoding: chunked\r\n", chunked.into_bytes()),
+        ] {
+            let err = respond(head, &bytes).into_body_within(63).unwrap_err();
+            assert!(err.to_string().contains("exceeds cap"), "{head:?}: {err}");
+            assert_eq!(respond(head, &bytes).into_body_within(64).unwrap(), body);
+        }
+        let event = format!("data: {}\n\n", "y".repeat(64));
+        let head = "Content-Type: text/event-stream\r\n";
+        let mut small = respond(head, event.as_bytes()).sse_within(32);
+        assert!(small.next_event().is_err());
+        let mut large = respond(head, event.as_bytes()).sse_within(128);
+        assert_eq!(large.next_event().unwrap().unwrap().data.len(), 64);
     }
 }

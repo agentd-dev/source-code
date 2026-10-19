@@ -494,6 +494,16 @@ impl StreamableHttpClient for AgentdHttp {
             rmcp::model::JsonRpcMessage::Request(r)
                 if matches!(r.request, rmcp::model::ClientRequest::ListToolsRequest(_))
         );
+        // A resource may be a skill's file, read whole (`RESOURCE_READ_MAX`).
+        let cap = if matches!(
+            &message,
+            rmcp::model::JsonRpcMessage::Request(r)
+                if matches!(r.request, rmcp::model::ClientRequest::ReadResourceRequest(_))
+        ) {
+            crate::http::RESOURCE_READ_MAX
+        } else {
+            net::http::MAX_RESPONSE
+        };
         // A `tools/call`'s failure says how far it got (the module doc).
         let calls_tool = matches!(
             &message,
@@ -632,6 +642,7 @@ impl StreamableHttpClient for AgentdHttp {
                     let _ = notes_tx.send(Pumped::Message(n));
                 },
                 &hangup,
+                cap,
             );
             // A `tools/call`'s error answer that came with a failing status
             // says it: a `5xx` may mean the call ran.

@@ -2551,10 +2551,11 @@ impl Runtime {
             ));
         }
         messages.push(Msg::user(user, None));
-        // Skills for the step.
-        let skill_bodies: Vec<String> = step
+        // Skills for the step: each loaded, or said not to be (RFC 0051 D3).
+        let refs: Vec<String> = step
             .skills
             .iter()
+            .cloned()
             .chain(
                 spec.get("skills")
                     .and_then(Value::as_array)
@@ -2564,33 +2565,10 @@ impl Runtime {
                             .map(str::to_string)
                             .collect::<Vec<_>>()
                     })
-                    .unwrap_or_default()
-                    .iter(),
+                    .unwrap_or_default(),
             )
-            .filter_map(|name| {
-                let mcp = self.mcp.clone();
-                let resolver = move |server: &str| -> Option<
-                    std::sync::Arc<dyn crate::context::skills::SkillServer>,
-                > {
-                    mcp.get(server).map(|c| {
-                        c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>
-                    })
-                };
-                let trace = self.step_trace(run_id, step_id);
-                self.skills
-                    .load(name, None, &resolver, trace.as_ref())
-                    .ok()
-                    .map(|b| format!("### Skill: {}\n{}", b.name, b.body))
-            })
             .collect();
-        let extra = if skill_bodies.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "Loaded skills — follow these instructions when relevant:\n{}",
-                skill_bodies.join("\n\n")
-            ))
-        };
+        let extra = self.step_skills(run_id, step_id, &refs);
         let system = match spec.get("system").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None if is_think => format!(

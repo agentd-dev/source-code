@@ -40,6 +40,7 @@ the environment — so there are no capability-gated checks to skip.
 | `auth`             | the card's security fields match what the listener enforces, the extended card needs a declared credential, and browsers are admitted only from listed origins. |
 | `mcp-auth-core`    | agentd as an OAuth client: RFC 8414 and RFC 9728 metadata read first at the path-inserted well-known URLs, a mismatched issuer refused, and the refresh token revoked at the server on `--logout`. |
 | `mcp-tasks`        | agentd as a client of the MCP Tasks extension (SEP-2663): a workflow step's task followed to its result, its timeout's `tasks/cancel`, and `tasks: off` against a server that requires the extension. |
+| `mcp-skills`       | agentd as a client of the MCP Skills extension (SEP-2640): a listed skill loaded once its `SKILL.md` matches its entry's digest and size, one whose bytes differ declined after a `skills/get` refresh, and a server's prompt that is never a skill. |
 | `companies`        | the fake Company agentd is tested against under the Personal Agent Protocol draft pinned at `95fcbf2`, driven by a Personal Agent written here from the draft: each check quotes the sentence it tests, passes against the fake, and catches the variant built to break it; then agentd itself as the Personal Agent, read from the fake's record of what reached it. |
 
 Every check, and what it proves, is listed in the repository's

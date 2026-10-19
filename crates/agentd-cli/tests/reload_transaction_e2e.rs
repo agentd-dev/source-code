@@ -831,7 +831,8 @@ fn a_reload_adding_a_tool_workflow_alone_registers_its_tool() {
 /// skills source on a server the same reload adds is found.
 #[test]
 fn skills_from_a_server_the_reload_adds_are_discovered() {
-    let b = common::spawn_mock_mcp("mock://b", false);
+    // A 2026-07-28 server: the Skills extension is defined only there.
+    let b = common::spawn_mock_mcp_at("2026-07-28", "mock://b", false);
     let t = tempfile::tempdir().unwrap();
     let cfg = t.path().join("agent.yaml");
     std::fs::write(&cfg, config("Work.", &[], &[], "")).unwrap();
@@ -844,7 +845,7 @@ fn skills_from_a_server_the_reload_adds_are_discovered() {
             "Work.",
             &[("b", &b.uri())],
             &[],
-            "skills:\n  sources:\n    - {server: b, discover: resources}\n",
+            "skills:\n  sources:\n    - {server: b}\n",
         ),
     )
     .unwrap();
@@ -855,6 +856,152 @@ fn skills_from_a_server_the_reload_adds_are_discovered() {
         changed(outcome).iter().any(|c| c == "skills"),
         "b's skills were not discovered: {:?}\n{log}",
         changed(outcome)
+    );
+}
+
+/// A reload that removes a skills source lets go of that server's skills in
+/// every context: its body leaves the next prompt and `skills.read` reads
+/// nothing of it, said as `skills.unloaded`. A folder skill the reload keeps
+/// stays loaded, and a reload that changes nothing keeps a skill no listing
+/// names, got with `skills/get`, and says it changed nothing. The root turns
+/// on each tick's finished run, and the mock model answers by what the
+/// prompt holds.
+#[test]
+fn a_removed_skills_source_lets_go_of_its_loaded_skills() {
+    let kb = common::spawn_mock_mcp_at("2026-07-28", "mock://kb", false);
+    let t = tempfile::tempdir().unwrap();
+    let folder = t.path().join("skills");
+    std::fs::create_dir_all(folder.join("notes")).unwrap();
+    std::fs::write(
+        folder.join("notes/SKILL.md"),
+        "---\nname: notes\ndescription: Mine\n---\n\nLOCAL-NOTES-BODY\n",
+    )
+    .unwrap();
+    let playbook = t.path().join("pb.json");
+    let play = |v: serde_json::Value| std::fs::write(&playbook, v.to_string()).unwrap();
+    // The server's body: the mock's `git-workflow`.
+    const SERVER_BODY: &str = "Branch from main as feature";
+    play(serde_json::json!({
+        "match": [{"when_contains": SERVER_BODY, "content": "server-body"}],
+        "turns": [{"content": "no-server-body"}]
+    }));
+    let cfg = t.path().join("agent.yaml");
+    let write = |sources: &str| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "agent:\n  name: tx\n  instruction: \"Follow @skill:git-workflow, @skill:kb/hidden and @skill:notes.\"\n  preflight: never\n  on_workflow_finished: think\n  wake_on: [workflow_finished]\n\
+                 intelligence:\n  endpoints: \"mock:file:{}\"\n  model: mock\n\
+                 store:\n  kind: memory\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n  log_content: true\n\
+                 mcp:\n  servers:\n    - {{name: kb, endpoint: \"{}\"}}\n\
+                 skills:\n  dir: {}\n{sources}\
+                 workflows:\n{QUIET_TICK}",
+                playbook.display(),
+                kb.uri(),
+                folder.display()
+            ),
+        )
+        .unwrap()
+    };
+    write("  sources:\n    - {server: kb}\n");
+    let d = Daemon::spawn(&cfg);
+    let replies = |log: &str| -> Vec<String> {
+        events(log, "turn.reply")
+            .iter()
+            .filter_map(|e| e["text"].as_str().map(str::to_string))
+            .collect()
+    };
+    d.wait_for(
+        |l| replies(l).iter().any(|r| r == "server-body"),
+        "a turn whose prompt holds the server's skill",
+        20,
+    );
+    // The same file again: the catalogue is rebuilt (a folder is
+    // configured), and holds what it held.
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert_eq!(changed(outcome), ["nothing"], "{log}");
+    assert!(events(&log, "skills.unloaded").is_empty(), "{log}");
+
+    // The source goes; the turns after the reload read the server's skill.
+    play(serde_json::json!({
+        "match": [{"when_contains": SERVER_BODY, "content": "server-body"}],
+        "turns": [
+            {"tool_calls": [{"name": "skills.read", "arguments": {"name": "git-workflow", "path": "SKILL.md"}}]},
+            {"echo_tool_result": true}
+        ]
+    }));
+    write("");
+    let log = d.reload(1);
+    let outcome = &outcomes(&log)[1];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert!(changed(outcome).iter().any(|c| c == "skills"), "{log}");
+    let unloaded = events(&log, "skills.unloaded");
+    let uris: Vec<&str> = unloaded.iter().filter_map(|e| e["uri"].as_str()).collect();
+    assert_eq!(
+        uris,
+        ["skill://git-workflow/SKILL.md", "skill://hidden/SKILL.md"],
+        "the server's two, and the folder skill stays:\n{log}"
+    );
+    for e in &unloaded {
+        assert_eq!(e["ctx"], "root", "{e}");
+        assert_eq!(e["server"], "kb", "{e}");
+        assert_eq!(
+            e["reason"], "its server is no longer a skills source",
+            "{e}"
+        );
+    }
+    // The turns spawned after the reload: never the server's body, and its
+    // file is not read.
+    let after = |log: &str| -> Vec<String> {
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let Some(at) = lines.iter().position(|v| v["event"] == "skills.unloaded") else {
+            return Vec::new();
+        };
+        let Some(spawned) = lines[at..].iter().position(|v| v["event"] == "turn.spawn") else {
+            return Vec::new();
+        };
+        lines[at + spawned..]
+            .iter()
+            .filter(|v| v["event"] == "turn.reply")
+            .filter_map(|v| v["text"].as_str().map(str::to_string))
+            .collect()
+    };
+    let log = d.wait_for(
+        |l| {
+            after(l)
+                .iter()
+                .any(|r| r.contains("not loaded in this context"))
+        },
+        "a turn after the reload told skills.read refused",
+        20,
+    );
+    assert!(
+        !after(&log).iter().any(|r| r == "server-body"),
+        "the server's body stayed in the prompt:\n{log}"
+    );
+    assert_eq!(
+        kb.reads("skill://git-workflow/SKILL.md"),
+        1,
+        "read once, at load:\n{}",
+        kb.log()
+    );
+
+    // The folder skill is still in the prompt.
+    play(serde_json::json!({
+        "match": [{"when_contains": "LOCAL-NOTES-BODY", "content": "local-body"}],
+        "turns": [{"content": "no-local-body"}]
+    }));
+    d.wait_for(
+        |l| after(l).iter().any(|r| r == "local-body"),
+        "a turn after the reload whose prompt holds the folder skill",
+        20,
     );
 }
 

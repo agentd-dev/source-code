@@ -169,7 +169,7 @@ Four folders beside the config fill in a setting you did not write:
 | Folder | Fills in | Files |
 |---|---|---|
 | `workflows/` | `workflows` | `*.yaml`, `*.yml`, `*.json`, one workflow document each |
-| `skills/` | `skills.dir` | `<name>.md`, or `<name>/SKILL.md` |
+| `skills/` | `skills.dir` | `<name>/SKILL.md`, one Agent Skill each |
 | `subagents/` | `subagents.templates` | `*.yaml`, `*.yml`, `*.json`, one template each, named by file stem |
 | `context/` | `context.templates` | `*.md`, `*.txt`, `*.hbs`, the whole body as the template, named by stem |
 
@@ -178,6 +178,13 @@ counts as set) and only when it yields at least one file. agentd looks beside
 each loaded config file, the last one first, and uses the first directory that
 has the folder; with no config file, the working directory. Files load in
 filename order.
+
+`.agents/skills/` beside a loaded config file is read as well, as the Agent
+Skills project scope: its `<name>/SKILL.md` skills sit beside those of
+`skills.dir`, and win a name over them. It has no key, and is never read
+from the working directory alone. A skill in either folder that breaks an
+Agent Skills rule refuses the configuration
+([Agent Skills](interoperability.md#agent-skills)).
 
 ### Several files
 
@@ -1088,13 +1095,13 @@ mentions `{{instruction}}` loads with a warning. How a turn uses it is
 | `knowledge.auto_context.top_k` | int | `5` | live · doc | Hits added per turn. |
 | `knowledge.auto_context.max_bytes` | int | `16384` | live · doc | The most bytes of hits added per turn. |
 | `search.server` | string | — | live · doc | The MCP server behind the `search.*` tools. |
-| `skills.sources[].server` | string | required | live · op | A server skills are discovered from. |
-| `skills.sources[].discover` | `prompts \| resources \| auto` | `auto` | live · op | Which MCP surface carries the skills. |
-| `skills.sources[].filter` | string | — | live · op | Narrow the skills discovered. |
-| `skills.dir` | path | `skills/` beside the config, when present | live · op | A local folder of skill files (`<name>.md` or `<name>/SKILL.md`). A local skill wins a name collision. |
-| `skills.reference_prefix` | string | `@skill:` | live · doc | How the model references a skill. |
-| `skills.max_loaded` | int | `8` | live · doc | Skills loaded into context at once. |
-| `skills.max_bytes` | int | `32768` | live · doc | A skill body is truncated past this. |
+| `skills.sources[].server` | string | required | live · op | An MCP server whose Skills extension (`io.modelcontextprotocol/skills`) skills are read from. Not `local`: that is the origin a reference names your own skills by. |
+| `skills.sources[].filter` | string | — | live · op | One skill name, or a prefix ending in `*`: the server's skills to take. |
+| `skills.sources[].dynamic` | `refuse \| allow` | `refuse` | live · op | Load a skill whose content is `dynamic`, which cannot be verified. |
+| `skills.dir` | path | `skills/` beside the config, when it holds a skill | live · op | A folder of `<name>/SKILL.md` skills, the user scope. A folder that cannot be read refuses the configuration. |
+| `skills.reference_prefix` | string | `@skill:` | live · doc | How a text references a skill. |
+| `skills.max_loaded` | int | `8` | live · doc | Skills loaded into a context at once. |
+| `skills.max_bytes` | int | `32768` | live · doc | The most text a skill body or file puts into context; the rest is cut. |
 
 ## store
 
@@ -1574,7 +1581,7 @@ Every other path is applied live, as follows:
 | `intelligence.routes` | Read as each turn is launched; a turn routed to a model the reload removed runs on `roles.turn`. |
 | `agent.instruction` | Re-read, through the servers the reload would run on, and its machinery folded again. A resource that cannot be read refuses the reload. |
 | `mcp.servers` | Added or changed servers are dialed beside the running set; unchanged ones keep their connection; removed ones disconnect when the reload applies. A server is unchanged only when everything its dial reads is (endpoint, headers, `auth`, `oauth`, `aauth`, `service`, the service's `rate`, `timeout`), so a rotated credential re-dials it and a tags-only change does not. |
-| `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt and the skills catalogue discovered again. |
+| `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt; the skills sources are listed again and both skills folders read again. A context keeps the skill bodies it loaded of the skills the new catalogue holds; a server's skill whose source was removed, or no longer admits it, is unloaded (`skills.unloaded`). |
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
 | `a2a.cors.origins` | Replaced in the live listener; removing an origin revokes it. |

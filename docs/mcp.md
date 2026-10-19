@@ -191,10 +191,12 @@ offers. agentd separates knowing that a resource exists from reading it:
   and a workflow reads with an `mcp.resource` step.
 
 A large resource therefore enters the context only when the model or the
-workflow asks for it. Prompts are used the same way: for a server named
-under `skills.sources`, agentd reads its prompts, and its resources marked
-as skills, into a catalogue of names and descriptions, and loads a body only
-when it is referenced.
+workflow asks for it. Skills are read the same way: for a server named under
+`skills.sources` that declares the MCP Skills extension, agentd lists the
+skills into a catalogue of names and descriptions, loads a body only when it
+is referenced, and a file only when the model asks for it, each checked
+against the digest the server listed
+([Load skills from a server](connect-mcp.md#load-skills-from-a-server)).
 
 ## Notify-then-read
 

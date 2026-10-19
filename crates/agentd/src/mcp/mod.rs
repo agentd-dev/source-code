@@ -58,6 +58,36 @@ pub mod pace {
     }
 }
 
+/// A `prompts/get` result's text: the text parts of its messages, a blank
+/// line between messages.
+pub fn prompt_text(messages: &[serde_json::Value]) -> String {
+    use serde_json::Value;
+    let mut out = String::new();
+    for m in messages {
+        let text = match m.get("content").unwrap_or(&Value::Null) {
+            Value::String(s) => s.clone(),
+            Value::Object(o) => o
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&text);
+        }
+    }
+    out
+}
+
 /// The `_meta` every `tools/call` on a connection carries, whichever process
 /// dialled it — the reactor at startup or on reload, or a subagent: the run id
 /// and instance, so a backing service can recognize a retried call and
@@ -276,6 +306,8 @@ pub mod mock_hooks;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
+pub mod mock_skills;
+#[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_tasks;
 
 // agentd-as-A2A-client: the remote-A2A-agent delegation backend. Reads a
@@ -284,3 +316,21 @@ pub mod mock_tasks;
 // serving side of A2A is `runtime::a2a_server`.
 #[cfg(feature = "a2a")]
 pub mod a2a_client;
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn a_prompts_text_is_its_messages_text_parts() {
+        assert_eq!(
+            super::prompt_text(&[
+                json!({"content": "a"}),
+                json!({"content": {"type": "text", "text": "b"}}),
+                json!({"content": [{"type": "text", "text": "c"}, {"type": "image"}, {"type": "text", "text": "d"}]}),
+                json!({"content": {"type": "image"}}),
+            ]),
+            "a\n\nb\n\nc\nd"
+        );
+    }
+}

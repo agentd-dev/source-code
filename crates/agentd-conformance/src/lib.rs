@@ -59,6 +59,10 @@ pub enum Category {
     /// task followed to its result, its timeout's `tasks/cancel`, and
     /// `tasks: off` against a server that requires it.
     McpTasks,
+    /// agentd as a client of the MCP Skills extension (RFC 0051): a listed
+    /// skill loaded once its digest matches, one whose bytes differ
+    /// declined, and a prompt that is no skill.
+    McpSkills,
     /// The Personal Agent Protocol draft agentd is pinned to: the fake
     /// Company it is tested against, held to the draft's own sentences.
     Companies,
@@ -66,7 +70,7 @@ pub enum Category {
 
 impl Category {
     /// Every family, in report order: the one list the docs are held to.
-    pub const ALL: [Category; 12] = [
+    pub const ALL: [Category; 13] = [
         Category::Supervisor,
         Category::Security,
         Category::Store,
@@ -78,6 +82,7 @@ impl Category {
         Category::Auth,
         Category::McpAuthCore,
         Category::McpTasks,
+        Category::McpSkills,
         Category::Companies,
     ];
 
@@ -94,6 +99,7 @@ impl Category {
             Category::Auth => "auth",
             Category::McpAuthCore => "mcp-auth-core",
             Category::McpTasks => "mcp-tasks",
+            Category::McpSkills => "mcp-skills",
             Category::Companies => "companies",
         }
     }
@@ -186,6 +192,7 @@ pub fn family(category: Category) -> Vec<Check> {
         Category::Auth => checks::auth::checks(),
         Category::McpAuthCore => checks::mcp_auth_core::checks(),
         Category::McpTasks => checks::mcp_tasks::checks(),
+        Category::McpSkills => checks::mcp_skills::checks(),
         Category::Companies => checks::companies::checks(),
     }
 }

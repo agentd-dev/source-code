@@ -88,7 +88,7 @@ These need no grant.
 | Kind | Forms | Body | What agentd does | The model reads |
 |---|---|---|---|---|
 | `!workflow` | container, section | YAML | Adds the body to `workflows:` exactly as an inline entry: same variable folding, validation, content hash and run pinning. `armed=false` loads it disarmed. In the section form, the prose becomes the workflow's `description`. A name in the body does not name the block; the fence's does. | `[workflow "<name>" is loaded and runs autonomously]` |
-| `!skill` | container, set, section | Markdown | Adds an inline skill to the skill catalogue, with `description` and `trigger` (`when` is an alias; `trigger` wins when both are set). The catalogue holds the body as delivered. An inline skill wins a name collision with a discovered one. | `[skill "<name>" is available — reference it as @skill/<name>]`, or with a trigger `[skill "<name>" is available — use it when <trigger>; reference it as @skill/<name>]` |
+| `!skill` | container, set, section | Markdown | Adds an inline skill to the skill catalogue, with `description` and `trigger` (`when` is an alias; `trigger` wins when both are set). The catalogue holds the body as delivered. An inline skill wins a name over a folder's skill; a name it shares with a server's skill is referenced as `local/<name>`. | `[skill "<name>" is available — reference it as @skill/<name>]`, or with a trigger `[skill "<name>" is available — use it when <trigger>; reference it as @skill/<name>]` |
 | `!config` | container | YAML | A configuration fragment, held to the [document boundary](#configuration-a-document-may-write). Several `!config` blocks fold in order; a later block's top-level section replaces an earlier block's section whole. | `[runtime configuration is applied]` |
 | `!mcp` | container, leaf | YAML | One `mcp.servers[]` entry. `allow` and `deny` (stored as `exclude`) filter the server's advertised tool names; an excluded tool does not exist. Takes `override` sub-blocks. | `[mcp server "<name>" is connected; its tools are available]` |
 | `!stream` | container, leaf, set | YAML | One `streams.<name>` entry. An empty body means the defaults. | `[event stream "<name>" is declared]` |
@@ -504,7 +504,7 @@ These log lines follow an instruction through its life. See
 | `instruction.unavailable` | The source went unconfirmed past its deadline. | `uri`, `server`, `err`, `policy`, `trust_pinned` |
 | `freshness.armed` | The re-read timer is set. | `every_ms` |
 | `freshness.recovered` | A re-read succeeded after a freeze. | `uri` |
-| `skills.discovered` | Inline skills joined the catalogue. | `server: "instruction"`, `skills` |
+| `skills.discovered` | Inline skills joined the catalogue. | `origin: "instruction"`, `skills` |
 
 With `agent.wake_on` including `instruction_updated`, a changed instruction
 also leaves a note for the root conversation.

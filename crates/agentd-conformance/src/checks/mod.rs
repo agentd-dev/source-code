@@ -9,7 +9,8 @@
 //! what an extension may add to a reply), [`auth`] (the card's security
 //! promises held against the listener), [`mcp_auth_core`] (agentd as an
 //! OAuth client: metadata discovery, the issuer, revocation), [`mcp_tasks`]
-//! (agentd as a client of the MCP Tasks extension) and
+//! (agentd as a client of the MCP Tasks extension), [`mcp_skills`] (agentd
+//! as a client of the MCP Skills extension) and
 //! [`companies`] (the fake Company, held to the Personal Agent Protocol
 //! draft by the [`probe`] Personal Agent, and agentd held to it as the
 //! Personal Agent by [`companies_agent`]).
@@ -22,6 +23,7 @@ pub mod durability;
 pub mod events;
 pub mod extensions;
 pub mod mcp_auth_core;
+pub mod mcp_skills;
 pub mod mcp_tasks;
 pub mod probe;
 pub mod security;

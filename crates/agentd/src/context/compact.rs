@@ -418,7 +418,15 @@ mod tests {
     fn apply_absorbs_the_summary_bumps_version_and_recounts() {
         let mut c = ctx_with(10);
         c.plan = Some(super::super::plan::Plan::create("goal", &[json!("a")], 32).unwrap());
-        c.load_skill("review", "h", 8).unwrap();
+        c.load_skill(
+            "review",
+            "h",
+            &super::super::skills::SkillId::Inline {
+                name: "review".into(),
+            },
+            8,
+        )
+        .unwrap();
         let before = c.est_tokens;
         let req = plan_compaction(&c, 3, None).unwrap();
         let out = apply_compaction(

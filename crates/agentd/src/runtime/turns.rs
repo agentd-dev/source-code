@@ -8,7 +8,7 @@ use super::children::ChildKind;
 use super::reactor::{Runtime, TurnJob};
 use crate::config::settings::ModelRole;
 use crate::context::compact::{self, CompactionRequest};
-use crate::context::{ContextState, Msg, ROOT, skills};
+use crate::context::{ContextState, Msg, ROOT};
 use crate::governor::Admission;
 use crate::obs::trace::TraceContext;
 use crate::registry::{Caller, ToolClass};
@@ -391,10 +391,8 @@ impl Runtime {
                     c.append(m);
                 }
             }
-            for u in unknown {
-                c.append(Msg::note(format!(
-                    "skill.unknown: {u:?} is not in the skill catalogue"
-                )));
+            for (_, line) in unknown {
+                c.append(Msg::note(line));
             }
             job.message = None;
             job.skills.clear();
@@ -924,7 +922,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                     if !unknown.is_empty() {
                         tlog.warn(
                             "preflight.skills_unknown",
-                            json!({"ctx": ctx_id, "skills": unknown}),
+                            json!({"ctx": ctx_id, "skills": unknown.iter().map(|(r, _)| r).collect::<Vec<_>>()}),
                         );
                     }
                 }
@@ -1196,52 +1194,6 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         let key = crate::a2a::principals::scope_key_for(id);
         self.governor.ensure_scope(&key, &budget);
         vec![key]
-    }
-
-    /// Resolve `@skill:` references: load bodies + record them on the context.
-    /// Returns the unknown names.
-    pub(crate) fn preload_skills(
-        &mut self,
-        ctx_id: &str,
-        names: &[String],
-        principal: Option<&str>,
-        trace: Option<&TraceContext>,
-    ) -> Vec<String> {
-        let tlog = self.log.in_trace(trace);
-        let mut unknown = Vec::new();
-        if names.is_empty() {
-            return unknown;
-        }
-        let max_loaded = self.settings.skills.max_loaded.unwrap_or(8) as usize;
-        for name in names {
-            let mcp = self.mcp.clone();
-            let resolver = move |server: &str| -> Option<std::sync::Arc<dyn skills::SkillServer>> {
-                mcp.get(server)
-                    .map(|c| c.clone() as std::sync::Arc<dyn skills::SkillServer>)
-            };
-            match self.skills.load(name, None, &resolver, trace) {
-                Ok(body) => {
-                    let c = if ctx_id == ROOT {
-                        self.contexts.root()
-                    } else {
-                        self.contexts.conversation(ctx_id, principal)
-                    };
-                    if let Err(e) = c.load_skill(name, &body.hash, max_loaded) {
-                        tlog.warn("skill.load.refused", json!({"skill": name, "err": e}));
-                    } else {
-                        tlog.info(
-                            "skill.loaded",
-                            json!({"ctx": ctx_id, "skill": name, "hash": &body.hash[..12]}),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tlog.warn("skill.unknown", json!({"skill": name, "err": e}));
-                    unknown.push(name.clone());
-                }
-            }
-        }
-        unknown
     }
 
     // ---- spawning ------------------------------------------------------------
@@ -1811,13 +1763,15 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                             tlog.info("context.compacted", json!({"ctx": ctx_id, "folded": o.folded, "version": o.version, "before": o.before_tokens, "after": o.after_tokens}));
                             // Evict skill bodies that no context still holds:
                             // compaction can drop the last reference to one,
-                            // and the cache is keyed by hash across contexts.
-                            let keep: Vec<String> = self
+                            // and the cache is shared across contexts.
+                            let keep: Vec<(crate::context::skills::SkillId, String)> = self
                                 .contexts
                                 .ids()
                                 .iter()
                                 .filter_map(|id| self.contexts.get(id))
-                                .flat_map(|c| c.skills.iter().map(|s| s.hash.clone()))
+                                .flat_map(|c| {
+                                    c.skills.iter().map(|s| (s.id.clone(), s.hash.clone()))
+                                })
                                 .collect();
                             self.skills.evict_except(&keep);
                             if let Some((node, id)) = reply_to {
@@ -2004,11 +1958,11 @@ fn preflight_questions(
             Question::Noul {
                 instructions: format!(
                     "The message calls for the skill `{}`: {}.{when}",
-                    m.name, m.description
+                    m.reference, m.description
                 ),
             },
         );
-        asked.push(m.name.clone());
+        asked.push(m.reference.clone());
     }
     (
         Decision {
@@ -2096,12 +2050,15 @@ mod tests {
     #[test]
     fn the_route_keeps_its_question_ahead_of_the_skills() {
         let metas: Vec<crate::context::skills::SkillMeta> = (0..MAX_QUESTIONS)
-            .map(|i| {
-                serde_json::from_value(json!({
-                    "name": format!("s{i}"), "description": "d",
-                    "source": {"server": "", "kind": "inline", "ref": format!("s{i}")}
-                }))
-                .unwrap()
+            .map(|i| crate::context::skills::SkillMeta {
+                id: crate::context::skills::SkillId::Inline {
+                    name: format!("s{i}"),
+                },
+                name: format!("s{i}"),
+                description: "d".into(),
+                when_to_use: None,
+                reference: format!("s{i}"),
+                source: crate::context::skills::Source::Inline { body: "b".into() },
             })
             .collect();
         let metas: Vec<&_> = metas.iter().collect();

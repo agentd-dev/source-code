@@ -25,6 +25,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// The cap on a `resources/read` answer. A skill may be one file of
+/// [`crate::skills::MAX_BYTES`] (16 MiB), which every host must read, and a
+/// blob arrives base64-encoded — a third larger — inside its JSON envelope.
+/// Every other answer is held to [`http::MAX_RESPONSE`].
+pub const RESOURCE_READ_MAX: usize = 24 * 1024 * 1024;
+// A 16 MiB blob, base64-encoded, and a megabyte of envelope fit.
+const _: () = assert!(RESOURCE_READ_MAX as u64 > crate::skills::MAX_BYTES / 3 * 4 + 1024 * 1024);
+
 /// What a host stamps into the `params._meta` of every request a socket
 /// sends. Called once per request, so a W3C trace context (SEP-414:
 /// `traceparent`, `tracestate`) gives each request a span of its own. The
@@ -788,12 +796,15 @@ impl HttpTransport {
             extra_headers,
             on_notification,
             hangup,
+            http::MAX_RESPONSE,
         )
         .map(|a| a.map(|a| a.message))
     }
 
     /// [`Self::send_until_hangup`], with the HTTP status the answer came
-    /// with.
+    /// with. The answer — its body, or each event of its stream — is read up
+    /// to `cap` bytes.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn exchange_until_hangup<F: FnMut(Value)>(
         &self,
         request_id: Option<i64>,
@@ -802,6 +813,7 @@ impl HttpTransport {
         extra_headers: &[(&str, &str)],
         mut on_notification: F,
         hangup: &Hangup,
+        cap: usize,
     ) -> Result<Option<Answer>, HttpError> {
         // Stamped once: every AAuth retry sends, and signs, the same bytes.
         let stamped = self.stamped(request_id, body);
@@ -812,12 +824,14 @@ impl HttpTransport {
             extra_headers,
             &mut on_notification,
             hangup,
+            cap,
         );
         hangup.disarm();
         out
     }
 
     /// The AAuth request loop behind [`Self::send_until_hangup`].
+    #[allow(clippy::too_many_arguments)]
     fn send_attempts<F: FnMut(Value)>(
         &self,
         request_id: Option<i64>,
@@ -826,6 +840,7 @@ impl HttpTransport {
         extra_headers: &[(&str, &str)],
         on_notification: &mut F,
         hangup: &Hangup,
+        cap: usize,
     ) -> Result<Option<Answer>, HttpError> {
         // AAuth request loop: send signed; if the server answers
         // with an `AAuth-Requirement` the signer can satisfy (adopt an access
@@ -846,6 +861,7 @@ impl HttpTransport {
                 extra_headers,
                 on_notification,
                 hangup,
+                cap,
             )? {
                 SendOutcome::Result(v) => return Ok(v),
                 SendOutcome::Error(e) => return Err(e),
@@ -861,6 +877,7 @@ impl HttpTransport {
                         extra_headers,
                         on_notification,
                         hangup,
+                        cap,
                     )? {
                         SendOutcome::Result(v) => Ok(v),
                         SendOutcome::Error(e) => Err(e),
@@ -887,6 +904,7 @@ impl HttpTransport {
         extra_headers: &[(&str, &str)],
         on_notification: &mut F,
         hangup: &Hangup,
+        cap: usize,
     ) -> Result<SendOutcome, HttpError> {
         // A server that asked for a wait gets nothing until it is over.
         self.waiting()?;
@@ -1028,7 +1046,7 @@ impl HttpTransport {
 
         let status = resp.status;
         if resp.is_event_stream() {
-            let mut sse = resp.sse();
+            let mut sse = resp.sse_within(cap);
             let mut first = true;
             while let Some(ev) = sse.next_event().map_err(HttpError::Http)? {
                 if std::mem::take(&mut first) {
@@ -1043,7 +1061,7 @@ impl HttpTransport {
             }
             Ok(SendOutcome::Error(HttpError::NoResponse))
         } else {
-            let bytes = resp.into_body().map_err(HttpError::Http)?;
+            let bytes = resp.into_body_within(cap).map_err(HttpError::Http)?;
             // A request accepted with nothing to say — a `202` — was not
             // answered, and saying so beats a JSON parse error about an empty
             // body.
@@ -1286,5 +1304,57 @@ mod tests {
         assert!(matches!(out, Err(HttpError::NoResponse)), "{out:?}");
         let got = server.join().unwrap();
         assert!(got.is_empty(), "sent: {}", String::from_utf8_lossy(&got));
+    }
+    /// An answer past [`http::MAX_RESPONSE`] fails a request held to it, and
+    /// is read whole by one whose cap is [`RESOURCE_READ_MAX`] — a skill's
+    /// file of 16 MiB, say — as a JSON body and as a stream's event.
+    #[test]
+    fn an_answer_is_read_within_its_requests_cap() {
+        use std::io::{Read, Write};
+        let text = "x".repeat(http::MAX_RESPONSE + 1);
+        let answer = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"contents":[{{"uri":"skill://a/SKILL.md","text":"{text}"}}]}}}}"#
+        );
+        let json = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+            answer.len()
+        );
+        let sse =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {answer}\n\n");
+        for response in [json, sse] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let ep = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut conn, _) = listener.accept().unwrap();
+                    let mut head = [0u8; 4096];
+                    let _ = conn.read(&mut head);
+                    let _ = conn.write_all(response.as_bytes());
+                }
+            });
+            let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]);
+            let body = br#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"skill://a/SKILL.md"}}"#;
+            let held = t.send(Some(1), body, Duration::from_secs(10), &[], |_| {});
+            assert!(held.is_err(), "past MAX_RESPONSE");
+            let read = t
+                .exchange_until_hangup(
+                    Some(1),
+                    body,
+                    Duration::from_secs(10),
+                    &[],
+                    |_| {},
+                    &Hangup::default(),
+                    RESOURCE_READ_MAX,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                read.message["result"]["contents"][0]["text"]
+                    .as_str()
+                    .map(str::len),
+                Some(text.len())
+            );
+            server.join().unwrap();
+        }
     }
 }

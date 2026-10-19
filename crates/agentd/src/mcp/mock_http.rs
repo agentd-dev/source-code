@@ -50,7 +50,15 @@
 //! (`mock_tasks`): `mock.job` becomes a task for a call that declares it,
 //! `tasks/*` follow it, each held to the extension's rules (`Mcp-Name` the
 //! `taskId`, the extension declared), and with [`Options::tasks_push`] a
-//! listen that asks for its tasks' ids is pushed each one's end.
+//! listen that asks for its tasks' ids is pushed each one's end. And, unless
+//! [`Options::skills`] is off, the Skills extension (`mock_skills`):
+//! `skills/list`, `skills/get`, `resources/directory/read`, and its skills'
+//! files through `resources/read`.
+//!
+//! Its prompts (`review-pr`, `deploy-safely`) and the resource
+//! `skill://incident-runbook` are a prompt and a resource, served on both
+//! edges: neither is a skill. Its 2025-11-25 `initialize` names the Skills
+//! extension too, which a client must not act on below 2026-07-28.
 //!
 //! It can also **restart** without exiting: `mock.restart` forgets every
 //! session it issued (a request still carrying one is answered `404`, as
@@ -118,6 +126,8 @@ pub struct Options {
     /// the listen once it ends (`notifications/tasks`). Off, a listen's
     /// `taskIds` are left out of its acknowledgment, and tasks are polled.
     pub tasks_push: bool,
+    /// Declare and serve the Skills extension (2026-07-28 edge).
+    pub skills: bool,
 }
 
 impl Options {
@@ -133,6 +143,7 @@ impl Options {
             hook_ca: None,
             listen: None,
             tasks_push: false,
+            skills: true,
         }
     }
 }
@@ -195,6 +206,8 @@ struct State {
     /// pushed its tasks' ends.
     tasks: super::mock_tasks::Tasks,
     tasks_push: bool,
+    /// Whether it declares and serves the Skills extension.
+    skills: bool,
     /// Its webhook delivery.
     #[cfg(all(feature = "mcp-events", feature = "tls"))]
     hooks: Arc<super::mock_hooks::Hooks>,
@@ -291,6 +304,7 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         events_spelling: opts.events,
         tasks: Default::default(),
         tasks_push: opts.tasks_push,
+        skills: opts.skills,
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -395,6 +409,16 @@ fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
             write_json(stream, 200, &payload, None);
         }
         "subscriptions/listen" => serve_listen(stream, &id, &body, state),
+        // The Skills extension (SEP-2640), where it is declared.
+        m if state.skills
+            && (m.starts_with("skills/") || m == super::mock_skills::DIRECTORY_READ) =>
+        {
+            let payload = match super::mock_skills::handle(m, &body["params"]) {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+            };
+            write_json(stream, 200, &payload, None);
+        }
         // MCP Tasks (SEP-2663): only for a request that declares it.
         m if m.starts_with("tasks/") => {
             let answered = if super::mock_tasks::declares(&body["params"]) {
@@ -579,6 +603,9 @@ fn discover_result(state: &State) -> Value {
     });
     super::mock_events::declare(&mut capabilities, state.events_spelling);
     capabilities["extensions"][super::mock_tasks::EXTENSION] = json!({});
+    if state.skills {
+        capabilities["extensions"][super::mock_skills::EXTENSION] = json!({"directoryRead": true});
+    }
     json!({
         "resultType": "complete",
         "supportedVersions": [DISCOVER_PROTOCOL_VERSION],
@@ -620,12 +647,18 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             eprintln!("MOCK_INITIALIZE {asked}");
+            let mut capabilities = json!({"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}});
+            // Named here too, though the extension is defined only from
+            // 2026-07-28: a client must not act on it at this revision.
+            if state.skills {
+                capabilities["extensions"] = json!({super::mock_skills::EXTENSION: {}});
+            }
             (
                 Response::ok(
                     req.id,
                     json!({
                         "protocolVersion": PROTOCOL_VERSION,
-                        "capabilities": {"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
+                        "capabilities": capabilities,
                         "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
                     }),
                 ),
@@ -696,6 +729,18 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
             if asked.starts_with("instruction://") {
                 return (Response::ok(req.id, registry_read(&asked)), false);
             }
+            if state.lifecycle == Lifecycle::Discover
+                && state.skills
+                && let Some(text) = super::mock_skills::read(&asked)
+            {
+                return (
+                    Response::ok(
+                        req.id,
+                        json!({"contents": [{"uri": asked, "mimeType": "text/markdown", "text": text}]}),
+                    ),
+                    false,
+                );
+            }
             let (mime, text) = match asked.as_str() {
                 "skill://incident-runbook" => ("text/x-skill+markdown", "# Incident runbook\n1. Acknowledge the alert. 2. Find the blast radius. 3. Mitigate first, root-cause later. 4. Write the timeline.".to_string()),
                 // A restart reads differently: the publisher's edit made
@@ -721,7 +766,7 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                 false,
             )
         }
-        // Skills as prompts: the catalogue, then a body per skill.
+        // Prompts: templates a client renders, never skills.
         "prompts/list" => (
             Response::ok(
                 req.id,

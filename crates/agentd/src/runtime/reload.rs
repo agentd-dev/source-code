@@ -515,32 +515,20 @@ impl Runtime {
         // section unchanged: the skills live in files, and comparing the
         // setting only would make "edit a skill, send SIGHUP" a reload that
         // reports success and changes nothing.
+        // A source whose server the reload dials again is listed again too.
+        let redialed = mcp.is_some_and(|m| {
+            new.skills
+                .sources
+                .iter()
+                .any(|src| m.fresh.contains(&src.server))
+        });
         let skills = if old.skills != new.skills
             || old.agent.inline_skills != new.agent.inline_skills
             || new.skills.dir.is_some()
+            || new.skills.project_dir.is_some()
+            || redialed
         {
-            let mut cat = crate::context::skills::Catalogue::new(
-                new.skills
-                    .reference_prefix
-                    .as_deref()
-                    .unwrap_or(crate::context::skills::DEFAULT_PREFIX),
-                new.skills.max_bytes.unwrap_or(32_768) as usize,
-            );
-            for src in &new.skills.sources {
-                if let Some(c) = conns.get(&src.server) {
-                    let mode = match src.discover {
-                        cfg::Discover::Prompts => crate::context::skills::Discover::Prompts,
-                        cfg::Discover::Resources => crate::context::skills::Discover::Resources,
-                        cfg::Discover::Auto => crate::context::skills::Discover::Auto,
-                    };
-                    cat.discover(&**c, mode, src.filter.as_deref());
-                }
-            }
-            if let Some(dir) = &new.skills.dir {
-                cat.add_dir(std::path::Path::new(dir));
-            }
-            cat.add_inline(&new.agent.inline_skills);
-            Some(cat)
+            Some(super::skills::build(new, conns))
         } else {
             None
         };
@@ -711,10 +699,9 @@ impl Runtime {
                     self.events_connection_replaced(name, std::sync::Arc::clone(old));
                 }
             }
+            // A dropped server is no skills source any more (validation
+            // refuses one that names it), so the catalogue was rebuilt.
             for r in &dropped {
-                if skills.is_none() {
-                    self.skills.forget_server(r);
-                }
                 self.log
                     .info("mcp.disconnect", json!({"server": r, "reason": "reload"}));
             }
@@ -797,13 +784,19 @@ impl Runtime {
                 changed.push("tools");
             }
         }
-        if let Some(cat) = skills {
+        if let Some((mut cat, notes)) = skills {
+            // A context keeps the body it loaded until it loads another — of
+            // a skill the new catalogue still holds. One whose source the
+            // reload removed, or no longer admits, is let go of everywhere.
+            cat.adopt_bodies(&mut self.skills);
             // Rebuilt on every reload when a local folder is configured, so
             // the report has to compare rather than assume: saying "skills"
             // changed on a reload that changed nothing is the same dishonesty
             // in the other direction.
             let differs = !cat.same_skills_as(&self.skills);
             self.skills = cat;
+            super::skills::say(&self.log, notes);
+            self.release_skills();
             if differs {
                 changed.push("skills");
             }
@@ -1006,7 +999,7 @@ struct StagedReload {
     /// (a rebuild is always reported); `None` keeps the running one.
     registry: Option<(Registry, bool)>,
     workflows: Option<super::steps::PreparedWorkflows>,
-    skills: Option<crate::context::skills::Catalogue>,
+    skills: Option<(crate::context::skills::Catalogue, Vec<super::skills::Note>)>,
     instruction: Option<StagedInstruction>,
     channels_moved: bool,
     #[cfg(feature = "a2a")]

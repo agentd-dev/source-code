@@ -129,10 +129,11 @@ A tool call and its two kinds of failure:
 | `resources/templates/list` | yes | The `mcp.resource` step's `templates`; a template is not subscribable |
 | `resources/subscribe`, `subscriptions/listen` | yes | `subscribe` starts, `wait {on: resource}`, the instruction; concrete URIs only, and only when the server advertises `resources.subscribe` |
 | `notifications/resources/list_changed` | received | Not acted on |
-| `prompts/list`, `prompts/get` | yes | Skill discovery; the `mcp.resource` step's `prompt` |
+| `prompts/get` | yes | The `mcp.resource` step's `prompt`. A prompt is not a skill |
 | `completion/complete` | yes | The `mcp.resource` step's `complete` |
 | Elicitation | yes | On worker and subagent connections: an `ask_human` gate, answered within 300 s or `cancel` |
 | MCP Tasks (SEP-2663) | yes, at 2026-07-28 only | A `tools/call` answered with a task (`resultType: "task"`) is followed with `tasks/get`, `tasks/update` and `tasks/cancel`, and pushes on a listen's `taskIds`; a task on any other method is an invalid answer. See [MCP Tasks reference](#mcp-tasks-reference) |
+| Skills (SEP-2640) | yes, at 2026-07-28 only | Where the server declares `io.modelcontextprotocol/skills`: `skills/list`, `skills/get`, `resources/directory/read` with `directoryRead`, and each file through `resources/read`. See [Skills reference](#skills-reference) |
 | Sampling, roots | no | Not declared; a server request for them is dropped |
 | Tasks of 2025-11-25 (core, experimental) | no | Not declared |
 | `notifications/message`, `notifications/progress` | received | Not acted on |
@@ -259,10 +260,18 @@ and not asked for again; the connection works without its `list_changed`.
 
 ### Skills
 
+A line names a server's skill by `server` and `uri`, a folder's by `path`.
+
 | Event | Level | Fields | When |
 |---|---|---|---|
-| `skills.discovered` | info | `server`, `count`, `skills` | Skills found on a source |
-| `skills.source.unavailable` | warn | `server` | A `skills.sources` server is not connected |
+| `skills.discovered` | info | `server`, `count`, `truncated`, `skills` (`[{name, uri}]`) | A source's skills were listed |
+| `skills.source.unavailable` | warn | `server`, `reason` | A `skills.sources` server is not connected, did not reach 2026-07-28, does not declare the extension, or its listing failed |
+| `skills.declined` | warn | `server`, `uri`, `reason`; `file`, `skill`, `ctx` or `run` and `step` when a load or a read asked | An entry broke a rule at discovery, or a file's bytes or the frontmatter did not match |
+| `skills.loaded` | info | `ctx` or `run` and `step`, `skill`, `server`, `uri`, `hash`, `verified` | A body entered a context or a step's prompt |
+| `skills.unknown` | warn | `skill`, `err`, `candidates` | A reference named no skill, or more than one |
+| `skills.load.failed` | warn | `skill`, `server`, `uri`, `err` | The skill's server was not connected or answered with an error |
+| `skills.collision` | warn | `name`, `candidates` | Skills of different origins share a name; each is reached by its qualified reference |
+| `skills.unloaded` | info | `ctx`, `skill`, `server`, `uri`, `reason` | A reload removed the skill's source, or its source no longer admits it: the context lets go of it |
 
 ### MCP Events
 
@@ -372,6 +381,63 @@ asks after it was handed over is declined: the turn that could have asked
 has moved on. A person's answer is never stored, so one the server has not
 acknowledged when the task is handed over has its key released, and is
 declined too.
+
+## Skills reference
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| Files per skill | 512, `SKILL.md` included; more is declined from the entry |
+| Bytes per skill | 16 MiB (16,777,216), the sum of the entry's `size`s; for a `dynamic` skill, what is read of it |
+| `skills/list` pages | 64 per listing; past them, `skills.discovered` says `truncated` |
+| A `resources/read` answer | 24 MiB, so one 16 MiB file arrives whole, a base64 blob included; every other MCP answer is held to 8 MiB |
+| A `dynamic` skill's file list | its directory and each subdirectory it lists, read with `resources/directory/read`, up to 64 files |
+| Each `skills/*` request | 30 s |
+| A body or a file in context | `skills.max_bytes` (32768), after the whole file was checked |
+| Loaded skills per context | `skills.max_loaded` (8) |
+
+### What is checked
+
+| When | Check | On failure |
+|---|---|---|
+| listing, `skills/get` | the entry: a `uri` ending in `/SKILL.md` whose last path segment is `frontmatter.name`, and every `uri` in a URI's own characters (no space, line break, quote or angle bracket); `name` and `description` by the Agent Skills rules; `resources` an array of `{uri, digest, size}` — each once, inside the skill's directory, `sha256:` and 64 lowercase hex digits, `SKILL.md` among them — or `"dynamic"` | declined |
+| listing | within the limits; `dynamic` only with `dynamic: allow` | declined |
+| load | `SKILL.md`'s size, then its SHA-256, against the entry | `skills/get` once: a changed digest is read again, the same one declined |
+| load | `SKILL.md`'s frontmatter, field by field, against the entry's | declined, naming the field |
+| `skills.read` | the file is listed in the entry the skill was loaded under, its size and SHA-256 match | declined; a refreshed entry that differs says to load the skill again |
+
+`allowed-tools` and every other frontmatter field are ignored: a skill
+grants nothing. agentd sends a skill URI only back to the server that
+served it.
+
+In the model's context a server's skill keeps to its block: the catalogue
+gives each skill one line (a line break in a description becomes a
+space), the header and the `<skill_content>` tag carry the server and
+`uri` with quotes and angle brackets escaped, and a `<skill_content` or
+`</skill_content` in the body, in any case, is made inert. A context
+names each loaded skill by the reference it loaded it under;
+`skills.read` and `skills.unload` find it by that or by what the
+catalogue calls it now.
+
+A reload keeps a context's loaded skills that the new catalogue holds. A
+server's skill whose source the reload removed, or whose source no longer
+admits it — a `filter` that leaves it out, `dynamic: refuse`, an entry now
+declined — leaves every context (`skills.unloaded`), and `skills.read`
+never reads from a server that is not a source. A skill got with
+`skills/get` stays while its source admits its entry.
+
+### References
+
+| Form | Names |
+|---|---|
+| `<name>` | the one skill of that name, in any origin |
+| `<origin>/<name>` | the skill of that name in one origin: a source's server name, or `local` for agentd's own |
+| `<origin>/<path>` | a server's skill by its path, the `uri` without its scheme and `/SKILL.md` |
+
+Two matches are an error listing both by `<origin>/<path>`. A
+`<server>/<path>` no listing names is asked of the server as
+`skill://<path>/SKILL.md` with `skills/get`.
 
 ## MCP Events reference
 
@@ -483,7 +549,7 @@ configuration can narrow.
 | `context.compact` | root, workflow, subagent | Summarize older messages in the context |
 | `think` | root, workflow, subagent | One structured reasoning call with no tools |
 | `decide` | root, workflow, subagent | Typed questions answered with calibrated confidence |
-| `skills.list`, `.load`, `.unload` | root, workflow, subagent | The skills catalogue and the loaded set |
+| `skills.list`, `.load`, `.read`, `.unload` | root, workflow, subagent | The skills catalogue, the loaded set, and a loaded skill's files, read through the skill's own origin |
 | `finish` | root, subagent | End the current unit of work with a status |
 | `status` | everyone, A2A callers included | The instance's runs, subagents, conversations, budget and store |
 | `company.status` | root, workflow, subagent | The Companies the instance acts at for its User, as it knows them now: verified, signed in, held by a `Retry-After`, which of its servers joined — its MCP servers, and those its operation tools are named under. Offered only where a Company is declared (the `companies` feature), in the User's work |
@@ -543,6 +609,11 @@ resources. It reads one resource by URI.
 - **Calls without a bound.** A subagent's, a mapped contract's and
   `knowledge.auto_context`'s calls have no bound of their own, so they do
   not offer tasks: a server that needs one refuses them with `-32021`.
+- **Skills are listed at startup and on a reload.** A skills source that
+  joins after startup has its skills listed at the next reload, and a
+  listing is not refreshed when its `ttlMs` passes.
+- **No per-skill approval.** The operator's `skills.sources` entry is the
+  approval of a server's skills; agentd asks no person before it loads one.
 
 ## Next steps
 

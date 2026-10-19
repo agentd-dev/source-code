@@ -426,16 +426,19 @@ rebuilt.
 
 ## Load skills from a server
 
-A server can also supply skills: named instruction bundles the agent loads
-when it needs them. agentd discovers them from a server's prompts
-(`prompts/list`), or from its resources whose URI starts with `skill://` or
-whose MIME type is `text/x-skill+markdown`.
+A server can also serve skills: Agent Skills, each a folder of files led by
+a `SKILL.md` whose frontmatter names and describes it and whose body tells
+the agent how to do one kind of work. agentd reads them through the MCP
+Skills extension (`io.modelcontextprotocol/skills`, SEP-2640), from a server
+that declares it on an MCP 2026-07-28 connection. A server's prompts are
+prompts and its resources are resources: neither is a skill, whatever its
+URI or MIME type.
 
 ```yaml
 agent:
   name: support
   instruction: |
-    Answer support questions. Follow @skill:refund-policy whenever a
+    Answer support questions. Follow @skill:refunds whenever a
     customer asks for money back.
 
 intelligence:
@@ -453,23 +456,79 @@ mcp:
 
 skills:
   sources:
-    - {server: playbooks, discover: auto}
+    - {server: playbooks}
   max_loaded: 4
 ```
 
-- `discover` is `prompts`, `resources` or `auto` (both, the default).
-  `filter` takes one name or a prefix ending in `*`.
-- `@skill:<name>` in the instruction, a step or a message loads that skill
-  into the context. The agent sees the catalogue of names and descriptions
-  always, and a body only once it is loaded.
+At startup agentd lists the server's skills (`skills/list`, every page) and
+puts each one's name and description in the agent's catalogue. Nothing else
+is read yet:
+
+- **A body is loaded** when `@skill:<name>` appears in the instruction, a
+  step's `skills:` or a message, or when the model calls `skills.load`. Its
+  `SKILL.md` is read then, checked against the size and `sha256:` digest
+  the server's entry lists, and its frontmatter compared field by field
+  with the entry's. Bytes that do not match are not used: agentd fetches the
+  entry again (`skills/get`), and declines the skill if it still does not
+  match.
+- **A file is read** when the model calls `skills.read {name, path}` for a
+  skill loaded in its context (`references/GUIDE.md`, an asset): only a
+  file the skill's entry lists, only from the server that served the skill,
+  checked the same way. One file may be as large as the skill's 16 MiB: a
+  `resources/read` answer is read up to 24 MiB, where other answers stop
+  at 8 MiB.
+- **A skill no listing names** is loaded by its URI: `@skill:playbooks/<path>`
+  asks the server for `skill://<path>/SKILL.md`, and `skills.load {server,
+  uri}` for any URI.
+
+A server's skill is the server's text, not yours. agentd shows it to the
+model inside a block that names the server and the URI and says so, and
+nothing the server wrote leaves that block: the catalogue gives each skill
+one line, the server and URI are escaped, and a URI holding a space, a line
+break, a quote or an angle bracket is declined. It grants no tool, its
+`allowed-tools` is ignored, and nothing in `scripts/` is run. Each server under `skills.sources` counts as `untrusted_input` in
+the [lethal-trifecta check](security.md#tool-tags-and-the-rule-of-two), whatever its tags.
+
+A skill is declined, and the reason logged as `skills.declined`, when its
+entry is invalid (no `resources`, a malformed digest, a file outside the
+skill), when it lists more than 512 files or 16 MiB, when its bytes or
+frontmatter do not match, or when its content is `dynamic` — generated, so
+nothing can be checked. `dynamic: allow` on the source loads such a skill
+unverified. Whoever referenced a declined skill is told: the instruction in
+a note, a message in its conversation, a step in its prompt, a tool call as
+its error.
+
+A skill is named by its server and its URI, never its name alone. When one
+name is held by two servers, or by a server and one of your own skills,
+`@skill:<name>` is an error that lists the candidates; name the origin:
+
+| Reference | Names |
+|---|---|
+| `@skill:refunds` | the one skill called `refunds` |
+| `@skill:playbooks/refunds` | the skill `refunds` of the server `playbooks` |
+| `@skill:playbooks/acme/billing/refunds` | the server's skill at `skill://acme/billing/refunds/SKILL.md` |
+| `@skill:local/refunds` | your own skill `refunds` (the instruction's, `.agents/skills/` or `skills.dir`) |
+
+The catalogue shows each skill by the shortest of these that names it
+alone. `local` is your own skills' origin, so a skills source named `local`
+is refused at load. A context names a skill it loaded by the reference it
+loaded it under, and `skills.read` finds it by that or by its name now.
+
+A reload lists the sources again. A server's skill a context loaded stays
+while its source is configured and still admits it; removing the source,
+or a `filter` or `dynamic: refuse` that now leaves the skill out, unloads it
+from every context, logged `skills.unloaded`.
+
+- `filter` takes one name or a prefix ending in `*`.
 - `skills.max_loaded` (default 8) caps loaded skills per context, and
-  `skills.max_bytes` (default 32768) caps a body.
-- If two sources offer the same name, the first source wins.
-- Startup logs `skills.discovered` with the names found, or
-  `skills.source.unavailable` when the server is not connected.
+  `skills.max_bytes` (default 32768) the text a body or a file puts into it.
+- A server that does not declare the extension, or reached MCP 2025-11-25,
+  is not asked: startup logs `skills.source.unavailable` with the reason.
+- Startup logs `skills.discovered` with each skill's name and URI.
 
 [How a turn runs](agent-loop.md) shows where the catalogue and loaded
-skills sit in the prompt.
+skills sit in the prompt, and [Agent Skills](interoperability.md#agent-skills)
+how skills in a folder are read.
 
 ## Verify the connection
 
@@ -492,7 +551,8 @@ keeps only the connection lines from a run's stderr:
 | `mcp.connect.fail` | warn | Not connected: `err` names the refusal (a `401`, a timeout, a refused handshake) |
 | `mcp.tool.dropped` | warn | A listed tool was left out because its definition is invalid; the agent does not have it |
 | `registry.warning` | warn | A tool registered as `<server>.<tool>`, or ignored, because its name collided |
-| `skills.discovered` | info | Skills found on a server |
+| `skills.discovered` | info | Skills found on a server, each by name and URI |
+| `skills.source.unavailable` | warn | A `skills.sources` server that is not connected or does not declare the Skills extension |
 | `mcp.joined` | info | A server that was down at startup has joined |
 
 A worker process logs its own `mcp.connect` line for each server it dials,

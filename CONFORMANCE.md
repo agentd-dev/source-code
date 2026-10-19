@@ -18,8 +18,9 @@ grouped into families — the process's exit-code table, the security gates, the
 durable store, crash-and-restore durability, the internal tool registry, the
 core A2A surface, the observation feed of the events extension, the extension
 contract itself, the authentication the card declares, agentd as an OAuth
-client, agentd as a client of the MCP Tasks extension, and the fake Company
-agentd is tested against under the Personal Agent Protocol draft. Every check is
+client, agentd as a client of the MCP Tasks and Skills extensions, and the
+fake Company agentd is tested against under the Personal Agent Protocol
+draft. Every check is
 registered in [`src/checks/`](crates/agentd-conformance/src/checks) as a
 `Check { id, category, desc, run }`, which both the test harness and the report
 runner pick up; the tables below are those registrations, and a unit test of
@@ -121,6 +122,14 @@ skip.
 | `mcp-tasks/a-step-follows-its-task-to-the-result` | a workflow step whose tools/call becomes a task finishes with the task's result |
 | `mcp-tasks/the-step-timeout-cancels-the-task` | a step's timeout ends its wait for a task and sends tasks/cancel |
 | `mcp-tasks/off-refuses-a-server-that-requires-tasks` | with tasks: off, a server that requires the extension fails the call with an error naming it |
+
+### `mcp-skills`
+
+| Check | What it proves |
+|---|---|
+| `mcp-skills/a-listed-skill-loads-once-its-digest-matches` | a skill skills/list names loads once its SKILL.md matches its entry's digest and size |
+| `mcp-skills/a-skill-whose-bytes-differ-is-declined` | a SKILL.md whose bytes do not match its entry is declined, after a skills/get refresh |
+| `mcp-skills/a-prompt-is-not-a-skill` | a server's prompt is never listed, fetched or loaded as a skill |
 
 ### `companies`
 
@@ -249,6 +258,10 @@ built-in mock at MCP 2026-07-28, which makes a task only for a call that
 declares the extension and refuses a `tasks/*` request without `Mcp-Name`
 or the extension. What agentd did is read from its own log and from the
 mock's record of each request that reached it.
+
+The `mcp-skills` family holds agentd to SEP-2640 as a client, against the
+same mock, which declares the Skills extension, lists its skills a page at
+a time, and serves one `SKILL.md` with other bytes than its entry lists.
 
 ## Beside the suite
 

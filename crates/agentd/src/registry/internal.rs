@@ -932,10 +932,10 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "skills.list",
         "skills",
-        "List the available skills (name, description, when to use).",
+        "List the available skills: each one's reference, description and origin, and what was declined.",
         obj(json!({}), &[]),
         open_obj(
-            json!({"skills": arr(json!({"type": "object"}))}),
+            json!({"skills": arr(json!({"type": "object"})), "declined": arr(json!({"type": "object"}))}),
             &["skills"],
         ),
         true,
@@ -944,14 +944,31 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "skills.load",
         "skills",
-        "Load a skill's full instructions into this context.",
+        "Load a skill's full instructions into this context: by its reference (`name`, as skills.list shows it), or by an MCP server and the uri of its SKILL.md.",
         obj(
-            json!({"name": s("Skill name"), "version": s("Version/hash (optional)"), "arguments": {"type": "object"}}),
-            &["name"],
+            json!({"name": s("The skill's reference: its name, or <origin>/<name> or <origin>/<path> where a name is shared"),
+                   "server": s("An MCP server of skills.sources (with uri)"),
+                   "uri": s("The uri of the skill's SKILL.md on that server (with server)")}),
+            &[],
         ),
         open_obj(
-            json!({"loaded": {"type": "boolean"}, "name": {"type": "string"}, "hash": {"type": "string"}, "body": {"type": "string"}}),
+            json!({"loaded": {"type": "boolean"}, "name": {"type": "string"}, "skill": {"type": "string"}, "origin": {"type": "object"}, "hash": {"type": "string"}, "files": arr(json!({"type": "string"})), "body": {"type": "string"}, "untrusted": {"type": "boolean"}, "verified": {"type": "boolean"}}),
             &["loaded"],
+        ),
+        true,
+        ALL,
+    );
+    c(
+        "skills.read",
+        "skills",
+        "Read a file of a skill loaded in this context (references/, assets/, any file it lists), through the skill's own origin. Nothing read is run.",
+        obj(
+            json!({"name": s("The loaded skill's reference"), "path": s("The file's path inside the skill, e.g. references/GUIDE.md")}),
+            &["name", "path"],
+        ),
+        open_obj(
+            json!({"name": {"type": "string"}, "path": {"type": "string"}, "size": {"type": "integer"}, "text": {"type": "string"}, "binary": {"type": "boolean"}, "origin": {"type": "object"}, "untrusted": {"type": "boolean"}, "verified": {"type": "boolean"}}),
+            &["path"],
         ),
         true,
         ALL,
@@ -1625,6 +1642,7 @@ mod tests {
             "search.fetch",
             "skills.list",
             "skills.load",
+            "skills.read",
             "skills.unload",
         ] {
             assert!(seen.contains(must), "missing contract {must}");

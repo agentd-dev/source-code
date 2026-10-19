@@ -301,38 +301,150 @@ fn subagent_and_context_templates_load_from_their_folders() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `skills/` beside the config: prose the model reads, with no MCP server
-/// between it and the agent. Both layouts, and a bare markdown file too.
+/// Write the Agent Skill `<folder>/<name>/SKILL.md`.
+fn skill(folder: &Path, name: &str, description: &str) {
+    std::fs::create_dir_all(folder.join(name)).unwrap();
+    std::fs::write(
+        folder.join(name).join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\nDo it.\n"),
+    )
+    .unwrap();
+}
+
+/// The `skills.discovered` lines of a log.
+fn discovered(log: &str) -> Vec<serde_json::Value> {
+    log.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "skills.discovered")
+        .collect()
+}
+
+/// `skills/` beside the config: Agent Skills the model reads, with no MCP
+/// server between them and the agent. A loose markdown file is not a skill.
 #[test]
 fn a_skills_folder_is_adopted_without_a_server() {
     let (root, home, work) = project("skdir");
     std::fs::write(work.join("agentd.yml"), BASE).unwrap();
-    std::fs::create_dir_all(work.join("skills/runbook")).unwrap();
-    std::fs::write(
-        work.join("skills/triage.md"),
-        "---\nname: triage\ndescription: Triage an issue. Use when: it has no labels\n---\n\nRead it, label it.\n",
-    )
-    .unwrap();
-    std::fs::write(
-        work.join("skills/runbook/SKILL.md"),
-        "---\nname: incident\ndescription: Handle an incident\n---\n\nAcknowledge, then mitigate.\n",
-    )
-    .unwrap();
+    skill(&work.join("skills"), "triage", "Triage an issue");
+    skill(&work.join("skills"), "incident", "Handle an incident");
     std::fs::write(
         work.join("skills/deploy.md"),
-        "# Deploy safely\n\nAlways deploy behind a flag.\n",
+        "---\nname: deploy\ndescription: Deploy safely\n---\n\nAlways deploy behind a flag.\n",
     )
     .unwrap();
 
     let (code, log) = run_in(&work, &home, &[]);
     assert_eq!(code, Some(0), "{log}");
+    let d = discovered(&log);
+    assert_eq!(d.len(), 1, "{log}");
+    assert_eq!(d[0]["scope"], "user", "{log}");
+    let names: Vec<&str> = d[0]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["incident", "triage"], "{log}");
     assert!(
-        log.contains("\"server\":\"file\"") && log.contains("\"count\":3"),
-        "all three layouts should register\n{log}"
+        !log.contains("\"deploy\""),
+        "a loose file is no skill\n{log}"
     );
-    for name in ["triage", "incident", "deploy"] {
-        assert!(log.contains(name), "{name} missing\n{log}");
-    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `.agents/skills/` beside the config is the project scope: read beside
+/// `skills.dir`, and its skill wins a name over the user scope's, said as a
+/// collision. Only beside a loaded config, never the working directory.
+#[test]
+fn the_project_scope_beside_the_config_overrides_the_user_scope() {
+    let (root, home, work) = project("skproject");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    skill(&work.join("skills"), "deploy", "The user's deploy");
+    skill(&work.join("skills"), "triage", "Triage");
+    skill(
+        &work.join(".agents/skills"),
+        "deploy",
+        "The project's deploy",
+    );
+    skill(&work.join(".agents/skills"), "review", "Review");
+
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    let d = discovered(&log);
+    let scope = |s: &str| {
+        d.iter()
+            .find(|e| e["scope"] == s)
+            .unwrap_or_else(|| panic!("no {s} scope\n{log}"))
+            .clone()
+    };
+    assert!(
+        scope("project")["dir"]
+            .as_str()
+            .unwrap()
+            .ends_with(".agents/skills")
+    );
+    assert_eq!(scope("user")["count"], 2);
+    let collision = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event"] == "skills.collision")
+        .unwrap_or_else(|| panic!("no collision said\n{log}"));
+    assert_eq!(collision["name"], "deploy");
+    assert!(
+        collision["kept"]["path"]
+            .as_str()
+            .unwrap()
+            .contains(".agents/skills/deploy/SKILL.md")
+    );
+    assert!(
+        collision["shadowed"]["path"]
+            .as_str()
+            .unwrap()
+            .contains("/skills/deploy/SKILL.md")
+    );
+
+    // A config named elsewhere does not read the working directory's.
+    let proj = work.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("agentd.yml"), BASE).unwrap();
+    let (code, log) = run_in(&work, &home, &["-c", "proj/agentd.yml"]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        discovered(&log).iter().all(|e| e["scope"] != "project"),
+        "the working directory's .agents/skills was read\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A local skill that breaks an Agent Skills rule refuses the config,
+/// naming the file and the rule.
+#[test]
+fn a_local_skill_that_breaks_a_rule_refuses_the_config_naming_file_and_rule() {
+    let (root, home, work) = project("skbroken");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    skill(&work.join("skills"), "fine", "Fine");
+    std::fs::create_dir_all(work.join(".agents/skills/runbook")).unwrap();
+    std::fs::write(
+        work.join(".agents/skills/runbook/SKILL.md"),
+        "---\nname: Incident_Runbook\ndescription: Handle an incident\n---\n",
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains(".agents/skills/runbook/SKILL.md") && log.contains("only a-z, 0-9 and -"),
+        "{log}"
+    );
+    // An explicit folder that is not there is refused too.
+    std::fs::remove_dir_all(work.join(".agents")).unwrap();
+    std::fs::write(
+        work.join("agentd.yml"),
+        format!("{BASE}skills: {{ dir: ./missing }}\n"),
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(log.contains("missing: cannot read the folder"), "{log}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -341,14 +453,8 @@ fn a_skills_folder_is_adopted_without_a_server() {
 #[test]
 fn an_explicit_skills_dir_suppresses_the_convention() {
     let (root, home, work) = project("skexplicit");
-    std::fs::create_dir_all(work.join("skills")).unwrap();
-    std::fs::create_dir_all(work.join("elsewhere")).unwrap();
-    std::fs::write(
-        work.join("skills/ignored.md"),
-        "# Ignored\n\nnot this one.\n",
-    )
-    .unwrap();
-    std::fs::write(work.join("elsewhere/chosen.md"), "# Chosen\n\nthis one.\n").unwrap();
+    skill(&work.join("skills"), "ignored", "Not this one");
+    skill(&work.join("elsewhere"), "chosen", "This one");
     std::fs::write(
         work.join("agentd.yml"),
         format!("{BASE}skills: {{ dir: ./elsewhere }}\n"),
@@ -505,12 +611,11 @@ fn the_working_directory_is_not_searched_for_a_named_config() {
     std::fs::write(proj.join("agentd.yml"), BASE).unwrap();
 
     // A `skills/` folder sits in the CWD, belonging to something else entirely.
-    std::fs::create_dir_all(work.join("skills")).unwrap();
-    std::fs::write(
-        work.join("skills/not-mine.md"),
-        "# Not mine\n\nbelongs to whatever lives in this directory.\n",
-    )
-    .unwrap();
+    skill(
+        &work.join("skills"),
+        "not-mine",
+        "Belongs to whatever lives here",
+    );
 
     let (code, log) = run_in(&work, &home, &["-c", "proj/agentd.yml"]);
     assert_eq!(code, Some(0), "{log}");

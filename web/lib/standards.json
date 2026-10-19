@@ -63,6 +63,20 @@
     "tier": 2
   },
   {
+    "name": "MCP Skills",
+    "version": "SEP-2640",
+    "full": "MCP Skills, the MCP extension that serves Agent Skills: agentd loads a server's skills, each file checked against its digest",
+    "href": "/docs/connect-mcp/#load-skills-from-a-server",
+    "tier": 2
+  },
+  {
+    "name": "Agent Skills",
+    "version": "SKILL.md",
+    "full": "Agent Skills, the SKILL.md format: skill folders held to its name and description rules",
+    "href": "/docs/interoperability/#agent-skills",
+    "tier": 2
+  },
+  {
     "name": "MCP Events",
     "version": "SEP-3415",
     "mark": "draft",

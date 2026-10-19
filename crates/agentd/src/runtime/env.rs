@@ -184,10 +184,16 @@ impl Runtime {
             skills.push_str(&cat);
         }
         if let Some(c) = ctx {
-            let bodies: Vec<&crate::context::skills::SkillBody> = c
+            // Each under the reference this context loaded it by, which the
+            // model reads it back with: the catalogue's may have moved since.
+            let bodies: Vec<(&str, &crate::context::skills::SkillBody)> = c
                 .skills
                 .iter()
-                .filter_map(|r| self.skills.body(&r.hash))
+                .filter_map(|r| {
+                    self.skills
+                        .body(&r.id, &r.hash)
+                        .map(|b| (r.name.as_str(), b))
+                })
                 .collect();
             if let Some(b) = crate::context::skills::render_bodies(&bodies) {
                 if !skills.is_empty() {

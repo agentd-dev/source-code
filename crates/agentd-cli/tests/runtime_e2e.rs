@@ -279,56 +279,53 @@ fn write_inbox(events: &serde_json::Value) -> String {
 /// seeded inbox.
 fn conversation_config(llm: &str, mock: &str, extra: &str) -> String {
     write_config(&format!(
-        "agent:\n  name: convo\n  instruction: You help the team.\n  preflight: always\nintelligence:\n  endpoints: {llm}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock}\nknowledge:\n  server: mock\n  auto_context:\n    on: turn\n    top_k: 3\nskills:\n  sources:\n    - server: mock\n      discover: auto\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"
+        "agent:\n  name: convo\n  instruction: You help the team.\n  preflight: always\nintelligence:\n  endpoints: {llm}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock}\nknowledge:\n  server: mock\n  auto_context:\n    on: turn\n    top_k: 3\nskills:\n  sources:\n    - server: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"
     ))
 }
 
 #[test]
 fn a_conversation_turn_runs_preflight_skills_and_knowledge_context() {
-    let mock = common::spawn_mock_mcp("mock://noop", false);
+    // A 2026-07-28 server, whose Skills extension serves the skills.
+    let mock = common::spawn_mock_mcp_at("2026-07-28", "mock://noop", false);
     let llm = spawn_mock_llm(&serde_json::json!({
         "turns": [{"content": "plain answer"}],
         "match": [
-            {"when_contains": "PREFLIGHT", "content": {"intent": "task", "needs_plan": true, "plan": [{"title": "read the policy"}, {"title": "review"}], "risk": "low", "skills": ["deploy-safely"]}},
+            {"when_contains": "PREFLIGHT", "content": {"intent": "task", "needs_plan": true, "plan": [{"title": "read the policy"}, {"title": "review"}], "risk": "low", "skills": ["refunds"]}},
             {"when_contains": "Retrieved knowledge", "content": "answer with knowledge + skills"}
         ]
     }));
-    let cfg = conversation_config(&llm.uri, &mock.uri(), "");
+    let cfg = conversation_config(&llm.uri, &format!("{}/mcp", mock.uri()), "");
     let inbox = write_inbox(&serde_json::json!([
-        {"kind": "a2a_message", "principal": "user:alice", "payload": {"context_id": "c1", "text": "Please review the deployment policy for the canary. @skill:review-pr"}}
+        {"kind": "a2a_message", "principal": "user:alice", "payload": {"context_id": "c1", "text": "Please review the deployment policy for the canary. @skill:git-workflow"}}
     ]));
     let out = run_agentd(&cfg, &[("AGENTD_TEST_INBOX_FILE", &inbox)]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
-    // Skills were discovered from prompts + resources.
+    // Skills were discovered from the server's Skills extension.
     let disc = events(&stderr, "skills.discovered");
+    let names: Vec<&str> = disc
+        .iter()
+        .flat_map(|e| e["skills"].as_array().unwrap())
+        .filter_map(|s| s["name"].as_str())
+        .collect();
     assert!(
-        disc.iter().any(|e| e["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s == "review-pr")
-            && e["skills"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s == "incident-runbook")),
+        names.contains(&"git-workflow") && names.contains(&"refunds"),
         "{stderr}"
     );
     // Preflight ran and its verdict was recorded; it named a skill to preload.
     let verdict = events(&stderr, "preflight.verdict");
     assert_eq!(verdict.len(), 1, "{stderr}");
     assert_eq!(verdict[0]["intent"], "task");
-    let loaded: Vec<String> = events(&stderr, "skill.loaded")
+    let loaded: Vec<String> = events(&stderr, "skills.loaded")
         .iter()
         .map(|e| e["skill"].as_str().unwrap().to_string())
         .collect();
     assert!(
-        loaded.contains(&"review-pr".to_string()),
+        loaded.contains(&"git-workflow".to_string()),
         "the @skill reference preloaded: {loaded:?}"
     );
     assert!(
-        loaded.contains(&"deploy-safely".to_string()),
+        loaded.contains(&"refunds".to_string()),
         "the preflight's skill preloaded: {loaded:?}"
     );
     // Knowledge auto-context found the deployment policy and the model saw it.

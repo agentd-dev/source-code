@@ -105,6 +105,7 @@ agentd's own convention. Under the no-legacy rule they go once the extension
 lands — a user decision (§6, Q2).
 
 *Size:* small to medium. *Recommendation:* second.
+*Built:* [RFC 0051](0051-skills.md), 2026-10-19.
 
 ### 5.3 C — Client ID Metadata Document for MCP servers
 

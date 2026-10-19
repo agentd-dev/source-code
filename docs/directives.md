@@ -209,9 +209,11 @@ marked `md.instruction/resolution: resolved` is used as served, and its
 publisher, such a read verifies only through a delivery signature, so the pin
 must also name a `reader`; otherwise the read is refused.
 
-`:::!skill` blocks join the skill catalogue alongside skills discovered from
-MCP servers, with the body as delivered. An inline skill wins a name collision
-with a discovered one, because the operator wrote it closer to this agent.
+`:::!skill` blocks join the skill catalogue alongside skills from folders
+and MCP servers, with the body as delivered. An inline skill wins a name over
+a folder's skill, because the operator wrote it closer to this agent. A name
+an inline skill shares with a server's skill names neither: write
+`@skill:local/<name>` or `@skill:<server>/<name>`.
 
 > **Limit.** agentd resolves no `::include` when it delivers a document
 > itself. Each include reaches the model as the note

@@ -4,12 +4,13 @@ Skills that teach an **AI coding assistant** (Claude Code and friends) how to
 work with agentd — how to install it, write and validate a config, wire tools,
 attach the TUI, and read a non-zero exit code.
 
-> **Not to be confused with agentd's own `skills:` config section.** Those are
-> instruction bundles the *agent* loads at runtime, and the stock binary
-> discovers them from **MCP servers** — agentd deliberately reads no local skill
-> directory, so a skill cannot be planted on the host filesystem. This directory
-> is for the tools
-> that help you build with agentd, not for agentd.
+> **Not to be confused with agentd's own skills.** An agent loads skills at
+> runtime from the folders its configuration names (`skills.dir`, and
+> `.agents/skills/` beside the configuration file) and from MCP servers that
+> serve the Skills extension. This directory is for the tools that help you
+> build with agentd, not for an agent. Each skill here is in the same
+> [Agent Skills](https://agentskills.io/specification) format: a directory
+> whose `SKILL.md` frontmatter `name` is the directory's name.
 
 | skill | use it when |
 |---|---|
@@ -19,7 +20,8 @@ attach the TUI, and read a non-zero exit code.
 
 Copy (or symlink) the skill into your assistant's skills directory — for Claude
 Code that is `~/.claude/skills/` for personal use, or `.claude/skills/` in a
-repository to share it with everyone working there:
+repository to share it with everyone working there; `.agents/skills/` is the
+directory other Agent Skills clients share:
 
 ```sh
 cp -r skills/agentd ~/.claude/skills/

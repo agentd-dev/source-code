@@ -19,11 +19,12 @@ agentd over MCP.
 | Implementation | [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK (3.5), over agentd's own HTTP transport, so agentd's credentials and signing apply to every request. |
 | Tools | `tools/list` (every page) and `tools/call`; `list_changed` refreshes the catalogue. |
 | Resources | list, read, and subscriptions: `resources/subscribe` on 2025-11-25, a `subscriptions/listen` filter on 2026-07-28. A change notification triggers a re-read (notify-then-read). |
-| Prompts | `prompts/list` and `prompts/get`, used as skills and by the `mcp.resource` workflow step. |
+| Prompts | `prompts/get`, by the `mcp.resource` workflow step. A prompt is not a skill. |
 | Completions | the `mcp.resource` step with `op: complete`. |
 | Elicitation | supported: a server's question becomes a human approval gate in every attached client; an answer that cannot match the requested schema, or none within 300 s, is returned as `cancel`. |
 | MCP Events | the draft extension SEP-3415, on 2026-07-28 connections: bindings into durable streams, runtime subscriptions inside an operator's grant, poll and webhook delivery. In the release binaries; agentd says at load that it tracks a draft. |
 | [MCP Tasks](connect-mcp.md#long-running-tool-calls) | the extension SEP-2663 (`io.modelcontextprotocol/tasks`), on 2026-07-28 connections, as a client: a tool call a server answers with a task is followed to its end — a workflow step's as a durable wait that survives a restart, a model's within the call and then with `mcp.task.get` — polled at the server's interval or pushed on `subscriptions/listen`, cancelled with `tasks/cancel`. `mcp.servers[].tasks: off` refuses a server's tasks. In the release binaries. |
+| [MCP Skills](connect-mcp.md#load-skills-from-a-server) | the extension SEP-2640 (`io.modelcontextprotocol/skills`), on 2026-07-28 connections that declare it, as a client: `skills/list` (every page), `skills/get` for a skill no listing names, `resources/directory/read` where the server declares `directoryRead`. Every file is checked against its entry's `sha256:` digest and size, and `SKILL.md`'s frontmatter against the entry's; a skill is named by its server and URI. In the release binaries. |
 | Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). |
 
 **Not supported:** `sampling` and `roots` (agentd declares no client
@@ -36,6 +37,40 @@ server); acting as an MCP server, or serving any MCP extension. A
 
 [MCP support reference](mcp-reference.md) has the probe rules, the
 capability matrix and the known limits.
+
+## Agent Skills
+
+A skill is a folder holding a `SKILL.md`: YAML frontmatter that names and
+describes it, and a Markdown body that tells the agent how to do one kind of
+work, beside any `references/`, `assets/` or `scripts/` it needs. agentd
+reads skills in the [Agent Skills](https://agentskills.io/specification)
+format from folders on disk and, over MCP, from a server's
+[Skills extension](connect-mcp.md#load-skills-from-a-server).
+
+| | Support |
+|---|---|
+| Layout | `<folder>/<name>/SKILL.md`. A loose file in the folder (`README.md`, `<name>.md`) and a directory without a `SKILL.md` are not skills. |
+| `name` | required: 1–64 characters of `a-z`, `0-9` and `-`, not starting or ending with `-`, without `--`, and equal to the directory's name |
+| `description` | required: 1–1024 characters |
+| `license`, `compatibility`, `metadata` | optional: a string; 1–500 characters; a map of strings to strings |
+| `allowed-tools` | read as a string and ignored: a skill never grants a tool |
+| Other fields | kept and ignored |
+| `scripts/` | never run; a file is read as text with `skills.read` |
+| User scope | `skills.dir`, or `skills/` beside the configuration file when it is unset |
+| Project scope | `.agents/skills/` beside a loaded configuration file. A project skill wins a name over a user skill, said as `skills.collision`. Never read from the working directory alone or the home directory. |
+| Progressive disclosure | each skill's name and description in every system prompt; the body once `@skill:<name>` or `skills.load` loads it; a file through `skills.read` |
+
+A folder skill that breaks a rule refuses the configuration, naming the
+file and the rule:
+
+```text
+skills: ./.agents/skills/runbook/SKILL.md: `name` "Incident_Runbook" has 'I'; only a-z, 0-9 and - are allowed (agentskills.io)
+```
+
+The instruction document's `:::!skill` blocks join the same catalogue.
+agentd's own skills — the instruction's, the project's and the user's —
+share one name each, and are named `local/<name>` where a server's skill
+shares the name.
 
 ## Agent2Agent (A2A)
 

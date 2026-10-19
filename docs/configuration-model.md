@@ -111,9 +111,10 @@ one cannot stop you reading the help.
 
 **Conventional folders** beside the config fill in settings you did not
 write, so a project can be a directory rather than one long file:
-`workflows/` (one workflow per file), `skills/` (one skill per Markdown file
-or `<name>/SKILL.md`), `subagents/` (one template per file) and `context/`
-(named system-prompt templates). They are looked for beside each loaded
+`workflows/` (one workflow per file), `skills/` (one Agent Skill per
+`<name>/SKILL.md`), `subagents/` (one template per file) and `context/`
+(named system-prompt templates); `.agents/skills/` adds project skills
+beside `skills/`. They are looked for beside each loaded
 config file, the last one first, or in the working directory when none was
 loaded. They apply only when the setting is absent — writing `workflows: []`
 is a decision, and the folder does not argue with it — and only when the

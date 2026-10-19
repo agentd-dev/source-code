@@ -1033,42 +1033,9 @@ impl Runtime {
             }
             // ---- skills ----
             "skills.list" => ok(self.skills.list_value()),
-            "skills.load" => {
-                let ctx_id = caller.context_id();
-                let name = args["name"].as_str().unwrap_or("").to_string();
-                let mcp = self.mcp.clone();
-                let resolver = move |server: &str| -> Option<
-                    std::sync::Arc<dyn crate::context::skills::SkillServer>,
-                > {
-                    mcp.get(server).map(|c| {
-                        c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>
-                    })
-                };
-                let trace = self.caller_trace(caller);
-                match self.skills.load(
-                    &name,
-                    args.get("arguments").cloned(),
-                    &resolver,
-                    trace.as_ref(),
-                ) {
-                    Ok(body) => {
-                        let max_loaded = self.settings.skills.max_loaded.unwrap_or(8) as usize;
-                        let c = self.context_for(&ctx_id, caller.principal.as_deref());
-                        match c.load_skill(&name, &body.hash, max_loaded) {
-                            Ok(()) => ok(
-                                json!({"loaded": true, "name": name, "hash": body.hash, "body": body.body}),
-                            ),
-                            Err(e) => err(e),
-                        }
-                    }
-                    Err(e) => err(e),
-                }
-            }
-            "skills.unload" => {
-                let ctx_id = caller.context_id();
-                let c = self.context_for(&ctx_id, caller.principal.as_deref());
-                ok(json!({"ok": c.unload_skill(args["name"].as_str().unwrap_or(""))}))
-            }
+            "skills.load" => self.skills_load_tool(caller, &args),
+            "skills.read" => self.skills_read_tool(caller, &args),
+            "skills.unload" => self.skills_unload_tool(caller, &args),
             // ---- status ----
             // The model is its caller's deputy: it reads what that caller may.
             "status" => ok(self.status_for(caller.principal.as_deref())),

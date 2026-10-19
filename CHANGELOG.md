@@ -820,6 +820,82 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - The mock MCP server's `mock.job`, a job that becomes an MCP task where
   the call declares the extension (its `seed`, `update_error` and
   `get_error` shape the seed and refuse requests), and `--tasks-push`.
+- MCP Skills (RFC 0051): agentd is a client of the Skills extension,
+  `io.modelcontextprotocol/skills` (SEP-2640), on MCP 2026-07-28
+  connections whose server declares it. A `skills.sources` server's skills
+  are listed with `skills/list` (every page, at most 64), a skill no
+  listing names is got with `skills/get` (`@skill:<server>/<path>`, or
+  `skills.load {server, uri}`), and a `dynamic` skill's directory, and each
+  subdirectory it lists, is read with `resources/directory/read` where the
+  server declares `directoryRead`. An entry is refused when its `resources`
+  is missing or malformed, a file sits outside the skill, a `uri` holds a
+  character a URI cannot carry unencoded (a space, a line break, a quote,
+  an angle bracket), its `name` or `description` breaks the Agent Skills
+  rules, or it lists more than 512 files or 16 MiB; one file may be the
+  whole 16 MiB.
+  Each file is checked against its entry's size and `sha256:` digest when
+  it is read, and refreshed once with `skills/get` on a mismatch;
+  `SKILL.md`'s frontmatter is compared field by field with the entry's. A
+  `dynamic` skill is refused unless the source sets `dynamic: allow`. A
+  skill is named by its server and `uri` in the catalogue, the body cache,
+  a context's loaded set and every log line. A server's body reaches the
+  model inside a `<skill_content>` block that names the server and the
+  `uri` and says it is untrusted text, and nothing the server wrote leaves
+  it: the catalogue gives each skill one line, the server and `uri` are
+  escaped, and a `<skill_content` or `</skill_content` in the body is made
+  inert. Each skills source counts as `untrusted_input` in the root grant's
+  trifecta check. A decline is logged and told to whoever referenced the
+  skill, on one line: the instruction in a root note, a message in its
+  conversation, a step in its prompt, a tool call as its error. Events
+  `skills.discovered`, `skills.declined`, `skills.loaded`,
+  `skills.unknown`, `skills.collision`, `skills.load.refused`,
+  `skills.load.failed`, `skills.source.unavailable` and `skills.unloaded`.
+- Agent Skills in folders (RFC 0051): `<name>/SKILL.md` skills are read
+  from `skills.dir` (the user scope; `skills/` beside the configuration by
+  default) and from `.agents/skills/` beside a loaded configuration file
+  (the project scope, never the working directory alone), the project's
+  winning a name over the user's, said as `skills.collision`. A skill is
+  held to the Agent Skills rules — `name` 1–64 characters of `a-z`, `0-9`
+  and `-` with no leading, trailing or doubled hyphen and equal to its
+  directory's name; `description` 1–1024 characters; `license` a string,
+  `compatibility` 1–500 characters, `metadata` a map of strings — and one
+  that breaks a rule refuses the configuration, naming the file and the
+  rule. `allowed-tools` and other fields are read and ignored.
+- The `skills.read {name, path}` tool: a file of a skill loaded in the
+  caller's context, through the skill's own origin — a server's only a file
+  its entry lists, checked against the digest; a folder's only under its
+  directory. Its result names the origin, and a server's says it is
+  untrusted.
+- `skills.sources[].dynamic: refuse | allow` (default `refuse`).
+- References name a skill by its name when one skill has it, else
+  `<origin>/<name>` or `<origin>/<path>`, where the origin is a source's
+  server name or `local` for agentd's own; a name more than one skill holds
+  is an error listing each candidate. A skills source named `local` is
+  refused. A context names each skill it loaded by the reference it loaded
+  it under, and `skills.read` and `skills.unload` find it by that or by
+  what the catalogue calls it now.
+- `agentd-mcp`: `skills` — `Skill`, `SkillResource`, `Files`, `Invalid`,
+  `Listing`, `Got`, `Support`, `declared`, `check_name`,
+  `check_frontmatter`, the limits and method names — and
+  `McpClient::{skills_support, list_skills, get_skill, read_directory}`,
+  `check_uri` and `Skill::relative`; `http::RESOURCE_READ_MAX` (24 MiB), the
+  cap on a `resources/read` answer, every other answer staying at 8 MiB.
+  `agentd-net`: `StreamingResponse::{into_body_within, sse_within}` and
+  `SseReader::within`, a body or an event read within the caller's cap.
+  `agentd-core`: `context::skills` rebuilt around `SkillId` (`Catalogue`,
+  `SkillMeta`, `SkillBody`, `Declined`, `LoadError`, `ReadError`,
+  `SourcePolicy`, `Scope`, `Collision`, the `SkillServer` trait's
+  extension methods) and `context::skills::local`; `mcp::prompt_text`;
+  `ContextState::load_skill` takes the skill's identity, `SkillRef::id`
+  is required, `ContextState::{loaded_skill, release_skills}`, and
+  `ContextState::unload_skill` takes the identity the catalogue resolves.
+- The mock MCP server serves the Skills extension on its 2026-07-28 edge
+  (ten skills, eight listed three to a page, one with a tampered file, one
+  with a tampered `SKILL.md`, one with a file past 8 MiB), and
+  `--no-skills` leaves it undeclared.
+- Conformance family `mcp-skills`: a listed skill loaded once its digest
+  matches, one whose bytes differ declined after a `skills/get` refresh, a
+  prompt that is no skill.
 
 **Changed.**
 
@@ -1017,9 +1093,37 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   labels is under the earlier record id and is not read: sign the User in
   again after upgrading. Conversations and operations kept before carry no
   account and are taken as begun, or proposed, signed out.
+- Skills come only from the MCP Skills extension and from `SKILL.md`
+  folders (RFC 0051), a breaking change. A server's prompts and its
+  resources whose URI starts with `skill://` or whose MIME type is
+  `text/x-skill+markdown` are not skills; prompts stay readable with the
+  `mcp.resource` step's `prompt`. `skills.sources[].discover` is gone and
+  is refused as any unknown key is: delete it, and serve the skills from a
+  server that implements the extension at MCP 2026-07-28. A loose
+  `<name>.md` in a skills folder is not read, and a `SKILL.md` needs
+  frontmatter with a `name` equal to its directory's and a `description`:
+  move each skill to `<name>/SKILL.md`. An explicit `skills.dir` that
+  cannot be read refuses the configuration. A name held by two origins —
+  two servers, or a server and an inline or folder skill — resolves to
+  neither: write `@skill:<server>/<name>` or `@skill:local/<name>`. An
+  inline skill wins a name over a folder's only. The `skill.loaded`,
+  `skill.unknown` and `skill.load.refused` events are
+  `skills.loaded`, `skills.unknown` and `skills.load.refused`;
+  `skills.discovered` names each skill as an object (`{name, uri}`,
+  `{name, path}` or `{name}`) and its origin by `server`, `scope` and
+  `dir`, or `origin: instruction`; `skills.file.unreadable` is gone. The
+  `skills.load` tool takes no `arguments` or `version`. A build with the
+  `exec` feature refuses `security.exec.enabled` together with
+  `skills.sources`.
 
 **Fixed.**
 
+- A reload that rebuilt the skills catalogue dropped the body of every
+  loaded skill from the prompts of the contexts that had loaded it, while
+  their loaded sets still named it: a context keeps the bodies it loaded
+  until it loads another version, of the skills the new catalogue holds. A
+  server's skill whose source the reload removed, or that its source no
+  longer admits, is unloaded from every context, logged `skills.unloaded`.
 - `agent_company_token_requests_total` counted a `refresh`, `device_code`,
   `authorization_code`, `device_authorization` or `revoke` request as grant
   `other`, and `agent_company_gates_total` a sign-in gate as kind `other`

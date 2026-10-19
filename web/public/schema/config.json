@@ -884,17 +884,19 @@
     "SkillSource": {
       "additionalProperties": false,
       "properties": {
-        "discover": {
+        "dynamic": {
+          "description": "load a skill whose content is dynamic, which cannot be verified (default refuse)",
           "enum": [
-            "prompts",
-            "resources",
-            "auto"
+            "refuse",
+            "allow"
           ]
         },
         "filter": {
+          "description": "one skill name, or a prefix ending in *",
           "type": "string"
         },
         "server": {
+          "description": "a declared MCP server whose Skills extension (io.modelcontextprotocol/skills) skills are read from; not `local`, the origin a reference names the operator's own skills by",
           "type": "string"
         }
       },
@@ -4635,7 +4637,7 @@
       "additionalProperties": false,
       "properties": {
         "dir": {
-          "description": "a local folder of skill files (frontmatter + body, or <name>/SKILL.md); `skills/` beside the config is adopted when this is unset",
+          "description": "a local folder of <name>/SKILL.md skills (Agent Skills, the user scope); `skills/` beside the config is adopted when this is unset, and `.agents/skills/` beside the config is read as the project scope",
           "type": "string"
         },
         "max_bytes": {

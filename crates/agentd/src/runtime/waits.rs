@@ -1740,7 +1740,7 @@ impl Runtime {
                         json!({"uri": uri, "text": t, "json": serde_json::from_str::<Value>(&t).ok(), "contents": r.contents})
                     }).map_err(|e| e.to_string()),
                     "list" => client.list_resources(pages.as_ref()).map(|l| json!({"resources": l})).map_err(|e| e.to_string()),
-                    "prompt" => client.get_prompt(&name, arguments, meta.as_ref()).map(|p| json!({"description": p.description, "messages": p.messages, "text": crate::context::skills::prompt_messages_text(&p.messages)})).map_err(|e| e.to_string()),
+                    "prompt" => client.get_prompt(&name, arguments, meta.as_ref()).map(|p| json!({"description": p.description, "messages": p.messages, "text": crate::mcp::prompt_text(&p.messages)})).map_err(|e| e.to_string()),
                     "complete" => client.complete(reference.unwrap_or(Value::Null), argument.unwrap_or(Value::Null), meta.as_ref()).map(|c| serde_json::to_value(c).unwrap_or(Value::Null)).map_err(|e| e.to_string()),
                     "templates" => client.list_resource_templates(pages.as_ref()).map(|l| json!({"templates": l})).map_err(|e| e.to_string()),
                     other => Err(format!("mcp.resource: op must be read|list|prompt|complete|templates (got {other:?})")),

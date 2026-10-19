@@ -136,7 +136,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **sensitive** | One of the three capability tags: the tool reaches private data or privileged systems. See [Security model](security.md). |
 | **service catalog** | `services:`, the named external services a deployment may use, with authoritative tags and a tool ceiling. Under `security.egress: closed` it is the allow-list. See [Harden a deployment](harden.md). |
 | **signal** | A named message delivered to waiting runs or `signal` start nodes, for coordination (`workflow.signal`). Also an operating-system signal such as `SIGTERM`. See [Jobs, daemons and triggers](modes-and-triggers.md). |
-| **skill** | A document of guidance the model can load on demand, from an MCP server, a local `skills/` folder or a `:::!skill` directive. A skill grants no tool. See [MCP: tools and context](mcp.md). |
+| **skill** | Guidance the model loads on demand, in the Agent Skills format (a folder led by a `SKILL.md`): from an MCP server's Skills extension, a `skills/` or `.agents/skills/` folder, or a `:::!skill` directive. A skill grants no tool. See [Agent Skills](interoperability.md#agent-skills). |
 | **start node** | The step that fires a workflow's runs: `once`, `manual`, `loop`, `schedule`, `subscribe`, `signal`, `event`, `stream`, `correlate`, `a2a` or `webhook`. Also called a trigger. See [Jobs, daemons and triggers](modes-and-triggers.md). |
 | **step** | One node instance in a run. A step's output is recorded before the run moves on. See [Workflows: how runs work](workflows.md). |
 | **store** | Where durable state lives: the local filesystem, an MCP server, an HTTP key-value service, memory, or nowhere. See [Architecture](architecture.md). |

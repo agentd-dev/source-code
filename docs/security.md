@@ -181,11 +181,13 @@ profile, or set `security.allow_trifecta: true`, which relaxes every trifecta
 check at once. The `security` section is restart-only, so a hot reload can
 never widen the override.
 
-Two sources other than `mcp.servers` matter. A binary built with the `exec`
-feature and running with `security.exec.enabled` contributes `sensitive` and
-`egress` to the same fold. Tools an embedder registers in code sit outside the
-accounting entirely: they carry no tags, so an embedded tool that does egress
-or reads secrets is invisible to the check.
+Three sources other than the servers' tags matter. A server named under
+`skills.sources` contributes `untrusted_input` whatever its tags: a skill it
+serves is its text, which the model reads ([below](#skills)). A binary built
+with the `exec` feature and running with `security.exec.enabled` contributes
+`sensitive` and `egress` to the same fold. Tools an embedder registers in
+code sit outside the accounting entirely: they carry no tags, so an embedded
+tool that does egress or reads secrets is invisible to the check.
 
 > **Limit.** Using `security.allow_trifecta` emits no event. The refusal text
 > says "audited", but an allowed trifecta proceeds silently and the only trace
@@ -762,6 +764,11 @@ timeout and caller, never the output.
 > (no `allow`, no `workdir`) surfaces as an error result at the first call,
 > not at startup.
 
+The local runner and skills from an MCP server do not load together:
+`security.exec.enabled` with any `skills.sources` refuses the configuration.
+A server's skill may tell the model to run a command, and agentd has no
+per-skill approval to put between that text and the host.
+
 ## Secrets
 
 A secret appears in configuration only as a reference:
@@ -942,6 +949,54 @@ include `sign`. Under `security.egress: closed`, the `url:` and `oci:` fetch
 must match a catalog entry before agentd dials it.
 [Write and ship instruction documents](instruction-documents.md) shows how to
 sign, pin and encrypt documents.
+
+## Skills
+
+A skill is instructions the model reads. Who wrote it decides how agentd
+treats it.
+
+- **Your own skills** — a folder's `<name>/SKILL.md`, the instruction's
+  `:::!skill` — are configuration. A folder skill that breaks an Agent
+  Skills rule refuses the configuration, and `.agents/skills/` is read only
+  beside a configuration file agentd loaded, never from the working
+  directory alone.
+- **A server's skills** are that server's text. agentd shows a body to the
+  model inside a block that names the server and the URI and says the text
+  is the server's, not yours, and nothing the server wrote leaves it: the
+  catalogue gives each skill one line, the server and URI are escaped, a
+  `<skill_content` or `</skill_content` in the body is made inert, and a
+  URI holding a space, a line break, a quote or an angle bracket is
+  declined. The server counts as `untrusted_input` in the Rule-of-Two fold.
+- **Removing a source takes its skills back.** A reload that removes a
+  skills source, or narrows what it admits, unloads that server's skills
+  from every context (`skills.unloaded`), and `skills.read` reads only from
+  a server that is a source.
+
+For every skill, from any origin:
+
+- **It grants nothing.** `allowed-tools` and every frontmatter field beyond
+  `name`, `description`, `license`, `compatibility` and `metadata` are
+  ignored. A skill never adds a tool, a server or a permission.
+- **Nothing in it runs.** `scripts/` are files: `skills.read` returns their
+  text.
+- **A name is not an identity.** A server's skill is known by its server and
+  its URI. A name two origins hold resolves to neither: a reference names
+  the origin, and the shared name is logged as `skills.collision`.
+
+What a server's skill is checked for, before any of it is used:
+
+| Check | Refuses |
+|---|---|
+| The entry, at listing | a missing or malformed `resources`, a file outside the skill, a `uri` in characters a URI cannot carry unencoded, a `name` the Agent Skills rules refuse, more than 512 files or 16 MiB, `dynamic` content without `dynamic: allow` |
+| Each file, when it is read | bytes whose size or SHA-256 differ from the entry's, after one `skills/get` refresh; a file the entry it was loaded under does not list |
+| `SKILL.md`'s frontmatter | any field that differs from the entry's |
+| Where a file is read from | anything but the skill's own server: `skills.read` follows the skill's origin, never the model's choice of server |
+
+A matching digest proves the entry and the bytes agree, not that either is
+trustworthy: the same server supplies both. The checks stop a stale or
+altered file from passing for the one listed, and keep one server's skill
+from reading another's; they do not make a server's text safe to obey.
+Server skill content is held in memory only, never written to disk.
 
 ## Companies
 

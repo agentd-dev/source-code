@@ -81,6 +81,11 @@ fn mcp_tasks_conformance() {
 }
 
 #[test]
+fn mcp_skills_conformance() {
+    run_family(Category::McpSkills);
+}
+
+#[test]
 fn companies_conformance() {
     run_family(Category::Companies);
 }

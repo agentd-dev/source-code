@@ -254,13 +254,17 @@ impl Summary {
     }
 }
 
-/// A loaded skill reference: its name plus the hash of the version that was
-/// loaded, so a skill edited on disk is detectable rather than silently
-/// diverging from what the transcript was built against.
+/// A loaded skill reference: the reference it was loaded by, who it is, and
+/// the hash of the version that was loaded, so a skill edited on disk or
+/// changed on its server is detectable rather than silently diverging from
+/// what the transcript was built against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRef {
     pub name: String,
     pub hash: String,
+    /// Its identity (RFC 0051 D2): a server and `uri`, a path, or an inline
+    /// name.
+    pub id: skills::SkillId,
 }
 
 /// The kind of a context.
@@ -412,8 +416,17 @@ impl ContextState {
         self.skills.iter().map(|s| s.name.clone()).collect()
     }
 
-    pub fn load_skill(&mut self, name: &str, hash: &str, max_loaded: usize) -> Result<(), String> {
-        if let Some(s) = self.skills.iter_mut().find(|s| s.name == name) {
+    /// Record `id`'s body `hash` as loaded, under the reference `name`: a
+    /// skill loaded again replaces its earlier version.
+    pub fn load_skill(
+        &mut self,
+        name: &str,
+        hash: &str,
+        id: &skills::SkillId,
+        max_loaded: usize,
+    ) -> Result<(), String> {
+        if let Some(s) = self.skills.iter_mut().find(|s| s.id == *id) {
+            s.name = name.to_string();
             s.hash = hash.to_string();
             self.touch();
             return Ok(());
@@ -426,20 +439,43 @@ impl ContextState {
         self.skills.push(SkillRef {
             name: name.to_string(),
             hash: hash.to_string(),
+            id: id.clone(),
         });
         self.touch();
         Ok(())
     }
 
-    pub fn unload_skill(&mut self, name: &str) -> bool {
-        let before = self.skills.len();
-        self.skills.retain(|s| s.name != name);
-        if self.skills.len() != before {
+    /// The loaded skill a tool call names: the one whose identity is `id` —
+    /// what the catalogue resolves `name` to now — or else the one loaded
+    /// under the reference `name`, which the catalogue may have moved on from.
+    pub fn loaded_skill(&self, name: &str, id: Option<&skills::SkillId>) -> Option<&SkillRef> {
+        id.and_then(|id| self.skills.iter().find(|s| s.id == *id))
+            .or_else(|| self.skills.iter().find(|s| s.name == name))
+    }
+
+    /// Unload the skill [`ContextState::loaded_skill`] finds.
+    pub fn unload_skill(&mut self, name: &str, id: Option<&skills::SkillId>) -> bool {
+        let Some(at) = id
+            .and_then(|id| self.skills.iter().position(|s| s.id == *id))
+            .or_else(|| self.skills.iter().position(|s| s.name == name))
+        else {
+            return false;
+        };
+        self.skills.remove(at);
+        self.touch();
+        true
+    }
+
+    /// Unload every skill `holds` says is no longer held, returning them.
+    pub fn release_skills(&mut self, holds: impl Fn(&skills::SkillId) -> bool) -> Vec<SkillRef> {
+        let (kept, gone): (Vec<SkillRef>, Vec<SkillRef>) = std::mem::take(&mut self.skills)
+            .into_iter()
+            .partition(|s| holds(&s.id));
+        self.skills = kept;
+        if !gone.is_empty() {
             self.touch();
-            true
-        } else {
-            false
         }
+        gone
     }
 }
 
@@ -757,13 +793,38 @@ mod tests {
     #[test]
     fn skills_load_unload_and_caps() {
         let mut c = ContextState::new(ContextKind::Conversation, 1000);
-        c.load_skill("a", "h1", 2).unwrap();
-        c.load_skill("b", "h2", 2).unwrap();
-        assert!(c.load_skill("c", "h3", 2).is_err());
-        c.load_skill("a", "h9", 2).unwrap();
+        let id = |n: &str| skills::SkillId::Server {
+            server: "s".into(),
+            uri: format!("skill://{n}/SKILL.md"),
+        };
+        c.load_skill("a", "h1", &id("a"), 2).unwrap();
+        c.load_skill("b", "h2", &id("b"), 2).unwrap();
+        assert!(c.load_skill("c", "h3", &id("c"), 2).is_err());
+        c.load_skill("s/a", "h9", &id("a"), 2).unwrap();
         assert_eq!(c.skills[0].hash, "h9");
-        assert!(c.unload_skill("a"));
-        assert!(!c.unload_skill("a"));
-        assert_eq!(c.skill_names().len(), 1);
+        assert_eq!(
+            c.skills[0].name, "s/a",
+            "the same skill, by another reference"
+        );
+        // By identity, whatever reference it was loaded under, or by that
+        // reference.
+        assert_eq!(c.loaded_skill("a", Some(&id("a"))).unwrap().name, "s/a");
+        assert_eq!(c.loaded_skill("s/a", None).unwrap().hash, "h9");
+        assert!(c.loaded_skill("a", None).is_none());
+        assert!(c.unload_skill("a", Some(&id("a"))));
+        assert!(c.unload_skill("b", None));
+        assert!(!c.unload_skill("b", Some(&id("b"))));
+        assert!(c.skill_names().is_empty());
+        c.load_skill("a", "h1", &id("a"), 2).unwrap();
+        c.load_skill("b", "h2", &id("b"), 2).unwrap();
+        c.dirty = false;
+        let gone = c.release_skills(|i| *i == id("b"));
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].id, id("a"));
+        assert_eq!(
+            c.skill_names(),
+            std::collections::BTreeSet::from(["b".to_string()])
+        );
+        assert!(c.dirty, "a released skill is saved");
     }
 }

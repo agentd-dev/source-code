@@ -52,6 +52,7 @@ pub mod pressure; // disk/memory pressure: shed new work, drain what is in fligh
 pub mod reactor;
 pub mod reload;
 pub(crate) mod retire;
+pub(crate) mod skills; // the skills catalogue: built, loaded into contexts, its tools (RFC 0051)
 pub mod starts;
 pub mod steps;
 pub(crate) mod streams;
@@ -69,8 +70,8 @@ pub mod worker;
 pub use reactor::Runtime;
 
 use crate::config::settings::{Loaded, ModelRole, StoreKind};
+use crate::context::Contexts;
 use crate::context::memory::Memory;
-use crate::context::{Contexts, skills};
 use crate::engine::run::StepStatus;
 use crate::governor::Governor;
 use crate::mcp::client::McpClient;
@@ -499,51 +500,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         log.warn("registry.warning", json!({"warning": w}));
     }
 
-    // The skills catalogue, discovered from the connected MCP servers.
-    let mut catalogue = skills::Catalogue::new(
-        settings
-            .skills
-            .reference_prefix
-            .as_deref()
-            .unwrap_or(skills::DEFAULT_PREFIX),
-        settings.skills.max_bytes.unwrap_or(32_768) as usize,
-    );
-    for src in &settings.skills.sources {
-        match mcp.get(&src.server) {
-            Some(c) => {
-                let mode = match src.discover {
-                    crate::config::settings::Discover::Prompts => skills::Discover::Prompts,
-                    crate::config::settings::Discover::Resources => skills::Discover::Resources,
-                    crate::config::settings::Discover::Auto => skills::Discover::Auto,
-                };
-                let found = catalogue.discover(&**c, mode, src.filter.as_deref());
-                log.info(
-                    "skills.discovered",
-                    json!({"server": src.server, "count": found.len(), "skills": found}),
-                );
-            }
-            None => log.warn("skills.source.unavailable", json!({"server": src.server})),
-        }
-    }
-    if let Some(dir) = &settings.skills.dir {
-        let (names, errs) = catalogue.add_dir(std::path::Path::new(dir));
-        for e in errs {
-            log.warn("skills.file.unreadable", json!({"err": e}));
-        }
-        if !names.is_empty() {
-            log.info(
-                "skills.discovered",
-                json!({"server": "file", "dir": dir, "count": names.len(), "skills": names}),
-            );
-        }
-    }
-    if !settings.agent.inline_skills.is_empty() {
-        let names = catalogue.add_inline(&settings.agent.inline_skills);
-        log.info(
-            "skills.discovered",
-            json!({"server": "instruction", "count": names.len(), "skills": names}),
-        );
-    }
+    // The skills catalogue: the sources' Skills extension, the folders and
+    // the instruction's own (RFC 0051).
+    let (catalogue, notes) = skills::build(&settings, &mcp);
+    skills::say(&log, notes);
 
     // Channels.
     let (events_tx, events_rx) = std::sync::mpsc::channel();
@@ -1107,14 +1067,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             rt.job_runs.push(r.id.clone());
         }
     }
-    // Skill references in the instruction preload into the root context.
+    // Skill references in the instruction preload into the root context; one
+    // that loads nothing is told there, beside the instruction that wrote it.
     let refs = rt.skills.references(&rt.instruction.text.clone());
     if !refs.is_empty() {
-        let unknown = rt.preload_skills(crate::context::ROOT, &refs, None, None);
-        for u in unknown {
-            rt.note_root(format!(
-                "skill.unknown: {u:?} referenced by the instruction is not in the catalogue"
-            ));
+        for (_, line) in rt.preload_skills(crate::context::ROOT, &refs, None, None) {
+            rt.note_root(format!("{line} (referenced by the instruction)"));
         }
     }
     // `lifecycle.watch_config`: a file change reloads exactly like SIGHUP,
@@ -1179,20 +1137,22 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                 watch_dir(d, glob, &log);
             }
         }
-        // A local skills folder: skills are documents read from disk, and the
-        // reload rebuilds the catalogue from it. The folder watch catches a
-        // new top-level document; the per-file watches catch an edit to one
-        // already loaded, including a `<name>/SKILL.md` in a subdirectory,
-        // which an inotify watch on the parent folder never sees.
-        if let Some(dir) = rt.settings.skills.dir.clone() {
-            watch_dir(&dir, "*.md,*.markdown", &log);
-            for name in rt.skills.names() {
-                if let Some(m) = rt.skills.get(&name)
-                    && m.source.server == "file"
-                {
-                    watch_file(&m.source.reference, &log);
-                }
-            }
+        // The skills folders: skills are documents read from disk, and the
+        // reload rebuilds the catalogue from them. The folder watch catches a
+        // change at the top of the folder; the per-file watches catch an edit
+        // to a `<name>/SKILL.md`, which an inotify watch on the parent folder
+        // never sees.
+        for dir in [
+            rt.settings.skills.dir.clone(),
+            rt.settings.skills.project_dir.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            watch_dir(&dir, "*", &log);
+        }
+        for path in rt.skills.local_files() {
+            watch_file(&path, &log);
         }
     }
     rt.arm_workflows();

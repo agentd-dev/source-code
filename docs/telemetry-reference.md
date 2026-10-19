@@ -118,7 +118,7 @@ these names, and anything else is refused at load.
 | `root` | The root conversation |
 | `run` | Workflow runs |
 | `signal` | Workflow signals |
-| `skill`, `skills` | Skills discovery and loading |
+| `skills` | Skills discovery, loading and declines |
 | `start` | Start nodes |
 | `step` | Workflow steps |
 | `store` | The durable store |
@@ -709,21 +709,22 @@ Company that verifies while its token endpoint refuses has not recovered.
 | `signal.delivered` | info | `link`, `run`, `signal`, `step` | A signal woke a waiting step. In the waiting step's span; `link` is the signal's `traceparent` — a webhook callback's, an A2A caller's, the sending run's. |
 | `signal.received` | info | `delivered`, `inbox_event`, `name` | A workflow signal arrived. |
 
-### skill
-
-| Event | Level | Fields | Notes |
-|---|---|---|---|
-| `skill.load.refused` | warn | `err`, `skill` |  |
-| `skill.loaded` | info | `ctx`, `hash`, `skill` |  |
-| `skill.unknown` | warn | `err`, `skill` |  |
-
 ### skills
 
+A line names a server's skill by `server` and `uri`, a folder's by `path`,
+an instruction's by `origin: instruction` and `name`.
+
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `skills.discovered` | info | `count`, `dir`, `server`, `skills` |  |
-| `skills.file.unreadable` | warn | `err` |  |
-| `skills.source.unavailable` | warn | `server` |  |
+| `skills.collision` | warn | `candidates`, `kept`, `name`, `shadowed` | A name more than one skill holds: an operator's skill that shadows another (`kept`, `shadowed`), or skills of different origins (`candidates`, each reached by its qualified reference). |
+| `skills.declined` | warn | `ctx`, `file`, `path`, `reason`, `run`, `server`, `skill`, `step`, `uri` | agentd refused a skill: an entry that breaks a rule, a file whose bytes or frontmatter do not match, a `dynamic` skill its source does not allow. `ctx`, or `run` and `step`, name who asked. |
+| `skills.discovered` | info | `count`, `dir`, `origin`, `scope`, `server`, `skills`, `truncated` | A source's skills were listed (`server`, `skills: [{name, uri}]`), a folder read (`scope`, `dir`, `skills: [{name, path}]`), or the instruction's added (`origin`). |
+| `skills.load.failed` | warn | `ctx`, `err`, `run`, `server`, `skill`, `step`, `uri` | A skill's server was not connected or answered with an error. |
+| `skills.load.refused` | warn | `ctx`, `err`, `skill` | `skills.max_loaded` was reached. |
+| `skills.loaded` | info | `ctx`, `hash`, `name`, `origin`, `path`, `run`, `server`, `skill`, `step`, `uri`, `verified` | A skill body entered a context (`ctx`) or a step's prompt (`run`, `step`). `verified` is false for a `dynamic` skill. |
+| `skills.source.unavailable` | warn | `reason`, `server` | A `skills.sources` server is not connected or does not declare the Skills extension on MCP 2026-07-28, or its listing failed. |
+| `skills.unknown` | warn | `candidates`, `ctx`, `err`, `run`, `skill`, `step` | A reference named no skill, or more than one (`candidates`). |
+| `skills.unloaded` | info | `ctx`, `name`, `origin`, `path`, `reason`, `server`, `skill`, `uri` | A reload's catalogue no longer holds a skill a context had loaded — its source removed or no longer admitting it, or an operator's skill no longer defined — so the context lets go of it. |
 
 ### start
 

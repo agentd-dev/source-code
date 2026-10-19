@@ -104,6 +104,11 @@ carrying `search.*` is `untrusted_input + egress` for the trifecta gate.
 
 ## 7. Skills
 
+> **Replaced by RFC 0051 (2026-10-19).** Skills come from the MCP Skills
+> extension (SEP-2640) and from `SKILL.md` folders only; prompts and
+> `skill://` resources are no longer skills, and `discover` is gone. The
+> loaded set, the limits and the reference prefix below still hold.
+
 A **skill** = `{name, description, when_to_use?, arguments?, body (Markdown),
 resources?, hash, source}`. Sources (`skills.sources[]`): MCP servers, discovered
 via **prompts** (`prompts/list` catalogue, `prompts/get` body with arguments) or

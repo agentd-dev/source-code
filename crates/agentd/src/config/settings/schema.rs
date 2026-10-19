@@ -266,7 +266,7 @@ fn top_level_properties(
         "skills".to_string(),
         json!({ "type": "object", "additionalProperties": false, "properties": {
                 "sources": { "type": "array", "items": { "$ref": "#/$defs/SkillSource" } },
-                "dir": { "type": "string", "description": "a local folder of skill files (frontmatter + body, or <name>/SKILL.md); `skills/` beside the config is adopted when this is unset" },
+                "dir": { "type": "string", "description": "a local folder of <name>/SKILL.md skills (Agent Skills, the user scope); `skills/` beside the config is adopted when this is unset, and `.agents/skills/` beside the config is read as the project scope" },
                 "reference_prefix": { "type": "string" },
                 "max_loaded": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1 } } }),
@@ -596,7 +596,9 @@ fn defs_properties(
                 "min_free": { "type": "string", "description": "shed new work below this much free disk (256MB, 1.5GiB, bytes; 0 disables); warn at twice it" },
                 "path": { "type": "string", "description": "the state root; default $AGENTD_STATE_DIR, else $XDG_STATE_HOME/agentd/state, else $HOME/.local/state/agentd/state, else the OS temp dir" } } }));
     m.insert("SkillSource".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["server"], "properties": {
-                "server": { "type": "string" }, "discover": { "enum": ["prompts", "resources", "auto"] }, "filter": { "type": "string" } } }));
+                "server": { "type": "string", "description": "a declared MCP server whose Skills extension (io.modelcontextprotocol/skills) skills are read from; not `local`, the origin a reference names the operator's own skills by" },
+                "filter": { "type": "string", "description": "one skill name, or a prefix ending in *" },
+                "dynamic": { "enum": ["refuse", "allow"], "description": "load a skill whose content is dynamic, which cannot be verified (default refuse)" } } }));
     // A `workflows[]` entry is either a REFERENCE (`file`/`uri`/`url`/`dir`) or
     // an inline definition — and most people write them inline, which is where
     // an editor's completion earns its keep. So the workflow document's own

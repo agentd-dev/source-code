@@ -3287,17 +3287,25 @@ pub struct Search {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Skills {
+    /// The MCP servers whose Skills extension (SEP-2640) skills are read
+    /// from (RFC 0051).
     pub sources: Vec<SkillSource>,
-    /// A LOCAL folder of skill files, beside the config rather than behind an
-    /// MCP server. Skills are documents; requiring a server to serve a
-    /// markdown file was the one place the "capability comes from a server"
-    /// rule bought nothing — a skill grants no tool, it is prose the model
-    /// reads. `skills/` beside the config is adopted automatically when this
-    /// is unset and the folder has files in it.
+    /// A LOCAL folder of `<name>/SKILL.md` skills — the Agent Skills user
+    /// scope. Skills are documents; requiring a server to serve a markdown
+    /// file was the one place the "capability comes from a server" rule
+    /// bought nothing — a skill grants no tool, it is prose the model reads.
+    /// `skills/` beside the config is adopted automatically when this is
+    /// unset and the folder holds a skill.
     pub dir: Option<String>,
     pub reference_prefix: Option<String>,
     pub max_loaded: Option<u32>,
     pub max_bytes: Option<u64>,
+    /// `.agents/skills/` beside the loaded configuration file — the Agent
+    /// Skills project scope — when it is there. DERIVED at load, never
+    /// written: only a folder beside a configuration file agentd loaded is
+    /// read, never the working directory alone.
+    #[serde(skip)]
+    pub project_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -3305,18 +3313,19 @@ pub struct Skills {
 pub struct SkillSource {
     pub server: String,
     #[serde(default)]
-    pub discover: Discover,
-    #[serde(default)]
     pub filter: Option<String>,
+    /// Whether a skill whose `resources` is `"dynamic"` — unverifiable — is
+    /// loaded.
+    #[serde(default)]
+    pub dynamic: DynamicSkills,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum Discover {
-    Prompts,
-    Resources,
+pub enum DynamicSkills {
     #[default]
-    Auto,
+    Refuse,
+    Allow,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -5996,6 +6005,16 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         t.record("${…} environment substitution", &doc);
     }
     let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
+    // --- the Agent Skills project scope: `.agents/skills/` beside a
+    //     configuration file agentd loaded, the most specific first — never
+    //     the working directory alone (RFC 0051 D5). ---
+    if !config_paths.is_empty() {
+        settings.skills.project_dir = config_dirs(&config_paths)
+            .iter()
+            .map(|d| crate::context::skills::project_folder(d))
+            .find(|p| p.is_dir())
+            .map(|p| p.to_string_lossy().into_owned());
+    }
     // --- sugar: `agentd --instruction X` with no workflows, in a job ---
     //
     // Decided HERE, on the TYPED settings, not on the raw document: only after
@@ -6500,14 +6519,10 @@ fn apply_default_folders(doc: &mut Value, dirs: &[PathBuf], warnings: &mut Vec<S
         );
     }
 
-    // skills/ — prose the model reads, so it needs no server. Either
-    // `<name>.md` or the Agent Skill directory form `<name>/SKILL.md`.
+    // skills/ — prose the model reads, so it needs no server: Agent Skills,
+    // each `<name>/SKILL.md`.
     if obj.get("skills").and_then(|s| s.get("dir")).is_none()
-        && let Some(d) = find(dirs, "skills", |p| {
-            !folder_files(p, &["md"]).is_empty()
-                || std::fs::read_dir(p)
-                    .is_ok_and(|rd| rd.flatten().any(|e| e.path().join("SKILL.md").is_file()))
-        })
+        && let Some(d) = find(dirs, "skills", crate::context::skills::local::holds_skills)
         && let Some(sk) = obj
             .entry("skills")
             .or_insert_with(|| json!({}))
@@ -8405,6 +8420,37 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 ),
             );
         }
+        // A reference names a skill by its origin, and `local/<name>` is the
+        // operator's own: a server of that name would answer to it.
+        if src.server == crate::context::skills::LOCAL {
+            err(
+                &mut d,
+                format!(
+                    "skills.sources[]: the server name '{}' is the origin a reference names agentd's own skills by; give the server another name",
+                    src.server
+                ),
+            );
+        }
+    }
+    // Local skills are the operator's documents: one that breaks an Agent
+    // Skills rule is refused here, naming its file and the rule, rather than
+    // skipped where nobody looks (RFC 0051 D5).
+    for dir in [&s.skills.dir, &s.skills.project_dir].into_iter().flatten() {
+        if let Err(errs) = crate::context::skills::local::read_folder(Path::new(dir)) {
+            for e in errs {
+                err(&mut d, format!("skills: {e}"));
+            }
+        }
+    }
+    // A server's skill may say to run anything. With the local runner on,
+    // nothing would stand between that text and the host, and agentd has no
+    // per-skill approval to ask for (RFC 0051 D4).
+    #[cfg(feature = "exec")]
+    if s.security.exec.enabled && !s.skills.sources.is_empty() {
+        err(
+            &mut d,
+            "security.exec.enabled with skills.sources: a skill an MCP server serves is untrusted text, and agentd runs no command it directs — turn the local runner off or read skills only from local folders".into(),
+        );
     }
     if let Some(c) = s.context.compact_at
         && !(c > 0.0 && c <= 1.0)
@@ -9093,6 +9139,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             Ok(t) if t.is_empty() => tags.push(crate::sec::scope::TrifectaTag::UntrustedInput),
             Ok(t) => tags.extend(t),
             Err(_) => {}
+        }
+        // A skill a server serves is untrusted model input whatever the
+        // server is tagged (RFC 0051 D4).
+        if s.skills.sources.iter().any(|src| src.server == srv.name) {
+            tags.push(crate::sec::scope::TrifectaTag::UntrustedInput);
         }
     }
     // The local command runner is a capability like any other, and it carries
@@ -10671,6 +10722,95 @@ mod tests {
             &base_env(),
         )
         .expect("two legs are not the trifecta");
+    }
+
+    /// A server's skill is untrusted text whatever the server is tagged, so a
+    /// skills source adds `untrusted_input` to the root fold (RFC 0051 D4).
+    #[test]
+    fn a_skills_source_is_untrusted_input_whatever_its_tags() {
+        let cfg = |skills: &str| {
+            format!(
+                "store: {{kind: memory}}\n\
+                 mcp:\n  servers:\n    - name: ops\n      endpoint: https://mcp-ops.internal/mcp\n      tags: {{\"*\": [sensitive, egress]}}\n{skills}"
+            )
+        };
+        let plain = write_tmp(&cfg(""), "yaml");
+        load(
+            &args(&[
+                "--config",
+                plain.path().to_str().unwrap(),
+                "--validate-config",
+            ]),
+            &base_env(),
+        )
+        .expect("sensitive and egress are two legs");
+        let source = write_tmp(&cfg("skills:\n  sources:\n    - {server: ops}\n"), "yaml");
+        let e = load(
+            &args(&[
+                "--config",
+                source.path().to_str().unwrap(),
+                "--validate-config",
+            ]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("lethal-trifecta refused"), "{e}");
+    }
+
+    /// `local` is the origin agentd's own skills answer to in a reference: a
+    /// skills source of that name is refused, so `local/<name>` is never a
+    /// server's skill.
+    #[test]
+    fn a_skills_source_named_local_is_refused() {
+        let cfg = |name: &str| {
+            format!(
+                "store: {{kind: memory}}\n\
+                 mcp:\n  servers:\n    - name: {name}\n      endpoint: https://mcp-kb.internal/mcp\n\
+                 skills:\n  sources:\n    - {{server: {name}}}\n"
+            )
+        };
+        let validate = |text: &str| {
+            let f = write_tmp(text, "yaml");
+            load(
+                &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
+                &base_env(),
+            )
+            .map(|_| ())
+        };
+        let e = validate(&cfg("local")).unwrap_err();
+        assert!(
+            format!("{e}").contains("the server name 'local' is the origin"),
+            "{e}"
+        );
+        validate(&cfg("locals")).expect("any other name");
+    }
+
+    /// The local runner beside a server's skills is refused: nothing would
+    /// stand between a skill's text and a command on the host.
+    #[cfg(feature = "exec")]
+    #[test]
+    fn the_local_runner_beside_a_skills_source_is_refused() {
+        let f = write_tmp(
+            "store: {kind: memory}\n\
+             mcp:\n  servers:\n    - name: kb\n      endpoint: https://mcp-kb.internal/mcp\n      tags: {\"*\": [untrusted_input]}\n\
+             skills:\n  sources:\n    - {server: kb}\n\
+             security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n",
+            "yaml",
+        );
+        let e = load(
+            &args(&[
+                "--config",
+                f.path().to_str().unwrap(),
+                "--validate-config",
+                "--allow-trifecta",
+            ]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e}").contains("security.exec.enabled with skills.sources"),
+            "{e}"
+        );
     }
 
     #[test]

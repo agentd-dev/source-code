@@ -205,7 +205,8 @@ the runtime's data. `agentd --context-template` prints the built-in one, and
 4. `## Workflows`, `## Services`, `## Streams`, `## Subagent templates`:
    everything derived from configuration.
 5. The skills catalogue, then the bodies of skills loaded on this
-   conversation.
+   conversation; a server's skill inside a block that names its server and
+   says the text is the server's.
 6. `## Peers`, `## Signals`, `## Memory`: live state.
 
 **That order is a cache contract, not a preference.** Providers cache on the

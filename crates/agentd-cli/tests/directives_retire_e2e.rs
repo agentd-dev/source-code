@@ -143,10 +143,10 @@ observability:
     assert!(
         events(&stderr, "skills.discovered")
             .iter()
-            .any(|e| e["server"] == "instruction"
+            .any(|e| e["origin"] == "instruction"
                 && e["skills"]
                     .as_array()
-                    .is_some_and(|a| a.iter().any(|s| s == "tidy"))),
+                    .is_some_and(|a| a.iter().any(|s| s["name"] == "tidy"))),
         "{stderr}"
     );
     let _ = std::fs::remove_file(&cfg);

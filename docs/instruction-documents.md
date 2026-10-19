@@ -183,7 +183,7 @@ Two more views help:
 At startup the log names the inline skills the document added:
 
 ```text
-{"event":"skills.discovered","server":"instruction","skills":["refunds"],…}
+{"event":"skills.discovered","origin":"instruction","skills":[{"name":"refunds"}],…}
 ```
 
 ## Run it

@@ -1565,15 +1565,34 @@ fn launcher_fds_never_reach_daemon_children() {
             .get(&3)
             .cloned()
             .expect("the client had fd 3");
-        let terminal_in = std::fs::read_link(format!("/proc/{launcher}/fd/0"))
-            .unwrap()
-            .display()
-            .to_string();
+        // The launcher's stdin is the pipe the test types into: both ends
+        // name one pipe, so the test's own end says which it is — where the
+        // supervisor's descriptors are hidden from the test too.
+        let hidden = descriptors_hidden(launcher);
+        let terminal_in = {
+            use std::os::fd::AsRawFd;
+            let own = run.stdin.as_ref().expect("a typed launch").as_raw_fd();
+            std::fs::read_link(format!("/proc/self/fd/{own}"))
+                .unwrap()
+                .display()
+                .to_string()
+        };
+        if !hidden {
+            let theirs = std::fs::read_link(format!("/proc/{launcher}/fd/0")).unwrap();
+            assert_eq!(theirs.display().to_string(), terminal_in);
+        }
         let terminal_err = s.path("launcher.err").display().to_string();
 
         // Every descriptor the launcher holds beyond its stdio is
         // close-on-exec: the saved terminal, and anything the daemon opened.
-        for (n, target) in proc_fds(launcher).range(3..) {
+        // Only a process that may read a non-dumpable supervisor's /proc can
+        // look; the exec child below shows the consequence either way.
+        let held = if hidden {
+            BTreeMap::new()
+        } else {
+            proc_fds(launcher)
+        };
+        for (n, target) in held.range(3..) {
             let info =
                 std::fs::read_to_string(format!("/proc/{launcher}/fdinfo/{n}")).unwrap_or_default();
             let flags = info

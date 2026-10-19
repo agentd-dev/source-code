@@ -81,6 +81,50 @@ fn run_daemon(config: &str, state_dir: &str, ms: u64) -> (Option<i32>, String) {
     )
 }
 
+/// [`run_daemon`], but held until its log says `needle` — a start that has
+/// fired, say — rather than for a fixed time a loaded runner may spend
+/// starting up; at most `within`.
+fn run_daemon_until(
+    config: &str,
+    state_dir: &str,
+    needle: &str,
+    within: Duration,
+) -> (Option<i32>, String) {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", config])
+        .env("AGENTD_STATE_DIR", state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd");
+    let log = Arc::new(Mutex::new(String::new()));
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let into = Arc::clone(&log);
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            into.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    let deadline = std::time::Instant::now() + within;
+    while !log.lock().unwrap().contains(needle) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().expect("wait agentd");
+    reader.join().expect("the stderr reader");
+    let out = log.lock().unwrap().clone();
+    (status.code(), out)
+}
+
 #[test]
 fn a_long_lived_instance_with_no_store_block_starts_on_the_file_store() {
     let dir = state_root("ll-default");
@@ -197,7 +241,12 @@ fn state_survives_a_kill_and_the_second_life_resumes_instead_of_starting_fresh()
         "agent:\n  name: resumer\nstore:\n  kind: file\n  file:\n    path: {dir}\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ));
     // Life 1: nothing on disk ⇒ a fresh restore, then the schedule writes.
-    let (code, first) = run_daemon(&cfg, &dir, 300);
+    let (code, first) = run_daemon_until(
+        &cfg,
+        &dir,
+        "\"event\":\"start.fired\"",
+        Duration::from_secs(20),
+    );
     assert_eq!(code, Some(0), "life 1 drains; stderr:\n{first}");
     assert_eq!(
         events(&first, "restore.fresh").len(),

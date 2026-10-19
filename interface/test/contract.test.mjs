@@ -125,6 +125,11 @@ const SEND = {
   [OPS.companyUserIdReset]: (c, e) => c.companyUserIdReset(e.company),
   [OPS.companySignIn]: (c, e) => c.companySignIn(e.company, { scopes: e.scopes, newAccount: e.new_account }),
   [OPS.companySignOut]: (c, e) => c.companySignOut(e.company),
+  [OPS.delegationEnrol]: (c, e) => c.delegationEnrol(e.idp, { grant: e.grant }),
+  [OPS.delegationList]: (c) => c.delegationList(),
+  [OPS.delegationApprove]: (c, e) => c.delegationApprove(e.gate, e.nonce, e.args_hash),
+  [OPS.delegationDeny]: (c, e) => c.delegationDeny(e.gate, e.nonce),
+  [OPS.delegationRevoke]: (c, e) => c.delegationRevoke(e.target),
 };
 
 /**
@@ -172,6 +177,12 @@ const MORE = [
   { op: OPS.companySignIn, company: 'shop' },
   { op: OPS.companySignIn, company: 'shop', scopes: ['poppy:read'], new_account: true },
   { op: OPS.companySignOut, company: 'shop' },
+  { op: OPS.delegationEnrol, idp: 'okta' },
+  { op: OPS.delegationEnrol, idp: 'okta', grant: 'device' },
+  { op: OPS.delegationList },
+  { op: OPS.delegationApprove, gate: 'consent-1', nonce: 'n0nce', args_hash: 'ab12' },
+  { op: OPS.delegationDeny, gate: 'consent-1', nonce: 'n0nce' },
+  { op: OPS.delegationRevoke, target: 'operator:ada' },
 ];
 
 /** Replace fetch for one test: record each JSON-RPC body, answer `reply(body)` with the echo `echo`. */

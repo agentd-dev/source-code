@@ -97,6 +97,11 @@ export const OPS = Object.freeze({
   companyUserIdReset: 'company.user_id.reset',
   companySignIn: 'company.sign_in',
   companySignOut: 'company.sign_out',
+  delegationEnrol: 'delegation.enrol',
+  delegationList: 'delegation.list',
+  delegationApprove: 'delegation.approve',
+  delegationDeny: 'delegation.deny',
+  delegationRevoke: 'delegation.revoke',
 } as const);
 
 /**

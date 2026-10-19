@@ -346,8 +346,12 @@ fn launch_holding_stray(s: &Scratch, args: &[&str], env: &[(&str, &str)]) -> (Ex
 
 /// On Linux: `pid` holds a pipe on each of [`STRAY_FDS`] — the stray was
 /// planted, and a test that finds it missing from a child tests something.
+/// A supervisor makes itself non-dumpable (RFC 0044 T4), which hides its
+/// descriptors from a process without root's ptrace right, such as a CI
+/// runner's: there, what the test sees is that hardening, and the stray's
+/// arrival rests on the `dup2` without close-on-exec that planted it.
 fn assert_holds_stray(pid: i32) {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(target_os = "linux") || descriptors_hidden(pid) {
         return;
     }
     for fd in STRAY_FDS {
@@ -359,6 +363,15 @@ fn assert_holds_stray(pid: i32) {
             "process {pid} inherited the stray pipe on fd {fd}: {target:?}"
         );
     }
+}
+
+/// Whether `pid` made itself non-dumpable and this process cannot see past
+/// it: the kernel gives a non-dumpable process's `/proc` entries to root, and
+/// this process is not root.
+fn descriptors_hidden(pid: i32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let me = unsafe { libc::geteuid() };
+    me != 0 && std::fs::metadata(format!("/proc/{pid}/fd")).is_ok_and(|m| m.uid() == 0)
 }
 
 /// The variables the daemon's configuration reads, each holding a value the

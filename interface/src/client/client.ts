@@ -495,6 +495,43 @@ export class AgentdClient {
     return this.command(OPS.companySignOut, { company }, { returnImmediately: true });
   }
 
+  /**
+   * Sign the per-person operator in at an identity provider and keep their
+   * delegation grant. The task says where to sign in, and how it ended.
+   */
+  async delegationEnrol(
+    idp: string,
+    opts: { grant?: 'device' | 'authorization_code' } = {},
+  ): Promise<CommandReply> {
+    const args: Obj = { idp };
+    if (opts.grant) args.grant = opts.grant;
+    return this.command(OPS.delegationEnrol, args, { returnImmediately: true });
+  }
+
+  /** The delegation grants held — never a secret — and the open consent gates. */
+  async delegationList(): Promise<Json> {
+    return this.data(OPS.delegationList);
+  }
+
+  /** Approve one consent gate: the call it holds runs. The person's alone. */
+  async delegationApprove(gate: string, nonce: string, argsHash: string): Promise<CommandReply> {
+    return this.command(
+      OPS.delegationApprove,
+      { gate, nonce, args_hash: argsHash },
+      { returnImmediately: true },
+    );
+  }
+
+  /** Deny one consent gate: the call it holds is refused, not made. */
+  async delegationDeny(gate: string, nonce: string): Promise<CommandReply> {
+    return this.command(OPS.delegationDeny, { gate, nonce }, { returnImmediately: true });
+  }
+
+  /** Revoke the delegation grants `target` names: a principal, or `idp:<name>#<sub>`. */
+  async delegationRevoke(target: string): Promise<CommandReply> {
+    return this.command(OPS.delegationRevoke, { target }, { returnImmediately: true });
+  }
+
   // ---- streams -----------------------------------------------------------
 
   /**

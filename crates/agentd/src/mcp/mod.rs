@@ -88,6 +88,17 @@ pub fn prompt_text(messages: &[serde_json::Value]) -> String {
     out
 }
 
+/// Name in `meta` the principal an MCP request is made for — the authority
+/// of the work, never a label a caller wrote — as its scope
+/// ([`::mcp::http::SCOPE_META`]): a request signer that holds per-person
+/// credentials (AAuth's Case C tokens) presents and earns them for that
+/// principal alone. The transport takes it out before the request is sent.
+pub(crate) fn scope(meta: &mut serde_json::Value, principal: Option<&str>) {
+    if let (Some(p), Some(m)) = (principal, meta.as_object_mut()) {
+        m.insert(::mcp::http::SCOPE_META.into(), serde_json::json!(p));
+    }
+}
+
 /// The `_meta` every `tools/call` on a connection carries, whichever process
 /// dialled it — the reactor at startup or on reload, or a subagent: the run id
 /// and instance, so a backing service can recognize a retried call and

@@ -273,6 +273,18 @@ fn probe(protocol_version: &str) -> common::MockMcp {
             params["arguments"].get("_meta").is_none(),
             "{who}: `_meta` rode inside the tool's arguments: {params}"
         );
+        // Whom the work is for — a loop's run is the autonomous actor's —
+        // whichever process made the call.
+        assert_eq!(
+            meta["agent/acting_for"], "system",
+            "{who}: no agent/acting_for in params._meta: {params}"
+        );
+        // The scope that names it to a request signer is the transport's,
+        // and never reaches the server.
+        assert!(
+            meta.get("agentd-mcp/scope").is_none(),
+            "{who}: the request scope reached the server: {params}"
+        );
     }
     // One run, one instance, one trace — whichever process made the call.
     let trace_of = |p: &Value| p["_meta"]["traceparent"].as_str().unwrap()[3..35].to_string();

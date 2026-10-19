@@ -11,8 +11,9 @@
 //! DER walk rather than a parser dependency:
 //! every read is length-checked, DER long-form lengths are bounded to 4 bytes,
 //! nothing recurses without shrinking the slice, and any malformed input yields
-//! an empty/partial result rather than a panic. It parses ONLY the two fields we
-//! need; it is NOT a general X.509 library.
+//! an empty/partial result rather than a panic. It parses ONLY the fields we
+//! need — the subject CN, the SANs and the SubjectPublicKeyInfo a caller is
+//! keyed by; it is NOT a general X.509 library.
 
 /// The identity fields lifted from a verified peer certificate.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -22,6 +23,10 @@ pub struct PeerIdentity {
     /// The Subject Alternative Names: dNSName / URI / rfc822 as-is, iPAddress
     /// formatted. A SPIFFE ID rides here as a `spiffe://…` URI SAN.
     pub sans: Vec<String>,
+    /// The DER of the SubjectPublicKeyInfo: what a certificate's key is
+    /// pinned by (its SHA-256, as RFC 7469 pins one), whatever else a
+    /// reissue changes. Empty when the certificate does not parse.
+    pub spki: Vec<u8>,
 }
 
 /// A hostile-input ceiling on the SAN count (a verified cert never has this many).
@@ -61,6 +66,11 @@ pub fn parse(cert_der: &[u8]) -> PeerIdentity {
     // subject Name is the 5th field after the (optional) version.
     if let Some((0x30, subject)) = fields.get(base + 4).copied() {
         out.subject_cn = subject_cn(subject);
+    }
+    // subjectPublicKeyInfo follows it. DER is canonical, so the field
+    // re-encoded is the certificate's own bytes.
+    if let Some((0x30, spki)) = fields.get(base + 5).copied() {
+        out.spki = der_encode(0x30, spki);
     }
     // extensions is the `[3]` (tag 0xA3) field, after subjectPublicKeyInfo.
     if let Some((_, ext3)) = fields.iter().skip(base + 5).find(|(t, _)| *t == 0xA3) {
@@ -143,6 +153,26 @@ fn sans(ext3_der: &[u8]) -> Vec<String> {
             }
         }
     }
+    out
+}
+
+/// `tag` and `value` as one DER TLV, its length in the definite short or
+/// long form.
+fn der_encode(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = value.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes: Vec<u8> = len
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        out.push(0x80 | bytes.len() as u8);
+        out.extend_from_slice(&bytes);
+    }
+    out.extend_from_slice(value);
     out
 }
 
@@ -247,6 +277,28 @@ mod tests {
         let der = pem_to_der(include_str!("../tests/fixtures/client.pem"));
         let id = parse(&der);
         assert_eq!(id.subject_cn.as_deref(), Some("agentctl-test"));
+        // Its SubjectPublicKeyInfo, byte for byte as the certificate holds it:
+        // one whole SEQUENCE, its header included.
+        assert_eq!(id.spki.first(), Some(&0x30));
+        let l0 = id.spki[1] as usize;
+        let whole = if l0 & 0x80 == 0 {
+            2 + l0
+        } else {
+            let n = l0 & 0x7f;
+            2 + n
+                + id.spki[2..2 + n]
+                    .iter()
+                    .fold(0, |a, b| a << 8 | *b as usize)
+        };
+        assert_eq!(whole, id.spki.len());
+        assert!(
+            der.windows(id.spki.len()).any(|w| w == id.spki.as_slice()),
+            "the SPKI is a slice of the certificate"
+        );
+        assert_ne!(
+            id.spki,
+            parse(&pem_to_der(include_str!("../tests/fixtures/server.pem"))).spki
+        );
         assert!(
             id.sans.is_empty(),
             "client fixture has no SAN: {:?}",

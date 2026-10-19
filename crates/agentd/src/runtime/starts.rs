@@ -483,13 +483,16 @@ impl Runtime {
             None,
             parent,
             &[],
+            None,
         )
     }
 
     /// Like [`Runtime::fire_start`], for a firing that hands the run text
     /// another run, child or peer carried (a signal): the start records it,
     /// and the run carries it (`withhold`). The run continues `parent`, the
-    /// trace of the signal that fired it.
+    /// trace of the signal that fired it. `authority` is the principal the
+    /// TRANSPORT authenticated — the A2A message's sender, the signal's — and
+    /// the run is theirs; `None` runs as `identity.autonomous_as`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_start_carrying(
         &mut self,
@@ -500,6 +503,7 @@ impl Runtime {
         kind: &str,
         carries: &super::withhold::Carries,
         parent: Option<&TraceContext>,
+        authority: Option<&str>,
     ) -> Admission {
         self.admit_start(
             workflow,
@@ -512,6 +516,7 @@ impl Runtime {
             Some(carries),
             parent,
             &[],
+            authority,
         )
         .0
     }
@@ -563,6 +568,7 @@ impl Runtime {
             (!carries.is_empty()).then_some(&carries),
             parent.as_ref(),
             &links,
+            None,
         )
         .0
     }
@@ -580,6 +586,7 @@ impl Runtime {
         carries: Option<&super::withhold::Carries>,
         parent: Option<&TraceContext>,
         links: &[String],
+        authority: Option<&str>,
     ) -> (Admission, Option<TraceContext>) {
         // Every line about this firing carries the same identity, plus the
         // stream position when a consumer is offering an event.
@@ -699,12 +706,11 @@ impl Runtime {
         // one that shows up in the audit line, the MCP `_meta` and the budget
         // scope like any other.
         //
-        // An inbound A2A message is the exception: it already carries the
-        // principal who sent it, and that is who the work is for.
-        let acting = ev
-            .get("payload")
-            .and_then(|p| p.get("principal"))
-            .and_then(Value::as_str)
+        // Whose the run is comes from the transport that authenticated the
+        // trigger — an A2A message's sender, a signal's — passed beside the
+        // payload, and from nothing else: a payload is what its sender wrote,
+        // and a `principal` in it is never the run's authority.
+        let acting = authority
             .map(str::to_string)
             .unwrap_or_else(|| self.settings.identity.autonomous_id().to_string());
         // The write-ahead decides whether this fired at all, so it comes before
@@ -1035,7 +1041,16 @@ impl Runtime {
             if let Some(id) = &by {
                 trigger["principal"] = json!(id);
             }
-            self.fire_start_carrying(&workflow, &node, &spec, trigger, "signal", carries, trace);
+            self.fire_start_carrying(
+                &workflow,
+                &node,
+                &spec,
+                trigger,
+                "signal",
+                carries,
+                trace,
+                by.as_deref(),
+            );
             fired += 1;
         }
         fired

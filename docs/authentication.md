@@ -159,6 +159,7 @@ auth:
   grant: device                             # device | authorization_code | client_credentials
   scopes: [tracker.read, offline_access]
   audience: https://tracker.example.com     # sent with the device authorization request
+  resource: auto                            # RFC 8707: auto | omit | a URI
 ```
 
 | Grant | When | How the token arrives |
@@ -185,22 +186,69 @@ server's metadata does, trailing slash included or not. Pin `token_url`,
 [agentd's Client ID Metadata Document](#client-id-metadata-document) — and
 either `issuer` or `token_url`; the device grant also needs `issuer` or
 `device_authorization_url`, and the browser grant `issuer` or
-`authorization_url`. The load checks each of these.
+`authorization_url`. An MCP server's block, or an MCP catalog entry's, may
+name none of them: the server names its authorization server. The load
+checks each of these.
 
-With no `issuer` and no pinned endpoint, `agentd --login` asks the MCP
-server itself (RFC 9728): the `resource_metadata` URL its `401` challenge
-names, else the protected-resource metadata with the well-known suffix
-inserted before the server's path
+**An MCP server names its authorization server.** With no `issuer` and no
+`token_url`, `agentd --login` and the daemon — at the first request that
+needs a token — ask the MCP server itself (RFC 9728): the
+`resource_metadata` URL its `401` challenge names, when it is on the
+server's own origin, else the protected-resource metadata with the
+well-known suffix inserted before the server's path
 (`https://mcp.example/.well-known/oauth-protected-resource/mcp`), else the
-one at the root.
+one at the root. The document is used only when its `resource` is the
+server's `endpoint`, byte for byte (RFC 9728 §3.3); metadata describing
+another resource is refused (`… describes the resource …, not … (RFC 9728
+§3.3)`). Its first `authorization_servers` entry is the issuer, and a login
+is kept with it: a server whose metadata names another issuer later finds
+the login is not presented there. That issuer is a URL the server chose:
+on the server's own origin it is reached as the server is; anywhere else
+only over HTTPS and through the SSRF guard — no loopback, private or
+link-local address — and, under `security.egress: closed`, only when a
+`services` entry covers it. Its metadata must keep the token, device and
+revocation endpoints on its own origin; pin `issuer` to use one that does
+not. Metadata of an issuer you pinned is trusted for the endpoints it
+names, wherever they are (Google's `https://accounts.google.com` names
+`https://oauth2.googleapis.com/token`).
 
-**The browser grant's checks.** The redirect's `state` must be the one the
-login sent, and its `iss` (RFC 9207) the issuer the request went to, byte
-for byte; a redirect without `iss` is refused when the server's metadata
-declares `authorization_response_iss_parameter_supported`. With endpoints
-pinned and no `issuer` there is nothing to compare `iss` with, and it is not
-checked. The `state` and the PKCE verifier are drawn from the kernel's
-random source with no fallback: a host that cannot read it fails the login.
+**The resource (RFC 8707).** Every authorization, token, refresh and
+client-credentials request names the endpoint the token is for as
+`resource`: on an MCP server or an MCP catalog entry, the server's
+`endpoint` in canonical form — scheme and host lowercased, no fragment, no
+trailing `/` — which is what MCP's authorization spec requires whether the
+authorization server supports the parameter or not. `resource: omit` sends
+none, for a server that refuses parameters it does not know; a URI sends
+that URI. A model connection's and an A2A peer's blocks send none unless
+told to (`resource: auto` sends the endpoint), because Microsoft Entra
+refuses the parameter (`AADSTS901002`). The `mcp.servers[].oauth` shortcut
+always sends the server's endpoint.
+
+**The browser grant's checks.** Before any URL is printed, the server's
+metadata must list `S256` in `code_challenge_methods_supported`: a server
+that cannot be held to PKCE is refused (MCP 2026-07-28). With every endpoint
+pinned no metadata is read, and nothing is judged. The redirect's `state`
+must be the one the login sent, and its `iss` (RFC 9207) the issuer the
+request went to, byte for byte; a redirect without `iss` is refused when the
+server's metadata declares `authorization_response_iss_parameter_supported`.
+With endpoints pinned and no `issuer` there is nothing to compare `iss`
+with, and it is not checked. A login that asks for `openid` sends a
+`nonce`, and an ID token in the answer must carry it, name the issuer and
+have this `client_id` in its `aud`, or the login is refused. The `state`,
+the PKCE verifier and the nonce are drawn from the kernel's random source
+with no fallback: a host that cannot read it fails the login.
+
+**Step-up.** An MCP server that answers a call `403` with `WWW-Authenticate:
+Bearer error="insufficient_scope", scope="…"` names scopes the token lacks.
+For a login (`device` or `authorization_code`), the daemon renews the token
+with the union of the scopes it holds and those the server named, and sends
+the call again with the new one — at most twice for one union in the life
+of the process. When the authorization server will not grant the union by
+a renewal, the call fails with the server's challenge, and the union is
+kept with the login: the next `agentd --login` asks for it. A challenge for
+scopes the token already holds is the server's inconsistency, and asks
+nothing. A `client_credentials` grant asks for nothing more: the call fails
+with the challenge, as MCP permits a client acting for itself.
 
 **Client authentication.** At the token and revocation endpoints a
 confidential client sends its `client_secret` in the form body. Set
@@ -233,7 +281,8 @@ without being sent; an issuer that is down at startup does not stop the
 start. Pin the endpoints to depend on no discovery at all.
 
 **The MCP shortcut.** `mcp.servers[].oauth` is a client-credentials grant
-with a pinned token endpoint, and nothing else:
+with a pinned token endpoint, and nothing else; its token request names the
+server as its `resource`:
 
 ```yaml
 # fragment: under mcp.servers[]:
@@ -619,6 +668,7 @@ out of rotation for it, so another endpoint serves meanwhile. The
 | `grant` | `oauth2` | `device` (default), `authorization_code` or `client_credentials` |
 | `scopes` | `oauth2` | requested scopes |
 | `audience` | `oauth2` | `audience` parameter sent with the device authorization request and the client-credentials grant, for authorization servers that want one |
+| `resource` | `oauth2` | RFC 8707 `resource` on every authorization, token, refresh and client-credentials request: `auto` (the endpoint, canonical), `omit` or a URI; unset, `auto` on an MCP server or MCP catalog entry and `omit` elsewhere |
 | `region` | `aws` | AWS region (required) |
 | `service` | `aws` | signing service name, such as `bedrock` or `execute-api` (required) |
 | `source` | `aws` | `env` (default), `static`, `imds`, `irsa` or `sso` |

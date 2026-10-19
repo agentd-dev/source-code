@@ -12,6 +12,15 @@ use std::time::Duration;
 
 use agentd::auth::challenge::discover_issuer;
 
+/// The issuer `endpoint`'s RFC 9728 metadata names, when it names one agentd
+/// may reach.
+fn issuer_of(endpoint: &str) -> Option<String> {
+    discover_issuer(endpoint, None, Duration::from_secs(5))
+        .ok()
+        .flatten()
+        .map(|(issuer, _)| issuer)
+}
+
 /// A mock resource server: `POST` anything → 401 with the RFC 9728 challenge;
 /// `GET /.well-known/oauth-protected-resource` → the metadata JSON naming the
 /// issuer. Serves a bounded number of connections then exits.
@@ -89,15 +98,24 @@ fn write_resp(s: &mut TcpStream, status: u16, reason: &str, headers: &[(&str, &s
 
 #[test]
 fn login_discovers_the_issuer_from_the_401_challenge() {
-    let issuer = "http://issuer.example/realms/agents";
+    let issuer = "https://issuer.example/realms/agents";
     let endpoint = spawn_resource(issuer);
 
-    let found = discover_issuer(&endpoint, Duration::from_secs(5));
+    let found = issuer_of(&endpoint);
     assert_eq!(
         found.as_deref(),
         Some(issuer),
         "the 401 challenge → resource metadata → authorization_servers[0] chain resolves the issuer"
     );
+    // A server-chosen authorization server off the server's origin must be
+    // HTTPS: a plain-http one is refused, not used.
+    let e = discover_issuer(
+        &spawn_resource("http://issuer.example/realms/agents"),
+        None,
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(e.contains("not an https URL"), "{e}");
 }
 
 /// One request: method, path, lower-cased headers, body.
@@ -188,10 +206,7 @@ fn a_server_that_checks_the_revision_before_auth_still_gives_its_challenge() {
     let ep = spawn_strict("https://as.example", |headers, _| {
         header(headers, "mcp-protocol-version").is_some_and(|v| v != "2025-11-25")
     });
-    assert_eq!(
-        discover_issuer(&ep, Duration::from_secs(5)).as_deref(),
-        Some("https://as.example")
-    );
+    assert_eq!(issuer_of(&ep).as_deref(), Some("https://as.example"));
 }
 
 #[test]
@@ -206,8 +221,5 @@ fn a_server_that_checks_the_standard_headers_before_auth_still_gives_its_challen
                 != header(headers, "mcp-protocol-version")
             || meta["io.modelcontextprotocol/clientCapabilities"].is_null()
     });
-    assert_eq!(
-        discover_issuer(&ep, Duration::from_secs(5)).as_deref(),
-        Some("https://as.example")
-    );
+    assert_eq!(issuer_of(&ep).as_deref(), Some("https://as.example"));
 }

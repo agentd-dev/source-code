@@ -52,6 +52,17 @@ pub struct OAuth2Params {
     pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub audience: Option<String>,
+    /// The RFC 8707 `resource` every authorization, token, refresh and
+    /// client-credentials request carries, when there is one.
+    pub resource: Option<String>,
+    /// What the server's metadata says of PKCE: `Some(true)` when its
+    /// `code_challenge_methods_supported` lists `S256`, `Some(false)` when
+    /// the metadata lacks the field or the method, `None` when no metadata
+    /// was read (the endpoints are pinned).
+    pub pkce_s256: Option<bool>,
+    /// How the endpoints are dialled: by name when the operator configured
+    /// the issuer, through the SSRF guard when a server named it.
+    pub dial: Dial,
 }
 
 /// How a client authenticates at the token and revocation endpoints.
@@ -140,6 +151,13 @@ impl OAuth2Params {
         out
     }
 
+    /// The RFC 8707 `resource`, when the block sends one.
+    fn add_resource(&self, form: &mut Form) {
+        if let Some(r) = &self.resource {
+            form.field("resource", r);
+        }
+    }
+
     fn scope_str(&self) -> Option<String> {
         if self.scopes.is_empty() {
             None
@@ -218,9 +236,44 @@ pub struct Discovered {
     /// (draft-ietf-oauth-client-id-metadata-document-02 §6).
     #[serde(default)]
     pub client_id_metadata_document_supported: bool,
+    /// The PKCE methods the server takes (RFC 8414 §2); MCP refuses an
+    /// authorization server whose metadata does not list one.
+    #[serde(default)]
+    pub code_challenge_methods_supported: Option<Vec<String>>,
 }
 
 impl Discovered {
+    /// Refuse metadata of an issuer a server named (RFC 9728) whose token,
+    /// device-authorization or revocation endpoint is off the issuer's own
+    /// origin: agentd sends its client's credential there, and only the
+    /// operator may point it elsewhere — by pinning the issuer.
+    pub fn endpoints_on_origin(&self, issuer: &str) -> Result<(), String> {
+        for (what, url) in [
+            ("token_endpoint", &self.token_endpoint),
+            (
+                "device_authorization_endpoint",
+                &self.device_authorization_endpoint,
+            ),
+            ("revocation_endpoint", &self.revocation_endpoint),
+        ] {
+            if let Some(u) = url
+                && !crate::auth::challenge::same_origin(issuer, u)
+            {
+                return Err(format!(
+                    "oauth: the metadata of {issuer}, an authorization server a server named, puts its {what} at {u}, off its own origin — pin `issuer` to use it"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the metadata lists `S256` among its PKCE methods.
+    pub fn pkce_s256(&self) -> bool {
+        self.code_challenge_methods_supported
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|x| x == "S256"))
+    }
+
     /// Whether this server may be given agentd's Client ID Metadata Document
     /// as its `client_id`: only when its metadata advertises that it fetches
     /// one (draft §6, MCP 2026-07-28 client registration). Otherwise the
@@ -266,6 +319,9 @@ pub struct Tokens {
     pub token_type: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+    /// The OpenID Connect ID token, when the grant issued one.
+    #[serde(default)]
+    pub id_token: Option<String>,
 }
 
 /// The result of one device-token poll (RFC 8628 §3.5).
@@ -351,9 +407,15 @@ pub fn discovery_urls(issuer: &str) -> Vec<String> {
 /// attack points a client at another server's endpoints. A caller may pin
 /// the endpoints in config to skip this.
 pub fn discover(issuer: &str, timeout: Duration) -> Result<Discovered, String> {
+    discover_by(issuer, timeout, Dial::Named)
+}
+
+/// [`discover`], dialling as `dial` says: [`Dial::Vetted`] for an issuer a
+/// server named rather than the operator.
+pub fn discover_by(issuer: &str, timeout: Duration, dial: Dial) -> Result<Discovered, String> {
     let mut last = String::new();
     for url in discovery_urls(issuer) {
-        let found = match get_json::<Discovered>(&url, timeout) {
+        let found = match get_json::<Discovered>(&url, timeout, dial) {
             Ok(d) => d,
             Err(e) => {
                 last = e;
@@ -386,10 +448,11 @@ pub fn start_device(params: &OAuth2Params, timeout: Duration) -> Result<DeviceAu
     if let Some(aud) = &params.audience {
         form.field("audience", aud);
     }
+    params.add_resource(&mut form);
     // A confidential client authenticates here as it does at the token
     // endpoint (RFC 8628 §3.1).
     let headers = params.authenticate(&mut form)?;
-    let reply = post_form(url, form, &headers, timeout)?;
+    let reply = post_form(url, form, &headers, timeout, params.dial)?;
     if reply.is_success() {
         serde_json::from_slice(&reply.body)
             .map_err(|e| format!("oauth: bad device-auth response: {e}"))
@@ -413,8 +476,9 @@ pub fn poll_device_once(
     form.field("grant_type", "urn:ietf:params:oauth:grant-type:device_code");
     form.field("device_code", device_code);
     form.field("client_id", &params.client_id);
+    params.add_resource(&mut form);
     let headers = params.authenticate(&mut form)?;
-    let reply = post_form(&params.token_url, form, &headers, timeout)?;
+    let reply = post_form(&params.token_url, form, &headers, timeout, params.dial)?;
     if reply.is_success() {
         let t: Tokens = serde_json::from_slice(&reply.body)
             .map_err(|e| format!("oauth: bad token response: {e}"))?;
@@ -448,8 +512,9 @@ pub fn exchange_code(
     form.field("redirect_uri", redirect_uri);
     form.field("client_id", &params.client_id);
     form.field("code_verifier", verifier);
+    params.add_resource(&mut form);
     let headers = params.authenticate(&mut form)?;
-    let reply = post_form(&params.token_url, form, &headers, timeout)?;
+    let reply = post_form(&params.token_url, form, &headers, timeout, params.dial)?;
     if reply.is_success() {
         serde_json::from_slice(&reply.body).map_err(|e| format!("oauth: bad token response: {e}"))
     } else {
@@ -468,15 +533,33 @@ pub fn refresh(
     refresh_token: &str,
     timeout: Duration,
 ) -> Result<Tokens, TokenError> {
+    refresh_scoped(params, refresh_token, None, timeout)
+}
+
+/// [`refresh`] asking for `scopes` in place of the block's: the union a
+/// step-up asks for (MCP's step-up authorization flow), or — an empty list
+/// — no `scope` at all, so the scopes first granted apply.
+pub fn refresh_scoped(
+    params: &OAuth2Params,
+    refresh_token: &str,
+    scopes: Option<&[String]>,
+    timeout: Duration,
+) -> Result<Tokens, TokenError> {
     let mut form = Form::new();
     form.field("grant_type", "refresh_token");
     form.field("refresh_token", refresh_token);
     form.field("client_id", &params.client_id);
-    if let Some(scope) = params.scope_str() {
+    let scope = match scopes {
+        Some([]) => None,
+        Some(s) => Some(s.join(" ")),
+        None => params.scope_str(),
+    };
+    if let Some(scope) = scope {
         form.field("scope", &scope);
     }
+    params.add_resource(&mut form);
     let headers = params.authenticate(&mut form)?;
-    let reply = post_form(&params.token_url, form, &headers, timeout)?;
+    let reply = post_form(&params.token_url, form, &headers, timeout, params.dial)?;
     if reply.is_success() {
         serde_json::from_slice(&reply.body)
             .map_err(|e| format!("oauth: bad refresh response: {e}").into())
@@ -501,8 +584,9 @@ pub fn client_credentials(params: &OAuth2Params, timeout: Duration) -> Result<To
     if let Some(aud) = &params.audience {
         form.field("audience", aud);
     }
+    params.add_resource(&mut form);
     let headers = params.authenticate(&mut form)?;
-    let reply = post_form(&params.token_url, form, &headers, timeout)?;
+    let reply = post_form(&params.token_url, form, &headers, timeout, params.dial)?;
     if reply.is_success() {
         serde_json::from_slice(&reply.body)
             .map_err(|e| format!("oauth: bad token response: {e}").into())
@@ -532,7 +616,7 @@ pub fn revoke(
     form.field("token_type_hint", hint);
     form.field("client_id", &params.client_id);
     let headers = params.authenticate(&mut form)?;
-    let reply = post_form(url, form, &headers, timeout)?;
+    let reply = post_form(url, form, &headers, timeout, params.dial)?;
     if reply.status == 200 {
         Ok(())
     } else {
@@ -608,24 +692,29 @@ fn form_encode(s: &str) -> String {
     out
 }
 
-/// POST a form to an operator-configured endpoint (or one its issuer's
-/// metadata names), with `headers`.
+/// POST a form to a token, device or revocation endpoint, with `headers`,
+/// dialled as `dial` says.
 fn post_form(
     url: &str,
     form: Form,
     headers: &[(String, String)],
     timeout: Duration,
+    dial: Dial,
 ) -> Result<Reply, String> {
     let headers: Vec<(&str, &str)> = headers
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    http::post_form(url, &form.finish(), &headers, timeout, Dial::Named)
+    http::post_form(url, &form.finish(), &headers, timeout, dial)
 }
 
 /// GET + parse JSON (discovery).
-fn get_json<T: serde::de::DeserializeOwned>(url: &str, timeout: Duration) -> Result<T, String> {
-    let reply = http::get(url, &[("Accept", "application/json")], timeout, Dial::Named)?;
+fn get_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    timeout: Duration,
+    dial: Dial,
+) -> Result<T, String> {
+    let reply = http::get(url, &[("Accept", "application/json")], timeout, dial)?;
     if !reply.is_success() {
         return Err(format!("HTTP {}", reply.status));
     }
@@ -873,6 +962,117 @@ mod tests {
             jtis.push(claims["jti"].clone());
         }
         assert_ne!(jtis[0], jtis[1], "a fresh assertion per request");
+    }
+
+    /// The metadata of an authorization server a server named keeps the
+    /// endpoints agentd sends its credential to on its own origin.
+    #[test]
+    fn a_server_named_issuer_keeps_its_endpoints_on_its_origin() {
+        let issuer = "https://as.example/tenant";
+        let d = |token: &str| Discovered {
+            token_endpoint: Some(token.into()),
+            revocation_endpoint: Some("https://as.example/revoke".into()),
+            ..Default::default()
+        };
+        assert!(
+            d("https://as.example/token")
+                .endpoints_on_origin(issuer)
+                .is_ok()
+        );
+        let e = d("https://oauth2.example.net/token")
+            .endpoints_on_origin(issuer)
+            .unwrap_err();
+        assert!(
+            e.contains("off its own origin") && e.contains("token_endpoint"),
+            "{e}"
+        );
+        let mut x = d("https://as.example/token");
+        x.device_authorization_endpoint = Some("http://as.example/device".into());
+        assert!(x.endpoints_on_origin(issuer).is_err(), "another scheme");
+        // PKCE: only an S256 entry counts.
+        assert!(!Discovered::default().pkce_s256());
+        let p = Discovered {
+            code_challenge_methods_supported: Some(vec!["plain".into(), "S256".into()]),
+            ..Default::default()
+        };
+        assert!(p.pkce_s256());
+        let p = Discovered {
+            code_challenge_methods_supported: Some(vec!["plain".into()]),
+            ..Default::default()
+        };
+        assert!(!p.pkce_s256());
+    }
+
+    /// RFC 8707: the `resource` rides every token request a block with one
+    /// makes — the device start and poll, the code exchange, the refresh and
+    /// client credentials — and none when the block has none.
+    #[test]
+    fn every_grant_carries_the_resource() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).ok();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0u8; len];
+                r.read_exact(&mut body).unwrap();
+                tx.send(String::from_utf8(body).unwrap()).unwrap();
+                let ok = if line.contains("/device") {
+                    r#"{"device_code":"d","user_code":"U","verification_uri":"https://as/v"}"#
+                } else {
+                    r#"{"access_token":"at","expires_in":60}"#
+                };
+                let mut w = c;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok}",
+                    ok.len()
+                );
+            }
+        });
+        let t = Duration::from_secs(5);
+        let mut p = OAuth2Params {
+            token_url: format!("{base}/token"),
+            device_authorization_url: Some(format!("{base}/device")),
+            client_id: "c".into(),
+            resource: Some("https://mcp.example/mcp".into()),
+            ..Default::default()
+        };
+        let want = "resource=https%3A%2F%2Fmcp.example%2Fmcp";
+        start_device(&p, t).unwrap();
+        assert!(rx.recv().unwrap().contains(want), "device authorization");
+        poll_device_once(&p, "d", t).unwrap();
+        assert!(rx.recv().unwrap().contains(want), "device token");
+        exchange_code(&p, "code", "verifier", "http://127.0.0.1/cb", t).unwrap();
+        assert!(rx.recv().unwrap().contains(want), "code exchange");
+        refresh(&p, "rt", t).unwrap();
+        assert!(rx.recv().unwrap().contains(want), "refresh");
+        client_credentials(&p, t).unwrap();
+        assert!(rx.recv().unwrap().contains(want), "client credentials");
+        p.resource = None;
+        refresh(&p, "rt", t).unwrap();
+        assert!(!rx.recv().unwrap().contains("resource="), "omitted");
+        // A step-up names its union; an empty list sends no scope at all.
+        p.scopes = vec!["a".into()];
+        refresh_scoped(&p, "rt", Some(&["a".into(), "b".into()]), t).unwrap();
+        assert!(rx.recv().unwrap().contains("scope=a%20b"));
+        refresh_scoped(&p, "rt", Some(&[]), t).unwrap();
+        assert!(!rx.recv().unwrap().contains("scope="));
     }
 
     #[test]

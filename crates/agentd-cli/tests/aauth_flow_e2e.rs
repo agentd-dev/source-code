@@ -80,10 +80,13 @@ fn spawn_apd() -> String {
 }
 
 /// The mock Person Server: POST /token with a resource token → an auth token
-/// (auto-approves, standing in for the human's consent).
-fn spawn_ps() -> String {
+/// (auto-approves, standing in for the human's consent), a new one each time:
+/// `eyJuser.auth-<n>`. Returns its URL and how many exchanges it served.
+fn spawn_ps() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&served);
     std::thread::spawn(move || {
         for c in l.incoming().flatten() {
             let mut s = c;
@@ -92,10 +95,16 @@ fn spawn_ps() -> String {
             // The exchange must carry the resource token we issued + a justification.
             assert_eq!(got["resource_token"], "RT-xyz", "PS got the resource token");
             assert!(got["justification"].is_string(), "PS got a justification");
-            write_http(&mut s, "200 OK", &[], r#"{"auth_token":"eyJuser.auth"}"#);
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            write_http(
+                &mut s,
+                "200 OK",
+                &[],
+                &format!(r#"{{"auth_token":"eyJuser.auth-{n}"}}"#),
+            );
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), served)
 }
 
 /// The mock AAuth MCP server (Case C): `initialize` succeeds; `tools/call`
@@ -119,6 +128,11 @@ fn spawn_aauth_mcp() -> String {
             let key = h.get("signature-key").cloned().unwrap_or_default();
             assert!(h.contains_key("signature"), "request is signed");
             let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            // Whom a request is for goes to the signer, never to the server.
+            assert!(
+                req["params"]["_meta"].get("agentd-mcp/scope").is_none(),
+                "the scope reached the server: {req}"
+            );
             let method = req["method"].as_str().unwrap_or("");
             let id = req["id"].clone();
             if method == "server/discover" {
@@ -141,10 +155,15 @@ fn spawn_aauth_mcp() -> String {
             } else if method == "notifications/initialized" {
                 write_http(&mut s, "202 Accepted", &[], "");
             } else if method == "tools/call" {
-                if key.contains("eyJuser.auth") {
-                    // Presenting the user-scoped auth token → the tool runs.
+                if let Some(n) = key
+                    .split("eyJuser.auth-")
+                    .nth(1)
+                    .and_then(|t| t.split('"').next())
+                {
+                    // Presenting the user-scoped auth token → the tool runs,
+                    // and says which exchange's token it was.
                     let r = serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
-                        "content":[{"type":"text","text":"secret data for the user"}],
+                        "content":[{"type":"text","text":format!("secret data for the user (token {n})")}],
                         "isError":false}});
                     write_http(&mut s, "200 OK", &[], &r.to_string());
                 } else {
@@ -171,7 +190,7 @@ fn spawn_aauth_mcp() -> String {
 #[test]
 fn case_c_person_server_exchange_over_the_transport() {
     let apd = spawn_apd();
-    let ps = spawn_ps();
+    let (ps, exchanges) = spawn_ps();
     let mcp_addr = spawn_aauth_mcp();
     let dir = tempfile::tempdir().unwrap();
 
@@ -205,12 +224,42 @@ fn case_c_person_server_exchange_over_the_transport() {
     // The tool call: the first signed attempt 401s (agent token only); the
     // transport reaction loop runs the PS exchange, gets the user auth token,
     // re-signs presenting it, and the retry succeeds — all inside call_tool.
-    let result = mcp
-        .call_tool("read_secret", Some(serde_json::json!({})))
-        .expect("tool call succeeds after the Case-C exchange");
-    let text = result.text();
+    // It is made for alice — its `_meta` scope, which the transport hands
+    // the signer and never sends — and the token it earns is hers.
+    let call = |principal: Option<&str>| {
+        let meta = match principal {
+            Some(p) => serde_json::json!({agentd::mcp::http::SCOPE_META: p}),
+            None => serde_json::json!({}),
+        };
+        mcp.call_tool_with_meta("read_secret", Some(serde_json::json!({})), meta)
+    };
+    let text = call(Some("user:alice"))
+        .expect("tool call succeeds after the Case-C exchange")
+        .text();
     assert!(
-        text.contains("secret data for the user"),
+        text.contains("secret data for the user (token 1)"),
         "the user-scoped call returned the protected result: {text:?}"
     );
+    let served = || exchanges.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(served(), 1);
+
+    // Two principals are isolated: bob's call presents none of alice's
+    // token, and earns one of his own; alice's next call presents hers
+    // again, and asks the Person Server for nothing.
+    let text = call(Some("user:bob")).expect("bob's own exchange").text();
+    assert!(
+        text.contains("(token 2)"),
+        "bob holds his own token: {text:?}"
+    );
+    assert_eq!(served(), 2);
+    let text = call(Some("user:alice")).expect("alice's held token").text();
+    assert!(
+        text.contains("(token 1)"),
+        "alice's token is hers: {text:?}"
+    );
+    assert_eq!(served(), 2, "no exchange for a principal that holds one");
+
+    // A call made for nobody presents no user's token, and earns none.
+    assert!(call(None).is_err(), "nobody's call is refused");
+    assert_eq!(served(), 2);
 }

@@ -116,6 +116,8 @@ fn subagent_command(exe: &Path, limits: &Limits) -> Command {
     // A subagent is handed its control pipes and stderr, nothing else, so
     // every descriptor from 3 up is marked.
     crate::signals::pass_only_stdio(&mut cmd);
+    // Nor the variables a supervisor-only secret is read from.
+    crate::sec::harden::strip(&mut cmd);
     cmd
 }
 
@@ -202,8 +204,15 @@ pub fn spawn(
     tap(node, "spawn", || {
         let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         for (k, v) in cmd.get_envs() {
-            if let (Some(k), Some(v)) = (k.to_str(), v.and_then(|v| v.to_str())) {
-                env.insert(k.to_string(), v.to_string());
+            let Some(k) = k.to_str() else { continue };
+            match v.and_then(|v| v.to_str()) {
+                Some(v) => {
+                    env.insert(k.to_string(), v.to_string());
+                }
+                // Removed from the child's environment.
+                None => {
+                    env.remove(k);
+                }
             }
         }
         serde_json::json!({"payload": serde_json::to_value(&spawn).unwrap_or_default(), "env": env})

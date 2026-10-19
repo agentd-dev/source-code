@@ -1345,6 +1345,9 @@ fn instance_command(
             cmd.env_remove(&k);
         }
     }
+    // An instance is a supervisor of its own, and is handed none of this
+    // one's supervisor-only secrets.
+    crate::sec::harden::strip(&mut cmd);
     cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
     cmd.env(
         crate::supervisor::reap::PARENT_PID_ENV,

@@ -635,6 +635,7 @@ Company that verifies while its token endpoint refuses has not recovered.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `proc.exit` | error, info | `code`, `uptime_ms`, `turns`, `tool_calls`, `runs`, `tokens_in`, `tokens_out`, `err?` | The process is exiting with `code`. At error level with `err` when startup fails, or when an exit policy (`unavailable: exit`, `lifetime_exhausted: exit`) ends the instance. |
+| `proc.harden` | warn | `refused` | The kernel refused to make the supervisor non-dumpable (`PR_SET_DUMPABLE`) or to set its core-dump limit to zero; the process runs on. |
 | `proc.ready` | info | `inbox_pending`, `instance`, `job_shape`, `runs`, `workflows` | Startup finished; triggers are armed. |
 | `proc.start` | info | `config_files`, `instance`, `version` | The process started. |
 

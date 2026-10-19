@@ -91,55 +91,71 @@ fn intelligence_connection<'a>(
 
 pub use super::canonical_target;
 
-/// Build the OAuth2 request params from an `auth:` block's runtime spec
-/// ([`Settings::auth_spec`]), discovering the token / device endpoints from
-/// the `issuer` when they are not pinned. `resource` (the endpoint being
-/// logged into) enables RFC 9728 issuer discovery when no `issuer` is
-/// configured: the server's `401 WWW-Authenticate` challenge names its
-/// authorization server. A spec whose client is agentd's Client ID Metadata
-/// Document always reads the issuer's metadata, and is refused where it does
-/// not advertise the document.
-pub fn params_from_auth(
-    auth: &AuthSpec,
-    resource: Option<&str>,
-    timeout: Duration,
-) -> Result<OAuth2Params, String> {
+/// Build the OAuth2 request params of an interactive login from an `auth:`
+/// block's runtime spec ([`Settings::auth_spec_at`]), discovering whichever
+/// of the token, device and authorization endpoints are not pinned from the
+/// `issuer` — or, on an MCP server's block that names none, from the
+/// authorization server the server's RFC 9728 metadata names. A spec whose
+/// client is agentd's Client ID Metadata Document always reads the issuer's
+/// metadata, and is refused where it does not advertise the document.
+pub fn params_from_auth(auth: &AuthSpec, timeout: Duration) -> Result<OAuth2Params, String> {
     if auth.kind != "oauth2" {
         return Err("login requires an `auth: { kind: oauth2 }` block".into());
     }
     if auth.grant.as_deref() == Some("client_credentials") {
         return Err("client_credentials is non-interactive — no login needed".into());
     }
+    resolve_params(auth, !pins_every_endpoint(auth), timeout)
+}
+
+/// The OAuth2 request params of `auth`, its authorization server's metadata
+/// read when `discover` (an endpoint the caller needs is not pinned) or the
+/// client is agentd's Client ID Metadata Document. The issuer is the block's,
+/// or the one the MCP server's RFC 9728 metadata names when the block names
+/// no `issuer` and no `token_url`: a server-chosen issuer is reached as
+/// [`challenge::reach`] allows, and its metadata must keep its endpoints on
+/// its own origin.
+///
+/// [`challenge::reach`]: crate::auth::challenge::reach
+pub(crate) fn resolve_params(
+    auth: &AuthSpec,
+    discover: bool,
+    timeout: Duration,
+) -> Result<OAuth2Params, String> {
     let client_id = auth
         .client_id
         .clone()
         .ok_or("auth.client_id is required for oauth2")?;
-
     let mut token_url = auth.token_url.clone();
     let mut device_url = auth.device_authorization_url.clone();
     let mut auth_url = auth.authorization_url.clone();
     let mut issuer = auth.issuer.clone();
-    let (mut revocation_url, mut iss_supported) = (None, false);
-    // RFC 9728: with no issuer AND no pinned endpoints, ask the resource — its
+    let (mut revocation_url, mut iss_supported, mut pkce_s256) = (None, false, None);
+    let mut dial = crate::auth::http::Dial::Named;
+    let mut named = false;
+    // RFC 9728: with no issuer and no token endpoint, ask the MCP server — its
     // 401 challenge (or well-known metadata) names the authorization server.
     if issuer.is_none()
         && token_url.is_none()
-        && device_url.is_none()
-        && let Some(res) = resource
-        && let Some(found) = crate::auth::challenge::discover_issuer(res, timeout)
+        && let Some(res) = &auth.protected_resource
+        && let Some((found, how)) =
+            crate::auth::challenge::discover_issuer(res, auth.catalog.as_deref(), timeout)?
     {
         issuer = Some(found);
+        dial = how;
+        named = true;
     }
-    // Discover the endpoints from the issuer if any are missing — and
-    // whatever is pinned when only its metadata says whether it takes the
-    // document.
-    if !pins_every_endpoint(auth) || auth.client_id_metadata_document {
+    if discover || named || auth.client_id_metadata_document {
         match &issuer {
             Some(issuer) => {
-                let d = oauth2::discover(issuer, timeout)?;
+                let d = oauth2::discover_by(issuer, timeout, dial)?;
+                if named {
+                    d.endpoints_on_origin(issuer)?;
+                }
                 if auth.client_id_metadata_document {
                     d.admits_document(issuer, &client_id)?;
                 }
+                pkce_s256 = Some(d.pkce_s256());
                 token_url = token_url.or(d.token_endpoint);
                 device_url = device_url.or(d.device_authorization_endpoint);
                 auth_url = auth_url.or(d.authorization_endpoint);
@@ -154,10 +170,10 @@ pub fn params_from_auth(
             None => {}
         }
     }
-
     Ok(OAuth2Params {
-        token_url: token_url
-            .ok_or("auth.token_url is required (or set auth.issuer for discovery)")?,
+        token_url: token_url.ok_or(
+            "auth.token_url is required (or set auth.issuer, or let the MCP server's RFC 9728 metadata name its authorization server)",
+        )?,
         device_authorization_url: device_url,
         authorization_url: auth_url,
         revocation_url,
@@ -170,6 +186,9 @@ pub fn params_from_auth(
         client_auth: oauth2::ClientAuth::of(auth.client_auth.as_ref())?,
         scopes: auth.scopes.clone(),
         audience: auth.audience.clone(),
+        resource: auth.resource.clone(),
+        pkce_s256,
+        dial,
     })
 }
 
@@ -247,6 +266,8 @@ pub fn tokens_to_cred(t: &oauth2::Tokens) -> CachedCred {
         expires_at_ms,
         token_type: t.token_type.clone(),
         authorization_server: None,
+        scope: t.scope.clone(),
+        step_up: Vec::new(),
         extra: Default::default(),
     }
 }
@@ -293,9 +314,18 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
             dir.display()
         ));
     }
-    let resource = resource_of(settings, target)?;
-    let spec = settings.auth_spec(auth);
-    let mut params = params_from_auth(&spec, resource.as_deref(), timeout)?;
+    let spec = spec_of(settings, target, auth)?;
+    let mut params = params_from_auth(&spec, timeout)?;
+    let dir = cache::default_dir();
+    // The scopes a server asked for since the last login, which its renewal
+    // could not get (MCP's step-up flow): this login asks for them too.
+    if let Some(held) = cache::load_file(&dir, target) {
+        for s in held.step_up {
+            if !params.scopes.contains(&s) {
+                params.scopes.push(s);
+            }
+        }
+    }
     // The document's client returns to the redirect URI it registers.
     if spec.client_id_metadata_document {
         params.redirect_uri = settings
@@ -326,7 +356,6 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
         authorization_server: Some(params.authorization_server().to_string()),
         ..cred
     };
-    let dir = cache::default_dir();
     let _held = cache::lock_file(&dir, target, timeout)?;
     cache::store_file(&dir, target, &cred)?;
     Ok(format!(
@@ -335,26 +364,26 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
     ))
 }
 
-/// The resource a target logs into, for RFC 9728 issuer discovery when no
-/// issuer is configured: the MCP server's endpoint, the catalog entry's, or
-/// the primary intelligence endpoint.
-pub fn resource_of(settings: &Settings, target: &str) -> Result<Option<String>, String> {
-    Ok(
-        if let Some(c) = intelligence_connection(settings, target)? {
-            c.endpoints.first().cloned()
-        } else if let Some(name) = target.strip_prefix("mcp:") {
-            settings
-                .mcp
-                .servers
-                .iter()
-                .find(|s| s.name == name)
-                .map(|s| s.endpoint.clone())
-        } else if let Some(name) = target.strip_prefix("service:") {
-            settings.services.get(name).map(|e| e.endpoint.clone())
-        } else {
-            None
-        },
-    )
+/// The runtime spec of `target`'s `auth:` block, as the daemon builds it
+/// for the endpoint the target names ([`Settings::auth_spec_at`]): an MCP
+/// server's, an MCP catalog entry's, a peer or intelligence entry's, or the
+/// primary intelligence endpoint.
+pub fn spec_of(settings: &Settings, target: &str, auth: &Auth) -> Result<AuthSpec, String> {
+    let (endpoint, mcp) = if let Some(c) = intelligence_connection(settings, target)? {
+        (c.endpoints.first().cloned().unwrap_or_default(), false)
+    } else if let Some(name) = target.strip_prefix("mcp:") {
+        let s = settings.mcp.servers.iter().find(|s| s.name == name);
+        (s.map(|s| s.endpoint.clone()).unwrap_or_default(), true)
+    } else if let Some(name) = target.strip_prefix("service:") {
+        let e = settings.services.get(name);
+        (
+            e.map(|e| e.endpoint.clone()).unwrap_or_default(),
+            e.is_some_and(|e| e.kind == crate::config::settings::ServiceKind::Mcp),
+        )
+    } else {
+        (String::new(), false)
+    };
+    Ok(settings.auth_spec_at(auth, &endpoint, mcp))
 }
 
 /// Print the browser-flow prompt to stderr (the authorization URL to open).
@@ -399,6 +428,7 @@ mod tests {
             grant: Some(OAuthGrant::Device),
             scopes: vec!["mcp:read".into()],
             audience: None,
+            resource: None,
             token: None,
             header: None,
             value: None,
@@ -501,7 +531,7 @@ mod tests {
 
     #[test]
     fn params_from_auth_maps_the_block() {
-        let p = params_from_auth(&oauth_block().to_spec(), None, Duration::from_secs(5)).unwrap();
+        let p = params_from_auth(&oauth_block().to_spec(), Duration::from_secs(5)).unwrap();
         assert_eq!(p.token_url, "https://as.example/token");
         assert_eq!(
             p.device_authorization_url.as_deref(),
@@ -515,10 +545,10 @@ mod tests {
     fn params_from_auth_rejects_non_oauth_and_client_creds() {
         let mut a = oauth_block();
         a.kind = AuthKind::Static;
-        assert!(params_from_auth(&a.to_spec(), None, Duration::from_secs(1)).is_err());
+        assert!(params_from_auth(&a.to_spec(), Duration::from_secs(1)).is_err());
         let mut a = oauth_block();
         a.grant = Some(OAuthGrant::ClientCredentials);
-        assert!(params_from_auth(&a.to_spec(), None, Duration::from_secs(1)).is_err());
+        assert!(params_from_auth(&a.to_spec(), Duration::from_secs(1)).is_err());
     }
 
     /// A refresh that rotates replaces the refresh token; one that does not
@@ -531,6 +561,7 @@ mod tests {
             expires_in: Some(60),
             token_type: None,
             scope: None,
+            id_token: None,
         };
         assert_eq!(
             refreshed_cred(&t, "rt-1").refresh_token.as_deref(),
@@ -552,6 +583,7 @@ mod tests {
             expires_in: Some(3600),
             token_type: Some("Bearer".into()),
             scope: None,
+            id_token: None,
         };
         let before = cache::now_ms();
         let c = tokens_to_cred(&t);

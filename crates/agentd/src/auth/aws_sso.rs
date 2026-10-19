@@ -173,8 +173,8 @@ pub fn sso_login(
             cache::now_ms() + 3_600_000
         },
         token_type: Some("aws-sso".into()),
-        authorization_server: None,
         extra,
+        ..Default::default()
     })
 }
 

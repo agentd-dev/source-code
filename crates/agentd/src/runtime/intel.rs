@@ -147,7 +147,8 @@ fn bearer_provider(settings: &Settings, c: &Connection<'_>) -> Result<Option<Bea
         let Some(auth) = c.auth else {
             return Ok(None);
         };
-        let spec = settings.auth_spec(auth);
+        let endpoint = c.endpoints.first().map(String::as_str).unwrap_or_default();
+        let spec = settings.auth_spec_at(auth, endpoint, false);
         // SigV4 (`kind: aws`) signs each request over its own method, path
         // and body, so there is no reusable bearer to hand back: the dial
         // carries the spec and signs itself.

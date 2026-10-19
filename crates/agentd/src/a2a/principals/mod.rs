@@ -15,6 +15,7 @@ use serde_json::Value;
 
 mod addressee;
 mod resolve;
+pub mod typed;
 
 pub use addressee::Addressee;
 pub use resolve::{
@@ -42,6 +43,10 @@ pub struct Principal {
     /// ownership survives a re-login. The sid is what one of them is revoked
     /// by, and what the audit trail tells them apart with.
     pub session: Option<String>,
+    /// Who the caller is as the transport established it ([`typed`]): the
+    /// tuple every key derived for a principal is over. `None` for a
+    /// principal the runtime made up rather than authenticated.
+    pub typed: Option<typed::PrincipalRef>,
 }
 
 impl Principal {
@@ -54,6 +59,7 @@ impl Principal {
             budget: None,
             labels: Default::default(),
             session: None,
+            typed: None,
         }
     }
 

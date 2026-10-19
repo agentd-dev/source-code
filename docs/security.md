@@ -501,7 +501,26 @@ equals a declared id can never inherit that principal's work.
 
 A rule that matches a certificate's subject or SAN needs `a2a.tls.client_ca`:
 without it no certificate is verified, and the load refuses the rule. An
-`any` rule needs no CA.
+`any` rule needs no CA. A rule matches only a caller every field of its
+`match` admits: a `bearer_ref` beside a `san` admits the bearer only with a
+certificate the `san` matches.
+
+**Who a caller is, as the transport said.** Beside its display id, every
+principal the listener names carries the tuple its transport established —
+how it was authenticated (`x509`, `bearer`, `device`, `operator`), by whom,
+and the stable id that transport proves: a certificate's
+SubjectPublicKeyInfo hash, a rule's id, a device session's name. Two callers
+that share a display string — every device approved under one name is
+`user:<name>`, and a certificate's CN can read like anybody — are two
+tuples, and every key a principal's credential is ever held under is derived
+from the tuple, never from the string.
+
+**Whose a run is comes from the transport.** A run started by an A2A message
+is its authenticated sender's; one started by a principal's signal is that
+principal's; every other run — a schedule, a webhook, a stream, a loop — is
+the autonomous actor's (`identity.autonomous_as`). A `principal` key in a
+trigger's payload is what its sender wrote, and is never the run's
+authority.
 
 ### The implicit operator
 
@@ -812,6 +831,25 @@ Validation refuses an inline credential in three shapes:
 Outbound credential providers (OAuth, AWS SigV4, SPIFFE) are in
 [Outbound credentials](authentication.md).
 
+**What the supervisor holds stays in it.** The supervisor is
+non-dumpable (`PR_SET_DUMPABLE` 0): no process of its uid can attach to it or
+read its memory or environment through `/proc/<pid>/`. Its core-dump limit
+is zero, and every child inherits that, so no core file holds a secret. A
+`proc.harden` warning names either that the kernel refused. Every child —
+turn worker, subagent, think child, instance — is started without the
+environment variables a supervisor-only secret is read from: the
+`{{secret:NAME}}` of `security.companies.seal_key`. Nothing else is taken
+from a child's environment.
+
+**A per-person credential is presented for its person alone.** AAuth's
+user-scoped (Case C) tokens are held for the authority and the principal
+the request was made for. The principal travels with each MCP request as
+its scope, set from the work's authority and never from anything a caller
+wrote; the transport hands it to the signer and never sends it. One
+principal's token is never presented on another's request, a request made
+for nobody presents none and earns none, and a child is handed only the
+tokens of whom it works for.
+
 ## Transport and process isolation
 
 MCP and model endpoints are HTTPS-only; plaintext `http://` is allowed for
@@ -880,9 +918,13 @@ something other than the operator's own endpoint list:
 - the AAuth Person Server exchange, where the URL the Person Server *returns*
   is vetted.
 
-Model, MCP, configured A2A peer and OAuth traffic is not classified, because
-those endpoints come from operator configuration. A model that can influence
-any of those URLs is outside the guard.
+- an authorization server an MCP server's RFC 9728 metadata names off the
+  server's own origin, and the endpoints that server's metadata names: HTTPS
+  only, and under `security.egress: closed` only inside the catalog.
+
+Model, MCP, configured A2A peer and operator-configured OAuth traffic is not
+classified, because those endpoints come from operator configuration. A model
+that can influence any of those URLs is outside the guard.
 
 **The guard and the dial are one step.** A check that resolves a name, likes
 the answer and then dials the name is decorative: the connect resolves again,

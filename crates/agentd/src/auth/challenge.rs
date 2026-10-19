@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! RFC 9728 **OAuth 2.0 Protected Resource Metadata** discovery. When an MCP
-//! `auth: { kind: oauth2 }` block names no `issuer`, agentd probes the server
-//! before login: an unauthenticated request draws a
+//! server's `auth: { kind: oauth2 }` block names no `issuer` and no
+//! `token_url`, agentd asks the server — at `--login`, and at the first
+//! request the daemon needs a token for: an unauthenticated request draws a
 //! `401 WWW-Authenticate: Bearer resource_metadata="…"`, and that metadata
-//! document lists the `authorization_servers` — the issuer to run RFC 8414 /
-//! OIDC discovery against. Best-effort throughout: any failure returns
-//! `None`, so an explicit `issuer` still wins and the caller reports its usual
-//! "issuer required" error rather than a confusing discovery failure.
+//! document lists the `authorization_servers`, the issuer to run RFC 8414 /
+//! OIDC discovery against.
+//!
+//! The document is used only when its `resource` is the server's URL byte
+//! for byte (RFC 9728 §3.3, §7.3): metadata describing another resource is
+//! refused, not used. The authorization server it names is a URL the SERVER
+//! chose, so it is held to [`reach`]: on the server's own origin it is as
+//! trusted as the server the operator configured; anywhere else it must be
+//! HTTPS, is dialled through the SSRF guard, and under `security.egress:
+//! closed` must be in the catalog. The endpoints that server's metadata
+//! names must be on its own origin ([`same_origin`]).
 
 use std::time::Duration;
 
@@ -15,41 +23,114 @@ use serde::Deserialize;
 use crate::auth::http::{self, Dial};
 use crate::net::http::Url;
 
-/// The RFC 9728 protected-resource metadata document (only the field we consume).
-#[derive(Debug, Deserialize)]
-struct ResourceMetadata {
+/// The RFC 9728 protected-resource metadata document (the fields consumed).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResourceMetadata {
+    /// The resource the document describes.
     #[serde(default)]
-    authorization_servers: Vec<String>,
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub authorization_servers: Vec<String>,
 }
 
-/// Discover the authorization-server **issuer** for an MCP `resource` endpoint
-/// via RFC 9728. Returns the first advertised `authorization_servers` entry, or
-/// `None` when the server offers no challenge / metadata (the caller then
-/// requires an explicit `issuer`). `resource` is the MCP server's endpoint URL.
-pub fn discover_issuer(resource: &str, timeout: Duration) -> Option<String> {
+/// The authorization server `resource`'s RFC 9728 metadata names, and how
+/// it may be dialled. `Ok(None)` when the server offers no metadata at all
+/// (the caller then needs an explicit `issuer`); `Err` when the metadata it
+/// offers is refused — it describes another resource, or names an
+/// authorization server agentd may not reach.
+pub fn discover_issuer(
+    resource: &str,
+    catalog: Option<&[String]>,
+    timeout: Duration,
+) -> Result<Option<(String, Dial)>, String> {
     // Prefer the metadata URL the server names in its 401 challenge; else the
     // well-known locations derived from the resource (RFC 9728 §3.1): the
     // suffix inserted before the resource's path, then at the origin's root.
     // A `resource_metadata` URL the SERVER named is only honoured when it lives
     // on the resource's own origin. RFC 9728 metadata describes that resource,
     // so same-origin is where it belongs — and the alternative is a blind GET at
-    // an address a hostile MCP server picks, whose `authorization_servers` answer
-    // then chooses the issuer for the OIDC discovery and token requests that
-    // follow. Cross-origin, we ignore the challenge and use the well-known
-    // location instead of refusing outright, so a misconfigured server degrades
-    // rather than breaks. Same-origin (rather than the SSRF classifier) keeps a
-    // loopback development server working, since its resource is loopback too.
+    // an address a hostile MCP server picks. Cross-origin, we ignore the
+    // challenge and use the well-known location instead of refusing outright,
+    // so a misconfigured server degrades rather than breaks.
     let named = challenge_metadata_url(resource, timeout).filter(|u| same_origin(resource, u));
     let candidates = match named {
         Some(u) => vec![u],
         None => well_known_urls(resource),
     };
-    let meta = candidates
-        .iter()
-        .find_map(|u| get_json::<ResourceMetadata>(u, timeout))?;
-    meta.authorization_servers
-        .into_iter()
-        .find(|s| !s.trim().is_empty())
+    let mut refused = None;
+    for url in &candidates {
+        let Some(meta) = get_json::<ResourceMetadata>(url, timeout) else {
+            continue;
+        };
+        // RFC 9728 §3.3: a document whose `resource` is not the URL it was
+        // derived from MUST NOT be used.
+        if meta.resource.as_deref() != Some(resource) {
+            refused = Some(format!(
+                "oauth: {url} describes the resource {:?}, not {resource:?} (RFC 9728 §3.3); its authorization servers are not used",
+                meta.resource.as_deref().unwrap_or("")
+            ));
+            continue;
+        }
+        let Some(issuer) = meta
+            .authorization_servers
+            .into_iter()
+            .find(|s| !s.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let dial = reach(&issuer, resource, catalog)?;
+        return Ok(Some((issuer, dial)));
+    }
+    match refused {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// How a URL a server chose — the authorization server RFC 9728 metadata
+/// names, or an endpoint that server's metadata names — may be dialled for
+/// a client of `resource`, the server the operator configured. On
+/// `resource`'s own origin it is dialled as the server is; anywhere else
+/// only over HTTPS, through the SSRF guard (no loopback, private or
+/// link-local address), and — when `catalog` is given, under
+/// `security.egress: closed` — only when a catalog entry covers it.
+pub fn reach(url: &str, resource: &str, catalog: Option<&[String]>) -> Result<Dial, String> {
+    if same_origin(resource, url) {
+        return Ok(Dial::Named);
+    }
+    let parsed = Url::parse(url).map_err(|e| format!("oauth: {url:?}: {e}"))?;
+    if !parsed.is_tls() {
+        return Err(format!(
+            "oauth: the authorization server {url} that {resource} named is not an https URL; a server-chosen URL off the server's own origin must be"
+        ));
+    }
+    if let Some(entries) = catalog
+        && !entries.iter().any(|e| covers(e, url))
+    {
+        return Err(format!(
+            "oauth: security.egress is closed and the authorization server {url} that {resource} named matches no services: catalog entry — catalog it to allow it"
+        ));
+    }
+    Ok(Dial::Vetted {
+        allow_private: false,
+    })
+}
+
+/// Whether the catalog entry `entry` covers `url`: the same scheme and
+/// authority, and a path that extends the entry's on a segment boundary.
+fn covers(entry: &str, url: &str) -> bool {
+    let (Some((eo, ep)), Some((uo, up))) = (http::split_origin(entry), http::split_origin(url))
+    else {
+        return false;
+    };
+    let ep = ep.split(['?', '#']).next().unwrap_or_default();
+    let up = up.split(['?', '#']).next().unwrap_or_default();
+    eo.eq_ignore_ascii_case(uo)
+        && (ep.is_empty()
+            || ep == "/"
+            || up == ep
+            || (up.starts_with(ep)
+                && (ep.ends_with('/') || up.as_bytes().get(ep.len()) == Some(&b'/'))))
 }
 
 /// Probe the resource with an unauthenticated MCP request; on a `401`, return
@@ -160,9 +241,8 @@ fn well_known_urls(resource: &str) -> Vec<String> {
     out
 }
 
-/// Whether `candidate` has the same scheme, host and port as `base`. Used to
-/// bound a server-named metadata URL to the resource it describes.
-fn same_origin(base: &str, candidate: &str) -> bool {
+/// Whether `candidate` has the same scheme, host and port as `base`.
+pub fn same_origin(base: &str, candidate: &str) -> bool {
     let (Ok(b), Ok(c)) = (Url::parse(base), Url::parse(candidate)) else {
         return false;
     };
@@ -171,7 +251,8 @@ fn same_origin(base: &str, candidate: &str) -> bool {
         && b.port == c.port
 }
 
-/// GET + parse JSON, tolerant of a non-2xx / bad body (→ `None`).
+/// GET + parse JSON, tolerant of a non-2xx / bad body (→ `None`). Each URL
+/// is on the configured server's origin.
 fn get_json<T: serde::de::DeserializeOwned>(url: &str, timeout: Duration) -> Option<T> {
     let resp = http::get(url, &[("Accept", "application/json")], timeout, Dial::Named).ok()?;
     if !resp.is_success() {
@@ -259,5 +340,120 @@ mod tests {
                 "{bare}"
             );
         }
+    }
+
+    /// A loopback MCP server: `401` on every POST, and at the path-inserted
+    /// RFC 9728 URL the document `doc` (`{base}` is its own URL).
+    fn spawn_prm(doc: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let me = base.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).ok();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = std::io::Read::read_exact(&mut r, &mut body);
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = if path == "/.well-known/oauth-protected-resource/mcp" {
+                    ("200 OK", doc.replace("{base}", &me))
+                } else if line.starts_with("POST") {
+                    ("401 Unauthorized", String::new())
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let mut w = c;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    /// RFC 9728 §3.3: metadata whose `resource` is not the server's URL byte
+    /// for byte is not used — refused, its authorization servers ignored —
+    /// and metadata that names it gives its first authorization server.
+    #[test]
+    fn metadata_for_another_resource_is_refused() {
+        let t = Duration::from_secs(5);
+        let base = spawn_prm(r#"{"resource":"{base}/mcp","authorization_servers":["{base}/as"]}"#);
+        let (issuer, dial) = discover_issuer(&format!("{base}/mcp"), None, t)
+            .unwrap()
+            .unwrap();
+        assert_eq!(issuer, format!("{base}/as"));
+        assert_eq!(dial, Dial::Named, "on the server's own origin");
+        for doc in [
+            r#"{"resource":"{base}/other","authorization_servers":["{base}/as"]}"#,
+            r#"{"resource":"{base}/mcp/","authorization_servers":["{base}/as"]}"#,
+            r#"{"authorization_servers":["{base}/as"]}"#,
+        ] {
+            let base = spawn_prm(doc);
+            let e = discover_issuer(&format!("{base}/mcp"), None, t).unwrap_err();
+            assert!(e.contains("RFC 9728 §3.3"), "{doc}: {e}");
+        }
+        // No metadata at all is not a refusal: the caller needs an issuer.
+        let base = spawn_prm("not json");
+        assert_eq!(discover_issuer(&format!("{base}/mcp"), None, t), Ok(None));
+    }
+
+    /// A server-chosen authorization server off the server's origin is
+    /// reached over HTTPS only, through the SSRF guard, and — under closed
+    /// egress — only inside the catalog; on the server's origin it is
+    /// dialled as the server is.
+    #[test]
+    fn a_server_named_authorization_server_is_held_to_https_the_guard_and_the_catalog() {
+        let mcp = "https://mcp.example/mcp";
+        assert_eq!(reach("https://mcp.example/as", mcp, None), Ok(Dial::Named));
+        assert_eq!(
+            reach("https://auth.example/tenant", mcp, None),
+            Ok(Dial::Vetted {
+                allow_private: false
+            })
+        );
+        let e = reach("http://auth.example/tenant", mcp, None).unwrap_err();
+        assert!(e.contains("not an https URL"), "{e}");
+        let e = reach("http://169.254.169.254/latest", mcp, None).unwrap_err();
+        assert!(e.contains("not an https URL"), "{e}");
+        let catalog = vec!["https://auth.example/tenant".to_string()];
+        assert!(reach("https://auth.example/tenant", mcp, Some(&catalog)).is_ok());
+        assert!(reach("https://auth.example/tenant/v2", mcp, Some(&catalog)).is_ok());
+        let e = reach("https://auth.example/tenantX", mcp, Some(&catalog)).unwrap_err();
+        assert!(e.contains("egress is closed"), "{e}");
+        let e = reach("https://evil.example/", mcp, Some(&catalog)).unwrap_err();
+        assert!(e.contains("egress is closed"), "{e}");
+        // A loopback development server's own origin.
+        assert_eq!(
+            reach(
+                "http://127.0.0.1:8080/as",
+                "http://127.0.0.1:8080/mcp",
+                None
+            ),
+            Ok(Dial::Named)
+        );
+        assert!(
+            reach(
+                "http://127.0.0.1:9090/as",
+                "http://127.0.0.1:8080/mcp",
+                None
+            )
+            .is_err()
+        );
     }
 }

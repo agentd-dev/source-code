@@ -575,6 +575,7 @@ fn defs_properties(
                     "assertion_aud": { "enum": ["token_endpoint", "issuer"] } } },
                 "grant": { "enum": ["device", "authorization_code", "client_credentials"] },
                 "scopes": { "type": "array", "items": { "type": "string" } }, "audience": { "type": "string" },
+                "resource": { "type": "string", "description": "oauth2: the RFC 8707 resource every authorization, token, refresh and client-credentials request carries — auto (the endpoint, canonical), omit, or a URI; unset, auto on an MCP server or MCP catalog entry and omit elsewhere" },
                 "token": secret, "header": { "type": "string" }, "value": secret,
                 "region": { "type": "string" }, "service": { "type": "string" },
                 "source": { "enum": ["env", "static", "imds", "irsa", "sso"] },

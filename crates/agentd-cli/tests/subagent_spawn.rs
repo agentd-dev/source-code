@@ -54,6 +54,7 @@ fn bogus_payload() -> SpawnPayload {
             log_level: "error".into(),
             log_content: false,
             otel_endpoint: None,
+            attribution: Default::default(),
         },
         depth: 0,
         warm: false,

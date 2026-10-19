@@ -2686,6 +2686,7 @@ impl McpServer {
                 client_id: o.client_id.clone(),
                 client_secret: o.client_secret.0.clone(),
                 scope: o.scope.clone(),
+                resource: canonical_resource(&self.endpoint),
             }),
             auth: self.auth.as_ref().map(|a| a.to_spec()),
             service: self.service.clone(),
@@ -2747,6 +2748,12 @@ pub struct Auth {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub audience: Option<String>,
+    /// The RFC 8707 `resource` sent on every authorization, token, refresh
+    /// and client-credentials request: `auto` (the endpoint the block
+    /// authenticates to, in canonical form), `omit`, or a URI. Unset, `auto`
+    /// on an MCP server or an MCP catalog entry and `omit` elsewhere.
+    #[serde(default)]
+    pub resource: Option<ResourceParam>,
     // --- static ---
     /// A static bearer (`{{secret:…}}`) → `Authorization: Bearer …`.
     #[serde(default)]
@@ -2835,6 +2842,12 @@ impl Auth {
             client_id_metadata_document: false,
             scopes: self.scopes.clone(),
             audience: self.audience.clone(),
+            resource: match &self.resource {
+                Some(ResourceParam::Uri(u)) => Some(u.clone()),
+                _ => None,
+            },
+            protected_resource: None,
+            catalog: None,
             token: self.token.as_ref().map(|s| s.0.clone()),
             header: self.header.clone(),
             value: self.value.as_ref().map(|s| s.0.clone()),
@@ -2919,6 +2932,75 @@ pub enum OAuthGrant {
     AuthorizationCode,
     /// The headless machine-to-machine grant.
     ClientCredentials,
+}
+
+/// An `auth:` block's `resource` (RFC 8707).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceParam {
+    /// The endpoint the block authenticates to, in canonical form.
+    Auto,
+    /// Never sent.
+    Omit,
+    /// This URI.
+    Uri(String),
+}
+
+impl<'de> Deserialize<'de> for ResourceParam {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "auto" => ResourceParam::Auto,
+            "omit" => ResourceParam::Omit,
+            _ => ResourceParam::Uri(s),
+        })
+    }
+}
+
+/// `url` as an RFC 8707 resource indicator, the form MCP's authorization
+/// specification calls canonical: scheme and host lowercased, no fragment,
+/// and no trailing `/` on the path. `None` for a string that is not an
+/// absolute `http`/`https` URL with a host.
+pub fn canonical_resource(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or_default();
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (path, query) = match tail.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (tail, None),
+    };
+    let mut out = format!(
+        "{scheme}://{}{}",
+        authority.to_ascii_lowercase(),
+        path.trim_end_matches('/')
+    );
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    Some(out)
+}
+
+impl Auth {
+    /// The RFC 8707 `resource` this block sends when it authenticates to
+    /// `endpoint`: what `resource` names, or — for `auto`, and unset on an
+    /// MCP target (`mcp`) — the endpoint in canonical form.
+    pub fn resource_for(&self, endpoint: &str, mcp: bool) -> Option<String> {
+        match &self.resource {
+            Some(ResourceParam::Omit) => None,
+            Some(ResourceParam::Uri(u)) => Some(u.clone()),
+            Some(ResourceParam::Auto) => canonical_resource(endpoint),
+            None if mcp => canonical_resource(endpoint),
+            None => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -4478,6 +4560,20 @@ pub fn substitute_config_vars(
 }
 
 impl Settings {
+    /// The environment variables only the supervisor reads: every
+    /// `{{secret:NAME}}` a supervisor-only secret is named by — the seal key
+    /// of the companies preview's store. No child process is started with
+    /// them (`sec::harden`).
+    pub fn supervisor_only_env(&self) -> std::collections::BTreeSet<String> {
+        let mut held = Vec::new();
+        if let Some(Secret(s)) = &self.security.companies.seal_key {
+            held.push(Value::String(s.clone()));
+        }
+        crate::sec::secret::secret_env_names(&Value::Array(held))
+            .into_iter()
+            .collect()
+    }
+
     /// Type a settings document. `source` names it in errors.
     ///
     /// `{{config.*}}` substitution happens here, before typing — so a var can
@@ -6793,8 +6889,14 @@ pub struct Diagnostics {
 /// and secret-freedom for credential fields. Returns error strings prefixed
 /// with `ctx` (e.g. `mcp server 'github'`). An `oauth2` block that names no
 /// `client_id` is held to `client`'s Client ID Metadata Document instead
-/// (RFC 0052).
-fn validate_auth_block(auth: &Auth, client: Option<&client::Client>, ctx: &str) -> Vec<String> {
+/// (RFC 0052). On an MCP server (`mcp`) a block may name no authorization
+/// server at all: the server's RFC 9728 metadata names it.
+fn validate_auth_block(
+    auth: &Auth,
+    client: Option<&client::Client>,
+    ctx: &str,
+    mcp: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     // Credential fields must be `{{secret:…}}` references, never inline.
     let key = auth.client_auth.as_ref().and_then(|c| c.key.clone());
@@ -6823,6 +6925,17 @@ fn validate_auth_block(auth: &Auth, client: Option<&client::Client>, ctx: &str) 
         && document.is_none()
     {
         out.extend(validate_client_auth(auth, c, ctx));
+    }
+    match &auth.resource {
+        Some(_) if auth.kind != AuthKind::Oauth2 => {
+            out.push(format!("{ctx}: auth.resource is for auth.kind oauth2"));
+        }
+        Some(ResourceParam::Uri(u)) if canonical_resource(u).is_none() || u.contains('#') => {
+            out.push(format!(
+                "{ctx}: auth.resource {u:?} is not an absolute http(s) URI without a fragment (RFC 8707 §2), nor auto or omit"
+            ));
+        }
+        _ => {}
     }
     match auth.kind {
         AuthKind::Static => {
@@ -6887,14 +7000,20 @@ fn validate_auth_block(auth: &Auth, client: Option<&client::Client>, ctx: &str) 
                 )),
                 None => {}
             }
-            if auth.token_url.is_none() && auth.issuer.is_none() {
+            // An MCP server's metadata (RFC 9728) names its authorization
+            // server when the block does not.
+            let discovered = mcp && auth.token_url.is_none() && auth.issuer.is_none();
+            if auth.token_url.is_none() && auth.issuer.is_none() && !mcp {
                 out.push(format!(
                     "{ctx}: auth oauth2 needs `token_url` or `issuer` (for discovery)"
                 ));
             }
             match auth.grant.unwrap_or(OAuthGrant::Device) {
                 OAuthGrant::Device => {
-                    if auth.device_authorization_url.is_none() && auth.issuer.is_none() {
+                    if auth.device_authorization_url.is_none()
+                        && auth.issuer.is_none()
+                        && !discovered
+                    {
                         out.push(format!(
                             "{ctx}: the device grant needs `device_authorization_url` or `issuer`"
                         ));
@@ -6912,7 +7031,7 @@ fn validate_auth_block(auth: &Auth, client: Option<&client::Client>, ctx: &str) 
                     }
                 }
                 OAuthGrant::AuthorizationCode => {
-                    if auth.authorization_url.is_none() && auth.issuer.is_none() {
+                    if auth.authorization_url.is_none() && auth.issuer.is_none() && !discovered {
                         out.push(format!(
                             "{ctx}: the authorization_code grant needs `authorization_url` or `issuer`"
                         ));
@@ -7929,6 +8048,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 auth,
                 s.security.client.as_ref(),
                 &format!("mcp server '{}'", srv.name),
+                true,
             ) {
                 err(&mut d, e);
             }
@@ -8061,6 +8181,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 auth,
                 s.security.client.as_ref(),
                 &format!("services.{name}"),
+                svc.kind == ServiceKind::Mcp,
             ) {
                 err(&mut d, e);
             }
@@ -9017,6 +9138,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 auth,
                 s.security.client.as_ref(),
                 &format!("a2a peer '{}'", p.name),
+                false,
             ) {
                 err(&mut d, e);
             }
@@ -9075,15 +9197,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 &mut d,
                 format!("a2a.principals[{i}]: match needs one of san | sub | bearer_ref | any"),
             );
-        } else if set > 1 {
-            // The resolver consults exactly one matcher per rule (by a fixed
-            // precedence), so the others would be silently ignored — a
-            // `bearer_ref` beside a `san` authenticates nobody, yet it would
-            // count as the operator credential the device grant requires.
+        } else if m.any && set > 1 {
+            // Every field a rule names must match, and `any` names everyone:
+            // beside another matcher it would say nothing, or widen it.
             err(
                 &mut d,
                 format!(
-                    "a2a.principals[{i}]: match sets more than one of san | sub | bearer_ref | any; a rule matches one way — write one rule per matcher"
+                    "a2a.principals[{i}]: `any` matches every caller left, so it is the rule's only matcher — drop san | sub | bearer_ref, or write two rules"
                 ),
             );
         }
@@ -9760,7 +9880,8 @@ fn validate_connection(c: &Connection<'_>, client: Option<&client::Client>, d: &
         ));
     }
     if let Some(auth) = c.auth {
-        d.errors.extend(validate_auth_block(auth, client, &at));
+        d.errors
+            .extend(validate_auth_block(auth, client, &at, false));
     }
     if let Some(dialect) = c.dialect {
         if crate::intel::client::Provider::from_dialect(Some(dialect)).is_none() {
@@ -13942,15 +14063,15 @@ mod tests {
             "a2a:\n{loopback}  principals: [{{id: ops, match: {{bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: operator}}]\n  device_grant: {{enabled: true}}\n"
         ));
         assert!(!e.contains(msg), "an operator rule: {e}");
-        // A bearer_ref that shares its rule with a `san` never authenticates
-        // anyone (the resolver consults one matcher per rule), so it is no
-        // operator credential — the rule is refused outright.
+        // A bearer_ref that shares its rule with a `san` admits the bearer
+        // only beside a matching certificate, which a listener with the
+        // device grant never verifies — the rule is refused outright.
         let e = load_errors(&format!(
             "a2a:\n{loopback}  principals: [{{id: ops, match: {{san: x.example, bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: operator}}]\n  device_grant: {{enabled: true}}\n"
         ));
         assert!(
             e.contains(
-                "a2a.principals[0]: match sets more than one of san | sub | bearer_ref | any"
+                "a2a.principals[0]: a certificate rule (san | sub) matches only a client certificate the listener verifies"
             ),
             "{e}"
         );
@@ -14046,16 +14167,28 @@ mod tests {
         // No prefix is reserved: device sessions are `user:<name>`, never a
         // `device:` id, so a rule may use one.
         assert_eq!(rules("device:x", "c"), "");
-        // One matcher per rule, whichever two are combined.
-        for m in [
-            "{san: a.example, sub: s}",
-            "{sub: s, any: true}",
-            "{san: a.example, bearer_ref: \"{{secret:A2A_TEST_BEARER}}\"}",
+        // Matchers combine — every field a rule names must match — except
+        // `any`, which names everyone and so stands alone.
+        for (m, refused) in [
+            ("{san: a.example, sub: s}", false),
+            (
+                "{san: a.example, bearer_ref: \"{{secret:A2A_TEST_BEARER}}\"}",
+                false,
+            ),
+            ("{sub: s, any: true}", true),
+            (
+                "{bearer_ref: \"{{secret:A2A_TEST_BEARER}}\", any: true}",
+                true,
+            ),
         ] {
             let e = load_errors(&format!(
                 "a2a:\n  tls: {{cert: /c.pem, key: /k.pem, client_ca: /ca.pem}}\n  principals:\n    - {{id: a, match: {m}, role: user}}\n"
             ));
-            assert!(e.contains("match sets more than one of"), "{m}: {e}");
+            assert_eq!(
+                e.contains("`any` matches every caller left"),
+                refused,
+                "{m}: {e}"
+            );
         }
     }
 
@@ -15168,6 +15301,74 @@ mod tests {
         );
     }
 
+    /// RFC 8707: an MCP server's block sends the server as its `resource`
+    /// unless told otherwise, every other block sends none unless told to;
+    /// `auto` is the endpoint in canonical form, and a URI is refused unless
+    /// it is an absolute http(s) URI with no fragment.
+    #[test]
+    fn the_resource_is_the_mcp_server_unless_the_block_says_otherwise() {
+        assert_eq!(
+            canonical_resource("HTTPS://MCP.Example/Team/mcp/").as_deref(),
+            Some("https://mcp.example/Team/mcp")
+        );
+        assert_eq!(
+            canonical_resource("https://mcp.example/mcp#x?y").as_deref(),
+            Some("https://mcp.example/mcp")
+        );
+        assert_eq!(
+            canonical_resource("https://mcp.example").as_deref(),
+            Some("https://mcp.example")
+        );
+        assert_eq!(canonical_resource("ftp://x/y"), None);
+        assert_eq!(canonical_resource("https:///y"), None);
+        let auth = |resource: Option<&str>| -> Auth {
+            let mut v = json!({"kind": "oauth2", "issuer": "https://as.example", "client_id": "c"});
+            if let Some(r) = resource {
+                v["resource"] = json!(r);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let mcp = "https://MCP.example/mcp/";
+        assert_eq!(
+            auth(None).resource_for(mcp, true).as_deref(),
+            Some("https://mcp.example/mcp")
+        );
+        assert_eq!(auth(None).resource_for(mcp, false), None);
+        assert_eq!(auth(Some("omit")).resource_for(mcp, true), None);
+        assert_eq!(
+            auth(Some("auto"))
+                .resource_for("https://api.example/v1", false)
+                .as_deref(),
+            Some("https://api.example/v1")
+        );
+        assert_eq!(
+            auth(Some("https://api.example/x"))
+                .resource_for(mcp, true)
+                .as_deref(),
+            Some("https://api.example/x")
+        );
+        for (bad, ok) in [
+            ("https://api.example/x", true),
+            ("auto", true),
+            ("omit", true),
+            ("api.example/x", false),
+            ("https://api.example/x#frag", false),
+        ] {
+            let errs = validate_auth_block(&auth(Some(bad)), None, "mcp server 's'", true);
+            assert_eq!(errs.is_empty(), ok, "{bad}: {errs:?}");
+        }
+        // An MCP server's block may leave its authorization server to the
+        // server's RFC 9728 metadata; nobody else's may.
+        let bare: Auth =
+            serde_json::from_value(json!({"kind": "oauth2", "client_id": "c"})).unwrap();
+        assert!(validate_auth_block(&bare, None, "mcp server 's'", true).is_empty());
+        let errs = validate_auth_block(&bare, None, "a2a peer 'p'", false);
+        assert!(
+            errs.iter().any(|e| e.contains("`token_url` or `issuer`")),
+            "{errs:?}"
+        );
+    }
+
     /// `client_auth` asks for the fields its method uses and refuses the
     /// rest; its key is a credential, so a file names it by reference only;
     /// and it lowers to the runtime spec unchanged.
@@ -15175,7 +15376,10 @@ mod tests {
     fn client_auth_takes_what_its_method_needs() {
         let check = |v: serde_json::Value| {
             let auth: Auth = serde_json::from_value(v).unwrap();
-            (validate_auth_block(&auth, None, "mcp server 's'"), auth)
+            (
+                validate_auth_block(&auth, None, "mcp server 's'", true),
+                auth,
+            )
         };
         let base = json!({"kind": "oauth2", "issuer": "https://as.example", "client_id": "c"});
         let with = |extra: serde_json::Value| {

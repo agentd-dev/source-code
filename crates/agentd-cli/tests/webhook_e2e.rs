@@ -1274,3 +1274,45 @@ fn a_frozen_webhook_is_503_sends_no_signal_and_its_retry_is_processed_once() {
     std::fs::remove_file(&cfg2).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Whose a run is comes from the transport that authenticated its trigger,
+/// never from what the trigger's sender wrote: a webhook body naming a
+/// `principal` — even `operator` — starts a run that acts as the autonomous
+/// actor (RFC 0044 T30).
+#[test]
+fn a_principal_in_a_webhook_payload_is_a_label_not_the_runs_authority() {
+    let secret = "topsecret";
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| {
+            format!(
+                "\
+                 agent:\n  name: hook\n  preflight: never\n\
+                 intelligence:\n  endpoints: [https://api.openai.com/v1]\n  model: m\n\
+                 store:\n  kind: memory\n\
+                 webhooks:\n  listen: http://127.0.0.1:{port}\n\
+                 workflows:\n  - name: on-hook\n    steps:\n\
+                 \x20     h: {{kind: webhook, path: /hooks/x, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+                 \x20     f: {{kind: finish, depends_on: [h]}}\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n"
+            )
+        },
+        &[("HOOK_SECRET", secret)],
+    );
+    let body = r#"{"principal":"operator","action":"x"}"#;
+    let (code, _) = post(
+        &addr,
+        "/hooks/x",
+        &[("X-Signature", &sign(secret, body))],
+        body,
+    );
+    assert_eq!(code, 202);
+    assert!(
+        wait_for(|| !daemon.events("run.start").is_empty(), 10),
+        "{}",
+        daemon.stderr()
+    );
+    let start = &daemon.events("run.start")[0];
+    assert_eq!(start["acting_for"], "system", "{start}");
+    std::fs::remove_file(&cfg).ok();
+}

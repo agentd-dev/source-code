@@ -457,6 +457,9 @@ pub struct McpOauthSpec {
     pub client_secret: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The RFC 8707 `resource`: the server's endpoint, in canonical form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 /// The runtime shape of a unified `auth:` credential provider. Every credential
@@ -494,6 +497,21 @@ pub struct AuthSpec {
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    /// oauth2: the RFC 8707 `resource` every authorization, token, refresh
+    /// and client-credentials request carries; `None` sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// oauth2: the MCP server whose RFC 9728 metadata names the
+    /// authorization server, when the block names no `issuer` and no
+    /// `token_url` — read by `--login` and by the first request that needs
+    /// a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_resource: Option<String>,
+    /// oauth2, under `security.egress: closed`: the catalog's endpoints. An
+    /// authorization server a server named (RFC 9728), and every endpoint its
+    /// metadata names, must be one of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Vec<String>>,
     /// static: a bearer token template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,

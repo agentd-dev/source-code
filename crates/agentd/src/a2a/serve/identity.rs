@@ -18,6 +18,8 @@ pub struct PeerId {
     pub presented: bool,
     pub subject: Option<String>,
     pub sans: Vec<String>,
+    /// The SHA-256 of the certificate's SubjectPublicKeyInfo, hex.
+    pub spki_sha256: Option<String>,
 }
 
 pub(super) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> PeerId {
@@ -35,6 +37,7 @@ pub(super) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> Pe
         presented: true,
         subject: id.subject_cn,
         sans: id.sans,
+        spki_sha256: (!id.spki.is_empty()).then(|| crate::sha::sha256_hex(&id.spki)),
     }
 }
 
@@ -83,6 +86,7 @@ pub(super) fn evidence_of(headers: &HeaderMap, peer_id: &PeerId, peer: &Peer) ->
         cert: peer_id.presented.then(|| CertId {
             subject: peer_id.subject.clone(),
             sans: peer_id.sans.clone(),
+            spki_sha256: peer_id.spki_sha256.clone(),
         }),
         local: match peer {
             Peer::Tcp(a) => a.ip().to_canonical().is_loopback(),
@@ -268,6 +272,7 @@ mod tests {
             presented: true,
             subject: Some("alice".into()),
             sans: vec![],
+            spki_sha256: None,
         };
         let ev = evidence_of(&HeaderMap::new(), &cert, &local());
         assert_eq!(ev.cert.unwrap().subject.as_deref(), Some("alice"));

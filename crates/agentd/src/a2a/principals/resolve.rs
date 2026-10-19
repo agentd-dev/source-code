@@ -22,6 +22,7 @@
 //! whose operator credential was its bearer: the flag was true, and the bearer
 //! was never asked for.
 
+use super::typed::{PrincipalRef, Source};
 use super::{Principal, glob};
 use crate::config::settings::{self, Role};
 use crate::runtime::surface::auth::{ListenerAuth, listener_auth_of};
@@ -40,6 +41,9 @@ pub struct CertId {
     pub subject: Option<String>,
     /// The SANs (a SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN).
     pub sans: Vec<String>,
+    /// The SHA-256 of its SubjectPublicKeyInfo, hex: the key a reissued
+    /// certificate keeps, which a CN or a SAN does not prove.
+    pub spki_sha256: Option<String>,
 }
 
 /// What the transport learned about one request.
@@ -244,7 +248,17 @@ impl Resolver {
                     if let Some(secret) = &c.bearer_secret
                         && crate::sha::ct_eq(secret.as_bytes(), token.as_bytes())
                     {
-                        return match c.principal(None) {
+                        // A rule that also names certificate fields admits the
+                        // bearer only beside a certificate they match.
+                        let cert_ok = (c.matcher.san.is_none() && c.matcher.sub.is_none())
+                            || ev
+                                .cert
+                                .as_ref()
+                                .is_some_and(|cert| c.cert_fields_match(cert));
+                        if !cert_ok {
+                            return Resolution::Unauthenticated { presented: true };
+                        }
+                        return match c.principal(ev.cert.as_ref()) {
                             Some(p) if p.role != Role::Anonymous => {
                                 Resolution::Named(p, Via::Bearer)
                             }
@@ -325,19 +339,33 @@ impl Resolver {
 
 impl Compiled {
     /// Whether this rule's certificate matcher admits `cert`. `any` admits
-    /// every certificate the CA signed; a `bearer_ref` rule admits none.
+    /// every certificate the CA signed; a rule naming neither `san` nor
+    /// `sub` admits none. A rule naming both admits only a certificate both
+    /// admit: every field a rule names must match.
     fn matches_cert(&self, cert: &CertId) -> bool {
         let m = &self.matcher;
         if m.any {
-            true
-        } else if let Some(san) = &m.san {
+            return true;
+        }
+        if m.san.is_none() && m.sub.is_none() {
+            return false;
+        }
+        self.cert_fields_match(cert)
+    }
+
+    /// Whether every certificate field the rule names — `san` and `sub`,
+    /// each a glob — matches `cert`. True for a rule that names none.
+    fn cert_fields_match(&self, cert: &CertId) -> bool {
+        let m = &self.matcher;
+        let san = m.san.as_ref().is_none_or(|san| {
             cert.sans.iter().any(|s| glob(san, s))
                 || cert.subject.as_deref().is_some_and(|s| glob(san, s))
-        } else if let Some(sub) = &m.sub {
-            cert.subject.as_deref() == Some(sub.as_str())
-        } else {
-            false
-        }
+        });
+        let sub = m
+            .sub
+            .as_ref()
+            .is_none_or(|sub| cert.subject.as_deref().is_some_and(|s| glob(sub, s)));
+        san && sub
     }
 
     /// The principal this rule's caller acts as, or `None` when neither the
@@ -349,14 +377,24 @@ impl Compiled {
     /// keeps `user:unknown` — one principal every such caller merged into —
     /// impossible rather than merely unconfigured.
     fn principal(&self, cert: Option<&CertId>) -> Option<Principal> {
+        let id = principal_id(self.role, self.id.as_deref(), cert)?;
+        // A bearer or an `any` rule is the rule; a certificate rule is the
+        // certificate's key, or — where none was read — what named it.
+        let typed = match cert {
+            Some(c) if self.bearer_secret.is_none() && !self.matcher.any => {
+                PrincipalRef::local(Source::X509, c.spki_sha256.as_deref().unwrap_or(&id))
+            }
+            _ => PrincipalRef::local(Source::Bearer, self.id.as_deref().unwrap_or(&id)),
+        };
         Some(Principal {
-            id: principal_id(self.role, self.id.as_deref(), cert)?,
+            id,
             role: self.role,
             grants: self.grants.clone(),
             rate: self.rate.clone(),
             budget: self.budget.clone(),
             labels: self.labels.clone(),
             session: None,
+            typed: Some(typed),
         })
     }
 }
@@ -398,12 +436,18 @@ pub fn declared_principals(a2a: &settings::A2a) -> std::collections::BTreeMap<St
                 budget: p.quotas.as_ref().and_then(|q| q.budget.clone()),
                 labels: p.labels.clone(),
                 session: None,
+                typed: Some(PrincipalRef::local(
+                    Source::Bearer,
+                    &p.id.clone().unwrap_or_default(),
+                )),
             },
         );
     }
     out
 }
 
+/// The bare operator: the unix listener's peer, the server bearer, a
+/// certificate no rule names, the loopback default.
 fn operator() -> Principal {
     Principal {
         id: "operator".into(),
@@ -413,6 +457,7 @@ fn operator() -> Principal {
         budget: None,
         labels: Default::default(),
         session: None,
+        typed: Some(PrincipalRef::operator()),
     }
 }
 
@@ -445,16 +490,19 @@ fn principal_id(role: Role, declared: Option<&str>, cert: Option<&CertId>) -> Op
 
 fn matcher_desc(m: &settings::PrincipalMatch) -> Value {
     if m.any {
-        json!({"any": true})
-    } else if let Some(s) = &m.san {
-        json!({"san": s})
-    } else if let Some(s) = &m.sub {
-        json!({"sub": s})
-    } else if m.bearer_ref.is_some() {
-        json!({"bearer_ref": "***"})
-    } else {
-        json!({})
+        return json!({"any": true});
     }
+    let mut out = serde_json::Map::new();
+    if let Some(s) = &m.san {
+        out.insert("san".into(), json!(s));
+    }
+    if let Some(s) = &m.sub {
+        out.insert("sub".into(), json!(s));
+    }
+    if m.bearer_ref.is_some() {
+        out.insert("bearer_ref".into(), json!("***"));
+    }
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -486,6 +534,7 @@ mod tests {
         Some(CertId {
             sans: sans.iter().map(|s| s.to_string()).collect(),
             subject: sub.map(str::to_string),
+            ..Default::default()
         })
     }
 
@@ -848,6 +897,49 @@ mod tests {
         // The same rule still names a certificate holder by its CN.
         let holder = r.resolve(&ev(None, cert(&[], Some("alice"))), false, None);
         assert_eq!(named(&holder), ("user:cn=alice", Via::Cert));
+    }
+
+    /// Every field a rule names must match, and `sub` is a glob as `san`
+    /// is: a certificate admitted by one field alone is nobody's, and a
+    /// bearer whose rule names a certificate field is admitted only beside
+    /// a certificate that field matches.
+    #[test]
+    fn every_field_a_rule_names_must_match() {
+        let r = Resolver::build(
+            &a2a(json!({
+                "listen": "https://0.0.0.0:8443",
+                "url": "https://agent.example",
+                "tls": {"cert": "c", "key": "k", "client_ca": "ca"},
+                "principals": [
+                    {"id": "ops", "match": {"san": "spiffe://corp/ops/*", "sub": "ops-*"}, "role": "user"},
+                    {"id": "ci", "match": {"bearer_ref": "{{secret:A}}", "san": "spiffe://corp/ci"}, "role": "agent"}
+                ]
+            })),
+            &secrets,
+        )
+        .unwrap();
+        let at = |bearer: Option<&str>, sans: &[&str], sub: Option<&str>| {
+            r.resolve(&ev(bearer, cert(sans, sub)), false, None)
+        };
+        assert_eq!(
+            named(&at(None, &["spiffe://corp/ops/a"], Some("ops-a"))).0,
+            "user:ops"
+        );
+        assert_eq!(
+            at(None, &["spiffe://corp/ops/a"], Some("dev-a")),
+            Resolution::NoRole
+        );
+        assert_eq!(
+            at(None, &["spiffe://corp/dev/a"], Some("ops-a")),
+            Resolution::NoRole
+        );
+        assert_eq!(
+            named(&at(Some("token-a"), &["spiffe://corp/ci"], None)).0,
+            "agent:ci"
+        );
+        let refused = Resolution::Unauthenticated { presented: true };
+        assert_eq!(at(Some("token-a"), &["spiffe://corp/other"], None), refused);
+        assert_eq!(r.resolve(&ev(Some("token-a"), None), false, None), refused);
     }
 
     #[test]

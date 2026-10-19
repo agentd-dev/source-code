@@ -19,9 +19,10 @@ use std::time::Duration;
 use crate::net::http::{self, Url};
 
 /// How a request's URL is dialled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dial {
     /// By name, `http://` or `https://` — an operator-configured endpoint.
+    #[default]
     Named,
     /// HTTPS only, through the SSRF guard; `allow_private` admits loopback,
     /// private and link-local addresses.

@@ -209,6 +209,14 @@ impl Session {
             budget: None,
             labels: Default::default(),
             session: Some(self.sid.clone()),
+            // Every session approved under one name is one principal: the
+            // name, whichever role its scope gave it.
+            typed: Some(crate::a2a::principals::typed::PrincipalRef::local(
+                crate::a2a::principals::typed::Source::Device,
+                self.principal
+                    .split_once(':')
+                    .map_or(self.principal.as_str(), |(_, name)| name),
+            )),
         }
     }
 

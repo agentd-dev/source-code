@@ -253,6 +253,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     }
     crate::signals::install();
     crate::supervisor::reap::set_child_subreaper();
+    // What the supervisor holds stays in it: no process of its uid reads its
+    // memory, no core dump holds it, and no child is handed a variable a
+    // supervisor-only secret is read from.
+    for refused in crate::sec::harden::supervisor() {
+        log.warn("proc.harden", json!({"refused": refused}));
+    }
+    crate::sec::harden::set_reserved(settings.supervisor_only_env());
     // The entropy source every secret is minted from, opened before anything
     // listens: a host without one refuses to start rather than failing the
     // first request that needs a token, and no later mint needs a free fd.

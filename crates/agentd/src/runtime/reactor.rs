@@ -1626,6 +1626,7 @@ impl Runtime {
                 "a2a",
                 carried,
                 ev.trace.as_ref(),
+                ev.principal.as_deref(),
             );
             return true;
         }
@@ -1676,7 +1677,13 @@ impl Runtime {
                 authority,
                 access,
                 auth_token,
-            } => crate::aauth::heard_token(&authority, access.as_deref(), auth_token.as_deref()),
+                principal,
+            } => crate::aauth::heard_token(
+                &authority,
+                access.as_deref(),
+                auth_token.as_deref(),
+                principal.as_deref(),
+            ),
             #[cfg(not(feature = "aauth"))]
             AgentMsg::AAuthToken { .. } => {}
             // A child a drain or a kill is stopping starts nothing more: its

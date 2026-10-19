@@ -204,6 +204,9 @@ pub enum AgentMsg {
         access: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_token: Option<String>,
+        /// The principal a Case C `auth_token` was earned for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<String>,
     },
 }
 
@@ -365,6 +368,10 @@ pub struct AAuthHandoff {
     /// a token the tree already holds.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub servers: std::collections::BTreeMap<String, HandedServer>,
+    /// The principal the child works for: its Case C tokens are held for
+    /// it, and those of `servers` are its.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 /// What the tree holds for one server: the `AAuth-Access` token it issued
@@ -803,6 +810,11 @@ pub struct Telemetry {
     /// Absent, it falls back to the inherited `OTEL_EXPORTER_OTLP_ENDPOINT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_endpoint: Option<String>,
+    /// Who the child's work is for — `agent/acting_for` and `agent/labels`,
+    /// as the supervisor stamps them — carried on every MCP call the child
+    /// makes on its own connections.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub attribution: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Telemetry {
@@ -874,6 +886,7 @@ mod tests {
                 log_level: "info".into(),
                 log_content: false,
                 otel_endpoint: None,
+                attribution: Default::default(),
             },
             depth: 1,
             warm: false,

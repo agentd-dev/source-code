@@ -16,7 +16,11 @@
 //! - **Case C (Person-Server / user-scoped):** a `401 requirement=auth-token`
 //!   drives the Person-Server exchange ([`ps`]) — the human consents there —
 //!   and the resulting user-scoped auth token is presented as the
-//!   `Signature-Key` instead of the agent token.
+//!   `Signature-Key` instead of the agent token. It is held for the
+//!   authority AND the principal the request was made for (the request's
+//!   scope, `mcp::http::SCOPE_META`): one principal's token is never
+//!   presented on another's call, and a call made for nobody presents none
+//!   and earns none.
 //!
 //! Every mode starts from a signed request, so none sends one unsigned: a
 //! request whose identity cannot be produced is not sent.
@@ -106,24 +110,40 @@ pub(crate) fn keep_fresh() {
     }
 }
 
+/// The principal the request being signed is made for: the scope its
+/// `_meta` named ([`::mcp::http::request_scope`]), which the host stamps
+/// from the work's authority, never from anything a caller wrote.
+fn acting() -> Option<String> {
+    ::mcp::http::request_scope()
+}
+
 /// How a child hands a token it earned for an authority to the supervisor:
-/// the authority, then the Case B access token or the Case C auth token.
-type HandUp = Box<dyn Fn(&str, Option<&str>, Option<&str>) + Send + Sync>;
+/// the authority, then the Case B access token or the Case C auth token,
+/// then the principal a Case C token is for.
+type HandUp = Box<dyn Fn(&str, Option<&str>, Option<&str>, Option<&str>) + Send + Sync>;
 
 static HAND_UP: OnceLock<HandUp> = OnceLock::new();
 
 /// Hand the tokens this child earns to `up`, which sends them to the
 /// supervisor ([`crate::subagent::protocol::AgentMsg::AAuthToken`]). Set
 /// once, in a turn worker or a subagent.
-pub(crate) fn hand_up(up: impl Fn(&str, Option<&str>, Option<&str>) + Send + Sync + 'static) {
+pub(crate) fn hand_up(
+    up: impl Fn(&str, Option<&str>, Option<&str>, Option<&str>) + Send + Sync + 'static,
+) {
     let _ = HAND_UP.set(Box::new(up));
 }
 
-/// A token a child earned for `authority`, kept by the installed client, so
-/// the children spawned after it are handed it.
-pub(crate) fn heard_token(authority: &str, access: Option<&str>, auth_token: Option<&str>) {
+/// A token a child earned for `authority` — a Case C one for `principal` —
+/// kept by the installed client, so the children spawned after it are handed
+/// it: the Case C one only children working for that principal.
+pub(crate) fn heard_token(
+    authority: &str,
+    access: Option<&str>,
+    auth_token: Option<&str>,
+    principal: Option<&str>,
+) {
     if let Some(client) = installed() {
-        client.heard_token(authority, access, auth_token);
+        client.heard_token(authority, access, auth_token, principal);
     }
 }
 
@@ -183,10 +203,11 @@ pub(crate) fn adopt(handed: &AAuthHandoff, timeout: Duration) -> Result<(), Stri
     Ok(())
 }
 
-/// The installed identity as a turn worker or a subagent is handed it, when
-/// this process has one.
-pub(crate) fn handoff() -> Option<AAuthHandoff> {
-    installed().map(AAuthClient::handoff)
+/// The installed identity as a turn worker or a subagent working for
+/// `principal` is handed it, when this process has one: the Case C tokens
+/// held for that principal and no other's.
+pub(crate) fn handoff(principal: Option<&str>) -> Option<AAuthHandoff> {
+    installed().map(|c| c.handoff(principal))
 }
 
 /// The `security.aauth` an instance child is composed, so the child daemon
@@ -254,25 +275,26 @@ struct AuthorityState {
     /// Case B: an opaque `AAuth-Access` token → `Authorization: AAuth <t>`.
     access: std::collections::HashMap<String, String>,
     /// Case C: a user-scoped auth-token (JWT) → presented as the `Signature-Key`
-    /// instead of the agent token.
-    auth_token: std::collections::HashMap<String, String>,
+    /// instead of the agent token. Keyed by authority and principal.
+    auth_token: std::collections::HashMap<(String, String), String>,
     /// Discovery: whether the server requires a `content-digest` cover, for
     /// each server that answered.
     wants_digest: std::collections::HashMap<String, bool>,
 }
 
 impl AuthorityState {
-    /// The state as a child is handed it. A Case C token within a minute of
+    /// The state as a child working for `principal` is handed it: its Case
+    /// C tokens, and no other principal's. A Case C token within a minute of
     /// its `exp` is left out: a child earns a fresh one rather than present
     /// one the server is about to refuse.
-    fn handed(&self) -> std::collections::BTreeMap<String, HandedServer> {
+    fn handed(&self, principal: Option<&str>) -> std::collections::BTreeMap<String, HandedServer> {
         let mut servers = std::collections::BTreeMap::<String, HandedServer>::new();
         for (authority, t) in &self.access {
             servers.entry(authority.clone()).or_default().access = Some(t.clone());
         }
         let live = sig::now_secs() + 60;
-        for (authority, t) in &self.auth_token {
-            if apd::exp_of(t).is_none_or(|exp| exp > live) {
+        for ((authority, p), t) in &self.auth_token {
+            if Some(p.as_str()) == principal && apd::exp_of(t).is_none_or(|exp| exp > live) {
                 servers.entry(authority.clone()).or_default().auth_token = Some(t.clone());
             }
         }
@@ -282,15 +304,19 @@ impl AuthorityState {
         servers
     }
 
-    /// The state a child was handed.
-    fn from_handed(servers: &std::collections::BTreeMap<String, HandedServer>) -> AuthorityState {
+    /// The state a child working for `principal` was handed.
+    fn from_handed(
+        servers: &std::collections::BTreeMap<String, HandedServer>,
+        principal: Option<&str>,
+    ) -> AuthorityState {
         let mut st = AuthorityState::default();
         for (authority, s) in servers {
             if let Some(t) = &s.access {
                 st.access.insert(authority.clone(), t.clone());
             }
-            if let Some(t) = &s.auth_token {
-                st.auth_token.insert(authority.clone(), t.clone());
+            if let (Some(t), Some(p)) = (&s.auth_token, principal) {
+                st.auth_token
+                    .insert((authority.clone(), p.to_string()), t.clone());
             }
             if let Some(d) = s.content_digest {
                 st.wants_digest.insert(authority.clone(), d);
@@ -396,14 +422,14 @@ impl AAuthClient {
     /// handed, and one near that is refreshed in the background
     /// ([`Self::keep_fresh`]), so the children that follow are handed a fresh
     /// one.
-    pub(crate) fn handoff(&self) -> AAuthHandoff {
+    pub(crate) fn handoff(&self, principal: Option<&str>) -> AAuthHandoff {
         let held = self.apd.held_token();
         self.keep_fresh();
         let servers = self
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .handed();
+            .handed(principal);
         let config = self.apd.config();
         let key = self.apd.key();
         AAuthHandoff {
@@ -423,6 +449,7 @@ impl AAuthClient {
                 good_until_ms: unix_ms_at(good_until),
             }),
             servers,
+            principal: principal.map(str::to_string),
         }
     }
 
@@ -460,22 +487,36 @@ impl AAuthClient {
         }
     }
 
-    /// [`heard_token`] for this client.
-    fn heard_token(&self, authority: &str, access: Option<&str>, auth_token: Option<&str>) {
+    /// [`heard_token`] for this client. A Case C token for nobody is not
+    /// kept.
+    fn heard_token(
+        &self,
+        authority: &str,
+        access: Option<&str>,
+        auth_token: Option<&str>,
+        principal: Option<&str>,
+    ) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(a) = access {
             st.access.insert(authority.to_string(), a.to_string());
         }
-        if let Some(t) = auth_token {
-            st.auth_token.insert(authority.to_string(), t.to_string());
+        if let (Some(t), Some(p)) = (auth_token, principal) {
+            st.auth_token
+                .insert((authority.to_string(), p.to_string()), t.to_string());
         }
     }
 
     /// Hand a token this child earned for `authority` up to the supervisor,
     /// in a process that has one.
-    fn earned(&self, authority: &str, access: Option<&str>, auth_token: Option<&str>) {
+    fn earned(
+        &self,
+        authority: &str,
+        access: Option<&str>,
+        auth_token: Option<&str>,
+        principal: Option<&str>,
+    ) {
         if let Some(up) = HAND_UP.get() {
-            up(authority, access, auth_token);
+            up(authority, access, auth_token, principal);
         }
     }
 
@@ -549,7 +590,10 @@ impl AAuthClient {
                 .map(|t| (t.token.clone(), instant_at(t.good_until_ms))),
         );
         let mut client = AAuthClient::over(apd, timeout);
-        client.state = Arc::new(Mutex::new(AuthorityState::from_handed(&handed.servers)));
+        client.state = Arc::new(Mutex::new(AuthorityState::from_handed(
+            &handed.servers,
+            handed.principal.as_deref(),
+        )));
         client.handed = true;
         Ok(match key_file {
             Some(path) => client.with_key_file(path),
@@ -591,7 +635,7 @@ impl AAuthClient {
             .unwrap_or_else(|e| e.into_inner())
             .access
             .insert(authority.to_string(), token.to_string());
-        self.earned(authority, Some(token), None);
+        self.earned(authority, Some(token), None, None);
     }
 }
 
@@ -600,7 +644,8 @@ impl AAuthClient {
 /// requirement becomes one retry rather than a hard failure.
 impl ::mcp::http::RequestSigner for AAuthClient {
     /// Sign the request with the agent's key, presenting the user-scoped auth
-    /// token held for `authority` (Case C) or else the agent token. An agent
+    /// token held for `authority` and the principal the request is made for
+    /// (Case C), or else the agent token. An agent
     /// token that cannot be produced — a provider that does not answer or is
     /// not verified, that will not enroll the key or issue a token, or issues
     /// one that is not ours — is the `Err`, and the request is not sent.
@@ -612,7 +657,8 @@ impl ::mcp::http::RequestSigner for AAuthClient {
         body: &[u8],
     ) -> Result<Vec<(String, String)>, String> {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let auth_token = st.auth_token.get(authority).cloned();
+        let auth_token =
+            acting().and_then(|p| st.auth_token.get(&(authority.to_string(), p)).cloned());
         let want_digest = *st.wants_digest.get(authority).unwrap_or(&false);
         let access = st.access.get(authority).cloned();
         drop(st);
@@ -648,17 +694,23 @@ impl ::mcp::http::RequestSigner for AAuthClient {
             return true;
         }
         // Case C: a user-scoped auth-token is required. Run the Person-Server
-        // exchange (the human consents there) and cache the resulting token.
+        // exchange (the human consents there) and cache the resulting token,
+        // for the principal this request is made for — a request made for
+        // nobody earns none.
         let Some(requirement) = &resp.requirement else {
             return false;
         };
         if ps::wants_auth_token(requirement) {
+            let Some(principal) = acting() else {
+                return false;
+            };
+            let key = (authority.to_string(), principal.clone());
             let already = self
                 .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .auth_token
-                .contains_key(authority);
+                .contains_key(&key);
             if already {
                 return false; // already have one; a fresh 401 is a real denial
             }
@@ -682,12 +734,12 @@ impl ::mcp::http::RequestSigner for AAuthClient {
                 self.timeout,
             ) {
                 Ok(auth_token) => {
-                    self.earned(authority, None, Some(&auth_token));
+                    self.earned(authority, None, Some(&auth_token), Some(&principal));
                     self.state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .auth_token
-                        .insert(authority.to_string(), auth_token);
+                        .insert(key, auth_token);
                     return true; // retry, now presenting the auth token
                 }
                 Err(_) => return false, // denied / timed out — surface the 401
@@ -896,7 +948,7 @@ mod tests {
         assert_eq!(asked, 3, "{:?}", served.lock().unwrap());
 
         // Over the spawn pipe, as JSON.
-        let handed = root.handoff();
+        let handed = root.handoff(None);
         assert_eq!(handed.key, AAuthKey::File(path.display().to_string()));
         let wire = serde_json::to_string(&handed).unwrap();
         let child = AAuthClient::from_handoff(
@@ -920,7 +972,7 @@ mod tests {
         // A key held only in memory is handed as its seed.
         let ephemeral = client(&provider, 8);
         ephemeral.start().unwrap();
-        let handed = ephemeral.handoff();
+        let handed = ephemeral.handoff(None);
         assert!(matches!(handed.key, AAuthKey::Seed(_)));
         let child = AAuthClient::from_handoff(&handed, Duration::from_secs(2)).unwrap();
         let headers = child.sign("POST", "host", "/mcp", b"{}").unwrap();
@@ -939,7 +991,7 @@ mod tests {
             Duration::from_secs(2),
         )
         .with_key_file(path.display().to_string());
-        let handed = root.handoff();
+        let handed = root.handoff(None);
 
         std::fs::remove_file(&path).unwrap();
         AgentKey::load_or_create(&path).unwrap();
@@ -967,10 +1019,10 @@ mod tests {
         let provider = format!("http://{}", listener.local_addr().unwrap());
         let served = serve_provider(listener, None);
         let root = client(&provider, 5);
-        assert!(root.handoff().token.is_none(), "nothing fetched yet");
+        assert!(root.handoff(None).token.is_none(), "nothing fetched yet");
         let deadline = Instant::now() + Duration::from_secs(10);
         let next = loop {
-            let handed = root.handoff();
+            let handed = root.handoff(None);
             if handed.token.is_some() || Instant::now() > deadline {
                 break handed;
             }
@@ -1029,10 +1081,15 @@ mod tests {
         assert_eq!(*asked.lock().unwrap(), 1);
         let user = jwt(serde_json::json!({"exp": sig::now_secs() + 3600}));
         let ending = jwt(serde_json::json!({"exp": sig::now_secs() + 10}));
-        root.heard_token(&authority, Some("acc-1"), Some(&user));
-        root.heard_token("ending.example", None, Some(&ending));
+        root.heard_token(&authority, Some("acc-1"), Some(&user), Some("user:alice"));
+        root.heard_token("ending.example", None, Some(&ending), Some("user:alice"));
+        // Another principal's child is handed the server's access token and
+        // none of the user-scoped ones.
+        let bob = root.handoff(Some("user:bob"));
+        assert_eq!(bob.servers[&authority].access.as_deref(), Some("acc-1"));
+        assert!(bob.servers[&authority].auth_token.is_none(), "{bob:?}");
 
-        let handed = root.handoff();
+        let handed = root.handoff(Some("user:alice"));
         assert!(!handed.servers.contains_key("ending.example"), "{handed:?}");
         let wire = serde_json::to_string(&handed).unwrap();
         let child = AAuthClient::from_handoff(
@@ -1040,7 +1097,11 @@ mod tests {
             Duration::from_secs(2),
         )
         .unwrap();
-        let headers = child.sign("POST", &authority, "/mcp", b"{}").unwrap();
+        // The child works for alice: its requests are made for her.
+        let headers = ::mcp::http::with_request_scope(Some("user:alice"), || {
+            child.sign("POST", &authority, "/mcp", b"{}")
+        })
+        .unwrap();
         let header = |name: &str| {
             headers
                 .iter()
@@ -1070,13 +1131,13 @@ mod tests {
         type Earned = Arc<Mutex<Vec<(String, Option<String>)>>>;
         let earned = Earned::default();
         let up = Arc::clone(&earned);
-        hand_up(move |authority, access, _| {
+        hand_up(move |authority, access, _, _| {
             up.lock()
                 .unwrap()
                 .push((authority.to_string(), access.map(str::to_string)))
         });
         let root = client("http://127.0.0.1:9", 6);
-        let child = AAuthClient::from_handoff(&root.handoff(), Duration::from_secs(2)).unwrap();
+        let child = AAuthClient::from_handoff(&root.handoff(None), Duration::from_secs(2)).unwrap();
         let issued = ::mcp::http::AuthResponse {
             status: 401,
             access: Some("acc-7".into()),
@@ -1093,9 +1154,9 @@ mod tests {
         assert_eq!(up, [("b.example".to_string(), Some("acc-7".to_string()))]);
 
         // The supervisor's reactor keeps what it heard.
-        root.heard_token("b.example", Some("acc-7"), None);
+        root.heard_token("b.example", Some("acc-7"), None, None);
         assert_eq!(
-            root.handoff().servers["b.example"].access.as_deref(),
+            root.handoff(None).servers["b.example"].access.as_deref(),
             Some("acc-7")
         );
     }
@@ -1119,7 +1180,7 @@ mod tests {
         assert_eq!(served.lock().unwrap().len(), 3, "not due yet");
 
         std::thread::sleep(Duration::from_millis(1100));
-        let handed = root.handoff();
+        let handed = root.handoff(None);
         assert_eq!(handed.token.map(|t| t.token).as_deref(), Some("tok-1"));
         let deadline = Instant::now() + Duration::from_secs(5);
         while token(&root).as_deref() == Some("tok-1") && Instant::now() < deadline {
@@ -1242,5 +1303,41 @@ mod tests {
         assert!(copy.exists());
         forget_key_copy(&child_dir, None);
         assert!(!copy.exists(), "the copy is removed once the child is done");
+    }
+
+    /// A user-scoped (Case C) token is held for the authority AND the
+    /// principal it was earned for: presented only on that principal's
+    /// requests — never another's, never a request made for nobody — and a
+    /// request made for nobody does not run the Person-Server exchange.
+    #[test]
+    fn a_user_scoped_token_is_presented_for_its_principal_alone() {
+        let root = client("http://127.0.0.1:9", 9);
+        let alice = jwt(serde_json::json!({"exp": sig::now_secs() + 3600}));
+        root.heard_token("mcp.example", None, Some(&alice), Some("user:alice"));
+        // A Case C token for nobody is not kept.
+        root.heard_token("mcp.example", None, Some("orphan"), None);
+        let key_of = |p: Option<&str>| {
+            ::mcp::http::with_request_scope(p, || root.sign("POST", "mcp.example", "/mcp", b"{}"))
+                .map(|h| presented(&h).to_string())
+        };
+        assert_eq!(
+            key_of(Some("user:alice")).unwrap(),
+            format!("sig=jwt;jwt=\"{alice}\"")
+        );
+        for other in [Some("user:bob"), None] {
+            // The agent token is all another principal's request may carry;
+            // this provider does not answer, so there is none to sign with.
+            let e = key_of(other).unwrap_err();
+            assert!(!e.contains(&alice), "{other:?}: {e}");
+        }
+        let wants = ::mcp::http::AuthResponse {
+            status: 401,
+            requirement: Some(r#"auth-token; resource-token="RT""#.into()),
+            ..Default::default()
+        };
+        assert!(
+            !::mcp::http::with_request_scope(None, || root.on_response(&wants, "other.example")),
+            "a request made for nobody earns no user-scoped token"
+        );
     }
 }

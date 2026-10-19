@@ -158,9 +158,8 @@
   {
     "name": "Resource Indicators",
     "version": "RFC 8707",
-    "mark": "preview",
-    "full": "Resource indicators for a company's MCP server: a build-from-source preview",
-    "href": "/docs/interoperability/#personal-agent-protocol",
+    "full": "Resource indicators: every token request to an MCP server's authorization server names the server",
+    "href": "/docs/authentication/#oauth-20",
     "tier": 2
   },
   {

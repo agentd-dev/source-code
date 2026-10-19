@@ -949,6 +949,58 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - `agentd-core`: `config::agents_md` (`AgentsMd`, `read`, `dirs`, `FILE`,
   `MAX_BYTES`); `Agent::{workspace, workspace_notes}`.
 
+- RFC 8707 resource indicators: every authorization, token, refresh and
+  client-credentials request an `oauth2` block makes carries `resource` —
+  on an MCP server or an MCP catalog entry the server's `endpoint` in
+  canonical form (scheme and host lowercased, no fragment, no trailing
+  `/`), as MCP's authorization spec requires. `auth.resource` is `auto`,
+  `omit` or a URI; unset, `auto` on an MCP target and `omit` on a model
+  connection or an A2A peer, since Microsoft Entra refuses the parameter
+  (AADSTS901002). The `mcp.servers[].oauth` shortcut sends the server's
+  endpoint. A `resource` that is not an absolute http(s) URI without a
+  fragment is refused at load.
+- An MCP server's `oauth2` block may name no `issuer` and no `token_url`:
+  `--login` and the daemon's first request that needs a token read the
+  server's RFC 9728 metadata, and a login is kept with the issuer it names.
+- The authorization-code login sends an OpenID Connect `nonce` when it asks
+  for `openid`, and refuses an ID token that does not carry it, names
+  another issuer, or is not for its `client_id`; `oauth2::Tokens` keeps the
+  `id_token`.
+- MCP's step-up flow: a `403` whose challenge is `insufficient_scope` with
+  the scopes a call needs renews a login's token for the union of the
+  scopes it holds and those named, and sends the call again — at most twice
+  for one union in a process's life. A renewal the authorization server
+  refuses keeps the union with the login (`step_up` in its cache record),
+  and the next `agentd --login` asks for it. A `client_credentials` grant
+  asks for nothing more.
+- Typed principals (RFC 0044 §5.2): every principal the A2A listener names
+  carries the tuple its transport established — `source` (`x509`,
+  `bearer`, `device`, `operator`, …), issuer and stable id: a certificate's
+  SubjectPublicKeyInfo hash, a rule's id, a device session's name — and
+  `PrincipalRef::grant_id` derives a key from it over length-prefixed
+  fields, never from the display string.
+- The supervisor makes itself non-dumpable (`PR_SET_DUMPABLE` 0) and sets
+  its core-dump limit to zero at start; a kernel that refuses either is a
+  `proc.harden` warning. Every child it starts — turn worker, subagent,
+  think child, instance — is started without the environment variables a
+  supervisor-only secret is read from: the `{{secret:NAME}}` of
+  `security.companies.seal_key`.
+- `agentd-mcp`: `http::SCOPE_META`, `request_scope` and
+  `with_request_scope`: a host names whom an MCP request is made for under
+  `params._meta["agentd-mcp/scope"]`, and the transport takes it out of the
+  request before it is signed or sent and hands it to the signer.
+- `agentd-net`: `x509::PeerIdentity::spki`, the DER of a certificate's
+  SubjectPublicKeyInfo.
+- `agentd-core`: `a2a::principals::typed` (`PrincipalRef`, `Source`) and
+  `Principal::typed`; `CertId::spki_sha256`; `Auth::resource` and
+  `resource_for`, `config::settings::{ResourceParam, canonical_resource}`,
+  `Settings::{auth_spec_at, supervisor_only_env}`; `AuthSpec::{resource,
+  protected_resource, catalog}`, `McpOauthSpec::resource`;
+  `auth::challenge::{reach, same_origin, ResourceMetadata}`;
+  `oauth2::{discover_by, refresh_scoped}`, `Discovered::{pkce_s256,
+  endpoints_on_origin, code_challenge_methods_supported}`,
+  `OAuth2Params::{resource, pkce_s256, dial}`; `login::{resolve_params,
+  spec_of}`; `CachedCred::{scope, step_up}`; `sec::harden`.
 **Changed.**
 
 - A login is cached with the authorization server it was made at — the
@@ -1183,6 +1235,42 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `exec` feature refuses `security.exec.enabled` together with
   `skills.sources`.
 
+- An authorization server an MCP server's RFC 9728 metadata names is held
+  as a URL the server chose: on the server's own origin it is reached as
+  the server is; anywhere else only over HTTPS, through the SSRF guard (no
+  loopback, private or link-local address), and under `security.egress:
+  closed` only when a `services` entry covers it. Its metadata must keep
+  its token, device and revocation endpoints on its own origin. RFC 9728
+  metadata whose `resource` is not the server's `endpoint` byte for byte is
+  refused (RFC 9728 §3.3), where it was used. Metadata of an issuer the
+  operator pinned is trusted for the endpoints it names, as before.
+- The authorization-code login refuses an authorization server whose
+  metadata does not list `S256` in `code_challenge_methods_supported`
+  before printing a URL. With every endpoint pinned, no metadata is read
+  and nothing is judged.
+- `a2a.principals[].match`: every field a rule names must match — `san`
+  and `sub` together admit a certificate both match, `bearer_ref` beside
+  either admits the bearer only with a certificate they match — and `sub`
+  is a glob, as `san` is. A rule naming several matchers was refused at
+  load; `any` beside another matcher still is.
+- Whose a run is comes from the transport that authenticated its trigger,
+  passed beside the payload: an A2A message's sender, a principal's
+  signal's sender, else the autonomous actor. A `principal` key in a
+  trigger's payload no longer names it. (A webhook's body and a stream
+  event's data were nested under `body` and `data`, so none could reach it.)
+- Every MCP call says whom it is for: the `mcp.tool` workflow step, the
+  calls a turn worker or a think child makes itself, the knowledge
+  auto-context call and a subagent's own calls carry `agent/acting_for` and
+  `agent/labels`, as the supervisor's tool calls did.
+- AAuth's user-scoped (Case C) tokens are held for the authority and the
+  principal the request was made for: never presented on another
+  principal's request, and neither presented nor earned on a request made
+  for nobody. A child is handed only the tokens of whom it works for, and
+  `AgentMsg::AAuthToken` and `AAuthHandoff` carry that `principal`.
+- `--login`'s and the daemon's OAuth requests share one resolution of a
+  block's endpoints (`login::resolve_params`); the `mcp.servers[].oauth`
+  shortcut's token request goes through `auth::http`, which follows no
+  redirect.
 **Fixed.**
 
 - A reload that rebuilt the skills catalogue dropped the body of every

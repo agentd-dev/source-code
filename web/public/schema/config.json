@@ -142,6 +142,10 @@
         "region": {
           "type": "string"
         },
+        "resource": {
+          "description": "oauth2: the RFC 8707 resource every authorization, token, refresh and client-credentials request carries — auto (the endpoint, canonical), omit, or a URI; unset, auto on an MCP server or MCP catalog entry and omit elsewhere",
+          "type": "string"
+        },
         "role_name": {
           "type": "string"
         },

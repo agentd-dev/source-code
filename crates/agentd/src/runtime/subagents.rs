@@ -476,7 +476,7 @@ impl Runtime {
             mcp_servers: servers.iter().filter_map(|s| self.spawn_spec(s)).collect(),
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
-            aauth: aauth_handoff(),
+            aauth: None,
             limits: Limits {
                 max_steps: steps,
                 max_tokens: tokens,
@@ -501,6 +501,7 @@ impl Runtime {
                     .unwrap_or_else(|| "info".into()),
                 log_content: self.settings.observability.log_content,
                 otel_endpoint: self.settings.observability.otel.endpoint.clone(),
+                attribution: Default::default(),
             },
             depth: depth + 1,
             warm: mode == "warm",
@@ -558,6 +559,17 @@ impl Runtime {
             dirty: true,
         };
         record.principal = self.spawn_principal(&record);
+        // It signs as the agent, holding the Case C tokens of whom it works
+        // for alone.
+        payload.aauth = aauth_handoff(record.principal.as_deref());
+        // Its direct MCP calls say whom they are for, as the supervisor's do.
+        let mut attribution = json!({});
+        self.attribute(&mut attribution, record.principal.as_deref());
+        crate::mcp::scope(&mut attribution, record.principal.as_deref());
+        if let Value::Object(m) = attribution {
+            payload.telemetry.attribution = m;
+            record.payload = Some(secret_free_payload(&payload));
+        }
         match self.children.spawn(
             &payload,
             ChildKind::Subagent {
@@ -980,7 +992,12 @@ impl Runtime {
             // since, and a stored one is never replayed.
             payload.intelligence = self.intel_config(payload.intelligence.reference.as_deref());
             // And it signs as this life's agent: the record kept no identity.
-            payload.aauth = aauth_handoff();
+            payload.aauth = aauth_handoff(
+                self.subagents
+                    .get(&handle)
+                    .and_then(|s| s.principal.clone())
+                    .as_deref(),
+            );
             // It carries on in the trace it was spawned in, as the
             // supervisor's lines about it do.
             let trace = self.subagents.get(&handle).and_then(|s| s.trace.clone());
@@ -1071,13 +1088,16 @@ fn apply_spawn_defaults(
 /// The AAuth identity this process signs with, as a turn worker or a
 /// subagent is handed it; `None` with no identity configured, or in a build
 /// without `aauth`.
-pub(crate) fn aauth_handoff() -> Option<crate::subagent::protocol::AAuthHandoff> {
+pub(crate) fn aauth_handoff(
+    principal: Option<&str>,
+) -> Option<crate::subagent::protocol::AAuthHandoff> {
     #[cfg(feature = "aauth")]
     {
-        crate::aauth::handoff()
+        crate::aauth::handoff(principal)
     }
     #[cfg(not(feature = "aauth"))]
     {
+        let _ = principal;
         None
     }
 }

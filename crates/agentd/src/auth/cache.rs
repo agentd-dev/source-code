@@ -50,6 +50,13 @@ pub struct CachedCred {
     /// under no server at all (MCP 2026-07-28, authorization server binding).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_server: Option<String>,
+    /// The scope the token was granted, as the token response said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Scopes a server's `insufficient_scope` challenge asked for that a
+    /// renewal could not get: the next `agentd --login` asks for them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_up: Vec<String>,
     /// Provider-specific extras — e.g. temporary AWS credentials from an SSO
     /// login (`aws_access_key_id` / `aws_secret_access_key` / `aws_session_token`).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]

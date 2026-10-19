@@ -515,7 +515,12 @@ impl Runtime {
             // restart, where turn ids begin again: a server that dedupes on
             // it would otherwise answer a new call with an old result.
             idempotency_prefix: format!("{}/{}/{ctx_id}", self.instance, self.process_nonce),
-            tool_meta: Some(json!({"agent/ctx": ctx_id, "agent/instance": self.instance})),
+            tool_meta: Some({
+                let mut m = json!({"agent/ctx": ctx_id, "agent/instance": self.instance});
+                self.attribute(&mut m, job.principal.as_deref());
+                crate::mcp::scope(&mut m, job.principal.as_deref());
+                m
+            }),
             temperature: None,
             max_tokens_per_call: 0,
             turn_id: turn_id.clone(),
@@ -1048,7 +1053,9 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         };
         let tx = self.events_tx.clone();
         let mut meta = json!({"agent/instance": self.instance, "agent/ctx": job.ctx});
+        self.attribute(&mut meta, job.principal.as_deref());
         let call = crate::mcp::stamp_trace(&mut meta, job.trace.as_ref());
+        crate::mcp::scope(&mut meta, job.principal.as_deref());
         self.staged_turns.insert(stage_id, job);
         std::thread::Builder::new()
             .name("knowledge.auto_context".into())
@@ -1177,6 +1184,43 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
         }
     }
 
+    /// Whom the child of `kind` works for: the run's principal for a step's
+    /// turn, the conversation's for a root turn or a think child.
+    pub(crate) fn child_principal(&self, kind: &ChildKind) -> Option<String> {
+        match kind {
+            ChildKind::RootTurn { ctx, .. } => {
+                self.contexts.get(ctx).and_then(|c| c.principal.clone())
+            }
+            ChildKind::StepTurn { run, .. } => self.runs.get(run).and_then(|r| r.principal.clone()),
+            ChildKind::Think { ctx, .. } => ctx
+                .as_ref()
+                .and_then(|c| self.contexts.get(c))
+                .and_then(|c| c.principal.clone()),
+            ChildKind::Subagent { handle } => {
+                self.subagents.get(handle).and_then(|s| s.principal.clone())
+            }
+        }
+    }
+
+    /// Who an MCP call's work is for, as its `_meta` says it: written into
+    /// `meta` as `agent/acting_for` — the principal, or the autonomous actor
+    /// (`identity.autonomous_as`) for work nobody's — and `agent/labels`,
+    /// when it has any. Every MCP call agentd makes carries it, whichever
+    /// process sends it: a server that attributes per person sees one.
+    pub(crate) fn attribute(&self, meta: &mut Value, principal: Option<&str>) {
+        meta["agent/acting_for"] = json!(
+            principal.map(str::to_string).unwrap_or_else(|| self
+                .settings
+                .identity
+                .autonomous_id()
+                .to_string())
+        );
+        let labels = self.labels_of(principal);
+        if !labels.is_empty() {
+            meta["agent/labels"] = json!(labels);
+        }
+    }
+
     /// The budget scope for the principal work is being done for.
     ///
     /// `a2a.principals[].quotas.budget` parsed, validated and landed on the
@@ -1245,7 +1289,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             mcp_servers: servers,
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
-            aauth: super::subagents::aauth_handoff(),
+            aauth: super::subagents::aauth_handoff(self.child_principal(&launch.kind).as_deref()),
             limits: Limits {
                 max_steps: launch.max_steps,
                 max_tokens: launch.max_tokens,
@@ -1270,6 +1314,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                     .unwrap_or_else(|| "info".into()),
                 log_content: self.settings.observability.log_content,
                 otel_endpoint: self.settings.observability.otel.endpoint.clone(),
+                attribution: Default::default(),
             },
             depth: 0,
             warm: false,

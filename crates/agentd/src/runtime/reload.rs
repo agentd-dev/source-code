@@ -148,6 +148,7 @@ impl Runtime {
             }
         };
         self.settings_doc = loaded.doc;
+        crate::sec::harden::set_reserved(self.settings.supervisor_only_env());
         Ok(self.commit_reload(&old, staged))
     }
 
@@ -1161,8 +1162,12 @@ pub(crate) fn dial_specs(
         match srv.to_spec() {
             Ok(mut spec) => {
                 // An `oauth2` block with no client_id presents agentd's
-                // Client ID Metadata Document (RFC 0052).
-                spec.auth = srv.auth.as_ref().map(|a| s.auth_spec(a));
+                // Client ID Metadata Document (RFC 0052), and every token
+                // request names the server as its RFC 8707 `resource`.
+                spec.auth = srv
+                    .auth
+                    .as_ref()
+                    .map(|a| s.auth_spec_at(a, &srv.endpoint, true));
                 specs.insert(srv.name.clone(), spec);
             }
             Err(e) => errs.push(format!("mcp server {:?}: {e}", srv.name)),

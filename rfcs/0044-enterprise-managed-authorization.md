@@ -3477,6 +3477,72 @@ command set (`--workspace --all-features`, the per-feature solo matrix, and the
 a2a-spec oracle), the shipped examples validate, and the RFC 0042 completeness
 test covers every new key.
 
+### 7.0 What P0 found built (2026-10-19)
+
+P0 was checked against `main` at `4dac22c0` before any of it was written.
+RFC 0047 P0 (`5a9a0ad8`) and RFC 0052 (`7917664a`) had built part of it;
+RFC 0043 (v1.17.0) the A2A rows. "Here" is the commit that carries this
+table.
+
+| P0 scope item | State at `4dac22c0` | Done here |
+|---|---|---|
+| RFC 8707 `resource` on every authorize, token, refresh and `client_credentials` request to an MCP server's AS; per-endpoint `resource: auto \| omit \| <uri>`, `omit` for `intelligence` and peers | not built | built: `auth.resource`, resolved per place (`Settings::auth_spec_at`); the `oauth:` shortcut sends the endpoint |
+| AS discovery in the MCP order with a byte-equal `issuer` | built (`5a9a0ad8`) | — |
+| PRM path-inserted first, then root | built (`5a9a0ad8`) | — |
+| PRM `resource` equality (RFC 9728 §3.3) | not built: only `authorization_servers` was read | built |
+| Discovery in the connect path | partly: AS metadata from a configured `issuer` at the first request (`5a9a0ad8`); RFC 9728 only at `--login`, and the load refused an MCP block with neither `issuer` nor `token_url`, so the daemon could never use it | built: the daemon reads RFC 9728 at its first token request, and an MCP block may name no AS |
+| `AuthResponse.www_authenticate` | built (`5a9a0ad8`), with `HttpError::Refused` | — |
+| PKCE-method gate | not built | built: no `S256` in `code_challenge_methods_supported` is refused before a URL is printed; pinned endpoints are not judged |
+| RFC 9207 `iss` decision table | built (`5a9a0ad8`) | a black-box check of every row |
+| `nonce` | not built | built, with the ID token's `iss` and `aud` |
+| `403 insufficient_scope` union step-up, bounded; agent mode fails fast | partly: the 403 reached the signer and was typed (`5a9a0ad8`); nothing stepped up | built: a renewal for the union, at most twice per union; a refused one is kept for the next `--login` |
+| Keep `id_token` | not built | built (`oauth2::Tokens::id_token`); not written to the file cache |
+| Refresh keeps the old token when none is returned; rotation written back | built (`5a9a0ad8`) | — |
+| Persisted credentials keyed by AS issuer (SEP-2352) | built (`7917664a`) | extended to the issuer RFC 9728 names in the daemon |
+| RFC 7009 on `--logout` | built (`5a9a0ad8`) | — |
+| `private_key_jwt` signer; `client_credentials` without a secret | built (`5a9a0ad8`, ES256 only; `7917664a` routed `client_credentials` through it) | — (RS256 is P1's, for providers) |
+| One auth HTTP helper: HTTPS, SSRF classifier, egress catalog, no redirects, same-origin token endpoint for MCP-discovered metadata | partly: `auth::http` with no redirects and `Dial::Vetted` (`5a9a0ad8`), used for a Company's URLs; MCP discovery dialled every URL by name, checked no catalog and no origin; the `oauth:` shortcut had a client of its own | built: a server-named AS off the server's origin is HTTPS-only, SSRF-vetted and, under `egress: closed`, catalogued; its token, device and revocation endpoints must share its origin; the shortcut uses `auth::http`. The "dev flag" is the server's own origin: an AS on the configured endpoint's origin is reached as the endpoint is, which is what keeps a loopback development setup working without a separate switch |
+| `oauth = ["dep:ring"]`; solo CI row for `oauth` | built (`5a9a0ad8`; the row predates it) | — |
+| `acting_for` gaps: `mcp.tool` step, turn and think `tool_meta`, knowledge call, subagent and think principal | partly: the subagent and think `ToolCaller` carried a principal; the rest did not | built, and a flat subagent's own connections |
+| `sub` a glob; matcher fields AND | not built (else-if chain, exact `sub`, validation refusing two matchers) | built |
+| AAuth Case C cache keyed by `(authority, principal)` | not built | built: keyed by the request's scope (`agentd-mcp/scope` in `_meta`, stripped by the transport), which the host stamps from the work's authority; a request for nobody presents and earns no Case C token; a child is handed its principal's tokens only. The login-hint and `idp_subject` check of §5.13 item 3 need pins and stay with P1/P2 |
+| A2A card `securitySchemes`; per-principal `contextId` | built (RFC 0043, v1.17.0; regression checks in the `auth` conformance family and `a2a_authz_e2e`) | — |
+| Two-principal no-mint conformance test | not built | P0 has no grant to mint under; the `ema` family (P1) asserts it |
+| Typed principals; typed authority on inbox events | not built | built: `PrincipalRef` on every listener-named `Principal`; the run's authority is a parameter set by the transport (A2A sender, signal sender). No payload could set it at `4dac22c0` (webhook bodies and stream data are nested), so this closes the read path rather than a live hole |
+| Reserved supervisor-only names stripped from every child; `PR_SET_DUMPABLE(0)`, `RLIMIT_CORE=0` | not built | built: today's one supervisor-only secret is `security.companies.seal_key`; P1 adds the delegation keys |
+
+| P0 exit criterion | Test |
+|---|---|
+| `resource` on every grant | `mcp-auth-core/resource-on-every-grant`; `oauth2` unit `every_grant_carries_the_resource`; `mcp_oauth` |
+| Wrong discovery order and issuer mismatch refused | `mcp-auth-core/as-metadata-path-inserted-first`, `as-issuer-must-match` (built `5a9a0ad8`) |
+| PRM `resource` mismatch refused | `mcp-auth-core/resource-metadata-must-name-the-server`; `challenge` unit |
+| Every RFC 9207 row | `mcp-auth-core/rfc9207-iss-table` (with the PKCE gate and the nonce) |
+| `insufficient_scope` union retry | `mcp-auth-core/insufficient-scope-union-step-up`; `device` unit |
+| Refresh-token rotation survives a restart | `mcp-auth-core/rotation-survives-a-restart` |
+| Two principals isolated under AAuth | `aauth_flow_e2e` (the real transport against mock APD, Person Server and MCP server); not a conformance check: the conformance binary is built without `aauth` |
+| `http://` and internal-address discovery refused | `mcp-auth-core/server-chosen-urls-are-https-and-public`; `mcp_rfc9728_e2e` |
+| Google shape; Entra shape | `mcp-auth-core/google-shape-cross-origin-token-endpoint`, `entra-shape-no-resource-on-intelligence` |
+| A2A oracle: `securitySchemes` whenever `extendedAgentCard`; a message into another principal's context joins nothing | built with RFC 0043: `auth/card-declares-what-the-listener-enforces`, `auth/extended-card-needs-a-declared-credential`, `a2a_authz_e2e` |
+| … and mints nothing under their grant | P1, `ema` |
+| A webhook payload containing `principal` yields an agent-mode run | `webhook_e2e::a_principal_in_a_webhook_payload_is_a_label_not_the_runs_authority` |
+| A worker's environment holds no reserved name | `supervisor_env_e2e` (the spawn frames tap); `sec::harden` unit |
+| Only the §7.1 behaviour changes | see below |
+
+**Behaviour changes against §7.1.** Every row of §7.1 happened, with two
+qualifications: the webhook, stream and signal row changes nothing
+observable, because no such payload could name the run's principal at
+`4dac22c0`, so no `label_principal` fact was built (there is no label to
+keep); and the HTTPS rule for discovered URLs applies to an authorization
+server a server names off its own origin, which §5.6 calls the dev flag.
+Four changes are P0 scope items §7.1 does not list, and an existing
+deployment can see them: an authorization-code login against an AS whose
+metadata does not list `S256` is refused (the PKCE gate); one whose ID
+token lacks the login's `nonce`, names another issuer or another client is
+refused; RFC 9728 metadata whose `resource` is not the server's URL is
+refused where `--login` used it; and an AAuth Case C token is earned per
+principal, so each principal's first call to such a server runs its own
+Person Server exchange where one token used to serve every caller.
+
 ### 7.1 Behaviour changes
 
 P0 has no delegation surface, but it changes behaviour that existing

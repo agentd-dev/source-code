@@ -113,6 +113,14 @@ skip.
 | `mcp-auth-core/as-metadata-path-inserted-first` | for an issuer with a path, --login reads RFC 8414 metadata first, at the well-known URL with the suffix inserted before the path, and completes the device grant with the endpoints it names |
 | `mcp-auth-core/as-issuer-must-match` | metadata naming another issuer than the configured one, by a trailing slash, is refused: --login fails and sends no device or token request |
 | `mcp-auth-core/resource-metadata-path-inserted-first` | with no issuer configured, --login asks the MCP server, then reads its RFC 9728 metadata at the well-known URL with the suffix inserted before the server's path, before the root, and uses the issuer it names |
+| `mcp-auth-core/resource-metadata-must-name-the-server` | RFC 9728 metadata whose `resource` is not the MCP server's URL is refused: --login fails, names RFC 9728 §3.3, and asks the authorization server it names for nothing |
+| `mcp-auth-core/server-chosen-urls-are-https-and-public` | an authorization server an MCP server's RFC 9728 metadata names off the server's own origin is refused when it is plain http:// or a link-local address |
+| `mcp-auth-core/resource-on-every-grant` | RFC 8707: the device authorization, the device token poll, the daemon's refresh and a client-credentials token request to an MCP server's authorization server all carry `resource` — the server's URL in canonical form |
+| `mcp-auth-core/rfc9207-iss-table` | the authorization-code login decides every RFC 9207 row — `iss` equal, different, or absent, with the metadata declaring support or not — refuses metadata without S256 before handing out a URL, and refuses an ID token without the login's nonce |
+| `mcp-auth-core/insufficient-scope-union-step-up` | a `403 insufficient_scope` naming a scope the token lacks is answered by a renewal asking for the union of the held and the challenged scopes, and the call goes through with the new token |
+| `mcp-auth-core/rotation-survives-a-restart` | a refresh token the authorization server rotates is kept: the daemon after a restart renews from the rotated token, never the spent one |
+| `mcp-auth-core/google-shape-cross-origin-token-endpoint` | metadata of an operator-pinned issuer that puts its token and device endpoints on another origin (Google's documented shape) is used as declared |
+| `mcp-auth-core/entra-shape-no-resource-on-intelligence` | an intelligence connection's oauth2 login sends no `resource` unless told to (Microsoft Entra refuses the parameter, AADSTS901002) |
 | `mcp-auth-core/logout-revokes-at-the-server` | --logout after a login revokes the refresh token at the revocation_endpoint the metadata names (RFC 7009: token and token_type_hint=refresh_token) |
 
 ### `mcp-tasks`

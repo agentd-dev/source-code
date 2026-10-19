@@ -235,6 +235,34 @@ impl Settings {
         }
         spec
     }
+
+    /// [`Self::auth_spec`] for a block that authenticates to `endpoint`, an
+    /// MCP server's when `mcp`: the RFC 8707 `resource` it sends
+    /// ([`Auth::resource_for`]); for an MCP server's `oauth2` block that
+    /// names no `issuer` and no `token_url`, the server whose RFC 9728
+    /// metadata names its authorization server; and, under
+    /// `security.egress: closed`, the catalog a server-named authorization
+    /// server must be in.
+    pub fn auth_spec_at(&self, auth: &Auth, endpoint: &str, mcp: bool) -> crate::config::AuthSpec {
+        let mut spec = self.auth_spec(auth);
+        if auth.kind != AuthKind::Oauth2 {
+            return spec;
+        }
+        spec.resource = auth.resource_for(endpoint, mcp);
+        if mcp && auth.issuer.is_none() && auth.token_url.is_none() {
+            spec.protected_resource = Some(endpoint.to_string());
+        }
+        if self.security.egress == super::Egress::Closed {
+            spec.catalog = Some(
+                self.services
+                    .values()
+                    .map(|s| s.endpoint.clone())
+                    .filter(|e| !e.is_empty())
+                    .collect(),
+            );
+        }
+        spec
+    }
 }
 
 /// An `oauth2` block that names no `client_id`, and so uses `client`'s

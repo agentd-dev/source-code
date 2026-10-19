@@ -204,7 +204,7 @@ connection cannot apply is refused when the configuration loads.
 |---|---|---|---|
 | Static bearer token | yes | yes | yes |
 | Static custom header in an `auth:` block | — (use `headers`, below) | yes | yes |
-| OAuth 2.1: device code, authorization code with PKCE and RFC 9207 `iss`, client credentials; RFC 8414 then OIDC discovery with an exact `issuer`; `private_key_jwt` (RFC 7523) and `client_secret_basic`; RFC 7009 revocation on `--logout`; with no registration, a [Client ID Metadata Document](authentication.md#client-id-metadata-document) (draft -02) | yes | yes | yes |
+| OAuth 2.1: device code, authorization code with PKCE, RFC 9207 `iss` and an OpenID Connect `nonce`, client credentials; RFC 8414 then OIDC discovery with an exact `issuer`; RFC 8707 `resource` (by default on MCP servers only); `private_key_jwt` (RFC 7523) and `client_secret_basic`; RFC 7009 revocation on `--logout`; with no registration, a [Client ID Metadata Document](authentication.md#client-id-metadata-document) (draft -02) | yes | yes | yes |
 | AWS SigV4: environment, IAM Identity Center (SSO), EC2 instance role, EKS IRSA | yes, and required by `dialect: bedrock` | yes | yes |
 | SPIFFE JWT-SVID as a bearer | yes | yes | yes |
 | SPIFFE X.509-SVID or a client certificate (mTLS) | — | yes | yes |
@@ -229,7 +229,7 @@ details.
 ## Internet standards
 
 The IETF RFCs agentd implements, and where. The release binaries implement
-all of them except the last two, which only the `companies` preview uses.
+all of them except the last, which only the `companies` preview uses.
 OAuth discovery also reads OpenID Connect Discovery 1.0 metadata, after
 RFC 8414. One OAuth Working Group draft is implemented too, in the release
 binaries: the [Client ID Metadata Document](authentication.md#client-id-metadata-document),
@@ -242,7 +242,8 @@ has no registration.
 | RFC 7636 | PKCE | authorization-code logins |
 | RFC 8628 | Device authorization grant | `agentd --login`, and the grant agentd serves display clients on its A2A listener |
 | RFC 8414 | Authorization server metadata | OAuth discovery, before OpenID Connect Discovery |
-| RFC 9728 | Protected resource metadata | finding an MCP server's authorization server |
+| RFC 9728 | Protected resource metadata | finding an MCP server's authorization server, its `resource` matched byte for byte |
+| RFC 8707 | Resource indicators | every authorization, token, refresh and client-credentials request to an MCP server's authorization server; the Bearer token for a company's MCP server |
 | RFC 9207 | `iss` in authorization responses | browser logins |
 | RFC 7523 | JWT client assertions (`private_key_jwt`) | client authentication at a token endpoint |
 | RFC 7009 | Token revocation | `agentd --logout` |
@@ -250,7 +251,6 @@ has no registration.
 | RFC 7748, RFC 7516 | X25519 and JWE Compact | encrypted instruction documents |
 | RFC 8446 | TLS 1.3 | every HTTPS connection, in and out |
 | RFC 9449 | DPoP | requests to a company (the `companies` preview) |
-| RFC 8707 | Resource indicators | the Bearer token for a company's MCP server (the `companies` preview) |
 
 ## Platforms and distribution
 

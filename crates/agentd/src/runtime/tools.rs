@@ -439,17 +439,8 @@ impl Runtime {
         // and nothing about WHO the work is for, so a server could neither
         // authorize nor attribute per person.
         let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
-        meta["agent/acting_for"] = json!(
-            caller.principal.clone().unwrap_or_else(|| self
-                .settings
-                .identity
-                .autonomous_id()
-                .to_string())
-        );
-        let labels = self.labels_of(caller.principal.as_deref());
-        if !labels.is_empty() {
-            meta["agent/labels"] = json!(labels);
-        }
+        self.attribute(&mut meta, caller.principal.as_deref());
+        crate::mcp::scope(&mut meta, caller.principal.as_deref());
         let call = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
@@ -602,17 +593,8 @@ impl Runtime {
             // — and nothing about WHO the work is for, so a server could
             // neither authorize nor attribute per person.
             let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
-            meta["agent/acting_for"] = json!(
-                caller.principal.clone().unwrap_or_else(|| self
-                    .settings
-                    .identity
-                    .autonomous_id()
-                    .to_string())
-            );
-            let labels = self.labels_of(caller.principal.as_deref());
-            if !labels.is_empty() {
-                meta["agent/labels"] = json!(labels);
-            }
+            self.attribute(&mut meta, caller.principal.as_deref());
+            crate::mcp::scope(&mut meta, caller.principal.as_deref());
             let call = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
             (meta, call)
         };

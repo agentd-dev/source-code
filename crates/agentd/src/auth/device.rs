@@ -40,30 +40,35 @@ use crate::config::AuthSpec;
 const REFRESH_SKEW_MS: u64 = 60_000;
 
 /// The OAuth2 request params of one `auth:` block: pinned by the block, or
-/// discovered from its `issuer` by the first request that needs them — and by
-/// each one after, until discovery succeeds — so an issuer that is down when
-/// the connection is built leaves its requests failing, not unauthenticated,
-/// until it answers.
+/// discovered from its `issuer` — or, on an MCP server's block that names
+/// neither an `issuer` nor a `token_url`, from the authorization server the
+/// server's RFC 9728 metadata names — by the first request that needs them,
+/// and by each one after, until discovery succeeds: so an issuer that is down
+/// when the connection is built leaves its requests failing, not
+/// unauthenticated, until it answers.
 pub struct Endpoints {
     auth: AuthSpec,
     timeout: Duration,
     resolved: Mutex<Option<OAuth2Params>>,
     /// The authorization server a cached record must have come from: the
     /// block's `issuer`, else its `token_url`
-    /// ([`OAuth2Params::authorization_server`]).
-    server: String,
+    /// ([`OAuth2Params::authorization_server`]); `None` until RFC 9728
+    /// discovery names it.
+    server: Option<String>,
 }
 
 impl Endpoints {
-    /// The block's endpoints, without dialing: `client_id` and a `token_url`
-    /// or an `issuer` are what it must name.
+    /// The block's endpoints, without dialing: `client_id`, and a
+    /// `token_url`, an `issuer` or an MCP server to ask, are what it must
+    /// name.
     pub fn new(auth: &AuthSpec, timeout: Duration) -> Result<Endpoints, String> {
         if auth.client_id.is_none() {
             return Err("auth.client_id is required for oauth2".into());
         }
-        let Some(server) = auth.issuer.clone().or_else(|| auth.token_url.clone()) else {
+        let server = auth.issuer.clone().or_else(|| auth.token_url.clone());
+        if server.is_none() && auth.protected_resource.is_none() {
             return Err("auth.token_url is required (or set auth.issuer)".into());
-        };
+        }
         Ok(Endpoints {
             auth: auth.clone(),
             timeout,
@@ -77,8 +82,18 @@ impl Endpoints {
         Endpoints {
             auth: AuthSpec::default(),
             timeout: Duration::ZERO,
-            server: params.authorization_server().to_string(),
+            server: Some(params.authorization_server().to_string()),
             resolved: Mutex::new(Some(params)),
+        }
+    }
+
+    /// The authorization server a token must have come from: the block's,
+    /// or — discovered by the first request — the one the MCP server's RFC
+    /// 9728 metadata names.
+    pub fn server(&self) -> Result<String, String> {
+        match &self.server {
+            Some(s) => Ok(s.clone()),
+            None => Ok(self.params()?.authorization_server().to_string()),
         }
     }
 
@@ -93,7 +108,11 @@ impl Endpoints {
         {
             return Ok(p.clone());
         }
-        let p = params_from_spec(&self.auth, self.timeout)?;
+        let p = crate::auth::login::resolve_params(
+            &self.auth,
+            self.auth.token_url.is_none(),
+            self.timeout,
+        )?;
         *self.resolved.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
         Ok(p)
     }
@@ -115,7 +134,14 @@ pub struct TokenSource {
     /// The instant before which the token endpoint asked for no refresh (a
     /// `429` or `503` with `Retry-After`).
     not_before: Mutex<Option<Instant>>,
+    /// How many step-ups each scope set has been asked for, so a server that
+    /// keeps challenging is answered a bounded number of times.
+    step_ups: Mutex<std::collections::BTreeMap<String, u32>>,
 }
+
+/// The step-ups one scope set is asked for, at most, in a process's life
+/// (MCP: retry "no more than a few times").
+const STEP_UP_ATTEMPTS: u32 = 2;
 
 impl TokenSource {
     /// The credential `target` names in the login cache at `dir`, refreshed
@@ -130,6 +156,7 @@ impl TokenSource {
             cache: Mutex::new(seed),
             unsaved: Mutex::new(false),
             not_before: Mutex::new(None),
+            step_ups: Mutex::new(Default::default()),
         }
     }
 
@@ -187,10 +214,15 @@ impl TokenSource {
                 return Err(e.message);
             }
         };
-        let cred = CachedCred {
+        let mut cred = CachedCred {
             authorization_server: file.authorization_server,
+            step_up: file.step_up,
             ..crate::auth::login::refreshed_cred(&toks, &rt)
         };
+        // A response without `scope` was granted what the refresh asked for.
+        if cred.scope.is_none() {
+            cred.scope = file.scope;
+        }
         let access = cred.access_token.clone();
         // Kept before it is used: a rotated refresh token memory alone held
         // would die with the process, and the one the cache still names is
@@ -207,11 +239,92 @@ impl TokenSource {
         Ok(access)
     }
 
+    /// A `403 insufficient_scope` challenge asked for `wanted` (MCP's step-up
+    /// authorization flow): renew the token for the union of the scopes it
+    /// holds and `wanted`, and say whether the request should be sent again
+    /// with the new one. Nothing is asked when the token already holds
+    /// `wanted` — the server is inconsistent, and another token would not
+    /// change its answer — nor more than [`STEP_UP_ATTEMPTS`] times for one
+    /// union. A renewal the authorization server refuses records the union
+    /// in the login cache, so the next `agentd --login` asks for it.
+    pub fn step_up(&self, wanted: &[String]) -> bool {
+        let held = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .or_else(|| cache::load_file(&self.dir, &self.target));
+        let mut union: Vec<String> = match held.as_ref().and_then(|c| c.scope.as_deref()) {
+            Some(granted) => granted.split_whitespace().map(str::to_string).collect(),
+            None => self.endpoints.auth.scopes.clone(),
+        };
+        let before = union.len();
+        for w in wanted {
+            if !union.contains(w) {
+                union.push(w.clone());
+            }
+        }
+        if union.len() == before {
+            return false;
+        }
+        let mut key: Vec<&str> = union.iter().map(String::as_str).collect();
+        key.sort_unstable();
+        {
+            let mut asked = self.step_ups.lock().unwrap_or_else(|e| e.into_inner());
+            let n = asked.entry(key.join(" ")).or_default();
+            if *n >= STEP_UP_ATTEMPTS {
+                return false;
+            }
+            *n += 1;
+        }
+        let Ok(_held) = cache::lock_file(&self.dir, &self.target, self.timeout) else {
+            return false;
+        };
+        let Some(file) = cache::load_file(&self.dir, &self.target) else {
+            return false;
+        };
+        if self.same_server(&file, "").is_err() {
+            return false;
+        }
+        let renewed = match (&file.refresh_token, self.endpoints.params()) {
+            (Some(rt), Ok(params)) => {
+                oauth2::refresh_scoped(&params, rt, Some(&union), self.timeout)
+                    .ok()
+                    .map(|t| (t, rt.clone()))
+            }
+            _ => None,
+        };
+        let Some((toks, rt)) = renewed else {
+            // The login asks for these next time.
+            let mut kept = file;
+            for w in &union[before..] {
+                if !kept.step_up.contains(w) {
+                    kept.step_up.push(w.clone());
+                }
+            }
+            let _ = cache::store_file(&self.dir, &self.target, &kept);
+            return false;
+        };
+        let mut cred = CachedCred {
+            authorization_server: file.authorization_server,
+            ..crate::auth::login::refreshed_cred(&toks, &rt)
+        };
+        if cred.scope.is_none() {
+            cred.scope = Some(union.join(" "));
+        }
+        let kept = cache::store_file(&self.dir, &self.target, &cred);
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(cred);
+        if kept.is_err() {
+            *self.unsaved.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        }
+        true
+    }
+
     /// Refuse a record that did not come from the block's authorization
     /// server, or does not say where it came from: its tokens are never
     /// presented to, or renewed at, a server that did not issue them.
     fn same_server(&self, c: &CachedCred, login: &str) -> Result<(), String> {
-        let want = &self.endpoints.server;
+        let want = &self.endpoints.server()?;
         match c.authorization_server.as_deref() {
             Some(from) if from == want => Ok(()),
             Some(from) => Err(format!(
@@ -283,6 +396,30 @@ impl ::mcp::http::RequestSigner for BearerSigner {
     ) -> Result<Vec<(String, String)>, String> {
         let tok = report::outcome(&self.source.target, self.source.bearer())?;
         Ok(vec![("Authorization".to_string(), format!("Bearer {tok}"))])
+    }
+
+    /// A `403` whose challenge is `insufficient_scope` with the scopes it
+    /// needs: step up ([`TokenSource::step_up`]) and send again with the
+    /// new token, when the authorization server gave one.
+    fn on_response(&self, resp: &::mcp::http::AuthResponse, _authority: &str) -> bool {
+        let Some(c) = resp
+            .www_authenticate
+            .as_deref()
+            .and_then(|h| ::mcp::http::Challenge::parse(resp.status, h))
+        else {
+            return false;
+        };
+        if resp.status != 403 || c.error.as_deref() != Some("insufficient_scope") {
+            return false;
+        }
+        let wanted: Vec<String> = c
+            .scope
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        !wanted.is_empty() && self.source.step_up(&wanted)
     }
 }
 
@@ -359,51 +496,6 @@ impl ::mcp::http::RequestSigner for StaticSigner {
         )?;
         Ok(vec![(self.header.clone(), v)])
     }
-}
-
-/// Resolve the OAuth2 request params from a runtime `AuthSpec`, discovering the
-/// endpoints from `issuer` when they are not pinned.
-fn params_from_spec(auth: &AuthSpec, timeout: Duration) -> Result<OAuth2Params, String> {
-    let client_id = auth
-        .client_id
-        .clone()
-        .ok_or("auth.client_id is required for oauth2")?;
-    let mut token_url = auth.token_url.clone();
-    let mut device_url = auth.device_authorization_url.clone();
-    let mut revocation_url = None;
-    // The document's client always reads the issuer's metadata: only it says
-    // whether the server fetches the document.
-    if auth.client_id_metadata_document && auth.issuer.is_none() {
-        return Err(
-            "auth.issuer is required to use agentd's Client ID Metadata Document: its metadata says whether the authorization server fetches one".into(),
-        );
-    }
-    if (token_url.is_none() || auth.client_id_metadata_document)
-        && let Some(issuer) = &auth.issuer
-    {
-        let d = oauth2::discover(issuer, timeout)?;
-        if auth.client_id_metadata_document {
-            d.admits_document(issuer, &client_id)?;
-        }
-        token_url = token_url.or(d.token_endpoint);
-        device_url = device_url.or(d.device_authorization_endpoint);
-        revocation_url = d.revocation_endpoint;
-    }
-    Ok(OAuth2Params {
-        token_url: token_url.ok_or("auth.token_url is required (or set auth.issuer)")?,
-        device_authorization_url: device_url,
-        authorization_url: auth.authorization_url.clone(),
-        revocation_url,
-        issuer: auth.issuer.clone(),
-        iss_supported: false,
-        client_id,
-        client_id_metadata_document: auth.client_id_metadata_document,
-        redirect_uri: None,
-        client_secret: auth.client_secret.clone(),
-        client_auth: oauth2::ClientAuth::of(auth.client_auth.as_ref())?,
-        scopes: auth.scopes.clone(),
-        audience: auth.audience.clone(),
-    })
 }
 
 /// Build a refreshing [`TokenSource`] for an interactive (device /
@@ -1142,6 +1234,130 @@ mod tests {
     }
 
     /// The block's own gaps are refused when the signer is built.
+    /// A token endpoint that renews `rt-1` for the scope `grants` and
+    /// refuses any other with `invalid_scope`, recording each form.
+    fn spawn_scoped(grants: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                r.read_exact(&mut body).ok();
+                let form = String::from_utf8_lossy(&body).into_owned();
+                log.lock().unwrap().push(form.clone());
+                let scope = crate::auth::browser::pct_decode(
+                    form.split('&')
+                        .find_map(|kv| kv.strip_prefix("scope="))
+                        .unwrap_or_default(),
+                );
+                let (status, payload) = if scope == grants {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"access_token":"at-2","refresh_token":"rt-2","scope":"{grants}","expires_in":3600}}"#
+                        ),
+                    )
+                } else {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"invalid_scope"}"#.to_string(),
+                    )
+                };
+                let mut w = c;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    /// A `403 insufficient_scope` naming the scopes a call needs.
+    fn insufficient(scope: &str) -> ::mcp::http::AuthResponse {
+        ::mcp::http::AuthResponse {
+            status: 403,
+            www_authenticate: Some(format!(
+                r#"Bearer error="insufficient_scope", scope="{scope}""#
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// MCP's step-up flow: a `403 insufficient_scope` renews the token for
+    /// the union of the scopes it holds and those challenged, and the
+    /// request goes again with it; a challenge the token already meets, or
+    /// the same union asked for past the bound, asks nothing; a renewal the
+    /// server refuses keeps the union for the next `--login`.
+    #[test]
+    fn insufficient_scope_steps_up_to_the_union_and_no_further() {
+        let (token_url, seen) = spawn_scoped("read write");
+        let dir = tempfile::tempdir().unwrap();
+        let held = CachedCred {
+            access_token: "at-1".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at_ms: cache::now_ms() + 3_600_000,
+            authorization_server: Some(token_url.clone()),
+            scope: Some("read".into()),
+            ..Default::default()
+        };
+        cache::store_file(dir.path(), "mcp:x", &held).unwrap();
+        let source = Arc::new(TokenSource::new(
+            Endpoints::pinned(OAuth2Params {
+                token_url: token_url.clone(),
+                client_id: "c".into(),
+                ..Default::default()
+            }),
+            "mcp:x",
+            dir.path().to_path_buf(),
+            Duration::from_secs(5),
+        ));
+        let signer = BearerSigner {
+            source: Arc::clone(&source),
+        };
+        assert!(
+            signer.on_response(&insufficient("write"), "mcp"),
+            "stepped up"
+        );
+        let form = seen.lock().unwrap().last().cloned().unwrap();
+        assert!(form.contains("scope=read%20write"), "the union: {form}");
+        assert_eq!(source.bearer().unwrap(), "at-2");
+        let kept = cache::load_file(dir.path(), "mcp:x").unwrap();
+        assert_eq!(kept.scope.as_deref(), Some("read write"));
+        // The token holds it now: another challenge for it asks nothing.
+        let asked = seen.lock().unwrap().len();
+        assert!(!signer.on_response(&insufficient("write"), "mcp"));
+        assert_eq!(seen.lock().unwrap().len(), asked);
+        // A 401, or a 403 of another error, is not a step-up.
+        let mut other = insufficient("admin");
+        other.status = 401;
+        assert!(!signer.on_response(&other, "mcp"));
+        // A scope the server will not grant: refused, kept for the login,
+        // and asked for at most twice.
+        for _ in 0..3 {
+            assert!(!signer.on_response(&insufficient("admin"), "mcp"));
+        }
+        assert_eq!(seen.lock().unwrap().len(), asked + 2, "bounded");
+        let kept = cache::load_file(dir.path(), "mcp:x").unwrap();
+        assert_eq!(kept.step_up, vec!["admin".to_string()]);
+    }
+
     #[test]
     fn an_oauth2_block_without_its_endpoints_is_refused_at_build() {
         let auth = AuthSpec {

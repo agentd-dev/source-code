@@ -518,7 +518,7 @@ named by `auth.kind`.
 | Mechanism | Required fields | Optional fields |
 |---|---|---|
 | `static` | `token` (a bearer), or `header` + `value` | — |
-| `oauth2` | `client_id`, or `security.client` and `issuer`; `token_url` or `issuer`; for `grant: device`, `device_authorization_url` or `issuer`; for `grant: client_credentials` with a `client_id`, `client_secret` or `client_auth: {method: private_key_jwt}` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; with no `client_id`, `assertion_aud` only) |
+| `oauth2` | `client_id`, or `security.client` and `issuer`; `token_url` or `issuer` — on an MCP server or an MCP catalog entry neither, the server's RFC 9728 metadata naming it; for `grant: device`, `device_authorization_url` or `issuer` (or neither, on an MCP server); for `grant: client_credentials` with a `client_id`, `client_secret` or `client_auth: {method: private_key_jwt}` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `resource` (`auto`, `omit` or a URI; unset, `auto` on an MCP server or MCP catalog entry, `omit` elsewhere), `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; with no `client_id`, `assertion_aud` only) |
 | `aws` | `region`, `service` (for example `bedrock`); for `source: sso`, `sso_start_url`, `account_id`, `role_name` | `source` (`env` default, `static`, `imds`, `irsa`, `sso`) |
 | `spiffe` | for `svid: jwt` (the default), `jwt_svid_file`; for `svid: x509`, `svid_file` + `key_file` | `audience` |
 
@@ -1253,7 +1253,7 @@ live · op.
 | Path | Type | Default | What it does |
 |---|---|---|---|
 | `a2a.principals[].match.san` | glob | — | Matches a verified client certificate's SANs or subject. |
-| `a2a.principals[].match.sub` | string | — | Matches a verified client certificate's subject CN exactly. |
+| `a2a.principals[].match.sub` | glob | — | Matches a verified client certificate's subject CN. |
 | `a2a.principals[].match.bearer_ref` | secret | — | Matches a presented bearer. May not equal `a2a.bearer`, another rule's secret, or start with `agentd_at_`. |
 | `a2a.principals[].match.any` | bool | `false` | Names every caller left; cannot grant `operator`. |
 | `a2a.principals[].role` | `operator \| user \| agent \| anonymous` | required | The caller's role. |
@@ -1263,10 +1263,14 @@ live · op.
 | `a2a.principals[].quotas.rate` | rate | — | Arrival quota at the listener; operators are exempt. |
 | `a2a.principals[].quotas.budget` | budget | — | A token budget charged by the work done for this principal. |
 
-Each `match` names exactly one matcher. A `san` or `sub` rule matches only a
-certificate the listener verified, so it needs `a2a.tls.client_ca` and is
-refused at load without it; an `any` rule needs no CA. A `user` id may not
-reuse a name ever approved through the device grant.
+A rule matches only a caller that every field its `match` names admits:
+`san` and `sub` together admit a certificate both match, and `bearer_ref`
+beside either admits the bearer only with a certificate they match. `any`
+names every caller left, so it is a rule's only matcher. A glob has one `*`
+for any run of characters. A `san` or `sub` rule matches only a certificate
+the listener verified, so it needs `a2a.tls.client_ca` and is refused at
+load without it; an `any` rule needs no CA. A `user` id may not reuse a name
+ever approved through the device grant.
 
 ### Device grant
 

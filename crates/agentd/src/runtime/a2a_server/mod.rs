@@ -456,6 +456,7 @@ mod tests {
             cert: Some(CertId {
                 subject: None,
                 sans: vec![san.into()],
+                ..Default::default()
             }),
             ..Default::default()
         };

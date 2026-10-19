@@ -2038,6 +2038,9 @@ impl Runtime {
                     .map(str::to_string)
                     .unwrap_or_else(|| crate::engine::run::idempotency_key(run_id, step_id));
                 let mut meta = json!({"agent/idempotency_key": key, "agent/attempt": attempt, "agent/instance": self.instance, "agent/run": run_id});
+                let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+                self.attribute(&mut meta, principal.as_deref());
+                crate::mcp::scope(&mut meta, principal.as_deref());
                 // A span of the step's: a retry or a replay is another span
                 // in the same trace, the idempotency key unchanged.
                 let call =
@@ -2722,9 +2725,13 @@ impl Runtime {
             max_rounds: if is_think { 3 } else { 0 },
             budget_admission: self.governor.is_active(),
             idempotency_prefix: format!("{}/{run_id}/{step_id}", self.instance),
-            tool_meta: Some(
-                json!({"agent/run": run_id, "agent/step": step_id, "agent/instance": self.instance}),
-            ),
+            tool_meta: Some({
+                let mut m = json!({"agent/run": run_id, "agent/step": step_id, "agent/instance": self.instance});
+                let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+                self.attribute(&mut m, principal.as_deref());
+                crate::mcp::scope(&mut m, principal.as_deref());
+                m
+            }),
             temperature: None,
             max_tokens_per_call: 0,
             turn_id: format!(

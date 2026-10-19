@@ -13,12 +13,14 @@
 //! `{{secret-file:…}}` template resolved at fetch time; it is form-posted to the
 //! token endpoint and never logged. The access token lives only in memory.
 //!
+//! Every request names the MCP server as its RFC 8707 `resource`, and goes
+//! through the one OAuth HTTP helper (`auth::http`): no redirect is followed.
+//!
 //! Dependency-free: the hand-rolled HTTP client (`net::http` + `net::tls`), the
 //! `sec::secret` resolver, `serde_json`, and a tiny hand-rolled form encoder —
 //! no `oauth2`/`url`/`form_urlencoded` crate. The dependency surface stays
 //! deliberately minimal, so auth code cannot pull a supply chain in behind it.
 
-use crate::net::http::{self, Url};
 use crate::sec::secret;
 use serde::Deserialize;
 use std::sync::Mutex;
@@ -41,6 +43,8 @@ pub struct OAuthConfig {
     pub client_secret: String,
     /// Optional space-delimited `scope` request.
     pub scope: Option<String>,
+    /// The RFC 8707 `resource`: the MCP server the token is for.
+    pub resource: Option<String>,
 }
 
 /// A cached access token with the instant it must be refreshed by.
@@ -103,6 +107,10 @@ impl OAuthClient {
             form.push_str("&scope=");
             form.push_str(&form_encode(scope));
         }
+        if let Some(resource) = &self.config.resource {
+            form.push_str("&resource=");
+            form.push_str(&form_encode(resource));
+        }
 
         let body = self.post_form(&self.config.token_url, form.as_bytes())?;
         let parsed: TokenResponse =
@@ -123,17 +131,13 @@ impl OAuthClient {
     /// response body, mapping a non-2xx status to an error (the body may carry an
     /// OAuth `error`, but must not be logged — it can echo request params).
     fn post_form(&self, url: &str, form: &[u8]) -> Result<Vec<u8>, String> {
-        let url = Url::parse(url).map_err(|e| format!("oauth: token_url: {e}"))?;
-        let mut stream = connect(&url, self.timeout)?;
-        let resp = http::send(
-            stream.as_mut(),
-            &url.host_header(),
-            "POST",
-            &url.path,
-            &[("Content-Type", "application/x-www-form-urlencoded")],
+        let resp = crate::auth::http::post_form(
+            url,
             form,
-        )
-        .map_err(|e| format!("oauth: token request failed: {e}"))?;
+            &[],
+            self.timeout,
+            crate::auth::http::Dial::Named,
+        )?;
         if !resp.is_success() {
             return Err(format!(
                 "oauth: token endpoint returned HTTP {}",
@@ -171,6 +175,7 @@ impl OAuthBearerSigner {
                     client_id: spec.client_id,
                     client_secret: spec.client_secret,
                     scope: spec.scope,
+                    resource: spec.resource,
                 },
                 timeout,
             ),
@@ -198,26 +203,6 @@ struct TokenResponse {
     access_token: String,
     #[serde(default)]
     expires_in: Option<u64>,
-}
-
-/// Connect to a token endpoint (`https://` over TLS, or `http://` plain TCP).
-fn connect(url: &Url, timeout: Duration) -> Result<Box<dyn http::Stream>, String> {
-    let tcp = http::connect_tcp(&url.host, url.port, timeout)
-        .map_err(|e| format!("oauth: connect {}: {e}", url.host))?;
-    if url.is_tls() {
-        #[cfg(feature = "tls")]
-        {
-            let s = crate::net::tls::connect(tcp, &url.host, None)
-                .map_err(|e| format!("oauth: tls {}: {e}", url.host))?;
-            Ok(Box::new(s))
-        }
-        #[cfg(not(feature = "tls"))]
-        {
-            Err("oauth: https token_url requires building with --features tls".to_string())
-        }
-    } else {
-        Ok(Box::new(tcp))
-    }
 }
 
 /// Percent-encode a form value per `application/x-www-form-urlencoded`: the

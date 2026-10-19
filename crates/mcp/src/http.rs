@@ -435,6 +435,55 @@ pub struct AuthResponse {
     pub retry_after: Option<Duration>,
 }
 
+/// The `_meta` key a host names, under `params._meta` of a request, whom the
+/// request is made for: the transport takes it out before the request is
+/// signed or sent — no server ever sees it — and hands it to the signer as
+/// [`request_scope`]. A signer that holds per-person credentials presents
+/// and earns them for that scope alone.
+pub const SCOPE_META: &str = "agentd-mcp/scope";
+
+thread_local! {
+    /// The scope of the request this thread is signing and sending.
+    static SCOPE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whom the request being signed — in [`RequestSigner::sign`] and
+/// [`RequestSigner::on_response`] — is made for, as its `_meta` named it
+/// ([`SCOPE_META`]); `None` for a request that named nobody.
+pub fn request_scope() -> Option<String> {
+    SCOPE.with(|s| s.borrow().clone())
+}
+
+/// Run `f` as the transport runs the exchange of a request scoped to
+/// `scope`: what a signer's [`request_scope`] answers inside it. For a host
+/// that drives a signer itself.
+pub fn with_request_scope<T>(scope: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let prev = SCOPE.with(|s| s.replace(scope.map(str::to_string)));
+    let out = f();
+    SCOPE.with(|s| *s.borrow_mut() = prev);
+    out
+}
+
+/// `body` without its [`SCOPE_META`], and the scope it named: `None` and the
+/// body untouched when it names none.
+fn take_scope(body: &[u8]) -> (Option<Vec<u8>>, Option<String>) {
+    let key = SCOPE_META.as_bytes();
+    if !body.windows(key.len()).any(|w| w == key) {
+        return (None, None);
+    }
+    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    let scope = v
+        .pointer_mut("/params/_meta")
+        .and_then(Value::as_object_mut)
+        .and_then(|m| m.remove(SCOPE_META));
+    match scope {
+        Some(s) => (serde_json::to_vec(&v).ok(), s.as_str().map(str::to_string)),
+        None => (None, None),
+    }
+}
+
 /// A per-request signer: AAuth, or a credential the caller presents (a
 /// bearer, a SigV4 signature). The transport calls [`sign`] just before each
 /// dial (the returned `(name, value)` pairs become request headers — the
@@ -815,17 +864,22 @@ impl HttpTransport {
         hangup: &Hangup,
         cap: usize,
     ) -> Result<Option<Answer>, HttpError> {
+        // Whom the request is for goes to the signer, not the server.
+        let (unscoped, scope) = take_scope(body);
+        let body = unscoped.as_deref().unwrap_or(body);
         // Stamped once: every AAuth retry sends, and signs, the same bytes.
         let stamped = self.stamped(request_id, body);
-        let out = self.send_attempts(
-            request_id,
-            stamped.as_deref().unwrap_or(body),
-            timeout,
-            extra_headers,
-            &mut on_notification,
-            hangup,
-            cap,
-        );
+        let out = with_request_scope(scope.as_deref(), || {
+            self.send_attempts(
+                request_id,
+                stamped.as_deref().unwrap_or(body),
+                timeout,
+                extra_headers,
+                &mut on_notification,
+                hangup,
+                cap,
+            )
+        });
         hangup.disarm();
         out
     }
@@ -1224,6 +1278,25 @@ mod tests {
 
     /// The RFC 6750 §3 examples, a `DPoP` offer beside a `Bearer` error, and
     /// a header that names no error.
+    /// The scope a request names in `_meta` is taken out of it, and is
+    /// what the signer is told; a request naming none is left as it came.
+    #[test]
+    fn a_request_scope_reaches_the_signer_and_not_the_server() {
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "t", "_meta": {SCOPE_META: "user:alice", "k": 1}}})
+        .to_string();
+        let (sent, scope) = take_scope(body.as_bytes());
+        assert_eq!(scope.as_deref(), Some("user:alice"));
+        let sent: Value = serde_json::from_slice(&sent.unwrap()).unwrap();
+        assert_eq!(sent["params"]["_meta"], serde_json::json!({"k": 1}));
+        let plain = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        assert_eq!(take_scope(plain), (None, None));
+        assert_eq!(request_scope(), None);
+        let inside = with_request_scope(Some("user:bob"), request_scope);
+        assert_eq!(inside.as_deref(), Some("user:bob"));
+        assert_eq!(request_scope(), None, "restored");
+    }
+
     #[test]
     fn a_challenge_names_its_error_and_scope() {
         let c = Challenge::parse(

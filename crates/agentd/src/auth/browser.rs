@@ -10,10 +10,14 @@
 //! means the callback did not come from the request we started, so the code is
 //! discarded) and the RFC 9207 `iss` (a response from another authorization
 //! server is a mix-up, and its code is discarded too), and exchanges the code
-//! plus the PKCE `code_verifier` for tokens. The `state` and the verifier come
-//! from the kernel CSPRNG (`sec::random`), with no fallback: a host that
-//! cannot read it fails the login rather than send a `state` an attacker
-//! could guess.
+//! plus the PKCE `code_verifier` for tokens. The `state`, the verifier and —
+//! when the login asks for `openid` — the OpenID Connect `nonce` come from
+//! the kernel CSPRNG (`sec::random`), with no fallback: a host that cannot
+//! read it fails the login rather than send a `state` an attacker could
+//! guess. An ID token in the answer must carry that `nonce`, name the issuer
+//! and be for this client. An authorization server whose metadata does not
+//! list the `S256` PKCE method is refused before the browser is sent
+//! anywhere (MCP 2026-07-28).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -34,6 +38,12 @@ pub fn browser_login(
         .authorization_url
         .as_deref()
         .ok_or("oauth: authorization_url is required for the browser flow (or set issuer)")?;
+    if params.pkce_s256 == Some(false) {
+        return Err(format!(
+            "oauth: the metadata of {} does not list S256 in code_challenge_methods_supported, so it cannot be held to PKCE — refused",
+            params.authorization_server()
+        ));
+    }
 
     // PKCE (RFC 7636): a high-entropy verifier (32 bytes, 43 characters) and
     // its S256 challenge; and the CSRF `state`.
@@ -44,6 +54,8 @@ pub fn browser_login(
     let verifier = random(32)?;
     let challenge = crate::b64::url_nopad(&sha256(verifier.as_bytes()));
     let state = random(16)?;
+    let oidc = params.scopes.iter().any(|s| s == "openid");
+    let nonce = if oidc { Some(random(16)?) } else { None };
 
     // The redirect URI a Client ID Metadata Document registers, on its port
     // when it names one; otherwise any free port of 127.0.0.1.
@@ -62,7 +74,7 @@ pub fn browser_login(
     let redirect = at.uri(port);
 
     let scope = params.scopes.join(" ");
-    let url = format!(
+    let mut url = format!(
         "{auth_url}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         pct(&params.client_id),
         pct(&redirect),
@@ -70,6 +82,12 @@ pub fn browser_login(
         pct(&state),
         challenge,
     );
+    if let Some(n) = &nonce {
+        url.push_str(&format!("&nonce={}", pct(n)));
+    }
+    if let Some(r) = &params.resource {
+        url.push_str(&format!("&resource={}", pct(r)));
+    }
     on_url(&url);
 
     let back = wait_for_callback(&listener, timeout)?;
@@ -82,7 +100,61 @@ pub fn browser_login(
         params.iss_supported,
     )?;
     let tokens = oauth2::exchange_code(params, &back.code, &verifier, &redirect, timeout)?;
+    if let Some(id_token) = &tokens.id_token {
+        check_id_token(
+            id_token,
+            nonce.as_deref(),
+            params.issuer.as_deref(),
+            &params.client_id,
+        )?;
+    }
     Ok(crate::auth::login::tokens_to_cred(&tokens))
+}
+
+/// An ID token the token endpoint returned (OpenID Connect Core §3.1.3.7):
+/// its `nonce` the one the request carried, its `iss` the issuer when one is
+/// known, and its `aud` this client. It came straight from the token
+/// endpoint, so TLS stands in for its signature (§3.1.3.7, item 6); what is
+/// checked is that it answers THIS request.
+fn check_id_token(
+    id_token: &str,
+    nonce: Option<&str>,
+    issuer: Option<&str>,
+    client_id: &str,
+) -> Result<(), String> {
+    let claims = id_token
+        .split('.')
+        .nth(1)
+        .and_then(|p| crate::b64::url_decode(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .ok_or("oauth: the ID token in the answer is not a JWT — aborted")?;
+    if let Some(want) = nonce
+        && claims["nonce"].as_str() != Some(want)
+    {
+        return Err(
+            "oauth: the ID token does not carry the nonce this login sent (a replayed or injected token) — aborted"
+                .into(),
+        );
+    }
+    if let Some(want) = issuer
+        && claims["iss"].as_str() != Some(want)
+    {
+        return Err(format!(
+            "oauth: the ID token names the issuer {:?}, not {want:?} — aborted",
+            claims["iss"].as_str().unwrap_or("")
+        ));
+    }
+    let for_us = match &claims["aud"] {
+        serde_json::Value::String(a) => a == client_id,
+        serde_json::Value::Array(a) => a.iter().any(|v| v.as_str() == Some(client_id)),
+        _ => false,
+    };
+    if !for_us {
+        return Err(format!(
+            "oauth: the ID token is not for this client ({client_id}) — aborted"
+        ));
+    }
+    Ok(())
 }
 
 /// RFC 9207 §2.4: an authorization response's `iss` must be the issuer the
@@ -230,6 +302,72 @@ mod tests {
         assert_eq!(pct("a b/c"), "a%20b%2Fc");
         assert_eq!(pct_decode("a%20b%2Fc"), "a b/c");
         assert_eq!(pct_decode("x+y"), "x y");
+    }
+
+    fn id_token(claims: serde_json::Value) -> String {
+        format!(
+            "{}.{}.sig",
+            crate::b64::url_nopad(br#"{"alg":"RS256"}"#),
+            crate::b64::url_nopad(claims.to_string().as_bytes())
+        )
+    }
+
+    /// An ID token answers this login only with its nonce, the issuer and
+    /// this client in its audience.
+    #[test]
+    fn an_id_token_must_carry_the_nonce_the_issuer_and_the_client() {
+        let iss = Some("https://as.example");
+        let ok =
+            id_token(serde_json::json!({"iss": "https://as.example", "aud": "c", "nonce": "n1"}));
+        assert!(check_id_token(&ok, Some("n1"), iss, "c").is_ok());
+        let e = check_id_token(&ok, Some("n2"), iss, "c").unwrap_err();
+        assert!(e.contains("nonce"), "{e}");
+        let e = check_id_token(&ok, Some("n1"), Some("https://other.example"), "c").unwrap_err();
+        assert!(e.contains("issuer"), "{e}");
+        let e = check_id_token(&ok, Some("n1"), iss, "d").unwrap_err();
+        assert!(e.contains("not for this client"), "{e}");
+        let many = id_token(
+            serde_json::json!({"iss": "https://as.example", "aud": ["x", "c"], "nonce": "n1"}),
+        );
+        assert!(check_id_token(&many, Some("n1"), iss, "c").is_ok());
+        let none = id_token(serde_json::json!({"iss": "https://as.example", "aud": "c"}));
+        assert!(check_id_token(&none, Some("n1"), iss, "c").is_err());
+        assert!(check_id_token("not-a-jwt", None, iss, "c").is_err());
+    }
+
+    /// MCP's PKCE gate: metadata that lists no `S256` is refused before any
+    /// URL is printed.
+    #[test]
+    fn an_authorization_server_without_s256_is_refused_before_the_browser() {
+        let p = OAuth2Params {
+            authorization_url: Some("https://as.example/authorize".into()),
+            token_url: "https://as.example/token".into(),
+            issuer: Some("https://as.example".into()),
+            client_id: "c".into(),
+            pkce_s256: Some(false),
+            ..Default::default()
+        };
+        // On a thread of its own: a login that went on would wait for a
+        // browser that never comes.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let printed = std::sync::atomic::AtomicBool::new(false);
+            let r = browser_login(
+                &p,
+                |_| printed.store(true, std::sync::atomic::Ordering::SeqCst),
+                Duration::from_millis(1),
+            );
+            let _ = tx.send((r, printed.into_inner()));
+        });
+        let (r, printed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refused at once, not waiting for a browser");
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("S256") && e.contains("https://as.example"),
+            "{e}"
+        );
+        assert!(!printed, "no URL was handed out");
     }
 
     /// Every RFC 9207 row: `iss` present or absent, the metadata declaring

@@ -200,13 +200,14 @@ pub fn run() -> i32 {
     #[cfg(feature = "aauth")]
     {
         let to = Arc::clone(&up);
-        crate::aauth::hand_up(move |authority, access, auth_token| {
+        crate::aauth::hand_up(move |authority, access, auth_token, principal| {
             send_up(
                 &to,
                 &AgentMsg::AAuthToken {
                     authority: authority.to_string(),
                     access: access.map(str::to_string),
                     auth_token: auth_token.map(str::to_string),
+                    principal: principal.map(str::to_string),
                 },
             )
         });
@@ -317,10 +318,12 @@ pub fn run() -> i32 {
                 );
                 // The same meta the reactor stamps on its own connections, so a
                 // server sees one instance whichever process made the call.
-                c.set_tool_meta(crate::mcp::tool_meta(
-                    &payload.telemetry.run_id,
-                    &payload.telemetry.instance,
-                ));
+                let mut meta =
+                    crate::mcp::tool_meta(&payload.telemetry.run_id, &payload.telemetry.instance);
+                if let Some(m) = meta.as_object_mut() {
+                    m.extend(payload.telemetry.attribution.clone());
+                }
+                c.set_tool_meta(meta);
                 servers.push(c);
             }
             Err(e) => {

@@ -80,6 +80,7 @@ fn client_credentials_fetches_then_caches() {
             client_id: "agentd-client".into(),
             client_secret: "{{secret:MCP_OAUTH_TEST_SECRET}}".into(),
             scope: Some("mcp:read mcp:write".into()),
+            resource: Some("https://mcp.example/mcp".into()),
         },
         Duration::from_secs(5),
     );
@@ -97,6 +98,11 @@ fn client_credentials_fetches_then_caches() {
     // The resolved secret is form-encoded (special chars escaped), never inline.
     assert!(form.contains("client_secret=sh%21hh%2Fsecret"), "{form}");
     assert!(form.contains("scope=mcp%3Aread%20mcp%3Awrite"), "{form}");
+    // RFC 8707: the MCP server the token is for.
+    assert!(
+        form.contains("resource=https%3A%2F%2Fmcp.example%2Fmcp"),
+        "{form}"
+    );
 
     unsafe { std::env::remove_var("MCP_OAUTH_TEST_SECRET") };
 }
@@ -115,6 +121,7 @@ fn oauth_bearer_signer_injects_a_refreshing_authorization_header() {
         client_id: "agentd".into(),
         client_secret: "{{secret:MCP_OAUTH_SIGNER_SECRET}}".into(),
         scope: None,
+        resource: None,
     };
     let signer = agentd::mcp::oauth::OAuthBearerSigner::new("mcp:x", spec, Duration::from_secs(5));
 
@@ -143,6 +150,7 @@ fn oauth_bearer_signer_fails_the_request_when_no_token_can_be_fetched() {
         client_id: "agentd".into(),
         client_secret: "{{secret:MCP_OAUTH_DEAD_SECRET}}".into(),
         scope: None,
+        resource: None,
     };
     unsafe { std::env::set_var("MCP_OAUTH_DEAD_SECRET", "sec") };
     let signer = agentd::mcp::oauth::OAuthBearerSigner::new("mcp:x", spec, Duration::from_secs(2));

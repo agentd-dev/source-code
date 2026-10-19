@@ -1861,7 +1861,7 @@ impl Runtime {
         let mut peer_signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>> = None;
         #[cfg(feature = "oauth")]
         if let Some(a) = &peer.auth {
-            let aspec = self.settings.auth_spec(a);
+            let aspec = self.settings.auth_spec_at(a, &peer.endpoint, false);
             // A peer that names a catalog `service:` caches its credential
             // under `service:<entry>`, shared with every other consumer of that
             // entry, so one `agentd --login service:<entry>` serves them all.

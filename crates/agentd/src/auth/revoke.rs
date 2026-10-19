@@ -70,9 +70,11 @@ fn revoke_login(settings: &Settings, target: &str, cred: &CachedCred, timeout: D
     if auth.kind != AuthKind::Oauth2 || auth.grant == Some(OAuthGrant::ClientCredentials) {
         return Remote::Nothing;
     }
-    let spec = settings.auth_spec(auth);
-    let resource = login::resource_of(settings, target).ok().flatten();
-    let params = match revocation_params(&spec, resource.as_deref(), timeout) {
+    let spec = match login::spec_of(settings, target, auth) {
+        Ok(s) => s,
+        Err(e) => return Remote::Failed(e),
+    };
+    let params = match revocation_params(&spec, timeout) {
         Ok(p) => p,
         Err(e) => return Remote::Failed(e),
     };
@@ -104,15 +106,15 @@ fn revoke_login(settings: &Settings, target: &str, cred: &CachedCred, timeout: D
 /// once: metadata fetched for the other endpoints already said.
 fn revocation_params(
     auth: &crate::config::AuthSpec,
-    resource: Option<&str>,
     timeout: Duration,
 ) -> Result<OAuth2Params, String> {
-    let mut params = login::params_from_auth(auth, resource, timeout)?;
+    let mut params = login::params_from_auth(auth, timeout)?;
     if params.revocation_url.is_none()
         && login::pins_every_endpoint(auth)
         && let Some(issuer) = params.issuer.clone()
     {
-        params.revocation_url = oauth2::discover(&issuer, timeout)?.revocation_endpoint;
+        params.revocation_url =
+            oauth2::discover_by(&issuer, timeout, params.dial)?.revocation_endpoint;
     }
     Ok(params)
 }

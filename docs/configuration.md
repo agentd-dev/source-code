@@ -312,6 +312,7 @@ behaves.
 | `agent.description` | string | a generic sentence | live · op | The public Agent Card's description, readable without signing in. |
 | `agent.instruction` | string or object | unset | live · op | The standing instruction, given to every turn. In a job with no workflow and no prompt it is also the task: agentd generates the workflow `main` (`once → agent → finish`) to run it. A daemon runs nothing for it at startup. See [The instruction source](#the-instruction-source). |
 | `agent.prompt` | string or object | unset | live · op | A task, delivered as a message into the root conversation at every start: a job's whole work, or what a daemon does as soon as it starts. Takes the `text`, `file`, `dir`, `url` and `oci` sources of the instruction, classified the same way; no `mcp`. A prompt also suppresses the generated `main` workflow a bare `--instruction` job gets. |
+| `agent.workspace` | path | unset | live · op | The workspace the agent works in: its [AGENTS.md](coding-agent.md#the-repositorys-agentsmd) files — the root's, then one in each directory down to agentd's working directory when that is inside it, the nearest last — reach every turn's system prompt as text, below the instruction (the template's `agents_md`). UTF-8, at most 32768 bytes together, a symlink followed only to a file inside the workspace; a file that breaks one refuses the load, naming it. Read again by a reload, and on a change with `lifecycle.watch_config`. |
 | `agent.preflight` | `never \| auto \| always` | `auto` | live · doc | Triage of an inbound message before its turn, on `intelligence.roles.preflight`. `intelligence.routes` needs `auto` or `always`. |
 | `agent.wake_on` | list of `a2a_message \| human_reply \| subagent_result \| workflow_finished \| workflow_failed \| instruction_updated \| budget_resumed` | `[a2a_message, human_reply, workflow_failed]` | live · doc | The events that wake the root conversation or leave it a note. `subagent_result` notes each child's result. |
 | `agent.on_workflow_finished` | `ignore \| note \| think` | `ignore` | live · doc | What a finished run leaves in the root transcript, for the runs `wake_on` names: nothing, a note, or a note that starts a turn. Withheld when the run may carry outside input and the root holds `sensitive` and `egress`. |
@@ -1064,9 +1065,10 @@ The template language:
 An expression is a path first and CEL second. Bare paths (`{{instance}}`,
 `{{#each services}}`) work in any build; anything more needs the `cel`
 feature, with two helpers CEL lacks: `take(list, n)` and `join(list, sep)`.
-The data names are `instance`, `instruction`, `workflows`, `services`,
-`streams`, `templates`, `skills`, `peers`, `signals`, `memory` and
-`tools.internal`.
+The data names are `instance`, `instruction`, `agents_md`, `workflows`,
+`services`, `streams`, `templates`, `skills`, `peers`, `signals`, `memory`
+and `tools.internal`. `agents_md` is the list of `agent.workspace`'s
+AGENTS.md files, root first, each `{path, text}`.
 
 ```yaml
 # fragment: under context:
@@ -1084,7 +1086,8 @@ templates:
 
 Order a template stable to volatile: providers cache on the request's literal
 prefix. A malformed block or an unknown name is exit 2; a template that never
-mentions `{{instruction}}` loads with a warning. How a turn uses it is
+mentions `{{instruction}}` loads with a warning, and so does one that never
+mentions `{{agents_md}}` while `agent.workspace` is set. How a turn uses it is
 [How a turn runs](agent-loop.md).
 
 ## memory, knowledge, search and skills
@@ -1403,7 +1406,7 @@ deadline exits 124; [cli.md](cli.md) has the full table.
 | `lifecycle.drain_timeout` | duration | `25s` | restart · op | The graceful drain budget on `SIGTERM`: how long work already running may finish before the drain stops it and leaves it for the next start. Keep it below the pod's `terminationGracePeriodSeconds`. |
 | `lifecycle.run_id` | string | a fresh ULID | restart · op | Sent as `agent/run_id` in every MCP call's `_meta`, beside `agent/instance`. Set a stable one per unit of work (a Job name, an input hash) so servers can dedupe retries; the default correlates logs but dedupes nothing. |
 | `lifecycle.exit_code_map` | map: `"3"` or `"7"` → 0–255 | `{}` | restart · op | Remap the policy exit codes 3 (partial) and 7 (budget). Any other key is exit 2. |
-| `lifecycle.watch_config` | bool | `false` | restart · op | Reload when a config file, the instruction file or folder, a workflow file or folder, or a skill file changes. Needs a `--config` file and the `config-watch` feature. |
+| `lifecycle.watch_config` | bool | `false` | restart · op | Reload when a config file, the instruction file or folder, a workflow file or folder, a skill file, or an `AGENTS.md` of `agent.workspace` on the way down to the working directory changes. Needs a `--config` file and the `config-watch` feature. |
 
 The long-lived start kinds are every kind but `once` and `manual`; they are
 listed in [Workflow node reference](node-registry.md) and explained in
@@ -1591,6 +1594,7 @@ Every other path is applied live, as follows:
 | `intelligence` | Each call resolves against the live settings, and a reload that moves any connection rebuilds every one. An in-flight turn follows `swap_policy`; running subagents take the new model at their next turn boundary. A token that cannot be resolved refuses the reload. |
 | `intelligence.routes` | Read as each turn is launched; a turn routed to a model the reload removed runs on `roles.turn`. |
 | `agent.instruction` | Re-read, through the servers the reload would run on, and its machinery folded again. A resource that cannot be read refuses the reload. |
+| `agent.workspace` | Its AGENTS.md files read again; the next turn's prompt carries them. A file the load cannot take refuses the reload. |
 | `mcp.servers` | Added or changed servers are dialed beside the running set; unchanged ones keep their connection; removed ones disconnect when the reload applies. A server is unchanged only when everything its dial reads is (endpoint, headers, `auth`, `oauth`, `aauth`, `service`, the service's `rate`, `timeout`), so a rotated credential re-dials it and a tags-only change does not. |
 | `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt; the skills sources are listed again and both skills folders read again. A context keeps the skill bodies it loaded of the skills the new catalogue holds; a server's skill whose source was removed, or no longer admits it, is unloaded (`skills.unloaded`). |
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |

@@ -138,6 +138,40 @@ What each block does:
 `${HOME}` and `${REPO}` are filled in from the environment when agentd
 loads the file; an unset variable stops it with a message naming it.
 
+### The repository's AGENTS.md
+
+Many repositories keep notes for coding agents in an
+[AGENTS.md](https://agents.md) file: how to build, test and style the code.
+Name the repository as the agent's workspace to give it them:
+
+```yaml
+# fragment: under agent: in ~/coding.yaml
+workspace: "${REPO}"
+```
+
+agentd reads the `AGENTS.md` at the repository's root, then the one in each
+directory on the way down to the directory you start the daemon in. Started
+from `services/billing`, it reads `AGENTS.md`, `services/AGENTS.md` and
+`services/billing/AGENTS.md`, in that order; started from the root, or from
+outside the repository, the root's alone. The nearest comes last, and wins
+where two disagree.
+
+Every turn's system prompt carries them, under `## AGENTS.md`, each under
+its path, below your instruction. Your instruction wins over them, and so
+does what you ask in a message. They are plain text: they grant no tool and
+change no setting, and a `:::!config` or `:::!workflow` block in one is text
+the model reads, never a directive.
+
+The files must be UTF-8 and hold at most 32 KiB together, and a symlinked
+one must lead to a file inside the repository. A file that breaks a rule
+stops the daemon starting (exit `2`), or a reload, naming the file. A reload
+reads them again, and with `lifecycle.watch_config` an `AGENTS.md` added or
+edited on the way down is a reload.
+
+> **Warning.** The files go into the prompt as written. Name as the
+> workspace only a repository whose `AGENTS.md` you would put in your
+> instruction yourself.
+
 ## Step 3: Start it and talk to it
 
 From the repository, export its path and start the daemon with the terminal

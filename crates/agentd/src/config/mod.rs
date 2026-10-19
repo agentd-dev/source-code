@@ -19,6 +19,7 @@
 //! `AGENTD_<PATH>` env names and `--<path>` flags for every config-file path),
 //! [`watch`] (the inotify reload trigger).
 
+pub mod agents_md; // a workspace's AGENTS.md files, read as prompt text (RFC 0053)
 #[cfg(feature = "sign")]
 pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
 #[cfg(feature = "decrypt")]

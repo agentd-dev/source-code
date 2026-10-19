@@ -933,6 +933,21 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `Discovered::{client_id_metadata_document_supported, admits_document}`;
   `oauth2::client_credentials`; `CachedCred::authorization_server`;
   `OAuth2Params::authorization_server`; `companies::served_paths`.
+- AGENTS.md (RFC 0053): `agent.workspace` names the operator's
+  workspace, and the `AGENTS.md` of its root, then of each directory on
+  the way down to agentd's working directory when that is inside it,
+  reach every turn's system prompt as text, each under its path from the
+  root, root first and the nearest last, below the instruction (the
+  template's `agents_md`; the built-in template's `## AGENTS.md`). They
+  are never parsed as an instruction document: a `:::!` block in one is
+  text. UTF-8, at most 32768 bytes together, a symlink followed only to a
+  file inside the workspace; a file that breaks one refuses the load or
+  the reload, naming it. A reload reads them again (`agent.workspace` in
+  `config.reloaded`), and `lifecycle.watch_config` watches each directory
+  on the way down. Operator-only; a custom template that never renders
+  `agents_md` while a workspace is named loads with a warning.
+- `agentd-core`: `config::agents_md` (`AgentsMd`, `read`, `dirs`, `FILE`,
+  `MAX_BYTES`); `Agent::{workspace, workspace_notes}`.
 
 **Changed.**
 

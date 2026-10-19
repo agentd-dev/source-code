@@ -289,6 +289,7 @@ series.
 | Standard | Where |
 |---|---|
 | [instruction.md](https://github.com/instruction-md/specification), the Instruction Specification, version 1, registry revision 1.1 | instruction documents: parsing, delivery, signatures and the resolution manifest |
+| [AGENTS.md](https://agents.md) (no version; the Agentic AI Foundation's `agentsmd/agents.md` at `d001185d79`) | the [workspace's notes for agents](coding-agent.md#the-repositorys-agentsmd): the `AGENTS.md` files of `agent.workspace`, from its root down to the working directory, nearest last, in the system prompt as text below the instruction |
 | OCI distribution, cosign signatures | `oci://` instruction sources, verified against a cosign key |
 | age v1, JWE Compact (ECDH-ES with X25519, `dir`) | encrypted instruction documents |
 | HMAC-SHA256 webhook signatures | inbound webhook routes, beside header and bearer checks |

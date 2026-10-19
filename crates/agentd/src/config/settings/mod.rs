@@ -249,6 +249,11 @@ pub struct Agent {
     /// the whole job — `agentd --prompt "…" --intelligence …` runs it once and
     /// exits with the answer on stdout.
     pub prompt: Option<String>,
+    /// The operator's workspace: its `AGENTS.md` files, from its root down
+    /// to the working directory, nearest last, reach the system prompt as
+    /// text below the instruction (RFC 0053). Operator-only: a served
+    /// document may not choose which directory's files become prompt text.
+    pub workspace: Option<String>,
     /// Skills defined by `:::!skill` directives in the instruction — DERIVED
     /// (never a config key): `Settings::from_document` extracts them, the
     /// runtime feeds them to the catalogue. In the struct so a reload diff
@@ -370,6 +375,10 @@ pub struct Agent {
     /// the instruction.
     #[serde(skip)]
     pub instruction_dir_files: Vec<String>,
+    /// The `AGENTS.md` files of `workspace`, root first — DERIVED, read at
+    /// load (`config::agents_md`), so a reload reads them again.
+    #[serde(skip)]
+    pub workspace_notes: Vec<crate::config::agents_md::AgentsMd>,
     /// Warnings raised while resolving the instruction — DERIVED. Carried
     /// here because `from_document` resolves the source but `load` owns the
     /// diagnostics list.
@@ -1117,6 +1126,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // The second fetched document, by the same argument: it becomes prompt
     // text, and a document may not re-point the text it is delivered with.
     "agent.prompt",
+    // The directory whose AGENTS.md files become prompt text, by the same
+    // argument: a document naming one would choose the host files its
+    // prompt carries.
+    "agent.workspace",
     // What the unauthenticated public Agent Card says this agent is. A
     // served document rewriting it would be the document describing itself
     // to strangers in the operator's name.
@@ -6022,6 +6035,15 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         t.record("${…} environment substitution", &doc);
     }
     let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
+    // --- AGENTS.md: the operator's workspace's files, root first and the
+    //     nearest to the working directory last (RFC 0053) — read here, on
+    //     the merged settings, so a reload reads them again. ---
+    if let Some(root) = settings.agent.workspace.clone() {
+        let cwd = std::env::current_dir().ok();
+        settings.agent.workspace_notes =
+            crate::config::agents_md::read(std::path::Path::new(&root), cwd.as_deref())
+                .map_err(|e| usage(format!("agent.workspace: {e}")))?;
+    }
     // --- the Agent Skills project scope: `.agents/skills/` beside a
     //     configuration file agentd loaded, the most specific first — never
     //     the working directory alone (RFC 0051 D5). ---
@@ -8192,6 +8214,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             "peers",
             "signals",
             "memory",
+            "agents_md",
         ];
         let mut check = |what: String, src: &str, is_default_slot: bool| {
             match crate::context::prompt::Template::parse(src) {
@@ -8221,6 +8244,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     if is_default_slot && !t.reads("instruction") {
                         d.warnings.push(format!(
                             "{what} never references {{{{instruction}}}} — this agent's standing policy will not reach the model"
+                        ));
+                    }
+                    if is_default_slot && s.agent.workspace.is_some() && !t.reads("agents_md") {
+                        d.warnings.push(format!(
+                            "{what} never references {{{{agents_md}}}} — the AGENTS.md files of agent.workspace will not reach the model"
                         ));
                     }
                 }
@@ -10029,6 +10057,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "agent.prompt",
     "agent.tools",
     "agent.wake_on",
+    // Read again by every reload's load, and rendered from the live
+    // settings at each turn.
+    "agent.workspace",
     "context.compact_at",
     "context.keep_last",
     "context.model_window",

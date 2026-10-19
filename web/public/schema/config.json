@@ -3401,6 +3401,10 @@
             ]
           },
           "type": "array"
+        },
+        "workspace": {
+          "description": "the operator's workspace, a directory: its AGENTS.md files, from its root down to agentd's working directory when that is inside it (root first, the nearest last), reach the system prompt as text below the instruction (RFC 0053). UTF-8, at most 32768 bytes together, a symlink followed only inside the workspace; read again on reload. Operator-only",
+          "type": "string"
         }
       },
       "type": "object"

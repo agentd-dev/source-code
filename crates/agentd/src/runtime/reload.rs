@@ -753,6 +753,13 @@ impl Runtime {
             }
             changed.push("agent.instruction");
         }
+        // The AGENTS.md files the load read again: the next turn's prompt
+        // renders them from the live settings.
+        if old.agent.workspace != new.agent.workspace
+            || old.agent.workspace_notes != new.agent.workspace_notes
+        {
+            changed.push("agent.workspace");
+        }
         if old.agent.preflight != new.agent.preflight
             || old.agent.wake_on != new.agent.wake_on
             || old.agent.tools != new.agent.tools

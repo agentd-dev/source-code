@@ -148,6 +148,7 @@ configures tools, services or policies (RFC 0042's boundary holds, as for any
 served document).
 
 *Size:* small. *Recommendation:* with S, or after it.
+*Built:* [RFC 0053](0053-agents-md.md), 2026-10-19.
 
 ### 5.6 P — Payments: x402 first, behind a spend policy
 

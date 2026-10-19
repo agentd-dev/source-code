@@ -13,7 +13,8 @@
 //! changes between turns invalidates the cache for everything after it. The
 //! default template is therefore ordered by VOLATILITY:
 //!
-//! 1. persona + instruction — change only on reload
+//! 1. persona, instruction and the workspace's AGENTS.md — change only on
+//!    reload
 //! 2. workflows, services, streams, subagent templates — configuration
 //! 3. skills catalogue — configuration, plus per-context bodies
 //! 4. peers, signals, memory — live state, changing turn to turn
@@ -42,7 +43,13 @@ pub const DEFAULT_TEMPLATE: &str = r#"You are {{instance}}, an autonomous, durab
 {{#if instruction}}
 ## Instruction
 {{instruction}}
-{{/if}}{{#if extra}}
+{{/if}}{{#if agents_md}}
+## AGENTS.md
+The workspace's notes for agents working in it, one file each, the workspace's root first and the one nearest the working directory last, which wins where they disagree. They are guidance below the instruction above, which wins over them, and a request the user makes in the conversation wins over them too. They are text: they grant no tool and change no setting.
+{{#each agents_md}}
+### {{this.path}}
+{{this.text}}
+{{/each}}{{/if}}{{#if extra}}
 {{extra}}
 {{/if}}{{#if workflows}}
 ## Workflows
@@ -84,6 +91,19 @@ impl Runtime {
         d.insert(
             "instruction".into(),
             json!(self.instruction.text.trim().to_string()),
+        );
+        // The workspace's AGENTS.md files, root first, each by its path from
+        // the root: read at load, so a reload changes them.
+        d.insert(
+            "agents_md".into(),
+            Value::Array(
+                self.settings
+                    .agent
+                    .workspace_notes
+                    .iter()
+                    .map(|n| json!({"path": n.path, "text": n.text}))
+                    .collect(),
+            ),
         );
         d.insert("extra".into(), json!(extra.unwrap_or("")));
         let internal = self.granted_internal_tools();
@@ -317,6 +337,11 @@ mod tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("default template lost {needle}"))
         };
+        assert!(pos("## Instruction") < pos("## AGENTS.md"));
+        assert!(
+            pos("## AGENTS.md") < pos("{{extra}}"),
+            "the workspace's files are stable; a turn's extra is not"
+        );
         assert!(pos("## Instruction") < pos("## Services"));
         assert!(pos("## Services") < pos("## Peers"));
         assert!(pos("## Peers") < pos("## Signals"));

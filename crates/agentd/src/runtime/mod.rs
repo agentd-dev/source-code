@@ -1125,6 +1125,18 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         for f in &rt.settings.agent.instruction_dir_files {
             watch_file(f, &log);
         }
+        // Each directory whose AGENTS.md the prompt carries, for the file
+        // by name: one appearing there is as much a change as one edited.
+        let workspace_dirs = rt
+            .settings
+            .agent
+            .workspace
+            .as_deref()
+            .and_then(|root| {
+                let cwd = std::env::current_dir().ok();
+                crate::config::agents_md::dirs(std::path::Path::new(root), cwd.as_deref()).ok()
+            })
+            .unwrap_or_default();
         for w in &rt.settings.workflows {
             if let Some(f) = w.get("file").and_then(Value::as_str) {
                 watch_file(f, &log);
@@ -1135,6 +1147,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                 crate::config::watch::spawn_dir_watcher(std::path::Path::new(dir), glob, log);
             }
         };
+        for d in &workspace_dirs {
+            watch_dir(&d.to_string_lossy(), crate::config::agents_md::FILE, &log);
+        }
         // …and the FOLDERS, on their globs: for a folder the change an
         // operator makes most often is dropping a new document in, which no
         // watch on the files already there can see.

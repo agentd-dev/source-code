@@ -77,6 +77,12 @@
     "tier": 2
   },
   {
+    "name": "AGENTS.md",
+    "full": "AGENTS.md, a workspace's notes for coding agents: read from the operator's workspace into the prompt as text",
+    "href": "/docs/coding-agent/#the-repositorys-agentsmd",
+    "tier": 2
+  },
+  {
     "name": "MCP Events",
     "version": "SEP-3415",
     "mark": "draft",

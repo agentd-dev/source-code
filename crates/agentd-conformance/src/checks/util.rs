@@ -302,6 +302,25 @@ pub fn send_command(addr: &str, id: i64, op: &str) -> Value {
     serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
 }
 
+/// `SendMessage` params for the command `op` with `args`, marked with the
+/// command extension and answered at once — for a check that sends it over a
+/// transport of its own (a unix listener, a bearer it chose).
+pub fn command_send_params(op: &str, args: &Value) -> Value {
+    let mut body = json!({"op": op});
+    if let (Some(b), Some(a)) = (body.as_object_mut(), args.as_object()) {
+        b.extend(a.clone());
+    }
+    json!({
+        "message": {
+            "role": "ROLE_USER",
+            "messageId": message_id(),
+            "extensions": [COMMAND],
+            "parts": [{"data": {"agentd": body}}],
+        },
+        "configuration": {"returnImmediately": true},
+    })
+}
+
 /// `SendMessage` params for the command `op`, marked with the extension `uri`.
 fn command_params(uri: &str, op: &str) -> Value {
     json!({

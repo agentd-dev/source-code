@@ -546,13 +546,7 @@ impl Setup {
 
     /// Send `op` over the unix listener.
     fn op(&self, op: &str, args: Value) -> Value {
-        let mut body = json!({"op": op});
-        if let (Some(b), Some(a)) = (body.as_object_mut(), args.as_object()) {
-            b.extend(a.clone());
-        }
-        let params = json!({"message": {"role": "ROLE_USER", "messageId": b64url(&rand16()),
-            "extensions": [COMMAND], "parts": [{"data": {"agentd": body}}]},
-            "configuration": {"returnImmediately": true}});
+        let params = crate::checks::util::command_send_params(op, &args);
         unix_rpc(&self.sock, "SendMessage", params)
     }
 
@@ -1484,10 +1478,8 @@ fn loopback_caller(h: &Harness) -> Outcome {
     crate::checks::util::wait_ready(&addr);
     let resp = crate::checks::util::post(
         &addr,
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
-            "message": {"role": "ROLE_USER", "messageId": b64url(&rand16()), "extensions": [COMMAND],
-                        "parts": [{"data": {"agentd": {"op": "workflow.run", "workflow": "who"}}}]},
-            "configuration": {"returnImmediately": true}}})
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+            "params": crate::checks::util::command_send_params("workflow.run", &json!({"workflow": "who"}))})
         .to_string(),
         &[("Authorization", "Bearer ema-bearer-0123456789"), ("A2A-Extensions", COMMAND)],
     );

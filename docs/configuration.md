@@ -517,7 +517,7 @@ named by `auth.kind`.
 | Mechanism | Required fields | Optional fields |
 |---|---|---|
 | `static` | `token` (a bearer), or `header` + `value` | — |
-| `oauth2` | `client_id`; `token_url` or `issuer`; for `grant: device`, `device_authorization_url` or `issuer`; for `grant: client_credentials`, `client_secret` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; not with `client_credentials`) |
+| `oauth2` | `client_id`, or `security.client` and `issuer`; `token_url` or `issuer`; for `grant: device`, `device_authorization_url` or `issuer`; for `grant: client_credentials` with a `client_id`, `client_secret` or `client_auth: {method: private_key_jwt}` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; with no `client_id`, `assertion_aud` only) |
 | `aws` | `region`, `service` (for example `bedrock`); for `source: sso`, `sso_start_url`, `account_id`, `role_name` | `source` (`env` default, `static`, `imds`, `irsa`, `sso`) |
 | `spiffe` | for `svid: jwt` (the default), `jwt_svid_file`; for `svid: x509`, `svid_file` + `key_file` | `audience` |
 
@@ -525,7 +525,10 @@ named by `auth.kind`.
 grants are completed with `agentd --login <target>`, where the target is
 `intelligence`, `intelligence:<provider>`, `mcp:<name>` or `service:<name>`.
 `kind: oauth2`, and any `auth` block on an MCP server, need the `oauth`
-feature. The guide is [Outbound credentials](authentication.md).
+feature. An `oauth2` block with no `client_id` presents agentd's
+[Client ID Metadata Document](authentication.md#client-id-metadata-document)
+(`security.client`) where its issuer's metadata advertises one. The guide is
+[Outbound credentials](authentication.md).
 
 ## mcp
 
@@ -1478,6 +1481,14 @@ Every `security` path is restart · op.
 | `security.cgroup.memory_max` | `max` or a size | — | Per-child `memory.max`. |
 | `security.cgroup.pids_max` | `max` or a count | — | Per-child `pids.max`; counts threads. |
 | `security.aauth.provider`, `.key_file`, `.enroll_token`, `.enroll_assertion_file`, `.person_server` | — | — | The AAuth agent identity. Needs `aauth`; see [AAuth agent identity](aauth.md). |
+| `security.client.id` | HTTPS URL | — | agentd's OAuth client where it has no registration: the `client_id` of its [Client ID Metadata Document](authentication.md#client-id-metadata-document), and where the document is published. A path of its own, with no userinfo, query, fragment or `.`/`..` segment. An `oauth2` block with no `client_id` uses it. Needs `oauth`, like every `security.client` path. |
+| `security.client.name`, `.logo_uri` | string, HTTPS URL | required, — | The document's `client_name` and `logo_uri`. |
+| `security.client.jwks_uri` | HTTPS URL | `jwks.json` beside the document | The key set's URL. |
+| `security.client.key_file` | path | `/var/lib/agentd/client-key` | The ES256 signing key (PKCS#8), created `0600` when absent. Read where a token request is made. |
+| `security.client.published_key_files` | list of paths | `[]` | Keys whose public halves the key set lists and that are never signed with: the next key before a rotation, the previous one after. |
+| `security.client.grants` | list of `device \| client_credentials \| authorization_code` | `[device]` | The grants the document lists in `grant_types`, with `refresh_token` beside `device` and `authorization_code`. A block that uses the document with another grant is refused at load. |
+| `security.client.redirect_uris` | list of loopback URIs | `[]` | For `authorization_code`, and only with it: `http://127.0.0.1[:port]/path` or `http://[::1][:port]/path`. A login listens on the first one's port, or on a free port when it names none. |
+| `security.client.serve` | bool | `false` | Serve the document and the key set on the A2A listener, at their URLs' paths. Needs `a2a`, and `a2a.url` the `client_id`'s origin. Otherwise publish what `agentd --print-client-metadata` writes. |
 | `security.companies.user` | `operator` or a principal id | `operator` | The one User this instance acts for at every Company. `operator` is refused when `a2a.principals` holds more than one rule of role `operator`. Needs `companies`, like every `security.companies` path. |
 | `security.companies.client.id` | HTTPS URL | required with a company entry | The `client_id`: the URL of the client metadata document. |
 | `security.companies.client.name`, `.logo_uri` | string, HTTPS URL | required, — | The document's `client_name` and `logo_uri`. |

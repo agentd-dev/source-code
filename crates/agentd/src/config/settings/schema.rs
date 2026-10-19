@@ -421,7 +421,25 @@ fn top_level_properties(
                     "max_output": { "type": "integer" },
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
                 "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" },
+                "client": client(),
                 "companies": companies() } }));
+}
+
+/// `security.client` (RFC 0052): agentd's OAuth client where it has no
+/// registration, published as a Client ID Metadata Document.
+fn client() -> Value {
+    json!({ "type": "object", "additionalProperties": false, "required": ["id", "name"],
+        "description": "agentd's OAuth client where it has no registration (RFC 0052; needs the oauth feature): an auth block of kind oauth2 that names no client_id presents this Client ID Metadata Document's URL as its client_id, with private_key_jwt, at an authorization server whose metadata advertises client_id_metadata_document_supported. Restart-only, operator-only",
+        "properties": {
+            "id": { "type": "string", "description": "the client_id: the HTTPS URL the document is published at — a path of its own, no userinfo, query, fragment or dot segment (draft §3)" },
+            "name": { "type": "string", "description": "client_name, shown on authorization servers' consent pages" },
+            "logo_uri": { "type": "string", "description": "an HTTPS URL" },
+            "jwks_uri": { "type": "string", "description": "the key set's HTTPS URL; default jwks.json beside the document" },
+            "key_file": { "type": "string", "description": "the ES256 signing key (PKCS#8), created 0600 when absent; default /var/lib/agentd/client-key" },
+            "published_key_files": { "type": "array", "items": { "type": "string" }, "description": "keys whose public halves are in the key set but are never signed with: the next key before a rotation, the previous one after it" },
+            "redirect_uris": { "type": "array", "items": { "type": "string" }, "description": "loopback redirect URIs for the authorization_code grant, http://127.0.0.1[:port]/path or http://[::1][:port]/path: with a port, the login listens on it; without one, on any free port, for an authorization server that allows any port on a loopback address (RFC 8252 §7.3)" },
+            "grants": { "type": "array", "items": { "enum": ["device", "authorization_code", "client_credentials"] }, "description": "the grants the document lists in grant_types (with refresh_token beside device and authorization_code); a block that uses the document with a grant it does not list is refused at load. Default [device]" },
+            "serve": { "type": "boolean", "description": "serve the document and key set on the A2A listener at their URLs' paths (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-client-metadata writes" } } })
 }
 
 /// `security.companies` (RFC 0047): the one User, the client identity
@@ -548,9 +566,9 @@ fn defs_properties(
                 "kind": { "enum": ["static", "oauth2", "aws", "spiffe"] },
                 "issuer": { "type": "string" }, "token_url": { "type": "string" },
                 "device_authorization_url": { "type": "string" }, "authorization_url": { "type": "string" },
-                "client_id": { "type": "string" }, "client_secret": secret,
+                "client_id": { "type": "string", "description": "the registered client; unset, agentd's Client ID Metadata Document (security.client) is the client, where the issuer's metadata advertises it" }, "client_secret": secret,
                 "client_auth": { "type": "object", "additionalProperties": false,
-                    "description": "how the client authenticates at the token and revocation endpoints", "properties": {
+                    "description": "how the client authenticates at the token and revocation endpoints; with no client_id, only assertion_aud", "properties": {
                     "method": { "enum": ["private_key_jwt", "client_secret_basic", "client_secret_post"] },
                     "key": secret, "kid": { "type": "string" },
                     "assertion_aud": { "enum": ["token_endpoint", "issuer"] } } },

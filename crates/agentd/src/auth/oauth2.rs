@@ -37,6 +37,14 @@ pub struct OAuth2Params {
     /// an authorization response without `iss` is then refused.
     pub iss_supported: bool,
     pub client_id: String,
+    /// `client_id` is agentd's Client ID Metadata Document URL (RFC 0052),
+    /// used only where the issuer's metadata advertises
+    /// `client_id_metadata_document_supported`.
+    pub client_id_metadata_document: bool,
+    /// The loopback redirect URI the document registers, which the
+    /// authorization-code login listens at; `None` listens on any free port
+    /// of `127.0.0.1`.
+    pub redirect_uri: Option<String>,
     /// A `{{secret:NAME}}` template for a confidential client, or `None` for a
     /// public client (the device/PKCE flows work without a secret).
     pub client_secret: Option<String>,
@@ -109,6 +117,29 @@ pub enum AssertionAud {
 }
 
 impl OAuth2Params {
+    /// The authorization server these endpoints belong to, as a login is
+    /// kept with it: the issuer, or the token endpoint where none is known.
+    pub fn authorization_server(&self) -> &str {
+        self.issuer.as_deref().unwrap_or(&self.token_url)
+    }
+
+    /// A refused token, device or revocation request, in a log line's words:
+    /// the server's `error` code and status, and — for an `invalid_client`
+    /// from a server that was given agentd's Client ID Metadata Document —
+    /// where the document it could not accept is published.
+    fn refused(&self, reply: &Reply) -> String {
+        let mut out = oauth_error(reply);
+        if self.client_id_metadata_document
+            && parse_error(&reply.body).as_deref() == Some("invalid_client")
+        {
+            out.push_str(&format!(
+                "; the authorization server did not accept the Client ID Metadata Document at {} — check that it serves what `agentd --print-client-metadata` writes, and its key set the signing key",
+                self.client_id
+            ));
+        }
+        out
+    }
+
     fn scope_str(&self) -> Option<String> {
         if self.scopes.is_empty() {
             None
@@ -183,6 +214,26 @@ pub struct Discovered {
     /// RFC 9207 §3: the server puts `iss` in every authorization response.
     #[serde(default)]
     pub authorization_response_iss_parameter_supported: bool,
+    /// The server fetches a client's metadata from a `client_id` URL
+    /// (draft-ietf-oauth-client-id-metadata-document-02 §6).
+    #[serde(default)]
+    pub client_id_metadata_document_supported: bool,
+}
+
+impl Discovered {
+    /// Whether this server may be given agentd's Client ID Metadata Document
+    /// as its `client_id`: only when its metadata advertises that it fetches
+    /// one (draft §6, MCP 2026-07-28 client registration). Otherwise the
+    /// error says what the operator registers instead; agentd does not
+    /// register itself dynamically.
+    pub fn admits_document(&self, issuer: &str, client_id: &str) -> Result<(), String> {
+        if self.client_id_metadata_document_supported {
+            return Ok(());
+        }
+        Err(format!(
+            "oauth: the authorization server {issuer} does not advertise client_id_metadata_document_supported, so it would not fetch agentd's Client ID Metadata Document ({client_id}); register agentd there — a client authenticating by private_key_jwt with the key set at its jwks_uri, or by a client secret — and set the block's `client_id` (and its `client_auth` or `client_secret`). agentd does not register dynamically (RFC 7591, which MCP 2026-07-28 deprecates)"
+        ))
+    }
 }
 
 /// The device-authorization response (RFC 8628 §3.2). `interval` defaults to the
@@ -335,14 +386,17 @@ pub fn start_device(params: &OAuth2Params, timeout: Duration) -> Result<DeviceAu
     if let Some(aud) = &params.audience {
         form.field("audience", aud);
     }
-    let reply = post_form(url, form, &[], timeout)?;
+    // A confidential client authenticates here as it does at the token
+    // endpoint (RFC 8628 §3.1).
+    let headers = params.authenticate(&mut form)?;
+    let reply = post_form(url, form, &headers, timeout)?;
     if reply.is_success() {
         serde_json::from_slice(&reply.body)
             .map_err(|e| format!("oauth: bad device-auth response: {e}"))
     } else {
         Err(format!(
             "oauth: device authorization failed: {}",
-            oauth_error(&reply)
+            params.refused(&reply)
         ))
     }
 }
@@ -375,7 +429,7 @@ pub fn poll_device_once(
         Some("slow_down") => Ok(PollOutcome::SlowDown),
         _ => Err(format!(
             "oauth: device token failed: {}",
-            oauth_error(&reply)
+            params.refused(&reply)
         )),
     }
 }
@@ -401,7 +455,7 @@ pub fn exchange_code(
     } else {
         Err(format!(
             "oauth: code exchange failed: {}",
-            oauth_error(&reply)
+            params.refused(&reply)
         ))
     }
 }
@@ -428,7 +482,36 @@ pub fn refresh(
             .map_err(|e| format!("oauth: bad refresh response: {e}").into())
     } else {
         Err(TokenError {
-            message: format!("oauth: refresh failed: {}", oauth_error(&reply)),
+            message: format!("oauth: refresh failed: {}", params.refused(&reply)),
+            retry_after: throttled(&reply),
+        })
+    }
+}
+
+/// The client-credentials grant (RFC 6749 §4.4): a token for the client
+/// itself, with this client's authentication — its secret, or a
+/// `private_key_jwt` assertion.
+pub fn client_credentials(params: &OAuth2Params, timeout: Duration) -> Result<Tokens, TokenError> {
+    let mut form = Form::new();
+    form.field("grant_type", "client_credentials");
+    form.field("client_id", &params.client_id);
+    if let Some(scope) = params.scope_str() {
+        form.field("scope", &scope);
+    }
+    if let Some(aud) = &params.audience {
+        form.field("audience", aud);
+    }
+    let headers = params.authenticate(&mut form)?;
+    let reply = post_form(&params.token_url, form, &headers, timeout)?;
+    if reply.is_success() {
+        serde_json::from_slice(&reply.body)
+            .map_err(|e| format!("oauth: bad token response: {e}").into())
+    } else {
+        Err(TokenError {
+            message: format!(
+                "oauth: client credentials failed: {}",
+                params.refused(&reply)
+            ),
             retry_after: throttled(&reply),
         })
     }
@@ -453,7 +536,10 @@ pub fn revoke(
     if reply.status == 200 {
         Ok(())
     } else {
-        Err(format!("oauth: revocation failed: {}", oauth_error(&reply)))
+        Err(format!(
+            "oauth: revocation failed: {}",
+            params.refused(&reply)
+        ))
     }
 }
 

@@ -225,3 +225,59 @@ fn browser_authorization_code_pkce_flow() {
     assert_eq!(cred.access_token, "at-browser");
     assert_eq!(cred.refresh_token.as_deref(), Some("rt-browser"));
 }
+
+/// A Client ID Metadata Document client returns to the loopback redirect URI
+/// its document registers (RFC 0052): with a port, the login sends that URI
+/// exactly and listens on its port; without one, it listens on a free port
+/// and sends the URI with that port, keeping the registered path.
+#[test]
+fn a_document_client_returns_to_the_redirect_uri_it_registers() {
+    let free = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    for (registered, fixed) in [
+        (format!("http://127.0.0.1:{free}/oauth/callback"), true),
+        ("http://127.0.0.1/oauth/callback".to_string(), false),
+    ] {
+        let (token_port, exchanges) = spawn_token_endpoint();
+        let mut p = params(token_port);
+        p.client_id_metadata_document = true;
+        p.redirect_uri = Some(registered.clone());
+        let (tx, rx) = mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            agentd::auth::browser::browser_login(
+                &p,
+                |url| tx.send(url.to_string()).unwrap(),
+                Duration::from_secs(10),
+            )
+        });
+        let url = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("auth URL printed");
+        let redirect = query_param(&url, "redirect_uri").expect("redirect_uri");
+        let state = query_param(&url, "state").expect("state");
+        let port: u16 = redirect
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|r| r.strip_suffix("/oauth/callback"))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("{redirect}"));
+        if fixed {
+            assert_eq!(redirect, registered, "the registered URI, exactly");
+        }
+        let mut cb = TcpStream::connect(("127.0.0.1", port)).expect("connect callback");
+        cb.write_all(
+            format!(
+                "GET /oauth/callback?code=c&state={state} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut resp = String::new();
+        cb.read_to_string(&mut resp).ok();
+        let cred = handle.join().unwrap().expect("browser_login succeeds");
+        assert_eq!(cred.access_token, "at-browser");
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+}

@@ -12,6 +12,7 @@
 //! never merged); flags apply in argument order — a generic `--<path>` SETS,
 //! while a named repeatable alias (`--mcp`, `--a2a-peer`) ADDS to its list.
 
+pub mod client;
 pub mod companies;
 pub mod events;
 pub mod schema;
@@ -2818,6 +2819,7 @@ impl Auth {
                     AssertionAud::Issuer => Some("issuer".to_string()),
                 },
             }),
+            client_id_metadata_document: false,
             scopes: self.scopes.clone(),
             audience: self.audience.clone(),
             token: self.token.as_ref().map(|s| s.0.clone()),
@@ -4088,6 +4090,10 @@ pub struct Security {
     /// asked for. It is also where the trifecta tags finally do work at
     /// runtime rather than only folding at startup.
     pub policies: Vec<Policy>,
+    /// agentd's OAuth client where it has no registration (RFC 0052): the
+    /// Client ID Metadata Document an `oauth2` block with no `client_id`
+    /// presents.
+    pub client: Option<client::Client>,
     /// Acting at Companies for one User (RFC 0047): who the User is, the
     /// client identity every Company sees, and the seal key.
     pub companies: companies::Companies,
@@ -5700,6 +5706,10 @@ pub enum Ask {
     /// and key set Companies fetch (RFC 0047 §5.5.2) into `dir`, for static
     /// hosting, creating the signing key when absent. Dials nothing.
     PrintCompanyClient(String),
+    /// `--print-client-metadata <dir>`: write `security.client`'s Client ID
+    /// Metadata Document and key set (RFC 0052) into `dir`, for static
+    /// hosting, creating the signing key when absent. Dials nothing.
+    PrintClientMetadata(String),
 }
 
 /// The ask a flag makes, when it makes one: the flags that want something
@@ -5720,6 +5730,7 @@ fn ask_flag(flag: &str) -> Option<Ask> {
         "--extension-schema" => Ask::ExtensionSchema(String::new()),
         "--extensions" => Ask::Extensions,
         "--print-company-client" => Ask::PrintCompanyClient(String::new()),
+        "--print-client-metadata" => Ask::PrintClientMetadata(String::new()),
         _ => return None,
     })
 }
@@ -5875,29 +5886,35 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     while let Some(arg) = it.next() {
         let a = arg.as_str();
         if let Some(asked) = ask_flag(a) {
-            ask =
-                match asked {
-                    // The two asks that name a target take it as the next argument.
-                    Ask::Login(_) => Ask::Login(it.next().cloned().ok_or_else(|| {
+            ask = match asked {
+                // The two asks that name a target take it as the next argument.
+                Ask::Login(_) => {
+                    Ask::Login(it.next().cloned().ok_or_else(|| {
                         usage("--login requires a target (e.g. mcp:<name>)".into())
-                    })?),
-                    Ask::Logout(_) => Ask::Logout(it.next().cloned().ok_or_else(|| {
+                    })?)
+                }
+                Ask::Logout(_) => {
+                    Ask::Logout(it.next().cloned().ok_or_else(|| {
                         usage("--logout requires a target (e.g. mcp:<name>)".into())
-                    })?),
-                    Ask::ExtensionSchema(_) => {
-                        Ask::ExtensionSchema(it.next().cloned().ok_or_else(|| {
-                            usage("--extension-schema requires a name (e.g. command)".into())
-                        })?)
-                    }
-                    Ask::PrintCompanyClient(_) => {
-                        Ask::PrintCompanyClient(it.next().cloned().ok_or_else(|| {
-                            usage(
-                                "--print-company-client requires a directory to write into".into(),
-                            )
-                        })?)
-                    }
-                    other => other,
-                };
+                    })?)
+                }
+                Ask::ExtensionSchema(_) => {
+                    Ask::ExtensionSchema(it.next().cloned().ok_or_else(|| {
+                        usage("--extension-schema requires a name (e.g. command)".into())
+                    })?)
+                }
+                Ask::PrintCompanyClient(_) => {
+                    Ask::PrintCompanyClient(it.next().cloned().ok_or_else(|| {
+                        usage("--print-company-client requires a directory to write into".into())
+                    })?)
+                }
+                Ask::PrintClientMetadata(_) => {
+                    Ask::PrintClientMetadata(it.next().cloned().ok_or_else(|| {
+                        usage("--print-client-metadata requires a directory to write into".into())
+                    })?)
+                }
+                other => other,
+            };
             continue;
         }
         match a {
@@ -6752,8 +6769,10 @@ pub struct Diagnostics {
 /// all problems at once. Pure.
 /// Validate a unified `auth:` block — the fields each `kind`/`grant` requires,
 /// and secret-freedom for credential fields. Returns error strings prefixed
-/// with `ctx` (e.g. `mcp server 'github'`).
-fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
+/// with `ctx` (e.g. `mcp server 'github'`). An `oauth2` block that names no
+/// `client_id` is held to `client`'s Client ID Metadata Document instead
+/// (RFC 0052).
+fn validate_auth_block(auth: &Auth, client: Option<&client::Client>, ctx: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Credential fields must be `{{secret:…}}` references, never inline.
     let key = auth.client_auth.as_ref().and_then(|c| c.key.clone());
@@ -6772,7 +6791,15 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
             ));
         }
     }
-    if let Some(c) = &auth.client_auth {
+    // A block that uses the document says nothing of its key: that is
+    // checked with the rest of it below.
+    let document = match (&auth.client_id, client) {
+        (None, Some(c)) if auth.kind == AuthKind::Oauth2 => Some(c),
+        _ => None,
+    };
+    if let Some(c) = &auth.client_auth
+        && document.is_none()
+    {
         out.extend(validate_client_auth(auth, c, ctx));
     }
     match auth.kind {
@@ -6831,8 +6858,12 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
             other => out.push(format!("{ctx}: auth.svid '{other}' (want jwt|x509)")),
         },
         AuthKind::Oauth2 => {
-            if auth.client_id.is_none() {
-                out.push(format!("{ctx}: auth.kind oauth2 needs `client_id`"));
+            match document {
+                Some(c) => out.extend(client::validate_block(auth, c, ctx)),
+                None if auth.client_id.is_none() => out.push(format!(
+                    "{ctx}: auth.kind oauth2 needs `client_id`, or security.client for agentd's Client ID Metadata Document"
+                )),
+                None => {}
             }
             if auth.token_url.is_none() && auth.issuer.is_none() {
                 out.push(format!(
@@ -6848,9 +6879,13 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
                     }
                 }
                 OAuthGrant::ClientCredentials => {
-                    if auth.client_secret.is_none() {
+                    let signs = auth
+                        .client_auth
+                        .as_ref()
+                        .is_some_and(|c| c.method == ClientAuthMethod::PrivateKeyJwt);
+                    if document.is_none() && auth.client_secret.is_none() && !signs {
                         out.push(format!(
-                            "{ctx}: the client_credentials grant needs `client_secret`"
+                            "{ctx}: the client_credentials grant needs `client_secret`, or `client_auth: {{method: private_key_jwt}}`"
                         ));
                     }
                 }
@@ -6874,11 +6909,6 @@ fn validate_client_auth(auth: &Auth, c: &ClientAuth, ctx: &str) -> Vec<String> {
     if auth.kind != AuthKind::Oauth2 {
         out.push(format!("{ctx}: auth.client_auth is for auth.kind oauth2"));
         return out;
-    }
-    if auth.grant == Some(OAuthGrant::ClientCredentials) {
-        out.push(format!(
-            "{ctx}: auth.client_auth applies to the device and authorization_code grants; a client_credentials grant sends its client_secret in the form body"
-        ));
     }
     match c.method {
         ClientAuthMethod::PrivateKeyJwt => {
@@ -7799,7 +7829,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         );
     }
     for c in s.intelligence.connections() {
-        validate_connection(&c, &mut d);
+        validate_connection(&c, s.security.client.as_ref(), &mut d);
     }
     validate_budget(&s.intelligence.budget, "intelligence.budget", &mut d);
     if let Some(b) = &s.agent.conversation_budget {
@@ -7808,6 +7838,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // MCP Events bindings and grants.
     events::validate(s, &mut d);
     // `security.companies` and the company entries.
+    client::validate(s, &mut d);
     companies::validate(s, &mut d);
 
     // mcp servers
@@ -7872,7 +7903,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
         if let Some(auth) = &srv.auth {
-            for e in validate_auth_block(auth, &format!("mcp server '{}'", srv.name)) {
+            for e in validate_auth_block(
+                auth,
+                s.security.client.as_ref(),
+                &format!("mcp server '{}'", srv.name),
+            ) {
                 err(&mut d, e);
             }
             // A server presents one credential, and `auth` would win: an
@@ -8000,7 +8035,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
         if let Some(auth) = &svc.auth {
-            for e in validate_auth_block(auth, &format!("services.{name}")) {
+            for e in validate_auth_block(
+                auth,
+                s.security.client.as_ref(),
+                &format!("services.{name}"),
+            ) {
                 err(&mut d, e);
             }
         }
@@ -8946,7 +8985,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             );
         }
         if let Some(auth) = &p.auth {
-            for e in validate_auth_block(auth, &format!("a2a peer '{}'", p.name)) {
+            for e in validate_auth_block(
+                auth,
+                s.security.client.as_ref(),
+                &format!("a2a peer '{}'", p.name),
+            ) {
                 err(&mut d, e);
             }
             if auth.kind == AuthKind::Aws {
@@ -9670,7 +9713,7 @@ pub(crate) fn model_refusals(s: &Settings, w: &crate::engine::model::Workflow) -
 /// and every provider: dialable endpoints, a known dialect with the
 /// credential it needs, a coherent `auth:` block, and no inline credential in
 /// a header.
-fn validate_connection(c: &Connection<'_>, d: &mut Diagnostics) {
+fn validate_connection(c: &Connection<'_>, client: Option<&client::Client>, d: &mut Diagnostics) {
     let at = c.at();
     if c.name.is_some() && c.endpoints.is_empty() {
         d.errors.push(format!("{at}.endpoints: required"));
@@ -9689,7 +9732,7 @@ fn validate_connection(c: &Connection<'_>, d: &mut Diagnostics) {
         ));
     }
     if let Some(auth) = c.auth {
-        d.errors.extend(validate_auth_block(auth, &at));
+        d.errors.extend(validate_auth_block(auth, client, &at));
     }
     if let Some(dialect) = c.dialect {
         if crate::intel::client::Provider::from_dialect(Some(dialect)).is_none() {
@@ -10186,6 +10229,8 @@ pub fn help_text() -> String {
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
          \x20 --logout <target>          evict a cached credential\n\
+         \x20 --print-client-metadata <dir>  write security.client's Client ID Metadata Document + key set\n\
+         \x20                            into <dir>, creating the signing key; dials nothing (needs oauth)\n\
          \x20 --print-company-client <dir>  write the client metadata document + key set Companies fetch\n\
          \x20                            into <dir>, creating the signing key; dials nothing (needs companies)\n\
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
@@ -15099,7 +15144,7 @@ mod tests {
     fn client_auth_takes_what_its_method_needs() {
         let check = |v: serde_json::Value| {
             let auth: Auth = serde_json::from_value(v).unwrap();
-            (validate_auth_block(&auth, "mcp server 's'"), auth)
+            (validate_auth_block(&auth, None, "mcp server 's'"), auth)
         };
         let base = json!({"kind": "oauth2", "issuer": "https://as.example", "client_id": "c"});
         let with = |extra: serde_json::Value| {
@@ -15140,13 +15185,18 @@ mod tests {
                 "are for private_key_jwt",
             ),
             (
-                json!({"client_auth": {"key": "{{secret:K}}"}, "grant": "client_credentials", "client_secret": "{{secret:S}}"}),
-                "client_credentials grant sends its client_secret",
+                json!({"grant": "client_credentials"}),
+                "client_credentials grant needs `client_secret`, or `client_auth: {method: private_key_jwt}`",
             ),
         ] {
             let (errs, _) = check(with(extra.clone()));
             assert!(errs.iter().any(|e| e.contains(want)), "{extra}: {errs:?}");
         }
+        // A client_credentials grant signs as any other grant does.
+        let (errs, _) = check(with(
+            json!({"grant": "client_credentials", "client_auth": {"key": "{{secret:K}}"}}),
+        ));
+        assert!(errs.is_empty(), "{errs:?}");
         let (errs, _) = check(
             json!({"kind": "oauth2", "token_url": "https://as.example/t",
             "client_id": "c", "client_auth": {"key": "{{secret:K}}", "assertion_aud": "issuer"}}),

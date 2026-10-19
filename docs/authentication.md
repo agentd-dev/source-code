@@ -165,7 +165,7 @@ auth:
 |---|---|---|
 | `device` (the default) | a person authorizes once, from any terminal, over SSH included | `agentd --login` prints a URL and a short code and polls until the person approves |
 | `authorization_code` | a person with a desktop browser | `agentd --login` prints the authorization URL, catches the redirect on a one-time `127.0.0.1` listener, checks `state` and `iss`, and exchanges the code with PKCE |
-| `client_credentials` | machine to machine | the daemon fetches the token with `client_secret` and refetches it before it expires; no login |
+| `client_credentials` | machine to machine | the daemon fetches the token with the client's authentication — its `client_secret`, or a `private_key_jwt` assertion — and fetches a new one a minute before it expires, or halfway through a lifetime shorter than two minutes; no login |
 
 **Endpoints.** With `issuer`, agentd discovers the token, device,
 authorization and revocation endpoints from the server's metadata. It asks
@@ -181,9 +181,11 @@ issuer …`), because metadata that does not match is how a mix-up attack
 points a client at another server's endpoints. Write `issuer` exactly as the
 server's metadata does, trailing slash included or not. Pin `token_url`,
 `device_authorization_url` or `authorization_url` to skip discovery. An
-`oauth2` block needs `client_id` and either `issuer` or `token_url`; the
-device grant also needs `issuer` or `device_authorization_url`, and the
-browser grant `issuer` or `authorization_url`. The load checks each of these.
+`oauth2` block needs `client_id` — or, without one,
+[agentd's Client ID Metadata Document](#client-id-metadata-document) — and
+either `issuer` or `token_url`; the device grant also needs `issuer` or
+`device_authorization_url`, and the browser grant `issuer` or
+`authorization_url`. The load checks each of these.
 
 With no `issuer` and no pinned endpoint, `agentd --login` asks the MCP
 server itself (RFC 9728): the `resource_metadata` URL its `401` challenge
@@ -218,9 +220,10 @@ fresh ES256 assertion signed with `key`, good for 60 seconds, with `iss` and
 `sub` the `client_id`, `aud` the token endpoint (or the `issuer`), and a
 random `jti`. Register the key's public half with the authorization server.
 `client_secret_basic` sends the `client_secret` in an `Authorization: Basic`
-header instead of the body. `client_auth` applies to the `device` and
-`authorization_code` grants; a `client_credentials` grant sends its
-`client_secret` in the body and refuses `client_auth` at load.
+header instead of the body. `client_auth` applies to every grant: a
+`client_credentials` grant with `private_key_jwt` needs no `client_secret`.
+A confidential client authenticates at the device authorization endpoint
+too, as at the token endpoint (RFC 8628 §3.1).
 
 The daemon discovers them at the first request that needs them — the first
 token fetch of a `client_credentials` grant, the first refresh of a login —
@@ -245,6 +248,108 @@ oauth:
 > and RFC 8628 specify, and does not send `Accept: application/json`. An
 > authorization server that answers form-encoded unless asked for JSON, such
 > as GitHub's OAuth endpoints, fails with `oauth: bad device-auth response`.
+
+## Client ID Metadata Document
+
+An authorization server agentd has no registration at can still know it, by
+a [Client ID Metadata Document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/)
+(draft -02): agentd's `client_id` is an HTTPS URL, and the JSON document at
+that URL says who the client is and where its public keys are. MCP's
+2026-07-28 client registration prefers it to dynamic registration, which it
+deprecates. Configure the identity once, under `security.client`:
+
+```yaml
+# fragment: under security:
+client:
+  id: https://agent.example.com/oauth/client.json   # the client_id, and where the document is published
+  name: Example operations agent                     # client_name, on consent pages
+  key_file: /var/lib/agentd/client-key               # the ES256 key, created 0600 when absent
+  grants: [device, client_credentials]               # what the document lets a server issue tokens by
+```
+
+An `oauth2` block that names no `client_id` then uses it: the document's URL
+is the `client_id`, and every token request — and the device authorization
+request — carries a `private_key_jwt` assertion signed with `key_file`. The
+block needs `issuer`, no `client_secret`, and a `grant` the document lists;
+`client_auth` may set `assertion_aud` and nothing else. A block that names a
+`client_id` keeps its own registration.
+
+```yaml
+# fragment: under mcp.servers[]:
+auth:
+  kind: oauth2
+  issuer: https://auth.tracker.example.com   # its metadata says whether it takes the document
+  grant: device
+  scopes: [tracker.read]
+```
+
+**Publish it.** The authorization server fetches the document from its URL,
+so the URL must answer it over HTTPS. Write the two files for a static host:
+
+```sh
+agentd --config agentd.yaml --print-client-metadata ./published
+```
+
+```text
+./published/client.json
+./published/jwks.json
+```
+
+Host `client.json` at `id` and `jwks.json` at `jwks_uri`, `jwks.json`
+beside the document unless `jwks_uri` names another URL. Or set
+`security.client.serve: true` and the A2A listener serves both at their
+URLs' paths, when `a2a.url` is the `client_id`'s origin. The document
+carries `client_id`, `client_name`, `logo_uri` when set, `jwks_uri`,
+`redirect_uris`, `grant_types`, `response_types` and
+`token_endpoint_auth_method: private_key_jwt`; never a secret or a private
+key. The key set lists the signing key and every `published_key_files` key
+— the next one before a rotation, the previous one after — by their public
+halves only. A server may refuse the document's tokens once its keys
+change, so publish a new key before signing with it.
+
+**Where agentd uses it.** In the order MCP's client registration gives: a
+configured `client_id` first; else the document, where the authorization
+server's metadata advertises `client_id_metadata_document_supported`. agentd
+does not register itself dynamically (RFC 7591). Where the metadata does not
+advertise the document, `agentd --login` and the daemon's first token
+request fail before anything else is sent, saying what to register:
+
+```text
+agentd: oauth: the authorization server https://auth.tracker.example.com does not advertise client_id_metadata_document_supported, so it would not fetch agentd's Client ID Metadata Document (https://agent.example.com/oauth/client.json); register agentd there — a client authenticating by private_key_jwt with the key set at its jwks_uri, or by a client secret — and set the block's `client_id` (and its `client_auth` or `client_secret`). agentd does not register dynamically (RFC 7591, which MCP 2026-07-28 deprecates)
+```
+
+A server that refuses the document with `invalid_client` is named with the
+document's URL: check that it serves what `--print-client-metadata` writes,
+and that its key set holds the signing key.
+
+**Grants.** `device` and `client_credentials` need no redirect URI. The
+document lists the grant types of `grants`, with `refresh_token` beside
+`device` and `authorization_code`, whose tokens agentd renews. For
+`authorization_code`, list a loopback redirect URI, where the login waits
+for the browser:
+
+```yaml
+# fragment: under security.client:
+grants: [authorization_code]
+redirect_uris: ["http://127.0.0.1:8765/callback"]
+```
+
+With a port, `agentd --login` listens on that port and sends the URI
+exactly, so it matches the document under the draft's exact comparison.
+Without one (`http://127.0.0.1/callback`), it listens on a free port and
+sends the URI with that port, for a server that allows any port on a
+loopback address, as RFC 8252 §7.3 and OAuth 2.1 have it. A redirect URI is
+`http://127.0.0.1` or `http://[::1]`, never `localhost`. A login uses the
+first one listed.
+
+**Every endpoint.** The document is the client of any `oauth2` block with no
+`client_id`: an MCP server's, a service entry's, a model connection's or an
+A2A peer's.
+
+The [Personal Agent Protocol preview](act-at-companies.md) keeps a document
+of its own, `security.companies.client`: that protocol holds every redirect
+URI to an HTTPS URL on the `client_id`'s domain, where this one lists
+loopback URIs, and adds an `extensions` member.
 
 ## Log in with agentd --login
 
@@ -341,7 +446,12 @@ of one, and a crash mid-write leaves the old. A write that fails leaves the
 refresh unused, and each request fails, naming the cause, until the write
 succeeds. Whenever the daemon holds no usable token it reads the cache
 again, so a login made while it runs is used by the next request, with no
-reload or restart.
+reload or restart. A login is kept with the authorization server it was
+made at: the block's `issuer`, the one RFC 9728 found, or, where the block
+names no issuer, its `token_url`. Under a block whose server is another —
+an `issuer` changed, or added to a block that only pinned `token_url` — the
+login is not presented, renewed or revoked, and requests fail naming the
+`--login` that fixes it.
 
 **Waits the server asks for.** A token endpoint that answers `429` or `503`
 with `Retry-After` (seconds or an HTTP date) is not asked again before the
@@ -503,12 +613,12 @@ out of rotation for it, so another endpoint serves meanwhile. The
 | `token_url` | `oauth2` | token endpoint; pins discovery |
 | `device_authorization_url` | `oauth2` | device authorization endpoint |
 | `authorization_url` | `oauth2` | authorization endpoint for `grant: authorization_code` |
-| `client_id` | `oauth2` | client id (required) |
-| `client_secret` | `oauth2` | client secret; must be a secret reference; required for `client_credentials` |
-| `client_auth` | `oauth2` | `{method, key, kid, assertion_aud}`: `private_key_jwt` (default) with a PKCS#8 P-256 `key` (a secret reference), `client_secret_basic` or `client_secret_post`; not with `client_credentials` |
+| `client_id` | `oauth2` | the registered client; without one, [agentd's Client ID Metadata Document](#client-id-metadata-document) (`security.client`) |
+| `client_secret` | `oauth2` | client secret; must be a secret reference; required for `client_credentials` unless `client_auth` signs |
+| `client_auth` | `oauth2` | `{method, key, kid, assertion_aud}`: `private_key_jwt` (default) with a PKCS#8 P-256 `key` (a secret reference), `client_secret_basic` or `client_secret_post`; with no `client_id`, only `assertion_aud` |
 | `grant` | `oauth2` | `device` (default), `authorization_code` or `client_credentials` |
 | `scopes` | `oauth2` | requested scopes |
-| `audience` | `oauth2` | `audience` parameter sent with the device authorization request, for authorization servers that want one |
+| `audience` | `oauth2` | `audience` parameter sent with the device authorization request and the client-credentials grant, for authorization servers that want one |
 | `region` | `aws` | AWS region (required) |
 | `service` | `aws` | signing service name, such as `bedrock` or `execute-api` (required) |
 | `source` | `aws` | `env` (default), `static`, `imds`, `irsa` or `sso` |

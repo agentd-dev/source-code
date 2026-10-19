@@ -45,9 +45,21 @@ pub fn browser_login(
     let challenge = crate::b64::url_nopad(&sha256(verifier.as_bytes()));
     let state = random(16)?;
 
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("oauth: loopback: {e}"))?;
+    // The redirect URI a Client ID Metadata Document registers, on its port
+    // when it names one; otherwise any free port of 127.0.0.1.
+    let at = match params.redirect_uri.as_deref() {
+        Some(uri) => crate::config::settings::client::loopback(uri)
+            .ok_or_else(|| format!("oauth: {uri:?} is not a loopback redirect URI"))?,
+        None => crate::config::settings::client::Loopback {
+            host: "127.0.0.1",
+            port: None,
+            path: "/callback".into(),
+        },
+    };
+    let listener = TcpListener::bind(format!("{}:{}", at.host, at.port.unwrap_or(0)))
+        .map_err(|e| format!("oauth: loopback: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let redirect = format!("http://127.0.0.1:{port}/callback");
+    let redirect = at.uri(port);
 
     let scope = params.scopes.join(" ");
     let url = format!(

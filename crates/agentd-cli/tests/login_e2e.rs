@@ -154,6 +154,11 @@ fn agentd_login_completes_the_device_flow_and_caches_the_token() {
     assert_eq!(cred["access_token"], "at-xyz");
     assert_eq!(cred["refresh_token"], "rt-xyz");
     assert!(cred["expires_at_ms"].as_u64().unwrap() > 0);
+    assert_eq!(
+        cred["authorization_server"],
+        format!("http://127.0.0.1:{port}/token"),
+        "a block that names no issuer: kept with its token endpoint"
+    );
 
     #[cfg(unix)]
     {
@@ -241,7 +246,9 @@ struct Seen {
 /// one with `invalid_grant`. `rt-1`'s refresh answers `rt-2`; `rt-2`'s first
 /// answers no refresh token at all, so `rt-2` stays good; its second answers
 /// `rt-4`. Its RFC 8414 metadata names its revocation endpoint, which
-/// answers `revoke_status` — or, with none, names no revocation endpoint.
+/// answers `revoke_status` — or, with none, names no revocation endpoint. A
+/// device login is approved at its first poll and issues `rt-1`, and the
+/// RFC 9728 metadata of an MCP server at its `/mcp` names it.
 fn spawn_rotating_as(revoke_status: Option<&'static str>) -> (String, Arc<std::sync::Mutex<Seen>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -287,6 +294,25 @@ fn spawn_rotating_as(revoke_status: Option<&'static str>) -> (String, Arc<std::s
                     format!(
                         r#"{{"issuer":"{issuer}","token_endpoint":"{issuer}/token","device_authorization_endpoint":"{issuer}/device"{revocation}}}"#
                     ),
+                )
+            } else if path == "/.well-known/oauth-protected-resource/mcp" {
+                (
+                    "200 OK",
+                    format!(
+                        r#"{{"resource":"{issuer}/mcp","authorization_servers":["{issuer}"]}}"#
+                    ),
+                )
+            } else if path == "/device" {
+                (
+                    "200 OK",
+                    r#"{"device_code":"dev-1","user_code":"WDJB-MJHT","verification_uri":"https://idp.example/device","interval":1,"expires_in":300}"#
+                        .to_string(),
+                )
+            } else if path == "/token" && field("device_code").is_some() {
+                (
+                    "200 OK",
+                    r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#
+                        .to_string(),
                 )
             } else if let (Some(revoke_status), "/revoke") = (revoke_status, path.as_str()) {
                 log.lock().unwrap().revocations.push(form.clone());
@@ -353,6 +379,7 @@ fn a_rotated_refresh_token_survives_a_restart() {
             access_token: "at-1".into(),
             refresh_token: Some("rt-1".into()),
             expires_at_ms: 1,
+            authorization_server: Some(format!("{issuer}/token")),
             ..Default::default()
         },
     )
@@ -416,6 +443,7 @@ fn logged_in(issuer: &str) -> (String, String) {
             access_token: "at-1".into(),
             refresh_token: Some("rt-1".into()),
             expires_at_ms: 0,
+            authorization_server: Some(issuer.to_string()),
             ..Default::default()
         },
     )
@@ -497,6 +525,62 @@ fn agentd_logout_revokes_the_token_where_it_was_issued() {
     assert_eq!(seen.lock().unwrap().metadata, 1, "the metadata, once");
     assert!(agentd::auth::cache::load_file(std::path::Path::new(&cred_dir), "mcp:test").is_none());
     std::fs::remove_dir_all(&cred_dir).ok();
+}
+
+/// A login made at the authorization server RFC 9728 found — the block
+/// names no issuer — is kept with that server, and the logout, finding it
+/// again, revokes the token there.
+#[test]
+fn a_logout_revokes_where_rfc_9728_found_the_login() {
+    let (issuer, seen) = spawn_rotating_as(Some("200 OK"));
+    let cfg = common::unique_path("logout-9728-cfg", "yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "\
+             agent:\n  name: logout\n  instruction: x\n  preflight: never\n\
+             intelligence:\n  endpoints: [https://api.openai.com/v1]\n  model: m\n\
+             store:\n  kind: memory\n\
+             mcp:\n  servers:\n    - name: test\n      endpoint: {issuer}/mcp\n\
+             \x20     auth:\n        kind: oauth2\n        grant: device\n\
+             \x20       client_id: agentd-cli\n\
+             lifecycle:\n  run_until: idle\n"
+        ),
+    )
+    .unwrap();
+    let cred_dir = common::unique_path("logout-9728-creds", "d");
+    let run = |verb: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([verb, "mcp:test", "--config", &cfg])
+            .env("AGENTD_CRED_DIR", &cred_dir)
+            .output()
+            .expect("run agentd")
+    };
+    let login = run("--login");
+    assert!(
+        login.status.success(),
+        "{}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    let kept = agentd::auth::cache::load_file(std::path::Path::new(&cred_dir), "mcp:test");
+    assert_eq!(
+        kept.and_then(|c| c.authorization_server).as_deref(),
+        Some(issuer.as_str()),
+        "kept with the issuer RFC 9728 found"
+    );
+    let out = run("--logout");
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&cred_dir).ok();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("revoked at the authorization server"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        seen.lock().unwrap().revocations,
+        ["token=rt-1&token_type_hint=refresh_token&client_id=agentd-cli"]
+    );
 }
 
 /// A logout deletes the login here before it dials anything, so one cut

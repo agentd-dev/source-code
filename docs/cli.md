@@ -68,7 +68,8 @@ server's metadata, token and revocation endpoints — or, for a `company:<name>`
 target, the running daemon's unix A2A listener. Every ask reads
 the configuration files you name, so a file that does not parse is exit 2 even
 for `--help`. Only `--validate-config`, `--capabilities`,
-`--effective-config` and `--print-company-client` also run validation.
+`--effective-config`, `--print-client-metadata` and `--print-company-client`
+also run validation.
 
 | Flag | Prints | Stream | Exit |
 |---|---|---|---|
@@ -86,6 +87,7 @@ for `--help`. Only `--validate-config`, `--capabilities`,
 | `--logout <target>` | Evicts a cached credential, then revokes it at its authorization server when the server's metadata lists a revocation endpoint (RFC 7009; needs the `oauth` feature). A revocation that fails exits 2, the credential evicted. | stdout | 0, or 2 on failure |
 | `--login company:<name>[/<label>]` | Asks the running daemon, over its unix A2A listener, to have the User sign in at the Company `<name>` — to the account agentd calls `<label>` (`[a-z0-9_-]{1,32}`), or, without one, the only account held there, else `default` ([Several accounts](act-at-companies.md#several-accounts)) — then prints what the daemon says: where to sign in and the code to check, then how it ended. The label rides in the target after a `/`, which neither an entry's name nor a label holds, so no flag of its own is added. The sign-in happens in the daemon; this process holds no code or token. Needs `a2a.listen` a unix socket, `security.companies.user: operator` (any User can ask the agent instead, whose `company.sign_in` tool opens the same gate, and one who is an operator principal can send the [`company.sign_in` command op](a2a-reference.md#command-ops) from their own A2A client; the TUI and web UI have no company sign-in command), and the `companies` and `a2a` features. | stdout | 0 signed in, 1 ended otherwise or no daemon answered, 2 on a configuration that cannot reach it or a label that is not one |
 | `--logout company:<name>[/<label>]` | Asks the running daemon, the same way, to sign the User out of one account at `<name>` — the one `<label>` names, or the only one held: its Account Token is revoked there and forgotten, and every other account stays signed in. With several held and no label it signs out of none. | stdout | 0 signed out or nobody signed in, 1 when the revocation failed, several accounts are held and none is named, or no daemon answered, 2 as for `--login` |
+| `--print-client-metadata <dir>` | Writes `client.json` (agentd's [Client ID Metadata Document](authentication.md#client-id-metadata-document)) and `jwks.json` (its key set, public halves only) for `security.client` into `<dir>`, for static hosting at the `client_id` and `jwks_uri`, and prints their paths. Creates the signing key `0600` when it is absent. Dials nothing. Needs the `oauth` feature. | stdout | 0, or 2 on an invalid configuration |
 | `--print-company-client <dir>` | Writes `client.json` (the client metadata document) and `jwks.json` (its key set, public halves only) for `security.companies.client` into `<dir>`, for static hosting at the `client_id` and `jwks_uri`, and prints their paths. Creates the signing key `0600` when it is absent. Dials nothing. Needs the `companies` feature. | stdout | 0, or 2 on an invalid configuration |
 
 > **Note.** `--validate-config` writes its verdict to **stderr**. A CI step

@@ -386,6 +386,37 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
                 exit::USAGE
             }
         }
+        // `--print-client-metadata <dir>`: agentd's Client ID Metadata
+        // Document for static hosting. The key is created when absent;
+        // nothing is dialled.
+        Ask::PrintClientMetadata(dir) => {
+            #[cfg(feature = "oauth")]
+            {
+                match agentd::auth::client_metadata::print_client(
+                    &loaded.settings,
+                    std::path::Path::new(&dir),
+                ) {
+                    Ok(files) => {
+                        for f in files {
+                            println!("{}", f.display());
+                        }
+                        exit::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("agentd: --print-client-metadata: {e}");
+                        exit::USAGE
+                    }
+                }
+            }
+            #[cfg(not(feature = "oauth"))]
+            {
+                let _ = &dir;
+                eprintln!(
+                    "agentd: --print-client-metadata needs the oauth feature (build with --features oauth)"
+                );
+                exit::USAGE
+            }
+        }
         Ask::Capabilities => {
             println!(
                 "{}",

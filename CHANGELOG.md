@@ -18,8 +18,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   128-bit `jti`. Its `kid` is the key's RFC 7638 thumbprint unless `kid`
   names one. `method: client_secret_basic` sends the `client_secret` in an
   `Authorization: Basic` header instead of the form body. `client_auth`
-  applies to the `device` and `authorization_code` grants; with
-  `client_credentials` it is refused at load, as is an inline `key`.
+  applies to every grant, `client_credentials` included, which then needs
+  no `client_secret`; an inline `key` is refused at load.
 - `agentd-core`: `auth::http`, the one helper OAuth requests go through —
   status, headers and body returned, no redirect followed, a server-chosen
   URL dialled HTTPS-only through the SSRF guard (`Dial::Vetted`);
@@ -896,9 +896,61 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - Conformance family `mcp-skills`: a listed skill loaded once its digest
   matches, one whose bytes differ declined after a `skills/get` refresh, a
   prompt that is no skill.
+- A Client ID Metadata Document (RFC 0052,
+  draft-ietf-oauth-client-id-metadata-document-02): `security.client`
+  (`id`, `name`, `logo_uri`, `jwks_uri`, `key_file`,
+  `published_key_files`, `redirect_uris`, `grants`, `serve`) is agentd's
+  OAuth client where it has no registration. An `oauth2` block with no
+  `client_id` — on an MCP server, a service entry, a model connection or
+  an A2A peer — presents the document's URL as its `client_id`, with a
+  `private_key_jwt` assertion signed by `key_file`, at an authorization
+  server whose RFC 8414 metadata advertises
+  `client_id_metadata_document_supported`; where it does not, `--login`
+  and the daemon's first token request fail before anything else is
+  sent, saying what to register. agentd does not register dynamically. Such
+  a block needs `issuer`, no `client_secret`, a grant `security.client.grants`
+  lists (`device` by default), and of `client_auth` only `assertion_aud`.
+  The document carries `client_id`, `client_name`, `logo_uri`, `jwks_uri`,
+  `redirect_uris`, the `grant_types` and `response_types` of its grants
+  and `token_endpoint_auth_method: private_key_jwt`, and is checked to
+  carry no secret and no private key. An `authorization_code` login
+  listens on the port of the first loopback redirect URI it lists, or on a
+  free one when the URI names none. `security.client.id` is held to the
+  draft's rules: HTTPS, a path of its own, no userinfo, query, fragment or
+  dot segment. With `serve: true` the A2A listener serves the document and
+  its key set at their URLs' paths.
+- `agentd --print-client-metadata <dir>` writes `client.json` and
+  `jwks.json` for `security.client`, for static hosting, creating the key
+  `0600` when absent. Dials nothing; needs `oauth`.
+- `agentd-core`: `auth::client_metadata` — `Identity` (one client
+  identity's document, key, key set, `documents`, `print`,
+  `client_assertion`), `of_client`, `print_client` and `check`, the draft's
+  rules on what a document carries; `config::settings::client` —
+  `Client`, `client_id_url_error`, `loopback`, `Loopback`,
+  `listener_answers`; `Settings::auth_spec`, an `auth:` block's runtime
+  spec with the document filled in; `AuthSpec::client_id_metadata_document`;
+  `OAuth2Params::{client_id_metadata_document, redirect_uri}`;
+  `Discovered::{client_id_metadata_document_supported, admits_document}`;
+  `oauth2::client_credentials`; `CachedCred::authorization_server`;
+  `OAuth2Params::authorization_server`; `companies::served_paths`.
 
 **Changed.**
 
+- A login is cached with the authorization server it was made at — the
+  block's `issuer`, the one RFC 9728 found, or else the block's
+  `token_url` — and is not presented, renewed or revoked under a block whose
+  server is another: requests fail naming the `--login` that fixes it. A
+  record that names no server is presented nowhere.
+- A confidential `oauth2` client authenticates at the device authorization
+  endpoint as it does at the token endpoint (RFC 8628 §3.1), with its
+  `client_secret` or a `private_key_jwt` assertion.
+- A `client_credentials` grant's token is fetched with the block's client
+  authentication, and its `audience` is sent with the request. It is
+  fetched again a minute before it expires, or halfway through a lifetime
+  shorter than two minutes.
+- `security.companies.client.id` is held to the Client ID Metadata
+  Document's rules on a client identifier URL, and the Companies' client
+  identity is built by `auth::client_metadata`, as `security.client`'s is.
 - A company entry's `interfaces` take `agent` and `openapi`, which load
   refused while only a Company's MCP servers were used.
 - A Company's `user_requested` event asks the User whether to talk with it

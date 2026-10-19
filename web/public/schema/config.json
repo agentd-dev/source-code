@@ -76,7 +76,7 @@
         },
         "client_auth": {
           "additionalProperties": false,
-          "description": "how the client authenticates at the token and revocation endpoints",
+          "description": "how the client authenticates at the token and revocation endpoints; with no client_id, only assertion_aud",
           "properties": {
             "assertion_aud": {
               "enum": [
@@ -102,6 +102,7 @@
           "type": "object"
         },
         "client_id": {
+          "description": "the registered client; unset, agentd's Client ID Metadata Document (security.client) is the client, where the issuer's metadata advertises it",
           "type": "string"
         },
         "client_secret": {
@@ -4284,6 +4285,66 @@
               "type": "string"
             }
           },
+          "type": "object"
+        },
+        "client": {
+          "additionalProperties": false,
+          "description": "agentd's OAuth client where it has no registration (RFC 0052; needs the oauth feature): an auth block of kind oauth2 that names no client_id presents this Client ID Metadata Document's URL as its client_id, with private_key_jwt, at an authorization server whose metadata advertises client_id_metadata_document_supported. Restart-only, operator-only",
+          "properties": {
+            "grants": {
+              "description": "the grants the document lists in grant_types (with refresh_token beside device and authorization_code); a block that uses the document with a grant it does not list is refused at load. Default [device]",
+              "items": {
+                "enum": [
+                  "device",
+                  "authorization_code",
+                  "client_credentials"
+                ]
+              },
+              "type": "array"
+            },
+            "id": {
+              "description": "the client_id: the HTTPS URL the document is published at — a path of its own, no userinfo, query, fragment or dot segment (draft §3)",
+              "type": "string"
+            },
+            "jwks_uri": {
+              "description": "the key set's HTTPS URL; default jwks.json beside the document",
+              "type": "string"
+            },
+            "key_file": {
+              "description": "the ES256 signing key (PKCS#8), created 0600 when absent; default /var/lib/agentd/client-key",
+              "type": "string"
+            },
+            "logo_uri": {
+              "description": "an HTTPS URL",
+              "type": "string"
+            },
+            "name": {
+              "description": "client_name, shown on authorization servers' consent pages",
+              "type": "string"
+            },
+            "published_key_files": {
+              "description": "keys whose public halves are in the key set but are never signed with: the next key before a rotation, the previous one after it",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "redirect_uris": {
+              "description": "loopback redirect URIs for the authorization_code grant, http://127.0.0.1[:port]/path or http://[::1][:port]/path: with a port, the login listens on it; without one, on any free port, for an authorization server that allows any port on a loopback address (RFC 8252 §7.3)",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "serve": {
+              "description": "serve the document and key set on the A2A listener at their URLs' paths (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-client-metadata writes",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "id",
+            "name"
+          ],
           "type": "object"
         },
         "companies": {

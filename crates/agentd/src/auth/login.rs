@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::cache::{self, CachedCred};
 use crate::auth::oauth2::{self, DeviceAuth, OAuth2Params, PollOutcome};
+use crate::config::AuthSpec;
 use crate::config::settings::{Auth, AuthKind, OAuthGrant, Settings};
 
 /// The user-facing device prompt (RFC 8628 §3.2) handed to the printer.
@@ -90,20 +91,23 @@ fn intelligence_connection<'a>(
 
 pub use super::canonical_target;
 
-/// Build the OAuth2 request params from a config `auth:` block, discovering the
-/// token / device endpoints from the `issuer` when they are not pinned.
-/// `resource` (the endpoint being logged into) enables RFC 9728 issuer discovery
-/// when no `issuer` is configured: the server's `401 WWW-Authenticate` challenge
-/// names its authorization server.
+/// Build the OAuth2 request params from an `auth:` block's runtime spec
+/// ([`Settings::auth_spec`]), discovering the token / device endpoints from
+/// the `issuer` when they are not pinned. `resource` (the endpoint being
+/// logged into) enables RFC 9728 issuer discovery when no `issuer` is
+/// configured: the server's `401 WWW-Authenticate` challenge names its
+/// authorization server. A spec whose client is agentd's Client ID Metadata
+/// Document always reads the issuer's metadata, and is refused where it does
+/// not advertise the document.
 pub fn params_from_auth(
-    auth: &Auth,
+    auth: &AuthSpec,
     resource: Option<&str>,
     timeout: Duration,
 ) -> Result<OAuth2Params, String> {
-    if auth.kind != AuthKind::Oauth2 {
+    if auth.kind != "oauth2" {
         return Err("login requires an `auth: { kind: oauth2 }` block".into());
     }
-    if matches!(auth.grant, Some(OAuthGrant::ClientCredentials)) {
+    if auth.grant.as_deref() == Some("client_credentials") {
         return Err("client_credentials is non-interactive — no login needed".into());
     }
     let client_id = auth
@@ -126,16 +130,29 @@ pub fn params_from_auth(
     {
         issuer = Some(found);
     }
-    // Discover the endpoints from the issuer if any are missing.
-    if !pins_every_endpoint(auth)
-        && let Some(issuer) = &issuer
-    {
-        let d = oauth2::discover(issuer, timeout)?;
-        token_url = token_url.or(d.token_endpoint);
-        device_url = device_url.or(d.device_authorization_endpoint);
-        auth_url = auth_url.or(d.authorization_endpoint);
-        revocation_url = d.revocation_endpoint;
-        iss_supported = d.authorization_response_iss_parameter_supported;
+    // Discover the endpoints from the issuer if any are missing — and
+    // whatever is pinned when only its metadata says whether it takes the
+    // document.
+    if !pins_every_endpoint(auth) || auth.client_id_metadata_document {
+        match &issuer {
+            Some(issuer) => {
+                let d = oauth2::discover(issuer, timeout)?;
+                if auth.client_id_metadata_document {
+                    d.admits_document(issuer, &client_id)?;
+                }
+                token_url = token_url.or(d.token_endpoint);
+                device_url = device_url.or(d.device_authorization_endpoint);
+                auth_url = auth_url.or(d.authorization_endpoint);
+                revocation_url = d.revocation_endpoint;
+                iss_supported = d.authorization_response_iss_parameter_supported;
+            }
+            None if auth.client_id_metadata_document => {
+                return Err(
+                    "auth.issuer is required to use agentd's Client ID Metadata Document: its metadata says whether the authorization server fetches one".into(),
+                );
+            }
+            None => {}
+        }
     }
 
     Ok(OAuth2Params {
@@ -147,8 +164,10 @@ pub fn params_from_auth(
         issuer,
         iss_supported,
         client_id,
-        client_secret: auth.client_secret.as_ref().map(|s| s.0.clone()),
-        client_auth: oauth2::ClientAuth::of(auth.to_spec().client_auth.as_ref())?,
+        client_id_metadata_document: auth.client_id_metadata_document,
+        redirect_uri: None,
+        client_secret: auth.client_secret.clone(),
+        client_auth: oauth2::ClientAuth::of(auth.client_auth.as_ref())?,
         scopes: auth.scopes.clone(),
         audience: auth.audience.clone(),
     })
@@ -156,7 +175,7 @@ pub fn params_from_auth(
 
 /// Whether `auth` pins the token, device and authorization endpoints, so
 /// [`params_from_auth`] asks no issuer for its metadata.
-pub(crate) fn pins_every_endpoint(auth: &Auth) -> bool {
+pub(crate) fn pins_every_endpoint(auth: &AuthSpec) -> bool {
     auth.token_url.is_some()
         && auth.device_authorization_url.is_some()
         && auth.authorization_url.is_some()
@@ -227,6 +246,7 @@ pub fn tokens_to_cred(t: &oauth2::Tokens) -> CachedCred {
         refresh_token: t.refresh_token.clone(),
         expires_at_ms,
         token_type: t.token_type.clone(),
+        authorization_server: None,
         extra: Default::default(),
     }
 }
@@ -274,7 +294,16 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
         ));
     }
     let resource = resource_of(settings, target)?;
-    let params = params_from_auth(auth, resource.as_deref(), timeout)?;
+    let spec = settings.auth_spec(auth);
+    let mut params = params_from_auth(&spec, resource.as_deref(), timeout)?;
+    // The document's client returns to the redirect URI it registers.
+    if spec.client_id_metadata_document {
+        params.redirect_uri = settings
+            .security
+            .client
+            .as_ref()
+            .and_then(|c| c.redirect_uris.first().cloned());
+    }
     // `grant: authorization_code` → the browser + PKCE loopback flow; otherwise
     // the device grant (the default).
     let cred = if auth.grant == Some(OAuthGrant::AuthorizationCode) {
@@ -290,6 +319,12 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
             |p| print_prompt(target, p),
             std::thread::sleep,
         )?
+    };
+    // Kept with the authorization server it came from: it is never
+    // presented to another.
+    let cred = CachedCred {
+        authorization_server: Some(params.authorization_server().to_string()),
+        ..cred
     };
     let dir = cache::default_dir();
     let _held = cache::lock_file(&dir, target, timeout)?;
@@ -466,7 +501,7 @@ mod tests {
 
     #[test]
     fn params_from_auth_maps_the_block() {
-        let p = params_from_auth(&oauth_block(), None, Duration::from_secs(5)).unwrap();
+        let p = params_from_auth(&oauth_block().to_spec(), None, Duration::from_secs(5)).unwrap();
         assert_eq!(p.token_url, "https://as.example/token");
         assert_eq!(
             p.device_authorization_url.as_deref(),
@@ -480,10 +515,10 @@ mod tests {
     fn params_from_auth_rejects_non_oauth_and_client_creds() {
         let mut a = oauth_block();
         a.kind = AuthKind::Static;
-        assert!(params_from_auth(&a, None, Duration::from_secs(1)).is_err());
+        assert!(params_from_auth(&a.to_spec(), None, Duration::from_secs(1)).is_err());
         let mut a = oauth_block();
         a.grant = Some(OAuthGrant::ClientCredentials);
-        assert!(params_from_auth(&a, None, Duration::from_secs(1)).is_err());
+        assert!(params_from_auth(&a.to_spec(), None, Duration::from_secs(1)).is_err());
     }
 
     /// A refresh that rotates replaces the refresh token; one that does not

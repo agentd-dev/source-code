@@ -11,9 +11,14 @@
 //! restart renews from the token the server last issued; it is made under
 //! the cache's lock for the target, so the processes and connections that
 //! share a login renew it once; and a target the cache no longer holds —
-//! logged out — is not renewed. A **client-credentials**
-//! provider reuses the machine-to-machine fetcher; a **static** provider
-//! resolves a `{{secret:…}}` per request.
+//! logged out — is not renewed. A record names the authorization server it
+//! came from — its issuer, or its token endpoint where the block names no
+//! issuer — and is never used or renewed under another. A
+//! **client-credentials** provider asks the token endpoint for the client's
+//! own token, with the client's authentication, and holds it in memory; a
+//! **static** provider resolves a `{{secret:…}}` per request. A client that
+//! is agentd's Client ID Metadata Document (RFC 0052) is presented only to an
+//! issuer whose metadata advertises it.
 //!
 //! Building a signer reads the block and the login cache and dials nothing:
 //! an `issuer` is asked for its endpoints by the first request that needs
@@ -43,6 +48,10 @@ pub struct Endpoints {
     auth: AuthSpec,
     timeout: Duration,
     resolved: Mutex<Option<OAuth2Params>>,
+    /// The authorization server a cached record must have come from: the
+    /// block's `issuer`, else its `token_url`
+    /// ([`OAuth2Params::authorization_server`]).
+    server: String,
 }
 
 impl Endpoints {
@@ -52,13 +61,14 @@ impl Endpoints {
         if auth.client_id.is_none() {
             return Err("auth.client_id is required for oauth2".into());
         }
-        if auth.token_url.is_none() && auth.issuer.is_none() {
+        let Some(server) = auth.issuer.clone().or_else(|| auth.token_url.clone()) else {
             return Err("auth.token_url is required (or set auth.issuer)".into());
-        }
+        };
         Ok(Endpoints {
             auth: auth.clone(),
             timeout,
             resolved: Mutex::new(None),
+            server,
         })
     }
 
@@ -67,6 +77,7 @@ impl Endpoints {
         Endpoints {
             auth: AuthSpec::default(),
             timeout: Duration::ZERO,
+            server: params.authorization_server().to_string(),
             resolved: Mutex::new(Some(params)),
         }
     }
@@ -135,8 +146,9 @@ impl TokenSource {
             return Ok(access);
         }
         let login = format!("run `agentd --login {}`", self.target);
-        if cache::load_file(&self.dir, &self.target).is_none() {
-            return Err(format!("no cached credential — {login}"));
+        match cache::load_file(&self.dir, &self.target) {
+            None => return Err(format!("no cached credential — {login}")),
+            Some(file) => self.same_server(&file, &login)?,
         }
         let _held = cache::lock_file(&self.dir, &self.target, self.timeout)?;
         // Another request, here or in another process, may have renewed it
@@ -151,6 +163,7 @@ impl TokenSource {
         let Some(file) = cache::load_file(&self.dir, &self.target) else {
             return Err(format!("no cached credential — {login}"));
         };
+        self.same_server(&file, &login)?;
         let rt = file
             .refresh_token
             .ok_or_else(|| format!("cached token expired with no refresh token — {login}"))?;
@@ -174,7 +187,10 @@ impl TokenSource {
                 return Err(e.message);
             }
         };
-        let cred = crate::auth::login::refreshed_cred(&toks, &rt);
+        let cred = CachedCred {
+            authorization_server: file.authorization_server,
+            ..crate::auth::login::refreshed_cred(&toks, &rt)
+        };
         let access = cred.access_token.clone();
         // Kept before it is used: a rotated refresh token memory alone held
         // would die with the process, and the one the cache still names is
@@ -191,16 +207,34 @@ impl TokenSource {
         Ok(access)
     }
 
+    /// Refuse a record that did not come from the block's authorization
+    /// server, or does not say where it came from: its tokens are never
+    /// presented to, or renewed at, a server that did not issue them.
+    fn same_server(&self, c: &CachedCred, login: &str) -> Result<(), String> {
+        let want = &self.endpoints.server;
+        match c.authorization_server.as_deref() {
+            Some(from) if from == want => Ok(()),
+            Some(from) => Err(format!(
+                "the cached credential was issued by {from}, not by this block's authorization server ({want}) — {login}"
+            )),
+            None => Err(format!(
+                "the cached credential does not name the authorization server that issued it, so it is not presented to {want} — {login}"
+            )),
+        }
+    }
+
     /// The access token memory or the login cache holds, if it is good at
-    /// `now` with [`REFRESH_SKEW_MS`] of headroom; a good one in the cache
-    /// is adopted.
+    /// `now` with [`REFRESH_SKEW_MS`] of headroom and came from the block's
+    /// authorization server; a good one in the cache is adopted.
     fn usable(&self, now: u64) -> Option<String> {
+        let good =
+            |c: &CachedCred| c.valid_at(now, REFRESH_SKEW_MS) && self.same_server(c, "").is_ok();
         let mut held = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = held.as_ref().filter(|c| c.valid_at(now, REFRESH_SKEW_MS)) {
+        if let Some(c) = held.as_ref().filter(|c| good(c)) {
             return Some(c.access_token.clone());
         }
         let file = cache::load_file(&self.dir, &self.target)?;
-        if !file.valid_at(now, REFRESH_SKEW_MS) {
+        if !good(&file) {
             return None;
         }
         let access = file.access_token.clone();
@@ -252,42 +286,39 @@ impl ::mcp::http::RequestSigner for BearerSigner {
     }
 }
 
-/// The client-credentials grant behind an `auth:` block: the machine-to-machine
-/// fetcher, made once the token endpoint is known — discovered from `issuer`
-/// by the first request when the block does not pin it.
+/// The client-credentials grant behind an `auth:` block: the client's own
+/// token, asked of the token endpoint — discovered from `issuer` by the first
+/// request when the block does not pin it — with the client's authentication,
+/// a secret or a `private_key_jwt` assertion, and held in memory until it
+/// nears expiry: [`REFRESH_SKEW_MS`] before it, or halfway through a
+/// lifetime shorter than twice that.
 pub struct ClientCredentialsSigner {
     endpoints: Endpoints,
     target: String,
-    client_secret: String,
     timeout: Duration,
-    client: Mutex<Option<Arc<crate::mcp::oauth::OAuthClient>>>,
+    /// The token held, and the instant (ms) a request asks for a new one.
+    held: Mutex<Option<(String, u64)>>,
 }
 
 impl ClientCredentialsSigner {
     fn bearer(&self) -> Result<String, String> {
-        let made = self
-            .client
+        if let Some((access, _)) = self
+            .held
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let client = match made {
-            Some(c) => c,
-            None => {
-                let p = self.endpoints.params()?;
-                let c = Arc::new(crate::mcp::oauth::OAuthClient::new(
-                    crate::mcp::oauth::OAuthConfig {
-                        token_url: p.token_url,
-                        client_id: p.client_id,
-                        client_secret: self.client_secret.clone(),
-                        scope: (!p.scopes.is_empty()).then(|| p.scopes.join(" ")),
-                    },
-                    self.timeout,
-                ));
-                *self.client.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&c));
-                c
-            }
-        };
-        client.bearer()
+            .as_ref()
+            .filter(|(_, renew_at)| cache::now_ms() < *renew_at)
+        {
+            return Ok(access.clone());
+        }
+        let params = self.endpoints.params()?;
+        let t = oauth2::client_credentials(&params, self.timeout)?;
+        // A server that names no lifetime is asked again after five minutes.
+        let lifetime = t.expires_in.map_or(300_000, |s| s.saturating_mul(1000));
+        let renew_at = cache::now_ms().saturating_add(lifetime - REFRESH_SKEW_MS.min(lifetime / 2));
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((t.access_token.clone(), renew_at));
+        Ok(t.access_token)
     }
 }
 
@@ -340,10 +371,20 @@ fn params_from_spec(auth: &AuthSpec, timeout: Duration) -> Result<OAuth2Params, 
     let mut token_url = auth.token_url.clone();
     let mut device_url = auth.device_authorization_url.clone();
     let mut revocation_url = None;
-    if token_url.is_none()
+    // The document's client always reads the issuer's metadata: only it says
+    // whether the server fetches the document.
+    if auth.client_id_metadata_document && auth.issuer.is_none() {
+        return Err(
+            "auth.issuer is required to use agentd's Client ID Metadata Document: its metadata says whether the authorization server fetches one".into(),
+        );
+    }
+    if (token_url.is_none() || auth.client_id_metadata_document)
         && let Some(issuer) = &auth.issuer
     {
         let d = oauth2::discover(issuer, timeout)?;
+        if auth.client_id_metadata_document {
+            d.admits_document(issuer, &client_id)?;
+        }
         token_url = token_url.or(d.token_endpoint);
         device_url = device_url.or(d.device_authorization_endpoint);
         revocation_url = d.revocation_endpoint;
@@ -356,6 +397,8 @@ fn params_from_spec(auth: &AuthSpec, timeout: Duration) -> Result<OAuth2Params, 
         issuer: auth.issuer.clone(),
         iss_supported: false,
         client_id,
+        client_id_metadata_document: auth.client_id_metadata_document,
+        redirect_uri: None,
         client_secret: auth.client_secret.clone(),
         client_auth: oauth2::ClientAuth::of(auth.client_auth.as_ref())?,
         scopes: auth.scopes.clone(),
@@ -417,16 +460,21 @@ pub fn signer_for(
             let endpoints = Endpoints::new(auth, timeout)?;
             match auth.grant.as_deref() {
                 Some("client_credentials") => {
-                    let client_secret = auth
-                        .client_secret
-                        .clone()
-                        .ok_or("client_credentials needs client_secret")?;
+                    let signs = auth
+                        .client_auth
+                        .as_ref()
+                        .is_some_and(|c| c.method == "private_key_jwt");
+                    if auth.client_secret.is_none() && !signs {
+                        return Err(
+                            "client_credentials needs client_secret or client_auth private_key_jwt"
+                                .into(),
+                        );
+                    }
                     Ok(Some(Arc::new(ClientCredentialsSigner {
                         endpoints,
                         target: target.to_string(),
-                        client_secret,
                         timeout,
-                        client: Mutex::new(None),
+                        held: Mutex::new(None),
                     })))
                 }
                 // device / authorization_code / unset → a cached, refreshing token.
@@ -481,10 +529,12 @@ mod tests {
         }
     }
 
+    /// A login good for an hour, made at [`params`]' token endpoint.
     fn live(token: &str) -> CachedCred {
         CachedCred {
             access_token: token.into(),
             expires_at_ms: cache::now_ms() + 3_600_000,
+            authorization_server: Some("https://as/token".into()),
             ..Default::default()
         }
     }
@@ -654,6 +704,7 @@ mod tests {
             access_token: "old".into(),
             refresh_token: Some("rt".into()),
             expires_at_ms: 1,
+            authorization_server: Some(token_url.clone()),
             ..Default::default()
         };
         cache::store_file(dir.path(), "mcp:x", &expired).unwrap();
@@ -748,6 +799,7 @@ mod tests {
             access_token: "at-1".into(),
             refresh_token: Some("rt-1".into()),
             expires_at_ms: 1,
+            authorization_server: Some(token_url.to_string()),
             ..Default::default()
         };
         if cache::load_file(dir, "mcp:x").is_none() {
@@ -899,9 +951,8 @@ mod tests {
     fn an_expired_token_with_no_refresh_token_asks_for_login() {
         let dir = tempfile::tempdir().unwrap();
         let expired = CachedCred {
-            access_token: "old".into(),
             expires_at_ms: 1,
-            ..Default::default()
+            ..live("old")
         };
         cache::store_file(dir.path(), "mcp:x", &expired).unwrap();
         let e = source(dir.path(), "mcp:x").bearer().unwrap_err();
@@ -909,6 +960,156 @@ mod tests {
             e.contains("expired with no refresh token") && e.contains("run `agentd --login mcp:x`"),
             "{e}"
         );
+    }
+
+    /// A login is kept with the authorization server it came from — its
+    /// issuer, or the token endpoint of a block that names none: under a
+    /// block whose server is another it is neither presented nor renewed,
+    /// and the request fails asking for a login; a record that names no
+    /// server is presented nowhere.
+    #[test]
+    fn a_login_from_another_authorization_server_is_never_presented() {
+        let dir = tempfile::tempdir().unwrap();
+        let under = |issuer: Option<&str>| {
+            TokenSource::new(
+                Endpoints::pinned(OAuth2Params {
+                    issuer: issuer.map(str::to_string),
+                    ..params()
+                }),
+                "mcp:x",
+                dir.path().to_path_buf(),
+                Duration::from_secs(5),
+            )
+        };
+        let old = CachedCred {
+            authorization_server: Some("https://old.example".into()),
+            ..live("from-old")
+        };
+        cache::store_file(dir.path(), "mcp:x", &old).unwrap();
+        assert_eq!(
+            under(Some("https://old.example")).bearer().unwrap(),
+            "from-old"
+        );
+        let e = under(Some("https://new.example")).bearer().unwrap_err();
+        assert!(
+            e.contains("issued by https://old.example")
+                && e.contains("(https://new.example)")
+                && e.contains("run `agentd --login mcp:x`"),
+            "{e}"
+        );
+        // Expired, it is not renewed at the other server either: the token
+        // endpoint is never asked.
+        let stale = CachedCred {
+            expires_at_ms: 1,
+            refresh_token: Some("rt-old".into()),
+            ..old
+        };
+        cache::store_file(dir.path(), "mcp:x", &stale).unwrap();
+        let e = under(Some("https://new.example")).bearer().unwrap_err();
+        assert!(e.contains("issued by https://old.example"), "{e}");
+        // A login under a block that pins only its token endpoint is kept
+        // with that endpoint: the block re-pointed at an issuer does not
+        // present it.
+        cache::store_file(dir.path(), "mcp:x", &live("pinned")).unwrap();
+        assert_eq!(under(None).bearer().unwrap(), "pinned");
+        let e = under(Some("https://new.example")).bearer().unwrap_err();
+        assert!(e.contains("issued by https://as/token"), "{e}");
+        let unbound = CachedCred {
+            authorization_server: None,
+            ..live("unbound")
+        };
+        cache::store_file(dir.path(), "mcp:x", &unbound).unwrap();
+        for issuer in [None, Some("https://new.example")] {
+            let e = under(issuer).bearer().unwrap_err();
+            assert!(
+                e.contains("does not name the authorization server")
+                    && e.contains("run `agentd --login mcp:x`"),
+                "{e}"
+            );
+        }
+    }
+
+    /// A token endpoint for the client-credentials grant whose tokens live
+    /// `expires_in` seconds: `cc-1`, `cc-2`, …, counted.
+    fn spawn_cc(expires_in: u64) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", l.local_addr().unwrap());
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&n);
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                r.read_exact(&mut body).ok();
+                let issued = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                let payload =
+                    format!(r#"{{"access_token":"cc-{issued}","expires_in":{expires_in}}}"#);
+                let mut w = conn;
+                let _ = write!(
+                    w,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (url, n)
+    }
+
+    /// A client-credentials token is held until a minute before it expires,
+    /// or halfway through a lifetime shorter than two minutes: one that
+    /// lives a minute serves the requests that follow with no new token
+    /// request, and one that lives two seconds is asked for again after one.
+    #[test]
+    fn a_short_lived_client_credentials_token_is_held_for_half_its_life() {
+        // SAFETY: a variable no other test reads.
+        unsafe { std::env::set_var("AUTH_DEV_CC_SHORT_SECRET", "cc") };
+        let signer = |token_url: String| {
+            signer_for(
+                &AuthSpec {
+                    kind: "oauth2".into(),
+                    grant: Some("client_credentials".into()),
+                    token_url: Some(token_url),
+                    client_id: Some("c".into()),
+                    client_secret: Some("{{secret:AUTH_DEV_CC_SHORT_SECRET}}".into()),
+                    ..Default::default()
+                },
+                "mcp:cc",
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let bearer =
+            |s: &Arc<dyn RequestSigner>| s.sign("POST", "a", "/p", b"").unwrap()[0].1.clone();
+        let (url, issued) = spawn_cc(60);
+        let s = signer(url);
+        assert_eq!(bearer(&s), "Bearer cc-1");
+        assert_eq!(bearer(&s), "Bearer cc-1");
+        assert_eq!(
+            issued.load(Ordering::SeqCst),
+            1,
+            "held, not asked for again"
+        );
+        let (url, issued) = spawn_cc(2);
+        let s = signer(url);
+        assert_eq!(bearer(&s), "Bearer cc-1");
+        assert_eq!(bearer(&s), "Bearer cc-1");
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(bearer(&s), "Bearer cc-2", "renewed halfway");
+        assert_eq!(issued.load(Ordering::SeqCst), 2);
+        unsafe { std::env::remove_var("AUTH_DEV_CC_SHORT_SECRET") };
     }
 
     /// Building the signer dials nothing; a request made while the issuer

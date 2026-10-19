@@ -484,6 +484,11 @@ pub struct AuthSpec {
     /// endpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuthSpec>,
+    /// oauth2: `client_id` is agentd's Client ID Metadata Document
+    /// (`security.client`), presented only to an authorization server whose
+    /// metadata advertises `client_id_metadata_document_supported`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_id_metadata_document: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -64,11 +64,11 @@ impl Conns {
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Conns, String> {
         let intel = &settings.intelligence;
-        let top = Conn::build(&intel.top_connection(), env)?;
+        let top = Conn::build(settings, &intel.top_connection(), env)?;
         let mut providers = BTreeMap::new();
         for c in intel.connections() {
             if let Some(name) = c.name {
-                providers.insert(name.to_string(), Conn::build(&c, env)?);
+                providers.insert(name.to_string(), Conn::build(settings, &c, env)?);
             }
         }
         Ok(Conns { top, providers })
@@ -84,7 +84,11 @@ impl Conns {
 }
 
 impl Conn {
-    fn build(c: &Connection<'_>, env: &dyn Fn(&str) -> Option<String>) -> Result<Conn, String> {
+    fn build(
+        settings: &Settings,
+        c: &Connection<'_>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Conn, String> {
         let at = c.at();
         let token = match c.token {
             Some(t) => Some(
@@ -117,7 +121,7 @@ impl Conn {
             token,
             token_file,
             headers,
-            bearer: bearer_provider(c).map_err(|e| format!("{at}.auth: {e}"))?,
+            bearer: bearer_provider(settings, c).map_err(|e| format!("{at}.auth: {e}"))?,
             aws: c
                 .auth
                 .filter(|a| a.kind == AuthKind::Aws)
@@ -137,13 +141,13 @@ impl Conn {
 /// `--features oauth`), which leaves the static `token` path untouched. An
 /// `Err` is a block no signer can be made from; building one dials nothing,
 /// so an issuer that is down is the calls' failure, not the start's.
-fn bearer_provider(c: &Connection<'_>) -> Result<Option<Bearer>, String> {
+fn bearer_provider(settings: &Settings, c: &Connection<'_>) -> Result<Option<Bearer>, String> {
     #[cfg(feature = "oauth")]
     {
         let Some(auth) = c.auth else {
             return Ok(None);
         };
-        let spec = auth.to_spec();
+        let spec = settings.auth_spec(auth);
         // SigV4 (`kind: aws`) signs each request over its own method, path
         // and body, so there is no reusable bearer to hand back: the dial
         // carries the spec and signs itself.
@@ -170,7 +174,7 @@ fn bearer_provider(c: &Connection<'_>) -> Result<Option<Bearer>, String> {
     }
     #[cfg(not(feature = "oauth"))]
     {
-        let _ = c;
+        let _ = (settings, c);
         Ok(None)
     }
 }

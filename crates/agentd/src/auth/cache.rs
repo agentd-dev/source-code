@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The endpoint-credential cache: access + refresh tokens with their expiry,
-//! keyed by a hash of the login target (e.g. `mcp:github`, `intelligence`).
+//! keyed by a hash of the login target (e.g. `mcp:github`, `intelligence`),
+//! each record bound to the authorization server that issued it.
 //!
 //! Two backings share one record shape. The **file** cache is the path the
 //! daemon uses: an interactive login writes a per-user `0600` file, and every
@@ -43,6 +44,12 @@ pub struct CachedCred {
     pub expires_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_type: Option<String>,
+    /// The authorization server the token came from: its issuer, or its
+    /// token endpoint where the login knew no issuer. The record is used,
+    /// renewed and revoked only under that server, and one that names none
+    /// under no server at all (MCP 2026-07-28, authorization server binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_server: Option<String>,
     /// Provider-specific extras — e.g. temporary AWS credentials from an SSO
     /// login (`aws_access_key_id` / `aws_secret_access_key` / `aws_session_token`).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]

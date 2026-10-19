@@ -7,7 +7,8 @@
 //! credential here; the revocation is made from the record read under the
 //! cache's lock. The revocation endpoint is the one the server's metadata
 //! lists: the `issuer` the `auth:` block names, or the one RFC 9728
-//! discovery finds for the resource, is asked for it. The refresh token is
+//! discovery finds for the resource, is asked for it, and the token is sent
+//! there only when the login was made at that server. The refresh token is
 //! revoked when there is one — which at most servers ends the grant and
 //! every access token it issued (§2.1) — else the access token. A server
 //! whose metadata lists no revocation endpoint, or a block with no issuer to
@@ -69,11 +70,28 @@ fn revoke_login(settings: &Settings, target: &str, cred: &CachedCred, timeout: D
     if auth.kind != AuthKind::Oauth2 || auth.grant == Some(OAuthGrant::ClientCredentials) {
         return Remote::Nothing;
     }
+    let spec = settings.auth_spec(auth);
     let resource = login::resource_of(settings, target).ok().flatten();
-    let params = match revocation_params(auth, resource.as_deref(), timeout) {
+    let params = match revocation_params(&spec, resource.as_deref(), timeout) {
         Ok(p) => p,
         Err(e) => return Remote::Failed(e),
     };
+    // A token is never presented to an authorization server other than the
+    // one that issued it — the one the login found, RFC 9728's included.
+    let server = params.authorization_server();
+    match cred.authorization_server.as_deref() {
+        Some(from) if from == server => {}
+        Some(from) => {
+            return Remote::Failed(format!(
+                "the token was issued by {from}, not by this block's authorization server ({server}); revoke it there"
+            ));
+        }
+        None => {
+            return Remote::Failed(format!(
+                "the login does not name the authorization server that issued it, so its token is not sent to {server}; revoke it where it was issued"
+            ));
+        }
+    }
     match revoke(&params, cred, timeout) {
         Ok(true) => Remote::Revoked,
         Ok(false) => Remote::Nothing,
@@ -85,7 +103,7 @@ fn revoke_login(settings: &Settings, target: &str, cred: &CachedCred, timeout: D
 /// lists, asked for even when every other endpoint is pinned — and asked
 /// once: metadata fetched for the other endpoints already said.
 fn revocation_params(
-    auth: &crate::config::settings::Auth,
+    auth: &crate::config::AuthSpec,
     resource: Option<&str>,
     timeout: Duration,
 ) -> Result<OAuth2Params, String> {

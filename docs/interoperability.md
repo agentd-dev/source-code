@@ -25,7 +25,7 @@ agentd over MCP.
 | MCP Events | the draft extension SEP-3415, on 2026-07-28 connections: bindings into durable streams, runtime subscriptions inside an operator's grant, poll and webhook delivery. In the release binaries; agentd says at load that it tracks a draft. |
 | [MCP Tasks](connect-mcp.md#long-running-tool-calls) | the extension SEP-2663 (`io.modelcontextprotocol/tasks`), on 2026-07-28 connections, as a client: a tool call a server answers with a task is followed to its end — a workflow step's as a durable wait that survives a restart, a model's within the call and then with `mcp.task.get` — polled at the server's interval or pushed on `subscriptions/listen`, cancelled with `tasks/cancel`. `mcp.servers[].tasks: off` refuses a server's tasks. In the release binaries. |
 | [MCP Skills](connect-mcp.md#load-skills-from-a-server) | the extension SEP-2640 (`io.modelcontextprotocol/skills`), on 2026-07-28 connections that declare it, as a client: `skills/list` (every page), `skills/get` for a skill no listing names, `resources/directory/read` where the server declares `directoryRead`. Every file is checked against its entry's `sha256:` digest and size, and `SKILL.md`'s frontmatter against the entry's; a skill is named by its server and URI. In the release binaries. |
-| Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). |
+| Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). Client registration in the order 2026-07-28 gives: a configured `client_id`, else agentd's [Client ID Metadata Document](authentication.md#client-id-metadata-document) where the authorization server advertises one; dynamic client registration, which that revision deprecates, is not implemented. |
 
 **Not supported:** `sampling` and `roots` (agentd declares no client
 capability for them, so a server's request is dropped rather than answered);
@@ -204,7 +204,7 @@ connection cannot apply is refused when the configuration loads.
 |---|---|---|---|
 | Static bearer token | yes | yes | yes |
 | Static custom header in an `auth:` block | — (use `headers`, below) | yes | yes |
-| OAuth 2.1: device code, authorization code with PKCE and RFC 9207 `iss`, client credentials; RFC 8414 then OIDC discovery with an exact `issuer`; `private_key_jwt` (RFC 7523) and `client_secret_basic`; RFC 7009 revocation on `--logout` | yes | yes | yes |
+| OAuth 2.1: device code, authorization code with PKCE and RFC 9207 `iss`, client credentials; RFC 8414 then OIDC discovery with an exact `issuer`; `private_key_jwt` (RFC 7523) and `client_secret_basic`; RFC 7009 revocation on `--logout`; with no registration, a [Client ID Metadata Document](authentication.md#client-id-metadata-document) (draft -02) | yes | yes | yes |
 | AWS SigV4: environment, IAM Identity Center (SSO), EC2 instance role, EKS IRSA | yes, and required by `dialect: bedrock` | yes | yes |
 | SPIFFE JWT-SVID as a bearer | yes | yes | yes |
 | SPIFFE X.509-SVID or a client certificate (mTLS) | — | yes | yes |
@@ -231,7 +231,10 @@ details.
 The IETF RFCs agentd implements, and where. The release binaries implement
 all of them except the last two, which only the `companies` preview uses.
 OAuth discovery also reads OpenID Connect Discovery 1.0 metadata, after
-RFC 8414.
+RFC 8414. One OAuth Working Group draft is implemented too, in the release
+binaries: the [Client ID Metadata Document](authentication.md#client-id-metadata-document),
+draft-ietf-oauth-client-id-metadata-document-02, agentd's client where it
+has no registration.
 
 | RFC | What | Where agentd uses it |
 |---|---|---|

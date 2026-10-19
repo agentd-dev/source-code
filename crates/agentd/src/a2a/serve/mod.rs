@@ -132,7 +132,9 @@ pub struct Opts {
     pub stream_deadline: Duration,
     /// Public JSON documents served at their paths with a `GET`: the client
     /// metadata document and key set a Company fetches (RFC 0047 §5.5.2),
-    /// when `security.companies.client.serve` says so. Mounted only then.
+    /// when `security.companies.client.serve` says so, and agentd's Client ID
+    /// Metadata Document and key set an authorization server fetches (RFC
+    /// 0052), when `security.client.serve` does. Mounted only then.
     pub documents: Vec<(String, Vec<u8>)>,
     /// The path of the Direct Sign-In callback (RFC 0047 §5.7), when a
     /// Company may be signed in to directly and the identity is served
@@ -140,7 +142,7 @@ pub struct Opts {
     pub callback: Option<String>,
 }
 
-/// How long a Company may cache a served document.
+/// How long a Company or an authorization server may cache a served document.
 const DOCUMENT_MAX_AGE: &str = "max-age=300";
 
 /// A running listener. Dropping it stops serving.

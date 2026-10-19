@@ -1137,9 +1137,9 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
 }
 
 fn validate_client(s: &Settings, cl: &Client, err: &mut impl FnMut(String)) {
-    if !is_https_url(&cl.id) {
+    if let Some(why) = super::client::client_id_url_error(&cl.id) {
         err(format!(
-            "security.companies.client.id: {:?} is not an HTTPS URL; a client_id is the HTTPS URL of its metadata document (draft §4.1)",
+            "security.companies.client.id: {:?} {why}; a client_id is the HTTPS URL of its metadata document (draft §4.1, and the Client ID Metadata Document draft §3 it follows)",
             cl.id
         ));
         return;
@@ -1203,14 +1203,9 @@ fn validate_client(s: &Settings, cl: &Client, err: &mut impl FnMut(String)) {
             _ => {}
         }
         // Served beside the listener's own routes, so on paths of their own.
-        let (a, b) = (path_of(&cl.id), path_of(&jwks));
-        let mut served = vec![&a, &b];
-        let callback = path_of(&redirect);
-        if signs_in_directly(s) {
-            served.push(&callback);
-        }
+        let served = served_paths(s, cl);
         for p in &served {
-            if *p == "/" || p.starts_with("/.well-known/") || p.starts_with("/oauth2/") {
+            if super::client::listener_answers(p) {
                 err(format!(
                     "security.companies.client.serve: {p} is a path the A2A listener answers itself; publish the client metadata, key set and callback elsewhere"
                 ));
@@ -1224,6 +1219,17 @@ fn validate_client(s: &Settings, cl: &Client, err: &mut impl FnMut(String)) {
             }
         }
     }
+}
+
+/// The paths the A2A listener serves the client identity at with
+/// `client.serve`: the client metadata document, the key set, and the Direct
+/// Sign-In callback when a Company may be signed in to directly.
+pub fn served_paths(s: &Settings, cl: &Client) -> Vec<String> {
+    let mut out = vec![path_of(&cl.id), path_of(&cl.jwks_uri())];
+    if signs_in_directly(s) {
+        out.push(path_of(&cl.redirect_uri()));
+    }
+    out
 }
 
 /// The path (and query) of `url`, `/` when it has none.

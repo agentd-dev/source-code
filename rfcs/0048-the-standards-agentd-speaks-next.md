@@ -122,6 +122,7 @@ server's issuer.
 
 *Size:* small. *Depends on:* a public URL the authorization server can fetch.
 *Recommendation:* third; it is also EMA's client identity.
+*Built:* [RFC 0052](0052-client-id-metadata-document.md), 2026-10-19.
 
 ### 5.4 E — Enterprise-managed authorization: RFC 0044
 

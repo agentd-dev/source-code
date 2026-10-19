@@ -330,6 +330,23 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         }
     }
 
+    // agentd's Client ID Metadata Document (RFC 0052): its key loaded, or
+    // created `0600`, before any token request signs with it, and its two
+    // documents kept for the A2A listener when it serves them.
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(not(feature = "a2a"), allow(unused_variables))]
+    let client_documents = match &settings.security.client {
+        None => Vec::new(),
+        Some(c) => match crate::auth::client_metadata::of_client(c) {
+            Ok(id) if c.serve => id.documents(),
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+                return crate::exit::USAGE;
+            }
+        },
+    };
+
     // Intelligence: every connection's credential, resolved once here (a
     // header is applied per dial; a token file and a login cache are read at
     // each one). The models are not: they resolve at each call.
@@ -1211,7 +1228,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             _ => (Vec::new(), None),
         };
         #[cfg(not(feature = "companies"))]
-        let (documents, callback) = (Vec::new(), None);
+        let (documents, callback): (Vec<(String, Vec<u8>)>, _) = (Vec::new(), None);
+        // agentd's Client ID Metadata Document beside it, when served here.
+        #[cfg(feature = "oauth")]
+        let documents = [documents, client_documents].concat();
         match a2a_server::spawn_a2a_listener(
             &rt.settings.a2a,
             rt.events_tx.clone(),

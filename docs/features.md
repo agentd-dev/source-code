@@ -51,7 +51,7 @@ Three features are never in a release binary:
 | `tls` | yes | yes | `rustls` (with the `ring` provider), `webpki-roots` | Direct `https://` to models, MCP servers and peers; an `https://` listener; mTLS client identities; `security.tls_ca`. The bundled roots mean a `scratch` image trusts public CAs with no system bundle. |
 | `a2a` | no | yes | the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`), `tokio`, `axum`, `hyper`, `hyper-util`, `tokio-rustls`, `tower`, `chrono`, `async-trait`, `tokio-stream`, `futures-util` | The A2A listener and everything served on it, outbound A2A peers, and the webhook listener. Implies `tls`. |
 | `cron` | no | yes | none | Five-field UTC cron expressions on `schedule` start nodes. |
-| `oauth` | no | yes | none new (reuses `ring`) | OAuth 2.1 credentials (device, authorization code with PKCE, client credentials, refresh, RFC 8414 and OIDC discovery, `private_key_jwt`) for models, MCP servers and peers; `agentd --login`, and RFC 7009 revocation on `agentd --logout`. |
+| `oauth` | no | yes | none new (reuses `ring`) | OAuth 2.1 credentials (device, authorization code with PKCE, client credentials, refresh, RFC 8414 and OIDC discovery, `private_key_jwt`) for models, MCP servers and peers; `security.client`, agentd's Client ID Metadata Document, and `agentd --print-client-metadata`; `agentd --login`, and RFC 7009 revocation on `agentd --logout`. |
 | `metrics` | no | yes | none | `/metrics` (Prometheus text), `/healthz` and `/readyz` on `observability.metrics_addr`. |
 | `otel` | no | yes | none | OTLP over HTTP/JSON: run traces with GenAI attributes, and log export. |
 | `hot-reload` | no | yes | none | Reload on `SIGHUP`: validate, stage, apply whole or refuse. |
@@ -85,7 +85,7 @@ see when the feature is missing.
 | `a2a.listen`, `a2a.peers`, `webhooks.listen`, and so every `webhook` node and A2A start | `a2a` | refused at load: `a2a.listen needs the a2a build feature, which this binary was built without — …` |
 | a `schedule` start with `cron:` | `cron` | refused at load: `cron schedules require the 'cron' build feature` |
 | any CEL expression | `cel` | refused at load: `… uses an expression, which needs the 'cel' build feature (bare paths work without it)` |
-| any `auth` on a model connection; any `auth` or `oauth` block on an MCP server; `agentd --login` | `oauth` | refused at load: `mcp.servers[].auth needs the oauth build feature, which this binary was built without — …` |
+| any `auth` on a model connection; any `auth` or `oauth` block on an MCP server; `security.client`; `agentd --login`, `--print-client-metadata` | `oauth` | refused at load: `mcp.servers[].auth needs the oauth build feature, which this binary was built without — …` |
 | `observability.metrics_addr` | `metrics` | refused at load: `observability.metrics_addr needs the metrics build feature, …` |
 | `observability.otel.endpoint`, `observability.otel.logs: true` | `otel` | refused at load: `observability.otel needs the otel build feature, …` |
 | `SIGHUP` reload | `hot-reload` | `SIGHUP` keeps its default action and ends the process |

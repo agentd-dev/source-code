@@ -143,8 +143,10 @@ fn a_tool_call_whose_token_cannot_be_renewed_fails_unsent_until_the_issuer_answe
     let creds = tempfile::tempdir().unwrap();
     // SAFETY: the one test in this binary, before it starts a thread.
     unsafe { std::env::set_var("AGENTD_CRED_DIR", creds.path()) };
-    // A login good for three more seconds before its refresh point (a minute
-    // ahead of expiry), with a refresh token.
+    let down = Arc::new(AtomicBool::new(true));
+    let issuer = spawn_issuer(Arc::clone(&down));
+    // A login at the issuer good for three more seconds before its refresh
+    // point (a minute ahead of expiry), with a refresh token.
     let refresh_at = cache::now_ms() + 3_000;
     cache::store_file(
         creds.path(),
@@ -153,12 +155,11 @@ fn a_tool_call_whose_token_cannot_be_renewed_fails_unsent_until_the_issuer_answe
             access_token: "tok-1".into(),
             refresh_token: Some("rt-1".into()),
             expires_at_ms: refresh_at + 60_000,
+            authorization_server: Some(issuer.clone()),
             ..Default::default()
         },
     )
     .unwrap();
-    let down = Arc::new(AtomicBool::new(true));
-    let issuer = spawn_issuer(Arc::clone(&down));
     let upstream = common::mock_in_thread(Options {
         emit: false,
         hold_listen: false,

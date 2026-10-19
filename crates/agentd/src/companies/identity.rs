@@ -20,32 +20,42 @@
 //! it finds to be what it would print, with the signing key in the set —
 //! the self-check; a Company would refuse its assertions otherwise, and this
 //! names the cause.
+//!
+//! The documents, keys and prints are [`client_metadata`]'s, the one
+//! implementation `security.client` uses too (RFC 0052). The identity keeps a
+//! document of its own: the draft holds every `redirect_uris` entry to an
+//! HTTPS URL on the `client_id`'s domain, where `security.client` lists
+//! loopback ones, and adds an `extensions` member no authorization server
+//! knows.
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::auth::client_assertion::{ClientKey, LIFETIME_S};
-use crate::config::settings::companies::{Client, path_of};
-
-/// The file names `--print-company-client` writes.
-pub const METADATA_FILE: &str = "client.json";
-pub const JWKS_FILE: &str = "jwks.json";
+use crate::auth::client_assertion::LIFETIME_S;
+use crate::auth::client_metadata;
+use crate::config::settings::companies::Client;
 
 /// How long a Company may cache the served documents.
 pub const SERVED_MAX_AGE_S: u64 = 300;
 
-/// The client identity.
+/// The client identity: a client metadata identity
+/// ([`client_metadata::Identity`]) whose document carries what the draft
+/// adds — the Direct Sign-In callback in `redirect_uris` and the
+/// `extensions` member — and whose key also signs Session assertions.
 pub struct Identity {
-    pub client_id: String,
-    pub jwks_uri: String,
     /// Where Direct Sign-In returns the User, when some Company may be
     /// signed in to directly.
     pub redirect_uri: Option<String>,
-    key: ClientKey,
-    published: Vec<ClientKey>,
-    metadata: Value,
+    doc: client_metadata::Identity,
+}
+
+impl std::ops::Deref for Identity {
+    type Target = client_metadata::Identity;
+
+    fn deref(&self) -> &client_metadata::Identity {
+        &self.doc
+    }
 }
 
 impl Identity {
@@ -53,35 +63,24 @@ impl Identity {
     /// and each published key likewise. With `direct`, its `redirect_uri` is
     /// listed for Direct Sign-In.
     pub fn load(client: &Client, direct: bool) -> Result<Identity, String> {
-        let key = ClientKey::load_or_create(Path::new(client.key_file()))
-            .map_err(|e| format!("security.companies.client.key_file: {e}"))?;
-        let mut published = Vec::new();
-        for p in &client.published_key_files {
-            published.push(
-                ClientKey::load_or_create(Path::new(p))
-                    .map_err(|e| format!("security.companies.client.published_key_files: {e}"))?,
-            );
-        }
-        let jwks_uri = client.jwks_uri();
         let redirect_uri = direct.then(|| client.redirect_uri());
-        let mut metadata = json!({
-            "client_id": client.id,
-            "client_name": client.name,
-            "jwks_uri": jwks_uri,
-            // Always present: the kit's schema requires the member, and a
-            // Company running its validator refuses a document without it.
-            // Nothing is listed until a Company may be signed in to directly.
-            "redirect_uris": redirect_uri.iter().collect::<Vec<_>>(),
-            "token_endpoint_auth_method": "private_key_jwt",
-        });
+        let mut members = Map::new();
+        members.insert("client_name".into(), json!(client.name));
+        // Always present: the kit's schema requires the member, and a
+        // Company running its validator refuses a document without it.
+        // Nothing is listed until a Company may be signed in to directly.
+        members.insert(
+            "redirect_uris".into(),
+            json!(redirect_uri.iter().collect::<Vec<_>>()),
+        );
         if let Some(l) = &client.logo_uri {
-            metadata["logo_uri"] = json!(l);
+            members.insert("logo_uri".into(), json!(l));
         }
         // The extensions it supports, each at the version agentd speaks: a
         // Company returns operations only to an agent that lists them
         // (Operations §2).
         if !client.extensions.is_empty() {
-            let mut ext = serde_json::Map::new();
+            let mut ext = Map::new();
             for x in &client.extensions {
                 match x {
                     crate::config::settings::companies::Extension::Operations => {
@@ -92,71 +91,17 @@ impl Identity {
                     }
                 }
             }
-            metadata[super::wire::EXTENSIONS_MEMBER] = Value::Object(ext);
+            members.insert(super::wire::EXTENSIONS_MEMBER.into(), Value::Object(ext));
         }
-        Ok(Identity {
-            client_id: client.id.clone(),
-            jwks_uri,
-            redirect_uri,
-            key,
-            published,
-            metadata,
-        })
-    }
-
-    /// The client metadata document.
-    pub fn metadata(&self) -> &Value {
-        &self.metadata
-    }
-
-    /// The key set: the signing key and every published one, public halves
-    /// only, each once.
-    pub fn jwks(&self) -> Value {
-        let mut keys: Vec<Value> = Vec::new();
-        for k in std::iter::once(&self.key).chain(self.published.iter()) {
-            let j = k.public_jwk();
-            if !keys.iter().any(|x| x["kid"] == j["kid"]) {
-                keys.push(j);
-            }
-        }
-        json!({"keys": keys})
-    }
-
-    /// The `kid` assertions are signed under.
-    pub fn kid(&self) -> &str {
-        self.key.kid()
-    }
-
-    /// The two documents and the paths of their URLs, for the listener to
-    /// serve.
-    pub fn documents(&self) -> Vec<(String, Vec<u8>)> {
-        vec![
-            (path_of(&self.client_id), pretty(&self.metadata)),
-            (path_of(&self.jwks_uri), pretty(&self.jwks())),
-        ]
-    }
-
-    /// Write `client.json` and `jwks.json` into `dir`, for static hosting at
-    /// the `client_id` and `jwks_uri`.
-    pub fn print(&self, dir: &Path) -> Result<Vec<PathBuf>, String> {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut out = Vec::new();
-        for (name, doc) in [
-            (METADATA_FILE, self.metadata.clone()),
-            (JWKS_FILE, self.jwks()),
-        ] {
-            let p = dir.join(name);
-            std::fs::write(&p, pretty(&doc)).map_err(|e| format!("{}: {e}", p.display()))?;
-            out.push(p);
-        }
-        Ok(out)
-    }
-
-    /// A client assertion (§4.1, RFC 7523): `iss` = `sub` = the `client_id`,
-    /// `aud` the Company's issuer as one string, a minute's life, a fresh
-    /// `jti`.
-    pub fn client_assertion(&self, issuer: &str) -> Result<String, String> {
-        self.key.client_assertion(&self.client_id, issuer)
+        let doc = client_metadata::Identity::load(
+            &client.id,
+            &client.jwks_uri(),
+            members,
+            client.key_file(),
+            &client.published_key_files,
+            "security.companies.client",
+        )?;
+        Ok(Identity { redirect_uri, doc })
     }
 
     /// A Session assertion (§4.2): `iss` the `client_id`, `sub` the User ID,
@@ -165,7 +110,7 @@ impl Identity {
         let iat = crate::auth::cache::now_ms() / 1000;
         let jti = crate::sec::random::b64url_token(16)
             .map_err(|e| format!("session assertion: no OS randomness for its jti: {e}"))?;
-        self.key.sign_jwt(
+        self.key().sign_jwt(
             json!({"typ": "JWT"}),
             &json!({
                 "iss": self.client_id,
@@ -195,7 +140,7 @@ impl Identity {
             super::http::parse_unique(&r.body).map_err(|e| format!("{url}: {e}"))
         };
         let published = fetch(&self.client_id)?;
-        if published != self.metadata {
+        if &published != self.metadata() {
             return Err(format!(
                 "the document at {} is not the client metadata this configuration prints (re-run --print-company-client and publish it)",
                 self.client_id
@@ -216,15 +161,10 @@ impl Identity {
     }
 }
 
-fn pretty(v: &Value) -> Vec<u8> {
-    let mut out = serde_json::to_vec_pretty(v).unwrap_or_default();
-    out.push(b'\n');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn client(dir: &Path) -> Client {
         Client {

@@ -1152,7 +1152,10 @@ pub(crate) fn dial_specs(
             continue;
         }
         match srv.to_spec() {
-            Ok(spec) => {
+            Ok(mut spec) => {
+                // An `oauth2` block with no client_id presents agentd's
+                // Client ID Metadata Document (RFC 0052).
+                spec.auth = srv.auth.as_ref().map(|a| s.auth_spec(a));
                 specs.insert(srv.name.clone(), spec);
             }
             Err(e) => errs.push(format!("mcp server {:?}: {e}", srv.name)),

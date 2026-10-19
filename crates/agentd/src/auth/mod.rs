@@ -8,7 +8,8 @@
 //! OIDC [`oauth2`] flows (device grant, browser + PKCE, refresh, discovery,
 //! revocation) behind `agentd --login` and `--logout`, over the one
 //! [`http`] helper; the `private_key_jwt` [`client_assertion`] signer, its
-//! [`jwk`], and the [`seal`] for secrets at rest; the AWS SigV4 / IAM Identity
+//! [`jwk`], the [`client_metadata`] document that publishes it, and the
+//! [`seal`] for secrets at rest; the AWS SigV4 / IAM Identity
 //! Center providers; and the [`report`] of credentials that cannot be
 //! produced. Everything but the cache and that report is gated on the
 //! `oauth` cargo feature, so a build without it carries no interactive-login
@@ -29,6 +30,9 @@ pub mod revoke;
 
 #[cfg(feature = "oauth")]
 pub mod client_assertion;
+
+#[cfg(feature = "oauth")]
+pub mod client_metadata;
 
 #[cfg(feature = "oauth")]
 pub mod jwk;

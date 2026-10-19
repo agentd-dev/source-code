@@ -142,6 +142,14 @@
     "tier": 2
   },
   {
+    "name": "Client ID Metadata Document",
+    "version": "draft -02",
+    "mark": "draft",
+    "full": "OAuth Client ID Metadata Document, an IETF draft: agentd's client where an authorization server has no registration for it",
+    "href": "/docs/authentication/#client-id-metadata-document",
+    "tier": 2
+  },
+  {
     "name": "Resource Indicators",
     "version": "RFC 8707",
     "mark": "preview",

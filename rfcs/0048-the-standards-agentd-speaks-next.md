@@ -1,6 +1,6 @@
 # RFC 0048: The standards agentd speaks next — a survey and a plan
 
-**Status:** Proposed
+**Status:** Accepted 2026-10-19 — the user answered §6: build RFC 0044, prompts are not skills, x402 on both EVM and Solana, each RFC its own entry on the strip. §2 is done; the tracks follow §7.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-19
 **Decision records:** [ADR 0001](adr/0001-mcp-extensions-client-side-only.md) (MCP extensions: the client side only), [ADR 0002](adr/0002-the-standards-strip-lists-what-ships.md) (the standards strip lists what the release binaries speak), [ADR 0003](adr/0003-no-payment-without-a-spend-policy.md) (no payment without a spend policy)
@@ -31,7 +31,7 @@ These need no code, only the strip on agentd.dev and its links (ADR 0002):
 | **Workflows** — agentd's own workflow language | `/docs/workflow-language/` | agentd's DSL, marked as agentd's |
 | **PID 1** — agentd as a container's or a device's init | `/docs/pid-1/` | a runtime role rather than a protocol, so it sits in the second row |
 | **OpenAPI 3.0 · 3.1** | `/docs/act-at-companies/#its-operations-as-tools` | PREVIEW: a company's operation tools (RFC 0047 P5a), in the `companies` preview |
-| **IETF RFCs** — the internet standards agentd implements, by number | a new "Internet standards" table in `docs/interoperability.md` | OAuth 2.0 (6749, 6750), PKCE (7636), device grant (8628), AS metadata (8414), protected-resource metadata (9728), `iss` (9207), JWT client assertions (7523), revocation (7009), HTTP Message Signatures (9421), X25519 (7748) and JWE (7516), TLS 1.3 (8446); in the preview, DPoP (9449) and resource indicators (8707) |
+| **The IETF RFCs** agentd implements, each its own entry (Q4) | the OAuth sections of `docs/authentication.md`, and a new "Internet standards" table in `docs/interoperability.md` | OAuth 2.0 (6749, 6750), PKCE (7636), device grant (8628), AS metadata (8414), protected-resource metadata (9728), `iss` (9207), JWT client assertions (7523), revocation (7009), HTTP Message Signatures (9421), X25519 (7748) and JWE (7516), TLS 1.3 (8446); in the preview, DPoP (9449) and resource indicators (8707) |
 | **JSON-RPC 2.0**, **JSON Schema 2020-12** | the interoperability sections that use them | the wire and the schemas of MCP, A2A and workflow inputs |
 
 The OpenTelemetry GenAI semantic conventions need nothing: agentd's spans
@@ -169,18 +169,23 @@ A new RFC (0049) before any code, under ADR 0003. Its scope:
 
 *Size:* large. *Recommendation:* design now, build after Q3.
 
-## 6. Questions for the user
+## 6. Questions for the user, and the answers (2026-10-19)
 
-1. **Q1 — RFC 0044.** Accept it, and build it after C?
+1. **Q1 — RFC 0044.** Accept it, and build it after C? — *"accept and
+   build"*: RFC 0044 is accepted, and track E builds it.
 2. **Q2 — Skills discovery.** When the Skills extension lands, remove the
    prompts-as-skills and `skill://` heuristics (no legacy), or keep prompts as
-   a second source?
+   a second source? — *"we should not treat prompts as skills"*: track S
+   removes them; skills come from the Skills extension and from local
+   `SKILL.md` folders only.
 3. **Q3 — Payment signing.** Which first network for x402, and may agentd take
    a RustCrypto crate (`k256` and `sha3`) for EVM signatures? The Solana
    binding signs with Ed25519, which `ring` has, but builds Solana
-   transactions.
+   transactions. — *"both"*: EVM (with `k256` and `sha3`) and Solana, both
+   under ADR 0003.
 4. **Q4 — The strip's RFCs.** One "IETF RFCs" entry linking to the table, or
-   each RFC as its own entry?
+   each RFC as its own entry? — *"show separately"*: each RFC is its own
+   entry.
 
 ## 7. Order
 
@@ -188,11 +193,11 @@ A new RFC (0049) before any code, under ADR 0003. Its scope:
 |---|---|---|
 | 0 | the strip and the "Internet standards" table (§2) | none — done with this RFC |
 | 1 | T — MCP Tasks | this RFC accepted |
-| 2 | S — Skills extension and SKILL.md | Q2 |
+| 2 | S — Skills extension and SKILL.md | Q2 answered: prompts are not skills |
 | 3 | C — CIMD | none |
 | 4 | G — AGENTS.md | none |
-| 5 | E — RFC 0044 | Q1 |
-| 6 | P — RFC 0049, then x402 | Q3 |
+| 5 | E — RFC 0044 | Q1 answered: accepted |
+| 6 | P — RFC 0049, then x402 on EVM and Solana | Q3 answered: both |
 
 ## 8. References
 

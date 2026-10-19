@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Proposed
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.

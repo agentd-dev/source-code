@@ -72,8 +72,66 @@
     "tier": 2
   },
   {
-    "name": "IETF RFCs",
-    "full": "The internet standards agentd implements, by RFC number",
+    "name": "PKCE",
+    "version": "RFC 7636",
+    "full": "Proof Key for Code Exchange, on authorization-code logins",
+    "href": "/docs/authentication/#oauth-20",
+    "tier": 2
+  },
+  {
+    "name": "Device Authorization Grant",
+    "version": "RFC 8628",
+    "full": "The OAuth device authorization grant: agentd --login, and the grant agentd serves display clients",
+    "href": "/docs/authentication/#log-in-with-agentd---login",
+    "tier": 2
+  },
+  {
+    "name": "Authorization Server Metadata",
+    "version": "RFC 8414",
+    "full": "OAuth 2.0 authorization server metadata, read before OpenID Connect discovery",
+    "href": "/docs/authentication/#oauth-20",
+    "tier": 2
+  },
+  {
+    "name": "Protected Resource Metadata",
+    "version": "RFC 9728",
+    "full": "OAuth 2.0 protected resource metadata: an MCP server's authorization server",
+    "href": "/docs/authentication/#oauth-20",
+    "tier": 2
+  },
+  {
+    "name": "Issuer Identification",
+    "version": "RFC 9207",
+    "full": "The iss parameter in authorization responses, checked byte for byte",
+    "href": "/docs/authentication/#oauth-20",
+    "tier": 2
+  },
+  {
+    "name": "JWT Client Assertions",
+    "version": "RFC 7523",
+    "full": "private_key_jwt client authentication at a token endpoint",
+    "href": "/docs/authentication/#oauth-20",
+    "tier": 2
+  },
+  {
+    "name": "Token Revocation",
+    "version": "RFC 7009",
+    "full": "OAuth 2.0 token revocation, on agentd --logout",
+    "href": "/docs/authentication/#log-in-with-agentd---login",
+    "tier": 2
+  },
+  {
+    "name": "Resource Indicators",
+    "version": "RFC 8707",
+    "mark": "preview",
+    "full": "Resource indicators for a company's MCP server: a build-from-source preview",
+    "href": "/docs/interoperability/#personal-agent-protocol",
+    "tier": 2
+  },
+  {
+    "name": "TLS",
+    "version": "1.3",
+    "full": "TLS 1.3 (RFC 8446) on every HTTPS connection, in and out",
     "href": "/docs/interoperability/#internet-standards",
     "tier": 2
   },

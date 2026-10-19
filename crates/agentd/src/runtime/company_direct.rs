@@ -229,6 +229,22 @@ impl Runtime {
             );
             return;
         }
+        // The account the Direct Conversation would go in is settled before
+        // the User is asked, as the tool's is: one it cannot go in — the
+        // conversation belongs to no account while several are held — is
+        // never put to the User only to be refused after they wrote, and the
+        // Company hears they are not available.
+        if let Some(sup) = self.companies.clone()
+            && let Some(c) = sup.company(&a.company)
+            && let Err(e) = sup.may_follow_in(&c, &a.conversation, None)
+        {
+            self.log.warn(
+                "company.direct.unplaced",
+                json!({"company": a.company, "error": e}),
+            );
+            self.say_unavailable(&a.company, &a.conversation, &a.event);
+            return;
+        }
         let id = format!("{}@{}", self.next_id("direct"), self.process_nonce);
         if !self.open_direct_gate(
             &id,

@@ -292,6 +292,7 @@ token, an assertion, a proof or a User ID; `session_id` appears only at
 | `company.standing.suspended` | info | `account`, `company` | A sign-in under the label `account` went in a new Session, which the Company may have signed in to another account than the label held — `new_account`, or a label whose account was signed out of, reset or lost with its Session: the standing permissions covering that label apply to none until a restart. |
 | `company.direct.requested` | info | `by`, `company`, `task` | The User is asked on `task` whether to talk with the Company directly: `by` `company` (its `user_requested` event) or `agent` (`company.direct`). Also an audit record, `company.direct` (`asked`). |
 | `company.direct.repeated` | info | `company`, `note` | The Company asked again while the User's question about the conversation is open: nothing more is asked. |
+| `company.direct.unplaced` | warn | `company`, `error` | The Company asked to talk with the User directly after a conversation no account holds while several are held: the User is not asked, and the Company is told they are not available. |
 | `company.direct.asked` | info | `answer`, `by`, `company` | The User answered: `join`, their first message, or `decline`. Also an audit record, `company.direct`. |
 | `company.direct.joined` | info | `company`, `task` | The Direct Conversation started with the User's first message; `task` relays it. |
 | `company.direct.conversation` | debug | `company`, `conversation`, `parent` | The Direct Conversation's id, and the one it follows. |

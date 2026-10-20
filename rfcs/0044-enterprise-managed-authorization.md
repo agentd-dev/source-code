@@ -3916,7 +3916,7 @@ part a signer's author needs — is a reference page,
   operator-only and restart-only by the existing prefixes.
 - *Wire.* One request per connection; a frame is a four-byte big-endian
   length and 1–65 536 bytes of UTF-8 JSON; bytes are base64url without
-  padding; every message carries `v: 1`. The ops: `public_key {key}` →
+  padding; an agentd-owned protocol, so no message carries a version. The ops: `public_key {key}` →
   `{alg, jwk}`; `sign {key, alg, data}` → `{sig}` over the JWS signing
   input, ES256 as the 64-byte `R ‖ S` and RS256 as PKCS#1 v1.5; `wrap {key,
   plaintext, aad}` → `{wrapped}`, opaque to agentd; `unwrap {key, wrapped,

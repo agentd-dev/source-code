@@ -10,8 +10,8 @@
 //!
 //! **The wire.** One request per connection: a frame is a four-byte
 //! big-endian length and that many bytes of a UTF-8 JSON object, at most
-//! [`MAX_FRAME`]. A request is `{"v": 1, "op", …}`; the answer is `{"v": 1,
-//! "ok": true, …}` or `{"v": 1, "ok": false, "error": {"code", "message"}}`.
+//! [`MAX_FRAME`]. A request is `{"op", …}`; the answer is `{"ok": true, …}`
+//! or `{"ok": false, "error": {"code", "message"}}`.
 //! Bytes travel as base64url without padding. The ops:
 //!
 //! - `public_key {key}` → `{alg, jwk}`: a signing key's public JWK;
@@ -56,8 +56,6 @@ use serde_json::{Value, json};
 
 use crate::b64;
 
-/// The protocol version agentd speaks.
-pub const VERSION: u64 = 1;
 /// The largest frame either side sends.
 pub const MAX_FRAME: usize = 64 * 1024;
 /// How long before a connection that could not be made is tried again.
@@ -200,7 +198,6 @@ impl Signer {
         sent: Option<&str>,
         secret: bool,
     ) -> Result<Value, SignerError> {
-        req["v"] = json!(VERSION);
         let op = req["op"].as_str().unwrap_or_default().to_string();
         let key = req["key"].as_str().unwrap_or_default().to_string();
         let at = || format!("{}: {op} {key:?}", self.socket.display());
@@ -252,12 +249,6 @@ impl Signer {
         }
         let a: Value = parsed
             .map_err(|_| SignerError::Unavailable(format!("{}: the answer is not JSON", at())))?;
-        if a["v"].as_u64() != Some(VERSION) {
-            return Err(SignerError::Unavailable(format!(
-                "{}: the answer is not protocol version {VERSION}",
-                at()
-            )));
-        }
         match a["ok"].as_bool() {
             Some(true) => Ok(a),
             Some(false) => Err(SignerError::Refused {

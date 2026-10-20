@@ -70,19 +70,18 @@ delegation:
 
 ## Messages
 
-Every request carries `v: 1` and an `op`. Every answer carries `v: 1` and
-`ok`. A request with another `v` is answered `unsupported_version`.
+Every request carries an `op`, and every answer `ok`.
 
 ```json
-{"v": 1, "op": "sign", "key": "agentd-idp-2026", "alg": "ES256", "data": "eyJhbGciOiJFUzI1NiIs…"}
+{"op": "sign", "key": "agentd-idp-2026", "alg": "ES256", "data": "eyJhbGciOiJFUzI1NiIs…"}
 ```
 
 ```json
-{"v": 1, "ok": true, "sig": "q3VxH8wZ…"}
+{"ok": true, "sig": "q3VxH8wZ…"}
 ```
 
 ```json
-{"v": 1, "ok": false, "error": {"code": "unknown_key", "message": "no key \"agentd-idp-2026\""}}
+{"ok": false, "error": {"code": "unknown_key", "message": "no key \"agentd-idp-2026\""}}
 ```
 
 | Op | Request | Answer |
@@ -113,7 +112,6 @@ oracle than one that signs anything.
 | `wrong_alg` | The key is not of the algorithm asked. |
 | `unwrap_failed` | `wrapped` does not open under `key` and `aad`. agentd treats the grant record as unreadable. |
 | `bad_request` | A field is missing or not base64url, or the op is unknown. |
-| `unsupported_version` | The request's `v` is not one the signer speaks. |
 | `denied` | The signer's own policy refuses the request. |
 | `internal` | Anything else on the signer's side. |
 

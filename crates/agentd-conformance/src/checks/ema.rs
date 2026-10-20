@@ -2396,9 +2396,8 @@ fn signer_holds_the_keys(h: &Harness) -> Outcome {
     tryo!(s.login(h));
     let run = tryo!(s.run("who"));
     let sock = s.tmp.path().join("signer.sock");
-    let jwk = |key: &str| {
-        signer_call(&sock, json!({"v": 1, "op": "public_key", "key": key}))["jwk"].clone()
-    };
+    let jwk =
+        |key: &str| signer_call(&sock, json!({"op": "public_key", "key": key}))["jwk"].clone();
     let (idp_key, ras_key) = (jwk("idp"), jwk("ras"));
     let exchange = s.xaa.grants("idp", EXCHANGE);
     let redeem = s.xaa.grants("ras", JWT_BEARER);

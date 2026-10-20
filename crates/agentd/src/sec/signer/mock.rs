@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair, RsaKeyPair};
 use serde_json::{Value, json};
 
-use super::{VERSION, peer_uid, read_frame, write_frame};
+use super::{peer_uid, read_frame, write_frame};
 use crate::auth::seal::SealKey;
 use crate::b64;
 
@@ -173,7 +173,7 @@ fn connection(mut c: UnixStream, state: &Arc<Mutex<State>>) {
 }
 
 fn refuse(code: &str, message: &str) -> Value {
-    json!({"v": VERSION, "ok": false, "error": {"code": code, "message": message}})
+    json!({"ok": false, "error": {"code": code, "message": message}})
 }
 
 fn field(req: &Value, f: &str) -> Option<Vec<u8>> {
@@ -209,14 +209,10 @@ fn answer(req: &Value, state: &Arc<Mutex<State>>) -> Value {
 fn answer_of(req: &Value, s: &State) -> Value {
     let op = req["op"].as_str().unwrap_or_default();
     let id = req["key"].as_str().unwrap_or_default();
-    if req["v"].as_u64() != Some(VERSION) {
-        return refuse("unsupported_version", "this signer speaks version 1");
-    }
     let Some(key) = s.keys.get(id) else {
         return refuse("unknown_key", &format!("no key {id:?}"));
     };
     let ok = |mut v: Value| {
-        v["v"] = json!(VERSION);
         v["ok"] = json!(true);
         v
     };

@@ -719,6 +719,8 @@ impl Runtime {
                         .get(run)
                         .and_then(|r| r.steps.get(step))
                         .is_some_and(|s| s.status == crate::engine::run::StepStatus::Suspended),
+                    // A tool call owes a sign-in, never a task's question.
+                    Owed::Call(Target::McpTask(..)) => true,
                     Owed::Task(task) => self.task_ended(task),
                 };
                 if gone || t.gate.as_deref().is_some_and(|g| self.task_ended(g)) {

@@ -859,6 +859,61 @@ fn skills_from_a_server_the_reload_adds_are_discovered() {
     );
 }
 
+/// A reload that builds the skills catalogue again holds the running
+/// workflows to it: a SKILL.md added to the folder under the name a step
+/// references bare makes that reference ambiguous, and the reload is refused
+/// naming both candidates, as a start would be. Before the skill is added,
+/// the same reload goes through and changes nothing.
+#[test]
+fn a_reload_that_makes_a_steps_skill_ambiguous_is_refused() {
+    let a = common::spawn_mock_mcp_at("2026-07-28", "mock://a", false);
+    let t = tempfile::tempdir().unwrap();
+    let folder = t.path().join("skills");
+    std::fs::create_dir_all(&folder).unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let uses = "  - name: uses\n    steps:\n      s: {kind: manual}\n      t: {kind: think, depends_on: [s], prompt: p, skills: [git-workflow]}\n      f: {kind: finish, depends_on: [t]}\n";
+    std::fs::write(
+        &cfg,
+        config(
+            "Work.",
+            &[("a", &a.uri())],
+            &[uses],
+            &format!(
+                "intelligence:\n  endpoints: \"mock:final\"\n  model: mock\n\
+                 skills:\n  dir: {}\n  sources:\n    - {{server: a}}\n",
+                folder.display()
+            ),
+        ),
+    )
+    .unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| !events(l, "proc.ready").is_empty(), "the daemon", 15);
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert_eq!(changed(outcome), ["nothing"], "{log}");
+
+    std::fs::create_dir_all(folder.join("git-workflow")).unwrap();
+    std::fs::write(
+        folder.join("git-workflow/SKILL.md"),
+        "---\nname: git-workflow\ndescription: Ours\n---\n\nOURS\n",
+    )
+    .unwrap();
+    let log = d.reload(1);
+    assert_eq!(outcomes(&log)[1]["event"], "config.reload.invalid", "{log}");
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(
+                |e| e["error"].as_str().is_some_and(|m| m.contains("step \"t\"")
+                    && m.contains(r#"skill "git-workflow" is ambiguous"#)
+                    && m.contains(r#""a/git-workflow""#)
+                    && m.contains(r#""local/git-workflow""#))
+            ),
+        "{log}"
+    );
+}
+
 /// A reload that removes a skills source lets go of that server's skills in
 /// every context: its body leaves the next prompt and `skills.read` reads
 /// nothing of it, said as `skills.unloaded`. A folder skill the reload keeps

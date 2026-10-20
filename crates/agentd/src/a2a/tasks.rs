@@ -177,6 +177,13 @@ pub struct Task {
     /// relay again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company_gate: Option<CompanyGate>,
+    /// The handle of the MCP task whose question this task's gate puts
+    /// (RFC 0054): a task made for the question alone. Durable with the
+    /// task: an answer is not kept across a restart, so a restart that finds
+    /// one open ends it, and the question is put again if the server still
+    /// asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_question: Option<String>,
     /// The command op that opened this task, when a command did (a built-in
     /// op, or a workflow's declared `a2a` command). What marks the result as
     /// the command vocabulary's data rather than an answer in prose.
@@ -272,6 +279,7 @@ impl Task {
             ask_channel: None,
             sign_in: None,
             company_gate: None,
+            mcp_question: None,
             id: id.to_string(),
             context_id: context_id.to_string(),
             conversation: context_id.to_string(),

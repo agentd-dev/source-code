@@ -753,6 +753,302 @@ workflows:
 - Set `store` explicitly when your long-lived workflows come from files.
   The file store is chosen by default only for workflows written inline.
 
+## Capabilities in workflows
+
+Each capability agentd has is reachable from a workflow. Most of them need
+no node of their own: a `tool` step calls their tools, and the nodes above
+express the rest. [RFC 0054](../rfcs/0054-workflow-nodes-for-new-capabilities.md)
+records which capability got a node or a field, which got nothing, and why.
+
+| Capability | Step shapes |
+|---|---|
+| A long MCP tool call (MCP Tasks) | an `mcp.tool` or `tool` step that waits for the task its call becomes; `detach: true` and `wait {on: mcp_task}` to collect it later; `input` to put its question to a person; `mcp.task.get` and `mcp.task.cancel` as `tool` steps |
+| Skills | `skills:` on `agent`, `think`, `classify`, `extract`, `summarize`, `judge`, `route` and `subagent`, by `<name>`, `<origin>/<name>`, `local/<name>` or `<origin>/<path>` |
+| Acting at a Company for its User | `company.*` and a Company's operation tools as `tool` steps, `http` with `auth: {kind: company}`, and the stream `company.<name>` through a `stream` start or `wait {on: event}` |
+| Acting for an enrolled person | `mcp.tool` and `tool` steps on a delegated server, in the person's own runs; the person's consent gate is the step's |
+| AGENTS.md, the Client ID Metadata Document | nothing in a workflow: AGENTS.md is in every turn's prompt, an `agent` step's included, and the metadata document is how agentd names itself at a login |
+
+### Start a long MCP call and collect it later
+
+A server that cannot finish a call in one answer makes it an MCP task. An
+`mcp.tool` step waits for it by default. With `detach: true` the step
+finishes as soon as the server makes the task, and the run goes on; a
+`wait {on: mcp_task}` collects the outcome when the run needs it.
+
+```yaml
+intelligence:
+  endpoints: "mock:final"
+mcp:
+  servers:
+    - name: builds
+      endpoint: https://builds.example.com/mcp
+workflows:
+  - name: release
+    inputs:
+      schema:
+        type: object
+        required: [ref]
+        properties: {ref: {type: string}}
+    steps:
+      start: {kind: manual}
+      build:
+        kind: mcp.tool
+        depends_on: [start]
+        server: builds
+        tool: build
+        args: {ref: "{{ inputs.ref }}"}
+        detach: true
+        input: {to: operator, timeout: 2h}
+      notes:
+        kind: agent
+        depends_on: [build]
+        instruction: "Draft release notes for {{ inputs.ref }}."
+      built:
+        kind: wait
+        depends_on: [notes]
+        on: mcp_task
+        task: "{{ steps.build.output.task.id }}"
+        timeout: 2h
+        on_timeout: too_slow
+      check:
+        kind: assert
+        depends_on: [built]
+        condition: "steps.built.output.ok"
+        message: "the build did not complete"
+      done:
+        kind: finish
+        depends_on: [check]
+        output: {notes: "{{ steps.notes.output }}", build: "{{ steps.built.output.result }}"}
+      too_slow: {kind: finish, status: cancelled, reason: "the build ran past two hours"}
+```
+
+- `build` outputs `{task: {server, id, status}}`. `id` is agentd's handle
+  for the task, never the server's id. A server that answers at once
+  answers the step as it would without `detach`, and then there is no task
+  to wait on.
+- The run owns the task. The wait's `timeout` ends the wait, not the task:
+  here the timeout branch finishes the run, and the run's end — completed,
+  failed or cancelled — cancels a task still open. To stop it and carry
+  on, call `mcp.task.cancel` from a `tool` step with `{task: "{{
+  steps.build.output.task.id }}"}`; the wait then resolves with what the
+  server made of the cancel.
+- The wait resolves `done` however the task ended, with `{task, server,
+  tool, status, ok, result?, error?}`. Check `ok` or `status`, as `check`
+  does here.
+- A `foreach` whose body detaches holds each lane only for the call, so it
+  can start many tasks; a second `foreach` waits on each by
+  `{{ item.task.id }}`.
+- `input` puts a question the task asks to a person, through the gate a
+  `human` step opens. Over A2A the question opens on a task of its own in
+  the run's conversation, beside the run's task, so the `approve` gate
+  above and the build's question can be open at once. `to` and `timeout`
+  are a `human` gate's, and the gate needs the A2A listener as a `human`
+  step's does. The answer goes back to the server. Without `input` the
+  question is declined, and the server decides what that means. A step
+  that waits on its own task (no `detach`) ends the task at its `timeout`,
+  and the question with it.
+- The task is durable: after a restart agentd polls it again and resolves
+  the wait when it ends.
+
+### Name a skill exactly
+
+`skills:` loads skills into a model step's prompt. A bare name is enough
+when one skill has it. When two origins have it — two servers, or a server
+and agentd's own folders — name the origin, or the configuration is refused
+at startup with both candidates.
+
+```yaml
+# needs: skills/
+intelligence:
+  endpoints: "mock:final"
+mcp:
+  servers:
+    - name: playbooks
+      endpoint: https://playbooks.example.com/mcp
+skills:
+  dir: ./skills
+  sources:
+    - server: playbooks
+workflows:
+  - name: plan-rollout
+    steps:
+      start: {kind: manual}
+      plan:
+        kind: think
+        depends_on: [start]
+        prompt: "Plan the rollout of the payments service."
+        skills: [playbooks/deploy, local/house-style]
+      done: {kind: finish, depends_on: [plan], output: "{{ steps.plan.output }}"}
+```
+
+`playbooks/deploy` is the server's skill named `deploy`; `local/house-style`
+is agentd's own, from the folder or the instruction. A reference that names
+no skill when the step runs is said in the step's prompt and logged
+`skills.unknown`: its server may have been down at startup.
+
+### Wait for a Company's operation
+
+A Company's tools are `tool` steps. An operation that is not final when it
+is confirmed reaches its final state later, on the stream `company.<name>`,
+with the subject `operation` and the operation's id as the correlation.
+
+```yaml
+agent:
+  name: dana
+intelligence:
+  endpoints: "mock:final"
+a2a:
+  listen: unix:///run/agentd/a2a.sock
+security:
+  companies:
+    client:
+      id: https://agent.example.com/companies/client.json
+      name: Dana's agent
+    seal_key: "{{secret:AGENTD_COMPANY_SEAL}}"
+services:
+  shop:
+    kind: company
+    endpoint: https://shop.example.com
+    sign_in: [device]
+    scopes: ["poppy:read", "poppy:write"]
+workflows:
+  - name: confirm-order
+    inputs:
+      schema:
+        type: object
+        required: [operation_id]
+        properties: {operation_id: {type: string}}
+    steps:
+      start: {kind: manual}
+      confirm:
+        kind: tool
+        depends_on: [start]
+        name: company.operation.confirm
+        args: {company: shop, operation_id: "{{ inputs.operation_id }}"}
+      settled:
+        kind: wait
+        depends_on: [confirm]
+        when: "steps.confirm.output.state == 'in_progress'"
+        on: event
+        stream: company.shop
+        subject: operation
+        match: "event.correlation == inputs.operation_id"
+        timeout: 1h
+        on_timeout: recheck
+      done:
+        kind: finish
+        depends_on: [confirm, settled]
+        output: {confirmed: "{{ steps.confirm.output.state }}", final: "{{ steps.settled.output.data.operation.state | null }}"}
+      recheck:
+        kind: tool
+        name: company.operation.get
+        args: {company: shop, operation_id: "{{ inputs.operation_id }}"}
+      checked: {kind: finish, depends_on: [recheck], output: "{{ steps.recheck.output.state }}"}
+```
+
+- The User approves the confirm at the gate the tool opens; the step waits
+  for it.
+- `match` sees `event`, `inputs` and `vars`, not `steps`: an id a step
+  outputs goes into a variable with `assign` first.
+- An event wait starts from where the stream stands when it arms, so a
+  final state reached before that is not seen. The timeout branch reads the
+  operation again.
+- The Company's agent's next message in a conversation arrives the same
+  way, with the subject `message`; `company.converse` with `wait` returns it
+  inline.
+
+### Call a delegated server for the enrolled person
+
+A delegated server's tools are called from `mcp.tool` and `tool` steps like
+any other's, but only a run that the enrolled person started uses their
+grant. Any other run — one a schedule, a webhook or another principal
+started — fails the step with `no_delegation`.
+
+```yaml
+# needs: ./okta-agent-key.pem, ./linear-ras-key.pem, ./delegation-seal
+agent: {name: assistant}
+intelligence: {endpoints: "mock:final", model: m}
+a2a:
+  listen: unix:///run/agentd/a2a.sock
+  principals:
+    - match: {uid: 1000}
+      role: operator
+      id: alice
+      idp_subject: {iss: https://acme.okta.com, sub: 00u1alice}
+security:
+  experimental: {id_jag: true}
+identity:
+  providers:
+    okta:
+      issuer: https://acme.okta.com
+      profile: okta
+      client_id: 0oa9agentdXAA
+      client_auth:
+        method: private_key_jwt
+        key: "{{secret-file:./okta-agent-key.pem}}"
+        kid: agentd-2026-10
+      sign_in: {grants: [device], scopes: [openid, offline_access]}
+  delegation:
+    seal_key: "{{secret-file:./delegation-seal}}"
+    templates:
+      - name: eng-tools
+        principals: {source: operator}
+        idp: okta
+        servers:
+          linear: {scopes: ["issues:read", "issues:write"]}
+mcp:
+  servers:
+    - name: linear
+      endpoint: https://mcp.linear.example/mcp
+      tags: {"*": [sensitive, egress]}
+      auth:
+        kind: oauth2
+        grant: id_jag
+        idp: okta
+        audience: https://auth.linear.example
+        resource: https://mcp.linear.example/mcp
+        client_id: agentd-at-linear
+        client_auth:
+          method: private_key_jwt
+          key: "{{secret-file:./linear-ras-key.pem}}"
+          kid: agentd-ras-1
+        scopes: ["issues:read"]
+        tool_scopes: {create_issue: ["issues:write"]}
+workflows:
+  - name: file-issue
+    inputs:
+      schema:
+        type: object
+        required: [title]
+        properties: {title: {type: string}}
+    steps:
+      start: {kind: manual}
+      file:
+        kind: mcp.tool
+        depends_on: [start]
+        server: linear
+        tool: create_issue
+        args: {title: "{{ inputs.title }}"}
+        on_error: continue
+      done: {kind: finish, depends_on: [file], output: "{{ steps.file.output }}"}
+```
+
+- Alice starts the run with the `workflow.run` command over the unix A2A
+  listener, so the run is hers, and its calls to `linear` use her grant.
+- `create_issue` is tagged `sensitive` and `egress`, so the call waits for
+  her consent. The step stays suspended until she answers with `agentd
+  --delegation-approve <gate>`; approved, it runs with the arguments she was
+  shown. Denied, or unanswered within `identity.delegation.consent_timeout`
+  (24 hours), the step fails with `delegation refused (policy_denied)`; the
+  step's own `timeout` does not bound the gate. `on_error` routes the
+  failure: here it is the step's output, `{"error": …}`.
+- Once a run holds a delegated server's data, any step that sends data off
+  the box — an `http` step, an `a2a.send` or `a2a.delegate`, an `emit` that
+  forwards, an `mcp.tool` at an `egress` server — waits for her consent in
+  the same way.
+- A delegated server is offered no MCP tasks, so it answers each call
+  inline, `detach` or not.
+
 ## Test a workflow
 
 Test a workflow offline by pointing it at the built-in mock endpoint with a

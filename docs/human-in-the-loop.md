@@ -37,6 +37,12 @@ A run is owned when an A2A caller started it, for example with the
 `workflow.run` command, or when its parent run was. Runs started by a
 schedule, a webhook, a stream, a tool call or a timer are owned by nobody.
 
+A question an MCP task asks a step that sets `input` (RFC 0054) takes the
+same path, but never lands on the run's task: it opens on a new task in the
+run's conversation, owned as that task is, because a task holds one gate and
+the task's question comes whenever the server asks it. See
+[`mcp.tool`](node-registry.md#mcptool).
+
 ## Add a gate to a workflow
 
 A `human` step asks a question and suspends the run until it is answered.

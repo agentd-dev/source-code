@@ -359,6 +359,7 @@ task depends on what made the call:
 | The call came from | What agentd does |
 |---|---|
 | a workflow `tool` or `mcp.tool` step | The step waits for the task, durably: a restart polls it again, and the step finishes with the task's result as it would with the call's. The step's `timeout` bounds the wait; at it, or when the run is cancelled, agentd sends `tasks/cancel`. |
+| a workflow step with `detach: true` | The step finishes at once with the task's handle, and the run owns the task: a `wait {on: mcp_task}` collects how it ended, and agentd sends `tasks/cancel` when the run ends with the task still open. See [Capabilities in workflows](author-workflows.md#capabilities-in-workflows). |
 | a model, in a turn | agentd follows the task while the call has time. If it is still running, the model gets the task's handle and status, and follows it with `mcp.task.get` and `mcp.task.cancel`. A task a workflow's `agent` step handed over is cancelled when its run ends, and a turn that is cancelled cancels its task. |
 | the store (a `kind: mcp` store adapter) | The call follows its task inside its own bound, and cancels it there. |
 | a subagent, a mapped contract, or another call with no time limit of its own | agentd does not offer a task: the server answers inline, or refuses with `-32021`. |
@@ -372,7 +373,9 @@ task depends on what made the call:
 - A task that asks a question is treated as the same question asked
   directly. In a turn it opens the human gate an elicitation opens. The
   supervisor's own connections declare no elicitation, so a workflow step's
-  task that asks is declined; put a `human` step before it instead.
+  task that asks is declined, unless the step sets `input`: then the
+  question goes to a person through the gate a `human` step opens, and
+  their answer goes back to the server.
 - agentd cancels a task it gives up while the server may still be running
   it: one still open 30 s past its `ttlMs`, or one whose `tasks/get` the
   server refuses with an error that will not pass.

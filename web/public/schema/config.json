@@ -2166,7 +2166,9 @@
           "args",
           "idempotency",
           "breaker",
-          "rate"
+          "rate",
+          "detach",
+          "input"
         ],
         "implemented": true,
         "required": [
@@ -2534,7 +2536,9 @@
       "tool": {
         "fields": [
           "name",
-          "args"
+          "args",
+          "detach",
+          "input"
         ],
         "implemented": true,
         "required": [
@@ -2582,6 +2586,7 @@
           "subject",
           "subscribe",
           "match",
+          "task",
           "timeout",
           "on_timeout"
         ],

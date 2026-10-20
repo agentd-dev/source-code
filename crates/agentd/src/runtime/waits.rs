@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Orchestration steps** — the integration, intelligence and control kinds:
 //! `wait` (on a resource update, a CEL condition, a signal, a run, a subagent,
-//! a conversation message, or a deadline), `join` (fan-in of runs/subagents),
+//! a conversation message, a deadline, or an MCP task the run detached),
+//! `join` (fan-in of runs/subagents),
 //! `workflow` (a child run: `sync | async | detached`, `cascade`),
 //! `workflow.signal` / `workflow.wait` / `workflow.cancel`, `subagent`,
 //! `human` (through the `ask_human` contract), `mcp.resource`
@@ -470,7 +471,8 @@ impl Runtime {
         self.checkpoint(false);
     }
 
-    /// `wait {on: resource|condition|signal|run|subagent|message, …, timeout}`.
+    /// `wait {on: resource|condition|signal|run|subagent|message|event|
+    /// webhook|deadline|mcp_task, …, timeout}`.
     fn step_wait(
         &mut self,
         run_id: &str,
@@ -612,7 +614,22 @@ impl Runtime {
             "deadline" | "" if timeout.is_some() => {
                 self.suspend_wait(run_id, step_id, wait_record("deadline", json!({}), timeout));
             }
-            other => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait: on must be resource|condition|signal|run|subagent|message|event|webhook (got {other:?})")), 0),
+            // An MCP task a step of this run detached (RFC 0054). One that
+            // already ended resolves the wait now: the record, not a stream,
+            // holds its outcome, so nothing that happened before the wait
+            // armed is missed.
+            "mcp_task" => {
+                let task = spec.get("task").and_then(Value::as_str).unwrap_or("").to_string();
+                match self.detached_outcome(run_id, &task) {
+                    Ok(Some(out)) => {
+                        self.step_log(run_id, step_id).info("wait.resolved", json!({"run": run_id, "step": step_id, "status": StepStatus::Done}));
+                        self.finish_step_pub(run_id, step_id, StepStatus::Done, Some(out), None, 0);
+                    }
+                    Ok(None) => self.suspend_wait(run_id, step_id, wait_record("mcp_task", json!({"task": task, "detached": true}), timeout)),
+                    Err(e) => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait on: mcp_task: {e}")), 0),
+                }
+            }
+            other => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait: on must be resource|condition|signal|run|subagent|message|event|webhook|deadline|mcp_task (got {other:?})")), 0),
         }
     }
 
@@ -951,6 +968,15 @@ impl Runtime {
                     // through `on_timeout` like any other deadline, which is
                     // what makes "alert fired, no recovery in ten minutes"
                     // expressible without a polling loop.
+                    // A wait on a task the run detached (RFC 0054): resolved
+                    // once the task ended, whatever its end. Its timeout ends
+                    // the wait alone; the task stays the run's.
+                    Some("mcp_task") if w["detached"] == true => match self.detached_outcome(rid, w["task"].as_str().unwrap_or("")) {
+                        Ok(Some(out)) => resolve.push((rid.clone(), sid.clone(), StepStatus::Done, out, None)),
+                        Ok(None) if timed_out => resolve.push((rid.clone(), sid.clone(), StepStatus::Timeout, json!({"task": w["task"], "timed_out": true}), Some("wait timed out".into()))),
+                        Ok(None) => {}
+                        Err(e) => resolve.push((rid.clone(), sid.clone(), StepStatus::Failed, Value::Null, Some(format!("wait on: mcp_task: {e}")))),
+                    },
                     // A step's MCP task past the step's timeout: the step
                     // ends `timeout`, and the task, which nothing waits for
                     // then, is cancelled (`mcp_tasks_tick`).

@@ -42,7 +42,7 @@ agentd --workflow-schema | jq '.["$defs"].kinds | keys | length'
 | `output_schema` | a JSON Schema the step's output must match, or the step fails. On a model step it also shapes the answer |
 | `cache` | `{key?, ttl?}`: reuse an earlier output. The key is a template (default: the rendered fields), shared across runs of the workflow; no `ttl` keeps it forever. Never written for a step that suspends or nests |
 | `budget` | a token allowance for this step's model calls |
-| `skills` | skills loaded into a model step's prompt |
+| `skills` | skills loaded into a model step's prompt: references `<name>`, `<origin>/<name>` (a `skills.sources` server, or `local` for agentd's own) or `<origin>/<path>`. One that two skills answer to is refused at load, naming both |
 | `description` | free text |
 | `idempotent`, `otel` | accepted, and read by nothing. Use `on_replay` to control a replay |
 
@@ -610,9 +610,10 @@ with its deadline intact.
 
 - **Fields:** **`on`**, `server`, `uri`, `condition`, `signal`, `run`,
   `subagent`, `conversation`, `from`, `webhook`, `stream`, `subject`,
-  `subscribe`, `match`, `timeout`, `on_timeout`.
+  `subscribe`, `match`, `task`, `timeout`, `on_timeout`.
 - `on` is written out, never templated: what a wait listens on decides what
-  it opens, which load checks.
+  it opens, which load checks. An `on` that is none of the forms below is
+  refused at load.
 - `timeout` ends the wait with status `timeout`. `on_timeout: <step>` makes
   that an expected branch: the named step runs, and the wait's dependents do
   not. The target has no `depends_on`; give it its own path to a `finish`.
@@ -629,6 +630,7 @@ with its deadline intact.
 | `message` | `conversation`, `from` | a message arrives on the conversation | `{conversation, contextId, message, principal}` |
 | `webhook` | `webhook: {path?, auth?, emit_url_to?}` | the callback route it opens is called | `{signal, payload, from}`; `payload` is the request |
 | `deadline` | `timeout` | the timeout passes; this ends `done`, not `timeout` | `{waited_ms}` |
+| `mcp_task` | `task` | the MCP task a step of this run detached ends, or already has | `{task, server, tool, status, ok, result?, error?}` |
 
 Notes per form:
 
@@ -657,6 +659,16 @@ Notes per form:
   so another step can hand it out. The route and its `auth` references are
   in the durable wait record, so a restart serves it again. Needs the `a2a`
   build feature.
+- **`mcp_task`**: `task` is the handle a detaching step outputs,
+  `steps.<id>.output.task.id` (see [`mcp.tool`](#mcptool)). The wait ends
+  `done` however the task ended, as `wait {on: run}` does: `status` is
+  `completed`, `failed` or `cancelled` — `failed` too when agentd stopped
+  following the task, with `error` saying why — and `ok` holds only for a
+  completed task whose result is no error. A task that ended before the wait
+  armed resolves it at once, and any number of waits may read one task. The
+  wait's `timeout` ends the wait, not the task, which stays the run's. A
+  `task` that names no task this run detached fails the step, and so does an
+  empty one: a detaching step the server answered at once made none.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -921,9 +933,10 @@ Calls a tool on a declared MCP server: the main way a workflow reaches the
 outside world.
 
 - **Fields:** **`server`**, **`tool`**, `args`, `idempotency`, `breaker`,
-  `rate`.
+  `rate`, `detach`, `input`.
 - **Output:** the tool's result. A result the server marks as an error
-  fails the step.
+  fails the step. With `detach: true` and a call the server makes a task
+  of, `{task: {server, id, status}}`.
 - Every call carries a retry-stable `agent/idempotency_key` in `_meta`, with
   `agent/attempt` beside it. `idempotency: {value}` replaces the key with an
   application key.
@@ -931,6 +944,33 @@ outside world.
   declared server that is down when the step runs fails the step; one down
   at startup joins when it comes up. A server in the `services:` catalog
   with a `rate` paces calls.
+- A call the server makes an MCP task of is waited for durably, bounded by
+  the step's `timeout` (default `limits.step_timeout`), which cancels the
+  task when it passes, and with it any question the task asks.
+- `detach: true` finishes the step as soon as the server makes the task:
+  `id` is agentd's handle for it (`mt_…`, never the server's task id) and
+  `status` the one the server gave. The run owns the task: a
+  [`wait {on: mcp_task}`](#wait) collects how it ended, a `tool` step reads
+  it with `mcp.task.get` and cancels it with `mcp.task.cancel`, and the run's
+  end — completed, failed or cancelled — cancels it while it is open. A
+  server that answers at once answers the step as it would without
+  `detach`, and so does one past its 32 open tasks, one with `tasks: off`,
+  and a Company's or a delegated server, which are offered no tasks.
+  `detach` is `true` or `false` as written, and refused beside `cache`.
+- `input: {to?, timeout?}` puts the task's questions (form elicitations) to
+  a person through the gate a [`human`](#human) step opens, under the same
+  rules: `to` names who answers, in a `human` gate's forms, and `timeout`
+  (default 24 h) how long they have, after which the answer is `cancel`.
+  Over A2A each question opens on a task of its own in the run's
+  conversation, never on the run's task, so it neither holds up nor is held
+  up by the run's `human` steps and policy gates; a client following the
+  run finds it among the conversation's tasks (`ListTasks` with its
+  `contextId` and `TASK_STATE_INPUT_REQUIRED`). A step that waits on its
+  own task bounds the question by its `timeout` too, and the gate shows
+  whichever deadline comes first; `detach` the task for a question that may
+  take longer. The answer goes back to the server as the elicitation's
+  `accept`. Without `input` the question is declined. `input` is taken as
+  written, not templated.
 
 ```yaml
 # fragment: under workflows[].steps
@@ -941,6 +981,24 @@ label:
   tool: add_labels
   args: {issue: "{{ inputs.issue }}", labels: ["{{ steps.triage.output.class }}"]}
   retry: {max: 3, backoff: 2s}
+```
+
+```yaml
+# fragment: under workflows[].steps
+build:
+  kind: mcp.tool
+  depends_on: [triage]
+  server: github
+  tool: run_workflow
+  args: {workflow: release.yml}
+  detach: true                       # finishes with {task: {server, id, status}}
+  input: {to: operator, timeout: 2h} # the task's questions go to the operator
+built:
+  kind: wait
+  depends_on: [build]
+  on: mcp_task
+  task: "{{ steps.build.output.task.id }}"
+  timeout: 3h
 ```
 
 ### `mcp.resource`
@@ -968,10 +1026,17 @@ readme: {kind: mcp.resource, depends_on: [start], server: github, op: read, uri:
 
 Calls any tool by its registry name: built-in, code-registered or MCP.
 
-- **Fields:** **`name`**, `args`.
+- **Fields:** **`name`**, `args`, `detach`, `input`.
 - **Output:** the tool's result.
 - The tool must be granted to workflows. One that is unknown, disabled or
   not granted exits `2` at startup.
+- On a tool of an MCP server's route, a call the server makes a task of is
+  waited for, and `detach` and `input` work as on
+  [`mcp.tool`](#mcptool). On any other tool they exit `2` at startup.
+- `mcp.task.get` and `mcp.task.cancel` reach a task a step of the same run
+  detached, by the `id` its output named: `get` reads its status and, once
+  it ended, its result, leaving it for the run's waits; `cancel` sends
+  `tasks/cancel`, and the task is followed until the server says it ended.
 - The call's `agent/idempotency_key` is the step's: the same across its
   retries and a restart's replay. A `company.*` call keeps the message id or
   `Idempotency-Key` it minted under it, so a retry sends the same one.
@@ -1376,6 +1441,7 @@ refund:
 | to run branches and take the first | `race` | `parallel` |
 | to run branches and keep them all | `parallel` | `race` |
 | to wait for an event about this run | `wait {on: event}` with `match` | a second workflow |
+| to start a long MCP call and collect it later | `detach: true` and `wait {on: mcp_task}` | an `mcp.tool` step that waits |
 | to join several events that never had a run | `correlate` | `wait` |
 
 ## Next steps

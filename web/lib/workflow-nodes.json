@@ -559,7 +559,9 @@
       "args",
       "idempotency",
       "breaker",
-      "rate"
+      "rate",
+      "detach",
+      "input"
     ],
     "implemented": true,
     "kind": "mcp.tool",
@@ -987,7 +989,9 @@
     "category": "io",
     "fields": [
       "name",
-      "args"
+      "args",
+      "detach",
+      "input"
     ],
     "implemented": true,
     "kind": "tool",
@@ -1041,6 +1045,7 @@
       "subject",
       "subscribe",
       "match",
+      "task",
       "timeout",
       "on_timeout"
     ],

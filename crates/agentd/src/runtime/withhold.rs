@@ -138,6 +138,11 @@ impl Runtime {
                 Some(ChildKind::RootTurn { ctx, .. }) => Reader::Conversation(Some(ctx.clone())),
                 _ => Reader::Conversation(None),
             },
+            // The run whose step made or detached the task.
+            Target::McpTask(h, _) => match self.mcp_tasks.task_run(h) {
+                Some(run) => Reader::Run(run),
+                None => Reader::Conversation(None),
+            },
         }
     }
 

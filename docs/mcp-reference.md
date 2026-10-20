@@ -370,7 +370,7 @@ nothing over.
 
 | Request | On a turn worker's connection | On the supervisor's |
 |---|---|---|
-| `elicitation/create`, form | the `ask_human` gate, as a direct elicitation; `cancel` after 300 s | declined |
+| `elicitation/create`, form | the `ask_human` gate, as a direct elicitation; `cancel` after 300 s | declined; with the step's `input`, the gate a `human` step opens, `cancel` after `input.timeout` (24 h) |
 | `elicitation/create`, URL | declined | declined |
 | anything else | the task is cancelled | the task is cancelled |
 
@@ -381,6 +381,15 @@ asks after it was handed over is declined: the turn that could have asked
 has moved on. A person's answer is never stored, so one the server has not
 acknowledged when the task is handed over has its key released, and is
 declined too.
+
+On the supervisor's connections, a workflow step that sets `input` (RFC
+0054) has its task's form elicitations put to a person one key at a time,
+each over A2A on a task of its own in the run's conversation, and sends the
+round's answers together once every key has one. The record keeps a key as
+answered only once the server acknowledged it, so after a restart the
+question's task ends and the person is asked again on a new one rather than
+a key being left unanswered. While a person decides, the task is polled at
+its own interval.
 
 ## Skills reference
 

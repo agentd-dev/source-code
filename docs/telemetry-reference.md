@@ -583,16 +583,20 @@ its `jti`.
 | `mcp.listen.narrowed` | warn | `server`, `dropped` | A re-listen came back without some URIs; they are asked for again. |
 | `mcp.listen.resumed` | info | `server` |  |
 | `mcp.listen.unavailable` | warn | `server`, `reason`, `retry_ms` | The standing listen failed or was refused. |
-| `mcp.task.cancelled` | info | `server`, `task`, `reason` | `tasks/cancel` was sent for an MCP task — its step timed out, its run was cancelled, its step no longer waits, the run its `agent` step handed it over in ended, or `mcp.task.cancel` — or the server cancelled it. `task` is agentd's handle (`mt_…`), never the server's id. |
+| `mcp.task.cancelled` | info | `server`, `task`, `reason` | `tasks/cancel` was sent for an MCP task — its step timed out, its run was cancelled, its step no longer waits, the run its `agent` step handed it over in or a step of which detached it ended (`the run ended`), or `mcp.task.cancel` — or the server cancelled it. `task` is agentd's handle (`mt_…`), never the server's id. |
 | `mcp.task.completed` | info | `server`, `task`, `is_error` | An MCP task completed; `is_error` is the tool's own. |
-| `mcp.task.created` | info | `server`, `tool`, `task`, `status`, `ttl_ms`, `poll_interval_ms`, `run`, `step` | A workflow step's tool call became an MCP task; the step waits on it. |
+| `mcp.task.created` | info | `server`, `tool`, `task`, `status`, `ttl_ms`, `poll_interval_ms`, `run`, `step` | A workflow step's tool call became an MCP task; the step waits on it, or, with `detach`, finishes (`mcp.task.detached`). |
+| `mcp.task.detached` | info | `server`, `task`, `run`, `step` | A step with `detach: true` finished with its task's handle; the task is its run's, collected by `wait {on: mcp_task}`. |
 | `mcp.task.expired` | warn | `server`, `task`, `reason`, `detail?` | `unknown` (the server answered `-32602`), `ttl` (open 30 s past its `ttlMs`; `tasks/cancel` is sent), or `unread` (a turn's ended task nobody read within a day, or before its run ended). |
 | `mcp.task.failed` | warn | `server`, `task`, `code?`, `reason?`, `detail?` | The task failed, asked for a request agentd never declares, or a request about it failed for good (then `tasks/cancel` is sent). |
 | `mcp.task.handed_over` | info | `server`, `task`, `ctx`, `run` | A turn's tool call became a task still running at the call's bound; the supervisor follows it for `mcp.task.get`. |
-| `mcp.task.input.declined` | warn | `server`, `task`, `key`, `method`, `reason` | A task the supervisor follows asked for input; it was answered `decline`. |
+| `mcp.task.input.answered` | info | `server`, `task`, `key`, `action`, `reason?` | A person's answer to a task's question — `accept`, `decline` or `cancel`, never its content — joined its round; `reason` says why a gate that failed or found nobody to ask answered `cancel`. The round's answers go to the server together. |
+| `mcp.task.input.asked` | info | `server`, `task`, `key`, `run`, `step` | A task's question went to a person through the gate a `human` step opens, because the step sets `input`; the gate's `human.ask` line follows, naming the A2A task made for the question. |
+| `mcp.task.input.declined` | warn | `server`, `task`, `key`, `method`, `reason` | A task the supervisor follows asked for input; it was answered `decline`: its step sets no `input`, its turn has moved on, or it is a URL elicitation. |
+| `mcp.task.input.interrupted` | info | `task`, `gate` | A restart found the A2A task `gate` still asking the MCP task `task`'s question and ended it failed: the answer was never kept. If the server still asks, the question is put again on a new task. |
 | `mcp.task.input.requested` | info | `server`, `task`, `key`, `method` | That input request, as the server made it. |
 | `mcp.task.listen.unavailable` | info | `server`, `err` | A listen asking for a server's task notifications failed; its tasks are polled. |
-| `mcp.task.poll.fail` | warn | `server`, `task`, `err`, `retry_ms` | A `tasks/get`, or the `tasks/update` declining a task's questions (`err` starts `tasks/update:`), failed in a way that may pass; retried after `retry_ms`, which doubles from 1 s to 5 min. |
+| `mcp.task.poll.fail` | warn | `server`, `task`, `err`, `retry_ms` | A `tasks/get`, or the `tasks/update` declining a task's questions or sending a person's answers (`err` starts `tasks/update:`), failed in a way that may pass; retried after `retry_ms`, which doubles from 1 s to 5 min. |
 | `mcp.task.resumed` | info | `server`, `task`, `status` | A restart read an MCP task back; it is polled again. |
 | `mcp.task.status` | info | `server`, `task`, `from`, `to`, `status_message?` | An MCP task moved; `status_message` is the server's, tamed. |
 | `mcp.tool.dropped` | warn | `reason`, `server`, `tool` | A tool the server listed was dropped by the client and cannot be called. |

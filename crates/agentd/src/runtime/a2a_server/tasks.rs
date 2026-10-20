@@ -846,7 +846,8 @@ impl Runtime {
 
     /// Restore durable tasks at startup: seed the shared view the transport
     /// threads read, and re-arm run-linked human gates so a question asked
-    /// before the restart is still answerable after it.
+    /// before the restart is still answerable after it. An MCP task's
+    /// question, whose answer was never kept, ends and is asked again.
     pub(crate) fn restore_a2a_tasks(&mut self, envs: &[crate::store::Envelope]) {
         for env in envs {
             match serde_json::from_value::<Task>(env.state.clone()) {
@@ -862,6 +863,7 @@ impl Runtime {
             }
         }
         self.rebuild_human_asks();
+        self.interrupt_mcp_task_questions();
         #[cfg(feature = "companies")]
         {
             self.interrupt_company_sign_ins();

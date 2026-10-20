@@ -207,6 +207,12 @@ deadline, 4 for an unreachable model, 1 otherwise. The full table is in
 | `on_timeout names unknown step`, `on_error goto names unknown step` | a routing edge to a step that does not exist |
 | `switch case "a" must name ONE step as a string (got a list)` | `cases` values are step ids, not lists |
 | `` `on` is fixed by the definition … so it cannot be templated `` | a templated `wait.on` |
+| `wait.on "x" is none of resource, condition, …` | a wait on something agentd does not wait on |
+| `` `wait {on: mcp_task}` needs `task` `` | a wait on an MCP task that names none |
+| `detach is true or false, written out` | a `detach` that is not a boolean |
+| `` `detach` cannot be combined with `cache` `` | a cached output would name another run's task |
+| `input is taken as written`, `input.to: …` | an `input` that is templated, or addressed to someone who could never see the gate |
+| `skills is a list of skill references` | a `skills:` entry that is not a non-empty string |
 | `concurrency.scope: key needs a \`key:\` template` | `scope: key` without `key` |
 | `workflow "x" is defined twice — by … and by …` | two sources define one name |
 | `a schedule needs \`cron\`, \`every\` or \`at\`` | a schedule that could never fire |
@@ -223,6 +229,8 @@ Some checks need the live registry and run at startup rather than in
 | Message | Cause |
 |---|---|
 | `tool "x" is unknown, disabled or not granted to workflows` | a `tool` step names a tool workflows cannot call |
+| `` `detach` and `input` are about the MCP task a call becomes, and tool "x" is not on an MCP server's route `` | `detach` or `input` on a `tool` step whose tool no MCP server serves |
+| `skills: skill "x" is ambiguous: name one of "a/x", "b/x"` | a step's bare skill name that two origins answer to |
 | `mcp server "x" is not declared under mcp.servers` | an `mcp.tool` or `mcp.resource` step names a server the configuration does not declare |
 | `stream "x" is not declared under \`streams:\`` | a `stream` start or an `emit` names an undeclared stream |
 | `a template names step "x", which the workflow does not have` | a template path to a step id the workflow does not define |

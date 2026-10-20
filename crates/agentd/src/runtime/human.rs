@@ -58,8 +58,8 @@ use std::time::Duration;
 /// The default patience for a human answer.
 const ASK_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 /// The same default in milliseconds, for callers that already work in ms
-/// (a `security.policies` gate with no explicit `timeout`).
-#[cfg(feature = "a2a")]
+/// (a `security.policies` gate with no explicit `timeout`, an MCP task's
+/// question).
 pub(crate) const ASK_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
 /// How long the auto judge gets once fired.
 const AUTO_GRACE_MS: u64 = 10 * 60 * 1000;
@@ -86,6 +86,20 @@ pub(crate) enum HumanChannel {
     Unowned,
     /// No A2A listener (or a build without one): nobody can be asked at all.
     None,
+}
+
+/// The A2A task a gate opens on.
+#[cfg(feature = "a2a")]
+pub(crate) enum GateOn {
+    /// The task the asking unit's caller follows ([`HumanChannel::Owned`]).
+    Owned(String),
+    /// A task made for a unit nobody owns: its run's, or a turn's own.
+    Unit,
+    /// A task of its own for the question the MCP task `handle` asks
+    /// (RFC 0054), beside the run's: a task holds one gate, and the run's is
+    /// its `human` steps' and policy gates', which a question the task asks
+    /// at any moment must never take or be refused by.
+    McpQuestion(String),
 }
 
 impl HumanChannel {
@@ -171,6 +185,18 @@ impl Runtime {
         &mut self,
         caller: &super::tools::ToolCaller,
         args: Value,
+    ) -> super::tools::ToolOutcome {
+        self.ask_human(caller, args, None)
+    }
+
+    /// An ask, as `ask_human` makes it: `question_of`, the handle of the MCP
+    /// task whose question it puts (RFC 0054), opens a gate on a task of its
+    /// own ([`GateOn::McpQuestion`]).
+    pub(crate) fn ask_human(
+        &mut self,
+        caller: &super::tools::ToolCaller,
+        args: Value,
+        question_of: Option<&str>,
     ) -> super::tools::ToolOutcome {
         use super::tools::ToolOutcome;
         // Lines and the audit record about this gate carry its unit's trace.
@@ -303,32 +329,23 @@ impl Runtime {
         #[cfg(feature = "a2a")]
         match channel {
             HumanChannel::Owned(task) => {
-                return self.human_gate(
-                    caller,
-                    Some(task),
-                    question,
-                    deadline_ms,
-                    schema,
-                    addressee,
-                    None,
-                );
+                let on = match question_of {
+                    Some(h) => GateOn::McpQuestion(h.to_string()),
+                    None => GateOn::Owned(task),
+                };
+                return self.human_gate(caller, on, question, deadline_ms, schema, addressee, None);
             }
             HumanChannel::Unowned
                 if self.settings.agent.ask_human_unowned
                     == crate::config::settings::AskHumanUnowned::Gate =>
             {
-                return self.human_gate(
-                    caller,
-                    None,
-                    question,
-                    deadline_ms,
-                    schema,
-                    addressee,
-                    None,
-                );
+                let on = question_of.map_or(GateOn::Unit, |h| GateOn::McpQuestion(h.to_string()));
+                return self.human_gate(caller, on, question, deadline_ms, schema, addressee, None);
             }
             _ => {}
         }
+        #[cfg(not(feature = "a2a"))]
+        let _ = question_of;
         let why = channel.why_unanswerable();
         // Nobody to ask: take the configured fallback.
         match self.settings.agent.ask_human_fallback {
@@ -385,16 +402,17 @@ impl Runtime {
         }
     }
 
-    /// The A2A gate: flip the owning task (`owned`, from [`HumanChannel`]) to
+    /// The A2A gate: flip the owning task (`on`, from [`HumanChannel`]) to
     /// `input-required`, or create a gate task when no caller owns the asking
-    /// unit, and suspend the asker. `policy` is the call a `security.policies`
-    /// gate holds (see [`PendingKind::Human`]).
+    /// unit or the gate is an MCP task's question, and suspend the asker.
+    /// `policy` is the call a `security.policies` gate holds (see
+    /// [`PendingKind::Human`]).
     #[cfg(feature = "a2a")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn human_gate(
         &mut self,
         caller: &super::tools::ToolCaller,
-        owned: Option<String>,
+        on: GateOn,
         question: String,
         deadline_ms: u64,
         schema: Option<Value>,
@@ -423,7 +441,7 @@ impl Runtime {
                 .iter()
                 .any(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == t))
         };
-        if let Some(t) = &owned
+        if let GateOn::Owned(t) = &on
             && open(t)
         {
             return ToolOutcome::Ready(
@@ -432,9 +450,10 @@ impl Runtime {
             );
         }
 
-        let (task_id, standalone) = match owned {
-            Some(t) => (t, false),
-            None => {
+        let (task_id, standalone) = match on {
+            GateOn::Owned(t) => (t, false),
+            GateOn::McpQuestion(h) => (self.mcp_question_task(caller, &h), true),
+            GateOn::Unit => {
                 // No A2A caller owns this unit (a scheduled turn, a subagent,
                 // a run started by a timer): create the gate task, owned by the
                 // caller the unit runs for or else the operator, so they can
@@ -712,9 +731,11 @@ impl Runtime {
             self.policy_settle(&p.target, &call, approved, answered_by.unwrap_or(via));
             return;
         }
+        // An MCP task's question takes the answer as a `human` step does,
+        // shaped to the request's schema, which is the gate's.
         let result = match &p.target {
             Target::Child(..) => json!({"reply": text, "timed_out": false, "via": via}),
-            Target::Step(..) => shaped
+            Target::Step(..) | Target::McpTask(..) => shaped
                 .clone()
                 .unwrap_or_else(|| Value::String(text.to_string())),
         };
@@ -779,9 +800,12 @@ impl Runtime {
 
     /// Move the gate task on once its ask is settled: a task that existed only
     /// for the ask completes, one that tracks other work goes back to working.
-    fn human_task_settle(&mut self, task: &str, standalone: bool, note: &str) {
+    /// A task already settled stays as it is: the work it tracks ended while
+    /// the gate was open — a run completed or was cancelled — and a client
+    /// that read it finished must never see it start again.
+    pub(crate) fn human_task_settle(&mut self, task: &str, standalone: bool, note: &str) {
         #[cfg(feature = "a2a")]
-        if self.tasks.contains_key(task) {
+        if self.tasks.get(task).is_some_and(|t| !t.state.is_terminal()) {
             use crate::a2a::tasks::State;
             if let Some(t) = self.tasks.get_mut(task) {
                 if standalone {
@@ -798,10 +822,11 @@ impl Runtime {
         let _ = (task, standalone, note);
     }
 
-    /// Fail the gate task itself (a no-op when no A2A task backs the ask).
+    /// Fail the gate task itself (a no-op when no A2A task backs the ask, or
+    /// when it is settled already, as [`Self::human_task_settle`] leaves one).
     fn human_task_fail(&mut self, task: &str, msg: &str) {
         #[cfg(feature = "a2a")]
-        if self.tasks.contains_key(task) {
+        if self.tasks.get(task).is_some_and(|t| !t.state.is_terminal()) {
             use crate::a2a::tasks::State;
             if let Some(t) = self.tasks.get_mut(task) {
                 t.transition(State::Failed, Some(msg.to_string()));
@@ -880,6 +905,22 @@ impl Runtime {
                     continue;
                 }
                 Target::Child(..) => {}
+                // An MCP task's question whose task no longer asks: the
+                // task's end closes it, so this is the backstop.
+                Target::McpTask(h, _)
+                    if !self
+                        .mcp_tasks
+                        .records
+                        .get(h)
+                        .is_some_and(super::mcp_tasks::Record::open) =>
+                {
+                    ends.push((
+                        p.target.clone(),
+                        End::Prune(task.clone(), "the MCP task no longer asks"),
+                    ));
+                    continue;
+                }
+                Target::McpTask(..) => {}
             }
             if now >= *deadline_ms {
                 // Never for an ADDRESSED gate, for the reason `ask_human`
@@ -1511,17 +1552,17 @@ impl Runtime {
         let channel = self.human_channel(caller);
         #[cfg(feature = "a2a")]
         {
-            let owned = match &channel {
-                HumanChannel::Owned(t) => Some(Some(t.clone())),
+            let on = match &channel {
+                HumanChannel::Owned(t) => Some(GateOn::Owned(t.clone())),
                 HumanChannel::Unowned
                     if self.settings.agent.ask_human_unowned
                         == crate::config::settings::AskHumanUnowned::Gate =>
                 {
-                    Some(None)
+                    Some(GateOn::Unit)
                 }
                 _ => None,
             };
-            if let Some(owned) = owned {
+            if let Some(on) = on {
                 let held = super::reactor::PolicyCall {
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -1535,7 +1576,7 @@ impl Runtime {
                 let to = self.company_user();
                 return self.human_gate(
                     caller,
-                    owned,
+                    on,
                     question,
                     now_ms() + ASK_TIMEOUT_MS,
                     Some(policy_answer_schema()),

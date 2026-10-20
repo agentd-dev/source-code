@@ -197,12 +197,20 @@ impl Runtime {
         // which nothing else re-checks, is held to the new line. The check
         // names its own inputs, so this cannot fall behind what it reads.
         let taint_inputs_moved = crate::config::taint::inputs_moved(old, new);
+        // …and whenever the skills catalogue is built again: a step's
+        // reference that a new skill makes ambiguous refuses the reload, as
+        // it refuses a start. A local folder builds it on every reload, its
+        // files changing without the config; unchanged definitions reload to
+        // the same hash. (A source whose server the reload dials again moves
+        // the servers, above.)
+        let skills_inputs_moved = skills_rebuilt(old, new);
         let workflows = if old.workflows != new.workflows
             || external
             || channels_moved
             || servers_change
             || registry_inputs_moved
             || taint_inputs_moved
+            || skills_inputs_moved
         {
             let mut staged = super::steps::StagedWorkflows::default();
             let docs = super::steps::workflow_documents(&self.settings, &mut staged.errs);
@@ -486,13 +494,29 @@ impl Runtime {
         } else {
             None
         };
+        // Skills sources ([`skills_rebuilt`]); a source whose server the
+        // reload dials again is listed again too.
+        let redialed = mcp.is_some_and(|m| {
+            new.skills
+                .sources
+                .iter()
+                .any(|src| m.fresh.contains(&src.server))
+        });
+        let skills = if skills_rebuilt(old, new) || redialed {
+            Some(super::skills::build(new, conns))
+        } else {
+            None
+        };
         // The workflows are checked against the registry they will run with
-        // — the staged one, not the running one — and the servers and
-        // streams the new configuration declares.
+        // — the staged one, not the running one — the servers and streams
+        // the new configuration declares, and the skills catalogue staged
+        // above.
         let workflows = match workflows {
-            Some(staged) => {
-                Some(self.prepare_workflows(staged, registry.as_ref().unwrap_or(&self.registry))?)
-            }
+            Some(staged) => Some(self.prepare_workflows(
+                staged,
+                registry.as_ref().unwrap_or(&self.registry),
+                skills.as_ref().map_or(&self.skills, |(c, _)| c),
+            )?),
             None => None,
         };
         // A rebuilt registry carries the workflow tools of the set that will
@@ -527,30 +551,6 @@ impl Runtime {
                 (tools_moved || !r.same_withholding(&self.registry)).then_some((r, tools_moved))
             }
             None => None,
-        };
-        // Skills sources — the config section, or the instruction's inline
-        // `:::!skill` definitions (they live on `agent`, but they land in this
-        // catalogue).
-        // …and rebuilt whenever a LOCAL folder is configured, even with the
-        // section unchanged: the skills live in files, and comparing the
-        // setting only would make "edit a skill, send SIGHUP" a reload that
-        // reports success and changes nothing.
-        // A source whose server the reload dials again is listed again too.
-        let redialed = mcp.is_some_and(|m| {
-            new.skills
-                .sources
-                .iter()
-                .any(|src| m.fresh.contains(&src.server))
-        });
-        let skills = if old.skills != new.skills
-            || old.agent.inline_skills != new.agent.inline_skills
-            || new.skills.dir.is_some()
-            || new.skills.project_dir.is_some()
-            || redialed
-        {
-            Some(super::skills::build(new, conns))
-        } else {
-            None
         };
         // The instruction: static text, or a resource read (and verified,
         // and folded) through the servers the reload would run on. One that
@@ -1147,6 +1147,19 @@ fn server_timeout(settings: &cfg::Settings, server: &cfg::McpServer) -> Duration
 /// Whether the reload moves what a turn worker dials the model with.
 /// Whether any intelligence connection's settings differ: the top-level
 /// one's or any provider's, added, removed or changed.
+/// Whether a reload builds the skills catalogue again: the skills section
+/// or the instruction's inline `:::!skill` definitions (they live on
+/// `agent`, but they land in this catalogue) moved — or a LOCAL folder is
+/// configured, even with the section unchanged: the skills live in files,
+/// and comparing the setting only would make "edit a skill, send SIGHUP" a
+/// reload that reports success and changes nothing.
+fn skills_rebuilt(old: &cfg::Settings, new: &cfg::Settings) -> bool {
+    old.skills != new.skills
+        || old.agent.inline_skills != new.agent.inline_skills
+        || new.skills.dir.is_some()
+        || new.skills.project_dir.is_some()
+}
+
 fn connections_moved(old: &cfg::Settings, new: &cfg::Settings) -> bool {
     let (o, n) = (&old.intelligence, &new.intelligence);
     o.endpoints != n.endpoints

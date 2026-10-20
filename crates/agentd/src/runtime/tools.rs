@@ -235,6 +235,10 @@ impl Runtime {
                 });
                 self.on_step_done(&run, &step, result, is_error, error, 0);
             }
+            Target::McpTask(h, key) => {
+                let (h, key) = (h.clone(), key.clone());
+                self.mcp_task_answered(&h, &key, result, is_error);
+            }
         }
     }
 
@@ -1356,17 +1360,19 @@ impl Runtime {
         let channel = self.human_channel(caller);
         #[cfg(feature = "a2a")]
         {
-            let owned = match &channel {
-                super::human::HumanChannel::Owned(t) => Some(Some(t.clone())),
+            let on = match &channel {
+                super::human::HumanChannel::Owned(t) => {
+                    Some(super::human::GateOn::Owned(t.clone()))
+                }
                 super::human::HumanChannel::Unowned
                     if self.settings.agent.ask_human_unowned
                         == crate::config::settings::AskHumanUnowned::Gate =>
                 {
-                    Some(None)
+                    Some(super::human::GateOn::Unit)
                 }
                 _ => None,
             };
-            if let Some(owned) = owned {
+            if let Some(on) = on {
                 self.log.info(
                     "tool.policy.ask",
                     json!({"tool": name, "rule": verdict.rule, "caller": caller.label()}),
@@ -1403,7 +1409,7 @@ impl Runtime {
                 );
                 return Some(self.human_gate(
                     caller,
-                    owned,
+                    on,
                     question,
                     deadline,
                     Some(super::human::policy_answer_schema()),
@@ -1528,6 +1534,9 @@ impl Runtime {
                 let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), passed);
                 self.step_tool_outcome(&run, &step, &call.tool, outcome);
             }
+            // A task's question is a gate of its own, never one holding a
+            // call.
+            Target::McpTask(..) => {}
         }
     }
 

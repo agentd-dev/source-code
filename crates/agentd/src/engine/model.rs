@@ -102,6 +102,67 @@ fn check_into(spec: &Map<String, Value>, at: &str, errs: &mut Vec<String>) {
     }
 }
 
+/// Validate `detach` and `input` on an `mcp.tool` or `tool` step (RFC
+/// 0054): what the step does when its call becomes an MCP task.
+///
+/// Both are taken as written. `detach` decides whether the step waits at all,
+/// which a template would decide only at run time; `input` is read when the
+/// task asks its question, long after the step rendered. A detached step's
+/// output names a task its run owns, so a `cache` that handed it to a later
+/// run would hand over a task that run does not own.
+fn check_task_fields(
+    spec: &Map<String, Value>,
+    o: &Map<String, Value>,
+    at: &str,
+    errs: &mut Vec<String>,
+) {
+    if let Some(d) = spec.get("detach") {
+        if !d.is_boolean() {
+            errs.push(format!(
+                "{at}: detach is true or false, written out: it decides whether the step waits for its MCP task"
+            ));
+        }
+        if d.as_bool() == Some(true) && o.get("cache").is_some_and(|c| !c.is_null()) {
+            errs.push(format!(
+                "{at}: `detach` cannot be combined with `cache`: a detached step's output names a task its own run owns"
+            ));
+        }
+    }
+    let Some(input) = spec.get("input") else {
+        return;
+    };
+    let Some(m) = input.as_object() else {
+        errs.push(format!(
+            "{at}: input takes {{to?, timeout?}}: who answers the MCP task's question, and for how long"
+        ));
+        return;
+    };
+    for key in m.keys() {
+        if key != "to" && key != "timeout" {
+            errs.push(format!(
+                "{at}: unknown field {key:?} in input (allowed: to, timeout)"
+            ));
+        }
+    }
+    if crate::engine::template::is_templated(input) {
+        errs.push(format!(
+            "{at}: input is taken as written: the MCP task asks its question after the step rendered"
+        ));
+        return;
+    }
+    // The addressee forms a `human` gate takes, held to the same rule.
+    if let Some(v) = m.get("to")
+        && let Err(e) = crate::a2a::principals::Addressee::parse(v).and_then(|a| a.check_gate())
+    {
+        errs.push(format!("{at}: input.to: {e}"));
+    }
+    if let Some(t) = m.get("timeout")
+        && let Err(e) = duration_ms(t)
+    {
+        errs.push(format!("{at}: input.timeout: {e}"));
+    }
+}
+
 const fn k(
     name: &'static str,
     start: bool,
@@ -317,6 +378,7 @@ pub const KINDS: &[KindInfo] = &[
             "subject",
             "subscribe",
             "match",
+            "task",
             "timeout",
             "on_timeout",
         ],
@@ -469,10 +531,22 @@ pub const KINDS: &[KindInfo] = &[
         false,
     ),
     // ---- integration ----
+    // `detach` finishes the step once its call becomes an MCP task, which
+    // the run then owns; `input` puts the task's question to a person
+    // (RFC 0054).
     k(
         "mcp.tool",
         false,
-        &["server", "tool", "args", "idempotency", "breaker", "rate"],
+        &[
+            "server",
+            "tool",
+            "args",
+            "idempotency",
+            "breaker",
+            "rate",
+            "detach",
+            "input",
+        ],
         &["server", "tool"],
         true,
         false,
@@ -493,7 +567,14 @@ pub const KINDS: &[KindInfo] = &[
         true,
         false,
     ),
-    k("tool", false, &["name", "args"], &["name"], true, false),
+    k(
+        "tool",
+        false,
+        &["name", "args", "detach", "input"],
+        &["name"],
+        true,
+        false,
+    ),
     k(
         "http",
         false,
@@ -1410,6 +1491,22 @@ pub fn is_long_lived_start(kind: &str) -> bool {
     KINDS.iter().any(|k| k.start && k.name == kind) && !ONE_SHOT_STARTS.contains(&kind)
 }
 
+/// What a `wait` listens on (`on`): an MCP resource, a CEL condition, a
+/// signal, a run, a subagent, a conversation's message, a stream's event, a
+/// callback route, a deadline, or an MCP task the run detached (RFC 0054).
+pub const WAIT_ON: &[&str] = &[
+    "resource",
+    "condition",
+    "signal",
+    "run",
+    "subagent",
+    "message",
+    "event",
+    "webhook",
+    "deadline",
+    "mcp_task",
+];
+
 /// The events an `event` start fires on — what the runtime raises.
 pub const START_EVENTS: &[&str] = &[
     "workflow.finished",
@@ -2117,6 +2214,19 @@ fn parse_step(
     {
         errs.push(format!("{at}: output_schema: {}", e.join("; ")));
     }
+    // A step's `skills:` are references (RFC 0051 D2), each a non-empty
+    // string; an entry of any other shape was dropped without a word. Which
+    // skill a reference names is the catalogue's to say, at startup.
+    if let Some(sk) = o.get("skills")
+        && !sk.as_array().is_some_and(|a| {
+            a.iter()
+                .all(|r| r.as_str().is_some_and(|r| !r.trim().is_empty()))
+        })
+    {
+        errs.push(format!(
+            "{at}: skills is a list of skill references: <name>, <origin>/<name> or <origin>/<path>"
+        ));
+    }
     // `auth: {kind: company, company: <entry>, account?: <label>}` makes an
     // `http` step a call of a Company's API (RFC 0047 §5.5.8) in the User's
     // account the label names (§9, P5b): the credential, the hosts and the
@@ -2359,6 +2469,29 @@ fn parse_step(
                     "{at}: `on` is fixed by the definition — it decides what the wait opens \
                      or reads, which is checked at load — so it cannot be templated"
                 ));
+            } else if kind == "wait"
+                && let Some(on) = spec.get("on").and_then(Value::as_str)
+            {
+                if !WAIT_ON.contains(&on) {
+                    errs.push(format!(
+                        "{at}: wait.on {on:?} is none of {}",
+                        WAIT_ON.join(", ")
+                    ));
+                }
+                // An MCP task the run detached (RFC 0054), named by the
+                // handle its detaching step output.
+                match (on == "mcp_task", spec.get("task")) {
+                    (true, None) => errs.push(format!(
+                        "{at}: `wait {{on: mcp_task}}` needs `task`: the handle a detaching step outputs (steps.<id>.output.task.id)"
+                    )),
+                    (true, Some(t)) if !t.is_string() => errs.push(format!(
+                        "{at}: task is the handle a detaching step outputs, a string"
+                    )),
+                    (false, Some(_)) => {
+                        errs.push(format!("{at}: `task` belongs to `wait {{on: mcp_task}}`"))
+                    }
+                    _ => {}
+                }
             }
             // A wait that subscribes (RFC 0045 §5.15): the server and the
             // event type are the definition's, since they decide which
@@ -2740,6 +2873,7 @@ fn parse_step(
                 }
             }
         }
+        "mcp.tool" | "tool" => check_task_fields(&spec, o, &at, errs),
         "finish" => {
             if let Some(st) = spec.get("status").and_then(Value::as_str)
                 && !matches!(st, "completed" | "failed" | "refused" | "cancelled")
@@ -3896,6 +4030,158 @@ mod tests {
             "f": {"kind": "finish", "depends_on": ["sub", "each"]}
         }}))
         .unwrap();
+    }
+
+    /// `detach` and `input` (RFC 0054) are taken as written and checked at
+    /// load: a template would decide at run time whether the step waits, or
+    /// who answers a question asked long after the step rendered.
+    #[test]
+    fn a_steps_task_fields_are_checked_at_load() {
+        let call = |kind: &str, extra: Value| {
+            let mut step = match kind {
+                "tool" => json!({"kind": "tool", "name": "mock.job", "depends_on": ["s"]}),
+                _ => json!({"kind": "mcp.tool", "server": "m", "tool": "job", "depends_on": ["s"]}),
+            };
+            if let (Some(o), Value::Object(e)) = (step.as_object_mut(), extra) {
+                o.extend(e);
+            }
+            wf(json!({"name": "w", "steps": {
+                "s": {"kind": "manual"},
+                "c": step,
+                "f": {"kind": "finish", "depends_on": ["c"]}}}))
+        };
+        for kind in ["mcp.tool", "tool"] {
+            for ok in [
+                json!({"detach": true}),
+                json!({"detach": false, "cache": {"ttl": "1h"}}),
+                json!({"input": {}}),
+                json!({"input": {"to": "operator", "timeout": "2h"}}),
+                json!({"detach": true, "input": {"to": {"role": "operator", "labels": {"team": "ops"}}, "timeout": 600}}),
+            ] {
+                assert!(
+                    call(kind, ok.clone()).is_ok(),
+                    "{kind} {ok}: {:?}",
+                    call(kind, ok.clone())
+                );
+            }
+            for (bad, said) in [
+                (json!({"detach": "yes"}), "detach is true or false"),
+                (
+                    json!({"detach": "{{ inputs.bg }}"}),
+                    "detach is true or false",
+                ),
+                (
+                    json!({"detach": true, "cache": {}}),
+                    "cannot be combined with `cache`",
+                ),
+                (json!({"input": "operator"}), "input takes {to?, timeout?}"),
+                (
+                    json!({"input": {"to": "operator", "channel": "ops"}}),
+                    "unknown field \"channel\" in input",
+                ),
+                (
+                    json!({"input": {"to": "{{ inputs.who }}"}}),
+                    "input is taken as written",
+                ),
+                (json!({"input": {"to": {"role": "user"}}}), "input.to"),
+                (json!({"input": {"to": "nobody at all"}}), "input.to"),
+                (json!({"input": {"timeout": "soon"}}), "input.timeout"),
+            ] {
+                let e = call(kind, bad.clone()).unwrap_err().join("; ");
+                assert!(e.contains(said), "{kind} {bad}: {e}");
+            }
+        }
+        // Only the two calling kinds take them.
+        let e = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "manual"},
+            "h": {"kind": "http", "url": "https://x.example", "detach": true, "depends_on": ["s"]},
+            "f": {"kind": "finish", "depends_on": ["h"]}}}))
+        .unwrap_err()
+        .join("; ");
+        assert!(e.contains("unknown field \"detach\""), "{e}");
+    }
+
+    /// What a wait listens on is one of its forms, checked at load; an MCP
+    /// task's wait names the task, and only that wait takes `task`.
+    #[test]
+    fn a_waits_form_and_its_task_are_checked_at_load() {
+        let wait = |extra: Value| {
+            let mut w = json!({"kind": "wait", "depends_on": ["s"], "timeout": "1h"});
+            if let (Some(o), Value::Object(e)) = (w.as_object_mut(), extra) {
+                o.extend(e);
+            }
+            wf(json!({"name": "w", "steps": {
+                "s": {"kind": "manual"},
+                "w": w,
+                "f": {"kind": "finish", "depends_on": ["w"]}}}))
+        };
+        assert!(
+            wait(json!({"on": "mcp_task", "task": "{{ steps.s.output.requested_by }}"})).is_ok()
+        );
+        assert!(wait(json!({"on": "mcp_task", "task": "mt_0123456789abcdef"})).is_ok());
+        for on in WAIT_ON.iter().filter(|o| **o != "mcp_task") {
+            let e = wait(json!({"on": on, "task": "mt_0123456789abcdef"}))
+                .unwrap_err()
+                .join("; ");
+            assert!(
+                e.contains("`task` belongs to `wait {on: mcp_task}`"),
+                "{on}: {e}"
+            );
+        }
+        for (bad, said) in [
+            (json!({"on": "mcp_task"}), "needs `task`"),
+            (json!({"on": "mcp_task", "task": 7}), "task is the handle"),
+            (
+                json!({"on": "mcp-task", "task": "mt_0123456789abcdef"}),
+                "wait.on \"mcp-task\" is none of",
+            ),
+            (json!({"on": "tasks"}), "wait.on \"tasks\" is none of"),
+        ] {
+            let e = wait(bad.clone()).unwrap_err().join("; ");
+            assert!(e.contains(said), "{bad}: {e}");
+        }
+    }
+
+    /// A step's `skills:` are references, each a non-empty string; an entry
+    /// of another shape was dropped without a word. The qualified forms are
+    /// references like any other.
+    #[test]
+    fn a_steps_skills_are_references() {
+        let skills = |v: Value| {
+            wf(json!({"name": "w", "steps": {
+                "s": {"kind": "manual"},
+                "t": {"kind": "think", "prompt": "p", "skills": v, "depends_on": ["s"]},
+                "f": {"kind": "finish", "depends_on": ["t"]}}}))
+        };
+        let ok = skills(json!([
+            "deploy",
+            "local/deploy",
+            "playbooks/deploy",
+            "playbooks/ops/deploy"
+        ]))
+        .unwrap();
+        assert_eq!(
+            ok.step("t").unwrap().skills,
+            [
+                "deploy",
+                "local/deploy",
+                "playbooks/deploy",
+                "playbooks/ops/deploy"
+            ]
+        );
+        for bad in [
+            json!("deploy"),
+            json!([7]),
+            json!([""]),
+            json!(["  "]),
+            json!([{"name": "deploy"}]),
+        ] {
+            let e = skills(bad.clone()).unwrap_err().join("; ");
+            assert!(
+                e.contains("skills is a list of skill references"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     /// `human.to` names who must answer and is enforced when the reply lands,

@@ -49,6 +49,10 @@ pub enum Target {
     Child(NodeId, u64),
     /// A workflow step (answered as the step's outcome).
     Step(String, String),
+    /// A question an MCP task asked, put to a person for the step that made
+    /// or detached the task (RFC 0054): the task's handle and the input key,
+    /// answered back to the server with `tasks/update`.
+    McpTask(String, String),
 }
 
 /// A deferred internal-tool request (answered when its wait resolves).
@@ -1284,6 +1288,7 @@ impl Runtime {
         match target {
             Target::Step(run, step) => self.step_trace(run, step),
             Target::Child(node, _) => self.children.get(*node).and_then(|c| c.trace.clone()),
+            Target::McpTask(h, _) => self.mcp_tasks.records.get(h).and_then(|r| r.trace.clone()),
         }
     }
 

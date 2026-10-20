@@ -534,6 +534,33 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// A `human` step that times out into its run's end leaves the run's task as
+/// the run left it: completed, never moved on again by the gate it no
+/// longer has.
+#[test]
+fn a_run_whose_gate_timed_out_into_its_end_keeps_its_task_completed() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve?\", timeout: 1s, on_error: continue, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], status: completed, output: \"went on\"}\n";
+    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, false, extra));
+    let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
+    let task_id = started["task"]["id"].as_str().unwrap().to_string();
+    wait_task(&addr, &task_id, 10, "the gate", |t| {
+        t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+    });
+    wait_task(&addr, &task_id, 10, "the run's end", |t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+    });
+    std::thread::sleep(Duration::from_millis(800));
+    let after = rpc(&addr, 902, "GetTask", json!({"id": task_id}));
+    assert_eq!(
+        after["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "{after}\n{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
 /// A gate with a schema answers in that shape: the step's output is the
 /// shaped answer, so a later step reads `steps.<gate>.output.<field>` —
 /// which never resolved while the output was the reply text.

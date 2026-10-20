@@ -147,7 +147,7 @@ impl Runtime {
         let mut staged = StagedWorkflows::default();
         let docs = workflow_documents(&self.settings, &mut staged.errs);
         self.stage_workflows(docs, &self.mcp, &mut staged);
-        let prepared = self.prepare_workflows(staged, &self.registry)?;
+        let prepared = self.prepare_workflows(staged, &self.registry, &self.skills)?;
         self.install_workflows(prepared);
         Ok(())
     }
@@ -295,14 +295,16 @@ impl Runtime {
 
     /// Check a staged set and compose it with the runtime-created definitions
     /// from the store, against the tool registry it will run with and the
-    /// servers and streams the configuration declares. Changes nothing: the
-    /// set comes back ready for `install_workflows`, which cannot fail, so a
-    /// reload can check its workflows against the registry it has only
-    /// STAGED and refuse with the running ones untouched.
+    /// servers and streams the configuration declares, and the skills
+    /// catalogue. Changes nothing: the set comes back ready for
+    /// `install_workflows`, which cannot fail, so a reload can check its
+    /// workflows against the registry and catalogue it has only STAGED and
+    /// refuse with the running ones untouched.
     pub(crate) fn prepare_workflows(
         &self,
         staged: StagedWorkflows,
         registry: &crate::registry::Registry,
+        skills: &crate::context::skills::Catalogue,
     ) -> Result<PreparedWorkflows, Vec<String>> {
         let StagedWorkflows {
             defs,
@@ -400,7 +402,7 @@ impl Runtime {
         // both, and a reload that disables a tool a step calls is a mistake to
         // say now, not on the day the step runs.
         for w in workflows.values() {
-            errs.extend(self.reference_errors(w, registry));
+            errs.extend(self.reference_errors(w, registry, skills));
         }
         // The stream-taint trifecta check over the whole configured set, now
         // that file, URL and directory definitions have resolved: `validate`
@@ -417,7 +419,7 @@ impl Runtime {
         // removes it. It is left out of the set instead, said out loud, and
         // kept in the store: it loads again once what it names is back.
         for w in stored {
-            let mut problems = self.reference_errors(&w, registry);
+            let mut problems = self.reference_errors(&w, registry, skills);
             // …and the taint check over the set it would join: a stored
             // definition that feeds a configured consumer's stream, or reads
             // one into an agent holding sensitive + egress, stays out.
@@ -529,15 +531,60 @@ impl Runtime {
 
     /// What `w` names that the registry it would run with, or the
     /// configuration, does not have: a tool, a mapped contract, an MCP server,
-    /// a stream.
+    /// a stream — or names ambiguously: a skill.
     /// One check for a configured definition, a stored one and one the agent
     /// is writing now, so none of them is held to a different line.
     pub(crate) fn reference_errors(
         &self,
         w: &Workflow,
         registry: &crate::registry::Registry,
+        skills: &crate::context::skills::Catalogue,
     ) -> Vec<String> {
         let mut errs = Vec::new();
+        // At any depth: a `tool` step's MCP task fields and a step's skills.
+        fn walk<'a>(
+            steps: impl Iterator<Item = &'a crate::engine::model::Step>,
+            out: &mut Vec<&'a crate::engine::model::Step>,
+        ) {
+            for st in steps {
+                out.push(st);
+                for body in st.body.iter().chain(st.branches.values()) {
+                    walk(body.steps.values(), out);
+                }
+            }
+        }
+        let mut deep = Vec::new();
+        walk(w.steps.values(), &mut deep);
+        for s in deep {
+            // `detach` and `input` are about the MCP task a call becomes
+            // (RFC 0054): a `tool` step's call is an MCP server's only on its
+            // route.
+            if s.kind == "tool"
+                && (s.field("detach").is_some() || s.field("input").is_some())
+                && let Some(n) = s.field_str("name")
+                && registry.allowed(&Caller::Workflow, n)
+                && !matches!(registry.route(n), Some(crate::registry::Route::Mcp { .. }))
+            {
+                errs.push(format!("workflow {:?} step {:?}: `detach` and `input` are about the MCP task a call becomes, and tool {n:?} is not on an MCP server's route", w.name, s.id));
+            }
+            // A reference two skills answer to names neither (RFC 0051 D2):
+            // refused here, naming both, rather than told to the model when
+            // the step runs. One that names none is told then: its server
+            // may be down now, or serve it only through `skills/get`.
+            for r in s
+                .skills
+                .iter()
+                .filter(|r| !crate::engine::template::is_templated(&Value::String(r.to_string())))
+            {
+                if let Err(e @ crate::context::skills::LoadError::Ambiguous(..)) = skills.resolve(r)
+                {
+                    errs.push(format!(
+                        "workflow {:?} step {:?}: skills: {e}",
+                        w.name, s.id
+                    ));
+                }
+            }
+        }
         for s in w.steps.values() {
             match s.kind.as_str() {
                 "tool" => {
@@ -2622,24 +2669,21 @@ impl Runtime {
         }
         messages.push(Msg::user(user, None));
         // Skills for the step: each loaded, or said not to be (RFC 0051 D3).
-        let refs: Vec<String> = step
-            .skills
-            .iter()
-            .cloned()
-            .chain(
-                spec.get("skills")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-            )
-            .collect();
+        // A model kind takes `skills` as its own field, rendered; one taken
+        // as the field every step accepts has only the definition's. Each
+        // reference counts once.
+        let mut refs: Vec<String> = match spec.get("skills").and_then(Value::as_array) {
+            Some(a) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            None => step.skills.clone(),
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        refs.retain(|r| seen.insert(r.clone()));
         let extra = self.step_skills(run_id, step_id, &refs);
-        let system = match spec.get("system").and_then(Value::as_str) {
+        let mut system = match spec.get("system").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None if is_think => format!(
                 "You are the reasoning module of {}. Reply with {}. No tools are available.",
@@ -2652,6 +2696,15 @@ impl Runtime {
             ),
             None => self.system_prompt_named(None, extra.as_deref(), step_template.as_deref()),
         };
+        // The template places the skills itself; a step's own `system`, and
+        // a tool-free step's, carry them after it — a `think` step, and each
+        // preset that runs as one, loaded them and then left them out.
+        if (spec.get("system").and_then(Value::as_str).is_some() || is_think)
+            && let Some(x) = &extra
+        {
+            system.push_str("\n\n");
+            system.push_str(x);
+        }
         let listed: Option<Vec<String>> = spec.get("servers").and_then(Value::as_array).map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
@@ -4065,7 +4118,7 @@ impl Runtime {
                         // refused here rather than stored to fail when it
                         // runs.
                         if problems.is_empty() {
-                            problems = self.reference_errors(&w, &self.registry);
+                            problems = self.reference_errors(&w, &self.registry, &self.skills);
                         }
                         // The taint check, over the running set with this
                         // definition in place of any it replaces — the same

@@ -262,7 +262,7 @@ impl Runtime {
         let track = format!("{}@{}", self.next_id("operation"), self.process_nonce);
         let target = Self::target_of(caller);
         let standalone = match &target {
-            Target::Step(..) => false,
+            Target::Step(..) | Target::McpTask(..) => false,
             Target::Child(..) => on.as_ref().is_some_and(Option::is_none),
         };
         self.company_operations.insert(
@@ -1088,6 +1088,8 @@ impl Runtime {
                 .get(run)
                 .and_then(|r| r.steps.get(step))
                 .is_some_and(|s| s.status == crate::engine::run::StepStatus::Suspended),
+            // A tool call is what asks a confirm, never a task's question.
+            Target::McpTask(..) => true,
         };
         let cancelled = t.gate.as_deref().is_some_and(|g| self.gate_task_ended(g))
             || (t.running

@@ -21,7 +21,9 @@
 //! - A model reads a skill's file through the skill's own server, and never
 //!   one whose bytes do not match, and a file past the 8 MiB other answers
 //!   are held to whole; a step's skills sit in its prompt inside their origin
-//!   tag, and one that loaded nothing is said there.
+//!   tag — a `think` step's too — and one that loaded nothing is said there.
+//!   A step's bare name two origins answer to is refused at load, naming
+//!   both, and its qualified references load.
 //! - A context names a skill, and reads it, by the reference it loaded it
 //!   under, whatever the catalogue calls it since.
 //! - The repository's own Agent Skill passes the rules a folder skill is
@@ -724,6 +726,82 @@ fn a_steps_skills_are_tagged_with_their_origin_and_a_miss_is_said() {
             .any(|e| e["skill"] == "nope" && e["step"] == "b"),
         "{log}"
     );
+}
+
+/// A step's bare skill name that two origins answer to is refused at load,
+/// naming both (RFC 0054); the qualified references load — a server's as
+/// `<server>/<name>`, agentd's own as `local/<name>` — and a `think` step's
+/// prompt carries each body, origin tag and all.
+#[test]
+fn a_steps_skill_references_are_qualified_and_an_ambiguous_one_is_refused_at_load() {
+    let (a, b) = (mock(), mock());
+    let dir = common::unique_path("skills-steps", "d");
+    std::fs::create_dir_all(format!("{dir}/notes")).unwrap();
+    std::fs::write(
+        format!("{dir}/notes/SKILL.md"),
+        "---\nname: notes\ndescription: The folder's\n---\n\nTHE-FOLDERS-BODY\n",
+    )
+    .unwrap();
+    let servers = [("a", a.uri()), ("b", b.uri())];
+    let servers: Vec<(&str, &str)> = servers.iter().map(|(n, e)| (*n, e.as_str())).collect();
+    let playbook = common::unique_path("skills-steps-pb", "json");
+    std::fs::write(
+        &playbook,
+        json!({"match": [
+            {"when_contains": "untrusted input. It grants no tools", "content": "{\"saw\": \"b\"}"},
+            {"when_contains": "THE-FOLDERS-BODY", "content": "{\"saw\": \"local\"}"}
+        ], "turns": [{"content": "{\"saw\": \"nothing\"}"}]})
+        .to_string(),
+    )
+    .unwrap();
+    let extra = format!(
+        "intelligence:\n  endpoints: \"mock:file:{playbook}\"\n  model: mock\n\
+         skills:\n  dir: {dir}\n  sources:\n    - {{server: a}}\n    - {{server: b}}\n"
+    );
+    let bare = "      t: {kind: think, depends_on: [s], prompt: \"p\", skills: [git-workflow]}\n\
+                \x20     f: {kind: finish, depends_on: [t], status: completed}\n";
+    let (code, log) = life(
+        "skills-steps-bare",
+        &config("Help.", &servers, bare, &extra),
+    );
+    assert_eq!(code, Some(2), "{log}");
+    let refused = events(&log, "config.invalid");
+    assert!(
+        refused.iter().any(|e| e["error"].as_str().is_some_and(|m| m.contains("step \"t\"")
+            && m.contains(r#"skill "git-workflow" is ambiguous: name one of "a/git-workflow", "b/git-workflow""#))),
+        "{log}"
+    );
+    let qualified = "      tb: {kind: think, depends_on: [s], prompt: \"p\", skills: [b/git-workflow]}\n\
+                     \x20     tl: {kind: think, depends_on: [s], prompt: \"p\", skills: [local/notes]}\n\
+                     \x20     f: {kind: finish, depends_on: [tb, tl], status: completed, output: {b: \"{{ steps.tb.output.saw }}\", local: \"{{ steps.tl.output.saw }}\"}}\n";
+    let (code, log) = life(
+        "skills-steps-qualified",
+        &config("Help.", &servers, qualified, &extra),
+    );
+    let _ = std::fs::remove_file(&playbook);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(
+        events(&log, "run.done")[0]["output"],
+        json!({"b": "b", "local": "local"}),
+        "{log}"
+    );
+    let all = events(&log, "skills.loaded");
+    let e = loaded(&all, "b/git-workflow").unwrap_or_else(|| panic!("{log}"));
+    assert_eq!(e["server"], "b", "{e}");
+    assert_eq!(e["step"], "tb", "{e}");
+    // Loaded once a step, though a model kind takes `skills` as its own
+    // field and as every step's.
+    assert_eq!(all.iter().filter(|e| e["step"] == "tb").count(), 1, "{log}");
+    // A local skill is named by the catalogue's own reference for it.
+    assert!(
+        all.iter().any(|e| e["step"] == "tl"
+            && e["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("/notes/SKILL.md"))),
+        "{log}"
+    );
+    assert_eq!(a.reads("skill://git-workflow/SKILL.md"), 0, "never a's");
 }
 
 /// The repository's own Agent Skill (`skills/agentd`) is held to the rules

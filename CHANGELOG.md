@@ -1099,6 +1099,43 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `auth::challenge::resource_metadata`; `mcp::mock_http::Options::prm`;
   `RunState::subagent`. `agentd-mcp`:
   `McpClient::with_extension` and `RmcpBuilder::with_extensions`.
+- `detach: true` on an `mcp.tool` step, and on a `tool` step whose tool is on
+  an MCP server's route (RFC 0054). When the call becomes an MCP task, the
+  step finishes at once with `{task: {server, id, status}}`, `id` being
+  agentd's handle for the task, and the run owns the task: it is followed
+  and kept durably like a step's, and cancelled with `tasks/cancel` when the
+  run ends with it still open. A call the server answers at once outputs
+  that answer, as without `detach`. `detach` is a literal boolean, and is
+  refused beside `cache`.
+- `wait {on: mcp_task, task: <handle>}` resolves `done` once that task
+  ended, or at once if it already has, with `{task, server, tool, status,
+  ok, result?, error?}`. Its `timeout` ends the wait and leaves the task to
+  the run. A `task` that names no task this run detached fails the step,
+  naming it.
+- `input: {to?, timeout?}` on `mcp.tool` and `tool`: a form elicitation
+  that the step's own or detached task asks goes to a person through the
+  gate a `human` step opens. Over A2A it opens on a task of its own in the
+  run's conversation, never on the run's task, so two questions, or a
+  question and a `human` step's or policy's gate, are open at once. `to`
+  takes a `human` gate's addressee forms and is checked at load as one is.
+  `timeout` defaults to 24 hours, after which the answer is `cancel`; for a
+  step that waits on its own task, the step's `timeout` (an `mcp.tool`
+  step's `limits.step_timeout` by default) bounds the question too, and the
+  gate shows the earlier deadline. The round's keys are asked one at a
+  time, and their answers, a URL elicitation's `decline` among them, go
+  back together in one `tasks/update`. A key is kept as answered only once
+  the server acknowledged it, so a restart ends the question's task and
+  asks again on a new one.
+- `mcp.task.get` and `mcp.task.cancel` reach a task a step of the caller's
+  run detached. Reading it leaves it for the run's waits. Cancelling it
+  sends `tasks/cancel` and goes on following it, so a wait resolves with
+  what the server made of the cancel.
+- Events `mcp.task.detached`, `mcp.task.input.asked`,
+  `mcp.task.input.answered` (whose `action` is `accept`, `decline` or
+  `cancel`, never the answer's content) and `mcp.task.input.interrupted`.
+- RFC 0054, which applies the rule that capabilities fit workflows to RFCs
+  0044, 0047 and 0050 to 0053, and a "Capabilities in workflows" section
+  in the workflow guide mapping each capability to its step shapes.
 
 **Changed.**
 
@@ -1389,9 +1426,26 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   reload that adds, removes or changes a `grant: id_jag` server, or changes
   the per-person operator's `a2a.principals` rule, refuses with
   `config.reload.restart_required`.
+- A `wait` whose `on` is none of its forms is refused at load, listing
+  them. Before, the step failed when it ran. `task` on any other wait than
+  `on: mcp_task` is refused too.
+- A step skill reference that two skills answer to is refused at startup,
+  on a reload, for a stored definition and for one the agent writes, naming
+  every candidate in its `<origin>/<path>` form. Before, it was told only in
+  the step's prompt when the step ran. A reload that builds the skills
+  catalogue again — its section or the inline skills moved, or a local
+  skills folder is configured — re-reads the workflows and checks them
+  against the catalogue it stages. A `skills:` entry that is not a
+  non-empty string is refused at load. Before, it was dropped.
+- `detach` or `input` on a `tool` step whose tool is not on an MCP server's
+  route is refused at startup.
 
 **Fixed.**
 
+- A run's A2A task that its run had completed or cancelled moved again
+  when a gate it had held closed afterwards: a `human` step that timed out
+  into the run's end turned the completed task `failed`. A gate that closes
+  now leaves a settled task as it is.
 - A reload that rebuilt the skills catalogue dropped the body of every
   loaded skill from the prompts of the contexts that had loaded it, while
   their loaded sets still named it: a context keeps the bodies it loaded
@@ -1511,6 +1565,14 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   against the size of a unix socket address, and refuses a spawn for which
   neither the child's directory nor the temporary directory gives a path
   short enough, naming `TMPDIR`.
+- A `think` step, and each preset that runs as one (`classify`, `extract`,
+  `summarize`, `judge` and `route` on a chat model), loaded the skills it
+  named and logged `skills.loaded`, but left their bodies out of its
+  prompt. So did an `agent` step with a `system` of its own. Each now
+  carries them after its system text.
+- A model step loaded, logged and rendered each skill it named twice,
+  because the field was read both as the kind's own and as the field every
+  step accepts. Each is now loaded once.
 
 ## v1.20.0 — one trace per unit of work, a drain that keeps work, and metrics that are written
 

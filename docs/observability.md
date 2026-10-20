@@ -609,6 +609,35 @@ the epoch, in place of the envelope's text timestamp. A failed audit write is
 logged (`audit.store.fail`) and never fails the action it records. Audit lines
 are metadata, so `log_content` does not change them.
 
+For records nobody can edit unnoticed, add the hash-chained log. Every audit
+record is appended to a file only the supervisor writes, each line carrying
+`seq` and `prev`, the SHA-256 of the line before:
+
+```yaml
+# fragment: under observability:
+audit:
+  sink: [stream]
+  stream: _governance
+  chain:
+    path: /var/lib/agentd/audit/audit.log
+    rotate_at: 64MiB
+    retention: 400d
+```
+
+```json
+{"action":"a2a.SendMessage:status","instance":"probe","outcome":"ok","prev":"5b2c0f7e9d…","principal":"operator","request_id":"m-2","role":"operator","seq":2,"target":{},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
+```
+
+Every start verifies the whole chain, and the head the store keeps catches a
+tail cut off while agentd was down; a chain that does not hold refuses the
+start with exit 2, naming the file and the line. The head is kept in the
+durable store, so with `store.kind: none` or `memory` a cut tail is not caught,
+and the load warns. Keep the log in a directory of its own, ship its closed
+segments (`audit.log.<first seq>`) off the host if the evidence must outlive
+it, delete them only by lowering `retention` (a segment removed by hand refuses
+the start), and see [Security model](security.md#the-audit-chain) for
+retention, starting a new chain after a refusal, and what the chain anchors.
+
 ## Feed runtime events back into workflows
 
 `observability.runtime_events` copies chosen event families onto a declared

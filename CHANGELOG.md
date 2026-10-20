@@ -1136,8 +1136,112 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - RFC 0054, which applies the rule that capabilities fit workflows to RFCs
   0044, 0047 and 0050 to 0053, and a "Capabilities in workflows" section
   in the workflow guide mapping each capability to its step shapes.
+- Keys an external signer holds (RFC 0044 P2a, the `xaa` feature):
+  `identity.delegation.key_custody: external` with `identity.delegation.signer:
+  {socket, uid, timeout, seal_key, seal_key_previous}`. agentd builds each
+  `private_key_jwt` assertion — at the IdP and at each delegated server's
+  authorization server, the key named by `client_auth.kid` — and the signer
+  signs it (ES256 or RS256); each grant's refresh token is sealed under a
+  fresh data key that the signer wraps under its key-encryption key, bound
+  to the grant, so neither a private key nor the seal key is ever in
+  agentd's memory, environment or files. The protocol is agentd's own, four
+  ops over a unix socket in length-prefixed JSON (`docs/external-signer.md`).
+  The socket's peer must be the uid configured or nothing is sent; the start
+  checks every key and refuses one the signer does not hold, and logs
+  `delegation.signer.unavailable` when it does not answer. A delegated call
+  whose assertion cannot be signed or whose grant cannot be opened fails
+  with the new code `signer_unavailable` before anything is sent. A request
+  ends within `timeout` (5s), its connect included, so a signer whose
+  backlog is full or that is stopped does not hold agentd; one that could
+  not connect is tried once more after 100 ms while time allows. Before
+  agentd asks the IdP anything that may rotate a refresh token, the signer
+  wraps the data key of the record that would keep the new one, so a
+  rotated token is kept even when the signer fails afterwards. Under
+  `external`, a `key` or `seal_key` is refused and each key needs its
+  `kid`; a `signer.uid` that is agentd's own is a load warning.
+- The hash-chained audit log (RFC 0044 P2a, T32): `observability.audit.chain:
+  {path, rotate_at, retention}` appends every audit record to a file only the
+  supervisor writes, each line carrying `seq` and `prev`, the SHA-256 of the
+  line before. Every start verifies every kept segment and the head the store
+  keeps (`audit.chain.open`), and a chain with a record changed, removed,
+  moved or cut from its front or tail refuses the start (exit 2) naming the
+  line; a last line cut short by a crash is cut back and recorded
+  (`audit.chain.repaired`). The store is handed only a head whose records
+  are flushed, so a power cut is not taken for a cut tail; with
+  `store.kind: none` or `memory` the head lives only in the process, and
+  the load warns. Segments rotate at `rotate_at` (64MiB) and are deleted
+  after `retention` (400d), each deletion a record naming the segment's
+  last record, written first; a segment removed by hand refuses the start.
+  Each segment's header carries the tombstone register. Delegation's
+  records are appended and flushed by the thread that makes them, before
+  the token or the answer they record is handed on, and the person's
+  consent answers before they take effect. The register of the grant vault
+  is anchored in the chain before the store is written, and a load is held
+  to the higher of the two, so a store restored from before a revocation
+  refuses the revoked grant (T26). An anchor the chain does not take is
+  logged (`delegation.register.unanchored`) and tried again at the next
+  raise and the next start; the store's register is raised and a revoked
+  record deleted all the same. `docs/security.md` gives how to start a new
+  chain after a refusal.
+- Children that cannot open the vault or a key file (RFC 0044 P2a,
+  invariant 1, T4): where the configuration holds a supervisor-only key —
+  `identity.providers`, a delegated server or `security.companies.seal_key`
+  — every child and every `exec` command starts in a Landlock domain that
+  denies it the file store's root and everything beneath it (a key file or
+  the chain kept inside it included), every `{{secret-file:…}}` such a key
+  is read from, the external signer's socket, and the audit chain with its
+  closed segments; with only the audit chain set, the chain. An
+  instance-tier child keeps its own directory under the store's root.
+  `proc.landlock` names the ABI and the paths; on a kernel without Landlock
+  `proc.landlock.unavailable` says the children run unconfined. Raw
+  syscalls, no crate.
+- `spawn.env_passthrough`: environment variables every child is also
+  started with, by name or `PREFIX*` pattern (live, operator-only); `*`
+  alone, or a variable a supervisor-only secret is read from, is refused.
+- `agentd-core`: `sec::signer::{Signer, SignerError, PublicKey,
+  read_frame, write_frame, peer_uid}`, its reference signer
+  `sec::signer::mock` (debug and `internal-mocks` builds, `agentd
+  --internal-mock-signer <socket> [--knobs <json>]`); `obs::chain::{Chain,
+  Options, Opened, Head, Anchor}`; `sec::landlock::{abi, confine,
+  confine_beside, set_protected, Protected}`; `sec::harden::{confine, child_env,
+  child_env_of, wanted_by, wanted_by_spawn, set_passthrough, matches, wipe,
+  BASELINE}`;
+  `oauth2::ClientAuth::PrivateKeyJwtSigner` and `oauth2::signer_failed`;
+  `client_assertion::assertion_input`; `idjag::Refusal::Signer`;
+  `delegation::Code::SignerUnavailable`; `delegation::vault::{Custody,
+  NotStored, Ahead}`, `Vault::{meta, ahead, store_ahead}`, a logger
+  argument to `Vault::new`, and `Refused::SignerUnavailable`;
+  `Settings::supervisor_only_paths` and `Settings::spawn`.
 
 **Changed.**
+
+- **Breaking:** a child's environment is an allow-list (RFC 0044 §7.1). A
+  turn worker, subagent, think child or instance is started with the
+  baseline (`PATH`, `HOME`, `TMPDIR`, `TZ`, `LANG`, `AGENTD_CRED_DIR`,
+  `RUST_LOG`, `NO_PROXY`, `XDG_*`, `LC_*`, `SSL_CERT_*`, `OTEL_*`,
+  `*_PROXY`), each `{{secret:NAME}}` its own connections reference (text in
+  its conversation that spells one brings nothing), `AWS_*` with the `aws`
+  sources' endpoint overrides when an `aws` credential is routed to it, the
+  `AGENTD_INTELLIGENCE_TOKEN*` credentials a worker reads itself for the
+  top-level connection's endpoints, an instance's intelligence configuration
+  variables, and `spawn.env_passthrough` — and nothing else of the parent's
+  environment, which a child used to inherit whole. A variable a child read
+  outside that set — one a tool's process or a library reads by convention
+  — goes in `spawn.env_passthrough`.
+- **Breaking:** an instance-tier template spawn whose param value spells a
+  secret reference (`{{secret:…}}` or `{{secret-file:…}}`) is refused: folded
+  into the child's configuration, it would have the child resolve a
+  credential, and be started with its variable, at the caller's choice. A
+  template that needs a credential references it in its own text.
+- **Breaking:** where the configuration holds a supervisor-only key, a
+  child or an `exec` command cannot create or remove an entry directly in a
+  directory on the way to the file store, a supervisor-only key file, the
+  external signer's socket or the audit chain (the Landlock domain grants
+  nothing there), and is started with `no_new_privs`. Keep those paths in
+  directories of their own, not in `/tmp`.
+- Under `key_custody: external` the grants are listed at start from their
+  metadata, unopened, so a signer down at start loses none; under a local
+  key a grant that does not open is still left out at start.
 
 - A login is cached with the authorization server it was made at — the
   block's `issuer`, the one RFC 9728 found, or else the block's

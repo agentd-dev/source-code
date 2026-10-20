@@ -80,7 +80,11 @@ inherited into the daemon's log.
 
 The spawn payload is the whole trust boundary. It travels as the first
 control frame on the child's stdin, never in argv (readable by anyone through
-`/proc`) and never in the environment.
+`/proc`) and never in the environment. The child's environment holds only the
+baseline, the variables its connections' secret references, routed `aws`
+credentials and the top-level model connection's `AGENTD_INTELLIGENCE_TOKEN*`
+read, and `spawn.env_passthrough`; text in its conversation that spells a
+secret reference adds nothing ([Security model](security.md#secrets)).
 
 | The child gets | How it is decided |
 |---|---|
@@ -314,7 +318,10 @@ spawn. The model fills only the template's declared parameters: each value is
 checked against its declared type, enum and `required` flag, then folded into
 the definition as data. A value is never parsed for directives, and a spawn
 whose values would add machinery, an author note or end matter to the text is
-refused.
+refused. An instance-tier spawn whose value spells a secret reference
+(`{{secret:…}}` or `{{secret-file:…}}`) is refused too: folded into the
+child's configuration, it would have the child resolve a credential, and be
+started with its variable, at the caller's choice.
 
 A template's tier follows from its text, so it cannot be declared wrongly:
 

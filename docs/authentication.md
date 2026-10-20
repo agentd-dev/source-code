@@ -699,7 +699,43 @@ client authentication, or reference any of those secrets by any spelling —
 a reference is compared by what it resolves to, and a `*_file` field's path
 as a file (RFC 0042, as RFC 0044 §5.14.1 amends it). `security.exec.enabled`
 is refused beside `identity.providers` or a seal key, as beside a delegated
-server.
+server. Where the kernel has Landlock, no child can open the store's
+directory, where the vault is, a mounted key file or the audit chain
+([Security model](security.md#secrets)).
+
+**Keys an external signer holds.** With `identity.delegation.key_custody:
+external`, agentd holds none of the keys: a signer process on a unix socket
+does, and agentd asks it to sign each client assertion — at the IdP and at
+each delegated server's authorization server — and to wrap the data key each
+grant's refresh token is sealed under. Each key is named by its
+`client_auth.kid`, which is also the `kid` the assertion carries; no `key`
+and no `seal_key` is given. The socket's peer must be the uid configured,
+which should not be agentd's own (the load warns), and the start checks that
+the signer holds every key under the algorithm configured. With the signer down, a delegated call fails
+`signer_unavailable` and nothing is sent. The protocol, for a signer of your
+own in front of a KMS or an HSM, is
+[The external signer protocol](external-signer.md).
+
+```yaml
+# fragment: under identity:
+providers:
+  okta:
+    issuer: https://acme.okta.com
+    profile: okta
+    client_id: 0oa9agentdXAA
+    client_auth: {method: private_key_jwt, kid: agentd-idp-2026}
+delegation:
+  key_custody: external
+  signer: {socket: /run/agentd-signer/signer.sock, uid: 991, seal_key: vault-kek-2026}
+```
+
+**The audit chain anchors revocation.** With `observability.audit.chain`
+set, enrolments, mints, uses, refusals, revocations and the person's consent
+answers are lines of a hash-chained log verified at every start, and each
+revocation and refresh-token version is anchored there before the store is
+written. A store restored from before a revocation then refuses the revoked
+grant as it loads: the person is `not_enrolled` and enrols again, and nothing
+is presented to the IdP.
 
 **What this preview does not do yet** (RFC 0044 P2 and later): several
 people, an IdP-federated display-client login, device and certificate
@@ -716,7 +752,8 @@ against an Okta Integrator org or xaa.dev.
 | `client_auth`, `client_secret` | `identity.providers.<name>` | `private_key_jwt` with an ES256 or RS256 (`alg`) PKCS#8 key, or a secret; a public client is refused |
 | `sign_in` | `identity.providers.<name>` | `grants` (`device`, `authorization_code`), `scopes` (default `[openid, offline_access]`) |
 | `subject`, `subjects`, `jwks_uri` | `identity.providers.<name>` | what the exchange presents; whether an ID-JAG's `sub` must be the person's; the key set's pin |
-| `seal_key`, `seal_key_previous` | `identity.delegation` | 32 bytes, hex or base64, as a secret reference |
+| `seal_key`, `seal_key_previous` | `identity.delegation` | 32 bytes, hex or base64, as a secret reference (`key_custody: local`) |
+| `key_custody`, `signer` | `identity.delegation` | `local` (default) or `external`; the signer's `{socket, uid, timeout, seal_key, seal_key_previous}` |
 | `at_cache_cap`, `liveness_interval`, `consent_timeout` | `identity.delegation` | `60m`, `15m`, `24h` |
 | `templates` | `identity.delegation` | `{name, principals: {source: operator}, idp, servers: {<name>: {scopes}}, ttl, budget}` |
 | `grant: id_jag`, `idp`, `audience`, `resource`, `client_id` | `mcp.servers[].auth` | the delegated server's IdP, its authorization server, itself, and agentd's client there (all required) |

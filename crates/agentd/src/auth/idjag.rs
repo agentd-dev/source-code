@@ -107,6 +107,8 @@ pub enum Refusal {
     },
     /// No answer, a 5xx, or an answer that is no OAuth response at all.
     Unavailable(String),
+    /// The external signer made no client assertion: nothing was sent.
+    Signer(String),
     /// The answer failed a check.
     Checked(Check),
 }
@@ -125,7 +127,7 @@ impl std::fmt::Display for Refusal {
                 }
                 Ok(())
             }
-            Refusal::Unavailable(e) => f.write_str(e),
+            Refusal::Unavailable(e) | Refusal::Signer(e) => f.write_str(e),
             Refusal::Checked(c) => f.write_str(&c.detail),
         }
     }
@@ -163,9 +165,13 @@ fn token_request(
     mut form: Form,
     timeout: Duration,
 ) -> Result<Value, Refusal> {
-    let headers = params
-        .authenticate(&mut form)
-        .map_err(Refusal::Unavailable)?;
+    let headers = params.authenticate(&mut form).map_err(|e| {
+        if crate::auth::oauth2::signer_failed(&e) {
+            Refusal::Signer(e)
+        } else {
+            Refusal::Unavailable(e)
+        }
+    })?;
     let reply = post_form(&params.token_url, form, &headers, timeout, params.dial)
         .map_err(Refusal::Unavailable)?;
     if !reply.is_success() {

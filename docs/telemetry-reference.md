@@ -185,6 +185,9 @@ case.
 | `audit` | info | `instance`, `principal`, `role`, `action`, `target`, `outcome`, `request_id`, `trace`, `sid?`, `link?` | One audit record, when `observability.audit.sink` includes `log`. |
 | `audit.emit` | info | `audit`, `run`, `step` | An `emit` step wrote an `audit` record. |
 | `audit.store.fail` | warn | `action`, `err` | An audit record could not be stored. The audited action still stands. |
+| `audit.chain.open` | info | `path`, `records`, `segments`, `retired`, `head` | The audit chain was verified from its oldest kept record to the head the store keeps, and opened for appending. `retired` counts the closed segments retention deleted. |
+| `audit.chain.repaired` | warn | `path`, `dropped_bytes` | The chain's last line was cut short, as a crash mid-write leaves it, and was cut back; an `audit.chain.repaired` record in the chain says the same. |
+| `audit.chain.fail` | error | `action`, `err` | An audit record could not be appended to the chain. The audited action still stands. |
 
 ### auth
 
@@ -384,7 +387,10 @@ its `jti`.
 | `delegation.catalogue.refused` | warn | `errors`, `server` | The listed tools did not fit the registry. |
 | `delegation.unbound` | warn | `grant_id`, `note`, `server` | An ID-JAG named no resource and `allow_unbound_at` admitted it. |
 | `delegation.probe.failed` | warn | `code`, `err`, `grant_id` | A liveness probe failed; the grant's tokens were dropped. |
-| `delegation.grant.unreadable` | warn | `err`, `grant_id` | A stored grant did not open at start: revoked, older than its latest refresh token, or sealed under another key. |
+| `delegation.register.unanchored` | warn | `err`, `grant_id`, `msg` | A floor of the tombstone register could not be anchored in the audit chain. The store's register was raised and a revoked record deleted all the same; the anchor is tried again at the next raise and the next start. `grant_id` is null for the anchors tried at start. |
+| `delegation.grant.unreadable` | warn | `err`, `grant_id` | A stored grant did not load at start: revoked or older than its latest refresh token by the register (and the audit chain's anchor of it), or — under a local seal key — sealed under another key. Under `key_custody: external` a grant is opened at its first use, not at start. |
+| `delegation.signer.ready` | info | `keys`, `socket` | The external signer answered at start: it holds every configured client key under its algorithm, and wrapped and unwrapped a probe under the seal key. |
+| `delegation.signer.unavailable` | warn | `err`, `socket` | The external signer did not answer at start. agentd runs on; every delegated call fails `signer_unavailable` until it answers. |
 | `delegation.quota.unsaved` | warn | `err`, `grant_id` | A mint's count was not written back. |
 | `delegation.revoke.failed` | error | `err`, `grant_id` | A revocation's tombstone was not written. |
 | `delegation.idp.no_id_jag` | warn | `idp`, `note` | The IdP's metadata lists identity-chaining token types without the ID-JAG. |
@@ -667,6 +673,8 @@ its `jti`.
 |---|---|---|---|
 | `proc.exit` | error, info | `code`, `uptime_ms`, `turns`, `tool_calls`, `runs`, `tokens_in`, `tokens_out`, `err?` | The process is exiting with `code`. At error level with `err` when startup fails, or when an exit policy (`unavailable: exit`, `lifetime_exhausted: exit`) ends the instance. |
 | `proc.harden` | warn | `refused` | The kernel refused to make the supervisor non-dumpable (`PR_SET_DUMPABLE`) or to set its core-dump limit to zero; the process runs on. |
+| `proc.landlock` | info | `abi`, `denied` | Every child and `exec` command is started in a Landlock domain (ABI `abi`) that denies it the paths in `denied`: the file store's root and everything beneath it, the supervisor-only key files, the external signer's socket and the audit chain. |
+| `proc.landlock.unavailable` | warn | `denied`, `msg` | The kernel has no Landlock: children start unconfined, and a same-uid child can read the paths in `denied`. |
 | `proc.ready` | info | `inbox_pending`, `instance`, `job_shape`, `runs`, `workflows` | Startup finished; triggers are armed. |
 | `proc.start` | info | `config_files`, `instance`, `version` | The process started. |
 

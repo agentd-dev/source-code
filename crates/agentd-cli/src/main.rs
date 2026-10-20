@@ -94,6 +94,32 @@ fn dispatch() -> i32 {
         return agentd::delegation::mock::run_with(addr_file, &knobs);
     }
 
+    // Hidden reference external signer (tests, and operators writing their
+    // own; RFC 0044 P2a): the signer protocol on the unix socket named,
+    // with keys made at start.
+    #[cfg(all(feature = "xaa", any(feature = "internal-mocks", debug_assertions)))]
+    if argv.get(1).map(String::as_str) == Some("--internal-mock-signer") {
+        let Some(socket) = argv.get(2) else {
+            eprintln!("--internal-mock-signer <socket> [--knobs <json>]");
+            return exit::USAGE;
+        };
+        let knobs = match argv.get(3).map(String::as_str) {
+            Some("--knobs") => match argv.get(4).map(|k| serde_json::from_str(k)) {
+                Some(Ok(v)) => v,
+                _ => {
+                    eprintln!("--internal-mock-signer: --knobs takes a JSON object");
+                    return exit::USAGE;
+                }
+            },
+            Some(other) => {
+                eprintln!("--internal-mock-signer: unknown argument {other:?}");
+                return exit::USAGE;
+            }
+            None => serde_json::json!({}),
+        };
+        return agentd::sec::signer::mock::run(socket, &knobs);
+    }
+
     // Hidden built-in mock LLM (tests):
     // `--internal-mock-llm <addr-file> [final|read|schedule|file:<playbook>]`.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]

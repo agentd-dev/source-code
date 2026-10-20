@@ -316,6 +316,34 @@ impl AnyClientKey {
     }
 }
 
+/// The JWS signing input (`header.claims`, RFC 7515 §5.1) of a
+/// `private_key_jwt` assertion for `client_id` at `aud`, signed under
+/// `alg` with the key published as `kid` — what an external signer is
+/// asked to sign (RFC 0044 P2a). The claims are those
+/// [`ClientKey::client_assertion`] makes.
+pub fn assertion_input(client_id: &str, aud: &str, alg: &str, kid: &str) -> Result<String, String> {
+    if !matches!(alg, "ES256" | "RS256") {
+        return Err(format!("client key: alg {alg:?} (want ES256 or RS256)"));
+    }
+    let iat = crate::auth::cache::now_ms() / 1000;
+    let jti = crate::sec::random::b64url_token(16)
+        .map_err(|e| format!("client assertion: no OS randomness for its jti: {e}"))?;
+    let header = json!({"alg": alg, "typ": "JWT", "kid": kid});
+    let claims = json!({
+        "iss": client_id,
+        "sub": client_id,
+        "aud": aud,
+        "iat": iat,
+        "exp": iat + LIFETIME_S,
+        "jti": jti,
+    });
+    Ok(format!(
+        "{}.{}",
+        b64::url_nopad(header.to_string().as_bytes()),
+        b64::url_nopad(claims.to_string().as_bytes())
+    ))
+}
+
 /// A PKCS#8 document as a PEM block.
 pub fn pem(der: &[u8]) -> String {
     let b = b64::std_pad(der);

@@ -320,6 +320,10 @@ fn top_level_properties(
                     "limits": { "type": "object", "additionalProperties": true },
                     "durable": { "type": "boolean", "description": "default durability class for spawns (false = memory-only records)" } } },
                 "templates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/SubagentTemplate" } } } }));
+    m.insert("spawn".to_string(), json!({ "type": "object", "additionalProperties": false,
+                "description": "what every child process — turn worker, subagent, think child, instance — is started with beyond its allow-listed environment: the baseline (PATH, HOME, TMPDIR, TZ, LANG, AGENTD_CRED_DIR, RUST_LOG, NO_PROXY, XDG_*, LC_*, SSL_CERT_*, OTEL_*, *_PROXY), the variables its own secret references and routed aws credentials read. Operator-only, reloadable",
+                "properties": {
+                "env_passthrough": { "type": "array", "items": { "type": "string" }, "description": "variables every child also gets, each a name or a PREFIX* pattern; one a supervisor-only secret is read from is refused" } } }));
     // Hoisted out of the `a2a` literal for the same recursion-limit reason as
     // `instruction_trust`. The scope vocabulary is the enum's own list.
     let device_scopes: Vec<&str> = super::DeviceScope::ALL.iter().map(|s| s.as_str()).collect();
@@ -375,7 +379,13 @@ fn top_level_properties(
                 "events_ring": { "type": "integer", "minimum": 1 },
                 "audit": { "type": "object", "additionalProperties": false, "properties": {
                     "sink": { "type": "array", "items": { "enum": ["log", "store", "stream"] } },
-                    "stream": { "type": "string", "description": "the declared stream `sink: [stream]` appends to — the supported path off the box, and the only sink a workflow can consume" } } },
+                    "stream": { "type": "string", "description": "the declared stream `sink: [stream]` appends to — the supported path off the box, and the only sink a workflow can consume" },
+                    "chain": { "type": "object", "additionalProperties": false, "required": ["path"],
+                        "description": "the hash-chained audit log (RFC 0044 P2a): every audit record appended to a file only the supervisor writes, each line carrying the SHA-256 of the line before, verified from the oldest kept record to the head the store keeps at every start (a chain that does not hold refuses the start); the tombstone register is anchored in it. Written whatever sink says. Restart-only",
+                        "properties": {
+                        "path": { "type": "string", "description": "an absolute path; closed segments are kept beside it as <path>.<first seq>" },
+                        "rotate_at": { "type": "string", "description": "the size the open segment is closed at (64MiB default, at least 64KiB)" },
+                        "retention": { "type": ["string", "integer"], "description": "how long a closed segment is kept after its last record (default 400d); each segment's header carries the register, so retention forgets no revocation" } } } } },
                 "runtime_events": { "type": "object", "additionalProperties": false, "properties": {
                     "stream": { "type": "string", "description": "declared stream the selected events land on" },
                     "include": { "type": "array", "items": { "type": "string" }, "description": "event families taken in full (the segment before the first dot); an unknown family is a startup error" },
@@ -491,6 +501,15 @@ fn delegation() -> Value {
         "properties": {
             "seal_key": secret,
             "seal_key_previous": secret,
+            "key_custody": { "enum": ["local", "external"], "description": "who holds the seal key and every private_key_jwt key under identity.providers and on a delegated server: agentd, from secret references (local, the default), or the external signer (external, with signer; the keys are then named by kid, and no key or seal_key is given)" },
+            "signer": { "type": "object", "additionalProperties": false, "required": ["socket", "uid", "seal_key"],
+                "description": "the external signer (key_custody external; docs/external-signer.md): agentd signs client assertions and wraps each grant's data key through it, and never holds a private key or the key-encryption key",
+                "properties": {
+                "socket": { "type": "string", "description": "the signer's unix socket, an absolute path" },
+                "uid": { "type": "integer", "minimum": 0, "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent" },
+                "timeout": duration,
+                "seal_key": { "type": "string", "description": "the signer's key-encryption key each grant's data key is wrapped under" },
+                "seal_key_previous": { "type": "string", "description": "the key-encryption key before a rotation: unwraps, never wraps" } } },
             "at_cache_cap": duration,
             "liveness_interval": duration,
             "consent_timeout": duration,

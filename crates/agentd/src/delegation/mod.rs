@@ -98,6 +98,9 @@ pub enum Code {
     ResourceFault,
     StepUp,
     IdpUnavailable,
+    /// The external signer did not sign, wrap or unwrap: nothing was sent
+    /// and nothing opened (RFC 0044 P2a).
+    SignerUnavailable,
     NeedsReenroll,
     BudgetExhausted,
     ResourceNotBound,
@@ -121,6 +124,7 @@ impl Code {
             Code::ResourceFault => "resource_fault",
             Code::StepUp => "step_up",
             Code::IdpUnavailable => "idp_unavailable",
+            Code::SignerUnavailable => "signer_unavailable",
             Code::NeedsReenroll => "needs_reenroll",
             Code::BudgetExhausted => "budget_exhausted",
             Code::ResourceNotBound => "resource_not_bound",
@@ -159,6 +163,100 @@ fn refuse(code: Code, message: impl Into<String>) -> DelegationError {
     DelegationError {
         code,
         message: message.into(),
+    }
+}
+
+/// The code an IdP request that got no token is refused with: the signer's
+/// when it made no client assertion, else the IdP's.
+fn unavailable(r: &Refusal) -> Code {
+    match r {
+        Refusal::Signer(_) => Code::SignerUnavailable,
+        _ => Code::IdpUnavailable,
+    }
+}
+
+/// A grant the vault did not store, as a refusal: the signer's when it
+/// wrapped no data key, else `otherwise`.
+fn not_stored(e: vault::NotStored, otherwise: Code, what: &str) -> DelegationError {
+    match e {
+        vault::NotStored::Signer(e) => refuse(Code::SignerUnavailable, format!("{what}: {e}")),
+        vault::NotStored::Failed(e) => refuse(otherwise, format!("{what}: {e}")),
+    }
+}
+
+/// Ask the external signer, before anything is served, for the public key
+/// of every client key it is to sign with — each must exist, under the
+/// algorithm configured — and to wrap and unwrap a probe under the seal
+/// key. A signer that refuses is a configuration error and the start fails;
+/// one that does not answer is said (`delegation.signer.unavailable`), and
+/// every use fails `signer_unavailable` until it does.
+fn probe_signer(
+    signer: &crate::sec::signer::Signer,
+    settings: &Settings,
+    log: &Logger,
+) -> Result<(), String> {
+    use crate::config::settings::ClientAuthMethod;
+    use crate::sec::signer::SignerError;
+    let mut keys: Vec<(String, String)> = Vec::new();
+    let auths = settings
+        .identity
+        .providers
+        .values()
+        .filter_map(|p| p.client_auth.as_ref())
+        .chain(
+            cfg::delegated_servers(settings)
+                .filter_map(|m| m.auth.as_ref().and_then(|a| a.client_auth.as_ref())),
+        );
+    for c in auths.filter(|c| c.method == ClientAuthMethod::PrivateKeyJwt) {
+        if let Some(kid) = &c.kid {
+            keys.push((kid.clone(), c.alg.unwrap_or_default().as_str().to_string()));
+        }
+    }
+    let seal = settings
+        .identity
+        .delegation
+        .external()
+        .map(|s| s.seal_key.clone())
+        .unwrap_or_default();
+    let checked = || -> Result<(), SignerError> {
+        for (kid, alg) in &keys {
+            let pk = signer.public_key(kid)?;
+            if &pk.alg != alg {
+                return Err(SignerError::Refused {
+                    code: "wrong_alg".into(),
+                    message: format!("{kid} is {} at the signer, and {alg} here", pk.alg),
+                });
+            }
+        }
+        let mut probe = [0u8; 32];
+        crate::sec::random::fill(&mut probe)
+            .map_err(|e| SignerError::Unavailable(format!("no OS randomness: {e}")))?;
+        let ad = b"agentd signer probe";
+        let back = signer.unwrap(&seal, &signer.wrap(&seal, &probe, ad)?, ad)?;
+        if back != probe {
+            return Err(SignerError::Refused {
+                code: "unwrap_failed".into(),
+                message: format!("{seal} unwrapped a probe to other bytes"),
+            });
+        }
+        Ok(())
+    };
+    match checked() {
+        Ok(()) => {
+            log.info(
+                "delegation.signer.ready",
+                json!({"socket": signer.socket.display().to_string(), "keys": keys.len() + 1}),
+            );
+            Ok(())
+        }
+        Err(SignerError::Unavailable(e)) => {
+            log.warn(
+                "delegation.signer.unavailable",
+                json!({"socket": signer.socket.display().to_string(), "err": e}),
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("identity.delegation.signer: {e}")),
     }
 }
 
@@ -218,6 +316,8 @@ pub struct Idp {
     pub name: String,
     pub cfg: Provider,
     meta: Mutex<Option<idjag::IdpMeta>>,
+    /// The external signer that holds its client key, if one does.
+    signer: Option<crate::sec::signer::Signer>,
 }
 
 impl Idp {
@@ -243,7 +343,7 @@ impl Idp {
             iss_supported: meta.iss_supported,
             client_id: self.cfg.client_id.clone(),
             client_secret: self.cfg.client_secret.as_ref().map(|s| s.0.clone()),
-            client_auth: client_auth_of(self.cfg.client_auth.as_ref())?,
+            client_auth: client_auth_of(self.cfg.client_auth.as_ref(), self.signer.as_ref())?,
             scopes: self.cfg.scopes(),
             pkce_s256: Some(meta.pkce_s256),
             prompt_only: true,
@@ -252,28 +352,43 @@ impl Idp {
     }
 }
 
-/// A configured client authentication, as the OAuth helpers send it.
+/// A configured client authentication, as the OAuth helpers send it: a
+/// `private_key_jwt` key the external `signer` holds, under `key_custody:
+/// external`, is asked of it by its `kid`.
 fn client_auth_of(
     c: Option<&crate::config::settings::ClientAuth>,
+    signer: Option<&crate::sec::signer::Signer>,
 ) -> Result<oauth2::ClientAuth, String> {
     use crate::config::settings::{AssertionAud, ClientAuthMethod};
     let Some(c) = c else {
         return Ok(oauth2::ClientAuth::Post);
     };
-    Ok(match c.method {
-        ClientAuthMethod::ClientSecretPost => oauth2::ClientAuth::Post,
-        ClientAuthMethod::ClientSecretBasic => oauth2::ClientAuth::Basic,
-        ClientAuthMethod::PrivateKeyJwt => oauth2::ClientAuth::PrivateKeyJwt {
+    let aud = match c.assertion_aud {
+        AssertionAud::TokenEndpoint => oauth2::AssertionAud::TokenEndpoint,
+        AssertionAud::Issuer => oauth2::AssertionAud::Issuer,
+    };
+    Ok(match (c.method, signer) {
+        (ClientAuthMethod::ClientSecretPost, _) => oauth2::ClientAuth::Post,
+        (ClientAuthMethod::ClientSecretBasic, _) => oauth2::ClientAuth::Basic,
+        (ClientAuthMethod::PrivateKeyJwt, Some(signer)) => {
+            oauth2::ClientAuth::PrivateKeyJwtSigner {
+                signer: signer.clone(),
+                key: c
+                    .kid
+                    .clone()
+                    .ok_or("client_auth private_key_jwt under key_custody external needs `kid`")?,
+                aud,
+                alg: c.alg.unwrap_or_default().as_str().to_string(),
+            }
+        }
+        (ClientAuthMethod::PrivateKeyJwt, None) => oauth2::ClientAuth::PrivateKeyJwt {
             key: c
                 .key
                 .as_ref()
                 .map(|k| k.0.clone())
                 .ok_or("client_auth private_key_jwt needs `key`")?,
             kid: c.kid.clone(),
-            aud: match c.assertion_aud {
-                AssertionAud::TokenEndpoint => oauth2::AssertionAud::TokenEndpoint,
-                AssertionAud::Issuer => oauth2::AssertionAud::Issuer,
-            },
+            aud,
             alg: c.alg.map(|a| a.as_str().to_string()),
         },
     })
@@ -307,7 +422,11 @@ pub struct Server {
 }
 
 impl Server {
-    fn of(m: &crate::config::settings::McpServer, timeout: Duration) -> Option<Server> {
+    fn of(
+        m: &crate::config::settings::McpServer,
+        timeout: Duration,
+        signer: Option<&crate::sec::signer::Signer>,
+    ) -> Option<Server> {
         let a = m.auth.as_ref()?;
         Some(Server {
             name: m.name.clone(),
@@ -316,7 +435,7 @@ impl Server {
             audience: a.audience.clone()?,
             resource: a.resource_for(&m.endpoint, true)?,
             client_id: a.client_id.clone()?,
-            client_auth: client_auth_of(a.client_auth.as_ref()).ok()?,
+            client_auth: client_auth_of(a.client_auth.as_ref(), signer).ok()?,
             client_secret: a.client_secret.as_ref().map(|s| s.0.clone()),
             token_url: a.token_url.clone(),
             scopes: a.scopes.clone(),
@@ -455,6 +574,9 @@ struct Live {
     id_jags: BTreeMap<String, (String, u64)>,
     /// A probe is running.
     probing: bool,
+    /// The data key a rotated refresh token would be kept with, wrapped
+    /// before the IdP is asked ([`vault::Ahead`]).
+    ahead: Option<vault::Ahead>,
 }
 
 /// What `(grant, server)` faults hold back.
@@ -628,11 +750,13 @@ pub struct Admitted {
 }
 
 impl Delegation {
-    /// The state `settings` declare, its grants loaded from `durable`; `None`
-    /// when no delegated server is declared.
+    /// The state `settings` declare, its grants loaded from `durable` and
+    /// its tombstone register anchored in `chain`, when the audit chain is
+    /// on; `None` when no delegated server is declared.
     pub fn build(
         settings: &Settings,
         durable: Arc<Durable>,
+        chain: Option<Arc<crate::obs::chain::Chain>>,
         log: &Logger,
     ) -> Result<Option<Arc<Delegation>>, String> {
         let delegated: Vec<_> = cfg::delegated_servers(settings).collect();
@@ -640,26 +764,40 @@ impl Delegation {
             return Ok(None);
         }
         let dl = &settings.identity.delegation;
-        let key = dl
-            .seal_key
-            .as_ref()
-            .ok_or("identity.delegation.seal_key is required to hold a grant")?;
-        let key = key_bytes(&resolve_secret(&key.0)?, "identity.delegation.seal_key")?;
-        let previous = dl
-            .seal_key_previous
-            .as_ref()
-            .map(|k| {
-                resolve_secret(&k.0)
-                    .and_then(|t| key_bytes(&t, "identity.delegation.seal_key_previous"))
-            })
-            .transpose()?;
+        let signer = dl.external().map(|s| s.signer());
+        let custody = match (&signer, dl.external()) {
+            (Some(signer), Some(sg)) => {
+                probe_signer(signer, settings, log)?;
+                vault::Custody::External {
+                    signer: signer.clone(),
+                    key: sg.seal_key.clone(),
+                    previous: sg.seal_key_previous.clone(),
+                }
+            }
+            _ => {
+                let key = dl
+                    .seal_key
+                    .as_ref()
+                    .ok_or("identity.delegation.seal_key is required to hold a grant")?;
+                let key = key_bytes(&resolve_secret(&key.0)?, "identity.delegation.seal_key")?;
+                let previous = dl
+                    .seal_key_previous
+                    .as_ref()
+                    .map(|k| {
+                        resolve_secret(&k.0)
+                            .and_then(|t| key_bytes(&t, "identity.delegation.seal_key_previous"))
+                    })
+                    .transpose()?;
+                vault::Custody::local(key, previous)?
+            }
+        };
         let timeout = settings
             .mcp
             .default_timeout
             .map_or(Duration::from_secs(30), |d| {
                 d.0.min(Duration::from_secs(60))
             });
-        let vault = Vault::new(Arc::clone(&durable), key, previous)?;
+        let vault = Vault::new(Arc::clone(&durable), custody, chain, Some(log.clone()));
         let d = Delegation {
             providers: settings
                 .identity
@@ -672,13 +810,16 @@ impl Delegation {
                             name: n.clone(),
                             cfg: p.clone(),
                             meta: Mutex::new(None),
+                            signer: signer.clone(),
                         },
                     )
                 })
                 .collect(),
             servers: delegated
                 .iter()
-                .filter_map(|m| Server::of(m, timeout).map(|s| (m.name.clone(), s)))
+                .filter_map(|m| {
+                    Server::of(m, timeout, signer.as_ref()).map(|s| (m.name.clone(), s))
+                })
                 .collect(),
             templates: dl.templates.clone(),
             person: Person::of(settings),
@@ -710,8 +851,8 @@ impl Delegation {
     fn load_grants(&self) {
         let mut grants = BTreeMap::new();
         for id in self.vault.ids() {
-            match self.vault.load(&id) {
-                Ok(Some((g, _))) => {
+            match self.vault.meta(&id) {
+                Ok(Some(g)) => {
                     grants.insert(id, g);
                 }
                 Ok(None) => {}
@@ -1100,6 +1241,7 @@ impl Delegation {
         self.with_live(grant, |l| {
             l.id_jags.clear();
             l.fresh_id_token = None;
+            l.ahead = None;
         });
     }
 
@@ -1308,6 +1450,11 @@ impl Delegation {
             let mut retried = false;
             loop {
                 let (subject, subject_type) = self.subject(idp, &params, &mut g, &mut rt)?;
+                // Presenting the refresh token may rotate it.
+                let ahead = match subject_type {
+                    SubjectType::RefreshToken => self.ahead(&g)?,
+                    SubjectType::IdToken => None,
+                };
                 let ex = Exchange {
                     subject_token: &subject,
                     subject_type,
@@ -1326,8 +1473,9 @@ impl Delegation {
                 // done with the answer — an ID-JAG a check refuses included:
                 // the IdP has spent the token presented, and the next mint,
                 // for any server, presents the new one.
-                if let Some(new) = &rotated {
-                    self.rotate(&mut g, &mut rt, new)?;
+                match &rotated {
+                    Some(new) => self.rotate(&mut g, &mut rt, new, ahead)?,
+                    None => self.keep_ahead(&g, ahead),
                 }
                 match answer {
                     Ok(x) => {
@@ -1340,7 +1488,7 @@ impl Delegation {
                         if let Err(e) = self.vault.store(&g, &rt, Some(g.rt_version)) {
                             self.log.warn(
                                 "delegation.quota.unsaved",
-                                json!({"grant_id": g.grant_id, "err": e}),
+                                json!({"grant_id": g.grant_id, "err": e.to_string()}),
                             );
                         }
                         self.remember(&g);
@@ -1450,6 +1598,11 @@ impl Delegation {
                 self.fault(&grant.grant_id, &s.name);
                 Err(refuse(Code::Config, format!("{}: {k}", s.name)))
             }
+            // The resource's client key at the signer: not the server's fault.
+            Err(Refusal::Signer(e)) => Err(refuse(
+                Code::SignerUnavailable,
+                format!("{}'s authorization server: {e}", s.name),
+            )),
             Err(r) => {
                 self.fault(&grant.grant_id, &s.name);
                 Err(refuse(
@@ -1481,20 +1634,23 @@ impl Delegation {
         match idp.cfg.subject() {
             SubjectKind::RefreshToken => Ok((rt.clone(), SubjectType::RefreshToken)),
             SubjectKind::IdToken => {
+                let ahead = self.ahead(g)?;
                 let t = match idjag::refresh(params, rt, self.timeout) {
                     Ok(t) => t,
                     Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
                         return Err(self.revoke_dead(g, "the refresh token is no longer good"));
                     }
                     Err(r) => {
+                        self.keep_ahead(g, ahead);
                         return Err(refuse(
-                            Code::IdpUnavailable,
+                            unavailable(&r),
                             format!("{}: refresh: {r}", idp.name),
                         ));
                     }
                 };
-                if let Some(new) = &t.refresh_token {
-                    self.rotate(g, rt, new)?;
+                match &t.refresh_token {
+                    Some(new) => self.rotate(g, rt, new, ahead)?,
+                    None => self.keep_ahead(g, ahead),
                 }
                 self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
                 let id = t.id_token.ok_or_else(|| {
@@ -1511,18 +1667,58 @@ impl Delegation {
         }
     }
 
+    /// The data key the record after `g`'s is sealed with when the IdP
+    /// rotates the refresh token, wrapped before the IdP is asked
+    /// ([`vault::Ahead`]): the one drawn for an earlier call while it is
+    /// still for that record, else one drawn now. A signer that wraps none
+    /// refuses the call before anything is sent.
+    fn ahead(&self, g: &Grant) -> Result<Option<vault::Ahead>, DelegationError> {
+        let mut next = g.clone();
+        next.rt_version += 1;
+        if let Some(a) = self
+            .with_live(&g.grant_id, |l| l.ahead.take())
+            .filter(|a| a.is_for(&next))
+        {
+            return Ok(Some(a));
+        }
+        self.vault.ahead(g).map_err(|e| {
+            not_stored(
+                e,
+                Code::IdpUnavailable,
+                "no data key to keep a rotated refresh token with",
+            )
+        })
+    }
+
+    /// Keep `a` for the next call: the IdP rotated nothing.
+    fn keep_ahead(&self, g: &Grant, a: Option<vault::Ahead>) {
+        if let Some(a) = a {
+            self.with_live(&g.grant_id, |l| l.ahead = Some(a));
+        }
+    }
+
     /// Keep a rotated refresh token: one version up, compared and swapped,
-    /// before it is used.
-    fn rotate(&self, g: &mut Grant, rt: &mut String, new: &str) -> Result<(), DelegationError> {
+    /// before it is used, sealed with the data key wrapped `ahead` — no
+    /// signer is asked once the IdP has spent the old token.
+    fn rotate(
+        &self,
+        g: &mut Grant,
+        rt: &mut String,
+        new: &str,
+        ahead: Option<vault::Ahead>,
+    ) -> Result<(), DelegationError> {
         let over = g.rt_version;
         let mut next = g.clone();
         next.rt_version += 1;
-        self.vault.store(&next, new, Some(over)).map_err(|e| {
-            refuse(
-                Code::IdpUnavailable,
-                format!("the rotated refresh token was not kept: {e}"),
-            )
-        })?;
+        self.vault
+            .store_ahead(&next, new, Some(over), ahead)
+            .map_err(|e| {
+                not_stored(
+                    e,
+                    Code::IdpUnavailable,
+                    "the rotated refresh token was not kept",
+                )
+            })?;
         *g = next;
         *rt = new.to_string();
         self.remember(g);
@@ -1550,6 +1746,10 @@ impl Delegation {
                 Code::Config,
                 format!("the grant does not open: {e}"),
             )),
+            Err(Refused::SignerUnavailable(e)) => Err(refuse(
+                Code::SignerUnavailable,
+                format!("the grant was not opened: {e}"),
+            )),
         }
     }
 
@@ -1575,6 +1775,7 @@ impl Delegation {
     fn idp_refusal(&self, g: &Grant, s: &Server, r: Refusal) -> DelegationError {
         match r {
             Refusal::Unavailable(e) => refuse(Code::IdpUnavailable, format!("{}: {e}", s.idp)),
+            Refusal::Signer(e) => refuse(Code::SignerUnavailable, format!("{}: {e}", s.idp)),
             Refusal::Checked(k) => {
                 self.fault(&g.grant_id, &s.name);
                 let code = match k.kind {
@@ -1627,10 +1828,12 @@ impl Delegation {
         let lock = self.lock_of(&g.grant_id);
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         let (mut g, mut rt) = self.load(&g.grant_id)?;
+        let ahead = self.ahead(&g)?;
         match idjag::refresh(&params, &rt, self.timeout) {
             Ok(t) => {
-                if let Some(new) = &t.refresh_token {
-                    self.rotate(&mut g, &mut rt, new)?;
+                match &t.refresh_token {
+                    Some(new) => self.rotate(&mut g, &mut rt, new, ahead)?,
+                    None => self.keep_ahead(&g, ahead),
                 }
                 self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
                 Ok(())
@@ -1641,7 +1844,7 @@ impl Delegation {
                     "the liveness probe's refresh was refused (invalid_grant)",
                 )),
             Err(r) => Err(refuse(
-                Code::IdpUnavailable,
+                unavailable(&r),
                 format!(
                     "{} did not answer the liveness probe ({r}); no delegated token is used without one",
                     g.idp
@@ -2194,7 +2397,17 @@ impl Delegation {
         let gid = person.typed.grant_id(&idp.cfg.issuer);
         let lock = self.lock_of(&gid);
         let held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let existing = self.vault.load(&gid).ok().flatten();
+        // A grant the signer cannot open now is not taken for none: the
+        // sign-in waits for it, rather than replacing a grant it never read.
+        let existing = match self.vault.load(&gid) {
+            Err(Refused::SignerUnavailable(e)) => {
+                return Err(refuse(
+                    Code::SignerUnavailable,
+                    format!("the grant was not opened: {e}"),
+                ));
+            }
+            r => r.ok().flatten(),
+        };
         let now = now_ms();
         let ceilings = ceilings_of(&template);
         let same = |g: &Grant| {
@@ -2212,7 +2425,7 @@ impl Delegation {
                 g.rt_version += 1;
                 self.vault
                     .store(&g, rt, Some(over))
-                    .map_err(|e| refuse(Code::Config, e))?;
+                    .map_err(|e| not_stored(e, Code::Config, "the grant was not kept"))?;
                 replaced = Some(old_rt);
                 g
             }
@@ -2256,7 +2469,7 @@ impl Delegation {
                 };
                 self.vault
                     .store(&g, rt, None)
-                    .map_err(|e| refuse(Code::Config, e))?;
+                    .map_err(|e| not_stored(e, Code::Config, "the grant was not kept"))?;
                 g
             }
         };

@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The taint engine and the consent-gate hardening remain
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -3875,6 +3875,312 @@ agent-mode egress gates too. A `subagents: inherit` child gets intersected
 authority and holds no token. An operator's answer to a consent gate and an A2A
 message answering one are both rejected. A worker cannot open the vault. Docs and
 `examples/okta-xaa-mcp.yaml` validate.
+
+#### §7.P2a — Prerequisites built (2026-10-20)
+
+On 2026-10-20 the user chose to finish P2 and P3 before x402, and a
+**unix-socket signer** as the first external key custody. This part builds
+five of the seven blocking prerequisites above, on `main` at `d9d3f0b6`; the
+taint engine with `holds_delegated_data` (T11, T12) and the consent-gate
+hardening (T7, T8, T29) are the rest, and P2's scope waits on them. Every
+item is behind nothing new: the signer and the vault's custody are the `xaa`
+feature's, the rest is in every build.
+
+| Prerequisite | State | Where |
+|---|---|---|
+| The instruction-freshness defect fixed (T27) | fixed in v1.17.0 (`f2e41f3a`); the evidence below | `mcp::rmcp_client` |
+| `key_custody: external` for the IdP client key and the seal key (T4, T5) | built: a unix-socket signer, agentd's own protocol; the resource client keys too | `sec::signer`, `delegation::vault::Custody`, `oauth2::ClientAuth::PrivateKeyJwtSigner` |
+| Workers unable to read the vault or a key file (invariant 1, T4) | built: a Landlock rule; no separate uid | `sec::landlock` |
+| The append-only audit log, anchoring the tombstone register (T32, T26) | built: a hash-chained file | `obs::chain`, `delegation::vault` |
+| Allow-listed child environments with `spawn.env_passthrough` (§5.13 item 1, §7.1) | built | `sec::harden` |
+| The taint engine (T11, T12) | not built | — |
+| Consent-gate hardening (T7, T8, T29) | not built | — |
+
+**1. External key custody: the unix-socket signer.** The design is a
+section here rather than an RFC of its own: it is four operations, it
+exists only to close T4 and T5, and its normative wire specification — the
+part a signer's author needs — is a reference page,
+`docs/external-signer.md`.
+
+- *Configuration.* `identity.delegation.key_custody: local | external`
+  (§5.14 named it; `local` is the default) and, under `external`,
+  `identity.delegation.signer: {socket, uid, timeout, seal_key,
+  seal_key_previous}`: an absolute socket path, the uid the signer runs as,
+  the bound on one request (5s, at most 60s), and the ids of the
+  key-encryption key and of the one before a rotation. Under `external` the
+  client keys under `identity.providers` **and on delegated servers** (the
+  RAS keys, asset 3 of §6.1, as well as the IdP key) are named by
+  `client_auth.kid`, which is also the assertion's `kid`; a `key`, a
+  `seal_key` or a `seal_key_previous` beside the signer is refused, and so
+  is a `signer` under `local`. All of it is under `identity.delegation`:
+  operator-only and restart-only by the existing prefixes.
+- *Wire.* One request per connection; a frame is a four-byte big-endian
+  length and 1–65 536 bytes of UTF-8 JSON; bytes are base64url without
+  padding; every message carries `v: 1`. The ops: `public_key {key}` →
+  `{alg, jwk}`; `sign {key, alg, data}` → `{sig}` over the JWS signing
+  input, ES256 as the 64-byte `R ‖ S` and RS256 as PKCS#1 v1.5; `wrap {key,
+  plaintext, aad}` → `{wrapped}`, opaque to agentd; `unwrap {key, wrapped,
+  aad}` → `{plaintext}`. Errors are `{ok: false, error: {code, message}}`
+  with the codes `unknown_key`, `wrong_use`, `wrong_alg`, `unwrap_failed`,
+  `bad_request`, `unsupported_version`, `denied`, `internal`. ES256 and
+  RS256 are what P1's `private_key_jwt` paths sign with; Ed25519 is in none
+  of them, so it is not in the protocol.
+- *Envelope encryption.* Each grant write draws a 32-byte data key, seals the
+  refresh token with it (AES-256-GCM, §5.5's associated data), has the signer
+  wrap it under `seal_key` with the associated data `("delegation-grant-key",
+  grant_id, idp_iss, sub, epoch, rt_version)`, and stores `{key, wrapped}`
+  beside the sealed token; the data key, and the request and answer buffers it
+  passes through in the client, are wiped once used (the AES key schedule
+  `ring` derives from it is not). The key-encryption key never leaves the
+  signer, and a wrapped key moved to another grant does not unwrap. Before
+  agentd asks the IdP anything that may rotate the refresh token — a refresh,
+  an exchange presenting it, a liveness probe — it draws and has the signer
+  wrap the data key of the record that would keep the new token (`rt_version`
+  one up, so its associated data is known), kept in memory until a rotation
+  uses it: a signer that fails after the IdP has spent the old token loses
+  nothing, and one that fails before refuses the call before it is sent. A
+  record sealed under one custody does not open under the other: changing
+  custody is a re-enrolment, as losing the seal key is (§5.5); there is no
+  migration (the no-legacy rule).
+- *The peer check.* Before a byte is sent, `SO_PEERCRED` (`getpeereid` off
+  Linux) must name `signer.uid`; otherwise nothing is sent and the error
+  names both uids. The reference signer checks its client's uid the same
+  way, and the protocol page asks every signer to. The check tells the
+  signer from agentd's workers only when `signer.uid` is another uid, so
+  agentd's own is a load warning, and the protocol page requires another;
+  under Landlock the children are denied the socket's path (item 4), so a
+  same-uid child can neither remove the socket nor bind its own there.
+- *Down.* Fail closed and typed. A request — connect, retry, write and read
+  together — ends within `timeout`: the connect is bounded by `SO_SNDTIMEO`
+  set before `connect(2)` (Linux waits out a full listen backlog by it), and
+  each read and write is given only what is left, so a stopped signer, a full
+  backlog and a trickled answer are all cut off; a connection that could not
+  be made is tried once more after 100 ms, time allowing; a request the signer
+  may have received is never sent again. At start, agentd asks for every
+  configured signing key's public key, checks its algorithm, and wraps and
+  unwraps a probe: a signer that *refuses* (an unknown key, a wrong algorithm,
+  the wrong uid) refuses the start; one that does not answer is
+  `delegation.signer.unavailable` and the start goes on. At use, a mint or a
+  probe whose assertion the signer did not sign, and a grant it did not
+  unwrap, fail with a **new §5.8 code, `signer_unavailable`** — a design
+  addition, said here — before anything reaches the IdP or the RAS, and are
+  not counted as the server's fault for its breaker. Under `external` the
+  grants are loaded at start from their metadata, unopened, so a signer down
+  at start loses none; an enrolment that cannot open the grant it would
+  replace waits rather than replacing a grant it never read.
+- *No secrets in logs.* An error names the socket, the op and the key id,
+  and the signer's own code and message cut to 200 characters; never data,
+  a signature, a data key or a wrapped key. The client does not log.
+- *Wired to* the IdP client assertion (exchange, refresh, probe, RFC 7009
+  revocation, enrolment — every path through `OAuth2Params::authenticate`),
+  the RAS client assertion of the redemption, and the vault. **Not to the
+  companies preview's seal key** (`security.companies.seal_key`): it shares
+  only the AES-GCM primitive with the vault, and it also derives the User ID
+  and Account Token record ids from its raw bytes by HMAC, which an
+  envelope-encryption signer cannot offer without a `derive` op. That is
+  RFC 0047's to add, if wanted.
+- *The reference signer* is `sec::signer::mock`, served in debug and
+  `internal-mocks` builds by `agentd --internal-mock-signer <socket>
+  [--knobs <json>]` (keys made at start, an optional request record of `{op,
+  key}` only), as `--internal-mock-xaa` serves the IdP.
+- *Residual.* `connect(2)` to a unix socket is no Landlock right in any ABI,
+  so a worker of agentd's uid can reach the socket and ask for signatures.
+  It cannot read the vault (item 3), so it has no refresh token to present
+  and no wrapped key to unwrap; the protocol page tells a signer how to sign
+  only what an assertion is. A separate worker uid closes it.
+
+**2. The append-only audit log.** `observability.audit.chain: {path,
+rotate_at, retention}` (restart-only inside the reloadable
+`observability.audit`; operator-only by that prefix). Every audit record —
+each A2A call, delegation's records, the person's consent answers with their
+rendered gate and `args_hash` — is a line of a file the supervisor alone
+holds open with `O_APPEND`, written whatever `sink` says. Each line carries
+`seq` and `prev`, the SHA-256 of the previous line's bytes (sixty-four zeros
+first). Segment headers, the register's anchors and every `delegation.*`
+record are flushed to the disk before the thread that writes them goes on:
+delegation's own records by the delegation thread that makes them, before
+the token it minted or the answer of the call it made is handed on, and the
+consent answers on the loop before they take effect. A call's
+`delegation.used` follows the call it records, so a crash during the call
+leaves no record of it.
+
+- *Verification* at every start reads every kept segment: a line that is
+  not JSON, a `seq` out of order, a `prev` that is not the previous line's
+  hash, a segment that does not begin with its `audit.chain.segment` header,
+  and a head the store keeps (`Kind::Audit`, written after every flushed
+  record, at most every 5 s otherwise, and at a clean stop) that the chain
+  does not reach or that names another record — each refuses the start,
+  exit 2, naming the file and the line. The store is handed only a head
+  whose records are on the disk: the open segment is flushed first when
+  records after the last flushed one are not, what a start reads is flushed
+  before a head names it, and a rotation's rename and new segment are
+  flushed (the directory too) before a record after them is — so a power
+  cut does not look like a cut tail. With `store.kind: none` or `memory`
+  the head lives in the process alone, a tail cut while agentd is down is
+  not caught, and the load warns. §6 left a broken chain's handling open; it
+  is a typed refusal because the register anchored in it is a security
+  control. A last line cut short by a crash is the one repair: cut back to
+  the last whole record, and an `audit.chain.repaired` record says how much.
+  A new chain begins only when the operator moves the chain aside as
+  evidence **and** removes the store's head of it (`docs/security.md` gives
+  the procedure); moved aside alone, it is a chain cut to nothing. The new
+  chain is anchored again from the store's register at that start; a
+  revocation only the old chain held is not carried.
+- *The anchored register (T26).* `Vault::raise` writes a
+  `delegation.register {grant_id, revoked_epoch?, rt_version}` record into
+  the chain, flushed, before the store's register; a load is held to the
+  higher of the store's floor and the chain's. A store restored from before
+  a revocation — the grant and its register both — then refuses the revoked
+  grant as it loads (`delegation.grant.unreadable`), so the person is
+  `not_enrolled` and nothing is presented; a register a writer of the store
+  truncated is restored by the chain. The anchor adds to the store's floor
+  and never stands in front of it: an anchor the chain does not take (a full
+  filesystem, a segment made append-only under agentd) is logged as
+  `delegation.register.unanchored`, the store's register is raised and a
+  revoked record deleted all the same — a revocation that kept the record
+  would be a grant the next start loads — and every floor the chain lacks
+  is anchored again at the next raise and at the next start. A revocation
+  deletes the record even when the store's register could not be raised.
+- *Retention and rotation.* The open segment closes at `rotate_at` (64MiB,
+  at least 64KiB) as `<path>.<first seq, 20 digits>`; a closed segment whose
+  last record is older than `retention` is deleted, and the deletion is an
+  `audit.chain.retired` record naming the segment's last record (`last_seq`,
+  `last_hash`), flushed before the file is deleted. A chain whose oldest
+  kept record is past the genesis is held to those records: one that no
+  retirement explains — a segment deleted by hand — refuses the start.
+  Every segment's header carries the register as it stands, so retention
+  never forgets a revocation. §6.4 named the
+  retention `identity.delegation.audit_retention`; it is
+  `observability.audit.chain.retention` because the chain holds every audit
+  record, not only delegation's — a design change, said here. The default is
+  §6.4's 400 days.
+- *Not built:* §6.4's per-principal encryption of a record's personal
+  content (crypto-shredding). The rendered gate content is in the chain in
+  the clear, beside `args_hash`, for as long as retention keeps it; it
+  belongs with P2's consent-gate hardening, whose rendering it would
+  encrypt. One chain per supervisor, as one store per supervisor (T38): two
+  writers break it.
+
+**3. Allow-listed child environments.** Every child — turn worker, subagent,
+think child, instance — is started with the baseline of §5.13 item 1 (`PATH`,
+`HOME`, `TMPDIR`, `TZ`, `LANG`, `AGENTD_CRED_DIR`, `RUST_LOG`, `NO_PROXY`,
+`XDG_*`, `LC_*`, `SSL_CERT_*`, `OTEL_*`, `*_PROXY`), the variables its own
+spawn names — each `{{secret:NAME}}` its payload's connections (the model's,
+the MCP servers', the A2A peers', the AAuth identity; an instance's composed
+configuration) reference, never its conversation, so text from outside that
+spells a reference brings nothing, `AWS_*` and the `aws` sources' endpoint
+overrides when an `aws` credential is routed to it, the
+`AGENTD_INTELLIGENCE_TOKEN*` credentials a worker reads itself for the
+top-level connection's failover endpoints (§5.13's "intelligence keys"), an
+instance's intelligence configuration variables — and `spawn.env_passthrough`
+(names and `PREFIX*` patterns; operator-only, reloadable since it is read at
+each spawn), each only when the supervisor has it, and never a reserved name.
+Debug and `internal-mocks` builds also pass `AGENTD_TEST_*`, the test hooks.
+`*` alone, and a passthrough that names a reserved variable, are refused at
+load. An instance's composed configuration folds in its caller's template
+params, so an instance-tier spawn whose param spells a secret reference is
+refused (the review of 2026-10-20 found the payload's conversation, and so
+the params, could otherwise pick the variables a child holds). The `exec`
+runner already built its environment from a list and is unchanged. The §7.1
+change is in the CHANGELOG as breaking, with what an operator adds.
+
+**4. Workers that cannot read the vault or key files.** The RFC allows a
+separate uid or a Landlock rule; this builds the Landlock rule, which needs
+no second account and no privilege. Raw syscalls (444–446) through `libc`.
+
+- *What is denied:* where the configuration holds a supervisor-only key —
+  `identity.providers`, a delegated server, or the companies preview's seal
+  key — the file store's root (the vault and its register), every
+  `{{secret-file:…}}` a supervisor-only secret is read from, the external
+  signer's socket, and the audit chain with its closed segments; with only
+  the chain set, the chain.
+- *How:* Landlock grants rather than denies, so the supervisor builds, before
+  each spawn, a ruleset that handles every file right of the kernel's ABI
+  but listing, and grants all of them beneath each entry of every directory
+  on the way to a protected path — except that path and those directories,
+  and nothing beneath a protected directory: a key file or the chain kept
+  inside the store's root (the layout the deployment docs show) puts no
+  directory of the root on the way, so the whole root stays denied.
+  The child calls `PR_SET_NO_NEW_PRIVS` and `landlock_restrict_self` between
+  `fork` and `exec`, before any code of its own; a child that cannot enter
+  the domain is not started. An instance-tier child is also granted its own
+  directory — its composed config, socket, log and store, which a durable
+  parent keeps under its file store's root — and nothing else of the root.
+  **`exec` commands** get the same domain, beyond
+  what the RFC asked: they run as the supervisor's uid too. The
+  `exec`/delegation exclusivity of P1 stays, because the signer's socket is
+  reachable and a command is model-chosen.
+- *What it costs:* a child cannot create or remove an entry directly in a
+  directory on the way to a protected path, and on ABI 1 cannot rename a
+  file across directories anywhere; truncation by path is handled from
+  ABI 3. Names in a protected directory can be listed.
+- *Without Landlock* (no ABI, or a seccomp profile that refuses the calls),
+  `proc.landlock.unavailable` says so at start and children start
+  unconfined: P1's single-person deployment keeps its documented residual.
+  When P2 adds several persons, a multi-user delegation configuration on
+  such a kernel is to be refused at load — recorded here for P2, which has
+  nothing to refuse yet.
+- *This kernel:* 6.1, `landlock` among the active LSMs, ABI 2; the tests skip
+  where `abi()` is `None`, and run alike as root and as a non-root user.
+
+**5. T27, the instruction-freshness defect.** Fixed in v1.17.0 by
+`f2e41f3a`: rmcp's SEP-2549 response cache (on by default, and answering a
+failed re-read with its expired copy) is disabled on every connection, at the
+one place a connection is built (`RmcpBuilder::connect`,
+`set_response_cache_config(ClientCacheConfig::disabled())`), and the poll
+re-reads only the server that served the instruction. Evidence at
+`d9d3f0b6`: `crates/mcp/tests/rmcp_backend.rs`
+(`every_read_reaches_the_server_even_when_it_offers_a_ttl`,
+`a_read_against_a_stopped_server_fails_instead_of_replaying_the_last_answer`,
+`a_refusal_from_the_server_is_not_masked_by_an_earlier_answer`) and
+`crates/agentd-cli/tests/instruction_freshness_e2e.rs` (four tests: a dead
+registry exits, a frozen agent refuses new work, only the serving server is
+re-read) pass, and no other rmcp client is built. Nothing of the defect
+remains. The conformance kill-switch extended to revoked documents (T27's
+mitigation) is P2 scope, with document-sourced gating, and is not built here.
+
+**6. Workflows.** None of the five has a workflow surface, and none is
+added: the signer, the Landlock rule and the child environment are process
+infrastructure, and the chain is evidence on disk. A workflow already reads
+the audit records it needs from the `stream` sink (`observability.audit.sink:
+[stream]`), which the chain does not replace; a node to read the chain file
+would be sugar.
+
+| Check | What it proves |
+|---|---|
+| `sec::signer` units: `every_op_round_trips_through_the_reference_signer`, `a_missing_signer_and_another_uids_socket_are_refused`, `a_silent_signer_times_out`, `a_stalled_signer_is_cut_off_at_the_timeout`, `frames_are_bounded` | the four ops; a signature verifies with the served JWK; unknown key, wrong use, wrong alg refused; no socket is a typed outage after one retry; another uid's socket is told nothing; a silent signer times out; a full listen backlog and a trickled answer are cut off at the timeout |
+| `delegation::vault` units: `a_grant_sealed_through_the_signer_opens_only_through_it`, `a_signer_that_is_down_opens_and_writes_nothing`, `a_restored_pre_revocation_blob_is_refused_through_the_anchored_register`, `a_revocation_the_chain_does_not_take_still_deletes_and_is_anchored_later`, `a_rotated_token_is_kept_with_a_data_key_wrapped_ahead` | no key in the store; a wrapped key is not the data key and does not move; custody mismatch refused; signer down: nothing opened, nothing written, metadata still loads; a restored store refused through the chain (and loaded without it); a revocation the chain refuses still raises the store's register and deletes the record, and is anchored at the next start; a rotated token kept with the data key wrapped before the signer went down, and not with one drawn for another record |
+| `oauth2` unit `a_client_assertion_is_signed_by_the_external_signer` | the assertion's `kid` is the key id and it verifies with the signer's key; signer down: no assertion |
+| `obs::chain` units: `records_chain_and_a_restart_continues_the_chain`, `a_tampered_chain_is_refused`, `a_torn_last_line_is_repaired_and_recorded`, `segments_rotate_and_retention_keeps_the_register`, `the_head_pins_its_record`, `a_segment_removed_by_hand_is_refused`, `the_head_names_only_records_on_the_disk` | the chain; an edit, a removal, a swap, a cut front and a cut tail refused; the crash repair; rotation, retention and the register in every header; a closed segment deleted by hand refused; a head handed to the store only once its records are flushed, and not while flushing fails |
+| `sec::harden` units, `sec::landlock` units (`a_child_is_denied_the_vault_and_the_key_files`, `a_protected_path_inside_another_grants_nothing_of_it`) | the allow-list on a real child (`env`); `aws` routing; a real child (`sh`) denied the vault, a key file, the chain and its segments, and not a file beside them; a key file and the chain inside the protected store root leave every other entry of the root denied |
+| settings units: `the_keys_are_held_as_their_custody_says`, `a_passthrough_and_an_audit_chain_are_held_to_their_rules`, `a_passthrough_never_reaches_a_supervisor_only_variable`, `the_paths_a_worker_is_denied_follow_the_keys` | every load rule of items 1–4; a signer of agentd's own uid warned of; the signer's socket among the paths denied; a chain whose head no durable store keeps warned of |
+| e2e `templates_e2e::an_instance_param_that_names_a_secret_is_refused` (`a2a`) | an instance-tier spawn whose param, from the trigger's input, spells a secret reference is refused and starts no child |
+| e2e `supervisor_env_e2e` | a real worker's environment: the baseline, its connection's secret, the second endpoint's `AGENTD_INTELLIGENCE_TOKEN_2`, the passthrough; no stray variable; no variable a reference in its conversation names; no reserved one (companies row) |
+| e2e `worker_confinement_e2e` | a real turn worker cannot open the audit chain (default build), the vault directory, the IdP key or the seal key (`xaa`), nor — with the seal key and the chain inside the store's root — any entry of the root (`xaa`), and opens a file beside them; an instance-tier child runs from its own directory inside the denied store root (`xaa`, `a2a`) |
+| e2e `audit_chain_e2e` (`a2a`) | A2A calls chained from the genesis; a restart continues; an edited record and a cut tail refuse the start, exit 2; the chain moved aside alone refuses; moved aside with the store's head removed, a new chain begins at the genesis |
+| `ema/keys-held-by-an-external-signer` | both client assertions verify with the signer's keys; the store holds the refresh token only sealed, the data key wrapped; no key configured |
+| `ema/signer-down-sends-nothing` | the start goes on and says so; the call fails `signer_unavailable`; no token request reaches the IdP or the RAS |
+| `ema/rotation-kept-when-the-signer-fails` | a rotating IdP and a signer that refuses the request after an IdP call's assertion: the rotated refresh token is kept, the next call completes, and no reuse revokes the grant |
+| `ema/signer-of-another-uid-refused` | the start is refused (2) naming the uid; the signer is sent nothing |
+| `ema/restored-vault-refused-by-the-audit-chain` | a store restored from before `--delegation-revoke` is refused at load: `not_enrolled`, no exchange sent; the register, enrolment, mint and revocation are chain records |
+
+Each new test was mutation-checked: with the code it guards broken — the
+chain's `prev` check, the head check, the chain's anchor merge, the signer's
+peer check, the data-key wrap, the assertion's key id, the
+`signer_unavailable` mapping, the allow-list filter, the passthrough, the
+Landlock domain, an instance's own directory, the custody and passthrough
+load rules — it fails. The review of 2026-10-20 added the checks for a
+protected path inside another, the connect and request deadline, the head
+that names only flushed records, the retirement record, the anchor that
+never stops a revocation, the data key wrapped ahead of a rotation, the
+allow-list read from the connections alone with the intelligence
+credentials, an instance param that names a secret refused, the delegation
+records chained on their own thread, the same-uid signer warning and the
+socket denied; each was mutation-checked the same way. Not checked by a
+test: the directory flushes at a rotation and at a new chain, the retirement
+record written before the deletion (each matters only across a power cut),
+the delete of a revoked record whose register write the store refused, and
+the wipe of the client's buffers.
 
 ### P3 — Inbound identity, A2A in-task auth, CIBA and unattended opt-ins
 

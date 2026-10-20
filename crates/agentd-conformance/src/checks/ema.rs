@@ -9,7 +9,9 @@
 //! listener whose peer — this process — is the per-person operator, the CLI
 //! (`--login idp:<name>`, `--delegation-*`) against it, and workflows started
 //! over the listener. Its IdP, the MCP server's authorization server and the
-//! EMA MCP server are agentd's own mocks (`agentd --internal-mock-xaa`),
+//! EMA MCP server are agentd's own mocks (`agentd --internal-mock-xaa`), and
+//! the external signer of `key_custody: external` its reference signer
+//! (`agentd --internal-mock-signer`),
 //! which record every request they receive and are steered per check; what
 //! a check asserts is read from that record and from the daemon's log.
 //! Live interop against an Okta Integrator org and xaa.dev is not a check
@@ -188,6 +190,31 @@ pub fn checks() -> Vec<Check> {
             enrol_again,
         ),
         check(
+            "ema/keys-held-by-an-external-signer",
+            "under key_custody external the IdP's and the authorization server's client assertions are signed by the external signer — each verifies with the public key it serves — and the refresh token is sealed under a data key the signer wraps: no key or seal key is configured, and no file of the store holds the refresh token",
+            signer_holds_the_keys,
+        ),
+        check(
+            "ema/signer-down-sends-nothing",
+            "with the external signer down the daemon starts and says so, and a delegated call fails signer_unavailable before any request reaches the IdP or the authorization server",
+            signer_down,
+        ),
+        check(
+            "ema/rotation-kept-when-the-signer-fails",
+            "under key_custody external, with a rotating IdP and a signer that fails right after it signed an IdP call's assertion, the rotated refresh token is kept — its data key was wrapped before the IdP was asked — so the next call presents it and completes, and the grant survives",
+            rotation_kept_when_the_signer_fails,
+        ),
+        check(
+            "ema/signer-of-another-uid-refused",
+            "a signer socket whose peer is not the configured uid refuses the start (config), and the signer is sent nothing",
+            signer_wrong_uid,
+        ),
+        check(
+            "ema/restored-vault-refused-by-the-audit-chain",
+            "with observability.audit.chain set, a store restored from before a revocation — the grant and the register both — is refused as revoked at load through the register the chain anchors, so the person is not_enrolled and nothing is sent to the IdP; the enrolment, mint, revocation and register records are in the chain",
+            restored_vault_refused,
+        ),
+        check(
             "ema/ema-declared-on-both-dialects",
             "the EMA extension is declared in initialize's capabilities at 2025-11-25, and in every request's _meta client capabilities at 2026-07-28",
             both_dialects,
@@ -323,6 +350,13 @@ struct Opts {
     template: Option<&'static str>,
     /// The template's `ttl`.
     ttl: Option<&'static str>,
+    /// `key_custody: external`, the signer configured as this uid.
+    signer_uid: Option<u32>,
+    /// `observability.audit.chain` set.
+    audit_chain: bool,
+    /// The reference signer fails the request after the first `sign:idp`
+    /// once `<dir>/outage` exists.
+    signer_outage: bool,
     extra: String,
 }
 
@@ -339,18 +373,29 @@ impl Default for Opts {
             sub: "00u1alice",
             template: None,
             ttl: None,
+            signer_uid: None,
+            audit_chain: false,
+            signer_outage: false,
             extra: String::new(),
         }
     }
 }
 
-/// A deployment: its directory, its mock, its configuration and socket.
+/// A deployment: its directory, its mock, its configuration and socket —
+/// and, under `key_custody: external`, the reference signer.
 struct Setup {
     tmp: TempDir,
     xaa: Xaa,
     cfg: PathBuf,
     sock: PathBuf,
     log: PathBuf,
+    signer: std::sync::Mutex<Option<Child>>,
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        self.stop_signer();
+    }
 }
 
 /// A PKCS#8 P-256 key as a PEM block.
@@ -394,17 +439,22 @@ fn uid() -> u32 {
 fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
     let d = dir.display();
     let person_uid = o.person_uid.unwrap_or_else(uid);
-    let idp_auth = match o.idp_auth {
-        "client_secret_basic" => format!(
+    let idp_auth = match (o.idp_auth, o.signer_uid) {
+        ("client_secret_basic", _) => format!(
             "client_auth: {{method: client_secret_basic}}\n      client_secret: \"{{{{secret-file:{d}/idp.secret}}}}\""
         ),
+        (_, Some(_)) => "client_auth: {method: private_key_jwt, kid: idp}".to_string(),
         _ => format!(
             "client_auth: {{method: private_key_jwt, key: \"{{{{secret-file:{d}/idp.pem}}}}\"}}"
         ),
     };
+    let ras_auth = match o.signer_uid {
+        Some(_) => "{method: private_key_jwt, kid: ras}".to_string(),
+        None => format!("{{method: private_key_jwt, key: \"{{{{secret-file:{d}/ras.pem}}}}\"}}"),
+    };
     let server = |name: &str, url: &str| {
         format!(
-            "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {{\"*\": {}}}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {{method: private_key_jwt, key: \"{{{{secret-file:{d}/ras.pem}}}}\"}}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n",
+            "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {{\"*\": {}}}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {ras_auth}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n",
             o.tags, x.ras
         )
     };
@@ -418,8 +468,14 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
         template_servers = t.to_string();
     }
     let ttl = o.ttl.map(|t| format!(", ttl: {t}")).unwrap_or_default();
+    let custody = match o.signer_uid {
+        Some(u) => format!(
+            "    key_custody: external\n    signer: {{socket: \"{d}/signer.sock\", uid: {u}, seal_key: seal}}\n"
+        ),
+        None => format!("    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n"),
+    };
     let mut delegation = format!(
-        "    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n    templates:\n      - {{name: eng, principals: {{source: operator}}, idp: okta, servers: {{{template_servers}}}{ttl}}}\n"
+        "{custody}    templates:\n      - {{name: eng, principals: {{source: operator}}, idp: okta, servers: {{{template_servers}}}{ttl}}}\n"
     );
     if let Some(l) = o.liveness {
         delegation.push_str(&format!("    liveness_interval: {l}\n"));
@@ -443,8 +499,13 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
         workflows.push_str(&wf("who2", "linear2", "whoami", "{}"));
     }
     workflows.push_str("  - name: quick\n    steps:\n      start: {kind: manual}\n      done: {kind: finish, depends_on: [start]}\n");
+    let observability = if o.audit_chain {
+        format!("{{log_level: info, audit: {{chain: {{path: \"{d}/audit/audit.log\"}}}}}}")
+    } else {
+        "{log_level: info}".to_string()
+    };
     format!(
-        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {{log_level: info}}\na2a:\n  listen: \"unix://{}\"\n  principals:\n    - {{match: {{uid: {person_uid}}}, role: operator, id: alice, idp_subject: {{iss: \"{}\", sub: {}}}}}\nsecurity:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{}\"\n      client_id: agentd-idp\n      {idp_auth}\n      subject: {}\n  delegation:\n{delegation}mcp:\n  servers:\n{servers}workflows:\n{workflows}{}",
+        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {observability}\na2a:\n  listen: \"unix://{}\"\n  principals:\n    - {{match: {{uid: {person_uid}}}, role: operator, id: alice, idp_subject: {{iss: \"{}\", sub: {}}}}}\nsecurity:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{}\"\n      client_id: agentd-idp\n      {idp_auth}\n      subject: {}\n  delegation:\n{delegation}mcp:\n  servers:\n{servers}workflows:\n{workflows}{}",
         sock.display(),
         x.idp,
         o.sub,
@@ -466,13 +527,71 @@ impl Setup {
         let cfg = tmp.path().join("c.yaml");
         std::fs::write(&cfg, config(&xaa, tmp.path(), &sock, o)).expect("write");
         let log = tmp.path().join("daemon.log");
+        let signer = o.signer_uid.map(|_| {
+            let socket = tmp.path().join("signer.sock");
+            let record = tmp.path().join("signer.jsonl");
+            let outage = o.signer_outage.then(
+                || json!({"file": tmp.path().join("outage"), "after": "sign:idp", "refuse": 1}),
+            );
+            let child = Command::new(h.agentd())
+                .args([
+                    "--internal-mock-signer",
+                    socket.to_str().expect("utf8"),
+                    "--knobs",
+                    &json!({"record": record, "outage": outage}).to_string(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the reference signer");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !socket.exists() {
+                assert!(Instant::now() < deadline, "the signer never listened");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child
+        });
         Setup {
             tmp,
             xaa,
             cfg,
             sock,
             log,
+            signer: std::sync::Mutex::new(signer),
         }
+    }
+
+    /// Stop the reference signer.
+    fn stop_signer(&self) {
+        if let Some(mut c) = self.signer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// What the signer was asked: `{op, key}` per request.
+    fn signer_record(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.tmp.path().join("signer.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Every file under the store, as bytes.
+    fn store_bytes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(p: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            if p.is_dir() {
+                for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                    walk(&e.path(), out);
+                }
+            } else if let Ok(b) = std::fs::read(p) {
+                out.push((p.to_path_buf(), b));
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.tmp.path().join("state"), &mut out);
+        out
     }
 
     fn cfg(&self) -> &str {
@@ -2221,6 +2340,362 @@ fn enrol_again(h: &Harness) -> Outcome {
                 format!(
                     "offboarding by the new sub finds the grant: {} {}",
                     off.stdout, off.stderr
+                ),
+            )
+        })
+}
+
+// --- keys an external signer holds, and the audit chain (RFC 0044 P2a) -------
+
+/// One request to the signer at `sock`, framed as its protocol says: a
+/// four-byte big-endian length, then the JSON.
+fn signer_call(sock: &Path, req: Value) -> Value {
+    let mut s = UnixStream::connect(sock).expect("connect the signer");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let body = req.to_string();
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(body.as_bytes());
+    s.write_all(&frame).expect("write");
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).expect("read");
+    let mut answer = vec![0u8; u32::from_be_bytes(len) as usize];
+    s.read_exact(&mut answer).expect("read");
+    serde_json::from_slice(&answer).unwrap_or(Value::Null)
+}
+
+/// Whether `jwt`'s ES256 signature verifies with the public JWK `jwk`.
+fn verifies(jwt: &str, jwk: &Value) -> bool {
+    let b64 = |s: &str| {
+        let mut t = s.replace('-', "+").replace('_', "/");
+        while !t.len().is_multiple_of(4) {
+            t.push('=');
+        }
+        std_b64_decode(&t)
+    };
+    let Some((input, sig)) = jwt.rsplit_once('.') else {
+        return false;
+    };
+    let mut point = vec![0x04];
+    point.extend(b64(jwk["x"].as_str().unwrap_or_default()));
+    point.extend(b64(jwk["y"].as_str().unwrap_or_default()));
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &point)
+        .verify(input.as_bytes(), &b64(sig))
+        .is_ok()
+}
+
+fn signer_holds_the_keys(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({}),
+        &Opts {
+            signer_uid: Some(uid()),
+            ..Opts::default()
+        },
+    );
+    let _d = s.daemon(h);
+    tryo!(s.login(h));
+    let run = tryo!(s.run("who"));
+    let sock = s.tmp.path().join("signer.sock");
+    let jwk = |key: &str| {
+        signer_call(&sock, json!({"v": 1, "op": "public_key", "key": key}))["jwk"].clone()
+    };
+    let (idp_key, ras_key) = (jwk("idp"), jwk("ras"));
+    let exchange = s.xaa.grants("idp", EXCHANGE);
+    let redeem = s.xaa.grants("ras", JWT_BEARER);
+    let assertion = |r: Option<&Value>| {
+        r.and_then(|r| r["body"]["client_assertion"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (at_idp, at_ras) = (assertion(exchange.last()), assertion(redeem.last()));
+    let rt = exchange
+        .last()
+        .and_then(|r| r["body"]["subject_token"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let stored = s.store_bytes();
+    let holds_rt = stored
+        .iter()
+        .find(|(_, b)| !rt.is_empty() && b.windows(rt.len()).any(|w| w == rt.as_bytes()));
+    let wrapped = stored
+        .iter()
+        .any(|(_, b)| String::from_utf8_lossy(b).contains("wrapped"));
+    let ops: Vec<String> = s
+        .signer_record()
+        .iter()
+        .map(|r| {
+            format!(
+                "{}:{}",
+                r["op"].as_str().unwrap_or_default(),
+                r["key"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    let cfg = std::fs::read_to_string(&s.cfg).unwrap_or_default();
+    completed(&run)
+        .and(|| {
+            Outcome::require(
+                verifies(&at_idp, &idp_key),
+                format!(
+                    "the IdP's client assertion verifies with the signer's idp key: {at_idp:?}"
+                ),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                verifies(&at_ras, &ras_key) && !verifies(&at_ras, &idp_key),
+                "the authorization server's client assertion verifies with the signer's ras key, and only it",
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                !rt.is_empty() && holds_rt.is_none() && wrapped,
+                format!(
+                    "the store holds the refresh token only sealed, its data key wrapped: {:?}",
+                    holds_rt.map(|(p, _)| p)
+                ),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                ops.iter().any(|o| o == "sign:idp")
+                    && ops.iter().any(|o| o == "sign:ras")
+                    && ops.iter().any(|o| o == "wrap:seal")
+                    && ops.iter().any(|o| o == "unwrap:seal"),
+                format!(
+                    "the signer signed with both keys and wrapped and unwrapped under the seal key: {ops:?}"
+                ),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                !cfg.contains("secret-file") && !s.events("delegation.signer.ready").is_empty(),
+                "no key or seal key is configured, and the start checked the signer",
+            )
+        })
+}
+
+fn signer_down(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({}),
+        &Opts {
+            signer_uid: Some(uid()),
+            ..Opts::default()
+        },
+    );
+    {
+        let _d = s.daemon(h);
+        tryo!(s.login(h));
+        let first = tryo!(s.run("who"));
+        let o = completed(&first);
+        if !o.passed {
+            return o;
+        }
+    }
+    s.stop_signer();
+    let token_requests = || {
+        s.xaa
+            .record()
+            .into_iter()
+            .filter(|r| r["path"] == "/token")
+            .count()
+    };
+    let before = token_requests();
+    let _d = s.daemon(h);
+    let run = tryo!(s.run("who"));
+    let after = token_requests();
+    failed_with(&run, "signer_unavailable")
+        .and(|| {
+            Outcome::require(
+                !s.events("delegation.signer.unavailable").is_empty(),
+                "the start says the signer did not answer",
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                after == before,
+                format!(
+                    "nothing is sent to the IdP or the authorization server: {before} token requests, then {after}"
+                ),
+            )
+        })
+}
+
+/// The IdP rotates the refresh token at every use, and the signer refuses
+/// the one request after it signed the assertion of the first IdP call of a
+/// delegated call (the liveness probe's refresh, or the exchange). The
+/// rotated token is kept all the same, sealed with the data key wrapped
+/// before the IdP was asked, so the next call presents it rather than the
+/// spent one, whose reuse would revoke the family. What the first call
+/// makes of the refusal depends on what it hit, and is not held.
+fn rotation_kept_when_the_signer_fails(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"rotate": true}),
+        &Opts {
+            signer_uid: Some(uid()),
+            signer_outage: true,
+            ..Opts::default()
+        },
+    );
+    {
+        let _d = s.daemon(h);
+        tryo!(s.login(h));
+    }
+    std::fs::write(s.tmp.path().join("outage"), "").expect("write");
+    let _d = s.daemon(h);
+    let _first = tryo!(s.run("who"));
+    let armed = !s.tmp.path().join("outage").exists();
+    let second = tryo!(s.run("who"));
+    Outcome::require(
+        armed,
+        "the signer's outage began at an IdP call's assertion",
+    )
+    .and(|| completed(&second))
+    .and(|| {
+        Outcome::require(
+            s.events("delegation.revoked").is_empty(),
+            "the grant survives: the spent refresh token was never presented again",
+        )
+    })
+}
+
+fn signer_wrong_uid(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({}),
+        &Opts {
+            signer_uid: Some(uid().wrapping_add(1)),
+            ..Opts::default()
+        },
+    );
+    // A daemon that starts instead would serve until stopped: watch its log
+    // for the refusal, and its socket for a listener, for 20 s.
+    let log = s.tmp.path().join("refused.log");
+    let d = h.spawn_logged(&["--config", s.cfg()], &log);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let t = std::fs::read_to_string(&log).unwrap_or_default();
+        if t.contains("\"proc.exit\"") || s.sock.exists() || Instant::now() >= deadline {
+            break t;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let listened = s.sock.exists();
+    drop(d);
+    let asked = s.signer_record();
+    Outcome::require(
+        !listened
+            && text.contains("\"proc.exit\"")
+            && text.contains("\"code\":2")
+            && text.contains("the socket's peer runs as uid"),
+        format!("the start is refused (2), naming the uid: {}", tail(&text)),
+    )
+    .and(|| {
+        Outcome::require(
+            asked.is_empty(),
+            format!("the signer is sent nothing: {asked:?}"),
+        )
+    })
+}
+
+/// Copy the directory `from` to `to`, files and all.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for e in std::fs::read_dir(from).into_iter().flatten().flatten() {
+        let (p, q) = (e.path(), to.join(e.file_name()));
+        if p.is_dir() {
+            copy_dir(&p, &q);
+        } else {
+            std::fs::copy(&p, &q).expect("copy");
+        }
+    }
+}
+
+fn restored_vault_refused(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({}),
+        &Opts {
+            audit_chain: true,
+            ..Opts::default()
+        },
+    );
+    let state = s.tmp.path().join("state");
+    let backup = s.tmp.path().join("state.before");
+    {
+        let _d = s.daemon(h);
+        tryo!(s.login(h));
+        let first = tryo!(s.run("who"));
+        let o = completed(&first);
+        if !o.passed {
+            return o;
+        }
+    }
+    copy_dir(&state, &backup);
+    {
+        let _d = s.daemon(h);
+        let off = s.cli(h, &["--delegation-revoke", "idp:okta#00u1alice"]);
+        if off.code != Some(0) {
+            return Outcome::fail(format!(
+                "--delegation-revoke: {} {}",
+                off.stdout, off.stderr
+            ));
+        }
+    }
+    // The store as it was before the revocation: the grant and the register.
+    let _ = std::fs::remove_dir_all(&state);
+    copy_dir(&backup, &state);
+    let sent = || s.xaa.grants("idp", EXCHANGE).len();
+    let before = sent();
+    let _d = s.daemon(h);
+    let run = tryo!(s.run("who"));
+    let after = sent();
+    let chain =
+        std::fs::read_to_string(s.tmp.path().join("audit").join("audit.log")).unwrap_or_default();
+    let records: Vec<Value> = chain
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let has = |action: &str| records.iter().any(|r| r["action"] == action);
+    // The restored record is refused as it loads: the person enrols again.
+    let refused_at_load = s
+        .events("delegation.grant.unreadable")
+        .iter()
+        .any(|e| e["err"].as_str().is_some_and(|x| x.contains("Revoked")));
+    failed_with(&run, "not_enrolled")
+        .and(|| {
+            Outcome::require(
+                refused_at_load,
+                "the restored grant is refused at load as revoked",
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                after == before,
+                format!(
+                    "the refusal comes before anything is sent: {before} exchanges, then {after}"
+                ),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                records.iter().any(|r| {
+                    r["action"] == "delegation.register" && r["target"]["revoked_epoch"].is_u64()
+                }),
+                "the chain anchors the revocation",
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                has("delegation.enrolled") && has("delegation.minted") && has("delegation.revoked"),
+                format!(
+                    "the chain holds the delegation records: {:?}",
+                    records
+                        .iter()
+                        .map(|r| r["action"].clone())
+                        .collect::<Vec<_>>()
                 ),
             )
         })

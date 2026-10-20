@@ -1362,6 +1362,19 @@ paths are live · op.
 
 The how-to is [Delegate to subagents](delegate-subagents.md).
 
+## spawn
+
+What every child process — turn worker, subagent, think child, instance — is
+started with. A child's environment is an allow-list: the baseline (`PATH`,
+`HOME`, `TMPDIR`, `TZ`, `LANG`, `AGENTD_CRED_DIR`, `RUST_LOG`, `NO_PROXY`,
+`XDG_*`, `LC_*`, `SSL_CERT_*`, `OTEL_*`, `*_PROXY`), the variables its own
+secret references and routed `aws` credentials read, and this list
+([Security model](security.md#secrets)).
+
+| Path | Type | Default | Class | What it does |
+|---|---|---|---|---|
+| `spawn.env_passthrough` | list of names and `PREFIX*` patterns | `[]` | live · op | Variables every child also gets, when agentd has them. `*` alone, and a name a supervisor-only secret is read from, are refused. |
+
 ## goal
 
 A goal watchdog that checks progress and acts. All paths are live · doc. A
@@ -1427,7 +1440,9 @@ Who autonomous work is done for. All paths are live · op.
 | `identity.autonomous_as` | string | `system` | The principal a schedule, webhook, stream or `once` firing runs as. It may not be the per-person operator of a delegation (`operator:<id>`, the `xaa` feature): autonomous work never acts with an enrolled person's grant. |
 | `identity.labels` | map | `{}` | Labels stamped on that work. |
 | `identity.providers.<name>` | object | — | An enterprise IdP agentd is a client of: `issuer`, `client_id` (required), `profile` (`generic \| okta`), `client_auth`, `client_secret`, `sign_in`, `subject`, `subjects`, `jwks_uri`. Restart. Needs `xaa`; see [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization). |
-| `identity.delegation.seal_key`, `.seal_key_previous` | secret reference | — | 32 random bytes, hex or base64, from a mounted file or the startup prompt — never the environment. Every grant's refresh token is sealed with `seal_key`; `seal_key_previous` only opens. Required with a `grant: id_jag` server. Restart. |
+| `identity.delegation.seal_key`, `.seal_key_previous` | secret reference | — | 32 random bytes, hex or base64, from a mounted file or the startup prompt — never the environment. Every grant's refresh token is sealed with `seal_key`; `seal_key_previous` only opens. Required with a `grant: id_jag` server under `key_custody: local`; refused under `external`. Restart. |
+| `identity.delegation.key_custody` | `local \| external` | `local` | Who holds the seal key and every `private_key_jwt` key under `identity.providers` and on a delegated server: agentd, from secret references, or the external signer. Under `external` each such key is named by `client_auth.kid` with no `key`. Changing it means enrolling again. Restart. |
+| `identity.delegation.signer` | `{socket, uid, timeout, seal_key, seal_key_previous}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (the socket's peer must be it; agentd's own uid is a load warning, since the peer check cannot then tell the signer from agentd's workers), the bound on a whole request, the connect included (`5s`, at most `60s`), and the ids of its key-encryption key and of the one before a rotation, which only unwraps ([The external signer protocol](external-signer.md)). Restart. |
 | `identity.delegation.at_cache_cap` | duration | `60m` | The longest an access token is used, whatever `expires_in` says. Restart. |
 | `identity.delegation.liveness_interval` | duration | `15m` | An access token is used only within this of the grant's last proof that its refresh token is alive. Restart. |
 | `identity.delegation.consent_timeout` | duration | `24h` | How long a consent gate waits before it denies. Restart. |
@@ -1456,6 +1471,9 @@ process.
 | `observability.otel.logs` | bool | `false` | restart · op | Also send the log lines to `<endpoint>/v1/logs`. |
 | `observability.audit.sink` | list of `log \| store \| stream` | unset (no audit records) | live · op | Where audit records go. `store` needs a store; `stream` needs `audit.stream`. |
 | `observability.audit.stream` | string | — | live · op | The declared stream `sink: [stream]` appends to. |
+| `observability.audit.chain.path` | absolute path | — | restart · op | The hash-chained audit log: every audit record appended, each carrying the SHA-256 of the one before, verified at every start; a chain that does not hold refuses the start. Written whatever `sink` says. The tombstone register is anchored in it. Closed segments are kept beside it as `<path>.<first seq>`. Its head is kept in the durable store: with `store.kind: none` or `memory` the load warns that a cut tail is not caught. |
+| `observability.audit.chain.rotate_at` | size | `64MiB` | restart · op | The size the open segment is closed at; at least `64KiB`. |
+| `observability.audit.chain.retention` | duration | `400d` | restart · op | How long a closed segment is kept after its last record. Each deletion is a record naming the segment's last record; a segment removed by hand refuses the start. Each segment's header carries the register, so no revocation is forgotten. |
 | `observability.runtime_events.stream` | string | required | live · doc | A declared stream that receives selected runtime events. |
 | `observability.runtime_events.include` | list of families | `[]` | live · doc | Event families taken in full (the segment before the first dot). |
 | `observability.runtime_events.sampled` | list of families | `[]` | live · doc | Families taken one in sixteen. |
@@ -1600,7 +1618,7 @@ refuses the reload with `config.reload.restart_required`:
 - `webhooks.listen`, `webhooks.tls`, `webhooks.url`
 - `observability.otel`, `observability.metrics_addr`,
   `observability.health_file`, `observability.events_ring`,
-  `observability.traceparent`
+  `observability.traceparent`, `observability.audit.chain`
 - `security` (every path)
 - `identity.providers`, `identity.delegation`
 - a `services` entry of `kind: company`, added, removed or changed

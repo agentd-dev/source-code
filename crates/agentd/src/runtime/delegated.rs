@@ -669,7 +669,7 @@ impl Runtime {
                 outcome,
                 principal,
                 target,
-            } => self.audit(super::audit::AuditEvent {
+            } => self.audit_chained(super::audit::AuditEvent {
                 action,
                 target,
                 outcome,
@@ -701,11 +701,44 @@ impl Runtime {
         }
     }
 
-    /// Where the delegation supervisor's notes go: the loop.
+    /// Where the delegation supervisor's notes go: the loop — and each
+    /// audit record first to the audit chain, from the thread that made it,
+    /// so it is on the disk before that thread hands on the token it
+    /// minted or the answer of the call it made.
     pub(crate) fn delegation_wire(&mut self) {
         if let Some(d) = &self.delegation {
             let tx = self.events_tx.clone();
+            let chain = self.audit_chain.clone();
+            let (instance, trace, log) =
+                (self.instance.clone(), self.trace.clone(), self.log.clone());
             d.notify_to(Arc::new(move |n| {
+                if let (
+                    Some(c),
+                    Note::Audit {
+                        action,
+                        outcome,
+                        principal,
+                        target,
+                    },
+                ) = (&chain, &n)
+                {
+                    let ev = super::audit::AuditEvent {
+                        action,
+                        target: target.clone(),
+                        outcome,
+                        principal: principal.as_deref(),
+                        role: None,
+                        request_id: None,
+                        sid: None,
+                        trace: None,
+                        link: None,
+                    };
+                    super::audit::chain_record(
+                        c,
+                        super::audit::record_of(&instance, &trace, &ev),
+                        &log,
+                    );
+                }
                 let _ = tx.send(Event::Delegation(Box::new(n)));
             }));
         }

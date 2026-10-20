@@ -642,3 +642,63 @@ fn a_respawned_instance_child_is_delivered_once_too() {
         "the respawned child delivered its instruction a second time:\n{prompt}"
     );
 }
+
+/// A param is data, and names no credential: one that spells a secret
+/// reference — text from outside, here the trigger's input — refuses the
+/// instance spawn, so no child resolves it or is started with the variable
+/// it names.
+#[cfg(feature = "a2a")]
+#[test]
+fn an_instance_param_that_names_a_secret_is_refused() {
+    let dir = common::unique_path("tpl-secret", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(
+        &cfg,
+        "agent: { name: parent }\nstore: { kind: memory }\n\
+         lifecycle: { run_until: idle, idle_grace: 700ms }\n\
+         observability: { log_level: info }\n\
+         subagents:\n\
+        \x20 templates:\n\
+        \x20   room:\n\
+        \x20     instruction: |\n\
+        \x20       You are the room for {{params.id}}.\n\
+        \x20       :::!workflow{name=on-ping}\n\
+        \x20       steps:\n\
+        \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
+        \x20         f:   { kind: finish, depends_on: [cmd], status: completed }\n\
+        \x20       :::\n\
+        \x20     params: { id: { type: string, required: true } }\n\
+         workflows:\n  - name: caller\n    steps:\n\
+        \x20     s:     { kind: once, inputs: { id: \"{{secret:TEMPLATE_PARAM_SECRET}}\" } }\n\
+        \x20     spawn: { kind: subagent, template: room, params: { id: \"{{ inputs.id }}\" }, depends_on: [s], on_error: continue }\n\
+        \x20     f:     { kind: finish, depends_on: [spawn], status: completed, output: \"{{steps.spawn.error | ok}}\" }\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .env("AGENTD_STATE_DIR", format!("{dir}/state"))
+        .env("TEMPLATE_PARAM_SECRET", "s3cr3t-value")
+        .output()
+        .expect("run");
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0), "{log}");
+    let spawn: Vec<Value> = events(&log, "step.done")
+        .into_iter()
+        .filter(|e| e["step"] == "spawn")
+        .collect();
+    assert_eq!(spawn.len(), 1, "{log}");
+    let err = spawn[0]["err"].as_str().unwrap_or("");
+    assert!(
+        spawn[0]["status"] == "failed" && err.contains("names a secret"),
+        "the spawn is refused for the param: {err}\n{log}"
+    );
+    assert!(
+        events(&log, "instance.spawn").is_empty(),
+        "no child was started:\n{log}"
+    );
+    assert!(!log.contains("s3cr3t-value"), "{log}");
+}

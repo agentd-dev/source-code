@@ -18,6 +18,16 @@ use crate::auth::http::{self, Dial, Reply};
 use serde::Deserialize;
 use std::time::Duration;
 
+/// What an error begins with when the external signer made no client
+/// assertion: the request was never sent ([`signer_failed`]).
+pub const SIGNER_FAILED: &str = "the external signer made no client assertion: ";
+
+/// Whether `err` says the external signer made no client assertion, so
+/// nothing was sent and the fault is the signer's, not the server's.
+pub fn signer_failed(err: &str) -> bool {
+    err.contains(SIGNER_FAILED)
+}
+
 /// Resolved OAuth endpoints + client identity for one target endpoint.
 #[derive(Debug, Clone, Default)]
 pub struct OAuth2Params {
@@ -87,6 +97,16 @@ pub enum ClientAuth {
         aud: AssertionAud,
         /// `RS256`, or `None` for ES256.
         alg: Option<String>,
+    },
+    /// `private_key_jwt` with a key an external signer holds (RFC 0044
+    /// P2a): the assertion is built here and signed there, under the key
+    /// `key`, which is also its `kid`.
+    PrivateKeyJwtSigner {
+        signer: crate::sec::signer::Signer,
+        key: String,
+        aud: AssertionAud,
+        /// `ES256` or `RS256`.
+        alg: String,
     },
 }
 
@@ -219,6 +239,34 @@ impl OAuth2Params {
                     super::client_assertion::ASSERTION_TYPE,
                 );
                 form.field("client_assertion", &assertion);
+                Ok(Vec::new())
+            }
+            ClientAuth::PrivateKeyJwtSigner {
+                signer,
+                key,
+                aud,
+                alg,
+            } => {
+                let aud = match aud {
+                    AssertionAud::TokenEndpoint => self.token_url.as_str(),
+                    AssertionAud::Issuer => self
+                        .issuer
+                        .as_deref()
+                        .ok_or("oauth: assertion_aud issuer needs auth.issuer")?,
+                };
+                let input =
+                    super::client_assertion::assertion_input(&self.client_id, aud, alg, key)?;
+                let sig = signer
+                    .sign(key, alg, input.as_bytes())
+                    .map_err(|e| format!("{SIGNER_FAILED}{e}"))?;
+                form.field(
+                    "client_assertion_type",
+                    super::client_assertion::ASSERTION_TYPE,
+                );
+                form.field(
+                    "client_assertion",
+                    &format!("{input}.{}", crate::b64::url_nopad(&sig)),
+                );
                 Ok(Vec::new())
             }
         }
@@ -1107,5 +1155,69 @@ mod tests {
         );
         assert!(f.finish().is_empty(), "the secret is not also in the body");
         unsafe { std::env::remove_var("OAUTH2_BASIC_TEST") };
+    }
+
+    /// A `private_key_jwt` key the external signer holds (RFC 0044 P2a):
+    /// the assertion is built here with the key's id as its `kid` and signed
+    /// there, and it verifies with the public key the signer serves; with the
+    /// signer down there is no assertion, and the error says so.
+    #[test]
+    fn a_client_assertion_is_signed_by_the_external_signer() {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("signer.sock");
+        let _signer =
+            crate::sec::signer::mock::serve(&sock, &crate::sec::signer::mock::default_knobs())
+                .unwrap();
+        // SAFETY: getuid has no failure mode.
+        let signer = crate::sec::signer::Signer::new(&sock, unsafe { libc::getuid() }, None);
+        let mut p = OAuth2Params {
+            token_url: "https://idp.example/token".into(),
+            client_id: "agentd-idp".into(),
+            client_auth: ClientAuth::PrivateKeyJwtSigner {
+                signer: signer.clone(),
+                key: "idp".into(),
+                aud: AssertionAud::TokenEndpoint,
+                alg: "ES256".into(),
+            },
+            ..Default::default()
+        };
+        let mut f = Form::new();
+        assert!(p.authenticate(&mut f).unwrap().is_empty());
+        let body = String::from_utf8(f.finish()).unwrap();
+        let jwt = body
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("client_assertion="))
+            .unwrap();
+        let (input, sig) = jwt.rsplit_once('.').unwrap();
+        let part = |i: usize| -> serde_json::Value {
+            serde_json::from_slice(
+                &crate::b64::url_decode(input.split('.').nth(i).unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+        let (header, claims) = (part(0), part(1));
+        assert_eq!(header["kid"], "idp");
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(claims["aud"], "https://idp.example/token");
+        assert_eq!(claims["iss"], "agentd-idp");
+        let jwk = signer.public_key("idp").unwrap().jwk;
+        let mut point = vec![0x04];
+        point.extend(crate::b64::url_decode(jwk["x"].as_str().unwrap()).unwrap());
+        point.extend(crate::b64::url_decode(jwk["y"].as_str().unwrap()).unwrap());
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &point)
+            .verify(input.as_bytes(), &crate::b64::url_decode(sig).unwrap())
+            .expect("the assertion verifies with the signer's public key");
+
+        p.client_auth = ClientAuth::PrivateKeyJwtSigner {
+            signer: crate::sec::signer::Signer::new(dir.path().join("gone.sock"), 0, None),
+            key: "idp".into(),
+            aud: AssertionAud::TokenEndpoint,
+            alg: "ES256".into(),
+        };
+        let mut f = Form::new();
+        let e = p.authenticate(&mut f).unwrap_err();
+        assert!(signer_failed(&e), "{e}");
+        assert!(f.finish().is_empty(), "no assertion");
     }
 }

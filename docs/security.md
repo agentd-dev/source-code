@@ -835,11 +835,66 @@ Outbound credential providers (OAuth, AWS SigV4, SPIFFE) are in
 non-dumpable (`PR_SET_DUMPABLE` 0): no process of its uid can attach to it or
 read its memory or environment through `/proc/<pid>/`. Its core-dump limit
 is zero, and every child inherits that, so no core file holds a secret. A
-`proc.harden` warning names either that the kernel refused. Every child —
-turn worker, subagent, think child, instance — is started without the
-environment variables a supervisor-only secret is read from: the
-`{{secret:NAME}}` of `security.companies.seal_key`. Nothing else is taken
-from a child's environment.
+`proc.harden` warning names either that the kernel refused.
+
+**A child's environment is an allow-list.** Every child — turn worker,
+subagent, think child, instance — is started with these variables, each only
+when the supervisor has it:
+
+- the baseline: `PATH`, `HOME`, `TMPDIR`, `TZ`, `LANG`, `AGENTD_CRED_DIR`,
+  `RUST_LOG`, `NO_PROXY`, and every `XDG_*`, `LC_*`, `SSL_CERT_*`, `OTEL_*`
+  and `*_PROXY`;
+- the variables its own spawn names: each `{{secret:NAME}}` its connections
+  reference (the model's, the MCP servers', the A2A peers'; an instance's
+  composed configuration), `AWS_*` with the `aws` sources' endpoint
+  overrides when an `aws` credential is routed to it, and
+  `AGENTD_INTELLIGENCE_TOKEN`, `_FILE` and `_<N>`/`_<N>_FILE`, which a
+  worker reads itself when it dials the top-level model connection's
+  endpoints; an instance also gets the intelligence family's configuration
+  variables;
+- the names and `PREFIX*` patterns in `spawn.env_passthrough`.
+
+Text in a child's conversation (an instruction, a message, a tool result, a
+step's output) never adds a variable, even when it spells `{{secret:NAME}}`:
+which variables a child holds is the configuration's to say.
+
+No other variable crosses, and a variable a supervisor-only secret is read
+from never does: the `{{secret:NAME}}` of `security.companies.seal_key`, and
+every key and secret under `identity.*` or on a delegated server. A
+passthrough that names one is refused at load.
+
+**A child cannot open the vault or a key file.** Where the configuration
+holds a supervisor-only key — `identity.providers`, a delegated server, or
+`security.companies.seal_key` — every child, and every `exec` command, is
+started in a Landlock domain that denies it the file store's root (where the
+grant vault and its register are), every `{{secret-file:…}}` such a key is
+read from, and the audit chain with its closed segments. With only
+`observability.audit.chain` set, the chain is denied. The child enters the
+domain before it runs any code of its own, and cannot leave it; one that
+cannot enter it is not started. An instance-tier child keeps its own
+directory, which a durable parent keeps under its store's root, and nothing
+else of the root. A key file or the chain kept inside the store's root, as
+`/var/lib/agentd/audit/audit.log` with the store at `/var/lib/agentd`, leaves
+the whole root denied. Under `key_custody: external` the signer's socket is
+denied too: a child can still connect to it, and can neither remove it nor
+bind another in its place. `proc.landlock` at start names the kernel's
+Landlock ABI and the paths denied.
+
+| Landlock ABI | What a child is denied in a protected path |
+|---|---|
+| 1 (Linux 5.13) | reading, writing, running, creating and removing — and, anywhere, renaming or linking a file into another directory |
+| 2 (5.19) | linking and renaming into or out of one |
+| 3 (6.2) | truncating a file by path |
+| 5 (6.10) | device ioctls |
+
+A protected path's names can be listed; its contents cannot be opened. A
+child cannot create or remove an entry directly in a directory on the way
+to a protected path, so keep the store, the key files, the signer's socket
+and the audit chain in directories of their own, not in `/tmp` or a home
+directory a tool writes to. On a kernel without Landlock (older than 5.13,
+built without it, or a seccomp profile that refuses the calls),
+`proc.landlock.unavailable` says so at start and children run unconfined: a
+same-uid child can then read those paths.
 
 **A per-person credential is presented for its person alone.** AAuth's
 user-scoped (Case C) tokens are held for the authority and the principal
@@ -1252,10 +1307,19 @@ What holds:
   from a mounted file or the startup prompt — `--validate-config` refuses one
   that would resolve from the environment
   (`delegation_secret_in_environment`) — and no child is started with the
-  variables such a secret names. A mounted file stays readable by a
-  same-uid worker until workers run under another uid (RFC 0044 P2), which
-  is why `security.exec.enabled` beside a delegated server, `identity.providers`
-  or a seal key is refused.
+  variables such a secret names. No child opens a mounted key file or the
+  vault where the kernel has Landlock (above). `security.exec.enabled`
+  beside a delegated server, `identity.providers` or a seal key is refused
+  all the same: a command runs as the supervisor's uid, and the external
+  signer's socket is no Landlock right.
+- **Keys agentd never holds.** Under `identity.delegation.key_custody:
+  external` an external signer holds the IdP and resource client keys and
+  the key-encryption key, on a unix socket whose peer must be the uid
+  configured. agentd builds each client assertion and has the signer sign
+  it; each grant's refresh token is sealed under a data key of its own,
+  which the signer wraps. With the signer down, a delegated call fails
+  `signer_unavailable` before anything is sent
+  ([The external signer protocol](external-signer.md)).
 - **Authority from the transport.** The person is the unix listener's peer
   the kernel names by uid, on a rule with an exact `idp_subject` pin. A run's
   authority is set by the transport that started it; a model, a tool
@@ -1272,8 +1336,12 @@ What holds:
   binding the grant id, the IdP, the subject, the epoch and the
   refresh-token version. A tombstone register, written only upward, refuses a
   revoked epoch and a record older than the latest refresh token — a store
-  restored from a backup — so a rotated-out token is never presented. A
-  writer of the store itself can truncate the register too. A rotation is
+  restored from a backup — so a rotated-out token is never presented. With
+  `observability.audit.chain` set, each raise of the register is anchored in
+  the hash-chained audit log first, and a load is held to the higher of the
+  two: a store restored with its register, or a register a writer of the
+  store truncated, does not bring a revoked grant back. Without the chain, a
+  writer of the store can truncate the register too. A rotation is
   kept before the ID-JAG it came with is checked. Signing in again replaces
   a grant that is no longer the same — expired, another identity, another
   template or ceilings — one epoch up, and the refresh token a sign-in
@@ -1312,17 +1380,67 @@ What holds:
 What this preview does not do: it acts for one person; there is no taint
 engine, so every unit that touches a delegated server counts as tainted; a
 grant held by a person stays usable after the IdP removes a Resource
-connection until the next mint (at most `at_cache_cap`); and the vault's
-key file is readable by any same-uid process.
+connection until the next mint (at most `at_cache_cap`); and on a kernel
+without Landlock the vault and a mounted key file are readable by any
+same-uid process.
+
+### The audit chain
+
+`observability.audit.chain` appends every audit record — each A2A call,
+delegation's records, the person's consent answers — to a file only the
+supervisor writes, opened for appending. Each line carries `seq` and `prev`,
+the SHA-256 of the line before, so a record edited, removed, inserted or
+moved breaks the chain. Delegation's records and the consent answers are
+flushed to the disk before the thread that makes them goes on: before a
+minted token is handed out, before a delegated call's answer is returned,
+before an answer takes effect. A delegated call's `delegation.used` record
+follows the call it records, so a crash during the call leaves no record of
+it. At every start agentd verifies every kept segment and the head the store
+keeps, and refuses to start (exit 2), naming the file and the line, when the
+chain does not hold: a cut tail is caught by that head, and the store is
+handed only a head whose records are on the disk, so a power cut does not
+look like a cut tail. A last line cut short by a crash is the one thing
+repaired, and an `audit.chain.repaired` record says how many bytes were
+dropped. With `store.kind: none` or `memory` the head lives only while
+agentd runs, so a tail cut while it is down is not caught; the load warns.
+
+The file rotates at `rotate_at`; a closed segment is kept until its last
+record is older than `retention` (400 days by default). Its deletion is an
+`audit.chain.retired` record naming the segment's last record, written before
+the segment is deleted; a chain that starts past its first record with no
+such record — a segment removed by hand — refuses the start. Each segment
+opens with a header that carries the tombstone register, so retention never
+forgets a revocation. The rendered arguments of a consent gate are kept in
+the clear in the chain, beside `args_hash`, for as long as retention keeps
+them.
+
+**Starting a new chain** after a refusal you have looked into:
+
+1. Stop agentd.
+2. Move the chain aside as evidence: `<path>` and every `<path>.<seq>`
+   beside it.
+3. Remove the store's head of the chain: the `audit` record `chain-head`
+   (under `store.kind: file`,
+   `<root>/<store.prefix>/<instance>/audit/chain-head.json`, the prefix
+   `agentd` by default).
+4. Start agentd. The new chain begins at record 1, and the store's tombstone
+   register is anchored in it again. Revocations only the old chain held are
+   not carried: check that the store you start from is not a backup taken
+   before one.
+
+Moving the chain aside alone is a chain cut to nothing, which the store's head
+refuses.
 
 ## What agentd does not protect against
 
 Stated plainly, so you size the surrounding environment correctly.
 
-- **No in-binary sandboxing.** No seccomp, no namespaces, no chroot. The OS
-  hardening is process groups, an optional cgroup leaf and the parent-death
-  signal. Confinement, filesystem scope and aggregate resource limits are the
-  deployment's job.
+- **No in-binary sandboxing beyond one Landlock rule.** No seccomp, no
+  namespaces, no chroot. The OS hardening is process groups, an optional
+  cgroup leaf, the parent-death signal and, where a supervisor-only key is
+  configured, the Landlock domain that keeps children out of the vault, the
+  key files and the audit chain. Any other confinement, filesystem scope and
+  aggregate resource limits are the deployment's job.
 - **No network enforcement.** `security.egress: closed` governs the dials
   agentd makes from configuration. Which hosts the process, an MCP server or
   an `exec` command may reach is a firewall or NetworkPolicy concern.

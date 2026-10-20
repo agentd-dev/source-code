@@ -116,8 +116,6 @@ fn subagent_command(exe: &Path, limits: &Limits) -> Command {
     // A subagent is handed its control pipes and stderr, nothing else, so
     // every descriptor from 3 up is marked.
     crate::signals::pass_only_stdio(&mut cmd);
-    // Nor the variables a supervisor-only secret is read from.
-    crate::sec::harden::strip(&mut cmd);
     cmd
 }
 
@@ -160,6 +158,12 @@ pub fn spawn(
     events: FrameSink,
 ) -> io::Result<Subagent> {
     let mut cmd = subagent_command(exe, &payload.limits);
+    // Its environment is the allow-list: the baseline, what its payload
+    // names, the operator's passthrough — never a supervisor-only variable.
+    let env = crate::sec::harden::confine(&mut cmd, &crate::sec::harden::wanted_by_spawn(payload));
+    // And, where the configuration holds a supervisor-only key, it can open
+    // neither the vault nor a key file (Landlock, `sec::landlock`).
+    let confined = crate::sec::landlock::confine(&mut cmd)?;
 
     // Spawn, retrying a transient `EAGAIN` — the kernel refusing a `fork` under
     // process/memory pressure (a wide fan-out starting many subagents at once, or
@@ -202,20 +206,8 @@ pub fn spawn(
     // Deliver the spawn payload as the first control frame.
     let spawn = ControlMsg::Spawn(Box::new(payload.clone()));
     tap(node, "spawn", || {
-        let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-        for (k, v) in cmd.get_envs() {
-            let Some(k) = k.to_str() else { continue };
-            match v.and_then(|v| v.to_str()) {
-                Some(v) => {
-                    env.insert(k.to_string(), v.to_string());
-                }
-                // Removed from the child's environment.
-                None => {
-                    env.remove(k);
-                }
-            }
-        }
-        serde_json::json!({"payload": serde_json::to_value(&spawn).unwrap_or_default(), "env": env})
+        serde_json::json!({"payload": serde_json::to_value(&spawn).unwrap_or_default(), "env": env,
+                           "landlock": confined})
     });
     frame::write_frame(&mut writer, &spawn)?;
 

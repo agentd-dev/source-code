@@ -154,6 +154,7 @@ impl Runtime {
         };
         self.settings_doc = loaded.doc;
         crate::sec::harden::set_reserved(self.settings.supervisor_only_env());
+        crate::sec::harden::set_passthrough(self.settings.spawn.env_passthrough.clone());
         Ok(self.commit_reload(&old, staged))
     }
 

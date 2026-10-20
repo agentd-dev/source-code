@@ -492,6 +492,9 @@ pub struct Runtime {
     /// Shared, so the supervisor's Company Sessions keep the User's records
     /// from the threads that open them (`companies::user_id`).
     pub(crate) durable: Arc<Durable>,
+    /// The hash-chained audit log (`observability.audit.chain`), when set:
+    /// every audit record is appended to it.
+    pub(crate) audit_chain: Option<Arc<crate::obs::chain::Chain>>,
     pub(crate) mcp: BTreeMap<String, Arc<McpClient>>,
     /// The Personal Agent at the declared Companies (RFC 0047): `None` when
     /// none is declared.

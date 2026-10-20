@@ -6,6 +6,9 @@
 //!
 //! Invariant: **stdout is the agent's result; stderr is all telemetry.**
 
+// The hash-chained audit log `observability.audit.chain` names (RFC 0044
+// P2a): dependency-free, on the hand-rolled SHA-256.
+pub mod chain;
 pub mod health;
 pub mod log;
 // W3C trace-context *propagation* is default-on and dependency-free (a few

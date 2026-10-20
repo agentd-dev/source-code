@@ -177,6 +177,9 @@ pub struct Settings {
     /// model may instantiate (filling declared `params` only), section-wide
     /// defaults, and the freeform-spawn switch.
     pub subagents: Subagents,
+    /// What every child process — turn worker, subagent, think child,
+    /// instance — is started with beyond its allow-listed environment.
+    pub spawn: Spawn,
     pub a2a: A2a,
     /// The inbound webhook HTTP surface: a dedicated listener for `webhook`
     /// start nodes and `wait: {on: webhook}` callbacks.
@@ -188,6 +191,17 @@ pub struct Settings {
     pub security: Security,
     /// Who work is done ON BEHALF OF, and what travels with it.
     pub identity: Identity,
+}
+
+/// `spawn` (RFC 0044 §5.13 item 1, P2).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Spawn {
+    /// Environment variables every child is started with besides the
+    /// baseline and what its own spawn names (`sec::harden`): a name, or a
+    /// `PREFIX*` pattern. A variable a supervisor-only secret is read from
+    /// is never passed, and naming one is refused.
+    pub env_passthrough: Vec<String>,
 }
 
 /// Recipient-key material for encrypted instruction envelopes.
@@ -1222,6 +1236,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // A document REFERENCES a template (`:::agent template=…`, the `compose`
     // family); defining one is the operator's.
     "subagents",
+    // What every child process is started with beyond its allow-listed
+    // environment (RFC 0044 §5.13): a document that set it could hand its
+    // turns the variables the operator kept from them.
+    "spawn",
     // Telemetry. `log_content` puts conversation TEXT into the operator's log
     // pipeline, `otel.endpoint` is the one egress `closed` deliberately does
     // not cover, `audit` is the record of what happened, and the rest name
@@ -4228,6 +4246,41 @@ pub struct Audit {
     /// sink; audit records are otherwise written and then unreadable, since
     /// `Kind::Audit` is deliberately not manifest-indexed.
     pub stream: Option<String>,
+    /// The hash-chained audit log (RFC 0044 P2a): every audit record, and
+    /// the tombstone register's anchor, appended to a file the supervisor
+    /// alone writes, verified at every start. Written whatever `sink` says.
+    pub chain: Option<AuditChain>,
+}
+
+/// `observability.audit.chain`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditChain {
+    /// The log's path; closed segments are kept beside it.
+    pub path: String,
+    /// How large the open segment grows before it is closed (`64MiB`).
+    #[serde(default)]
+    pub rotate_at: Option<String>,
+    /// How long a closed segment is kept, by its last record; default 400d.
+    #[serde(default)]
+    pub retention: Option<Dur>,
+}
+
+impl AuditChain {
+    /// The chain's options, `rotate_at` read as a size.
+    pub fn options(&self) -> Result<crate::obs::chain::Options, String> {
+        Ok(crate::obs::chain::Options {
+            path: std::path::PathBuf::from(&self.path),
+            rotate_at: match &self.rotate_at {
+                Some(s) => crate::runtime::pressure::parse_bytes(s)
+                    .map_err(|e| format!("observability.audit.chain.rotate_at: {e}"))?,
+                None => crate::obs::chain::DEFAULT_ROTATE_AT,
+            },
+            retention: self
+                .retention
+                .map_or(crate::obs::chain::DEFAULT_RETENTION, |d| d.0),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -4667,6 +4720,60 @@ impl Settings {
         crate::sec::secret::secret_env_names(&Value::Array(held))
             .into_iter()
             .collect()
+    }
+
+    /// What no child may open (RFC 0044 P2a, `sec::landlock`), where the
+    /// configuration holds a supervisor-only key — a delegation is declared,
+    /// or the companies preview's seal key is: the file store's root, where
+    /// the vault is; every `{{secret-file:…}}` a supervisor-only secret is
+    /// read from; and the audit chain with its closed segments. With no such
+    /// key, the audit chain alone, when it is set; else nothing.
+    pub fn supervisor_only_paths(&self) -> Vec<crate::sec::landlock::Protected> {
+        use crate::sec::landlock::Protected;
+        let mut out = Vec::new();
+        let keyed = !self.identity.providers.is_empty()
+            || delegation::delegated_servers(self).next().is_some()
+            || self.security.companies.seal_key.is_some();
+        if keyed {
+            if self.store.kind == StoreKind::File {
+                out.push(Protected {
+                    path: file_store_root(&self.store),
+                    with_suffixes: false,
+                });
+            }
+            let mut refs = delegation::reserved_refs(self);
+            if let Some(Secret(s)) = &self.security.companies.seal_key {
+                refs.extend(
+                    crate::sec::secret::refs_of(s)
+                        .iter()
+                        .map(|r| crate::sec::secret::canonical_ref(r)),
+                );
+            }
+            for r in refs {
+                if let Some(p) = r.strip_prefix("secret-file:") {
+                    out.push(Protected {
+                        path: std::path::PathBuf::from(p),
+                        with_suffixes: false,
+                    });
+                }
+            }
+            // The external signer's socket: a child can still connect to
+            // it (no Landlock right covers that), and can neither remove it
+            // nor bind another in its place.
+            if let Some(sg) = self.identity.delegation.external() {
+                out.push(Protected {
+                    path: std::path::PathBuf::from(&sg.socket),
+                    with_suffixes: false,
+                });
+            }
+        }
+        if let Some(c) = &self.observability.audit.chain {
+            out.push(Protected {
+                path: std::path::PathBuf::from(&c.path),
+                with_suffixes: true,
+            });
+        }
+        out
     }
 
     /// Type a settings document. `source` names it in errors.
@@ -7203,7 +7310,9 @@ fn validate_client_auth(auth: &Auth, c: &ClientAuth, ctx: &str) -> Vec<String> {
     }
     match c.method {
         ClientAuthMethod::PrivateKeyJwt => {
-            if c.key.is_none() {
+            // A delegated server's key is `delegation::validate`'s: under
+            // `key_custody: external` the signer holds it and none is given.
+            if c.key.is_none() && auth.grant != Some(OAuthGrant::IdJag) {
                 out.push(format!(
                     "{ctx}: auth.client_auth private_key_jwt needs `key` (a {{{{secret-file:…}}}} PKCS#8 key)"
                 ));
@@ -7676,6 +7785,61 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 ),
             ),
             Some(_) => {}
+        }
+    }
+    // `spawn.env_passthrough`: names or patterns, never everything, and never
+    // a variable only the supervisor reads.
+    let reserved = s.supervisor_only_env();
+    for (i, p) in s.spawn.env_passthrough.iter().enumerate() {
+        let at = format!("spawn.env_passthrough[{i}]");
+        let body = p.strip_suffix('*').unwrap_or(p);
+        if body.is_empty() || body.contains('*') || body.contains('=') {
+            err(
+                &mut d,
+                format!(
+                    "{at}: {p:?} is not a variable name or a `PREFIX*` pattern (a passthrough of everything is the parent's whole environment, which no child gets)"
+                ),
+            );
+            continue;
+        }
+        if let Some(r) = reserved.iter().find(|r| crate::sec::harden::matches(p, r)) {
+            err(
+                &mut d,
+                format!(
+                    "{at}: {p:?} names {r}, which a supervisor-only secret is read from and no child is started with"
+                ),
+            );
+        }
+    }
+    if let Some(c) = &s.observability.audit.chain {
+        if !std::path::Path::new(&c.path).is_absolute() {
+            err(
+                &mut d,
+                format!(
+                    "observability.audit.chain.path {:?} is not an absolute path",
+                    c.path
+                ),
+            );
+        }
+        match c.options() {
+            Err(e) => err(&mut d, e),
+            Ok(o) if o.rotate_at < 64 << 10 => err(
+                &mut d,
+                "observability.audit.chain.rotate_at: at least 64KiB".into(),
+            ),
+            Ok(_) => {}
+        }
+        if c.retention.is_some_and(|r| r.0.is_zero()) {
+            err(
+                &mut d,
+                "observability.audit.chain.retention: 0 would delete every closed segment".into(),
+            );
+        }
+        if matches!(s.store.kind, StoreKind::None | StoreKind::Memory) {
+            d.warnings.push(format!(
+                "observability.audit.chain: store.kind {} keeps the chain's head only while this process runs, so records cut from the chain's end while agentd is down are not caught — use store.kind file, mcp or http",
+                if s.store.kind == StoreKind::None { "none" } else { "memory" }
+            ));
         }
     }
 
@@ -10292,6 +10456,11 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "observability.health_file",
     "observability.events_ring",
     "observability.traceparent",
+    // The hash-chained audit log (RFC 0044 P2a) is opened and verified at
+    // start, and the tombstone register is anchored in it: moving it under
+    // a running process would start a second chain beside the first.
+    // Restart-only INSIDE the reloadable `observability.audit`.
+    "observability.audit.chain",
     "security",
     // The IdPs a grant is held at and the key it is sealed with (RFC 0044):
     // a grant sealed under one key, or bound to one issuer, is never moved
@@ -10409,6 +10578,8 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "store.retention",
     "store.timeout",
     "streams",
+    // Read at every spawn; the reload sets it as it sets the reserved names.
+    "spawn.env_passthrough",
     "subagents.allow_freeform",
     "subagents.defaults",
     "subagents.templates",
@@ -10449,7 +10620,8 @@ pub const RELOADABLE_PATHS: &[&str] = &[
 /// classification guardrail matches by prefix and cannot see the difference —
 /// so each such path is declared here, and the guardrail checks that the only
 /// ones nested this way are the ones somebody meant.
-pub const RESTART_ONLY_WITHIN_RELOADABLE: &[&str] = &["agent.instruction.trust"];
+pub const RESTART_ONLY_WITHIN_RELOADABLE: &[&str] =
+    &["agent.instruction.trust", "observability.audit.chain"];
 
 /// `doc` with the instruction's own `:::!config` under it, the operator's
 /// value standing where both set a path — the layers `settings` was typed
@@ -10899,7 +11071,8 @@ mod tests {
                         || p.ends_with("every")
                         || p.ends_with("_cap")
                         || p.ends_with("_interval")
-                        || p.ends_with("_age") =>
+                        || p.ends_with("_age")
+                        || p == "observability.audit.chain.retention" =>
                     {
                         json!("10s")
                     }
@@ -11026,6 +11199,12 @@ mod tests {
                             .filter(|a| !a.is_empty())
                         {
                             Some(vs) => vs[0].clone(),
+                            // …and an integer-typed one (`signer.uid`).
+                            None if props.get(r).and_then(|f| f.get("type"))
+                                == Some(&json!("integer")) =>
+                            {
+                                json!(1)
+                            }
                             None => match r {
                                 "provider" | "base_url" | "url" => json!("https://x.example"),
                                 _ => json!("x"),
@@ -13719,6 +13898,111 @@ mod tests {
             Ok(_) => String::new(),
             Err(e) => e.to_string(),
         }
+    }
+
+    /// `spawn.env_passthrough` takes names and `PREFIX*` patterns, never
+    /// everything and never a variable a supervisor-only secret is read
+    /// from; `observability.audit.chain` an absolute path, a size of at
+    /// least 64KiB and a retention above zero, and one whose head no
+    /// durable store keeps warned of (RFC 0044 P2a).
+    #[test]
+    fn a_passthrough_and_an_audit_chain_are_held_to_their_rules() {
+        let ok = "spawn: {env_passthrough: [MY_VAR, \"MY_PREFIX_*\"]}\n\
+                  observability: {audit: {chain: {path: /var/lib/agentd/audit/audit.log, rotate_at: 1MiB, retention: 30d}}}\n";
+        assert_eq!(load_errors(ok), "", "the rules' own example loads");
+        for (yaml, says) in [
+            (
+                "spawn: {env_passthrough: [\"*\"]}\n",
+                "is not a variable name",
+            ),
+            (
+                "spawn: {env_passthrough: [\"A*B\"]}\n",
+                "is not a variable name",
+            ),
+            (
+                "spawn: {env_passthrough: [\"A=B\"]}\n",
+                "is not a variable name",
+            ),
+            (
+                "observability: {audit: {chain: {path: audit.log}}}\n",
+                "is not an absolute path",
+            ),
+            (
+                "observability: {audit: {chain: {path: /a/audit.log, rotate_at: 1KiB}}}\n",
+                "at least 64KiB",
+            ),
+            (
+                "observability: {audit: {chain: {path: /a/audit.log, rotate_at: lots}}}\n",
+                "rotate_at",
+            ),
+            (
+                "observability: {audit: {chain: {path: /a/audit.log, retention: 0s}}}\n",
+                "would delete every closed segment",
+            ),
+        ] {
+            let e = load_errors(yaml);
+            assert!(e.contains(says), "{yaml}: want {says:?} in {e}");
+        }
+        // A chain whose head no durable store keeps is said.
+        let warned = |store: &str| {
+            load_doc(&format!(
+                "store: {{kind: {store}}}
+{ok}"
+            ))
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains("keeps the chain's head only while this process runs"))
+        };
+        assert!(warned("memory") && warned("none"));
+        assert!(!warned("file"));
+    }
+
+    /// A passthrough that names the companies preview's seal key variable —
+    /// a supervisor-only secret — is refused, by name or by pattern.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn a_passthrough_never_reaches_a_supervisor_only_variable() {
+        crate::sec::secret::set_prompted("PASSTHROUGH_TEST_SEAL", "ab".repeat(32));
+        for p in ["PASSTHROUGH_TEST_SEAL", "PASSTHROUGH_TEST_*"] {
+            let e = load_errors(&format!(
+                "security: {{companies: {{seal_key: \"{{{{secret:PASSTHROUGH_TEST_SEAL}}}}\"}}}}\nspawn: {{env_passthrough: [\"{p}\"]}}\n"
+            ));
+            assert!(e.contains("no child is started with"), "{p}: {e}");
+        }
+    }
+
+    /// What a worker is denied, from the configuration: nothing where no
+    /// supervisor-only key or audit chain is set; the chain alone where only
+    /// it is; with the companies preview's seal key, the file store's root,
+    /// the key file and the chain.
+    #[test]
+    fn the_paths_a_worker_is_denied_follow_the_keys() {
+        let doc = |extra: &str| {
+            Settings::from_document(
+                crate::config::yaml::parse(&format!(
+                    "store: {{kind: file, file: {{path: /srv/state}}}}\n{extra}"
+                ))
+                .unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        assert!(doc("").supervisor_only_paths().is_empty());
+        let chain = "observability: {audit: {chain: {path: /srv/audit/audit.log}}}\n";
+        let only = doc(chain).supervisor_only_paths();
+        assert_eq!(only.len(), 1);
+        assert!(only[0].with_suffixes, "its closed segments too");
+        let keyed = doc(&format!(
+            "{chain}security: {{companies: {{seal_key: \"{{{{secret-file:/srv/keys/seal}}}}\"}}}}\n"
+        ))
+        .supervisor_only_paths();
+        let paths: Vec<String> = keyed.iter().map(|p| p.path.display().to_string()).collect();
+        assert_eq!(
+            paths,
+            ["/srv/state", "/srv/keys/seal", "/srv/audit/audit.log"],
+            "{paths:?}"
+        );
     }
 
     /// A loopback TCP listener with no credential makes every local caller

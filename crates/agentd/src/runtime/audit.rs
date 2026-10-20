@@ -9,7 +9,9 @@
 //! a request from another trace caused it, as the answer to a gate does,
 //! emitted to the configured sinks: `log` (a closed-vocabulary `audit` log line)
 //! and/or `store` (a durable, append-only `Kind::Audit` record, ULID-keyed — never
-//! CAS'd, never listed, so it cannot be rewritten). Audit is security telemetry:
+//! CAS'd, never listed, so it cannot be rewritten) — and, with
+//! `observability.audit.chain`, a line of the hash-chained log
+//! ([`crate::obs::chain`]), whatever the sinks say. Audit is security telemetry:
 //! it answers "why did the agent do that, and on whose authority?".
 
 use crate::config::settings::AuditSink;
@@ -38,16 +40,67 @@ pub(crate) struct AuditEvent<'a> {
     pub link: Option<&'a crate::obs::trace::TraceContext>,
 }
 
+/// The record `ev` is, as every sink and the chain keep it: `trace` is the
+/// process's when the event names none.
+pub(crate) fn record_of(
+    instance: &str,
+    process: &crate::obs::trace::TraceContext,
+    ev: &AuditEvent<'_>,
+) -> Value {
+    let mut record = json!({
+        "ts": now_ms(),
+        "instance": instance,
+        "principal": ev.principal,
+        "role": ev.role,
+        "action": ev.action,
+        "target": ev.target,
+        "outcome": ev.outcome,
+        "request_id": ev.request_id,
+        "trace": ev.trace.unwrap_or(process).trace_id,
+    });
+    if let Some(sid) = ev.sid {
+        record["sid"] = json!(sid);
+    }
+    if let Some(link) = ev.link {
+        record["link"] = json!(link.traceparent());
+    }
+    record
+}
+
+/// Append `record` to the audit chain; the security records — every
+/// `delegation.*` one, the consent answers among them — flushed to the disk
+/// before this returns, so before the action they record goes on. The rest
+/// is flushed as the OS sees fit, and a cut tail of it is caught by the
+/// head the store keeps.
+pub(crate) fn chain_record(
+    chain: &crate::obs::chain::Chain,
+    record: Value,
+    log: &crate::obs::log::Logger,
+) {
+    let action = record["action"].as_str().unwrap_or_default().to_string();
+    let sync = action.starts_with("delegation.");
+    if let Err(e) = chain.append(record, sync) {
+        log.error("audit.chain.fail", json!({"action": action, "err": e}));
+    }
+}
+
 impl Runtime {
     /// Emit an audit event to the configured sinks. A no-op when no sink is
     /// configured (`observability.audit.sink`). Cheap on the common path.
     pub(crate) fn audit(&self, ev: AuditEvent<'_>) {
-        self.audit_mirrored(ev, true)
+        self.audit_to(ev, true, true)
+    }
+
+    /// [`Runtime::audit`] of a record already in the audit chain: a
+    /// delegation record, appended by the thread that made it.
+    #[cfg(feature = "xaa")]
+    pub(crate) fn audit_chained(&self, ev: AuditEvent<'_>) {
+        self.audit_to(ev, true, false)
     }
 
     /// [`Runtime::audit`], saying whether the event is also mirrored onto the
-    /// observation feed.
-    fn audit_mirrored(&self, ev: AuditEvent<'_>, mirror_to_feed: bool) {
+    /// observation feed and whether it is appended to the audit chain.
+    fn audit_to(&self, ev: AuditEvent<'_>, mirror_to_feed: bool, to_chain: bool) {
         // Mirror onto the observation feed as operator-visible `audit` events
         // when introspection is on — independent of the sinks, which stay the
         // durable/system record and are written either way.
@@ -72,28 +125,20 @@ impl Runtime {
         }
         #[cfg(not(feature = "a2a"))]
         let _ = mirror_to_feed;
-        let Some(sinks) = &self.settings.observability.audit.sink else {
-            return;
-        };
-        if sinks.is_empty() {
+        let sinks: &[AuditSink] = self
+            .settings
+            .observability
+            .audit
+            .sink
+            .as_deref()
+            .unwrap_or_default();
+        let chain = self.audit_chain.as_ref().filter(|_| to_chain);
+        if sinks.is_empty() && chain.is_none() {
             return;
         }
-        let mut record = json!({
-            "ts": now_ms(),
-            "instance": self.instance,
-            "principal": ev.principal,
-            "role": ev.role,
-            "action": ev.action,
-            "target": ev.target,
-            "outcome": ev.outcome,
-            "request_id": ev.request_id,
-            "trace": ev.trace.unwrap_or(&self.trace).trace_id,
-        });
-        if let Some(sid) = ev.sid {
-            record["sid"] = json!(sid);
-        }
-        if let Some(link) = ev.link {
-            record["link"] = json!(link.traceparent());
+        let record = record_of(&self.instance, &self.trace, &ev);
+        if let Some(chain) = chain {
+            chain_record(chain, record.clone(), &self.log);
         }
         if sinks.iter().any(|s| matches!(s, AuditSink::Log)) {
             // A single closed-vocabulary `audit` event (never content-suppressed —
@@ -150,7 +195,7 @@ impl Runtime {
             None => format!("a2a.{method}"),
         };
         let role = format!("{:?}", principal.role).to_lowercase();
-        self.audit_mirrored(
+        self.audit_to(
             AuditEvent {
                 action: &action,
                 target,
@@ -163,6 +208,7 @@ impl Runtime {
                 link,
             },
             mirror_to_feed(method, op, outcome),
+            true,
         );
     }
 }

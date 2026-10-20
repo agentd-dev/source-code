@@ -591,6 +591,14 @@ export const DOCS = [
     "blurb": "MCP revisions, capabilities, negotiation and the events agentd logs."
   },
   {
+    "slug": "external-signer",
+    "file": "docs/external-signer.md",
+    "title": "The external signer protocol",
+    "group": "reference",
+    "section": "protocols",
+    "blurb": "The unix-socket protocol a signer serves when it, not agentd, holds the delegation keys."
+  },
+  {
     "slug": "a2a-reference",
     "file": "docs/a2a-reference.md",
     "title": "A2A API reference",

@@ -152,6 +152,21 @@ pub fn run() -> i32 {
             return crate::exit::USAGE;
         }
     };
+    // A test hook (debug and `internal-mocks` builds only): each path a test
+    // names is opened here, by the worker's own process, and the outcome
+    // said on stderr as `test.worker_open` — so a test sees what a worker
+    // may read, not what the supervisor meant it to.
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    if let Ok(paths) = std::env::var("AGENTD_TEST_WORKER_OPEN") {
+        for p in paths.split(':').filter(|p| !p.is_empty()) {
+            let r = std::fs::read(p);
+            eprintln!(
+                "{}",
+                serde_json::json!({"event": "test.worker_open", "path": p, "opened": r.is_ok(),
+                                   "err": r.err().map(|e| e.to_string())})
+            );
+        }
+    }
     // Spans go where the operator configured, as the supervisor's own OTLP
     // logs do; the inherited environment variable is the fallback.
     crate::obs::otel::set_endpoint(payload.telemetry.otel_endpoint.clone());

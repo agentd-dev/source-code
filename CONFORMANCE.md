@@ -231,6 +231,11 @@ skip.
 | `ema/resource-metadata-confirms-the-pins` | a delegated server whose RFC 9728 metadata names another resource, or not the pinned authorization server, is refused (config) before anything is minted for it |
 | `ema/a-narrowed-template-narrows-the-grant` | after a restart under a template that allows less, a grant enrolled under more is held to it: scope_beyond_ceiling, delegation_not_permitted for a server it dropped |
 | `ema/enrolling-again-replaces-a-grant` | an expired grant, or one enrolled under a pin since changed, is replaced by signing in again: a new epoch, the new identity, the old refresh token revoked at the IdP |
+| `ema/keys-held-by-an-external-signer` | under key_custody external the IdP's and the authorization server's client assertions are signed by the external signer — each verifies with the public key it serves — and the refresh token is sealed under a data key the signer wraps: no key or seal key is configured, and no file of the store holds the refresh token |
+| `ema/signer-down-sends-nothing` | with the external signer down the daemon starts and says so, and a delegated call fails signer_unavailable before any request reaches the IdP or the authorization server |
+| `ema/rotation-kept-when-the-signer-fails` | under key_custody external, with a rotating IdP and a signer that fails right after it signed an IdP call's assertion, the rotated refresh token is kept — its data key was wrapped before the IdP was asked — so the next call presents it and completes, and the grant survives |
+| `ema/signer-of-another-uid-refused` | a signer socket whose peer is not the configured uid refuses the start (config), and the signer is sent nothing |
+| `ema/restored-vault-refused-by-the-audit-chain` | with observability.audit.chain set, a store restored from before a revocation — the grant and the register both — is refused as revoked at load through the register the chain anchors, so the person is not_enrolled and nothing is sent to the IdP; the enrolment, mint, revocation and register records are in the chain |
 | `ema/ema-declared-on-both-dialects` | the EMA extension is declared in initialize's capabilities at 2025-11-25, and in every request's _meta client capabilities at 2026-07-28 |
 
 ## Running it

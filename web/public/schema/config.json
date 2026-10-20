@@ -3642,6 +3642,13 @@
                 "integer"
               ]
             },
+            "key_custody": {
+              "description": "who holds the seal key and every private_key_jwt key under identity.providers and on a delegated server: agentd, from secret references (local, the default), or the external signer (external, with signer; the keys are then named by kid, and no key or seal_key is given)",
+              "enum": [
+                "local",
+                "external"
+              ]
+            },
             "liveness_interval": {
               "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
               "type": [
@@ -3656,6 +3663,42 @@
             "seal_key_previous": {
               "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment",
               "type": "string"
+            },
+            "signer": {
+              "additionalProperties": false,
+              "description": "the external signer (key_custody external; docs/external-signer.md): agentd signs client assertions and wraps each grant's data key through it, and never holds a private key or the key-encryption key",
+              "properties": {
+                "seal_key": {
+                  "description": "the signer's key-encryption key each grant's data key is wrapped under",
+                  "type": "string"
+                },
+                "seal_key_previous": {
+                  "description": "the key-encryption key before a rotation: unwraps, never wraps",
+                  "type": "string"
+                },
+                "socket": {
+                  "description": "the signer's unix socket, an absolute path",
+                  "type": "string"
+                },
+                "timeout": {
+                  "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                },
+                "uid": {
+                  "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "socket",
+                "uid",
+                "seal_key"
+              ],
+              "type": "object"
             },
             "templates": {
               "description": "who may enrol, for what; no matching template, no enrolment",
@@ -4516,6 +4559,31 @@
         "audit": {
           "additionalProperties": false,
           "properties": {
+            "chain": {
+              "additionalProperties": false,
+              "description": "the hash-chained audit log (RFC 0044 P2a): every audit record appended to a file only the supervisor writes, each line carrying the SHA-256 of the line before, verified from the oldest kept record to the head the store keeps at every start (a chain that does not hold refuses the start); the tombstone register is anchored in it. Written whatever sink says. Restart-only",
+              "properties": {
+                "path": {
+                  "description": "an absolute path; closed segments are kept beside it as <path>.<first seq>",
+                  "type": "string"
+                },
+                "retention": {
+                  "description": "how long a closed segment is kept after its last record (default 400d); each segment's header carries the register, so retention forgets no revocation",
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                },
+                "rotate_at": {
+                  "description": "the size the open segment is closed at (64MiB default, at least 64KiB)",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            },
             "sink": {
               "items": {
                 "enum": [
@@ -5100,6 +5168,20 @@
         "sources": {
           "items": {
             "$ref": "#/$defs/SkillSource"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "spawn": {
+      "additionalProperties": false,
+      "description": "what every child process — turn worker, subagent, think child, instance — is started with beyond its allow-listed environment: the baseline (PATH, HOME, TMPDIR, TZ, LANG, AGENTD_CRED_DIR, RUST_LOG, NO_PROXY, XDG_*, LC_*, SSL_CERT_*, OTEL_*, *_PROXY), the variables its own secret references and routed aws credentials read. Operator-only, reloadable",
+      "properties": {
+        "env_passthrough": {
+          "description": "variables every child also gets, each a name or a PREFIX* pattern; one a supervisor-only secret is read from is refused",
+          "items": {
+            "type": "string"
           },
           "type": "array"
         }

@@ -190,10 +190,17 @@ impl Provider {
 #[serde(deny_unknown_fields, default)]
 pub struct Delegation {
     /// 32 random bytes as a secret reference: every grant's refresh token is
-    /// sealed with it.
+    /// sealed with it. `key_custody: local` only.
     pub seal_key: Option<Secret>,
     /// The key before a rotation: read, never written with.
     pub seal_key_previous: Option<Secret>,
+    /// Who holds the seal key and every `private_key_jwt` key under
+    /// `identity.providers` and on a delegated server: the supervisor, read
+    /// from secret references (`local`, the default), or an external signer
+    /// it asks (`external`, with `signer`).
+    pub key_custody: KeyCustody,
+    /// The external signer, under `key_custody: external`.
+    pub signer: Option<SignerCfg>,
     /// The longest an access token is used, whatever the server says;
     /// default 60m.
     pub at_cache_cap: Option<Dur>,
@@ -206,7 +213,54 @@ pub struct Delegation {
     pub templates: Vec<Template>,
 }
 
+/// `identity.delegation.key_custody`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyCustody {
+    /// The keys are secret references the supervisor reads.
+    #[default]
+    Local,
+    /// An external signer holds them; agentd never does.
+    External,
+}
+
+/// `identity.delegation.signer`: the external signer (RFC 0044 P2a,
+/// `docs/external-signer.md`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SignerCfg {
+    /// The signer's unix socket, an absolute path.
+    pub socket: String,
+    /// The uid the signer process runs as: the socket's peer must be it.
+    pub uid: u32,
+    /// The bound on one request; default 5s.
+    #[serde(default)]
+    pub timeout: Option<Dur>,
+    /// The signer's key-encryption key each grant's data key is wrapped
+    /// under.
+    pub seal_key: String,
+    /// The key-encryption key before a rotation: unwraps, never wraps.
+    #[serde(default)]
+    pub seal_key_previous: Option<String>,
+}
+
+impl SignerCfg {
+    /// The signer client this names.
+    #[cfg(feature = "oauth")]
+    pub fn signer(&self) -> crate::sec::signer::Signer {
+        crate::sec::signer::Signer::new(&self.socket, self.uid, self.timeout.map(|d| d.0))
+    }
+}
+
 impl Delegation {
+    /// The signer every key is asked of, under `key_custody: external`.
+    pub fn external(&self) -> Option<&SignerCfg> {
+        match self.key_custody {
+            KeyCustody::External => self.signer.as_ref(),
+            KeyCustody::Local => None,
+        }
+    }
+
     pub fn at_cache_cap(&self) -> std::time::Duration {
         self.at_cache_cap.map_or(AT_CACHE_CAP, |d| d.0)
     }
@@ -653,12 +707,40 @@ fn check_client_secrets(
     }
 }
 
-/// Whether a client authentication proves anything: a key, or a secret.
-fn confidential(client_auth: Option<&ClientAuth>, client_secret: Option<&Secret>) -> bool {
+/// Whether a client authentication proves anything: a key — one the
+/// signer holds, under `key_custody: external` — or a secret.
+fn confidential(
+    client_auth: Option<&ClientAuth>,
+    client_secret: Option<&Secret>,
+    external: bool,
+) -> bool {
     match client_auth.map(|c| c.method) {
         None => client_secret.is_some(),
-        Some(ClientAuthMethod::PrivateKeyJwt) => client_auth.is_some_and(|c| c.key.is_some()),
+        Some(ClientAuthMethod::PrivateKeyJwt) => {
+            client_auth.is_some_and(|c| c.key.is_some() || (external && c.kid.is_some()))
+        }
         Some(_) => client_secret.is_some(),
+    }
+}
+
+/// A `private_key_jwt` key as its custody gives it: a `key` reference under
+/// `local`; under `external`, no key at all, and a `kid` naming the
+/// signer's key.
+fn check_custody(at: &str, c: Option<&ClientAuth>, external: bool, err: &mut dyn FnMut(String)) {
+    let Some(c) = c.filter(|c| c.method == ClientAuthMethod::PrivateKeyJwt) else {
+        return;
+    };
+    match (external, c.key.is_some(), c.kid.is_some()) {
+        (true, true, _) => err(format!(
+            "{at}.client_auth.key: under identity.delegation.key_custody external the signer holds the key — name it by kid, and give no key"
+        )),
+        (true, false, false) => err(format!(
+            "{at}.client_auth.kid is required under identity.delegation.key_custody external: the signer's key id, which the assertion names"
+        )),
+        (false, false, _) => err(format!(
+            "{at}.client_auth: private_key_jwt needs `key` (a {{{{secret-file:…}}}} PKCS#8 key)"
+        )),
+        _ => {}
     }
 }
 
@@ -673,6 +755,8 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         return;
     }
     let mut warn = Vec::new();
+    let dl = &s.identity.delegation;
+    let external = dl.key_custody == KeyCustody::External;
     // The providers.
     for (name, p) in &s.identity.providers {
         let at = format!("identity.providers.{name}");
@@ -692,11 +776,9 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         {
             err(format!("{at}.jwks_uri {j:?} is not an https:// URL"));
         }
+        check_custody(&at, p.client_auth.as_ref(), external, &mut err);
         if let Some(c) = &p.client_auth {
             match c.method {
-                ClientAuthMethod::PrivateKeyJwt if c.key.is_none() => err(format!(
-                    "{at}.client_auth: private_key_jwt needs `key` (a {{{{secret-file:…}}}} PKCS#8 key)"
-                )),
                 ClientAuthMethod::PrivateKeyJwt if p.client_secret.is_some() => err(format!(
                     "{at}: client_secret beside a key-based client_auth — say one"
                 )),
@@ -711,7 +793,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 _ => {}
             }
         }
-        if !confidential(p.client_auth.as_ref(), p.client_secret.as_ref()) {
+        if !confidential(p.client_auth.as_ref(), p.client_secret.as_ref(), external) {
             err(format!(
                 "{at}: a public client cannot exchange for an ID-JAG (ID-JAG §9.1) — give it client_auth with a key, or a client_secret"
             ));
@@ -740,7 +822,50 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
     }
     // The delegation section.
-    let dl = &s.identity.delegation;
+    match (external, &dl.signer) {
+        (true, None) => err(
+            "identity.delegation.key_custody external needs identity.delegation.signer {socket, uid, seal_key}"
+                .into(),
+        ),
+        (false, Some(_)) => err(
+            "identity.delegation.signer is read under key_custody: external alone — say key_custody: external, or drop the signer"
+                .into(),
+        ),
+        (true, Some(sg)) => {
+            if !std::path::Path::new(&sg.socket).is_absolute() {
+                err(format!(
+                    "identity.delegation.signer.socket {:?} is not an absolute path to the signer's unix socket",
+                    sg.socket
+                ));
+            }
+            // SAFETY: geteuid has no failure mode.
+            if sg.uid == unsafe { libc::geteuid() } {
+                warn.push(format!(
+                    "identity.delegation.signer.uid {} is agentd's own: the peer check cannot tell the signer from a process of agentd's uid, which can also read a same-uid signer's memory and key files — run the signer as another uid",
+                    sg.uid
+                ));
+            }
+            if let Some(t) = sg.timeout
+                && (t.0.is_zero() || t.0 > std::time::Duration::from_secs(60))
+            {
+                err("identity.delegation.signer.timeout: between 1ms and 60s".into());
+            }
+            if sg.seal_key.trim().is_empty() || sg.seal_key_previous.as_deref() == Some(sg.seal_key.as_str()) {
+                err("identity.delegation.signer.seal_key names the signer's key-encryption key, and seal_key_previous another one".into());
+            }
+            for (field, k) in [
+                ("seal_key", &dl.seal_key),
+                ("seal_key_previous", &dl.seal_key_previous),
+            ] {
+                if k.is_some() {
+                    err(format!(
+                        "identity.delegation.{field}: under key_custody external the signer holds the key-encryption key — name it as identity.delegation.signer.{field}, and give no key"
+                    ));
+                }
+            }
+        }
+        (false, None) => {}
+    }
     for (field, k) in [
         ("identity.delegation.seal_key", &dl.seal_key),
         (
@@ -907,7 +1032,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                     .into(),
             );
         }
-        if dl.seal_key.is_none() {
+        if dl.seal_key.is_none() && !external {
             err("grant: id_jag needs identity.delegation.seal_key: the refresh tokens are sealed with it".into());
         }
         // Who may answer: a listener that authenticates its callers — a
@@ -996,7 +1121,13 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 "{at}.auth.client_id is required: agentd's client at the server's authorization server, which the ID-JAG names"
             ));
         }
-        if !confidential(a.client_auth.as_ref(), a.client_secret.as_ref()) {
+        check_custody(
+            &format!("{at}.auth"),
+            a.client_auth.as_ref(),
+            external,
+            &mut err,
+        );
+        if !confidential(a.client_auth.as_ref(), a.client_secret.as_ref(), external) {
             err(format!(
                 "{at}.auth: a public client cannot redeem an ID-JAG (ID-JAG §9.1) — client_auth with a key, or a client_secret"
             ));
@@ -1172,7 +1303,11 @@ mod tests {
     /// load's error, or nothing when it loads.
     #[cfg(feature = "xaa")]
     fn load_error(edit: &dyn Fn(String) -> String) -> String {
-        const BASE: &str = r#"store: {kind: memory}
+        loaded(edit).err().unwrap_or_default()
+    }
+
+    #[cfg(feature = "xaa")]
+    const BASE: &str = r#"store: {kind: memory}
 a2a:
   listen: "unix://__D__/a.sock"
   principals:
@@ -1204,6 +1339,10 @@ mcp:
         client_id: agentd-at-linear
         client_auth: {method: private_key_jwt, key: "{{secret-file:__D__/ras.pem}}", kid: ras-1}
 "#;
+
+    /// [`load_error`]'s configuration as `edit` rewrites it, loaded.
+    #[cfg(feature = "xaa")]
+    fn loaded(edit: &dyn Fn(String) -> String) -> Result<crate::config::settings::Loaded, String> {
         let dir = tempfile::tempdir().unwrap();
         for f in ["idp.pem", "ras.pem", "seal"] {
             std::fs::write(dir.path().join(f), "x").unwrap();
@@ -1211,13 +1350,103 @@ mcp:
         let yaml = edit(BASE.to_string()).replace("__D__", &dir.path().display().to_string());
         let path = dir.path().join("c.yaml");
         std::fs::write(&path, yaml).unwrap();
-        match crate::config::settings::load(
-            &["--config".to_string(), path.display().to_string()],
-            &[],
-        ) {
-            Ok(_) => String::new(),
-            Err(e) => e.to_string(),
+        crate::config::settings::load(&["--config".to_string(), path.display().to_string()], &[])
+            .map(|(l, _)| l)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Under `key_custody: external` the signer holds every key: the
+    /// configuration names them by `kid` and gives no key and no seal key,
+    /// and the signer is a socket by absolute path; under `local`, a signer
+    /// is refused as unread (RFC 0044 P2a).
+    #[cfg(feature = "xaa")]
+    #[test]
+    fn the_keys_are_held_as_their_custody_says() {
+        if !cfg!(feature = "a2a") {
+            return;
         }
+        let external = |y: String| {
+            y.replace(
+                "    seal_key: \"{{secret-file:__D__/seal}}\"\n",
+                "    key_custody: external\n    signer: {socket: \"__D__/signer.sock\", uid: 990, seal_key: vault-1}\n",
+            )
+            .replace(", key: \"{{secret-file:__D__/idp.pem}}\"", "")
+            .replace(", key: \"{{secret-file:__D__/ras.pem}}\"", "")
+        };
+        assert_eq!(load_error(&external), "", "the external custody loads");
+        type Case = (&'static str, Box<dyn Fn(String) -> String>, &'static str);
+        let cases: Vec<Case> = vec![
+            (
+                "a key beside the signer",
+                Box::new(move |y| {
+                    external(y).replace(
+                        "kid: idp-1",
+                        "key: \"{{secret-file:__D__/idp.pem}}\", kid: idp-1",
+                    )
+                }),
+                "the signer holds the key",
+            ),
+            (
+                "no kid",
+                Box::new(move |y| external(y).replace(", kid: ras-1", "")),
+                "kid is required under identity.delegation.key_custody external",
+            ),
+            (
+                "a seal key beside the signer",
+                Box::new(move |y| {
+                    external(y).replace(
+                        "    key_custody: external\n",
+                        "    key_custody: external\n    seal_key: \"{{secret-file:__D__/seal}}\"\n",
+                    )
+                }),
+                "name it as identity.delegation.signer.seal_key",
+            ),
+            (
+                "no signer",
+                Box::new(move |y| {
+                    external(y).replace(
+                        "    signer: {socket: \"__D__/signer.sock\", uid: 990, seal_key: vault-1}\n",
+                        "",
+                    )
+                }),
+                "needs identity.delegation.signer",
+            ),
+            (
+                "a relative socket",
+                Box::new(move |y| external(y).replace("\"__D__/signer.sock\"", "signer.sock")),
+                "is not an absolute path",
+            ),
+            (
+                "a signer under local custody",
+                Box::new(|y| {
+                    y.replace(
+                        "  delegation:\n",
+                        "  delegation:\n    signer: {socket: /run/s.sock, uid: 990, seal_key: vault-1}\n",
+                    )
+                }),
+                "is read under key_custody: external alone",
+            ),
+        ];
+        for (what, edit, says) in cases {
+            let e = load_error(&edit);
+            assert!(e.contains(says), "{what}: want {says:?} in:\n{e}");
+        }
+        // A signer of agentd's own uid loads, and is said; the signer's
+        // socket is among what a child is denied.
+        let same = |uid: u32| {
+            let l = loaded(&|y| external(y).replace("uid: 990", &format!("uid: {uid}"))).unwrap();
+            let warned = l.warnings.iter().any(|w| w.contains("is agentd's own"));
+            let denied = l
+                .settings
+                .supervisor_only_paths()
+                .iter()
+                .any(|p| p.path.ends_with("signer.sock"));
+            (warned, denied)
+        };
+        // SAFETY: geteuid has no failure mode.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(same(me), (true, true), "agentd's own uid");
+        assert_eq!(same(me.wrapping_add(1)), (false, true), "another uid");
     }
 
     /// Every rule a delegated server is held to at load refuses what it

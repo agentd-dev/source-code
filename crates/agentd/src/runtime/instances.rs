@@ -127,6 +127,15 @@ impl Runtime {
                 "subagent.run refused: params for template '{tname}' introduced directive machinery"
             ));
         }
+        // A param is data, and names no credential: folded into the child's
+        // configuration, a secret reference would have the child resolve it,
+        // and be started with the variable it names (`sec::harden`), at its
+        // caller's choice.
+        if params.values().any(names_a_secret) {
+            return err(format!(
+                "subagent.run refused: a param for template '{tname}' names a secret ({{{{secret:…}}}} or {{{{secret-file:…}}}}); a param is data, and names no credential"
+            ));
+        }
         // A child reports home over its `parent` peer; one that cannot be
         // named there would run its work and then have every `_instance.*`
         // report refused, leaving a sync spawn parked until its timeout.
@@ -1307,11 +1316,14 @@ impl Runtime {
     }
 }
 
-/// The instance daemon's command: same binary, `--config <path>`, config-alias
-/// env scrubbed (the composed file is the child's whole config; only the
-/// intelligence family passes through for credentials), own process group,
-/// template rlimits, stdout and stderr to `log_file` — and no other
-/// descriptor the process holds, however the process was started.
+/// The instance daemon's command: same binary, `--config <path>`, its
+/// environment the allow-list (`sec::harden`: the baseline, the variables
+/// the composed file's secret references and `aws` credentials read, the
+/// intelligence family's config aliases for credentials, the operator's
+/// `spawn.env_passthrough` — the composed file is the child's whole config),
+/// own process group, template rlimits, stdout and stderr to `log_file` —
+/// and no other descriptor the process holds, however the process was
+/// started.
 ///
 /// `delivered` is the instruction prose the composed config carries, which
 /// this parent already delivered: its digest rides beside the child marker so
@@ -1331,6 +1343,11 @@ fn instance_command(
             log_file.try_clone().map_err(|e| e.to_string())?,
         ))
         .stderr(std::process::Stdio::from(log_file));
+    let composed: Value = std::fs::read(config_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let mut wanted = crate::sec::harden::wanted_by(&composed);
     for (k, _) in std::env::vars() {
         let alias = k.starts_with(crate::config::paths::ENV_PREFIX);
         // The intelligence credentials ride the environment (a composed file
@@ -1340,14 +1357,10 @@ fn instance_command(
         let choice = k.ends_with("_INTELLIGENCE_MODEL")
             || k.contains("_INTELLIGENCE_MODELS_")
             || k.contains("_INTELLIGENCE_ROLES");
-        let keep = k.contains("INTELLIGENCE") && !choice;
-        if alias && !keep {
-            cmd.env_remove(&k);
+        if alias && k.contains("INTELLIGENCE") && !choice {
+            wanted.insert(k);
         }
     }
-    // An instance is a supervisor of its own, and is handed none of this
-    // one's supervisor-only secrets.
-    crate::sec::harden::strip(&mut cmd);
     cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
     cmd.env(
         crate::supervisor::reap::PARENT_PID_ENV,
@@ -1391,7 +1404,30 @@ fn instance_command(
     // An instance is handed its log and nothing else: every descriptor
     // from 3 up is marked.
     crate::signals::pass_only_stdio(&mut cmd);
+    // An instance is a supervisor of its own, and is handed none of this
+    // one's supervisor-only secrets, nor any variable outside the
+    // allow-list — and, where this configuration holds a supervisor-only
+    // key, it opens neither the vault nor a key file. Its own directory —
+    // its config, log, socket and store, under this store's root when it is
+    // durable — stays its own.
+    crate::sec::harden::confine(&mut cmd, &wanted);
+    let own: Vec<std::path::PathBuf> = config_path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .into_iter()
+        .collect();
+    crate::sec::landlock::confine_beside(&mut cmd, &own).map_err(|e| e.to_string())?;
     Ok(cmd)
+}
+
+/// Whether `v` spells a secret reference anywhere.
+fn names_a_secret(v: &Value) -> bool {
+    match v {
+        Value::String(s) => crate::sec::secret::has_secret_ref(s),
+        Value::Array(a) => a.iter().any(names_a_secret),
+        Value::Object(o) => o.values().any(names_a_secret),
+        _ => false,
+    }
 }
 
 /// Instance rlimits: `{memory, cpu}` only (compile enforced it; parse here).

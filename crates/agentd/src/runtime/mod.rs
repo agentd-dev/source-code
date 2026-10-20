@@ -138,6 +138,28 @@ fn resolve_verify_key(
     None
 }
 
+/// Where the store keeps the audit chain's head.
+const AUDIT_CHAIN_HEAD: &str = "chain-head";
+
+/// Open the audit chain `c` names against the head `durable` keeps, and
+/// keep each new head there.
+fn open_audit_chain(
+    c: &crate::config::settings::AuditChain,
+    durable: &Arc<Durable>,
+) -> Result<(crate::obs::chain::Chain, crate::obs::chain::Opened), String> {
+    let head = durable
+        .get(Kind::Audit, AUDIT_CHAIN_HEAD)
+        .map_err(|e| format!("audit chain: the store's head: {e}"))?
+        .and_then(|e| serde_json::from_value(e.state).ok());
+    let store = Arc::clone(durable);
+    let sink: crate::obs::chain::HeadSink = Box::new(move |h| {
+        if let Ok(v) = serde_json::to_value(h) {
+            let _ = store.put(Kind::Audit, AUDIT_CHAIN_HEAD, v, None);
+        }
+    });
+    crate::obs::chain::Chain::open(c.options()?, head, Some(sink))
+}
+
 /// Check every secret reference in `doc`; prompt for the promptable ones when
 /// `--prompt-missing` was given and a controlling terminal exists; report
 /// whatever is still missing — all of it, together — and return the exit code
@@ -262,6 +284,26 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         log.warn("proc.harden", json!({"refused": refused}));
     }
     crate::sec::harden::set_reserved(settings.supervisor_only_env());
+    crate::sec::harden::set_passthrough(settings.spawn.env_passthrough.clone());
+    // Where the configuration holds a supervisor-only key, no child opens
+    // the vault, a key file or the audit chain (RFC 0044 P2a); a kernel
+    // without Landlock is said out loud, since the P1 residual holds there.
+    let protected = settings.supervisor_only_paths();
+    if !protected.is_empty() {
+        let denied: Vec<String> = protected
+            .iter()
+            .map(|p| p.path.display().to_string())
+            .collect();
+        match crate::sec::landlock::abi() {
+            Some(abi) => log.info("proc.landlock", json!({"abi": abi, "denied": denied})),
+            None => log.warn(
+                "proc.landlock.unavailable",
+                json!({"denied": denied,
+                       "msg": "this kernel has no Landlock: a child of this uid can read these paths (RFC 0044 invariant 1, the P1 residual)"}),
+            ),
+        }
+    }
+    crate::sec::landlock::set_protected(protected);
     // The entropy source every secret is minted from, opened before anything
     // listens: a host without one refuses to start rather than failing the
     // first request that needs a token, and no later mint needs a free fd.
@@ -513,18 +555,49 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         );
     }
 
-    // Acting for the enrolled person (RFC 0044): the grants loaded, nothing
-    // minted. A delegated server's tools come from its catalogue — the
-    // operator's file, or what its first delegated connection listed.
-    #[cfg(feature = "xaa")]
-    let delegation =
-        match crate::delegation::Delegation::build(&settings, Arc::clone(&durable), &log) {
-            Ok(d) => d,
+    // The hash-chained audit log (RFC 0044 P2a), verified from its oldest
+    // kept record to the head the store keeps, before anything is served or
+    // any grant loaded: a chain that does not hold is a refusal to start.
+    let audit_chain = match &settings.observability.audit.chain {
+        None => None,
+        Some(c) => match open_audit_chain(c, &durable) {
+            Ok((chain, opened)) => {
+                if let Some(n) = opened.repaired {
+                    log.warn(
+                        "audit.chain.repaired",
+                        json!({"path": c.path, "dropped_bytes": n}),
+                    );
+                }
+                log.info(
+                    "audit.chain.open",
+                    json!({"path": c.path, "records": opened.records, "segments": opened.segments,
+                           "retired": opened.retired, "head": chain.head().seq}),
+                );
+                Some(Arc::new(chain))
+            }
             Err(e) => {
                 log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
                 return crate::exit::USAGE;
             }
-        };
+        },
+    };
+
+    // Acting for the enrolled person (RFC 0044): the grants loaded, nothing
+    // minted. A delegated server's tools come from its catalogue — the
+    // operator's file, or what its first delegated connection listed.
+    #[cfg(feature = "xaa")]
+    let delegation = match crate::delegation::Delegation::build(
+        &settings,
+        Arc::clone(&durable),
+        audit_chain.clone(),
+        &log,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+            return crate::exit::USAGE;
+        }
+    };
     #[cfg(feature = "xaa")]
     if let Some(d) = &delegation {
         for s in settings
@@ -646,6 +719,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         instance: instance.clone(),
         run_id: run_id.clone(),
         durable,
+        audit_chain,
         #[cfg(feature = "companies")]
         companies,
         #[cfg(feature = "companies")]
@@ -1460,6 +1534,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     }
     rt.checkpoint(true);
     let code = rt.run_loop();
+    if let Some(chain) = &rt.audit_chain {
+        chain.flush_head();
+    }
     let _ = &rt.last_manifest_flush;
     // A job-shaped run prints its result on stdout, so it composes with a
     // shell pipeline the way any other one-shot command does.

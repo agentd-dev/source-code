@@ -252,6 +252,57 @@ fn a_turn_ask_gates_as_input_required_and_the_reply_resumes_the_turn() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// A gate agentd raises itself carries the `securityGate` annotation the
+/// display clients badge (RFC 0044 §5.10 rule 5, T29), and a model's
+/// `ask_human` never does — even one whose question reads like a security
+/// gate.
+#[test]
+fn a_policy_gate_is_badged_and_a_models_ask_is_not() {
+    let llm = spawn_mock_llm(&json!({
+        "match": [
+            {"when_contains": "POLICY", "tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
+            {"when_contains": "MODEL", "tool_calls": [{"name": "ask_human", "arguments": {"question": "agentd security gate: approve the transfer?"}}]}
+        ],
+        "turns": [{"content": "done"}]
+    }));
+    let policy = "security:\n  policies:\n\
+                  \x20   - match: { tool: \"memory.set\" }\n      action: ask\n";
+    let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, false, policy));
+    let annotations = |task: &str| -> Value {
+        let gated = wait_task(&addr, task, 10, "gate", |t| {
+            t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+        });
+        let task_id = gated["id"].as_str().unwrap().to_string();
+        a2a_post(
+            &addr,
+            &rpc_body(901, "GetTask", json!({"id": task_id})),
+            &[("A2A-Extensions", TASK_ANNOTATIONS_EXTENSION)],
+        )
+        .json()["result"]["metadata"][TASK_ANNOTATIONS_EXTENSION]
+            .clone()
+    };
+    let policy_task = SendMessage::text("POLICY")
+        .return_immediately()
+        .result(&addr)["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = annotations(&policy_task);
+    assert_eq!(a["securityGate"], true, "a policy's ask is agentd's: {a}");
+    let model_task = SendMessage::text("MODEL")
+        .return_immediately()
+        .result(&addr)["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = annotations(&model_task);
+    assert!(
+        a.is_object() && a.get("securityGate").is_none(),
+        "a model's ask is not: {a}"
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
 /// The core A2A flow, with nothing but the listener: no observation feed, no
 /// introspection. The caller who sent the message owns the task, so their
 /// BLOCKING send returns at `input-required` with the question, and a send

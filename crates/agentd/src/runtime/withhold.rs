@@ -59,19 +59,6 @@ pub(crate) enum Source<'a> {
     Child(&'a str),
 }
 
-/// The Company origins of `c` (RFC 0047 §6.2), with its reason.
-pub(crate) fn companies_of(c: &Carries) -> Carries {
-    let mut out = Carries::default();
-    out.add(
-        c.origins
-            .iter()
-            .filter(|o| o.starts_with(COMPANY_ORIGIN))
-            .cloned(),
-        || c.why.clone().unwrap_or_default(),
-    );
-    out
-}
-
 /// What every Company origin starts with (RFC 0047 §6.2): what a
 /// conversation keeps of what it reads back.
 pub(crate) const COMPANY_ORIGIN: &str = "company:";
@@ -96,6 +83,29 @@ pub(crate) fn peer_carries(peer: &str, how: &str) -> Carries {
     c.add([format!("the A2A peer {peer}")], || {
         format!("it was {how} by the A2A peer {peer}")
     });
+    c
+}
+
+/// Whether the principal `id` of role `role` (`None`: not one this
+/// process's rules name) is an operator: the bare `operator` and every
+/// per-person `operator:<id>`.
+fn is_operator(id: &str, role: Option<Role>) -> bool {
+    role == Some(Role::Operator) || id == "operator" || id.starts_with("operator:")
+}
+
+/// What a principal's own message hands whatever it reaches (RFC 0044
+/// §5.13 item 5): an A2A peer agent's is outside input, an origin withheld
+/// as one ([`peer_carries`]); anyone else's but an operator's — a person's
+/// A2A message, which may hold whatever they pasted or a front end relayed
+/// — taints it; an operator's, nothing.
+pub(crate) fn principal_carries(id: &str, role: Option<Role>, how: &str) -> Carries {
+    if role == Some(Role::Agent) {
+        return peer_carries(id, how);
+    }
+    let mut c = Carries::default();
+    if !is_operator(id, role) {
+        c.taint([format!("the A2A principal {id}")]);
+    }
     c
 }
 
@@ -179,17 +189,16 @@ impl Runtime {
             Source::Run(id) => (self.run_carries(id), "this run"),
             Source::Child(h) => (self.child_carries(h), "this subagent"),
         };
-        if carried.origins.is_subset(&handed.origins) {
-            return None;
-        }
-        if !both {
+        if !both || carried.origins.is_subset(&handed.origins) {
             // Handed whole, the reader carries it on: its own result is
-            // judged with it, whatever the table says the reader can read.
-            // A conversation keeps only the Companies it was handed, for the
-            // cross-Company rule.
+            // judged with it, whatever the table says the reader can read,
+            // and so is its taint (RFC 0044 §5.13). A conversation keeps the
+            // Companies it was handed, for the cross-Company rule, the
+            // delegated servers' data and the taint — never an origin it
+            // would be withheld from.
             let flow = match reader {
                 Reader::Run(_) | Reader::Child(_) => Some(carried),
-                Reader::Conversation(Some(_)) => Some(companies_of(&carried)),
+                Reader::Conversation(Some(_)) => Some(carried.kept_by_holder(true)),
                 Reader::Conversation(None) => None,
             };
             if let Some(flow) = flow.filter(|c| !c.is_empty()) {
@@ -382,19 +391,23 @@ impl Runtime {
         }
     }
 
-    /// The Companies whose content `source`'s result carries.
-    pub(crate) fn companies_carried(&self, source: Source) -> Carries {
-        companies_of(&match source {
+    /// What a conversation keeps of `source`'s record when its result is
+    /// handed whole ([`Carries::kept_by_holder`]): the Companies whose
+    /// content it carries, its delegated data and its taint.
+    pub(crate) fn kept_of(&self, source: Source) -> Carries {
+        match source {
             Source::Run(id) => self.run_carries(id),
             Source::Child(h) => self.child_carries(h),
-        })
+        }
+        .kept_by_holder(true)
     }
 
-    /// Add `carries` to conversation `ctx`'s record — the Companies whose
-    /// content reached it.
+    /// Add to conversation `ctx`'s record what reached it of `carries`: the
+    /// Companies whose content it read, the delegated data and the taint
+    /// ([`Carries::kept_by_holder`]).
     pub(crate) fn hand_conversation(&mut self, ctx: &str, carries: &Carries) {
         if let Some(c) = self.contexts.get_mut(ctx)
-            && c.carries.union(carries)
+            && c.carries.union(&carries.kept_by_holder(true))
         {
             c.dirty = true;
         }
@@ -407,7 +420,9 @@ impl Runtime {
     /// known, and recorded on what it reaches.
     ///
     /// A conversation carries nothing else but the Companies whose content
-    /// it read. A root holding both legs is withheld every tainted result;
+    /// it read, the delegated data and the taint ([`Carries::kept_by_holder`]),
+    /// and what its principal's own messages hand it ([`principal_carries`]).
+    /// A root holding both legs is withheld every tainted result;
     /// one holding a leg less is judged by everything it can hand its text
     /// on to (`config::taint::Withholding`), so what it starts or spawns
     /// holds a leg less too, and no reader downstream of it holds both.
@@ -428,15 +443,16 @@ impl Runtime {
                 &mut c,
             );
         }
-        if let Some(p) = caller.principal.as_deref()
-            && self
-                .principal_index
-                .get(p)
-                .is_some_and(|p| p.role == Role::Agent)
-        {
-            c.union(&peer_carries(p, "handed text"));
+        if let Some(p) = caller.principal.as_deref() {
+            c.union(&self.principal_message_carries(p, "handed text"));
         }
         c
+    }
+
+    /// [`principal_carries`] for the principal `id`, by the role the rules
+    /// in force give it.
+    pub(crate) fn principal_message_carries(&self, id: &str, how: &str) -> Carries {
+        principal_carries(id, self.principal_index.get(id).map(|p| p.role), how)
     }
 
     /// What the asker behind a deferred reply to `target` carries — a run's
@@ -454,13 +470,8 @@ impl Runtime {
                     |r| matches!(r, Reader::Conversation(Some(x)) if Some(x) == ctx.as_ref()),
                     &mut c,
                 );
-                if let Some(p) = principal.as_deref()
-                    && self
-                        .principal_index
-                        .get(p)
-                        .is_some_and(|p| p.role == Role::Agent)
-                {
-                    c.union(&peer_carries(p, "handed text"));
+                if let Some(p) = principal.as_deref() {
+                    c.union(&self.principal_message_carries(p, "handed text"));
                 }
                 c
             }

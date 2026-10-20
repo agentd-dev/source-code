@@ -1,0 +1,16 @@
+{
+  "link": {"kind": "turn", "id": "ctx-4f2a"},
+  "created": "2026-10-20T09:14:02.118Z",
+  "statusHistory": [
+    {"state": "TASK_STATE_SUBMITTED", "ts": "2026-10-20T09:14:02.118Z"},
+    {"state": "TASK_STATE_WORKING", "ts": "2026-10-20T09:14:02.120Z"},
+    {"state": "TASK_STATE_INPUT_REQUIRED", "ts": "2026-10-20T09:14:05.871Z"}
+  ],
+  "principal": "user:dana",
+  "securityGate": true,
+  "askSchema": {
+    "type": "object",
+    "required": ["decision"],
+    "properties": {"decision": {"enum": ["approve", "deny"]}}
+  }
+}

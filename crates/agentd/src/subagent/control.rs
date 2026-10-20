@@ -94,6 +94,16 @@ impl SelfHandler for NoSelfTools {
         self.offered.clone()
     }
     fn handle(&mut self, name: &str, args: &serde_json::Value) -> Option<(String, bool)> {
+        // Every call is said before it is made, so the supervisor records an
+        // `untrusted_input` tool's taint on this child before its result is
+        // read (RFC 0044 §5.13, `runtime::taint`).
+        send_up(
+            &self.up,
+            &AgentMsg::Event {
+                event: "tool.called".to_string(),
+                fields: serde_json::json!({"tool": name}),
+            },
+        );
         if !self.gated.iter().any(|g| g == name) {
             return None;
         }
@@ -156,6 +166,29 @@ pub fn run() -> i32 {
     // names is opened here, by the worker's own process, and the outcome
     // said on stderr as `test.worker_open` — so a test sees what a worker
     // may read, not what the supervisor meant it to.
+    // So is who the process runs as, under `AGENTD_TEST_WORKER_ID`, as
+    // `test.worker_id`.
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    if std::env::var_os("AGENTD_TEST_WORKER_ID").is_some() {
+        let mut groups = [0 as libc::gid_t; 64];
+        // SAFETY: getgroups writes at most the count given into the buffer.
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        // SAFETY: the id calls have no failure mode.
+        let (uid, euid, gid, egid) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            )
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({"event": "test.worker_id", "uid": uid, "euid": euid,
+                               "gid": gid, "egid": egid,
+                               "groups": groups.get(..n.max(0) as usize).unwrap_or_default()})
+        );
+    }
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if let Ok(paths) = std::env::var("AGENTD_TEST_WORKER_OPEN") {
         for p in paths.split(':').filter(|p| !p.is_empty()) {

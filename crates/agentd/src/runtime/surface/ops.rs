@@ -561,6 +561,30 @@ pub const OPS: &[OpSpec] = &[
         no_result,
     ),
     op(
+        "delegation.forget",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "Erase a person {principal}: their grants revoked as delegation.revoke does, then their personal key destroyed — what it sealed in the audit chain, the arguments their consent gates showed, is unreadable from then on, and the chain still verifies",
+        delegation_forget_args,
+        no_result,
+    ),
+    op(
+        "delegation.audit",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Delegation,
+        Handler::Delegation,
+        "A person's consent records {principal?} from the audit chain, the latest first, as the task's result — each with what the gate showed opened under their personal key, or `unreadable` once they were forgotten; read off the loop. The per-person operator reads their own; any other operator names a principal",
+        delegation_audit_args,
+        delegation_audit_result,
+    ),
+    op(
         "_instance.",
         Task,
         Operator,
@@ -1306,6 +1330,34 @@ fn delegation_revoke_args() -> Value {
     )
 }
 
+fn delegation_forget_args() -> Value {
+    closed(
+        &["principal"],
+        json!({"principal": named("The principal to erase (operator:<id>)")}),
+    )
+}
+
+fn delegation_audit_args() -> Value {
+    closed(
+        &[],
+        json!({
+            "principal": named("The principal whose records are read; the caller's own when absent"),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "At most this many records, the latest; default 100"},
+        }),
+    )
+}
+
+fn delegation_audit_result() -> Value {
+    json!({
+        "type": "object",
+        "required": ["principal", "records"],
+        "properties": {
+            "principal": {"type": "string"},
+            "records": {"type": "array", "items": {"type": "object"}},
+        },
+    })
+}
+
 fn delegation_list_result() -> Value {
     json!({
         "type": "object",
@@ -1930,6 +1982,8 @@ mod tests {
             }
             "delegation.deny" => json!({"gate": "consent-1", "nonce": "n0nce"}),
             "delegation.revoke" => json!({"target": "operator:ada"}),
+            "delegation.forget" => json!({"principal": "operator:ada"}),
+            "delegation.audit" => json!({"limit": 10}),
             "status"
             | "config"
             | "auth.device.pending"

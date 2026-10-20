@@ -8,15 +8,28 @@
 //! own) — the check a real signer makes too, since the socket's directory
 //! permissions are the only other thing between it and any local process.
 //!
+//! **What it signs** is held to the policy `docs/external-signer.md` asks
+//! of every signer ([`assertion`]): only a client assertion — a JWS whose
+//! header is `{alg, typ: "JWT", kid}` with the key's own algorithm and id,
+//! and whose claims are `iss` = `sub`, an `aud` among the key's
+//! `audiences`, an `iat` near its clock, an `exp` at most five minutes
+//! after it and a `jti`, and nothing else. Anything else is `denied`, and
+//! so is every request for a key with no `audiences`. A wrap key wraps and
+//! unwraps and a derivation key derives, each nothing else (`wrong_use`).
+//!
 //! Knobs:
 //!
-//! - `keys`: `{<id>: {"alg": "ES256"} | {"alg": "RS256", "pem_file": …} |
-//!   {"use": "wrap"}}` — a P-256 signing key made at start, an RSA key read
-//!   from a PKCS#8 file, an AES-256-GCM key-encryption key made at start
-//!   (`"hex"` gives its 32 bytes instead). Default `idp` and `ras` (ES256)
-//!   and `seal` (wrap).
-//! - `record`: a file each request is appended to as `{"op", "key"}` — never
-//!   its data.
+//! - `keys`: `{<id>: {"alg": "ES256", "audiences": [...]} | {"alg":
+//!   "RS256", "pem_file": …, "audiences": [...]} | {"use": "wrap"} |
+//!   {"use": "derive"}}` — a P-256 signing key made at start, an RSA key read
+//!   from a PKCS#8 file, an AES-256-GCM key-encryption key or an HMAC-SHA256
+//!   derivation key made at start (`"hex"` gives its 32 bytes instead); a
+//!   signing key's `clients`, when given, are the only `iss` it signs for.
+//!   Default `idp` and `ras` (ES256, no audience: they sign nothing until
+//!   one is given), `seal` (wrap) and `derive` (derive).
+//! - `record`: a file each request is appended to as `{"op", "key"}`, and
+//!   each refusal of the policy as `{"op", "key", "denied"}` — never its
+//!   data.
 //! - `allow_uid`: the client uid served.
 //! - `outage`: `{"file", "after", "refuse"}` — while `file` exists, the next
 //!   request `after` names (`"<op>:<key>"`) is answered and then the
@@ -30,26 +43,42 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair, RsaKeyPair};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{peer_uid, read_frame, write_frame};
 use crate::auth::seal::SealKey;
 use crate::b64;
 
+/// The longest an assertion it signs may live: `exp` after `iat`.
+pub const MAX_LIFETIME_S: u64 = 300;
+/// How far an assertion's `iat` may be from its clock.
+pub const MAX_SKEW_S: u64 = 120;
+
 /// The keys and the record a test starts with.
 pub fn default_knobs() -> Value {
     json!({
-        "keys": {"idp": {"alg": "ES256"}, "ras": {"alg": "ES256"}, "seal": {"use": "wrap"}},
+        "keys": {"idp": {"alg": "ES256"}, "ras": {"alg": "ES256"},
+                 "seal": {"use": "wrap"}, "derive": {"use": "derive"}},
         "record": null,
         "allow_uid": null,
         "outage": null,
     })
 }
 
-enum Key {
+enum Kind {
     Es256(Box<EcdsaKeyPair>),
     Rs256(Box<RsaKeyPair>),
     Wrap(Box<SealKey>),
+    Derive(Box<[u8; 32]>),
+}
+
+/// One key and what it may be used for.
+pub struct Key {
+    kind: Kind,
+    /// The `aud` values a signing key signs an assertion for.
+    audiences: Vec<String>,
+    /// The `iss` values it signs for; empty, any.
+    clients: Vec<String>,
 }
 
 struct State {
@@ -66,24 +95,42 @@ pub struct Mock {
     pub socket: std::path::PathBuf,
 }
 
+/// 32 bytes: `hex` when the knob gives them, else random.
+fn raw_key(id: &str, k: &Value) -> Result<[u8; 32], String> {
+    let mut b = [0u8; 32];
+    match k["hex"].as_str() {
+        Some(h) => {
+            let v = (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(h.get(i..i + 2).unwrap_or("zz"), 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| format!("key {id}: hex"))?;
+            b = v
+                .try_into()
+                .map_err(|_| format!("key {id}: not 32 bytes"))?;
+        }
+        None => crate::sec::random::fill(&mut b).map_err(|e| e.to_string())?,
+    }
+    Ok(b)
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
 fn keys_of(knobs: &Value) -> Result<BTreeMap<String, Key>, String> {
     let rng = ring::rand::SystemRandom::new();
     let mut out = BTreeMap::new();
     for (id, k) in knobs["keys"].as_object().into_iter().flatten() {
-        let key = if k["use"] == "wrap" {
-            let raw = match k["hex"].as_str() {
-                Some(h) => (0..h.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(h.get(i..i + 2).unwrap_or("zz"), 16))
-                    .collect::<Result<Vec<u8>, _>>()
-                    .map_err(|_| format!("key {id}: hex"))?,
-                None => {
-                    let mut b = vec![0u8; 32];
-                    crate::sec::random::fill(&mut b).map_err(|e| e.to_string())?;
-                    b
-                }
-            };
-            Key::Wrap(Box::new(SealKey::new(&raw)?))
+        let kind = if k["use"] == "wrap" {
+            Kind::Wrap(Box::new(SealKey::new(&raw_key(id, k)?)?))
+        } else if k["use"] == "derive" {
+            Kind::Derive(Box::new(raw_key(id, k)?))
         } else if k["alg"] == "RS256" {
             let pem = std::fs::read_to_string(k["pem_file"].as_str().unwrap_or_default())
                 .map_err(|e| format!("key {id}: {e}"))?;
@@ -92,20 +139,113 @@ fn keys_of(knobs: &Value) -> Result<BTreeMap<String, Key>, String> {
                 .filter(|l| !l.starts_with("-----"))
                 .collect::<String>();
             let der = b64::std_decode(&body)?;
-            Key::Rs256(Box::new(
+            Kind::Rs256(Box::new(
                 RsaKeyPair::from_pkcs8(&der).map_err(|e| format!("key {id}: {e}"))?,
             ))
         } else {
             let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
                 .map_err(|_| format!("key {id}: generation"))?;
-            Key::Es256(Box::new(
+            Kind::Es256(Box::new(
                 EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng)
                     .map_err(|e| format!("key {id}: {e}"))?,
             ))
         };
-        out.insert(id.clone(), key);
+        out.insert(
+            id.clone(),
+            Key {
+                kind,
+                audiences: strings(&k["audiences"]),
+                clients: strings(&k["clients"]),
+            },
+        );
     }
     Ok(out)
+}
+
+/// Whether `data`, asked to be signed with `key` (id `id`) under `alg`, is
+/// a client assertion this key signs at `now_s`: the JWS signing input of
+/// a header `{alg, typ: "JWT", kid}` naming this key and its algorithm, and
+/// of the claims `iss` = `sub` (one of the key's `clients`, when it has
+/// them), an `aud` among its audiences, an `iat` within [`MAX_SKEW_S`] of
+/// now, an `exp` after it by at most [`MAX_LIFETIME_S`], a `jti` of 16 to
+/// 128 base64url characters, and no other member. `Err` says why not —
+/// never with what the data held.
+fn assertion(data: &[u8], id: &str, alg: &str, key: &Key, now_s: u64) -> Result<(), String> {
+    if key.audiences.is_empty() {
+        return Err(format!(
+            "key {id} has no audience configured, so it signs nothing"
+        ));
+    }
+    let text =
+        std::str::from_utf8(data).map_err(|_| "the signing input is not text".to_string())?;
+    let (h, c) = text
+        .split_once('.')
+        .filter(|(_, c)| !c.contains('.'))
+        .ok_or("the signing input is not a JWS header.claims")?;
+    let object = |part: &str, what: &str| -> Result<Map<String, Value>, String> {
+        b64::url_decode(part)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned())
+            .ok_or(format!("its {what} is not a base64url JSON object"))
+    };
+    let only = |m: &Map<String, Value>, keys: &[&str], what: &str| {
+        let mut have: Vec<&str> = m.keys().map(String::as_str).collect();
+        have.sort_unstable();
+        let mut want = keys.to_vec();
+        want.sort_unstable();
+        if have == want {
+            Ok(())
+        } else {
+            Err(format!(
+                "its {what} members are not exactly {}",
+                keys.join(", ")
+            ))
+        }
+    };
+    let header = object(h, "header")?;
+    only(&header, &["alg", "typ", "kid"], "header")?;
+    if header["alg"] != alg || header["typ"] != "JWT" || header["kid"] != id {
+        return Err(format!(
+            "its header is not {{alg: {alg}, typ: JWT, kid: {id}}}"
+        ));
+    }
+    let claims = object(c, "claims")?;
+    only(
+        &claims,
+        &["iss", "sub", "aud", "iat", "exp", "jti"],
+        "claims",
+    )?;
+    let iss = claims["iss"].as_str().unwrap_or_default();
+    if iss.is_empty() || iss.len() > 256 || claims["sub"] != iss {
+        return Err("its iss and sub are not one client id".into());
+    }
+    if !key.clients.is_empty() && !key.clients.iter().any(|c| c == iss) {
+        return Err(format!("key {id} does not sign for that client"));
+    }
+    if !claims["aud"]
+        .as_str()
+        .is_some_and(|a| key.audiences.iter().any(|x| x == a))
+    {
+        return Err(format!("its aud is not an audience key {id} signs for"));
+    }
+    let (Some(iat), Some(exp)) = (claims["iat"].as_u64(), claims["exp"].as_u64()) else {
+        return Err("its iat and exp are not whole seconds".into());
+    };
+    if iat.abs_diff(now_s) > MAX_SKEW_S || exp <= iat || exp - iat > MAX_LIFETIME_S {
+        return Err(format!(
+            "its iat is not within {MAX_SKEW_S}s of now, or its exp not within {MAX_LIFETIME_S}s after it"
+        ));
+    }
+    let jti = claims["jti"].as_str().unwrap_or_default();
+    if !(16..=128).contains(&jti.len())
+        || !jti
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("its jti is not 16 to 128 base64url characters".into());
+    }
+    Ok(())
 }
 
 /// Bind `socket` and answer on a thread of its own until the process ends.
@@ -180,23 +320,34 @@ fn field(req: &Value, f: &str) -> Option<Vec<u8>> {
     req[f].as_str().and_then(|s| b64::url_decode(s).ok())
 }
 
-fn answer(req: &Value, state: &Arc<Mutex<State>>) -> Value {
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let op = req["op"].as_str().unwrap_or_default();
-    let id = req["key"].as_str().unwrap_or_default();
+/// Append `line` to the request record, when there is one.
+fn record(s: &State, line: Value) {
     if let Some(path) = &s.record
         && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
     {
-        let _ = writeln!(f, "{}", json!({"op": op, "key": id}));
+        let _ = writeln!(f, "{line}");
     }
+}
+
+fn answer(req: &Value, state: &Arc<Mutex<State>>) -> Value {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let op = req["op"].as_str().unwrap_or_default();
+    let id = req["key"].as_str().unwrap_or_default();
+    record(&s, json!({"op": op, "key": id}));
     if s.refusing > 0 {
         s.refusing -= 1;
         return refuse("internal", "an outage (the `outage` knob)");
     }
     let out = answer_of(req, &s);
+    if out["error"]["code"] == "denied" {
+        record(
+            &s,
+            json!({"op": op, "key": id, "denied": out["error"]["message"]}),
+        );
+    }
     if let Some(file) = s.outage["file"].as_str()
         && s.outage["after"].as_str() == Some(&format!("{op}:{id}"))
         && std::fs::remove_file(file).is_ok()
@@ -216,30 +367,42 @@ fn answer_of(req: &Value, s: &State) -> Value {
         v["ok"] = json!(true);
         v
     };
-    if op == "sign" && !matches!(key, Key::Wrap(_)) && req["alg"] != alg_of(key) {
-        return refuse("wrong_alg", &format!("{id} is {}", alg_of(key)));
+    if op == "sign" && matches!(key.kind, Kind::Es256(_) | Kind::Rs256(_)) {
+        if req["alg"] != alg_of(key) {
+            return refuse("wrong_alg", &format!("{id} is {}", alg_of(key)));
+        }
+        let Some(data) = field(req, "data") else {
+            return refuse("bad_request", "no base64url data");
+        };
+        let now = crate::auth::cache::now_ms() / 1000;
+        if let Err(why) = assertion(&data, id, alg_of(key), key, now) {
+            return refuse(
+                "denied",
+                &format!("not a client assertion this signer signs: {why}"),
+            );
+        }
     }
     let rng = ring::rand::SystemRandom::new();
-    match (op, key) {
-        ("public_key", Key::Es256(p)) => {
+    match (op, &key.kind) {
+        ("public_key", Kind::Es256(p)) => {
             match crate::auth::jwk::p256_public(p.public_key().as_ref()) {
                 Ok(jwk) => ok(json!({"alg": "ES256", "jwk": jwk})),
                 Err(e) => refuse("internal", &e),
             }
         }
-        ("public_key", Key::Rs256(p)) => {
+        ("public_key", Kind::Rs256(p)) => {
             let parts = ring::rsa::PublicKeyComponents::<Vec<u8>>::from(p.public());
             ok(json!({"alg": "RS256", "jwk": {"kty": "RSA",
                 "n": b64::url_nopad(&parts.n), "e": b64::url_nopad(&parts.e)}}))
         }
-        ("sign", Key::Es256(p)) => match field(req, "data") {
+        ("sign", Kind::Es256(p)) => match field(req, "data") {
             Some(data) => match p.sign(&rng, &data) {
                 Ok(sig) => ok(json!({"sig": b64::url_nopad(sig.as_ref())})),
                 Err(_) => refuse("internal", "signing failed"),
             },
             None => refuse("bad_request", "no base64url data"),
         },
-        ("sign", Key::Rs256(p)) => match field(req, "data") {
+        ("sign", Kind::Rs256(p)) => match field(req, "data") {
             Some(data) => {
                 let mut sig = vec![0u8; p.public().modulus_len()];
                 match p.sign(&ring::signature::RSA_PKCS1_SHA256, &rng, &data, &mut sig) {
@@ -249,14 +412,14 @@ fn answer_of(req: &Value, s: &State) -> Value {
             }
             None => refuse("bad_request", "no base64url data"),
         },
-        ("wrap", Key::Wrap(k)) => match (field(req, "plaintext"), field(req, "aad")) {
+        ("wrap", Kind::Wrap(k)) => match (field(req, "plaintext"), field(req, "aad")) {
             (Some(p), Some(a)) => match k.seal(&a, &p) {
                 Ok(w) => ok(json!({"wrapped": b64::url_nopad(&w)})),
                 Err(e) => refuse("internal", &e),
             },
             _ => refuse("bad_request", "plaintext and aad are base64url"),
         },
-        ("unwrap", Key::Wrap(k)) => match (field(req, "wrapped"), field(req, "aad")) {
+        ("unwrap", Kind::Wrap(k)) => match (field(req, "wrapped"), field(req, "aad")) {
             (Some(w), Some(a)) => match k.open(&a, &w) {
                 Ok(p) => ok(json!({"plaintext": b64::url_nopad(&p)})),
                 Err(_) => refuse(
@@ -266,7 +429,13 @@ fn answer_of(req: &Value, s: &State) -> Value {
             },
             _ => refuse("bad_request", "wrapped and aad are base64url"),
         },
-        ("public_key" | "sign" | "wrap" | "unwrap", _) => {
+        ("derive", Kind::Derive(k)) => match field(req, "data") {
+            Some(d) if !d.is_empty() && d.len() <= 256 => {
+                ok(json!({"mac": b64::url_nopad(&crate::sha::hmac_sha256(&k[..], &d))}))
+            }
+            _ => refuse("bad_request", "data is 1 to 256 base64url bytes"),
+        },
+        ("public_key" | "sign" | "wrap" | "unwrap" | "derive", _) => {
             refuse("wrong_use", &format!("{id} is not a key for {op}"))
         }
         _ => refuse("bad_request", &format!("no op {op:?}")),
@@ -274,9 +443,130 @@ fn answer_of(req: &Value, s: &State) -> Value {
 }
 
 fn alg_of(k: &Key) -> &'static str {
-    match k {
-        Key::Es256(_) => "ES256",
-        Key::Rs256(_) => "RS256",
-        Key::Wrap(_) => "A256GCM",
+    match k.kind {
+        Kind::Es256(_) => "ES256",
+        Kind::Rs256(_) => "RS256",
+        Kind::Wrap(_) => "A256GCM",
+        Kind::Derive(_) => "HS256",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(audiences: &[&str], clients: &[&str]) -> Key {
+        Key {
+            kind: Kind::Derive(Box::new([0; 32])),
+            audiences: audiences.iter().map(|s| s.to_string()).collect(),
+            clients: clients.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn input(header: Value, claims: Value) -> Vec<u8> {
+        format!(
+            "{}.{}",
+            b64::url_nopad(header.to_string().as_bytes()),
+            b64::url_nopad(claims.to_string().as_bytes())
+        )
+        .into_bytes()
+    }
+
+    /// Only the shape of a client assertion, for a configured audience, is
+    /// signed: every header and claim agentd sends is read, each limit is
+    /// held, and a member past the set is refused.
+    #[test]
+    fn only_a_client_assertion_for_a_configured_audience_passes() {
+        let k = key(&["https://idp.example/token"], &[]);
+        let now = 1_800_000_000;
+        let header = json!({"alg": "ES256", "typ": "JWT", "kid": "idp"});
+        let claims = json!({"iss": "c", "sub": "c", "aud": "https://idp.example/token",
+                            "iat": now, "exp": now + 60, "jti": "abcdefghijklmnopqrstuv"});
+        assert_eq!(
+            assertion(
+                &input(header.clone(), claims.clone()),
+                "idp",
+                "ES256",
+                &k,
+                now
+            ),
+            Ok(())
+        );
+        // The real input agentd builds.
+        let real = crate::auth::client_assertion::assertion_input(
+            "c",
+            "https://idp.example/token",
+            "ES256",
+            "idp",
+        )
+        .unwrap();
+        let now_s = crate::auth::cache::now_ms() / 1000;
+        assert_eq!(
+            assertion(real.as_bytes(), "idp", "ES256", &k, now_s),
+            Ok(())
+        );
+        let with = |f: &dyn Fn(&mut Value, &mut Value)| {
+            let (mut h, mut c) = (header.clone(), claims.clone());
+            f(&mut h, &mut c);
+            assertion(&input(h, c), "idp", "ES256", &k, now)
+        };
+        let refused: Vec<(&str, Result<(), String>)> = vec![
+            (
+                "not a JWS",
+                assertion(b"header.claims", "idp", "ES256", &k, now),
+            ),
+            ("three parts", assertion(b"a.b.c", "idp", "ES256", &k, now)),
+            (
+                "another aud",
+                with(&|_, c| c["aud"] = json!("https://evil.example/token")),
+            ),
+            ("another kid", with(&|h, _| h["kid"] = json!("ras"))),
+            ("another alg", with(&|h, _| h["alg"] = json!("none"))),
+            (
+                "no typ",
+                with(&|h, _| {
+                    h.as_object_mut().unwrap().remove("typ");
+                }),
+            ),
+            (
+                "an extra header",
+                with(&|h, _| h["jku"] = json!("https://x")),
+            ),
+            ("an extra claim", with(&|_, c| c["scope"] = json!("admin"))),
+            ("sub is not iss", with(&|_, c| c["sub"] = json!("someone"))),
+            (
+                "a long life",
+                with(&|_, c| c["exp"] = json!(now + MAX_LIFETIME_S + 1)),
+            ),
+            ("exp before iat", with(&|_, c| c["exp"] = json!(now - 1))),
+            (
+                "an old iat",
+                with(&|_, c| {
+                    c["iat"] = json!(now - 600);
+                    c["exp"] = json!(now - 540);
+                }),
+            ),
+            ("a short jti", with(&|_, c| c["jti"] = json!("x"))),
+            (
+                "an aud array",
+                with(&|_, c| c["aud"] = json!(["https://idp.example/token"])),
+            ),
+        ];
+        for (what, r) in refused {
+            assert!(r.is_err(), "{what} must be refused");
+        }
+        // No audience configured: nothing is signed; a client list holds iss.
+        assert!(
+            assertion(
+                &input(header.clone(), claims.clone()),
+                "idp",
+                "ES256",
+                &key(&[], &[]),
+                now
+            )
+            .is_err()
+        );
+        let held = key(&["https://idp.example/token"], &["other"]);
+        assert!(assertion(&input(header, claims), "idp", "ES256", &held, now).is_err());
     }
 }

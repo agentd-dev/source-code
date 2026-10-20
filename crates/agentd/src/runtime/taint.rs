@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! **The taint engine** (RFC 0044 §5.13 item 5, T11, T12): which work has
+//! read outside text, and which holds an enrolled person's delegated data —
+//! the facts the person's consent rules (`runtime::delegated`) and the
+//! policy matchers `tainted` and `holds_delegated_data` read.
+//!
+//! It is the outside-input record runs, children and conversations already
+//! keep ([`Carries`]), carried the same ways: what a context starts,
+//! spawns, signals, steers or sends a message to carries what it carried, a
+//! result read back whole hands its record to the reader, an event a run
+//! emits carries the run's, and every record is durable. Read for taint,
+//! the record says:
+//!
+//! - **tainted** — it holds an origin of outside text (a webhook's or an
+//!   A2A start's route, an A2A peer agent's text, a Company's content, an
+//!   untrusted delegated result, a run or child no longer on record) or a
+//!   taint source the withholding does not follow: an `untrusted_input`
+//!   tool's result, a non-operator principal's A2A message, an A2A peer's
+//!   answer to a step, an `http` step's response, an `untrusted_input`
+//!   server's `mcp.tool` or `mcp.resource` result, knowledge context, a
+//!   memory entry tainted work wrote. A deployment whose instruction is
+//!   served (a URL, an OCI artifact, an MCP resource) has every unit
+//!   tainted: every turn's prompt holds that text.
+//! - **holds delegated data** — a delegated server's result reached it,
+//!   trusted (`auth.trusted_output`) or not.
+//!
+//! Each source is recorded **before** its text is read: a worker announces
+//! a call before it makes it (`turn.tool`, a subagent's `tool.called`), a
+//! delegated or Company result's record is sent before the result, a step's
+//! result is recorded as the step finishes, before a step after it runs.
+//!
+//! **Not followed**, said: text inside an instance child (a daemon with its
+//! own record; what it answers its parent is a peer's answer), and an MCP
+//! elicitation's answer, which reaches only the server that asked, never a
+//! model — the server's result after it is judged as that server's.
+
+use super::reactor::{Runtime, Target};
+use super::tools::ToolCaller;
+use super::withhold::Reader;
+use crate::engine::run::Carries;
+use crate::sec::scope::TrifectaTag;
+use crate::supervisor::tree::NodeId;
+use serde_json::{Map, Value, json};
+
+/// What the consent rules and the policy matchers know of one unit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Facts {
+    pub tainted: bool,
+    pub holds_delegated_data: bool,
+    /// Where the outside text it read entered, for a gate to show.
+    pub sources: Vec<String>,
+}
+
+impl Facts {
+    /// The facts of a unit whose record is `c`, in a deployment whose
+    /// instruction is `served` from outside, when it is.
+    pub(crate) fn of(c: &Carries, served: Option<&str>) -> Facts {
+        let mut sources = c.taint_sources();
+        if let Some(s) = served {
+            sources.push(format!("the served instruction {s}"));
+        }
+        Facts {
+            tainted: !sources.is_empty(),
+            holds_delegated_data: c.holds_delegated_data(),
+            sources,
+        }
+    }
+
+    /// The facts as a record shows them.
+    pub(crate) fn to_value(&self) -> Value {
+        json!({"tainted": self.tainted, "holds_delegated_data": self.holds_delegated_data,
+               "taint": self.sources})
+    }
+}
+
+/// The taint source of an `untrusted_input` tool's result.
+fn tool_source(tool: &str) -> String {
+    format!("the untrusted_input tool {tool}")
+}
+
+impl Runtime {
+    /// Where the agent's instruction is served from, when it is not the
+    /// operator's own text, file or folder: every turn's prompt holds it.
+    pub(crate) fn served_instruction(&self) -> Option<String> {
+        let spec = &self.settings.agent.instruction_spec;
+        if let Some(u) = &spec.url {
+            return Some(u.clone());
+        }
+        if let Some(o) = &spec.oci {
+            return Some(format!("oci://{}", o.reference()));
+        }
+        if let Some(m) = &spec.mcp {
+            return Some(m.to_uri());
+        }
+        self.settings
+            .agent
+            .instruction_is_uri()
+            .then(|| self.settings.agent.instruction.clone().unwrap_or_default())
+    }
+
+    /// The facts of the unit behind `caller`.
+    pub(crate) fn caller_facts(&self, caller: &ToolCaller) -> Facts {
+        Facts::of(
+            &self.caller_carries(caller),
+            self.served_instruction().as_deref(),
+        )
+    }
+
+    /// The facts of run `run`.
+    pub(crate) fn run_facts(&self, run: &str) -> Facts {
+        Facts::of(&self.run_carries(run), self.served_instruction().as_deref())
+    }
+
+    /// Add `carries` to the record of the context `reader` is.
+    pub(crate) fn hand_reader(&mut self, reader: &Reader, carries: &Carries) {
+        match reader {
+            Reader::Run(id) => self.hand_run(id, carries),
+            Reader::Child(h) => self.steer_carries(h, carries),
+            Reader::Conversation(Some(ctx)) => self.hand_conversation(ctx, carries),
+            Reader::Conversation(None) => {}
+        }
+    }
+
+    /// Add `carries` to the record of the context `caller`'s reply is read
+    /// into — a memory entry it read. A call no model makes reads nothing.
+    pub(crate) fn hand_caller(&mut self, caller: &ToolCaller, carries: &Carries) {
+        if carries.is_empty() {
+            return;
+        }
+        if let Some(r) = self.reader_of(caller) {
+            self.hand_reader(&r, carries);
+        }
+    }
+
+    /// Whether the registry's tool `name` is tagged `untrusted_input`.
+    fn untrusted_tool(&self, name: &str) -> bool {
+        self.registry
+            .tags_of(std::slice::from_ref(&name.to_string()))
+            .contains(&TrifectaTag::UntrustedInput)
+    }
+
+    /// The child `node` announced a call to `tool`: an `untrusted_input`
+    /// tool's result taints the unit it is read into — recorded now, before
+    /// the call is made, so before its result is read.
+    pub(crate) fn taint_announced(&mut self, node: NodeId, tool: &str) {
+        if !self.untrusted_tool(tool) {
+            return;
+        }
+        let reader = self.reader_at(&Target::Child(node, 0));
+        let mut c = Carries::default();
+        c.taint([tool_source(tool)]);
+        self.hand_reader(&reader, &c);
+    }
+
+    /// Whether a worker's call to a tool tagged `tags` comes back to the
+    /// supervisor rather than being dialled by the worker: where a person's
+    /// grant is delegated, every `egress` tool does, since from work that is
+    /// tainted and holds their data it asks the person (RFC 0044 §5.13 item
+    /// 6) — a call the supervisor never sees is one no rule can hold.
+    pub(crate) fn egress_round_trips(&self, tags: &[TrifectaTag]) -> bool {
+        #[cfg(feature = "xaa")]
+        {
+            self.delegation.is_some() && tags.contains(&TrifectaTag::Egress)
+        }
+        #[cfg(not(feature = "xaa"))]
+        {
+            let _ = tags;
+            false
+        }
+    }
+
+    /// Whether the registry's tool `name` is served by a delegated server:
+    /// a call to it is made with an enrolled person's grant.
+    pub(crate) fn delegated_tool(&self, name: &str) -> bool {
+        match self.registry.route(name) {
+            Some(crate::registry::Route::Mcp { server, .. }) => self.delegated(server),
+            Some(crate::registry::Route::Mapped(m)) => self.delegated(&m.server),
+            _ => false,
+        }
+    }
+
+    /// Whether `server` is a delegated server, whose results the call that
+    /// made it records.
+    fn delegated(&self, server: &str) -> bool {
+        #[cfg(feature = "xaa")]
+        {
+            self.is_delegated_server(server)
+        }
+        #[cfg(not(feature = "xaa"))]
+        {
+            let _ = server;
+            false
+        }
+    }
+
+    /// Whether `server`'s results are outside text: its declared `tags`
+    /// name `untrusted_input`, for any tool or for every one, or a registry
+    /// tool it serves carries it — so a server that serves only resources
+    /// is judged by what it declares.
+    fn untrusted_server(&self, server: &str) -> bool {
+        let declared = self
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.tag_set().ok())
+            .is_some_and(|t| t.contains(&TrifectaTag::UntrustedInput));
+        declared
+            || self.registry.iter().any(|t| {
+                t.server.as_deref() == Some(server) && t.tags.contains(&TrifectaTag::UntrustedInput)
+            })
+    }
+
+    /// What a finished step of `kind`, run with `spec`, hands its run of
+    /// outside text, if anything: an `http` step's response, an A2A peer's
+    /// answer, an `untrusted_input` tool's result through a `tool` step or
+    /// a built-in `search.*` step, a `knowledge.*` step's result (as
+    /// knowledge context taints a turn), and an `mcp.tool` or `mcp.resource`
+    /// result from an `untrusted_input` server ([`Self::untrusted_server`]).
+    /// A delegated server's result is recorded by the call that made it.
+    pub(crate) fn taint_step(&mut self, run_id: &str, kind: &str, spec: &Map<String, Value>) {
+        let source = match kind {
+            "http" => Some(format!(
+                "the response of an http step to {}",
+                spec.get("url").and_then(Value::as_str).unwrap_or("a URL")
+            )),
+            "a2a.send" | "a2a.delegate" | "a2a.wait" => Some(format!(
+                "the A2A peer {}'s answer",
+                spec.get("to")
+                    .or_else(|| spec.get("peer"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("of a step")
+            )),
+            "tool" => spec
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|t| self.untrusted_tool(t))
+                .map(tool_source),
+            k if k.starts_with("knowledge.") => Some(format!(
+                "knowledge context from {}",
+                self.settings
+                    .knowledge
+                    .server
+                    .as_deref()
+                    .unwrap_or("the knowledge server")
+            )),
+            k if k.starts_with("search.") => self.untrusted_tool(k).then(|| tool_source(k)),
+            "mcp.tool" | "mcp.resource" => spec
+                .get("server")
+                .and_then(Value::as_str)
+                .filter(|s| !self.delegated(s))
+                .filter(|s| self.untrusted_server(s))
+                .map(|s| format!("a result of the untrusted_input server {s}")),
+            _ => None,
+        };
+        if let Some(s) = source {
+            let mut c = Carries::default();
+            c.taint([s]);
+            self.hand_run(run_id, &c);
+        }
+    }
+
+    /// Knowledge context from `server` reached conversation `ctx`'s turn.
+    pub(crate) fn taint_knowledge(&mut self, ctx: &str) {
+        let server = self
+            .settings
+            .knowledge
+            .server
+            .clone()
+            .unwrap_or_else(|| "the knowledge server".into());
+        let mut c = Carries::default();
+        c.taint([format!("knowledge context from {server}")]);
+        self.hand_conversation(ctx, &c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record's facts: any origin but a delegated one, or any taint source,
+    /// taints it; a delegated origin alone holds data and does not; a served
+    /// instruction taints everything.
+    #[test]
+    fn the_facts_follow_the_record() {
+        let mut trusted = Carries::default();
+        trusted.add(["delegated:linear".to_string()], || "read".into());
+        let f = Facts::of(&trusted, None);
+        assert!(f.holds_delegated_data && !f.tainted, "{f:?}");
+        let mut untrusted = trusted.clone();
+        untrusted.taint(["delegated:linear".to_string()]);
+        assert!(Facts::of(&untrusted, None).tainted);
+        let mut peer = Carries::default();
+        peer.add(["the A2A peer agent:x".to_string()], || "peer".into());
+        let f = Facts::of(&peer, None);
+        assert!(f.tainted && !f.holds_delegated_data, "{f:?}");
+        assert_eq!(f.sources, ["the A2A peer agent:x"]);
+        let f = Facts::of(&Carries::default(), Some("https://x.example/a.md"));
+        assert!(
+            f.tainted && f.sources[0].contains("served instruction"),
+            "{f:?}"
+        );
+        assert_eq!(Facts::of(&Carries::default(), None), Facts::default());
+    }
+
+    /// What a conversation or a memory entry keeps of a record: delegated
+    /// origins, Companies only for a conversation, every other origin as
+    /// taint — so it stays tainted without being an origin a reader is
+    /// withheld from.
+    #[test]
+    fn a_holder_keeps_the_data_and_the_taint_and_no_other_origin() {
+        let mut c = Carries::default();
+        c.add(
+            [
+                "delegated:linear".to_string(),
+                "company:https://a.example".to_string(),
+                "the route of workflow \"hook\"".to_string(),
+            ],
+            || "why".into(),
+        );
+        c.taint(["the untrusted_input tool web.fetch".to_string()]);
+        let conv = c.kept_by_holder(true);
+        assert!(conv.origins.contains("delegated:linear"));
+        assert!(conv.origins.contains("company:https://a.example"));
+        assert!(!conv.origins.contains("the route of workflow \"hook\""));
+        assert!(conv.taint.contains("the route of workflow \"hook\""));
+        assert!(conv.taint.contains("the untrusted_input tool web.fetch"));
+        let mem = c.kept_by_holder(false);
+        assert!(!mem.origins.iter().any(|o| o.starts_with("company:")));
+        assert!(mem.tainted() && mem.holds_delegated_data());
+        // A union carries the taint too.
+        let mut r = Carries::default();
+        assert!(r.union(&mem));
+        assert!(r.tainted() && !r.union(&mem), "nothing new the second time");
+    }
+}

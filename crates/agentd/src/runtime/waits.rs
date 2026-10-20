@@ -15,7 +15,7 @@
 use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
-use super::withhold::{Reader, Source};
+use super::withhold::{Carries, Reader, Source};
 use crate::context::ROOT;
 use crate::engine::model::Step;
 use crate::engine::run::StepStatus;
@@ -1244,12 +1244,11 @@ impl Runtime {
             }
         }
         // A peer agent's message is another agent's output: the run it wakes
-        // carries it (`withhold`), decided now, while who sent it is known.
+        // carries it (`withhold`), decided now, while who sent it is known;
+        // any other sender's but an operator's taints it (RFC 0044 §5.13).
         let mut carries = match &sender {
-            Some(p) if p.role == crate::config::settings::Role::Agent => {
-                super::withhold::peer_carries(&p.id, "handed a message")
-            }
-            _ => super::withhold::Carries::default(),
+            Some(p) => super::withhold::principal_carries(&p.id, Some(p.role), "handed a message"),
+            None => super::withhold::Carries::default(),
         };
         carries.union(carried);
         let mut woken = Vec::with_capacity(hits.len());
@@ -1501,9 +1500,10 @@ impl Runtime {
         if let Some(p) = parts {
             payload["parts"] = p;
         }
-        // What the run read of a Company may be in the text: whatever the
-        // message reaches carries those Companies (RFC 0047 §6.2).
-        let carried = super::withhold::companies_of(&self.run_carries(run_id));
+        // What the run read may be in the text: whatever the message reaches
+        // carries the Companies (RFC 0047 §6.2), the delegated data and the
+        // taint (RFC 0044 §5.13) the run holds.
+        let carried = self.run_carries(run_id).kept_by_holder(true);
         if !carried.is_empty() {
             payload["carries"] = json!(carried);
         }
@@ -2351,13 +2351,16 @@ impl Runtime {
         self.step_turn_pub(run_id, step_id, &think, &think_spec, data, role, work);
     }
 
-    /// Step `cache {key, ttl}`: a memoized output by key (memory `_cache/<hash>`).
+    /// Step `cache {key, ttl}`: a memoized output by key (memory
+    /// `_cache/<hash>`), with what the run that produced it carried — which
+    /// the run it is handed to takes on, as it would the step's own result
+    /// (RFC 0044 §5.13).
     pub(crate) fn cache_lookup(
         &mut self,
         step: &Step,
         spec: &Map<String, Value>,
         data: &Data,
-    ) -> Option<(String, Option<Value>)> {
+    ) -> Option<(String, Option<(Value, Carries)>)> {
         let cache = step.cache.as_ref()?;
         let key_expr = cache.get("key").and_then(Value::as_str).unwrap_or("");
         let key_material = if key_expr.is_empty() {
@@ -2383,18 +2386,45 @@ impl Runtime {
             .and_then(|env| {
                 let ts = env.state.get("ts").and_then(Value::as_u64).unwrap_or(0);
                 let fresh = ttl_ms.is_none_or(|t| now_ms() < ts + t);
-                fresh.then(|| env.state.get("value").cloned()).flatten()
+                let carries = env
+                    .state
+                    .get("carries")
+                    .and_then(|c| serde_json::from_value::<Carries>(c.clone()).ok())
+                    .unwrap_or_default();
+                fresh
+                    .then(|| env.state.get("value").cloned())
+                    .flatten()
+                    .map(|v| (v, carries))
             });
         Some((cache_key, hit))
     }
 
-    pub(crate) fn cache_store(&mut self, cache_key: &str, output: &Value) {
-        let _ = self.durable.put(
-            Kind::Memory,
-            cache_key,
-            json!({"value": output, "ts": now_ms()}),
-            None,
-        );
+    /// Memoize `output` of a step of run `run_id` under `cache_key`, with
+    /// what the run carries. A run holding a person's delegated data stores
+    /// nothing: the cache is every run's, keyed by no principal, and a hit
+    /// would hand their data to another run past the admission and the
+    /// revocation every delegated read is held to (RFC 0044 §5.13).
+    pub(crate) fn cache_store(
+        &mut self,
+        run_id: &str,
+        step_id: &str,
+        cache_key: &str,
+        output: &Value,
+    ) {
+        let carries = self.run_carries(run_id);
+        if carries.holds_delegated_data() {
+            self.run_log(run_id).info(
+                "step.cache.not_kept",
+                json!({"run": run_id, "step": step_id,
+                       "why": "the run holds delegated data"}),
+            );
+            return;
+        }
+        let mut entry = json!({"value": output, "ts": now_ms()});
+        if !carries.is_empty() {
+            entry["carries"] = json!(carries);
+        }
+        let _ = self.durable.put(Kind::Memory, cache_key, entry, None);
     }
 }
 

@@ -40,7 +40,7 @@ agentd --workflow-schema | jq '.["$defs"].kinds | keys | length'
 | `on_error` | `fail` (default) fails the run; `continue` marks the step done with `error` set and output `{"error": …}`; `"goto:<step>"` runs that step instead, even though its dependencies have not finished |
 | `on_replay` | what restore does with a step a crash caught running: `retry` (default), `skip`, or `fail` |
 | `output_schema` | a JSON Schema the step's output must match, or the step fails. On a model step it also shapes the answer |
-| `cache` | `{key?, ttl?}`: reuse an earlier output. The key is a template (default: the rendered fields), shared across runs of the workflow; no `ttl` keeps it forever. Never written for a step that suspends or nests |
+| `cache` | `{key?, ttl?}`: reuse an earlier output. The key is a template (default: the rendered fields), shared across runs of the workflow; no `ttl` keeps it forever. Never written for a step that suspends or nests, nor by a run that holds a person's delegated data; a run handed a cached output carries what the run that produced it did |
 | `budget` | a token allowance for this step's model calls |
 | `skills` | skills loaded into a model step's prompt: references `<name>`, `<origin>/<name>` (a `skills.sources` server, or `local` for agentd's own) or `<origin>/<path>`. One that two skills answer to is refused at load, naming both |
 | `description` | free text |

@@ -48,6 +48,10 @@
       "description": "who started the task",
       "type": "string"
     },
+    "securityGate": {
+      "const": true,
+      "description": "the INPUT_REQUIRED gate is one agentd raised itself — a security.policies ask, a Company's gate — never a model's ask_human or a workflow's human step; a client shows it with a badge no question text can earn"
+    },
     "spanId": {
       "description": "the W3C span id the task's work is done in, 16 lowercase hex digits: the span a `traceparent` response header names",
       "type": "string"

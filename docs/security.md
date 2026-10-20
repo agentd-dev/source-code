@@ -394,11 +394,16 @@ off before any egress-tagged call". `security.policies` is that layer: an
 ordered list of rules matched against the call itself. The first match wins,
 and no match is allow.
 
-A rule matches on any combination of the tool name (a glob), the tool's tags,
-the caller kind (`root`, `workflow`, `subagent`), the principal id (a glob,
-for calls made on a principal's behalf) and a CEL expression over the
-arguments. Conditions are ANDed, so adding one always narrows a rule. The
-verdict is `allow`, `deny`, `ask` or `shadow`.
+A rule matches on any combination of the tool name (a glob), the tool's tags
+(`tags`, every one listed; `any_tags`, at least one), the caller kind
+(`root`, `workflow`, `subagent`), the principal id (a glob, for calls made on
+a principal's behalf), a CEL expression over the arguments, and three facts
+of the call: `delegated` (it is made with an enrolled person's grant),
+`tainted` (the work making it has read outside text) and
+`holds_delegated_data` (a delegated server's result reached that work) — see
+[Acting for an enrolled person](#acting-for-an-enrolled-person). Conditions
+are ANDed, so adding one always narrows a rule. The verdict is `allow`,
+`deny`, `ask` or `shadow`.
 
 Policies run at one chokepoint every call passes, after the arguments are
 validated against the tool's schema, so a guard judges arguments that already
@@ -416,6 +421,12 @@ the held call, so a restart rebuilds it unweakened.
 **An `ask` is addressed.** It goes to the rule's `to:`, or to the operators
 when the rule names nobody. It never goes to the caller whose call is being
 judged, which would let the party the policy checks approve itself.
+
+**An `ask` carries agentd's badge.** The task of a gate agentd raised itself
+— a policy's `ask`, a Company's gate — is marked `securityGate` in its
+task annotations, and the TUI and the web UI show it as *agentd security
+gate*. A model's `ask_human` and a workflow's `human` step are never marked,
+whatever their question says.
 
 **Every caller is covered.** A policy that held for root turns and not for
 subagents would be worse than none. A turn worker dials its own MCP tools, so
@@ -1310,14 +1321,18 @@ What holds:
   variables such a secret names. No child opens a mounted key file or the
   vault where the kernel has Landlock (above). `security.exec.enabled`
   beside a delegated server, `identity.providers` or a seal key is refused
-  all the same: a command runs as the supervisor's uid, and the external
-  signer's socket is no Landlock right.
+  all the same: a command is model-chosen, and the external signer's socket
+  is no Landlock right — even under a worker uid of its own, the exclusivity
+  stays until it is weighed again.
 - **Keys agentd never holds.** Under `identity.delegation.key_custody:
   external` an external signer holds the IdP and resource client keys and
   the key-encryption key, on a unix socket whose peer must be the uid
   configured. agentd builds each client assertion and has the signer sign
   it; each grant's refresh token is sealed under a data key of its own,
-  which the signer wraps. With the signer down, a delegated call fails
+  which the signer wraps. The signer signs only what a client assertion is,
+  for the audiences and key ids it is configured with, and wraps only under
+  its key-encryption keys, so a process that reaches its socket gets no
+  signature of anything else. With the signer down, a delegated call fails
   `signer_unavailable` before anything is sent
   ([The external signer protocol](external-signer.md)).
 - **Authority from the transport.** The person is the unix listener's peer
@@ -1359,16 +1374,53 @@ What holds:
   delegated calls within that interval; a refresh token the IdP revoked is
   noticed at the next probe or mint, and the grant is revoked, tombstoned and
   purged.
-- **Consent from the person.** A delegated `sensitive` or `egress` call, and
-  any `egress` call from work holding delegated data — a workflow step that
-  sends the run's data out by its own effect too (`http`, `a2a.send`,
-  `a2a.delegate`, a forwarded `emit`, an `mcp.tool` or `mcp.resource` step at
-  an `egress` server) — gates for the person; an approved step runs with the
-  spec they saw.
-  Only they answer, over the unix listener, bound to the gate's nonce and
-  argument hash; no operator answers for them, no judge answers whatever
-  `agent.ask_human_fallback` says, a message on the asking task is no
-  answer, and an unanswered gate denies.
+- **Taint is tracked.** Work — a run, a step, a turn's conversation, a
+  subagent — is *tainted* once outside text reached it: a delegated server's
+  result (unless the operator sets `auth.trusted_output: true` on it), an
+  `untrusted_input` tool's result — through a model's call, a `tool` step or
+  a built-in `search.*` step — a webhook's or a stream's events, a
+  non-operator principal's A2A message, an A2A peer's answer, an `http`
+  step's response, an `mcp.tool` or `mcp.resource` result from a server
+  whose `tags` name `untrusted_input` (whether or not it serves a tool),
+  knowledge context or a `knowledge.*` step's result, a served instruction,
+  or a memory entry or an artifact tainted work wrote. It *holds delegated
+  data* once a delegated server's result reached it, trusted or not. Both
+  are recorded before the text is read, durably, and carried wherever the
+  work's text goes: into what it starts, spawns, signals or steers, the
+  messages it sends (`message.send`, a `message` step), the events it
+  emits, the memory and the artifacts it writes, a plan item's note, and
+  the results read back from it. A step's cached output (`cache`) hands
+  the run it is given to what the run that produced it carried; a run that
+  holds delegated data caches nothing — the cache is every run's, keyed by
+  no principal, and a hit would hand the person's data past the admission
+  and the revocation every read is held to (`step.cache.not_kept`).
+  `security.policies` match them as `tainted` and `holds_delegated_data`,
+  beside `delegated` and `any_tags`; a single run's `workflow.status` shows
+  them under `taint`.
+- **Consent from the person.** These ask the person: any `egress` call —
+  delegated or under agentd's own credential, from a turn, a subagent or a
+  workflow step that sends the run's data out by its own effect (`http`,
+  `a2a.send`, `a2a.delegate`, a forwarded `emit`, an `mcp.tool` or
+  `mcp.resource` step at an `egress` server) — from work that is tainted and
+  holds delegated data; a delegated `sensitive` or `egress` call from
+  tainted work; and every delegated `egress` call. Where a delegation is
+  declared every `egress` tool comes back to the supervisor, so no worker
+  dials one past the rule. An approved step runs with the spec the person
+  saw. Only they answer, over the unix listener, bound to the gate's nonce
+  and argument hash; an operator who is not them is refused, a message on
+  the task the gate holds is refused, and each is recorded
+  (`delegation.consent.refused`); no judge answers whatever
+  `agent.ask_human_fallback` says, and an unanswered gate denies. What they
+  read is agentd's own text: fixed lines, and every value the work chose —
+  a server, a tool, a scope, the arguments — quoted and escaped to
+  printable ASCII, so a bidirectional override, a zero-width character or a
+  letter that only looks Latin shows as `\uXXXX`; the arguments in full up
+  to 4,000 characters, with their length, and all of them in
+  `--delegation-list`. In the display clients a gate agentd raised itself — a
+  policy's, a Company's — carries the badge *agentd security gate*, which
+  no question a model asks can earn; under it, a policy `ask` shows the
+  call's `{{args}}` as printable-ASCII JSON, capped, and `{{tool}}` quoted,
+  and the cross-Company gate its arguments the same way.
 - **Documents cannot configure authority.** A served document, a
   `:::!config` or `:::!mcp` fragment and a subagent template's machinery may
   not declare a delegated server, set its pins or its client
@@ -1377,12 +1429,52 @@ What holds:
   resolves to, a `*_file` field's path as a file (RFC 0042, as RFC 0044
   §5.14.1 amends it).
 
-What this preview does not do: it acts for one person; there is no taint
-engine, so every unit that touches a delegated server counts as tainted; a
-grant held by a person stays usable after the IdP removes a Resource
-connection until the next mint (at most `at_cache_cap`); and on a kernel
-without Landlock the vault and a mounted key file are readable by any
-same-uid process.
+- **Workers under a uid of their own.** With `spawn.uid` and `spawn.gid`
+  every turn worker, subagent and think child, an instance child's own
+  workers, and every `exec` command run as that uid and gid with no
+  supplementary group, before they enter the Landlock domain: no worker can
+  read agentd's memory, a file only agentd's uid may open, or pass an
+  external signer's peer check. Every capability is dropped with the uid —
+  the ambient set cleared, the permitted, effective and inheritable sets
+  emptied and read back empty — and `no_new_privs` set, so no worker can
+  set its uid back to agentd's, whatever agentd held or the binary's file
+  capabilities say. agentd needs root, or `CAP_SETUID`, `CAP_SETGID` and
+  `CAP_KILL` (the last to signal a worker of another uid at its deadline
+  and its drain), to do it, and the load refuses the configuration where it
+  cannot, naming why; a uid that is agentd's own, root's or a signer's is
+  refused too. An instance child itself keeps agentd's uid — it answers its
+  parent's unix listener as the operator — and starts its own workers under
+  the same uid.
+
+What this preview does not do: it acts for one person; a grant held by a
+person stays usable after the IdP removes a Resource connection until the
+next mint (at most `at_cache_cap`); taint does not follow text inside an
+instance child, which keeps a record of its own; and on a kernel without
+Landlock, with no separate worker uid, the vault and a mounted key file are
+readable by any same-uid process.
+
+### A container deployment with a worker uid
+
+Run agentd as root in the container (it drops every worker, and the drop
+from root clears every capability the kernel's way too) — or as a uid of its
+own granted `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL`, with no instance-tier
+template — and give the worker uid only what a worker reads itself:
+
+- the agentd binary, readable and executable by it (`0755`);
+- each `{{secret-file:…}}` its connections name — a model's token, an MCP
+  server's header — readable by its gid, and none of the supervisor's keys:
+  the IdP and resource keys, the seal keys and the companies' seal key stay
+  `0600` to agentd's uid;
+- `AGENTD_CRED_DIR`, where workers keep the OAuth tokens of the MCP servers
+  they dial, owned by the worker uid (sign in there with `agentd --login`
+  run as it);
+- `security.exec.workdir`, owned by it, when `exec` is enabled;
+- a TLS trust file (`security.tls_ca`), readable.
+
+The store's root and the audit chain stay agentd's alone; with Landlock they
+are denied to every child as well. Keep the external signer's socket in a
+directory the worker uid cannot write, and the signer under a uid of its
+own.
 
 ### The audit chain
 
@@ -1410,9 +1502,30 @@ record is older than `retention` (400 days by default). Its deletion is an
 the segment is deleted; a chain that starts past its first record with no
 such record — a segment removed by hand — refuses the start. Each segment
 opens with a header that carries the tombstone register, so retention never
-forgets a revocation. The rendered arguments of a consent gate are kept in
-the clear in the chain, beside `args_hash`, for as long as retention keeps
-them.
+forgets a revocation.
+
+**What a person saw is sealed for them.** A consent record keeps who
+decided, how (`via`), the run, step, tool, server, scope and rule, the
+arguments' hash and length and whether the work was tainted, in the clear;
+what the gate showed — its rendered fields and text, the arguments among
+them — only sealed (AES-256-GCM) under the person's own key, `personal:
+{key, sealed}`. That key is kept in the vault as a grant's refresh token is:
+sealed under the seal key, or wrapped by the external signer.
+A key is made only for a person who holds a grant. Under the external signer
+it is opened off the loop — at start, and when a gate of theirs opens — and a
+record is sealed only with a key already open, so the loop never waits on
+the signer; one not open yet leaves an approval undecided, the gate open, and
+is opened again for the next answer. `agentd --delegation-audit` reads a
+person's records back with it, off the loop. `agentd --delegation-forget
+<principal>` erases the person: every gate open for them is denied first
+(`via: forgotten`), recorded under their key; then their grants are revoked,
+and their key is destroyed — its id raised in the tombstone register, which
+the chain anchors, so a store restored from before still opens nothing it
+sealed. With their grants gone no key is made for them again, so nothing of
+theirs is sealed readable after. Their records stay in the chain,
+unreadable, and the chain still verifies. A backup of the store taken before the erasure holds
+the key, sealed under the seal key: destroying such backups, or the seal key
+with them, is the operator's part of an erasure.
 
 **Starting a new chain** after a refusal you have looked into:
 

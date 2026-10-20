@@ -1374,6 +1374,7 @@ secret references and routed `aws` credentials read, and this list
 | Path | Type | Default | Class | What it does |
 |---|---|---|---|---|
 | `spawn.env_passthrough` | list of names and `PREFIX*` patterns | `[]` | live · op | Variables every child also gets, when agentd has them. `*` alone, and a name a supervisor-only secret is read from, are refused. |
+| `spawn.uid`, `spawn.gid` | ints ≥ 1 | — (agentd's own) | restart · op | The uid and gid every worker runs as — turn workers, subagents, think children, an instance child's own workers, `exec` commands — with no supplementary group, inside its Landlock domain as before. Both or neither. Every capability is dropped with the uid, and `no_new_privs` set, so a worker can never set its uid back. Needs root, or `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` (with an instance-tier template, root); refused at load where agentd cannot drop to them, and for agentd's own uid, root's, or an external signer's ([Security model](security.md#a-container-deployment-with-a-worker-uid)). |
 
 ## goal
 
@@ -1501,10 +1502,11 @@ Every `security` path is restart · op.
 | `security.policies[].match.principal` | glob | — | The principal id, for calls that carry one. |
 | `security.policies[].match.args` | CEL | — | A predicate over `args`, `tool` and `caller`. Needs `cel`. |
 | `security.policies[].match.delegated` | bool | — | The call is made with an enrolled person's grant. |
-| `security.policies[].match.tainted` | bool | — | The work holds outside input; until the taint engine, every unit that touched a delegated server is tainted. |
+| `security.policies[].match.tainted` | bool | — | The work making the call has read outside text — a delegated server's result (unless `trusted_output`), an `untrusted_input` tool's, a webhook's or a non-operator principal's message, a peer's answer, an `http` step's response, knowledge context, a served instruction, a tainted memory entry ([Security model](security.md#acting-for-an-enrolled-person)). |
+| `security.policies[].match.holds_delegated_data` | bool | — | A delegated server's result has reached the work making the call. |
 | `security.policies[].match.any_tags` | list of tags | — | At least one listed tag is on the tool. |
 | `security.policies[].action` | `allow \| deny \| ask \| shadow` | required | `shadow` refuses and says the call was held. |
-| `security.policies[].question` | string | — | For `ask`: the question; `{{tool}}`, `{{caller}}` and `{{args}}` are substituted. |
+| `security.policies[].question` | string | — | For `ask`: the question; `{{tool}}` (quoted), `{{caller}}` and `{{args}}` (the call's arguments as printable-ASCII JSON, at most 1,500 characters) are substituted — the gate carries agentd's badge, so what the work chose is shown escaped. |
 | `security.policies[].timeout` | duration | — | For `ask`: how long to wait. |
 | `security.policies[].on_timeout` | `allow \| deny \| ask \| shadow` | `deny` | What an unanswered ask becomes. |
 | `security.policies[].to` | `{role: operator, labels}` or `operator` | `{role: operator}` | Who may answer an `ask`. |
@@ -1544,7 +1546,9 @@ Every `security` path is restart · op.
 | `security.companies.standing[].expires` | RFC 3339 time | required | When it stops applying. |
 | `security.companies.standing[].uses` | int ≥ 1 | no limit | How many confirms it covers: each reserved with the confirm, spent once the Company records a confirmation by it, and given back when the Company does not take the confirm or the operation ends unconfirmed. Counted per permission as written: one changed starts its count again. |
 | `security.companies.standing[].accounts` | list of account labels | `default` alone | The User's accounts at the Company it covers, by the labels sign-ins gave them (`[a-z0-9_-]{1,32}`; [Several accounts](act-at-companies.md#several-accounts)): an operation proposed in another account's Session asks the User. Without it, the account labelled `default` and the signed-out Session alone, so signing in to a second account never widens it. |
-| `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the Account Tokens a sign-in gives agentd, and the User ID records, so the store cannot read them. Required with any `sign_in`, and with a remote store. |
+| `security.companies.seal_key` | secret reference | — | 32 random bytes, hex or base64. Seals the Account Tokens a sign-in gives agentd, and the User ID records, so the store cannot read them. Required with any `sign_in`, and with a remote store, under `key_custody: local`; refused under `external`. |
+| `security.companies.key_custody` | `local \| external` | `local` | Who holds the seal key: agentd, from `seal_key`, or the external signer `signer` names, which wraps each record's data key and derives the record-id keys, so agentd holds neither ([The external signer protocol](external-signer.md)). A store sealed under one custody does not open under the other. Restart. |
+| `security.companies.signer` | `{socket, uid, timeout, seal_key, derive_key}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (agentd's own is a load warning), the bound on a request (`5s`, at most `60s`), its key-encryption key's id and its derivation key's id. Restart. |
 | `security.companies.browsers` | list of server names | `[]` | Browser MCP servers to keep off every Company's hosts; each must name an `mcp.servers` entry. A call on one with any string argument naming a Company's host as a browser reads it — or a host that is not ASCII — is refused unsent (`company.browser.refused`); their tools are served by the supervisor. |
 | `security.companies.limits.in_flight` | int | `4` | Company calls in flight per Company; one more is refused until one ends. |
 | `security.companies.limits.conversations` | int | `16` | Open conversations in the instance, each followed by a reader; a new one is refused until one closes. |
@@ -1660,7 +1664,8 @@ naming the line:
   `event_grants`, nor a server of `grant: id_jag` or any of its fields —
   `auth.idp`, `.audience`, `.resource`, `.client_auth`, `.tool_scopes`,
   `.scope_mode`, `.tools_from`, `.tools_file`, `.id_jag`, `.id_jag_reuse`,
-  `.on_revoked`, `.allow_unbound_at`, `.attribution`, `.max_at_age` — on any
+  `.on_revoked`, `.allow_unbound_at`, `.attribution`, `.max_at_age`,
+  `.trusted_output` — on any
   server, nor a reference to a secret under `identity.*` or on a delegated
   server), `vars`, `context`, `goal`, `knowledge`, `search`, `memory`,
   `limits`

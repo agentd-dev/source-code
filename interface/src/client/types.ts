@@ -92,6 +92,12 @@ export interface TaskView {
    * document's `::!human` it is addressed to. It never decides who answers.
    */
   askChannel?: string;
+  /**
+   * The gate is one agentd raised itself — a `security.policies` ask, a
+   * Company's gate — never a model's `ask_human`: shown with a badge no
+   * question text can earn.
+   */
+  securityGate?: boolean;
   /** Epoch ms of `status.timestamp`; 0 when the task carries none. */
   updated: number;
 }

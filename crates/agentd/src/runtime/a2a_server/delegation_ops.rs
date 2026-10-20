@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The `delegation.*` command ops (RFC 0044 P1): what `agentd --login
+//! The `delegation.*` command ops (RFC 0044): what `agentd --login
 //! idp:<name>`, `--delegation-list`, `--delegation-approve`,
-//! `--delegation-deny` and `--delegation-revoke` send over the unix A2A
-//! listener.
+//! `--delegation-deny`, `--delegation-revoke`, `--delegation-forget` and
+//! `--delegation-audit` send over the unix A2A listener.
 //!
 //! All are on the operator floor, and served only where an IdP or a
 //! delegated server is declared, in a build that acts for an enrolled person
 //! (the op table's `Gate::Delegation`). Enrolling, approving and denying are
 //! the per-person operator's alone — the caller the listener named
 //! `operator:<id>` by its peer's uid: no other operator signs in as them or
-//! answers for them. Any operator lists and revokes: an operator offboards.
-//! An enrolment's task says where to sign in and how it ended; a
-//! revocation's says what the IdP acknowledged.
+//! answers for them, and an attempt is refused and recorded. Any operator
+//! lists, revokes, forgets and reads a person's consent records: an
+//! operator offboards, and keeps the audit. An enrolment's task says where
+//! to sign in and how it ended; a revocation's and an erasure's say what
+//! was done; a read of the consent records answers with them as its
+//! result, read off the loop.
 
 #[cfg(feature = "xaa")]
 use super::commands::refusal;
@@ -149,8 +152,13 @@ fn served(
                 Ok(DelegationAnswer::Task(rt.task_reply(&task)))
             }
             "delegation.approve" | "delegation.deny" => {
-                theirs("answers for the person a consent gate asks")?;
                 let gate = args["gate"].as_str().unwrap_or_default().to_string();
+                // No operator answers for the person (T7): refused, and the
+                // attempt recorded.
+                if let Err(e) = theirs("answers for the person a consent gate asks") {
+                    rt.consent_refused(&gate, &principal.id, "not_the_person");
+                    return Err(e);
+                }
                 let task = new_task(rt);
                 let answered = rt.consent_answer(
                     &gate,
@@ -167,6 +175,82 @@ fn served(
                     }
                     Err(e) => rt.a2a_task_fail(&task, &format!("{op}: {e}")),
                 }
+                rt.task_persist(&task);
+                rt.task_sync(&task);
+                Ok(DelegationAnswer::Task(rt.task_reply(&task)))
+            }
+            "delegation.audit" => {
+                let who = args["principal"]
+                    .as_str()
+                    .unwrap_or(principal.id.as_str())
+                    .to_string();
+                let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 1000) as usize;
+                let Some(chain) = rt.audit_chain.clone() else {
+                    return Err(bad(format!(
+                        "{op}: observability.audit.chain is not set, so no consent record is kept to read"
+                    )));
+                };
+                let task = new_task(rt);
+                let tx = rt.events_tx.clone();
+                let t = task.clone();
+                // Every kept segment is read, and each record opened under
+                // the person's key — through the external signer when it
+                // holds them: off the loop.
+                std::thread::Builder::new()
+                    .name("delegation-audit".into())
+                    .spawn(move || {
+                        let said = match consent_records(&chain, &d, &who, limit) {
+                            Ok(doc) => Said::Answered(
+                                format!(
+                                    "{}: {} consent record(s)",
+                                    who,
+                                    doc["records"].as_array().map_or(0, Vec::len)
+                                ),
+                                doc,
+                            ),
+                            Err(e) => Said::Done(Err(e)),
+                        };
+                        let _ = tx
+                            .send(crate::runtime::events::Event::DelegationSaid { task: t, said });
+                    })
+                    .ok();
+                rt.task_persist(&task);
+                rt.task_sync(&task);
+                Ok(DelegationAnswer::Task(rt.task_reply(&task)))
+            }
+            "delegation.forget" => {
+                let target = args["principal"].as_str().unwrap_or_default().to_string();
+                if target.is_empty() {
+                    return Err(bad(format!("{op}: principal is required")));
+                }
+                // Their open gates close first, recorded under the key the
+                // erasure destroys.
+                rt.forget_consents(&target);
+                let task = new_task(rt);
+                let tx = rt.events_tx.clone();
+                let (t, by) = (task.clone(), principal.id.clone());
+                // RFC 7009 is retried for seconds: off the loop.
+                std::thread::Builder::new()
+                    .name("delegation-forget".into())
+                    .spawn(move || {
+                        let end = d.forget(&target, &by).map(|done| {
+                            format!(
+                                "{target}: {} grant(s) revoked; {}",
+                                done["revoked"].as_array().map_or(0, Vec::len),
+                                if done["key"].is_null() {
+                                    "no personal key was kept".to_string()
+                                } else {
+                                    "their personal key was destroyed: what it sealed is unreadable"
+                                        .to_string()
+                                }
+                            )
+                        });
+                        let _ = tx.send(crate::runtime::events::Event::DelegationSaid {
+                            task: t,
+                            said: Said::Done(end),
+                        });
+                    })
+                    .ok();
                 rt.task_persist(&task);
                 rt.task_sync(&task);
                 Ok(DelegationAnswer::Task(rt.task_reply(&task)))
@@ -214,6 +298,38 @@ fn served(
     }
 }
 
+/// `who`'s last `limit` consent records in `chain`, the latest first,
+/// each with what its gate showed opened under their personal key —
+/// `unreadable` once that key is gone, `unsealed` where none was kept.
+#[cfg(feature = "xaa")]
+fn consent_records(
+    chain: &crate::obs::chain::Chain,
+    d: &crate::delegation::Delegation,
+    who: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let mut records = chain.records(
+        |r| r["action"] == "delegation.consent" && r["principal"] == who,
+        limit,
+    )?;
+    records.reverse();
+    for r in &mut records {
+        let gate = r["target"]["gate"].as_str().unwrap_or_default().to_string();
+        let sealed = r["target"]["personal"].clone();
+        let shown = if sealed.get("sealed").is_none() {
+            serde_json::json!("unsealed")
+        } else {
+            match d.open_personal(who, &format!("consent:{gate}"), &sealed) {
+                Ok(Some(content)) => content,
+                Ok(None) => serde_json::json!("unreadable"),
+                Err(e) => serde_json::json!({"error": e}),
+            }
+        };
+        r["target"]["personal"] = shown;
+    }
+    Ok(serde_json::json!({"principal": who, "records": records}))
+}
+
 #[cfg(feature = "xaa")]
 impl Runtime {
     /// A delegation op's task moved on: what the sign-in says, or how it
@@ -230,6 +346,10 @@ impl Runtime {
         match said {
             Said::Text(text) => t.transition(State::Working, Some(text)),
             Said::Done(Ok(text)) => t.transition(State::Completed, Some(text)),
+            Said::Answered(text, doc) => {
+                t.set_result(doc);
+                t.transition(State::Completed, Some(text));
+            }
             Said::Done(Err(e)) => t.transition(State::Failed, Some(e)),
         }
         self.task_persist(task);

@@ -143,6 +143,17 @@ impl Runtime {
     /// A child's progress frame (`AgentMsg::Event`) — fold it into the unit's
     /// activity and publish the change.
     pub(crate) fn on_child_progress(&mut self, node: NodeId, event: &str, fields: &Value) {
+        // A call the child is about to make: what an `untrusted_input` tool
+        // answers taints its unit before the child reads it
+        // (`runtime::taint`). A subagent's `tool.called` says only that.
+        if matches!(event, "turn.tool" | "tool.called")
+            && let Some(tool) = fields["tool"].as_str()
+        {
+            self.taint_announced(node, tool);
+        }
+        if event == "tool.called" {
+            return;
+        }
         let (task, ctx) = self.unit_of(node);
         let trace_id = self
             .children

@@ -251,7 +251,8 @@ token, an assertion, a proof or a User ID; `session_id` appears only at
 | `company.api.not_offered` | warn | `company`, `operation`, `reason`, `server` | An operation `api_allow` lists has no tool: the description does not declare it, its schemas do not resolve within their bounds, its input schema would be over 16 KiB, or it requires a header or cookie agentd does not send. Written once per change. |
 | `company.api.unavailable` | warn | `company`, `error`, `server` | The operation tools of `server` could not be made: the Company is unavailable, its description could not be read, it lists several OpenAPI APIs and `api_names` names them not, or it lists none at the URL `api_names` gives `server`. Tried again with the backoff of a server down at boot. Written once per change. |
 | `company.identity.unpublished` | error | `error`, `kid`, `url` | The client metadata document or key set at its URL is not what this configuration prints: every Company is unavailable until it is. |
-| `company.seal_key.mismatch` | error | `error` | `security.companies.seal_key` opens none of the store's sealed User ID records, or is not set for a store whose records are sealed: every Company is unavailable, rather than meet a new User ID. |
+| `company.seal_key.mismatch` | error | `error` | The seal key opens none of the store's sealed User ID records — another key, or the other custody — or is not set for a store whose records are sealed: every Company is unavailable, rather than meet a new User ID. |
+| `company.signer.unavailable` | warn, error | `error`, `socket?`, `msg?` | The external signer that holds the companies' seal key (`key_custody: external`) did not answer: at start (warn), or at a Company's first use (error). Every Company is unavailable until it does; no User is started over. |
 | `company.session.started` | info | `account`, `company`, `signed_in` | A new Session at the Company: of the User's account `account` (its label, agentd's own word), or the signed-out Session (`account` null). |
 | `company.session.renewed` | debug | `account`, `company`, `signed_in` | The Session's Session Token renewed. |
 | `company.session.ended` | info | `account`, `company`, `reason` | The Company ended the Session (`invalid_session`); a new one is started. |
@@ -379,7 +380,11 @@ its `jti`.
 | `delegation.used` | info | `grant_id`, `run`, `server`, `step`, `tool` | A delegated call was answered. |
 | `delegation.denied` | info | `code`, `error`, `server?`, `tool?`, `run?`, `step?`, `idp?`, `approving_sub?` | A delegated call or a sign-in was refused; `code` is the RFC 0044 §5.8 code. |
 | `delegation.step_up` | info | `grant_id`, `max_age`, `server`, `tool` | The IdP asked for a fresher sign-in. |
-| `delegation.consent` | info | `gate`, `decision`, `rendered?`, `answer?`, `via?`, `principal?`, `args_hash?` | A consent gate was asked (`decision: asked`), or answered `approved` or `denied` — by the person (`via: operator_self`) or by its deadline (`via: on_timeout`). A workflow step's own egress gates as `tool` its kind (`http`, …) with `args` its rendered spec. |
+| `delegation.consent` | info | `gate`, `decision`, `rendered?`, `answer?`, `via?`, `principal?`, `args_hash?` | A consent gate was asked (`decision: asked`), or answered `approved` or `denied` — by the person (`via: operator_self`), by its deadline (`via: on_timeout`), or by the person being forgotten (`via: forgotten`). `rendered` is what the gate shows: the rule, server, tool, scope, run, `tainted`, `holds_delegated_data` and `taint`, and `args` only under `observability.log_content`. A workflow step's own egress gates as `tool` its kind (`http`, …) with `args` its rendered spec. The audit record of a decision holds the gate's content only sealed under the person's key (`personal`). |
+| `delegation.consent.refused` | warn | `by`, `gate`, `why` | An answer to a consent gate was refused, and the gate left open: `not_the_person` (an operator who is not the person), `not_bound` (another nonce or argument hash), `a_message_is_no_answer` (a message on the task the gate holds). Also an audit record. |
+| `delegation.consent.unsealed` | warn | `err`, `gate`, `msg` | A denial's record could not be sealed under the person's key, and keeps none of the gate's content. An approval whose record cannot be sealed decides nothing. |
+| `delegation.forgotten` | info | `by`, `key`, `principal`, `revoked` | A person was erased: their grants revoked, their personal key (`key`, its id) destroyed, so what it sealed is unreadable. |
+| `delegation.personal.unreadable` | warn | `err`, `principal` | The person's personal key could not be opened, or made, off the loop — at start or when a gate of theirs opened (the external signer did not answer, or the record does not open); it is opened again when a record of theirs could not be sealed. |
 | `delegation.revoked` | info | `by`, `grant_id`, `sub`, `principal?`, `why?`, `epoch?`, `at_idp?`, `at_idp_error?`, `tombstoned?` | A grant was revoked: `by: idp` when the refresh token died, `by: enrolment` when a sign-in replaced a grant no longer the same (expired, another identity, template or ceilings), else who revoked it. |
 | `delegation.replaced_token` | info | `grant_id`, `revoked_at_idp`, `at_idp_error?` | A sign-in replaced the grant's refresh token, and the one it replaced was revoked at the IdP (RFC 7009) — or not, said. |
 | `delegation.quota_warn` | info | `day`, `grant_id`, `month`, `per_day`, `per_month`, `resource` | A mint brought a day or a month to 80% of its budget. |
@@ -675,6 +680,7 @@ its `jti`.
 | `proc.harden` | warn | `refused` | The kernel refused to make the supervisor non-dumpable (`PR_SET_DUMPABLE`) or to set its core-dump limit to zero; the process runs on. |
 | `proc.landlock` | info | `abi`, `denied` | Every child and `exec` command is started in a Landlock domain (ABI `abi`) that denies it the paths in `denied`: the file store's root and everything beneath it, the supervisor-only key files, the external signer's socket and the audit chain. |
 | `proc.landlock.unavailable` | warn | `denied`, `msg` | The kernel has no Landlock: children start unconfined, and a same-uid child can read the paths in `denied`. |
+| `proc.worker` | info | `gid`, `uid` | Every worker, an instance child's own workers and every `exec` command run as `uid` and `gid` (`spawn.uid`, `spawn.gid`), with no supplementary group. |
 | `proc.ready` | info | `inbox_pending`, `instance`, `job_shape`, `runs`, `workflows` | Startup finished; triggers are armed. |
 | `proc.start` | info | `config_files`, `instance`, `version` | The process started. |
 
@@ -796,7 +802,8 @@ an instruction's by `origin: instruction` and `name`.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `step.cache_hit` | info | `run`, `step` |  |
+| `step.cache.not_kept` | info | `run`, `step`, `why` | A step's output was not memoized under its `cache`: the run holds a person's delegated data, which the cache — every run's, keyed by no principal — never keeps. |
+| `step.cache_hit` | info | `run`, `step` | The step's output came from its `cache`; the run takes on what the run that produced it carried (its taint, its origins). |
 | `step.done` | info | `attempt`, `err`, `run`, `status`, `step`, `tokens` | A workflow step ended with `status`. In the span of the attempt, as `step.start` and `step.retry` are. |
 | `step.goto` | info | `from`, `run`, `to` |  |
 | `step.output.artifact` | info | `artifact`, `run`, `size`, `step` |  |

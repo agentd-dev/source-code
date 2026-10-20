@@ -281,8 +281,9 @@ impl Runtime {
                     // touch is served by the runtime instead. Gated tools pay
                     // one round-trip; everything else keeps the fast path.
                     let tags = self.registry.tags_of(std::slice::from_ref(&d.name));
-                    if !policies.is_empty()
-                        && crate::sec::policy::could_apply(policies, &d.name, &tags, who)
+                    if (!policies.is_empty()
+                        && crate::sec::policy::could_apply(policies, &d.name, &tags, who))
+                        || self.egress_round_trips(&tags)
                     {
                         internal.push(d.name.clone());
                     } else {
@@ -1114,6 +1115,11 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             return;
         };
         self.log.in_trace(job.trace.as_ref()).info("knowledge.auto_context", json!({"ctx": job.ctx, "hit": block.is_some(), "bytes": block.as_ref().map(|b| b.len()).unwrap_or(0)}));
+        // Retrieved text is outside text, in the turn's prompt: it taints the
+        // conversation before the turn reads it (RFC 0044 §5.13).
+        if block.is_some() {
+            self.taint_knowledge(&job.ctx);
+        }
         job.knowledge = block;
         job.knowledge_done = true;
         self.turn_queue.push_back(job);

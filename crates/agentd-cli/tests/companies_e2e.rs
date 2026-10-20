@@ -999,6 +999,84 @@ fn a_restart_keeps_the_user_and_the_session_and_the_store_holds_them_sealed() {
     holds_no(&s.dir.join("state"), user);
 }
 
+/// With `key_custody: external` the reference signer holds the seal key
+/// (RFC 0044 §7.P2b): the record-id keys are derived there and every
+/// record's data key wrapped there — agentd holds neither — and the User ID
+/// the store keeps sealed is the same User in the next life.
+#[test]
+fn the_seal_key_held_by_the_external_signer_keeps_the_user_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &[], None);
+    let h = host();
+    let sock = dir.path().join("signer.sock");
+    let record = dir.path().join("signer.jsonl");
+    // Stopped however the test ends, so a failure leaves no signer behind.
+    struct Stopped(std::process::Child);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _signer = Stopped(
+        Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([
+                "--internal-mock-signer",
+                &sock.display().to_string(),
+                "--knobs",
+            ])
+            .arg(json!({"record": record}).to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "the signer never listened");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: getuid has no failure mode.
+    let uid = unsafe { libc::getuid() };
+    let s = setup(
+        &h,
+        &f.origin,
+        "",
+        &format!(
+            "    key_custody: external\n    signer: {{socket: \"{}\", uid: {uid}, seal_key: seal, derive_key: derive}}\n",
+            sock.display()
+        ),
+    );
+    let mut d = start(&s, "first", &[]);
+    wait_for(&d.log, "joined", |l| joined(l, "shop"));
+    d.stop();
+    let first = f.record();
+    let user = first
+        .iter()
+        .find_map(|t| t["assertion"]["sub"].as_str().map(str::to_string))
+        .expect("a Session assertion");
+    holds_no(&s.dir.join("state"), &user);
+    let asked = std::fs::read_to_string(&record).unwrap_or_default();
+    for op in ["\"op\":\"derive\"", "\"op\":\"wrap\""] {
+        assert!(asked.contains(op), "the signer was asked to {op}: {asked}");
+    }
+    let mut d = start(&s, "second", &[]);
+    wait_for(&d.log, "joined again", |l| joined(l, "shop"));
+    d.stop();
+    let all = f.record();
+    let again = all[first.len()..]
+        .iter()
+        .find_map(|t| t["assertion"]["sub"].as_str().map(str::to_string))
+        .expect("a Session assertion after the restart");
+    assert_eq!(again, user, "the same User ID, opened through the signer");
+    assert!(
+        std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains("\"op\":\"unwrap\""),
+        "the record was opened through the signer"
+    );
+}
+
 /// No file under `dir` names `secret`, the User ID.
 fn holds_no(dir: &Path, secret: &str) {
     let mut stack = vec![dir.to_path_buf()];

@@ -76,14 +76,15 @@ pub enum Event {
     /// An MCP task moved on: a step's call became one, a poll answered, a
     /// listen took its ids (`runtime::mcp_tasks`).
     McpTask(Box<super::mcp_tasks::Note>),
-    /// A Company call's result is about to reach the context `into`: its
-    /// record gains `origin`, `company:<issuer>` (RFC 0047 §6.2). Sent by
-    /// the call's executor thread just before the result itself, so the
-    /// record is written before the result is read.
-    CompanyRead {
+    /// A result is about to reach the context `into`, and its record gains
+    /// what the result `carries`: a Company's origin, `company:<issuer>`
+    /// (RFC 0047 §6.2), or a delegated server's, `delegated:<server>`, and
+    /// its taint (RFC 0044 §5.13). Sent by the call's executor thread just
+    /// before the result itself, so the record is written before the
+    /// result is read.
+    Read {
         into: super::companies::Reads,
-        origin: String,
-        why: String,
+        carries: crate::engine::run::Carries,
     },
     /// What the delegation supervisor tells the loop (RFC 0044): an audit
     /// record, a delegated server's tool catalogue.

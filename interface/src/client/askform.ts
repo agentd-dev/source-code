@@ -110,3 +110,12 @@ export function askAnswer(form: AskForm, picked: string[], other: string): Json 
       return other.trim();
   }
 }
+
+/**
+ * The badge a waiting task's gate is shown with, before anything it asks:
+ * `agentd security gate` for a gate agentd raised itself (`securityGate`),
+ * which no question's own words can produce, and nothing for anyone else's.
+ */
+export function gateBadge(task: { securityGate?: boolean }): string {
+  return task.securityGate === true ? 'agentd security gate · ' : '';
+}

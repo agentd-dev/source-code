@@ -545,6 +545,50 @@ impl Chain {
         &self.opts.path
     }
 
+    /// The last `limit` records `keep` takes, oldest first, from every kept
+    /// segment. Only the open segment is read while no record is appended,
+    /// so none is half seen; a closed one is never written again, so it is
+    /// read with appends going on.
+    pub fn records(
+        &self,
+        keep: impl Fn(&Value) -> bool,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        let read = |f: &Path| match std::fs::read(f) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", f.display())),
+        };
+        let (closed, open) = {
+            let _held = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let closed: Vec<PathBuf> = closed_segments(&self.opts.path)?
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect();
+            (closed, read(&self.opts.path)?)
+        };
+        let mut out = std::collections::VecDeque::new();
+        // A closed segment retention removed since is skipped.
+        let segments = closed
+            .iter()
+            .map(|f| read(f))
+            .chain(std::iter::once(Ok(open)));
+        for bytes in segments {
+            let Some(bytes) = bytes? else { continue };
+            for line in lines_of(&bytes).0 {
+                if let Ok(v) = serde_json::from_slice::<Value>(line)
+                    && keep(&v)
+                {
+                    out.push_back(v);
+                    if out.len() > limit {
+                        out.pop_front();
+                    }
+                }
+            }
+        }
+        Ok(out.into())
+    }
+
     /// Hand the store the head — the last record on the disk, the open
     /// segment flushed first when records after it are not: a head the disk
     /// does not hold would make a power cut look like a cut tail.
@@ -705,6 +749,39 @@ mod tests {
 
     fn rec(action: &str) -> Value {
         json!({"ts": now_ms(), "action": action, "outcome": "ok", "target": {}})
+    }
+
+    /// The records a reader asks for come from every kept segment, oldest
+    /// first, the last `limit` of them.
+    #[test]
+    fn records_are_read_across_every_kept_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = Options {
+            rotate_at: 64 << 10,
+            ..opts(dir.path())
+        };
+        let (c, _) = Chain::open(o.clone(), None, None).unwrap();
+        let pad = "p".repeat(1024);
+        for i in 0..200 {
+            let mut r = rec(if i % 2 == 0 {
+                "delegation.consent"
+            } else {
+                "x"
+            });
+            r["target"] = json!({"i": i, "pad": pad});
+            c.append(r, false).unwrap();
+        }
+        assert!(!closed_segments(&o.path).unwrap().is_empty(), "it rotated");
+        let all = c
+            .records(|r| r["action"] == "delegation.consent", 1000)
+            .unwrap();
+        assert_eq!(all.len(), 100);
+        assert_eq!(all[0]["target"]["i"], 0, "from the oldest segment");
+        let last = c
+            .records(|r| r["action"] == "delegation.consent", 3)
+            .unwrap();
+        let i: Vec<_> = last.iter().map(|r| r["target"]["i"].clone()).collect();
+        assert_eq!(i, [json!(194), json!(196), json!(198)]);
     }
 
     /// Every line carries the hash of the one before; a restart continues

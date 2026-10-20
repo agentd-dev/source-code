@@ -57,6 +57,8 @@ pub mod http;
 #[cfg(feature = "companies")]
 pub mod identity;
 #[cfg(feature = "companies")]
+pub mod keys;
+#[cfg(feature = "companies")]
 pub mod ledger;
 #[cfg(feature = "companies")]
 pub mod mcp;
@@ -138,6 +140,7 @@ mod supervisor {
     use super::discover::{Discovery, Entry, Note, Verified};
     use super::http::Pace;
     use super::identity::Identity;
+    use super::keys::{KeyError, Keyring};
     use super::ledger::Ledger;
     use super::session::{Env, Session};
     use super::user_id::{self, UserIds};
@@ -381,19 +384,35 @@ mod supervisor {
                 .as_ref()
                 .ok_or("security.companies.client is required")?;
             let identity = Identity::load(client, cfg::signs_in_directly(settings))?;
-            let seal = match &c.seal_key {
-                Some(s) => {
+            // The seal key: read here, or held by the external signer, which
+            // is asked now whether it holds both keys — a signer that refuses
+            // refuses the start, one that does not answer is said, and every
+            // Company waits for it.
+            let seal = match (&c.seal_key, c.external()) {
+                (_, Some(sg)) => {
+                    let k = Keyring::external(sg.signer(), &sg.seal_key, &sg.derive_key);
+                    match k.probe() {
+                        Ok(()) => {}
+                        Err(KeyError::Unavailable(e)) => log.warn(
+                            "company.signer.unavailable",
+                            json!({"socket": sg.socket, "error": e,
+                                   "msg": "every Company is unavailable until the signer answers"}),
+                        ),
+                        Err(KeyError::Refused(e)) => return Err(e),
+                    }
+                    Some(Arc::new(k))
+                }
+                (Some(s), None) => {
                     let text = crate::sec::secret::resolve(&s.0, &|k| std::env::var(k).ok())
                         .map_err(|e| format!("security.companies.seal_key: {e}"))?;
-                    Some(user_id::seal_bytes(&text)?)
+                    Some(Arc::new(Keyring::local(user_id::seal_bytes(&text)?)?))
                 }
-                None => None,
+                (None, None) => None,
             };
-            let accounts = match seal {
-                Some(raw) => Some(Accounts::new(Arc::clone(&durable), &client.id, raw)?),
-                None => None,
-            };
-            let ledger = Ledger::new(Arc::clone(&durable), &client.id, seal)?;
+            let accounts = seal
+                .as_ref()
+                .map(|k| Accounts::new(Arc::clone(&durable), &client.id, Arc::clone(k)));
+            let ledger = Ledger::new(Arc::clone(&durable), &client.id, seal.clone());
             let users = UserIds::new(durable, &client.id, seal)?;
             let timeout = settings
                 .mcp
@@ -826,7 +845,14 @@ mod supervisor {
         /// unavailable until each is reset too (RFC 0047 §5.5.3). Once every
         /// Company has started over, the store takes the key.
         pub fn reset_user(&self, company: &Company) -> Result<serde_json::Value, String> {
-            if self.users.check_seal().is_err() && !self.has_started_over(company) {
+            // A signer that does not answer is no key that opens nothing:
+            // nobody is started over for it.
+            let mismatch = match self.users.check_seal() {
+                Ok(()) => false,
+                Err(KeyError::Refused(_)) => true,
+                Err(KeyError::Unavailable(e)) => return Err(e),
+            };
+            if mismatch && !self.has_started_over(company) {
                 self.users.start_over_at(&company.name)?;
                 let all: Vec<&str> = self.companies.keys().map(String::as_str).collect();
                 if all.iter().all(|e| self.users.started_over(e)) {
@@ -919,8 +945,9 @@ mod supervisor {
             }
             let outcome = match self.users.check_seal() {
                 Ok(()) => Ok(true),
+                Err(KeyError::Unavailable(e)) => Err(("company.signer.unavailable", e)),
                 Err(_) if self.users.started_over(&company.name) => Ok(false),
-                Err(e) => Err(("company.seal_key.mismatch", e)),
+                Err(KeyError::Refused(e)) => Err(("company.seal_key.mismatch", e)),
             }
             .and_then(|all| {
                 self.identity

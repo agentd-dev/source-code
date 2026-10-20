@@ -513,6 +513,10 @@ impl Runtime {
             // shows where the question also went. Set on every gate, so a
             // later gate on the same task that has none clears it.
             t.ask_channel = channel.clone();
+            // A gate agentd raised itself — a policy's, a Company's — is
+            // marked so, which no model's `ask_human` is, whatever its text
+            // says (RFC 0044 §5.10 rule 5, T29).
+            t.security_gate = policy.is_some();
             t.transition(State::InputRequired, Some(question.clone()));
             // A gate task of its own is done in the asking unit's span.
             if let Some(trace) = &trace {

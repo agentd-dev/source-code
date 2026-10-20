@@ -569,6 +569,7 @@ pub const SERVER_AUTH_OPERATOR_ONLY: &[&str] = &[
     "allow_unbound_at",
     "attribution",
     "max_at_age",
+    "trusted_output",
 ];
 
 /// What a served document's configuration `fragment` sets that only the
@@ -1216,6 +1217,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 ("allow_unbound_at", a.allow_unbound_at.is_some()),
                 ("attribution", a.attribution.is_some()),
                 ("max_at_age", a.max_at_age.is_some()),
+                ("trusted_output", a.trusted_output.is_some()),
             ] {
                 if set {
                     err(format!(

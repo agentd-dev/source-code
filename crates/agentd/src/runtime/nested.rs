@@ -376,6 +376,7 @@ impl Runtime {
         let v = Value::Array(items);
         let cap = self.settings.limits.inline_max_bytes.unwrap_or(65_536) as usize;
         if v.to_string().len() > cap {
+            let carries = self.run_carries(run_id);
             match self.artifacts.create(
                 &self.durable,
                 super::artifacts::NewArtifact {
@@ -385,6 +386,7 @@ impl Runtime {
                     created_by: Some("engine"),
                     sensitive: false,
                     owner: Some(run_id),
+                    carries: &carries,
                 },
             ) {
                 Ok(meta) => return json!({"$artifact": meta["id"]}),

@@ -55,11 +55,13 @@ const START_LINK_FOR: Duration = Duration::from_secs(60);
 /// The cookie that binds a browser to the sign-in it started.
 const COOKIE: &str = "__Host-agentd-enrol";
 
-/// What a sign-in says while it runs, and how it ends.
+/// What a sign-in says while it runs, and how it ends — or how a read ends:
+/// what it says, and the document it answers with.
 #[derive(Debug)]
 pub enum Said {
     Text(String),
     Done(Result<String, String>),
+    Answered(String, serde_json::Value),
 }
 
 /// Where a sign-in says it.

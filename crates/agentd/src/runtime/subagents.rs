@@ -398,6 +398,23 @@ impl Runtime {
                 })
                 .collect()
         };
+        // Where a person's grant is delegated, every egress tool on its
+        // servers comes back too (`Runtime::egress_round_trips`).
+        for d in self
+            .registry
+            .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
+        {
+            let on_its_servers = matches!(
+                self.registry.get(&d.name).map(|t| &t.imp),
+                Some(crate::registry::Impl::Mcp { server, .. }) if servers.contains(server)
+            );
+            if on_its_servers
+                && !gated_tools.contains(&d.name)
+                && self.egress_round_trips(&self.registry.tags_of(std::slice::from_ref(&d.name)))
+            {
+                gated_tools.push(d.name);
+            }
+        }
         // A Company's tools on the servers it was handed come back to the
         // supervisor whatever the policies say, and only in work the
         // Company's User owns (RFC 0047 §5.6): the child has no connection
@@ -890,9 +907,10 @@ impl Runtime {
         let reader = super::withhold::Reader::Conversation(None);
         let withheld = self.withheld(&reader, source).filter(|_| !note.is_empty());
         let note = withheld.as_deref().unwrap_or(note);
-        // A note handed whole hands the conversation the Companies it carries.
-        let companies = if withheld.is_none() {
-            self.companies_carried(source)
+        // A note handed whole hands the conversation what it keeps of the
+        // source's record: the Companies, the delegated data and the taint.
+        let kept = if withheld.is_none() {
+            self.kept_of(source)
         } else {
             Default::default()
         };
@@ -904,7 +922,7 @@ impl Runtime {
                 let advanced = p.settle_binding(binding, ok, Some(note));
                 if !advanced.is_empty() {
                     settled = true;
-                    c.carries.union(&companies);
+                    c.carries.union(&kept);
                     c.touch();
                     self.log.info(
                         "plan.updated",

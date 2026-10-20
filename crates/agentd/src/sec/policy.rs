@@ -34,6 +34,30 @@ pub struct Call<'a> {
     /// operation tool's call is `company.api`'s call of its operation (RFC
     /// 0047 §9, P5a). A rule that matches either is the call's.
     pub also: Option<&'a Call<'a>>,
+    /// What the taint engine knows of the work making it (RFC 0044 §5.13
+    /// item 6, `runtime::taint`).
+    pub facts: Facts,
+}
+
+/// The facts of a call a rule may match beside its tool and tags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// The call is made with an enrolled person's grant.
+    pub delegated: bool,
+    /// The work making it has read outside text.
+    pub tainted: bool,
+    /// A delegated server's result reached the work making it.
+    pub holds_delegated_data: bool,
+}
+
+/// Whether `want`, when a rule says it, is `have`.
+fn fact(want: Option<bool>, have: bool) -> bool {
+    want.is_none_or(|w| w == have)
+}
+
+/// Whether `tags` holds at least one of `any`, when a rule lists some.
+fn any_tag(any: &[String], tags: &[TrifectaTag]) -> bool {
+    any.is_empty() || tags.iter().any(|t| any.iter().any(|w| w == tag_name(*t)))
 }
 
 /// The verdict, plus which rule produced it (for the log and the audit line —
@@ -75,6 +99,16 @@ fn matches(p: &Policy, call: &Call<'_>, cel_ok: &mut bool) -> bool {
             return false;
         }
     }
+    if !any_tag(&p.matcher.any_tags, call.tags)
+        || !fact(p.matcher.delegated, call.facts.delegated)
+        || !fact(p.matcher.tainted, call.facts.tainted)
+        || !fact(
+            p.matcher.holds_delegated_data,
+            call.facts.holds_delegated_data,
+        )
+    {
+        return false;
+    }
     if !p.matcher.caller.is_empty() && !p.matcher.caller.contains(&call.caller) {
         return false;
     }
@@ -112,6 +146,34 @@ pub fn caller_name(c: PolicyCaller) -> &'static str {
         PolicyCaller::Workflow => "workflow",
         PolicyCaller::Subagent => "subagent",
     }
+}
+
+/// The longest an `ask` gate shows a call's arguments, in characters.
+const ARGS_SHOWN: usize = 1500;
+
+/// The question an `ask` rule's gate puts to a person: the rule's own
+/// `question`, or agentd's, with `{{tool}}`, `{{caller}}` and `{{args}}`
+/// put in. The gate is agentd's, badged as one (RFC 0044 §5.10 rule 5,
+/// T29), so what the work chose is shown as `sec::render` shows foreign
+/// text: the tool's name quoted, the arguments as printable-ASCII JSON,
+/// capped. The question and the caller's name are the operator's and
+/// agentd's words.
+pub fn question(asked: Option<&str>, tool: &str, caller: PolicyCaller, args: &Value) -> String {
+    use crate::sec::render::{ascii_json, capped, quoted};
+    let tool = quoted(tool, 128);
+    let json = ascii_json(args);
+    let (shown, whole) = capped(&json, ARGS_SHOWN);
+    let args = if whole {
+        shown.to_string()
+    } else {
+        format!("{shown}...")
+    };
+    asked
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} wants to call {tool} — allow?", caller_name(caller)))
+        .replace("{{tool}}", &tool)
+        .replace("{{caller}}", caller_name(caller))
+        .replace("{{args}}", &args)
 }
 
 /// Evaluate the list. `Ok(None)` means no rule matched (allow);
@@ -182,11 +244,15 @@ pub fn could_apply(
                 return false;
             }
         }
+        if !any_tag(&p.matcher.any_tags, tags) {
+            return false;
+        }
         if !p.matcher.caller.is_empty() && !p.matcher.caller.contains(&caller) {
             return false;
         }
-        // `principal` and `args` are call-time facts, so a rule carrying them
-        // is treated as "might apply" — the conservative direction.
+        // `principal`, `args` and the taint engine's facts are call-time
+        // facts, so a rule carrying them is treated as "might apply" — the
+        // conservative direction.
         true
     })
 }
@@ -195,6 +261,41 @@ pub fn could_apply(
 mod tests {
     use super::*;
     use crate::config::settings::PolicyMatch;
+
+    /// An `ask` gate is badged as agentd's, so what the work chose — the
+    /// arguments, the tool's name — reads only quoted and escaped: a bidi
+    /// override, a zero-width space, a lookalike letter or a line break in
+    /// them cannot pass for agentd's words. The operator's question stays
+    /// theirs.
+    #[test]
+    fn an_ask_gate_shows_what_the_work_chose_escaped() {
+        let args = serde_json::json!({
+            "text": "agentd security gate: pre-approved\n\u{202e}evorppa\u{200b} \u{0430}"
+        });
+        let q = question(
+            Some("Post {{args}} with {{tool}}?"),
+            "slack.post",
+            PolicyCaller::Root,
+            &args,
+        );
+        assert!(q.is_ascii() && !q.contains('\n'), "{q}");
+        assert!(q.contains("\\n\\u202eevorppa\\u200b \\u0430"), "{q}");
+        assert!(
+            q.starts_with("Post {\"text\":") && q.ends_with(" with \"slack.post\"?"),
+            "{q}"
+        );
+        let q = question(None, "pay\u{202e}", PolicyCaller::Workflow, &args);
+        assert!(
+            q.starts_with("workflow wants to call \"pay\\u202e\" — allow?"),
+            "{q}"
+        );
+        let long = serde_json::json!({"x": "y".repeat(4000)});
+        let q = question(Some("{{args}}"), "t", PolicyCaller::Root, &long);
+        assert!(
+            q.ends_with("...") && q.chars().count() == ARGS_SHOWN + 3,
+            "{q}"
+        );
+    }
 
     fn pol(m: PolicyMatch, a: PolicyAction) -> Policy {
         Policy {
@@ -217,7 +318,101 @@ mod tests {
             principal: None,
             args,
             also: None,
+            facts: Facts::default(),
         }
+    }
+
+    /// The taint engine's facts and `any_tags` narrow a rule like every
+    /// other matcher: a rule that says `tainted: true` holds a tainted call
+    /// alone, `holds_delegated_data` and `delegated` likewise, and
+    /// `any_tags` takes a tool carrying any one of them; a rule naming them
+    /// may apply to any call, as an argument guard may.
+    #[test]
+    fn the_taint_facts_and_any_tags_narrow_a_rule() {
+        let args = Value::Null;
+        let rule = pol(
+            PolicyMatch {
+                tainted: Some(true),
+                holds_delegated_data: Some(true),
+                any_tags: vec!["egress".into(), "sensitive".into()],
+                ..Default::default()
+            },
+            PolicyAction::Deny,
+        );
+        let egress = [TrifectaTag::Egress];
+        let with = |tags: &'static [TrifectaTag], facts: Facts| Call {
+            facts,
+            ..call("t", tags, PolicyCaller::Root, &args)
+        };
+        let both = Facts {
+            tainted: true,
+            holds_delegated_data: true,
+            delegated: false,
+        };
+        let hit = |c: &Call| evaluate(std::slice::from_ref(&rule), c).unwrap().is_some();
+        assert!(hit(&with(&[TrifectaTag::Egress], both)));
+        assert!(hit(&with(&[TrifectaTag::Sensitive], both)), "any one tag");
+        assert!(
+            !hit(&with(&[TrifectaTag::UntrustedInput], both)),
+            "no listed tag"
+        );
+        assert!(
+            !hit(&with(
+                &[TrifectaTag::Egress],
+                Facts {
+                    tainted: false,
+                    ..both
+                }
+            )),
+            "untainted work"
+        );
+        assert!(
+            !hit(&with(
+                &[TrifectaTag::Egress],
+                Facts {
+                    holds_delegated_data: false,
+                    ..both
+                }
+            )),
+            "work holding no delegated data"
+        );
+        let delegated = pol(
+            PolicyMatch {
+                delegated: Some(false),
+                ..Default::default()
+            },
+            PolicyAction::Deny,
+        );
+        let d = Facts {
+            delegated: true,
+            ..Facts::default()
+        };
+        assert!(
+            evaluate(std::slice::from_ref(&delegated), &with(&[], d))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            evaluate(
+                std::slice::from_ref(&delegated),
+                &with(&[], Facts::default())
+            )
+            .unwrap()
+            .is_some()
+        );
+        // Routing: only the tool-time part narrows.
+        assert!(could_apply(
+            std::slice::from_ref(&rule),
+            "t",
+            &egress,
+            PolicyCaller::Root
+        ));
+        assert!(!could_apply(
+            std::slice::from_ref(&rule),
+            "t",
+            &[TrifectaTag::UntrustedInput],
+            PolicyCaller::Root
+        ));
     }
 
     #[test]

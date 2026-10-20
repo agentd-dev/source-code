@@ -91,6 +91,7 @@ function annotationsOf(a: Obj): Partial<TaskView> {
   if (a.askSchema !== undefined && a.askSchema !== null) out.askSchema = a.askSchema;
   const askChannel = str(a.askChannel);
   if (askChannel !== undefined) out.askChannel = askChannel;
+  if (a.securityGate === true) out.securityGate = true;
   return out;
 }
 
@@ -530,6 +531,26 @@ export class AgentdClient {
   /** Revoke the delegation grants `target` names: a principal, or `idp:<name>#<sub>`. */
   async delegationRevoke(target: string): Promise<CommandReply> {
     return this.command(OPS.delegationRevoke, { target }, { returnImmediately: true });
+  }
+
+  /**
+   * Erase a person: their grants revoked, then their personal key destroyed,
+   * so what it sealed in the audit chain is unreadable from then on.
+   */
+  async delegationForget(principal: string): Promise<CommandReply> {
+    return this.command(OPS.delegationForget, { principal }, { returnImmediately: true });
+  }
+
+  /**
+   * A person's consent records from the audit chain, the latest first, each
+   * with what the gate showed — or `unreadable` once they were forgotten.
+   * The caller's own when `principal` is absent.
+   */
+  async delegationAudit(principal?: string, limit?: number): Promise<Json> {
+    const args: Obj = {};
+    if (principal !== undefined) args.principal = principal;
+    if (limit !== undefined) args.limit = limit;
+    return this.data(OPS.delegationAudit, args);
   }
 
   // ---- streams -----------------------------------------------------------

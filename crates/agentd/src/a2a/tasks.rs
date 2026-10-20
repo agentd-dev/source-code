@@ -165,6 +165,12 @@ pub struct Task {
     /// question to, never who may answer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_channel: Option<String>,
+    /// The open gate is one agentd raised itself — a `security.policies`
+    /// ask, a Company's gate — never a model's `ask_human` or a workflow's
+    /// `human` step (RFC 0044 §5.10 rule 5, T29): a display client shows it
+    /// with a badge no question's text can earn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub security_gate: bool,
     /// The Company sign-in this task's gate is (RFC 0047 §5.7), while it is
     /// open. Durable with the task: a sign-in does not outlive the process
     /// that started it, so a restart that finds one ends it `interrupted`.
@@ -277,6 +283,7 @@ impl Task {
         Task {
             ask_schema: None,
             ask_channel: None,
+            security_gate: false,
             sign_in: None,
             company_gate: None,
             mcp_question: None,

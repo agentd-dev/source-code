@@ -14,7 +14,8 @@
 //! associated data `("company-user", client_id, issuer, principal, "1")`)
 //! and its id is an HMAC-SHA256 of `issuer|principal` under a key derived
 //! from the seal key, so a store that holds it can read neither the User ID
-//! nor which Company it is for. Without one the id is
+//! nor which Company it is for — held by agentd, or by the external signer
+//! under `key_custody: external` ([`super::keys`]). Without one the id is
 //! `sha256("company-user|" + issuer + "|" + principal)` and the record is
 //! plain, which load allows only with a local store. A plain record is
 //! sealed the first time it is read with a seal key set. A seal key that
@@ -31,12 +32,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::auth::seal::{SealKey, associated_data};
+use super::keys::{KeyError, Keyring};
+use crate::auth::seal::associated_data;
 use crate::b64;
 use crate::state::{Durable, Kind};
 
 /// The record version the associated data names.
 const VERSION: &str = "1";
+/// The label the record-id key is derived from.
+pub const ID_LABEL: &[u8] = b"agentd company-user record id";
 
 /// One User at one Company.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,24 +73,17 @@ pub fn seal_bytes(text: &str) -> Result<[u8; 32], String> {
 pub struct UserIds {
     durable: Arc<Durable>,
     client_id: String,
-    seal: Option<(SealKey, [u8; 32])>,
+    seal: Option<Arc<Keyring>>,
 }
 
 impl UserIds {
-    /// `seal`, when given, is `security.companies.seal_key`'s bytes: the
-    /// records are sealed with it, under ids keyed by a key derived from it.
+    /// `seal`, when given, is the seal key: the records are sealed with it,
+    /// under ids keyed by a key derived from it.
     pub fn new(
         durable: Arc<Durable>,
         client_id: &str,
-        seal: Option<[u8; 32]>,
+        seal: Option<Arc<Keyring>>,
     ) -> Result<UserIds, String> {
-        let seal = match seal {
-            Some(raw) => Some((
-                SealKey::new(&raw).map_err(|e| format!("security.companies.seal_key: {e}"))?,
-                crate::sha::hmac_sha256(&raw, b"agentd company-user record id"),
-            )),
-            None => None,
-        };
         Ok(UserIds {
             durable,
             client_id: client_id.to_string(),
@@ -98,11 +95,8 @@ impl UserIds {
         crate::sha::sha256_hex(format!("company-user|{issuer}|{principal}").as_bytes())
     }
 
-    fn sealed_id(key: &[u8; 32], issuer: &str, principal: &str) -> String {
-        crate::sha::hmac_sha256(key, format!("{issuer}|{principal}").as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+    fn sealed_id(key: &Keyring, issuer: &str, principal: &str) -> Result<String, KeyError> {
+        key.record_id(ID_LABEL, &format!("{issuer}|{principal}"))
     }
 
     fn ad(&self, issuer: &str, principal: &str) -> Vec<u8> {
@@ -118,40 +112,34 @@ impl UserIds {
     /// Check the seal key is the one the store's records were sealed with,
     /// writing the check record the first time a key is set. A key that does
     /// not open it, or no key for a store that has one, is
-    /// `company.seal_key.mismatch`: either would mint a new User ID.
-    pub fn check_seal(&self) -> Result<(), String> {
+    /// `company.seal_key.mismatch` ([`KeyError::Refused`]): either would
+    /// mint a new User ID. An external signer that does not answer is
+    /// [`KeyError::Unavailable`], and starts nobody over.
+    pub fn check_seal(&self) -> Result<(), KeyError> {
         let id = crate::sha::sha256_hex(b"company-seal-check");
         let ad = associated_data(&[b"company-seal-check", self.client_id.as_bytes()]);
         let check = self
             .durable
             .get(Kind::Cred, &id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| KeyError::Unavailable(format!("company user records: {e}")))?
             .filter(|env| !env.state.is_null());
-        let Some((key, _)) = &self.seal else {
+        let Some(key) = &self.seal else {
             return match check {
-                Some(_) => Err("the store's User ID records are sealed, and security.companies.seal_key is not set: set the key they were sealed with (without it every Company would see a new User)".to_string()),
+                Some(_) => Err(KeyError::Refused("the store's User ID records are sealed, and security.companies.seal_key is not set: set the key they were sealed with (without it every Company would see a new User)".to_string())),
                 None => Ok(()),
             };
         };
         match check {
-            Some(env) => {
-                let sealed = env.state["sealed"].as_str().unwrap_or_default();
-                let bytes = b64::url_decode(sealed).unwrap_or_default();
-                key.open(&ad, &bytes).map(|_| ()).map_err(|_| {
-                    "security.companies.seal_key opens none of the sealed User ID records: restore the key the store was sealed with (a new key would make a new User at every Company)".to_string()
-                })
-            }
+            Some(env) => key.open(&ad, &env.state).map(|_| ()).map_err(|e| match e {
+                KeyError::Unavailable(_) => e,
+                KeyError::Refused(_) => KeyError::Refused("security.companies' seal key opens none of the sealed User ID records: restore the key, or the custody, the store was sealed with (a new key would make a new User at every Company)".to_string()),
+            }),
             _ => {
                 let sealed = key.seal(&ad, b"ok")?;
                 self.durable
-                    .put(
-                        Kind::Cred,
-                        &id,
-                        json!({"sealed": b64::url_nopad(&sealed)}),
-                        None,
-                    )
+                    .put(Kind::Cred, &id, Value::Object(sealed), None)
                     .map(|_| ())
-                    .map_err(|e| format!("company user records: {e}"))
+                    .map_err(|e| KeyError::Unavailable(format!("company user records: {e}")))
             }
         }
     }
@@ -181,20 +169,20 @@ impl UserIds {
         let plain = Self::plain_id(issuer, principal);
         match &self.seal {
             None => self.read_plain(&plain),
-            Some((key, idk)) => {
-                let id = Self::sealed_id(idk, issuer, principal);
+            Some(key) => {
+                let id = Self::sealed_id(key, issuer, principal)?;
                 if let Some(env) = self
                     .durable
                     .get(Kind::Cred, &id)
                     .map_err(|e| e.to_string())?
                     && !env.state.is_null()
                 {
-                    let bytes = b64::url_decode(env.state["sealed"].as_str().unwrap_or_default())
-                        .unwrap_or_default();
-                    let open = key.open(&self.ad(issuer, principal), &bytes).map_err(|_| {
-                        "a sealed User ID record does not open with security.companies.seal_key"
-                            .to_string()
-                    })?;
+                    let open =
+                        key.open(&self.ad(issuer, principal), &env.state)
+                            .map_err(|e| match e {
+                                KeyError::Unavailable(e) => e,
+                                KeyError::Refused(_) => "a sealed User ID record does not open with security.companies' seal key".to_string(),
+                            })?;
                     return serde_json::from_slice(&open)
                         .map(Some)
                         .map_err(|e| format!("a User ID record: {e}"));
@@ -233,8 +221,8 @@ impl UserIds {
     /// needed. Both of the ids it may be kept under are removed.
     pub fn forget(&self, principal: &str, issuer: &str) -> Result<(), String> {
         let mut ids = vec![Self::plain_id(issuer, principal)];
-        if let Some((_, idk)) = &self.seal {
-            ids.push(Self::sealed_id(idk, issuer, principal));
+        if let Some(key) = &self.seal {
+            ids.push(Self::sealed_id(key, issuer, principal)?);
         }
         for id in ids {
             self.durable
@@ -246,11 +234,11 @@ impl UserIds {
 
     /// The id of the record that says the operator started over at the
     /// company entry `entry` with the current seal key (or with none).
-    fn started_id(&self, entry: &str) -> String {
+    fn started_id(&self, entry: &str) -> Result<String, KeyError> {
         let what = format!("company-start-over|{entry}");
         match &self.seal {
-            Some((_, idk)) => Self::sealed_id(idk, &what, "check"),
-            None => crate::sha::sha256_hex(what.as_bytes()),
+            Some(key) => Self::sealed_id(key, &what, "check"),
+            None => Ok(crate::sha::sha256_hex(what.as_bytes())),
         }
     }
 
@@ -266,15 +254,14 @@ impl UserIds {
     /// this seal key while it opened none of the store's records
     /// ([`Self::start_over_at`]).
     pub fn started_over(&self, entry: &str) -> bool {
-        let Ok(Some(env)) = self.durable.get(Kind::Cred, &self.started_id(entry)) else {
+        let Ok(id) = self.started_id(entry) else {
+            return false;
+        };
+        let Ok(Some(env)) = self.durable.get(Kind::Cred, &id) else {
             return false;
         };
         match &self.seal {
-            Some((key, _)) => {
-                let bytes = b64::url_decode(env.state["sealed"].as_str().unwrap_or_default())
-                    .unwrap_or_default();
-                key.open(&self.started_ad(entry), &bytes).is_ok()
-            }
+            Some(key) => key.open(&self.started_ad(entry), &env.state).is_ok(),
             None => env.state["started_over"] == true,
         }
     }
@@ -285,14 +272,11 @@ impl UserIds {
     /// call. Every other Company stays unavailable until it is reset too.
     pub fn start_over_at(&self, entry: &str) -> Result<(), String> {
         let value = match &self.seal {
-            Some((key, _)) => {
-                let sealed = key.seal(&self.started_ad(entry), b"ok")?;
-                json!({"sealed": b64::url_nopad(&sealed)})
-            }
+            Some(key) => Value::Object(key.seal(&self.started_ad(entry), b"ok")?),
             None => json!({"started_over": true}),
         };
         self.durable
-            .put(Kind::Cred, &self.started_id(entry), value, None)
+            .put(Kind::Cred, &self.started_id(entry)?, value, None)
             .map(|_| ())
             .map_err(|e| format!("company user records: {e}"))
     }
@@ -307,7 +291,7 @@ impl UserIds {
         self.check_seal()?;
         for e in entries {
             self.durable
-                .delete(Kind::Cred, &self.started_id(e))
+                .delete(Kind::Cred, &self.started_id(e)?)
                 .map_err(|e| format!("company user records: {e}"))?;
         }
         Ok(())
@@ -320,12 +304,13 @@ impl UserIds {
                 Self::plain_id(issuer, principal),
                 serde_json::to_value(rec).map_err(|e| e.to_string())?,
             ),
-            Some((key, idk)) => {
+            Some(key) => {
                 let bytes = serde_json::to_vec(rec).map_err(|e| e.to_string())?;
-                let sealed = key.seal(&self.ad(issuer, principal), &bytes)?;
+                let mut sealed = key.seal(&self.ad(issuer, principal), &bytes)?;
+                sealed.insert("v".into(), json!(VERSION));
                 (
-                    Self::sealed_id(idk, issuer, principal),
-                    json!({"v": VERSION, "sealed": b64::url_nopad(&sealed)}),
+                    Self::sealed_id(key, issuer, principal)?,
+                    Value::Object(sealed),
                 )
             }
         };
@@ -349,6 +334,11 @@ mod tests {
             crate::state::Policy::default(),
             None,
         ))
+    }
+
+    /// A local seal key of `b`s.
+    fn local(b: u8) -> Option<Arc<Keyring>> {
+        Some(Arc::new(Keyring::local([b; 32]).unwrap()))
     }
 
     /// Every key and record the store holds, as one string.
@@ -411,13 +401,13 @@ mod tests {
         let sealed = UserIds::new(
             durable(Arc::clone(&store)),
             "https://a.example/c.json",
-            Some([9u8; 32]),
+            local(9),
         )
         .unwrap();
         sealed.check_seal().unwrap();
         // Once sealed, a store is refused to a reader without the key, which
         // would mint new User IDs.
-        let e = plain.check_seal().unwrap_err();
+        let e = plain.check_seal().unwrap_err().to_string();
         assert!(e.contains("seal_key is not set"), "{e}");
         assert_eq!(
             sealed.load("user:dana", "https://as.one").unwrap(),
@@ -434,7 +424,7 @@ mod tests {
         let again = UserIds::new(
             durable(Arc::clone(&store)),
             "https://a.example/c.json",
-            Some([9u8; 32]),
+            local(9),
         )
         .unwrap();
         assert_eq!(
@@ -445,10 +435,10 @@ mod tests {
         let wrong = UserIds::new(
             durable(Arc::clone(&store)),
             "https://a.example/c.json",
-            Some([7u8; 32]),
+            local(7),
         )
         .unwrap();
-        let e = wrong.check_seal().unwrap_err();
+        let e = wrong.check_seal().unwrap_err().to_string();
         assert!(e.contains("opens none of the sealed"), "{e}");
     }
 
@@ -461,7 +451,7 @@ mod tests {
         let old = UserIds::new(
             durable(Arc::clone(&store)),
             "https://a.example/c.json",
-            Some([1u8; 32]),
+            local(1),
         )
         .unwrap();
         old.check_seal().unwrap();
@@ -474,7 +464,7 @@ mod tests {
         let new = UserIds::new(
             durable(Arc::clone(&store)),
             "https://a.example/c.json",
-            Some([2u8; 32]),
+            local(2),
         )
         .unwrap();
         assert!(new.check_seal().is_err());
@@ -489,7 +479,7 @@ mod tests {
         new.durable
             .put(
                 Kind::Cred,
-                &new.started_id("travel"),
+                &new.started_id("travel").unwrap(),
                 json!({"sealed": b64::url_nopad(b"not sealed with the key")}),
                 None,
             )
@@ -505,6 +495,60 @@ mod tests {
         );
         assert_eq!(new.load("operator", "https://as.one").unwrap(), None);
         assert!(old.check_seal().is_err());
+    }
+
+    /// Under `key_custody: external` the reference signer holds the seal
+    /// key: the User ID record is sealed under a data key it wraps, kept at
+    /// an id of the same shape as a local key's — 64 hex digits of an
+    /// HMAC-SHA256, here under the key the signer derived — and read back
+    /// through it; the store holds neither the User ID nor the issuer, and
+    /// a local key opens nothing of it.
+    #[test]
+    fn the_seal_key_is_held_by_the_external_signer_and_ids_keep_their_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("signer.sock");
+        let _m = crate::sec::signer::mock::serve(&sock, &crate::sec::signer::mock::default_knobs())
+            .unwrap();
+        // SAFETY: getuid has no failure mode.
+        let signer = crate::sec::signer::Signer::new(&sock, unsafe { libc::getuid() }, None);
+        let ext = Arc::new(Keyring::external(signer, "seal", "derive"));
+        let store = Arc::new(MemoryStore::new());
+        let ids = UserIds::new(
+            durable(Arc::clone(&store)),
+            "https://a.example/c.json",
+            Some(Arc::clone(&ext)),
+        )
+        .unwrap();
+        ids.check_seal().unwrap();
+        let rec = ids.load_or_mint("operator", "https://as.one").unwrap();
+        let id = UserIds::sealed_id(&ext, "https://as.one", "operator").unwrap();
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+        let local_id = UserIds::sealed_id(
+            &Keyring::local([9; 32]).unwrap(),
+            "https://as.one",
+            "operator",
+        )
+        .unwrap();
+        assert_ne!(
+            id, local_id,
+            "derived under the signer's key, not a local one"
+        );
+        let kept = ids.durable.get(Kind::Cred, &id).unwrap().unwrap().state;
+        assert!(kept["dek"].is_string(), "the data key, wrapped: {kept}");
+        let dump = all_state(&store);
+        assert!(
+            !dump.contains(&rec.user_id) && !dump.contains("as.one"),
+            "{dump}"
+        );
+        assert_eq!(ids.load("operator", "https://as.one").unwrap(), Some(rec));
+        let local = UserIds::new(
+            durable(Arc::clone(&store)),
+            "https://a.example/c.json",
+            local(9),
+        )
+        .unwrap();
+        assert!(matches!(local.check_seal(), Err(KeyError::Refused(_))));
     }
 
     #[test]

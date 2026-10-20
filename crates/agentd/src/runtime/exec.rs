@@ -101,8 +101,10 @@ pub(crate) fn run_command(
     // Nor any descriptor the host left inheritable: a model-chosen command
     // gets its three pipes and nothing else, however agentd was started.
     crate::signals::pass_only_stdio(&mut c);
-    // Nor the vault, a key file or the audit chain, where they are kept
-    // (`sec::landlock`): the command runs as the supervisor's uid.
+    // It runs as the worker uid when one is configured (`sec::worker`), and
+    // opens neither the vault, a key file nor the audit chain, where they
+    // are kept (`sec::landlock`).
+    crate::sec::worker::confine(&mut c);
     crate::sec::landlock::confine(&mut c).map_err(|e| format!("spawn {cmd}: {e}"))?;
     // Routed from the fork on: a workflow step runs this on a `tool:exec`
     // thread while the reactor's tick reaps every exited child in the process,

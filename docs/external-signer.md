@@ -1,11 +1,14 @@
 # The external signer protocol
 
 With `identity.delegation.key_custody: external`, agentd holds none of the
-keys an enrolled person's delegation rests on. A signer process you run
-holds them, and agentd asks it, over a unix socket, to sign client assertions
-and to wrap and unwrap the data keys the grant vault is sealed with. This page
-is the protocol's normative specification, for operators who put a KMS, an
-HSM or a process of their own behind that socket.
+keys an enrolled person's delegation rests on, and with
+`security.companies.key_custody: external` none of the companies preview's
+seal key. A signer process you run holds them, and agentd asks it, over a
+unix socket, to sign client assertions, to wrap and unwrap the data keys the
+grant vault and the Company records are sealed with, and to derive the
+Company records' id keys. This page is the protocol's normative
+specification, for operators who put a KMS, an HSM or a process of their own
+behind that socket. The key words MUST, SHOULD and MAY are as in RFC 2119.
 
 ## What the signer holds
 
@@ -13,7 +16,9 @@ HSM or a process of their own behind that socket.
 |---|---|---|
 | The IdP client key | signs the `private_key_jwt` assertion agentd presents at the IdP's token endpoint | `identity.providers.<name>.client_auth.kid` |
 | Each resource's client key | signs the assertion agentd presents at a delegated server's authorization server | `mcp.servers[].auth.client_auth.kid` |
-| The key-encryption key | wraps and unwraps each grant's data key | `identity.delegation.signer.seal_key` (and `seal_key_previous`) |
+| The key-encryption key | wraps and unwraps each grant's data key, and each person's personal key | `identity.delegation.signer.seal_key` (and `seal_key_previous`) |
+| The companies' key-encryption key | wraps and unwraps the data key of each User ID, Account Token and ledger record | `security.companies.signer.seal_key` |
+| The companies' derivation key | derives the key each Company store's record ids are made under | `security.companies.signer.derive_key` |
 
 A key is named by its id, and a signing key's id is also the `kid` its
 assertions carry, so register the public key at the IdP under that `kid`.
@@ -43,6 +48,31 @@ delegation:
     timeout: 5s
     seal_key: vault-kek-2026
 ```
+
+The companies preview names its own signer, which may be the same socket.
+Its custody is its own setting because the preview runs with or without a
+delegation, and its keys — a key-encryption key and a derivation key — are
+not a delegation's:
+
+```yaml
+# fragment: under security:
+companies:
+  key_custody: external          # local (default): seal_key, read by agentd
+  signer:
+    socket: /run/agentd-signer/signer.sock
+    uid: 991
+    seal_key: companies-kek-2026
+    derive_key: companies-ids-2026
+```
+
+Under it, each User ID, Account Token and ledger record is sealed under a
+data key of its own the signer wraps, bound to the record's associated data;
+the key each store's record ids are made under is `derive` of a fixed label,
+asked once a process, so the ids keep their shape — 64 hex digits of an
+HMAC-SHA256. A store sealed under one custody does not open under the other:
+changing it starts every Company over with a new User, as a new seal key
+does. A signer that does not answer makes every Company unavailable until it
+does; it never starts a User over.
 
 ## Transport
 
@@ -90,18 +120,50 @@ Every request carries an `op`, and every answer `ok`.
 | `sign` | `key`, `alg`, `data`: the JWS signing input, `header.claims` | `sig`: the JWS signature. `ES256` is the 64-byte `R ‖ S` (convert a DER signature from a KMS); `RS256` is RSASSA-PKCS1-v1_5 with SHA-256 |
 | `wrap` | `key`, `plaintext` (a 32-byte data key), `aad` | `wrapped`: opaque bytes agentd stores and hands back unchanged |
 | `unwrap` | `key`, `wrapped`, `aad` | `plaintext`: the data key, only when `wrapped` was made under `key` and the same `aad` |
+| `derive` | `key`, `data` (1 to 256 bytes) | `mac`: HMAC-SHA256 of `data` under the derivation key `key`, 32 bytes |
 
-The associated data binds a wrapped key to its grant: the parts
-`delegation-grant-key`, the grant id, the IdP issuer, the subject, the epoch
-and the refresh-token version, each with a four-byte big-endian length. A
-signer passes it to its AEAD, or to a KMS as its encryption context. A wrapped
-key moved to another grant's record does not unwrap.
+The associated data binds a wrapped key to what it seals, each part with a
+four-byte big-endian length: for a grant the parts `delegation-grant-key`,
+the grant id, the IdP issuer, the subject, the epoch and the refresh-token
+version; for a person's personal key `delegation-personal-key`, the
+principal and the key's id; for a Company record `company-record-key` and
+the record's own associated data. A signer passes it to its AEAD, or to a
+KMS as its encryption context. A wrapped key moved to another record does
+not unwrap.
 
-A signer may read the signing input before it signs. It is a JWS whose
-claims are `iss` and `sub` (the client id), `aud` (the token endpoint or the
-issuer), `iat`, `exp` sixty seconds later and a random `jti`. A signer that
-signs only an assertion of that shape, for audiences it knows, is a narrower
-oracle than one that signs anything.
+## What a signer signs
+
+The signer's socket is reachable by any process of agentd's uid — Landlock
+has no right for `connect(2)` — so the signer's own policy decides what such
+a process can get from it. agentd sends the signing input itself, the JWS
+`header.claims` it is about to send; a signer reads every header and claim
+from it, and needs no other field. A signer:
+
+- MUST sign only a signing input of two base64url parts, each a JSON object;
+- MUST sign only a header of exactly `alg`, `typ` and `kid`, with `alg` the
+  key's algorithm, `typ` `JWT` and `kid` the key id asked for;
+- MUST sign only claims of exactly `iss`, `sub`, `aud`, `iat`, `exp` and
+  `jti`, where `iss` equals `sub` (a client id), `aud` is a string among the
+  audiences configured for that key — the authorization server's token
+  endpoint or its issuer, as `assertion_aud` says — `iat` is within 120
+  seconds of its clock, `exp` is after `iat` and at most 300 seconds after
+  it, and `jti` is 16 to 128 base64url characters. agentd's assertions have
+  `exp` sixty seconds after `iat` and a 22-character `jti`;
+- MUST sign nothing with a key that has no audience configured;
+- SHOULD hold `iss` to the client ids each key is registered for;
+- MUST wrap and unwrap only under a key configured as a key-encryption key,
+  and derive only under one configured as a derivation key;
+- SHOULD derive only the labels agentd asks for: `agentd company-user record
+  id`, `agentd company-account record id`, `agentd company-account index id`
+  and `agentd company-ledger record id`.
+
+What it refuses it answers `denied`, naming the rule and never the data.
+agentd treats a refused signature as an unavailable signer
+(`signer_unavailable`): nothing is sent to the IdP or the authorization
+server. The reference signer (`agentd --internal-mock-signer`, in debug and
+`internal-mocks` builds) is configured by its `keys` knob — `{"alg": "ES256",
+"audiences": [...], "clients": [...]}`, `{"use": "wrap"}`, `{"use":
+"derive"}` — and holds to every rule above.
 
 ## Errors
 
@@ -130,7 +192,10 @@ sent again.
   key, checks its algorithm, and wraps and unwraps a probe under the seal key.
   A signer that refuses (an unknown key, a wrong algorithm, the wrong uid) is
   a configuration error, and the start fails. A signer that does not answer is
-  logged as `delegation.signer.unavailable`, and agentd starts.
+  logged as `delegation.signer.unavailable`, and agentd starts. The
+  companies' signer is asked for a derivation and a wrap and unwrap of a
+  probe the same way: a refusal fails the start, and silence is
+  `company.signer.unavailable`.
 - **At use**, a delegated call whose grant cannot be opened, or whose
   assertion cannot be signed, fails `signer_unavailable` before any request
   reaches the IdP or the authorization server, and is recorded as
@@ -138,24 +203,41 @@ sent again.
   metadata is stored in the clear.
 - **An enrolment** that cannot open the grant it would replace waits for the
   signer rather than replacing a grant it never read.
+- **A consent record** is sealed only under a personal key agentd already
+  holds open: the person's key is unwrapped — or made and wrapped — off
+  agentd's event loop, at start and when a gate of theirs opens, so a slow
+  signer delays no other work. An approval whose key is not open yet decides
+  nothing, the gate stays open, and the key is asked for again; a denial is
+  recorded without the gate's content (`delegation.consent.unsealed`).
+
+## Closing the socket to agentd's workers
+
+`connect(2)` to a unix socket is no Landlock right, so a worker that runs as
+agentd's uid can reach the signer and pass its peer check. Two things close
+that, and both are meant to be used:
+
+- **The signer's own policy** ([What a signer signs](#what-a-signer-signs)):
+  such a process gets no signature of anything but a client assertion for a
+  configured audience — which it could only present with a refresh token or
+  an ID-JAG it does not have, since it cannot read the vault — and no
+  unwrap of a key it has no wrapped copy of.
+- **Workers under a uid of their own** (`spawn.uid`, `spawn.gid`): a worker
+  then fails the peer check the signer makes of its client, and agentd's
+  own. A `spawn.uid` equal to a signer's uid is refused at load. The worker
+  holds no capability either, so it cannot set its uid back to agentd's.
 
 ## What it does not protect
 
-- **A process of agentd's uid can reach the socket.** `connect(2)` to a unix
-  socket is no Landlock right, so a worker running as agentd's uid could ask
-  the signer to sign. It cannot read the vault, so it has no refresh token to
-  present and no wrapped key to unwrap ([Security model](security.md)). Run
-  workers under another uid, or have the signer sign only what an assertion
-  is, to close that.
+- **The supervisor's uid reaches the socket.** A process that runs as
+  agentd's own uid — agentd itself, an instance child — passes the signer's
+  peer check; the signer's policy is what holds for it.
 - **A record sealed under one custody does not open under the other.**
   Moving between `key_custody: local` and `external` means enrolling again,
-  as losing the seal key does.
-- **The companies preview's seal key** (`security.companies.seal_key`) is
-  read locally: it also derives the record ids of the User ID store, which an
-  envelope-encryption signer does not offer.
+  as losing the seal key does — and, for the companies preview, a new User
+  at every Company.
 
 ## Next steps
 
 - [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization): enrolling a person and their grant.
 - [Security model](security.md#acting-for-an-enrolled-person): what holds around the grant.
-- [Configuration reference](configuration.md): every `identity.delegation` key.
+- [Configuration reference](configuration.md): every `identity.delegation`, `security.companies` and `spawn` key.

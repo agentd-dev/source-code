@@ -150,6 +150,38 @@ struct Stored {
     dek: Option<Wrapped>,
 }
 
+/// Where each principal's personal key is kept, by the SHA-256 of its id.
+const PERSONAL_PREFIX: &str = "delegation/personal/";
+
+/// A principal's personal key (RFC 0044 §6.4): the key their records'
+/// personal content is sealed with, itself kept as a grant's refresh token
+/// is — `sealed` under a local seal key, or `wrapped` by the signer.
+#[derive(Serialize, Deserialize)]
+struct StoredPersonal {
+    principal: String,
+    /// Named by every record it seals.
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrapped: Option<Wrapped>,
+}
+
+/// What a personal key is sealed or wrapped under.
+fn personal_ad(principal: &str, id: &str) -> Vec<u8> {
+    associated_data(&[
+        b"delegation-personal-key",
+        principal.as_bytes(),
+        id.as_bytes(),
+    ])
+}
+
+/// The register's entry of a personal key: forgotten once its revoked
+/// epoch is set.
+fn personal_floor(id: &str) -> String {
+    format!("personal:{id}")
+}
+
 /// A record's data key as the signer wrapped it.
 #[derive(Serialize, Deserialize)]
 struct Wrapped {
@@ -310,6 +342,12 @@ impl Vault {
             v.unanchored(None, &e);
         }
         v
+    }
+
+    /// Whether the external signer holds the key-encryption key: opening a
+    /// record then asks it.
+    pub fn external(&self) -> bool {
+        matches!(self.custody, Custody::External { .. })
     }
 
     /// Anchor in `c` every floor of the store's register it lacks, and
@@ -618,6 +656,148 @@ impl Vault {
         raised.and(deleted)
     }
 
+    /// Where `principal`'s personal key is kept.
+    fn personal_id(principal: &str) -> String {
+        format!(
+            "{PERSONAL_PREFIX}{}",
+            crate::sha::sha256_hex(principal.as_bytes())
+        )
+    }
+
+    /// `principal`'s personal key (RFC 0044 §6.4): the one kept, opened —
+    /// or, with `create`, a new one made and kept when there is none. Kept
+    /// sealed as a grant's refresh token is: under `seal_key`, or wrapped by
+    /// the external signer, bound to the principal and the key's id. A key
+    /// the register says was forgotten never opens again, even from a store
+    /// restored from before it was.
+    pub fn personal_key(
+        &self,
+        principal: &str,
+        create: bool,
+    ) -> Result<Option<(String, [u8; 32])>, Refused> {
+        let at = Self::personal_id(principal);
+        let stored = self
+            .durable
+            .get(Kind::Cred, &at)
+            .map_err(|e| Refused::Unreadable(e.to_string()))?
+            .and_then(|e| serde_json::from_value::<StoredPersonal>(e.state).ok())
+            .filter(|s| s.principal == principal);
+        let Some(s) = stored else {
+            if !create {
+                return Ok(None);
+            }
+            let mut key = [0u8; 32];
+            crate::sec::random::fill(&mut key)
+                .map_err(|e| Refused::Unreadable(format!("no OS randomness for a key: {e}")))?;
+            let id = crate::sec::random::b64url_token(12)
+                .map_err(|e| Refused::Unreadable(format!("no OS randomness for a key id: {e}")))?;
+            let ad = personal_ad(principal, &id);
+            let (sealed, wrapped) = match &self.custody {
+                Custody::Local { key: k, .. } => (
+                    Some(b64::url_nopad(
+                        &k.seal(&ad, &key).map_err(Refused::Unreadable)?,
+                    )),
+                    None,
+                ),
+                Custody::External { signer, key: k, .. } => {
+                    let w = signer.wrap(k, &key, &ad).map_err(|e| match e {
+                        SignerError::Unavailable(_) => Refused::SignerUnavailable(e.to_string()),
+                        e => Refused::Unreadable(e.to_string()),
+                    })?;
+                    (
+                        None,
+                        Some(Wrapped {
+                            key: k.clone(),
+                            wrapped: b64::url_nopad(&w),
+                        }),
+                    )
+                }
+            };
+            let v = serde_json::to_value(StoredPersonal {
+                principal: principal.to_string(),
+                id: id.clone(),
+                sealed,
+                wrapped,
+            })
+            .map_err(|e| Refused::Unreadable(e.to_string()))?;
+            let put = self.durable.put(Kind::Cred, &at, v, None);
+            if let Err(e) = put {
+                crate::sec::harden::wipe(&mut key);
+                return Err(Refused::Unreadable(format!(
+                    "{principal}'s personal key: {e}"
+                )));
+            }
+            return Ok(Some((id, key)));
+        };
+        if self
+            .floors()
+            .get(&personal_floor(&s.id))
+            .is_some_and(|f| f.revoked_epoch.is_some())
+        {
+            return Err(Refused::Revoked);
+        }
+        let ad = personal_ad(principal, &s.id);
+        let mut raw = match (&self.custody, &s.sealed, &s.wrapped) {
+            (Custody::Local { key, previous }, Some(sealed), None) => {
+                let b = b64::url_decode(sealed)
+                    .map_err(|_| Refused::Unreadable("a personal key is not base64url".into()))?;
+                key.open(&ad, &b)
+                    .or_else(|e| match previous {
+                        Some(p) => p.open(&ad, &b),
+                        None => Err(e),
+                    })
+                    .map_err(Refused::Unreadable)?
+            }
+            (
+                Custody::External {
+                    signer,
+                    key,
+                    previous,
+                },
+                None,
+                Some(w),
+            ) if &w.key == key || previous.as_ref() == Some(&w.key) => {
+                let b = b64::url_decode(&w.wrapped).map_err(|_| {
+                    Refused::Unreadable("a wrapped personal key is not base64url".into())
+                })?;
+                signer.unwrap(&w.key, &b, &ad).map_err(unwrap_refused)?
+            }
+            _ => {
+                return Err(Refused::Unreadable(
+                    "a personal key kept under another custody or key-encryption key".into(),
+                ));
+            }
+        };
+        let key = <[u8; 32]>::try_from(raw.as_slice())
+            .map_err(|_| Refused::Unreadable("a personal key is not 32 bytes".into()));
+        crate::sec::harden::wipe(&mut raw);
+        Ok(Some((s.id, key?)))
+    }
+
+    /// Destroy `principal`'s personal key (crypto-shredding, RFC 0044 §6.4):
+    /// its id is raised in the register as forgotten — anchored in the audit
+    /// chain first, as a revocation is — and the record deleted, so what it
+    /// sealed is unreadable from here on and a store restored from before
+    /// still opens none of it. The id forgotten, or `None` when there was no
+    /// key.
+    pub fn forget_personal(&self, principal: &str) -> Result<Option<String>, String> {
+        let at = Self::personal_id(principal);
+        let Some(s) = self
+            .durable
+            .get(Kind::Cred, &at)
+            .map_err(|e| e.to_string())?
+            .and_then(|e| serde_json::from_value::<StoredPersonal>(e.state).ok())
+        else {
+            return Ok(None);
+        };
+        let raised = self.raise(&personal_floor(&s.id), |f| f.revoked_epoch = Some(1));
+        let deleted = self
+            .durable
+            .delete(Kind::Cred, &at)
+            .map_err(|e| format!("{principal}'s personal key: {e}"));
+        raised.and(deleted).map(|()| Some(s.id))
+    }
+
     /// Every grant's id.
     pub fn ids(&self) -> Vec<String> {
         self.durable
@@ -881,6 +1061,97 @@ mod tests {
                 .is_none(),
             "nothing written"
         );
+    }
+
+    /// A principal's personal key (§6.4) is made once, kept sealed — never
+    /// in the clear — and the same key opens in every later life; forgotten,
+    /// it is gone, and a store restored from before it was forgotten opens
+    /// none of it again through the register the audit chain anchors. Under
+    /// the external signer it is kept wrapped, and opens only through it.
+    #[test]
+    fn a_personal_key_is_kept_sealed_until_it_is_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (chain, _) = Chain::open(
+            crate::obs::chain::Options {
+                path: dir.path().join("audit.log"),
+                rotate_at: crate::obs::chain::DEFAULT_ROTATE_AT,
+                retention: crate::obs::chain::DEFAULT_RETENTION,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let chain = Arc::new(chain);
+        let anchored = |store: &Arc<MemoryStore>| {
+            Vault::new(
+                Arc::new(durable(store)),
+                Custody::local([7; 32], None).unwrap(),
+                Some(Arc::clone(&chain)),
+                None,
+            )
+        };
+        let store = Arc::new(MemoryStore::new());
+        let who = "operator:alice";
+        assert_eq!(anchored(&store).personal_key(who, false), Ok(None));
+        let (id, key) = anchored(&store).personal_key(who, true).unwrap().unwrap();
+        assert_eq!(
+            anchored(&store).personal_key(who, true).unwrap(),
+            Some((id.clone(), key)),
+            "the same key in a later life"
+        );
+        let at = Vault::personal_id(who);
+        let kept = raw(&store, &at);
+        assert!(kept["state"]["sealed"].is_string(), "{kept}");
+        let text = serde_json::to_vec(&kept).unwrap();
+        assert!(!text.windows(32).any(|w| w == key), "kept sealed only");
+        // Another principal's key is another key.
+        let (other, _) = anchored(&store)
+            .personal_key("operator:bob", true)
+            .unwrap()
+            .unwrap();
+        assert_ne!(other, id);
+        // Forgotten: the record is gone and a new life finds no key.
+        let backup = kept.clone();
+        assert_eq!(anchored(&store).forget_personal(who), Ok(Some(id.clone())));
+        assert_eq!(anchored(&store).personal_key(who, false), Ok(None));
+        // Restored from before: refused, by the register the chain holds.
+        let restored = Arc::new(MemoryStore::new());
+        let d = durable(&restored);
+        restored.put(&d.key(Kind::Cred, &at), 1, &backup).unwrap();
+        assert_eq!(
+            anchored(&restored).personal_key(who, false),
+            Err(Refused::Revoked)
+        );
+        assert!(chain.anchors().contains_key(&personal_floor(&id)));
+
+        // Under the external signer: wrapped, and only it opens the key.
+        let sock = dir.path().join("signer.sock");
+        let _signer =
+            crate::sec::signer::mock::serve(&sock, &crate::sec::signer::mock::default_knobs())
+                .unwrap();
+        let ext = Arc::new(MemoryStore::new());
+        let (eid, ekey) = external(&ext, &sock)
+            .personal_key(who, true)
+            .unwrap()
+            .unwrap();
+        let wrapped = raw(&ext, &at);
+        assert!(
+            wrapped["state"]["wrapped"]["wrapped"].is_string(),
+            "{wrapped}"
+        );
+        assert!(wrapped["state"]["sealed"].is_null());
+        assert_eq!(
+            external(&ext, &sock).personal_key(who, false).unwrap(),
+            Some((eid, ekey))
+        );
+        assert!(matches!(
+            vault(&ext, 7, None).personal_key(who, false),
+            Err(Refused::Unreadable(_))
+        ));
+        assert!(matches!(
+            external(&ext, &dir.path().join("gone.sock")).personal_key(who, false),
+            Err(Refused::SignerUnavailable(_))
+        ));
     }
 
     /// A store restored from before a revocation — the grant and the

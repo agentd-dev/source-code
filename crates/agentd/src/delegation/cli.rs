@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `agentd --login idp:<name>`, `--delegation-list`, `--delegation-approve
-//! <gate>`, `--delegation-deny <gate>` and `--delegation-revoke <target>`
-//! (RFC 0044 P1): thin clients of the running daemon. Each sends an operator
+//! <gate>`, `--delegation-deny <gate>`, `--delegation-revoke <target>`,
+//! `--delegation-forget <principal>` and `--delegation-audit` (RFC 0044):
+//! thin clients of the running daemon. Each sends an operator
 //! op over the daemon's unix A2A listener — whose peer the kernel holds to
 //! the daemon's own uid, or root, and which names the per-person operator by
 //! that uid — prints what the daemon says, and, for a sign-in, follows its
@@ -94,6 +95,15 @@ fn status_text(task: &Value) -> String {
 /// Follow the task `sent` answered with to its end, writing each thing it
 /// says.
 fn follow(endpoint: &A2aEndpoint, sent: Value, out: &mut dyn Write) -> Result<String, String> {
+    follow_task(endpoint, sent, out).map(|(said, _)| said)
+}
+
+/// [`follow`], with the task as it ended.
+fn follow_task(
+    endpoint: &A2aEndpoint,
+    sent: Value,
+    out: &mut dyn Write,
+) -> Result<(String, Value), String> {
     let deadline = Instant::now() + FOLLOW_FOR;
     if let Some(err) = sent.get("_error").or_else(|| sent.get("error")) {
         return Err(err.to_string());
@@ -116,7 +126,7 @@ fn follow(endpoint: &A2aEndpoint, sent: Value, out: &mut dyn Write) -> Result<St
             said = text;
         }
         match state.as_str() {
-            "TASK_STATE_COMPLETED" => return Ok(said),
+            "TASK_STATE_COMPLETED" => return Ok((said, task)),
             "TASK_STATE_FAILED" | "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED" => {
                 return Err(said);
             }
@@ -221,13 +231,13 @@ pub fn answer(
     else {
         return Err(Failed::Ended(format!("no open consent gate is {gate:?}")));
     };
+    // What the person answers is what agentd rendered: its own lines, and
+    // what the work chose quoted and escaped.
     let _ = writeln!(
         out,
-        "{} {} on {} — arguments {}",
+        "{}\n{}",
+        g["text"].as_str().unwrap_or_default(),
         if approve { "approving" } else { "denying" },
-        g["rendered"]["tool"].as_str().unwrap_or_default(),
-        g["rendered"]["server"].as_str().unwrap_or_default(),
-        g["rendered"]["args"]
     );
     let op = if approve {
         "delegation.approve"
@@ -242,6 +252,47 @@ pub fn answer(
     )
     .map_err(Failed::Ended)?;
     follow(&endpoint, sent, out).map_err(Failed::Ended)
+}
+
+/// `--delegation-forget <principal>`: erase a person — their grants
+/// revoked, their personal key destroyed.
+pub fn forget(settings: &Settings, principal: &str, out: &mut dyn Write) -> Result<String, Failed> {
+    let endpoint = daemon(settings, "--delegation-forget").map_err(Failed::Usage)?;
+    let sent = send(
+        &endpoint,
+        "delegation.forget",
+        json!({"principal": principal}),
+        Instant::now() + Duration::from_secs(60),
+    )
+    .map_err(Failed::Ended)?;
+    follow(&endpoint, sent, out).map_err(Failed::Ended)
+}
+
+/// `--delegation-audit`: the caller's own consent records, each with what
+/// its gate showed, opened under their personal key — the task's result,
+/// printed as JSON and nothing else.
+pub fn audit(settings: &Settings, out: &mut dyn Write) -> Result<String, Failed> {
+    let endpoint = daemon(settings, "--delegation-audit").map_err(Failed::Usage)?;
+    let sent = send(
+        &endpoint,
+        "delegation.audit",
+        json!({}),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .map_err(Failed::Ended)?;
+    let (_, task) = follow_task(&endpoint, sent, &mut std::io::sink()).map_err(Failed::Ended)?;
+    let result = format!("{}.result", task["id"].as_str().unwrap_or_default());
+    let doc = task["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| a["artifactId"].as_str() == Some(result.as_str()))
+        .and_then(|a| a["parts"][0]["data"].as_object())
+        .map(|d| Value::Object(d.clone()))
+        .ok_or_else(|| Failed::Ended(format!("the daemon answered no records: {task}")))?;
+    let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
+    let _ = writeln!(out, "{text}");
+    Ok(text)
 }
 
 /// `--delegation-revoke <principal | idp:<name>#<sub>>`.

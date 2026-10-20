@@ -288,6 +288,7 @@ impl Runtime {
                 self.company_gate_task(None, None, Some(&user), &format!("company-direct-{id}"));
             if let Some(t) = self.tasks.get_mut(&task) {
                 t.ask_schema = None;
+                t.security_gate = false;
                 t.ask_channel = None;
                 t.company_gate = Some(CompanyGate {
                     company: company.to_string(),

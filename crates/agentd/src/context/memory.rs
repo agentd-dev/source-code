@@ -6,6 +6,7 @@
 //! maintains, so listing works on every backend rather than only the ones that
 //! can enumerate. Overridable by an MCP memory server through the registry.
 
+use crate::engine::run::Carries;
 use crate::state::{Durable, Kind, now_ms};
 use crate::store::StoreError;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,11 @@ pub struct Record {
     pub ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// What the work that wrote it carried (RFC 0044 §5.13 item 5): its
+    /// taint and its delegated data, which every reader of the entry takes
+    /// on (`runtime::taint`).
+    #[serde(default, skip_serializing_if = "Carries::is_empty")]
+    pub carries: Carries,
 }
 
 impl Record {
@@ -107,6 +113,20 @@ impl Memory {
         ttl_ms: Option<u64>,
         by: Option<&str>,
     ) -> Result<Value, String> {
+        self.set_carrying(d, key, value, ttl_ms, by, &Carries::default())
+    }
+
+    /// [`Self::set`] by work that carries `carries`: the entry keeps its
+    /// taint and its delegated data ([`Carries::kept_by_holder`]).
+    pub fn set_carrying(
+        &mut self,
+        d: &Durable,
+        key: &str,
+        value: Value,
+        ttl_ms: Option<u64>,
+        by: Option<&str>,
+        carries: &Carries,
+    ) -> Result<Value, String> {
         Self::check_key(key)?;
         let bytes = value.to_string().len();
         if bytes > self.max_value_bytes {
@@ -121,6 +141,7 @@ impl Memory {
             ts: now_ms(),
             ttl_ms,
             by: by.map(str::to_string),
+            carries: carries.kept_by_holder(false),
         };
         d.put(
             Kind::Memory,
@@ -147,7 +168,21 @@ impl Memory {
         value: Value,
         by: Option<&str>,
     ) -> Result<Value, String> {
-        let cur = self.get(d, key)?;
+        self.push_carrying(d, key, value, by, &Carries::default())
+    }
+
+    /// [`Self::push`] by work that carries `carries`: the queue keeps what
+    /// it held and what the pusher carries.
+    pub fn push_carrying(
+        &mut self,
+        d: &Durable,
+        key: &str,
+        value: Value,
+        by: Option<&str>,
+        carries: &Carries,
+    ) -> Result<Value, String> {
+        let (cur, mut held) = self.get_carrying(d, key)?;
+        held.union(carries);
         let mut arr = if cur["found"] == json!(true) {
             match cur["value"].as_array() {
                 Some(a) => a.clone(),
@@ -158,19 +193,29 @@ impl Memory {
         };
         arr.push(value);
         let length = arr.len();
-        self.set(d, key, Value::Array(arr), None, by)?;
+        self.set_carrying(d, key, Value::Array(arr), None, by, &held)?;
         Ok(json!({"ok": true, "key": key, "length": length}))
     }
 
     /// `memory.shift {key}` — remove and return the FIRST element
     /// (`{found: false}` on empty or absent — never an error, so a drain loop
-    /// can just stop).
-    pub fn shift(&mut self, d: &Durable, key: &str, by: Option<&str>) -> Result<Value, String> {
+    /// can just stop), with what the entry carries, which its reader takes on.
+    pub fn shift(
+        &mut self,
+        d: &Durable,
+        key: &str,
+        by: Option<&str>,
+    ) -> Result<(Value, Carries), String> {
         self.take(d, key, by, true)
     }
 
     /// `memory.pop {key}` — remove and return the LAST element.
-    pub fn pop(&mut self, d: &Durable, key: &str, by: Option<&str>) -> Result<Value, String> {
+    pub fn pop(
+        &mut self,
+        d: &Durable,
+        key: &str,
+        by: Option<&str>,
+    ) -> Result<(Value, Carries), String> {
         self.take(d, key, by, false)
     }
 
@@ -180,10 +225,13 @@ impl Memory {
         key: &str,
         by: Option<&str>,
         first: bool,
-    ) -> Result<Value, String> {
-        let cur = self.get(d, key)?;
+    ) -> Result<(Value, Carries), String> {
+        let (cur, held) = self.get_carrying(d, key)?;
         if cur["found"] != json!(true) {
-            return Ok(json!({"found": false, "key": key, "remaining": 0}));
+            return Ok((
+                json!({"found": false, "key": key, "remaining": 0}),
+                Carries::default(),
+            ));
         }
         let mut arr = match cur["value"].as_array() {
             Some(a) => a.clone(),
@@ -195,7 +243,10 @@ impl Memory {
             }
         };
         if arr.is_empty() {
-            return Ok(json!({"found": false, "key": key, "remaining": 0}));
+            return Ok((
+                json!({"found": false, "key": key, "remaining": 0}),
+                Carries::default(),
+            ));
         }
         let value = if first {
             arr.remove(0)
@@ -203,23 +254,37 @@ impl Memory {
             arr.pop().expect("non-empty")
         };
         let remaining = arr.len();
-        self.set(d, key, Value::Array(arr), None, by)?;
-        Ok(json!({"found": true, "key": key, "value": value, "remaining": remaining}))
+        self.set_carrying(d, key, Value::Array(arr), None, by, &held)?;
+        Ok((
+            json!({"found": true, "key": key, "value": value, "remaining": remaining}),
+            held,
+        ))
     }
 
     /// `memory.get {key}` → `{value?, meta?, found}` (expired ⇒ not found).
     pub fn get(&mut self, d: &Durable, key: &str) -> Result<Value, String> {
+        self.get_carrying(d, key).map(|(v, _)| v)
+    }
+
+    /// [`Self::get`], with what the entry carries: its reader takes it on.
+    pub fn get_carrying(&mut self, d: &Durable, key: &str) -> Result<(Value, Carries), String> {
         Self::check_key(key)?;
         match d.get(Kind::Memory, key).map_err(|e| e.to_string())? {
-            None => Ok(json!({"found": false, "key": key})),
+            None => Ok((json!({"found": false, "key": key}), Carries::default())),
             Some(env) => {
                 let rec: Record = serde_json::from_value(env.state)
                     .map_err(|e| format!("memory record {key}: {e}"))?;
                 if rec.expired(now_ms()) {
                     let _ = self.delete(d, key);
-                    return Ok(json!({"found": false, "key": key, "expired": true}));
+                    return Ok((
+                        json!({"found": false, "key": key, "expired": true}),
+                        Carries::default(),
+                    ));
                 }
-                Ok(json!({"found": true, "key": key, "value": rec.value, "meta": rec.meta()}))
+                Ok((
+                    json!({"found": true, "key": key, "value": rec.value, "meta": rec.meta()}),
+                    rec.carries,
+                ))
             }
         }
     }
@@ -315,6 +380,43 @@ mod tests {
         assert!(m.set(&d, "_reserved", json!(1), None, None).is_err());
         assert!(m.set(&d, "has space", json!(1), None, None).is_err());
         assert!(m.get(&d, "").is_err());
+    }
+
+    /// An entry keeps what its writer carried — its taint and delegated
+    /// data, never another origin — a push adds the pusher's, and every
+    /// read hands it to the reader.
+    #[test]
+    fn an_entry_keeps_what_its_writer_carried_for_its_reader() {
+        let mem = Arc::new(MemoryStore::new());
+        let d = Durable::new(mem, "agentd", "i", Policy::default(), None);
+        let mut m = Memory::new(4096, 10);
+        let mut tainted = Carries::default();
+        tainted.add(
+            [
+                "delegated:linear".to_string(),
+                "the route of workflow \"hook\"".to_string(),
+            ],
+            || "read".into(),
+        );
+        m.set_carrying(&d, "k", json!("v"), None, None, &tainted)
+            .unwrap();
+        let (v, held) = m.get_carrying(&d, "k").unwrap();
+        assert_eq!(v["value"], json!("v"));
+        assert!(held.tainted() && held.holds_delegated_data(), "{held:?}");
+        assert!(
+            !held.origins.contains("the route of workflow \"hook\""),
+            "kept as taint, not an origin a reader is withheld from"
+        );
+        assert_eq!(v.get("carries"), None, "the reply is what it was");
+        // A clean entry reads clean; a queue keeps every pusher's.
+        m.set(&d, "clean", json!(1), None, None).unwrap();
+        assert!(m.get_carrying(&d, "clean").unwrap().1.is_empty());
+        m.push(&d, "q", json!(1), None).unwrap();
+        m.push_carrying(&d, "q", json!(2), None, &tainted).unwrap();
+        let (first, held) = m.shift(&d, "q", None).unwrap();
+        assert_eq!(first["value"], json!(1));
+        assert!(held.tainted(), "the queue holds the tainted push");
+        assert!(m.get_carrying(&d, "q").unwrap().1.tainted(), "and keeps it");
     }
 
     #[test]

@@ -345,6 +345,10 @@ security:
   whose call is held cannot approve it.
 - A gate nobody can be asked takes its `on_timeout`, which defaults to
   `deny`, and logs `tool.policy.unanswerable`.
+- The gate carries agentd's *security gate* badge, so what the call chose
+  is shown escaped: `{{tool}}` quoted, and `{{args}}` as printable-ASCII
+  JSON of at most 1,500 characters — a character outside it reads
+  `\uXXXX`, so no argument can pass for the question's own words.
 
 [Harden a deployment](harden.md) covers policies in full.
 

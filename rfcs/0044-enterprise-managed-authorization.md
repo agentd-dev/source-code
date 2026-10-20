@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The taint engine and the consent-gate hardening remain
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope is next
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -4181,6 +4181,344 @@ test: the directory flushes at a rotation and at a new chain, the retirement
 record written before the deletion (each matters only across a power cut),
 the delete of a revoked record whose register write the store refused, and
 the wipe of the client's buffers.
+
+#### §7.P2b — Prerequisites built (part 2) (2026-10-20)
+
+This part builds the last two blocking prerequisites, §6.4's per-principal
+sealing that P2a left out, and the user's decisions of 2026-10-20 on what P2a
+left open, on `main` at `4234e0c9`. The taint engine, the gate rendering and
+the worker uid are in every build; the consent gate and the personal key are
+the `xaa` feature's; the companies preview's external custody is the
+`companies` feature's. With this, every prerequisite of P2 is built, and P2's
+scope is next.
+
+| Prerequisite or decision | State | Where |
+|---|---|---|
+| The taint engine and `holds_delegated_data` (T11, T12) | built | `runtime::taint`, `engine::run::Carries`, `sec::policy` |
+| Consent-gate hardening (T7, T8, T29) | built: human channel only, structured and bound, rendered by agentd, the badge, recorded; rule 6 and `approvers` are P2 scope | `runtime::delegated`, `sec::render`, `a2a::tasks` |
+| §6.4 per-principal encryption of personal content | built | `delegation::vault`, `delegation` |
+| Decision: a broken audit chain refuses the start | kept as P2a built it | `obs::chain` |
+| Decision (a): the signer's own policy | built, normative in `docs/external-signer.md` | `sec::signer::mock` |
+| Decision (b): workers under a uid of their own | built | `sec::worker` |
+| Decision (c): the companies preview's seal key in the signer, and a `derive` op | built | `companies::keys`, `sec::signer` |
+
+**1. The taint engine (§5.13 item 5).** P1 counted every unit that touched
+a delegated server as tainted, §5.13's fail-closed rule for a build without
+the engine. The engine replaces it.
+
+- *One record.* Runs, children and conversations already keep a record of
+  the outside input they read, for RFC 0045's withholding (`Carries`: its
+  origins). The record gains `taint`, the sources the withholding does not
+  follow. A unit is **tainted** when it holds a taint source or an origin of
+  outside text — any origin but a delegated server's, which is the person's
+  own data; it **holds delegated data** when it holds a `delegated:<server>`
+  origin. One record means taint goes wherever withheld text already goes,
+  and is durable where that is: the run's checkpoint, a child's spawn, a
+  conversation's record, a memory entry, an event's payload.
+- *Sources*, against §5.13's list: a delegated server's results (taint
+  unless the operator sets `auth.trusted_output: true` on it, a new
+  operator-only key; holding delegated data either way); an
+  `untrusted_input` tool's result; a non-operator principal's A2A message,
+  signal or start (an operator's own text is not outside text); a webhook's
+  and an A2A start's route; an event, a signal and a `wait` payload, which
+  carry their sender's record; an A2A peer's answer to `a2a.send`,
+  `a2a.delegate` and `a2a.wait`; knowledge context; a served instruction (a
+  URL, an OCI artifact, an MCP resource), which taints every unit, since
+  every turn's prompt holds it; a memory entry or an artifact tainted work
+  wrote. Added, beyond the list: an `http` step's response; an
+  `untrusted_input` server's `mcp.tool` or `mcp.resource` step result, the
+  server judged by its declared `tags` as well as its tools', so one that
+  serves only resources is judged by what it declares; a built-in
+  `search.*` step's result from an `untrusted_input` tool, and a
+  `knowledge.*` step's, as knowledge context is. **Not a source, a design
+  change:** an MCP elicitation's answer. It reaches only the server that
+  asked, never a model, and the server's result after it is judged as that
+  server's. A person's answer to a `human` step or an `ask_human` needs no
+  record of its own: a gate's task is answered only by its owner, whose own
+  messages, start or signal already taint the unit, or by an operator,
+  whose text is not outside text.
+- *Before the text is read.* A worker announces a call before it makes it
+  (`turn.tool`; a subagent now sends `tool.called`, which carries only the
+  tool's name), a delegated or Company result's record reaches the loop
+  before the result, and a step's source is recorded as the step finishes,
+  before any step after it runs.
+- *Propagation.* What a unit starts, spawns, signals, steers or sends a
+  message to (`message.send`, a `message` step) carries its record; a
+  result read back whole hands the reader the record; a holder that keeps
+  text past its unit — a conversation, a plan item's note, a memory entry,
+  an artifact — keeps the delegated data and the taint and turns every
+  other origin into taint. A step's cached output keeps the record of the
+  run that produced it and hands it to the run it is given; a run holding
+  delegated data caches nothing (`step.cache.not_kept`), since the cache is
+  every run's, keyed by no principal, and a hit would hand the person's data
+  to another run past the admission and the revocation every delegated read
+  is held to. Taint is never cleared: there is no declassification.
+- *The facts.* `security.policies` match `delegated`, `tainted`,
+  `holds_delegated_data` and `any_tags`. **A defect found:** P1's parser
+  took `delegated`, `tainted` and `any_tags` and the matcher ignored them,
+  so a rule that named one matched calls it should not have. They are
+  matched now, `holds_delegated_data` is added, and an `any_tags` naming an
+  unknown tag is refused at load. `unattended`, `document_sourced` and
+  `mode` are P2 scope.
+- *The shipped consent rules* (§5.13 item 6), code-fixed in P1 and now on
+  real facts: any `egress` call — delegated or under agentd's own
+  credential — from work that is tainted and holds delegated data
+  (`egress_from_tainted_work_holding_delegated_data`, renamed from P1's
+  `egress_holding_delegated_data`); a delegated `sensitive` or `egress` call
+  from tainted work (`delegated_call_from_tainted_work`); every delegated
+  `egress` call (`delegated_egress`; asked on every use until rule 6's first
+  use per run and tool, P2 scope). Where a delegation is declared every
+  `egress` tool — a turn worker's and a subagent's — comes back to the
+  supervisor, so no worker dials one past the rule.
+- *Limits, said.* Text inside an instance child is not followed: it is a
+  daemon with a record of its own, and what it answers its parent is a
+  peer's answer. `security.taint.enabled` is not built: the engine has no
+  off switch, so §5.13's fallback has nothing to fall back from.
+
+**2. Consent-gate hardening (§5.10 rules 1–7).**
+
+1. *Human channel only.* P1's channel stays: the per-person operator over the
+   unix listener (`via: operator_self`); `consent_session_max_age` comes with
+   P2's IdP-federated login. New: a `SendMessage` on a task whose work waits
+   on a consent gate is refused (`INVALID_PARAMS`, naming the commands the
+   person answers with), decides nothing, leaves the gate open and is
+   recorded as `delegation.consent.refused` with `why:
+   a_message_is_no_answer`. With nobody to ask, the call is denied.
+2. *No operator override.* An operator who is not the person, holding the
+   gate's id, nonce and hash, is refused and recorded (`not_the_person`).
+   `approvers: [principal, operator]` is a template's, P2 scope.
+3. *Never judged.* As P1 built it: no judge answers a consent gate, whatever
+   `agent.ask_human_fallback` says, and an unanswered gate denies at its
+   deadline — now an audit record too, `via: on_timeout`.
+4. *Structured and bound.* Approve or deny, bound to the gate's nonce and,
+   for an approval, its argument hash; an answer that is not bound is
+   refused and recorded (`not_bound`).
+5. *Rendered by agentd, as data.* The gate's text is agentd's: fixed lines
+   saying why it asks and what each field is, and every value the work chose
+   — the server, the tool, the scope, where its outside text came from, the
+   arguments — quoted and escaped to printable ASCII by `sec::render`, so a
+   bidirectional override, a zero-width character or a letter that only
+   looks Latin shows as `\uXXXX`. A value is cut at 128 characters; the
+   arguments are shown in full up to 4,000, with their length and, past
+   that, a notice that the rest is in the person's `--delegation-list`, which
+   alone shows the arguments, the text and the binding. **The badge:** a gate
+   agentd raised itself on an A2A task — a policy's `ask`, a Company's gate —
+   carries the task annotation `securityGate: true` (the published
+   task-annotations extension, with an example); the TUI and the web UI
+   show *agentd security gate*; a model's `ask_human` and a workflow's
+   `human` step never carry it, whatever their text. Under the badge, a
+   policy `ask` shows what the work chose as `sec::render` does: `{{args}}`
+   as printable-ASCII JSON, capped at 1,500 characters, and `{{tool}}`
+   quoted; the cross-Company gate shows its arguments as printable-ASCII
+   JSON too. A consent gate is answered by the person on the command line,
+   whose text opens with agentd's own line.
+6. *Not a firehose.* Not built: P2 scope, with templates.
+7. *Recorded.* Each decision is a `delegation.consent` record in the audit
+   chain: who, `via` (`operator_self`, `on_timeout`, or `forgotten` for a
+   gate open when its person was erased), the run, step, context, tool, server, scope and rule,
+   the arguments' hash and length, whether the work was tainted and held
+   delegated data, when — and what the person saw only as item 3 seals it.
+   The `asked` log line carries the arguments only under `log_content`.
+
+**3. §6.4: per-principal encryption, and erasure.** Each person has a
+personal key: 32 bytes drawn at their first record, and only for a person
+who holds a grant, kept in the vault as a grant's refresh token is — sealed
+under the seal key, or wrapped by the external signer with the associated
+data `("delegation-personal-key", principal, key id)` — opened once a
+process. Under the external signer it is opened, or made, off the loop — at
+start, and when a gate of the person's opens — and a record is sealed on the
+loop only with a key already open, so the loop never waits on the signer: an
+approval whose key is not open yet decides nothing, and the key is asked for
+again. A consent
+record holds what the gate showed (its rendered fields and text) only as
+`personal: {key, sealed}`, AES-256-GCM under that key with the associated data
+`("delegation-personal", key id, "consent:<gate>")`; the chain hashes the
+ciphertext. An approval whose content cannot be sealed decides nothing and the
+gate stays open; a denial that cannot be is recorded with `personal:
+{unsealed: true}` and none of the content. This is stricter than §6.4's
+minimisation (a redacted preview in the clear above a size threshold): the
+clear record has the hash and the length alone. The other delegation records
+hold identifiers — the principal, the subject, the grant, the run, the tool —
+which §6.4's retained fields keep in the clear; the email hash and the login
+hint are only in the grant and leave with it.
+
+- *Erasure.* `agentd --delegation-forget <principal>` (op
+  `delegation.forget`, any operator) first denies every gate open for the
+  person (`via: forgotten`), sealed under their key, then revokes their
+  grants as `--delegation-revoke` does and destroys the key: the vault
+  record is deleted and `personal:<key id>` is raised in the tombstone
+  register, which the chain anchors, so a store restored from before the
+  erasure refuses the key. A key opened while it is destroyed is never kept
+  behind it, and with the grants gone none is made for them again, so
+  nothing of theirs is sealed readable after the erasure. Their records stay in the chain, unreadable, and the chain still
+  verifies at every start. A `delegation.forgotten` record names the key id
+  and the grants revoked. Revocation alone keeps the key, so the audit of a
+  revoked person stays readable: forgetting is the erasure, a separate act.
+- *Reading back.* `agentd --delegation-audit [<principal>]` (op
+  `delegation.audit`, a task whose result is the records) returns a person's
+  consent records from the chain, newest first, each opened under their
+  key, or `unreadable` once they were forgotten — read off the loop, the
+  closed segments without holding the chain's append lock. The per-person
+  operator reads their own; another operator names the principal.
+- *Residual, said in `docs/security.md`:* a backup of the store from before
+  the erasure holds the key under the seal key; destroying such backups, or
+  that seal key with them, is the operator's part.
+
+**4. The user's decisions of 2026-10-20.**
+
+- *A broken audit chain refuses the start.* Kept as P2a built it.
+- *(a) The signer's own policy.* `docs/external-signer.md` now says, with
+  RFC 2119 words, what a signer signs: a signing input of two base64url JSON
+  parts; a header of exactly `alg` (the key's), `typ: JWT` and `kid` (the
+  key asked for); claims of exactly `iss` = `sub`, `aud` among the audiences
+  configured for that key, `iat` within 120 s of its clock, `exp` after `iat`
+  and at most 300 s after it, `jti` of 16 to 128 base64url characters; nothing
+  with a key that has no audience configured; `iss` held to the key's client
+  ids (SHOULD). It wraps and unwraps only under a key-encryption key and
+  derives only under a derivation key, and refuses with `denied`, naming the
+  rule and never the data. agentd treats a refused signature as
+  `signer_unavailable`. The reference signer (`agentd --internal-mock-signer`)
+  holds to every rule, configured by its `keys` knob. **No context field is
+  added:** agentd sends the signing input itself, and every header and claim
+  the policy reads is in it.
+- *(b) Workers under a uid of their own.* `spawn.uid` and `spawn.gid`
+  (operator-only by the `spawn` prefix, restart-only by name): every turn
+  worker, subagent and think child, an instance child's own workers, and
+  every `exec` command start as that uid and gid with no supplementary
+  group — `setgroups(0)`, `setgid`, `setuid`, each checked and verified;
+  then every capability dropped (the ambient set cleared, the permitted,
+  effective and inheritable sets emptied and read back empty) and
+  `PR_SET_NO_NEW_PRIVS` — between `fork` and `exec` and before the Landlock
+  domain, which still applies. A drop from a non-root agentd keeps the
+  capabilities the kernel would not clear, ambient ones and a binary's file
+  capabilities among them, so without the explicit drop a worker could set
+  its uid back to agentd's. A child that cannot drop is not started.
+  agentd needs root, or `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` in effect
+  — the last because signalling a process of another uid needs it, and a
+  worker past its deadline or a drain is signalled; the load refuses a
+  configuration it cannot honour, naming why: one of `spawn.uid` and
+  `spawn.gid` alone; a uid or gid of 0; agentd's own uid; a signer's uid;
+  a missing capability; and, as a non-root holder of the capabilities, an
+  instance-tier template, whose child (started with `no_new_privs`) could
+  not drop its own workers. `proc.worker` says the uid at start. **A
+  deviation from the decision's list, said:** an instance child itself keeps
+  agentd's uid, since it answers its parent's unix listener as the operator
+  and a worker uid that could do that would make every worker the operator;
+  its composed configuration carries `spawn.uid` and `spawn.gid`, so its
+  workers drop. Workers read what the operator gives the worker uid — the
+  binary, their connections' `{{secret-file:…}}` files, `AGENTD_CRED_DIR`,
+  a TLS trust file, `exec`'s `workdir`; agentd changes the ownership of no
+  file, and no worker reads the store. What a container deployment needs is
+  a section of `docs/security.md`: agentd as root in the container, the
+  worker uid given exactly those files, the signer's socket in a directory
+  the worker uid cannot write. The `exec`/delegation exclusivity of P1
+  stays, to be weighed again now that a command can run as another uid.
+- *(c) The companies preview's seal key in the signer, now.* A new op,
+  `derive {key, data}` → `{mac}`, HMAC-SHA256 under a derivation key, gives
+  RFC 0047 its record-id keys: each store's id key is `derive` of a fixed
+  label (`agentd company-user record id` and three more), asked once a
+  process and kept, so ids keep their shape — 64 hex digits of an
+  HMAC-SHA256. Each User ID, Account Token and ledger record is sealed under
+  a data key of its own, wrapped by the signer with the associated data
+  `("company-record-key", the record's own associated data)` and stored as
+  `dek` beside `sealed`. **The configuration shape, decided:**
+  `security.companies.key_custody: local | external` (local, the default,
+  keeps `seal_key`) and `security.companies.signer: {socket, uid, timeout,
+  seal_key, derive_key}`, under the preview's own section rather than
+  `identity.delegation`'s signer, because the preview runs with or without
+  a delegation and its two keys are not a delegation's; the two may name
+  the same socket. The load refuses a signer under `local`, `external`
+  without one, a relative socket, a missing key id, a timeout outside 1 ms
+  to 60 s and a `seal_key` beside it, and warns of a signer of agentd's own
+  uid. It is restart-only and operator-only by the `security` prefixes. At
+  start agentd asks for a derivation and wraps and unwraps a probe: a refusal
+  fails the start, silence is `company.signer.unavailable` and every
+  Company waits, never starting a User over. A store sealed under one
+  custody does not open under the other (`company.seal_key.mismatch`), which,
+  like a new seal key, would make a new User at every Company: there is no
+  migration.
+
+**5. Workflows.** What a workflow sees, and what was added because it means
+something to a workflow:
+
+- A step's run is tainted by what its steps read, recorded as each step
+  finishes, before any step after it runs, and a step whose templates read
+  a memory entry carries what the entry carried. **Added:** a single run's
+  `workflow.status` shows `taint: {tainted, holds_delegated_data, taint:
+  [where the outside text entered]}`, so an operator sees why a step of it
+  met a gate or a rule.
+- A step that calls a tool meets the consent rules as a turn's call does;
+  a step whose own effect sends data out (`http`, `a2a.send`,
+  `a2a.delegate`, a forwarded `emit`, an `mcp.tool` or `mcp.resource` step
+  at an `egress` server) gates under the first rule from a run that is
+  tainted and holds delegated data — P1 gated it on holding alone — and the
+  approved step runs once with the spec the person saw. As P1 built it, the
+  step waits with the gate whole in its wait record, so a restart asks
+  again with the same binding, and a denial fails it.
+- The policy facts hold for the `workflow` caller as for any other.
+- A step's `cache` keeps the record of the run that filled it, and a run
+  holding delegated data keeps nothing in it (item 1).
+- **Not added:** a CEL `run.tainted` for `when:` and `branch`. A workflow
+  that branched on its own taint would let outside text choose the branch
+  that decides whether it is asked; the gate is the control.
+
+| Check | What it proves |
+|---|---|
+| `runtime::taint` units `the_facts_follow_the_record`, `a_holder_keeps_the_data_and_the_taint_and_no_other_origin` | tainted and holding follow the record; a served instruction taints; a holder keeps delegated data and taint and turns other origins into taint |
+| `sec::policy` unit `the_taint_facts_and_any_tags_narrow_a_rule` | `delegated`, `tainted`, `holds_delegated_data` and `any_tags` each narrow a rule |
+| `context::memory` unit `an_entry_keeps_what_its_writer_carried_for_its_reader` | an entry keeps its writer's record, durably, and hands it to its reader |
+| `sec::render` unit `outside_text_is_quoted_escaped_and_capped`; `runtime::delegated` unit `a_gate_is_agentds_text_with_what_the_work_chose_quoted` | quoting, escaping (bidi, zero-width, Cyrillic, control) and the caps; the gate's fixed lines, its quoted values, the arguments' length and the truncation notice |
+| `delegation::vault` unit `a_personal_key_is_kept_sealed_until_it_is_forgotten`; `obs::chain` unit `records_are_read_across_every_kept_segment` | a personal key never in the clear, under either custody; forgetting deletes it and anchors its floor, so a restored store opens nothing; records read back across rotated segments |
+| `sec::signer::mock` unit `only_a_client_assertion_for_a_configured_audience_passes`; `sec::signer` unit `the_signer_signs_only_an_assertion_for_a_configured_audience` | every policy rule refuses its payload; `derive` only under a derivation key; a refusal is `denied` and names no data |
+| `companies::keys` unit `a_record_sealed_through_the_signer_opens_only_through_it`; `companies::user_id` unit `the_seal_key_is_held_by_the_external_signer_and_ids_keep_their_shape`; settings unit `the_seal_key_is_held_as_its_custody_says` | records sealed under a wrapped data key, not moved between records, refused across custody; ids 64 hex digits and stable; every custody load rule |
+| `sec::worker` units `workers_run_as_another_uid_only_where_agentd_can_drop_to_it`, `a_child_runs_as_the_worker_uid` and `a_child_keeps_no_capability_the_supervisor_held` (both root); settings unit `a_worker_uid_is_held_to_its_rules` | every refusal, `CAP_KILL`'s among them, as any uid; a real child runs as the uid with no supplementary group and no capability in any set, also where the kernel kept the supervisor's capabilities across the change of uid |
+| `sec::policy` unit `an_ask_gate_shows_what_the_work_chose_escaped`; `companies::carry` unit `the_gate_text_is_fixed_and_the_companies_quoted` | a policy `ask`'s `{{args}}` and `{{tool}}`, and the cross-Company gate's arguments, in printable ASCII, capped |
+| `runtime::artifacts` unit `create_get_list_delete_and_restore`; `delegation` unit `no_personal_key_is_made_for_a_principal_without_a_grant` | an artifact keeps its maker's record across a restore; no personal key is made, and nothing sealed, for a principal holding no grant |
+| e2e `taint_e2e` (default) | an `untrusted_input` server's result taints its run and the `tainted` fact denies its `memory.set`, while a clean run's goes ahead; a run that reads a tainted entry, or a tainted artifact, in a later life of the daemon is tainted, and one that reads a clean one is not; a `search.fetch` step and an `mcp.resource` read from a server serving no tool taint their runs; a run handed a cached output is tainted by what the run that produced it read |
+| e2e `worker_uid_e2e` (root; skips cleanly otherwise) | a real turn worker runs as uid 65534 with no supplementary group and cannot open the audit chain; an `exec` command runs as it (`exec`); as a non-root uid the load refuses, naming why |
+| e2e `hitl_e2e::a_policy_gate_is_badged_and_a_models_ask_is_not` (`a2a`) | a policy `ask`'s task carries `securityGate`, a model's `ask_human` does not |
+| e2e `companies_e2e::the_seal_key_held_by_the_external_signer_keeps_the_user_across_restarts` (`companies`) | a real daemon with the reference signer holding the seal key: the signer is asked to `derive` and `wrap`, the store holds no User ID in the clear, and the next life opens the same User through `unwrap` |
+| `ema/taint-gates-the-delegated-write-and-the-egress` | a delegated read followed by a delegated write gates (`delegated_call_from_tainted_work`), and followed by an agent-mode `http` egress gates (the first rule); a run that read nothing writes unasked |
+| `ema/trusted-output-holds-data-and-taints-nothing` | `auth.trusted_output`: the run holds the data, is not tainted, and neither call asks |
+| `ema/consent-is-the-persons-alone` | a message on the gate's task and an operator's answer are both refused, recorded and decide nothing; the gate denies at its deadline and the call is never made |
+| `ema/the-signer-signs-only-an-assertion` | a non-assertion payload is denied; the resource key signing for another audience is denied, the call fails `signer_unavailable`, nothing reaches the authorization server |
+| `ema/forgotten-content-unreadable-chain-verifies` | what a gate showed is in the chain only sealed and reads back whole; after `--delegation-forget` it is unreadable and the next start verifies the chain |
+| `ema/a-message-carries-what-its-sender-read` | after a delegated read, a `message` step and an agent step's `message.send` each start a conversation whose delegated write asks under the tainted rule; the person's own conversation writes unasked |
+| `ema/a-cached-step-keeps-no-delegated-data` | a cached delegated read is never kept: the second run reads the server again, and each says why |
+| `ema/forgetting-closes-the-persons-gates` | under the external signer an approval is sealed with the key opened when the gate opened and reads back; `--delegation-forget` denies the call waiting on the person's open gate at once (`via: forgotten`), and every record of theirs is then unreadable |
+
+Each new test was mutation-checked: with the code it guards broken, it
+fails. Broken were the signer's assertion policy (the mock units, and
+`ema/the-signer-signs-only-an-assertion`), the wrapped data key of a Company
+record (the `companies::keys` unit, and the companies e2e: the next life
+does not open the User), the derivation under the signer's key (the
+`user_id` unit), the custody, worker-uid and both-or-neither load rules,
+the signer-uid refusal, `setgroups` (the root unit) and the drop itself (both
+`worker_uid_e2e` tests), the served instruction's taint, a holder turning
+origins into taint, a step's taint (both `taint_e2e` tests), a memory
+entry's record (the memory unit and the second `taint_e2e` test), the
+`holds_delegated_data` matcher, the quoting of outside text and of a gate's
+values, the personal key's floor, the chain's read across segments, the
+badge (the `hitl_e2e` test), the taint set in a unit's sources
+(`ema/taint-gates-the-delegated-write-and-the-egress`), `trusted_output`
+(`ema/trusted-output-holds-data-and-taints-nothing`), the refusal of a
+message on the gate's task and the record of an operator's attempt (each
+alone, `ema/consent-is-the-persons-alone`), and the key's destruction at
+erasure (`ema/forgotten-content-unreadable-chain-verifies`). After review,
+also: the child's capability drop (`a_child_keeps_no_capability_the_supervisor_held`)
+and the `CAP_KILL` rule, a personal key made without a grant, the escaping
+of a policy `ask`'s and the cross-Company gate's arguments, an artifact's
+record (the unit, and `artifact.get` handing it on in `taint_e2e`), the
+`search.*` taint and a server judged by its declared tags (each,
+`taint_e2e`), a cache hit handing on its record (`taint_e2e`), the record
+`message.send` and a `message` step carry (each alone,
+`ema/a-message-carries-what-its-sender-read`), the cache keeping a run's
+delegated data (`ema/a-cached-step-keeps-no-delegated-data`), and the
+erasure closing open gates and the key opened at a gate's opening (each
+alone, `ema/forgetting-closes-the-persons-gates`). Not checked by
+a running test here: the load refusal of `worker_uid_e2e` as a non-root uid,
+which skips as root (the refusal itself is the `sec::worker` unit's, as any
+uid).
 
 ### P3 — Inbound identity, A2A in-task auth, CIBA and unattended opt-ins
 

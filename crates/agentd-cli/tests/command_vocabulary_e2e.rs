@@ -527,6 +527,7 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
             }
             "delegation.deny" => json!({"gate": "consent-1", "nonce": "n0nce"}),
             "delegation.revoke" => json!({"target": "operator:ada"}),
+            "delegation.forget" => json!({"principal": "operator:ada"}),
             "_instance.result" => json!({"handle": "c1"}),
             "_instance.emit" => json!({"handle": "c1", "stream": "s", "event": {}}),
             _ => json!({}),

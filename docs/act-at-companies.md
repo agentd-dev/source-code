@@ -169,6 +169,23 @@ Then follow these steps.
    restarts, so `store.kind: none` and `memory` are refused; the listener
    makes this instance a daemon, whose default store is the local file
    store.
+
+   Or let an [external signer](external-signer.md) hold it, so agentd holds
+   no seal key at all: `key_custody: external` and the signer's socket, its
+   uid, and the ids of its key-encryption key and its derivation key, in
+   place of `seal_key`. The signer then wraps each record's own data key and
+   derives the keys the record ids are made under; the ids keep their shape.
+
+   ```yaml
+   security:
+     companies:
+       key_custody: external
+       signer: {socket: /run/agentd-signer/signer.sock, uid: 991, seal_key: companies-kek, derive_key: companies-ids}
+   ```
+
+   A store sealed under one custody does not open under the other, which,
+   like a new seal key, would make a new User at every company: choose before
+   the first sign-in.
 6. **Check, then start.**
 
    ```bash
@@ -758,8 +775,8 @@ No company request carries an AAuth signature, under either profile. Set
 | the client signing key | `client.key_file`, `0600`, read by the supervisor only |
 | the DPoP keys | supervisor memory, one per Session, a new one each start |
 | Session and Bearer tokens | supervisor memory |
-| each account's Account Token | the store, one record per account, sealed with the seal key |
-| the User ID | the store, sealed when `seal_key` is set |
+| each account's Account Token | the store, one record per account, sealed with the seal key — or under a data key the external signer wraps |
+| the User ID | the store, sealed when `seal_key` is set or the external signer holds the key |
 | a device code, a PKCE verifier, a sign-in's `state` | supervisor memory |
 
 No token reaches a log line, a model's context, a URL or a child's payload.
@@ -792,7 +809,8 @@ gap.
 | `store.kind none forgets every User ID …` | a store that keeps nothing | use the file store, or `mcp` or `http` with a `seal_key` |
 | `services.shop.sign_in needs security.companies.seal_key` | a sign-in with nowhere sealed to keep its token | add a `seal_key` |
 | `company.identity.unpublished` (error) | the documents at `client.id` or the key set's URL are not what this configuration prints | print and publish them again; every company waits until they match |
-| `company.seal_key.mismatch` (error) | the seal key opens none of the store's records, or was removed | restore the key; or send the [`company.user_id.reset` command op](a2a-reference.md#command-ops) as the operator for each company, which starts the User over there |
+| `company.signer.unavailable` (warn, error) | the external signer that holds the seal key does not answer | start the signer; every company waits for it, and no User is started over |
+| `company.seal_key.mismatch` (error) | the seal key opens none of the store's records, or was removed, or the store was sealed under the other custody | restore the key, or the custody; or send the [`company.user_id.reset` command op](a2a-reference.md#command-ops) as the operator for each company, which starts the User over there |
 | `company.refused` with a `reason` | the company's documents do not verify: `issuer`, `domains`, `es256`, `endpoint`, `https` and others | tell the company; agentd tries again with backoff |
 | `company.endpoint.refused` | a URL the company names is off the entry's hosts | add the host to `hosts` if it belongs to the company |
 | `company.clock_skew` (warn) | the host clock is over 30 s from the company's | fix the clock; assertions and proofs live about a minute |

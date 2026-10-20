@@ -501,6 +501,36 @@
           "if": {
             "properties": {
               "op": {
+                "const": "delegation.forget"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.forget"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "delegation.audit"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/delegation.audit"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
                 "const": "_instance.result"
               }
             },
@@ -1023,6 +1053,29 @@
           ],
           "type": "object"
         },
+        "delegation.audit": {
+          "additionalProperties": false,
+          "properties": {
+            "limit": {
+              "description": "At most this many records, the latest; default 100",
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "op": {
+              "const": "delegation.audit"
+            },
+            "principal": {
+              "description": "The principal whose records are read; the caller's own when absent",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
         "delegation.deny": {
           "additionalProperties": false,
           "properties": {
@@ -1073,6 +1126,24 @@
           "required": [
             "op",
             "idp"
+          ],
+          "type": "object"
+        },
+        "delegation.forget": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "delegation.forget"
+            },
+            "principal": {
+              "description": "The principal to erase (operator:<id>)",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "principal"
           ],
           "type": "object"
         },
@@ -2444,6 +2515,46 @@
         "reply": "task",
         "result": false
       },
+      "delegation.audit": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "limit": {
+              "description": "At most this many records, the latest; default 100",
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "principal": {
+              "description": "The principal whose records are read; the caller's own when absent",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "A person's consent records {principal?} from the audit chain, the latest first, as the task's result — each with what the gate showed opened under their personal key, or `unreadable` once they were forgotten; read off the loop. The per-person operator reads their own; any other operator names a principal",
+        "reply": "task",
+        "result": {
+          "properties": {
+            "principal": {
+              "type": "string"
+            },
+            "records": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "principal",
+            "records"
+          ],
+          "type": "object"
+        }
+      },
       "delegation.deny": {
         "args": {
           "additionalProperties": false,
@@ -2496,6 +2607,25 @@
           "type": "object"
         },
         "description": "Sign the per-person operator in at an identity provider {idp, grant?} and keep their delegation grant: the task says where to sign in, and how it ended. The per-person operator's alone",
+        "reply": "task",
+        "result": false
+      },
+      "delegation.forget": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "principal": {
+              "description": "The principal to erase (operator:<id>)",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "principal"
+          ],
+          "type": "object"
+        },
+        "description": "Erase a person {principal}: their grants revoked as delegation.revoke does, then their personal key destroyed — what it sealed in the audit chain, the arguments their consent gates showed, is unreadable from then on, and the chain still verifies",
         "reply": "task",
         "result": false
       },

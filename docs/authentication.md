@@ -625,21 +625,35 @@ callback the daemon holds for the sign-in: the link sets a cookie bound to
 the sign-in, and the callback is taken only with it, so an IdP URL forwarded
 to someone else never completes.
 
-**The person's approvals.** Until the taint engine, every unit of work that
-touches a delegated server is treated as tainted and as holding delegated
-data, so a delegated call to a `sensitive` or `egress` tool, and any `egress`
-call from work that holds delegated data, waits for the person — a workflow
-step that sends the run's data out by its own effect too: an `http` step,
-`a2a.send`, `a2a.delegate`, an `emit` forwarded to a webhook or a peer, an
-`mcp.tool` or `mcp.resource` step at a server tagged `egress`. The call
-gates, `agentd --delegation-list` shows it — server, tool, the full
-arguments, the scopes the token carries, the run — and the person answers
-with `agentd --delegation-approve <gate>` or `--delegation-deny <gate>`, over
-the unix listener. An answer is bound to the gate's nonce and the hash of its
-arguments, and an approved step runs with the spec the person saw. No
-operator answers for the person, no judge answers whatever
-`agent.ask_human_fallback` says, and an unanswered gate denies after
-`identity.delegation.consent_timeout` (24 hours by default).
+**The person's approvals.** agentd tracks which work has read outside text
+(*tainted*) and which holds the person's delegated data. A delegated
+server's results are both — anyone can write a Linear issue body — unless
+the operator sets `auth.trusted_output: true` on it, when they hold data and
+taint nothing; an `untrusted_input` tool's result, a webhook's or a
+non-operator's message, a peer's answer and the rest taint
+([Security model](security.md#acting-for-an-enrolled-person)). Then these
+wait for the person: any `egress` call — delegated or under agentd's own
+credential, a workflow step that sends the run's data out by its own effect
+too (an `http` step, `a2a.send`, `a2a.delegate`, an `emit` forwarded to a
+webhook or a peer, an `mcp.tool` or `mcp.resource` step at a server tagged
+`egress`) — from work that is tainted and holds delegated data; a delegated
+call to a `sensitive` or `egress` tool from tainted work; and every
+delegated `egress` call. The call gates, `agentd --delegation-list` shows it
+— agentd's own text of it, with the server, the tool, the arguments quoted
+and escaped, the scopes the token carries, the run, and what tainted it —
+and the person answers with `agentd --delegation-approve <gate>` or
+`--delegation-deny <gate>`, over the unix listener. An answer is bound to
+the gate's nonce and the hash of its arguments, and an approved step runs
+with the spec the person saw. No operator answers for the person, no
+message on the gate's task is an answer — each is refused and recorded — no
+judge answers whatever `agent.ask_human_fallback` says, and an unanswered
+gate denies after `identity.delegation.consent_timeout` (24 hours by
+default). Each decision is a record of the audit chain whose content — what
+the person saw — is sealed under their own key: `agentd --delegation-audit`
+reads it back, and `agentd --delegation-forget <principal>` erases the
+person — the gates open for them denied first, then their grants revoked
+and their key destroyed — so their records stay in the chain, unreadable,
+and no key is made for them again.
 
 **Pins, not discovery.** `audience` (the authorization server's issuer) and
 `resource` are required, and discovery only confirms them: before anything
@@ -739,9 +753,10 @@ is presented to the IdP.
 
 **What this preview does not do yet** (RFC 0044 P2 and later): several
 people, an IdP-federated display-client login, device and certificate
-principals that delegate, the taint engine, CIBA, unattended runs,
-same-domain token exchange (`grant: token_exchange`), and live interop
-against an Okta Integrator org or xaa.dev.
+principals that delegate, consent rules an operator configures (`once_per`,
+`to: principal`) and consent gates in the display clients, CIBA,
+unattended runs, same-domain token exchange (`grant: token_exchange`), and
+live interop against an Okta Integrator org or xaa.dev.
 
 ### Fields
 
@@ -761,6 +776,7 @@ against an Okta Integrator org or xaa.dev.
 | `scopes`, `tool_scopes`, `scope_mode` | `mcp.servers[].auth` | baseline and per-tool scopes; one token per server with their union (`server`, default) or per scope set (`per_tool`) |
 | `tools_from`, `tools_file` | `mcp.servers[].auth` | `first_grant` (default) or `file` |
 | `id_jag`, `id_jag_reuse`, `allow_unbound_at`, `attribution`, `max_at_age` | `mcp.servers[].auth` | `discover`/`assume`; `auto`/`never`; accept an ID-JAG that names no resource; `sub`/`none`; a stricter cap |
+| `trusted_output` | `mcp.servers[].auth` | the operator vouches nobody outside writes what the server answers: its results hold the person's data and taint nothing (default `false`) |
 | `uid`, `idp_subject` | `a2a.principals[]` | the per-person operator: the unix peer's uid, and their exact IdP identity |
 
 ## AWS SigV4

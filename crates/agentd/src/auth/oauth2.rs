@@ -1166,9 +1166,9 @@ mod tests {
         use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("signer.sock");
-        let _signer =
-            crate::sec::signer::mock::serve(&sock, &crate::sec::signer::mock::default_knobs())
-                .unwrap();
+        let mut knobs = crate::sec::signer::mock::default_knobs();
+        knobs["keys"]["idp"]["audiences"] = serde_json::json!(["https://idp.example/token"]);
+        let _signer = crate::sec::signer::mock::serve(&sock, &knobs).unwrap();
         // SAFETY: getuid has no failure mode.
         let signer = crate::sec::signer::Signer::new(&sock, unsafe { libc::getuid() }, None);
         let mut p = OAuth2Params {

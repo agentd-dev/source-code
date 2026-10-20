@@ -161,17 +161,89 @@ impl RunStatus {
 /// against whatever is installed then: a definition deleted or replaced, a
 /// spawner's record evicted, a restart that forgot which peer asked, and the
 /// result would go out whole. Durable for the same reason.
+///
+/// **Taint** (RFC 0044 §5.13 item 5) is the same record read for the
+/// person's consent rules and the policy facts: the holder is `tainted`
+/// when it holds an origin of outside text — every origin but a delegated
+/// server's trusted results ([`DELEGATED`]) — or a `taint` source, outside
+/// text the withholding does not follow: an `untrusted_input` tool's
+/// result, a non-operator's A2A message, knowledge context, a peer's
+/// answer, an outside step result, a memory entry written by tainted work.
+/// It `holds_delegated_data` once a delegated server's result reached it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Carries {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub origins: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// Where outside text that is no origin above entered, and so taints
+    /// the holder without being withheld from a reader.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub taint: BTreeSet<String>,
 }
+
+/// What every origin of a delegated server's results starts with: the
+/// person's own data, `delegated:<server>` (RFC 0044).
+pub const DELEGATED: &str = "delegated:";
 
 impl Carries {
     pub fn is_empty(&self) -> bool {
-        self.origins.is_empty()
+        self.origins.is_empty() && self.taint.is_empty()
+    }
+
+    /// Whether the holder read outside text: an origin other than a
+    /// delegated server's, or a taint source.
+    pub fn tainted(&self) -> bool {
+        !self.taint.is_empty() || self.origins.iter().any(|o| !o.starts_with(DELEGATED))
+    }
+
+    /// Whether a delegated server's result reached the holder.
+    pub fn holds_delegated_data(&self) -> bool {
+        self.origins.iter().any(|o| o.starts_with(DELEGATED))
+    }
+
+    /// Every source that taints the holder, origins first.
+    pub fn taint_sources(&self) -> Vec<String> {
+        self.origins
+            .iter()
+            .filter(|o| !o.starts_with(DELEGATED))
+            .chain(self.taint.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Add the taint `sources`. Whether anything was new.
+    pub fn taint(&mut self, sources: impl IntoIterator<Item = String>) -> bool {
+        let before = self.taint.len();
+        self.taint.extend(sources);
+        self.taint.len() > before
+    }
+
+    /// What a record that holds content but is never read back as a result
+    /// keeps of this one — a conversation's (`companies` true: the Company
+    /// origins the cross-Company rule reads), a memory entry's: the
+    /// delegated origins, and every other origin as taint, so its holder is
+    /// tainted and withheld from no reader for it.
+    pub fn kept_by_holder(&self, companies: bool) -> Carries {
+        let mut out = Carries {
+            taint: self.taint.clone(),
+            ..Carries::default()
+        };
+        for o in &self.origins {
+            if o.starts_with(DELEGATED)
+                || (companies && o.starts_with(crate::runtime::withhold::COMPANY_ORIGIN))
+            {
+                out.origins.insert(o.clone());
+            } else {
+                out.taint.insert(o.clone());
+            }
+        }
+        if !out.origins.is_empty() {
+            out.why = self.why.clone();
+        }
+        out
     }
 
     /// Add `origins`; the reason is kept only from the first that brought
@@ -193,9 +265,10 @@ impl Carries {
     /// Add everything `other` carries. Whether anything was new.
     pub fn union(&mut self, other: &Carries) -> bool {
         let why = other.why.clone();
-        self.add(other.origins.iter().cloned(), || {
+        let origins = self.add(other.origins.iter().cloned(), || {
             why.unwrap_or_else(|| "it may carry outside input".into())
-        })
+        });
+        self.taint(other.taint.iter().cloned()) || origins
     }
 }
 

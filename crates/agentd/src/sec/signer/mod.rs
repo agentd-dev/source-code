@@ -20,7 +20,15 @@
 //!   `RS256` as RSASSA-PKCS1-v1_5;
 //! - `wrap {key, plaintext, aad}` → `{wrapped}`: a data key encrypted under
 //!   the key-encryption key `key`, bound to `aad`, opaque to agentd;
-//! - `unwrap {key, wrapped, aad}` → `{plaintext}`.
+//! - `unwrap {key, wrapped, aad}` → `{plaintext}`;
+//! - `derive {key, data}` → `{mac}`: HMAC-SHA256 of `data` under the
+//!   derivation key `key` — the record-id keys of the companies preview's
+//!   stores (RFC 0047), each derived from a fixed label.
+//!
+//! **What a signer signs** is its own policy, and `docs/external-signer.md`
+//! asks it to sign only what a client assertion is: agentd sends the JWS
+//! signing input itself, so a signer reads every header and claim before it
+//! signs, and needs no field beside it.
 //!
 //! **Who answers.** Before a byte is sent, the socket's peer must be the uid
 //! the operator named (`SO_PEERCRED`; `getpeereid` off Linux): a socket some
@@ -167,6 +175,26 @@ impl Signer {
         )?;
         let out = self.bytes(&a, "plaintext", "unwrap", key);
         wipe_field(&mut a, "plaintext");
+        out
+    }
+
+    /// HMAC-SHA256 of `data` under the derivation key `key`: 32 bytes.
+    pub fn derive(&self, key: &str, data: &[u8]) -> Result<[u8; 32], SignerError> {
+        let mut a = self.call_secret(
+            json!({"op": "derive", "key": key, "data": b64::url_nopad(data)}),
+            None,
+            true,
+        )?;
+        let mut mac = self.bytes(&a, "mac", "derive", key)?;
+        wipe_field(&mut a, "mac");
+        let out = <[u8; 32]>::try_from(mac.as_slice()).map_err(|_| {
+            self.malformed(
+                "derive",
+                key,
+                &format!("a mac of {} bytes, not 32", mac.len()),
+            )
+        });
+        crate::sec::harden::wipe(&mut mac);
         out
     }
 
@@ -492,6 +520,15 @@ mod tests {
         unsafe { libc::getuid() }
     }
 
+    /// The reference signer's knobs with `idp` signing for `aud`.
+    fn knobs_for(aud: &str) -> Value {
+        let mut k = mock::default_knobs();
+        k["keys"]["idp"]["audiences"] = json!([aud]);
+        k
+    }
+
+    const AUD: &str = "https://idp.example/token";
+
     /// The reference signer answers every op, and agentd's client reads
     /// each answer: a signature that verifies with the public JWK alone, a
     /// data key that unwraps only under the associated data it was wrapped
@@ -500,19 +537,42 @@ mod tests {
     fn every_op_round_trips_through_the_reference_signer() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("s.sock");
-        let _m = mock::serve(&sock, &mock::default_knobs()).unwrap();
+        let _m = mock::serve(&sock, &knobs_for(AUD)).unwrap();
         let s = Signer::new(&sock, uid(), None);
 
         let pk = s.public_key("idp").unwrap();
         assert_eq!(pk.alg, "ES256");
         assert!(pk.jwk.get("d").is_none(), "a public JWK: {}", pk.jwk);
-        let sig = s.sign("idp", "ES256", b"header.claims").unwrap();
+        let input =
+            crate::auth::client_assertion::assertion_input("agentd", AUD, "ES256", "idp").unwrap();
+        let sig = s.sign("idp", "ES256", input.as_bytes()).unwrap();
         let mut point = vec![0x04];
         point.extend(b64::url_decode(pk.jwk["x"].as_str().unwrap()).unwrap());
         point.extend(b64::url_decode(pk.jwk["y"].as_str().unwrap()).unwrap());
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &point)
-            .verify(b"header.claims", &sig)
+            .verify(input.as_bytes(), &sig)
             .expect("the signature verifies with the public key");
+        // A derivation is HMAC-SHA256 under the derivation key: the same
+        // data the same 32 bytes, other data others.
+        let a = s
+            .derive("derive", b"agentd company-user record id")
+            .unwrap();
+        assert_eq!(
+            a,
+            s.derive("derive", b"agentd company-user record id")
+                .unwrap()
+        );
+        assert_ne!(
+            a,
+            s.derive("derive", b"agentd company-account record id")
+                .unwrap()
+        );
+        assert!(
+            matches!(s.derive("seal", b"x"), Err(SignerError::Refused { code, .. }) if code == "wrong_use")
+        );
+        assert!(
+            matches!(s.derive("derive", b""), Err(SignerError::Refused { code, .. }) if code == "bad_request")
+        );
 
         let wrapped = s.wrap("seal", &[7u8; 32], b"ad-1").unwrap();
         assert!(!wrapped.windows(32).any(|w| w == [7u8; 32]), "wrapped");
@@ -530,6 +590,50 @@ mod tests {
         ] {
             assert!(matches!(r, Some(SignerError::Refused { .. })), "{r:?}");
         }
+    }
+
+    /// The reference signer signs only a client assertion, and only for an
+    /// audience its key is configured with: a payload of any other shape,
+    /// and an assertion for another audience, are `denied` and recorded as
+    /// refused — nothing is signed.
+    #[test]
+    fn the_signer_signs_only_an_assertion_for_a_configured_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let record = dir.path().join("record.jsonl");
+        let mut knobs = knobs_for(AUD);
+        knobs["record"] = json!(record.display().to_string());
+        let _m = mock::serve(&sock, &knobs).unwrap();
+        let s = Signer::new(&sock, uid(), None);
+        let denied = |r: Result<Vec<u8>, SignerError>| matches!(r, Err(SignerError::Refused { code, .. }) if code == "denied");
+        assert!(
+            denied(s.sign("idp", "ES256", b"anything at all")),
+            "a non-assertion payload"
+        );
+        let elsewhere = crate::auth::client_assertion::assertion_input(
+            "agentd",
+            "https://evil.example/token",
+            "ES256",
+            "idp",
+        )
+        .unwrap();
+        assert!(
+            denied(s.sign("idp", "ES256", elsewhere.as_bytes())),
+            "an unconfigured audience"
+        );
+        // `ras` has no audience at all: it signs nothing.
+        let for_ras =
+            crate::auth::client_assertion::assertion_input("agentd", AUD, "ES256", "ras").unwrap();
+        assert!(denied(s.sign("ras", "ES256", for_ras.as_bytes())));
+        let ok =
+            crate::auth::client_assertion::assertion_input("agentd", AUD, "ES256", "idp").unwrap();
+        assert!(s.sign("idp", "ES256", ok.as_bytes()).is_ok());
+        let seen = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(seen.matches("\"denied\"").count(), 3, "{seen}");
+        assert!(
+            !seen.contains("evil.example"),
+            "the record holds no data: {seen}"
+        );
     }
 
     /// No socket is a typed outage after one retry; a socket whose peer is

@@ -321,9 +321,11 @@ fn top_level_properties(
                     "durable": { "type": "boolean", "description": "default durability class for spawns (false = memory-only records)" } } },
                 "templates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/SubagentTemplate" } } } }));
     m.insert("spawn".to_string(), json!({ "type": "object", "additionalProperties": false,
-                "description": "what every child process — turn worker, subagent, think child, instance — is started with beyond its allow-listed environment: the baseline (PATH, HOME, TMPDIR, TZ, LANG, AGENTD_CRED_DIR, RUST_LOG, NO_PROXY, XDG_*, LC_*, SSL_CERT_*, OTEL_*, *_PROXY), the variables its own secret references and routed aws credentials read. Operator-only, reloadable",
+                "description": "what every child process — turn worker, subagent, think child, instance — is started with: beyond its allow-listed environment, the baseline (PATH, HOME, TMPDIR, TZ, LANG, AGENTD_CRED_DIR, RUST_LOG, NO_PROXY, XDG_*, LC_*, SSL_CERT_*, OTEL_*, *_PROXY) and the variables its own secret references and routed aws credentials read, the passthrough (reloadable); and the uid and gid a worker runs as (restart-only). Operator-only",
                 "properties": {
-                "env_passthrough": { "type": "array", "items": { "type": "string" }, "description": "variables every child also gets, each a name or a PREFIX* pattern; one a supervisor-only secret is read from is refused" } } }));
+                "env_passthrough": { "type": "array", "items": { "type": "string" }, "description": "variables every child also gets, each a name or a PREFIX* pattern; one a supervisor-only secret is read from is refused" },
+                "uid": { "type": "integer", "minimum": 1, "description": "the uid every worker runs as instead of agentd's — turn workers, subagents, think children, an instance child's own workers, exec commands — with gid and no supplementary group; needs root, or CAP_SETUID and CAP_SETGID (instance-tier templates need root), and is refused at load where agentd cannot. Restart-only" },
+                "gid": { "type": "integer", "minimum": 1, "description": "the gid every worker runs as, with uid. Restart-only" } } }));
     // Hoisted out of the `a2a` literal for the same recursion-limit reason as
     // `instruction_trust`. The scope vocabulary is the enum's own list.
     let device_scopes: Vec<&str> = super::DeviceScope::ALL.iter().map(|s| s.as_str()).collect();
@@ -411,7 +413,8 @@ fn top_level_properties(
                             "principal": { "type": "string", "description": "principal-id glob, for calls carrying one" },
                             "args": { "type": "string", "description": "CEL over `args`, `tool` and `caller` — the only place an ARGUMENT can be judged, since grants are name patterns" },
                             "delegated": { "type": "boolean", "description": "the call is made with an enrolled person's grant (RFC 0044)" },
-                            "tainted": { "type": "boolean", "description": "the work holds outside input; until the taint engine, every unit that touched a delegated server" },
+                            "tainted": { "type": "boolean", "description": "the work making the call has read outside text: an untrusted_input tool's result, a delegated server's (unless trusted_output), a webhook's or a non-operator's A2A message, a peer's answer, knowledge context, a served instruction, a tainted memory entry" },
+                            "holds_delegated_data": { "type": "boolean", "description": "a delegated server's result has reached the work making the call" },
                             "any_tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "at least one listed trifecta tag is on the tool" } } },
                         "action": { "enum": ["allow", "deny", "ask", "shadow"], "description": "shadow refuses and says the call was held; it never fabricates a result" },
                         "question": { "type": "string", "description": "the question put to a person for `ask`; {{tool}}, {{caller}} and {{args}} are substituted" },
@@ -467,7 +470,8 @@ fn auth_delegation_properties(duration: &Value) -> Map<String, Value> {
         "on_revoked": { "enum": ["fail", "ask"], "description": "grant id_jag: a revoked grant fails the call; ask is P2" },
         "allow_unbound_at": { "type": "boolean", "description": "grant id_jag: accept an ID-JAG that does not name the pinned resource (warned and recorded)" },
         "attribution": { "enum": ["sub", "none"], "description": "grant id_jag: what agent/acting_for carries — the ID-JAG's sub (default), or nothing" },
-        "max_at_age": duration
+        "max_at_age": duration,
+        "trusted_output": { "type": "boolean", "description": "grant id_jag: nobody outside can write what this server answers, so its results mark the work as holding delegated data and do not taint it (default false: delegated SaaS content is attacker-writable)" }
     });
     match v {
         Value::Object(m) => m,
@@ -565,7 +569,16 @@ fn companies() -> Value {
                 "redirect_uri": { "type": "string", "description": "where Direct Sign-In returns the User, an HTTPS URL on the client_id's host; default <client_id origin>/companies/callback. Listed in the document's redirect_uris when a Company lists direct" },
                 "serve": { "type": "boolean", "description": "serve the client metadata document and key set on the A2A listener at their URLs' paths, and the Direct Sign-In callback when a Company lists direct (needs a2a, and a2a.url the client_id's origin); otherwise publish what --print-company-client writes" },
                 "extensions": { "type": "array", "items": { "enum": ["operations"] }, "description": "the extensions the client metadata document lists: operations (version 1) — a Company proposes an action, and agentd confirms it only with the User's approval of its terms or a standing permission; default none" } } },
-            "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http)" },
+            "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http), unless key_custody is external" },
+            "key_custody": { "enum": ["local", "external"], "description": "who holds the seal key: agentd, from seal_key (local, the default), or the external signer (external, with signer and no seal_key), which wraps each record's data key and derives the record-id keys" },
+            "signer": { "type": "object", "additionalProperties": false, "required": ["socket", "uid", "seal_key", "derive_key"],
+                "description": "the external signer that holds the seal key (key_custody external; docs/external-signer.md): agentd never holds the key-encryption key or the derivation key",
+                "properties": {
+                "socket": { "type": "string", "description": "the signer's unix socket, an absolute path" },
+                "uid": { "type": "integer", "minimum": 0, "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent" },
+                "timeout": { "type": ["string", "integer"], "description": "the bound on one request, 1ms to 60s, a duration: `5s`, `500ms`, or bare seconds; default 5s" },
+                "seal_key": { "type": "string", "description": "the signer's key-encryption key each record's data key is wrapped under" },
+                "derive_key": { "type": "string", "description": "the signer's HMAC-SHA256 key the record-id keys are derived under (the derive op)" } } },
             "context": company_context("what the messages agentd sends in a Company's conversations share of the User's situation, each field in the draft's format; nothing is shared that is not set. Needs an entry that uses `agent`"),
             "browsers": { "type": "array", "items": { "type": "string" }, "description": "browser MCP servers to keep off every Company's hosts; each names an mcp.servers entry" },
             "limits": { "type": "object", "additionalProperties": false, "properties": {

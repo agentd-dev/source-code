@@ -462,6 +462,7 @@ mod tests {
             allow_unbound_at: None,
             attribution: None,
             max_at_age: None,
+            trusted_output: None,
         }
     }
 

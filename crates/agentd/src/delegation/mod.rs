@@ -175,6 +175,13 @@ fn unavailable(r: &Refusal) -> Code {
     }
 }
 
+/// What a record's personal content is sealed under: the personal key's id
+/// and the record it is in, so a sealed part moved to another record does
+/// not open there.
+fn personal_record_ad(key: &str, record: &str) -> Vec<u8> {
+    crate::auth::seal::associated_data(&[b"delegation-personal", key.as_bytes(), record.as_bytes()])
+}
+
 /// A grant the vault did not store, as a refusal: the signer's when it
 /// wrapped no data key, else `otherwise`.
 fn not_stored(e: vault::NotStored, otherwise: Code, what: &str) -> DelegationError {
@@ -417,6 +424,9 @@ pub struct Server {
     pub allow_unbound: bool,
     pub attribution: Attribution,
     max_at_age: Option<Duration>,
+    /// Whether nobody outside can write what it answers (`auth.trusted_output`):
+    /// its results then hold the person's data and taint nothing.
+    pub trusted_output: bool,
     headers: Vec<(String, String)>,
     timeout: Duration,
 }
@@ -448,6 +458,7 @@ impl Server {
             allow_unbound: a.allow_unbound_at == Some(true),
             attribution: a.attribution.unwrap_or_default(),
             max_at_age: a.max_at_age.map(|d| d.0),
+            trusted_output: a.trusted_output == Some(true),
             headers: m
                 .headers
                 .iter()
@@ -619,7 +630,17 @@ pub struct Delegation {
     listing: Mutex<BTreeSet<String>>,
     /// Servers whose protected-resource metadata confirmed their pins.
     confirmed: Mutex<BTreeSet<String>>,
+    /// Each principal's personal key once opened (RFC 0044 §6.4), by
+    /// principal: its id and its bytes, wiped when forgotten or dropped.
+    personal: Mutex<BTreeMap<String, PersonalKey>>,
+    /// Held while a personal key is opened or made into `personal`, and
+    /// while one is forgotten: a key opened as it is destroyed is never
+    /// kept behind it.
+    personal_open: Mutex<()>,
 }
+
+/// A personal key opened: its id and its bytes.
+type PersonalKey = (String, Box<[u8; 32]>);
 
 /// The scope ceilings `t` allows, per server.
 fn ceilings_of(t: &Template) -> BTreeMap<String, Vec<String>> {
@@ -842,6 +863,8 @@ impl Delegation {
             handles: Mutex::new(BTreeMap::new()),
             listing: Mutex::new(BTreeSet::new()),
             confirmed: Mutex::new(BTreeSet::new()),
+            personal: Mutex::new(BTreeMap::new()),
+            personal_open: Mutex::new(()),
         };
         d.load_grants();
         Ok(Some(Arc::new(d)))
@@ -2268,6 +2291,190 @@ impl Delegation {
             .collect()
     }
 
+    /// `principal`'s personal key when this process holds it open.
+    fn cached_personal(&self, principal: &str) -> Option<(String, [u8; 32])> {
+        self.personal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(principal)
+            .map(|(id, k)| (id.clone(), **k))
+    }
+
+    /// Whether `principal` holds a grant here: a personal key is made only
+    /// for a person agentd acts for, so none is made again for one
+    /// forgotten, whose grants are gone.
+    fn holds_grant(&self, principal: &str) -> bool {
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|g| g.principal.display() == principal)
+    }
+
+    /// `principal`'s personal key, opened once a process and kept in memory
+    /// (`create`: made when there is none and they hold a grant). Under an
+    /// external signer this asks it: never on the loop.
+    fn personal_key(
+        &self,
+        principal: &str,
+        create: bool,
+    ) -> Result<Option<(String, [u8; 32])>, String> {
+        if let Some(k) = self.cached_personal(principal) {
+            return Ok(Some(k));
+        }
+        let _open = self.personal_open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = self.cached_personal(principal) {
+            return Ok(Some(k));
+        }
+        let create = create && self.holds_grant(principal);
+        let found = self
+            .vault
+            .personal_key(principal, create)
+            .map_err(|e| match e {
+                vault::Refused::Revoked => format!("{principal}'s personal key was forgotten"),
+                vault::Refused::SignerUnavailable(e) | vault::Refused::Unreadable(e) => e,
+                vault::Refused::Stale => format!("{principal}'s personal key is stale"),
+            })?;
+        if let Some((id, k)) = &found {
+            self.personal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(principal.to_string(), (id.clone(), Box::new(*k)));
+        }
+        Ok(found)
+    }
+
+    /// Under an external signer, open the enrolled person's personal key —
+    /// made when they hold a grant and have none — off the loop, so a
+    /// consent record then asks the signer nothing; a local key is opened
+    /// where a record needs it.
+    pub fn warm_personal(self: &Arc<Self>) {
+        if let Some(p) = self.person.as_ref().map(|p| p.id.clone()) {
+            self.warm(&p);
+        }
+    }
+
+    /// Open `principal`'s personal key off the loop, as
+    /// [`Self::warm_personal`] does, when an external signer holds it and
+    /// this process does not have it open: a consent gate of theirs just
+    /// opened, and its record is sealed on the loop.
+    pub fn warm(self: &Arc<Self>, principal: &str) {
+        if !self.vault.external() || self.cached_personal(principal).is_some() {
+            return;
+        }
+        let (d, p) = (Arc::clone(self), principal.to_string());
+        std::thread::Builder::new()
+            .name("delegation-personal".into())
+            .spawn(move || {
+                if let Err(e) = d.personal_key(&p, true) {
+                    d.log.warn(
+                        "delegation.personal.unreadable",
+                        json!({"principal": p, "err": e}),
+                    );
+                }
+            })
+            .ok();
+    }
+
+    /// The personal content of record `record` about `principal` — the
+    /// arguments a person saw — sealed under their personal key (RFC 0044
+    /// §6.4): `{key, sealed}`, the key's id and the AES-256-GCM ciphertext
+    /// bound to it and to `record`. Kept in the audit chain in place of the
+    /// content, so destroying the key makes it unreadable while the chain
+    /// still verifies.
+    ///
+    /// Called on the loop: under an external signer only a key this
+    /// process holds open seals ([`Self::warm`] opens it when the gate
+    /// does), so the loop never waits on the signer; a local key is opened,
+    /// or made, here.
+    pub fn seal_personal(
+        &self,
+        principal: &str,
+        record: &str,
+        content: &Value,
+    ) -> Result<Value, String> {
+        let held = if self.vault.external() {
+            self.cached_personal(principal).ok_or_else(|| {
+                format!("{principal}'s personal key is not open yet: it is opened off the loop")
+            })?
+        } else {
+            self.personal_key(principal, true)?
+                .ok_or_else(|| format!("{principal} has no personal key"))?
+        };
+        let (id, mut key) = held;
+        let sealed = crate::auth::seal::SealKey::new(&key).and_then(|k| {
+            k.seal(
+                &personal_record_ad(&id, record),
+                content.to_string().as_bytes(),
+            )
+        });
+        crate::sec::harden::wipe(&mut key);
+        Ok(json!({"key": id, "sealed": crate::b64::url_nopad(&sealed?)}))
+    }
+
+    /// What `sealed` ([`Self::seal_personal`]) holds of record `record`
+    /// about `principal`: `None` when the key that sealed it is gone —
+    /// forgotten, or never this principal's.
+    pub fn open_personal(
+        &self,
+        principal: &str,
+        record: &str,
+        sealed: &Value,
+    ) -> Result<Option<Value>, String> {
+        let Some((id, mut key)) = self.personal_key(principal, false)? else {
+            return Ok(None);
+        };
+        if sealed["key"].as_str() != Some(id.as_str()) {
+            crate::sec::harden::wipe(&mut key);
+            return Ok(None);
+        }
+        let bytes = crate::b64::url_decode(sealed["sealed"].as_str().unwrap_or_default())
+            .map_err(|_| "a sealed record is not base64url".to_string());
+        let opened = bytes.and_then(|b| {
+            crate::auth::seal::SealKey::new(&key)
+                .and_then(|k| k.open(&personal_record_ad(&id, record), &b))
+        });
+        crate::sec::harden::wipe(&mut key);
+        let plain = opened?;
+        serde_json::from_slice(&plain)
+            .map(Some)
+            .map_err(|e| format!("a sealed record: {e}"))
+    }
+
+    /// Erase `principal` (RFC 0044 §6.4): their grants revoked as
+    /// [`Self::revoke`] revokes them, then their personal key destroyed —
+    /// what it sealed in the audit chain is unreadable from here on, and the
+    /// chain still verifies. What was done.
+    pub fn forget(&self, principal: &str, by: &str) -> Result<Value, String> {
+        let revoked = match self.revoke(principal, by) {
+            Ok(r) => r,
+            Err(e) if e.starts_with("no grant names") => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        // Destroyed, then dropped from memory, with no key opened between.
+        let key = {
+            let _open = self.personal_open.lock().unwrap_or_else(|e| e.into_inner());
+            let key = self.vault.forget_personal(principal);
+            if let Some((_, mut k)) = self
+                .personal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(principal)
+            {
+                crate::sec::harden::wipe(&mut k[..]);
+            }
+            key?
+        };
+        self.audit(
+            "delegation.forgotten",
+            "forgotten",
+            Some(by),
+            json!({"principal": principal, "by": by, "key": key,
+                   "revoked": revoked.iter().map(|r| r["grant_id"].clone()).collect::<Vec<_>>()}),
+        );
+        Ok(json!({"principal": principal, "revoked": revoked, "key": key}))
+    }
+
     /// Revoke the grants `target` names — a principal id, or
     /// `idp:<name>#<sub>` for every grant of that IdP subject — by `by`:
     /// RFC 7009 at the IdP, retried until acknowledged or out of tries, then
@@ -2579,6 +2786,7 @@ mod tests {
             allow_unbound: false,
             attribution: Attribution::Sub,
             max_at_age: None,
+            trusted_output: false,
             headers: Vec::new(),
             timeout: Duration::from_secs(5),
         }
@@ -2642,5 +2850,62 @@ mod tests {
             [7u8; 32]
         );
         assert!(key_bytes("short", "k").is_err());
+    }
+
+    /// A personal key is made only for a person who holds a grant here: a
+    /// forgotten person, whose grants are gone, gets none again, so what a
+    /// gate of theirs showed is never sealed readable after they were
+    /// forgotten — nothing is sealed, and no key is kept.
+    #[test]
+    fn no_personal_key_is_made_for_a_principal_without_a_grant() {
+        use crate::obs::log::{Comp, Level, LogCtx};
+        let dir = tempfile::tempdir().unwrap();
+        let seal = dir.path().join("seal");
+        std::fs::write(&seal, "ab".repeat(32)).unwrap();
+        let settings = Settings::from_document(
+            json!({"agent": {"instruction": "x"},
+                   "identity": {
+                       "providers": {"okta": {"issuer": "https://idp.example",
+                                              "client_id": "agentd", "subject": "refresh_token",
+                                              "client_auth": {"method": "client_secret_basic"},
+                                              "client_secret": format!("{{{{secret-file:{}}}}}", seal.display())}},
+                       "delegation": {"seal_key": format!("{{{{secret-file:{}}}}}", seal.display())}}}),
+            "test",
+        )
+        .unwrap();
+        let durable = Arc::new(Durable::new(
+            Arc::new(crate::store::memory::MemoryStore::new()),
+            "t/",
+            "t",
+            crate::state::Policy::default(),
+            None,
+        ));
+        let log = Logger::new(
+            LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: std::process::id(),
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                trace_flags: None,
+            },
+            Level::Error,
+        );
+        let d = Delegation::build(&settings, durable, None, &log)
+            .unwrap()
+            .expect("an IdP is declared");
+        let who = "operator:alice";
+        let e = d
+            .seal_personal(who, "consent:g", &json!({"rendered": {}}))
+            .unwrap_err();
+        assert!(e.contains("has no personal key"), "{e}");
+        assert!(
+            matches!(d.vault.personal_key(who, false), Ok(None)),
+            "none kept"
+        );
+        assert!(d.cached_personal(who).is_none());
     }
 }

@@ -323,6 +323,7 @@ test('normalizeTask reads only URI-keyed annotations and core history', () => {
         statusHistory: [{ state: 'TASK_STATE_SUBMITTED', ts: '2026-08-17T13:41:00Z' }],
         askSchema: { type: 'string', enum: ['eu', 'us'] },
         askChannel: '@channel/ops',
+        securityGate: true,
       },
     },
   });
@@ -342,6 +343,7 @@ test('normalizeTask reads only URI-keyed annotations and core history', () => {
   assert.deepEqual(full.statusHistory, [{ state: 'TASK_STATE_SUBMITTED', ts: Date.parse('2026-08-17T13:41:00Z') }]);
   assert.deepEqual(full.askSchema, { type: 'string', enum: ['eu', 'us'] });
   assert.equal(full.askChannel, '@channel/ops');
+  assert.equal(full.securityGate, true);
   // RFC 3339 on the wire, epoch ms in the view: the TUI sorts and subtracts it.
   assert.equal(full.updated, Date.parse('2026-08-17T13:41:27.824Z'));
 
@@ -563,6 +565,20 @@ test('a run with many steps stays bounded in client memory', () => {
     m.apply({ seq: i + 1, ts: i, kind: 'step', data: { run: 'big', step: `s${i}`, phase: 'start' } });
   }
   assert.ok(m.state.steps.get('big').length <= 200, 'the ring is capped');
+});
+
+test('a gate agentd raised carries a badge no question text can earn', async () => {
+  const { gateBadge, normalizeTask } = await import('../dist/client/index.js');
+  const ask = (ann, message) =>
+    normalizeTask({
+      id: 't',
+      status: { state: 'TASK_STATE_INPUT_REQUIRED', message: { role: 'ROLE_AGENT', messageId: 'm', parts: [{ text: message }] } },
+      metadata: { [ANN]: { link: { kind: 'turn', id: 'c' }, created: '2026-10-20T09:00:00Z', statusHistory: [], ...ann } },
+    });
+  assert.equal(gateBadge(ask({ securityGate: true }, 'approve the call?')), 'agentd security gate · ');
+  // A model's question that dresses as one is still a model's question.
+  assert.equal(gateBadge(ask({}, 'agentd security gate · approve the transfer?')), '');
+  assert.equal(gateBadge(ask({ securityGate: 'true' }, 'x')), '', 'only the boolean true');
 });
 
 test('a gate schema becomes the form a person can actually answer', async () => {

@@ -60,6 +60,7 @@ pub mod steps;
 pub(crate) mod streams;
 pub mod subagents;
 pub mod surface;
+pub(crate) mod taint; // which work read outside text, and which holds delegated data (RFC 0044 P2)
 pub mod timers;
 pub mod tools;
 pub mod turns;
@@ -285,6 +286,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     }
     crate::sec::harden::set_reserved(settings.supervisor_only_env());
     crate::sec::harden::set_passthrough(settings.spawn.env_passthrough.clone());
+    // Every worker runs as the uid and gid the operator named, when it named
+    // them (load refused them where this process cannot drop to them).
+    crate::sec::worker::set(settings.spawn.worker());
+    if let Some((uid, gid)) = settings.spawn.worker() {
+        log.info("proc.worker", json!({"uid": uid, "gid": gid}));
+    }
     // Where the configuration holds a supervisor-only key, no child opens
     // the vault, a key file or the audit chain (RFC 0044 P2a); a kernel
     // without Landlock is said out loud, since the P1 residual holds there.
@@ -1344,12 +1351,16 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // events handed to the loop for the stream `company.<name>`.
     #[cfg(feature = "companies")]
     rt.resume_company_conversations();
-    // The delegation supervisor's notes reach the loop, and each workflow
-    // step suspended on the person's consent asks again.
+    // The delegation supervisor's notes reach the loop, each workflow step
+    // suspended on the person's consent asks again, and the person's
+    // personal key is opened off the loop, ready for the first record.
     #[cfg(feature = "xaa")]
     {
         rt.delegation_wire();
         rt.rebuild_consents();
+        if let Some(d) = &rt.delegation {
+            d.warm_personal();
+        }
     }
     // The A2A transport: the HTTPS listener for conversations,
     // command DataParts, and durable tasks. A bind/TLS/principals failure at

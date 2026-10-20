@@ -350,10 +350,9 @@ impl Runtime {
                 // so does an error that may hold what the Company sent.
                 let read = res.as_ref().map_or_else(|e| e.read_the_company(), |_| true);
                 if read && let (Some(into), Some(issuer)) = (reads, slot.issuer()) {
-                    let _ = tx.send(super::events::Event::CompanyRead {
+                    let _ = tx.send(super::events::Event::Read {
                         into,
-                        origin: crate::companies::carry::origin(&issuer),
-                        why: crate::companies::carry::why(slot.company()),
+                        carries: crate::companies::carry::read(&issuer, slot.company()),
                     });
                 }
                 let company_name = slot.company().to_string();

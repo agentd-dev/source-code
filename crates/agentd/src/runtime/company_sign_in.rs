@@ -476,6 +476,7 @@ impl Runtime {
         );
         if let Some(t) = self.tasks.get_mut(&task) {
             t.ask_schema = Some(sign_in_answer_schema());
+            t.security_gate = true;
             t.ask_channel = None;
             t.sign_in = Some(SignInGate {
                 company: company.clone(),
@@ -597,6 +598,7 @@ impl Runtime {
         };
         t.sign_in = None;
         t.ask_schema = None;
+        t.security_gate = false;
         let said = outcome.said(company, account);
         if t.state.is_terminal() {
             // Its work ended first: nothing to move on.

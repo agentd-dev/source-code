@@ -38,6 +38,7 @@ import {
   applySuggestion,
   askAnswer,
   askForm,
+  gateBadge,
   availableCommands,
   commandHelp,
   conversationsNote,
@@ -824,7 +825,9 @@ export function App(props: AppProps): React.JSX.Element {
               ? // A form-shaped gate lists its options below, so the working
                 // line does not repeat the wait. Where else the question
                 // went rides on the same line: it tells whoever sees it that
-                // someone may already be answering there.
+                // someone may already be answering there. A gate agentd raised
+                // itself leads with its badge, which no question's text earns.
+                gateBadge(active[0]) +
                 (gateForm.kind === 'text' ? 'waiting for your answer' : 'waiting for your choice') +
                 (active[0].askChannel ? ` · also asked on ${active[0].askChannel}` : '')
               : active[0].state === 'TASK_STATE_AUTH_REQUIRED'

@@ -297,6 +297,11 @@ pub fn annotations(t: &Task) -> Value {
     if let Some(ch) = &t.ask_channel {
         a["askChannel"] = json!(ch);
     }
+    // A gate agentd raised itself, for a client's badge: no question text
+    // can set it.
+    if t.security_gate {
+        a["securityGate"] = json!(true);
+    }
     if let Some(op) = &t.command {
         a["command"] = json!(op);
     }

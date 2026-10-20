@@ -733,10 +733,9 @@ impl Runtime {
                     };
                     crate::obs::metrics::record_company_request(slot.company(), "mcp", outcome);
                     if read && let (Some(into), Some(issuer)) = (reads.clone(), slot.issuer()) {
-                        let _ = tx.send(super::events::Event::CompanyRead {
+                        let _ = tx.send(super::events::Event::Read {
                             into,
-                            origin: crate::companies::carry::origin(&issuer),
-                            why: crate::companies::carry::why(slot.company()),
+                            carries: crate::companies::carry::read(&issuer, slot.company()),
                         });
                     }
                     // An operation the tool proposes in place of performing
@@ -842,11 +841,16 @@ impl Runtime {
                 }
             }
             // ---- memory ----
+            // An entry keeps what its writer carried — its taint and its
+            // delegated data — and every reader takes it on (RFC 0044 §5.13).
             "memory.get" => match self
                 .memory
-                .get(&self.durable, args["key"].as_str().unwrap_or(""))
+                .get_carrying(&self.durable, args["key"].as_str().unwrap_or(""))
             {
-                Ok(v) => ok(v),
+                Ok((v, held)) => {
+                    self.hand_caller(caller, &held);
+                    ok(v)
+                }
                 Err(e) => err(e),
             },
             "memory.set" => {
@@ -857,12 +861,14 @@ impl Runtime {
                     },
                     None => None,
                 };
-                match self.memory.set(
+                let carries = self.caller_carries(caller);
+                match self.memory.set_carrying(
                     &self.durable,
                     args["key"].as_str().unwrap_or(""),
                     args["value"].clone(),
                     ttl,
                     Some(&by),
+                    &carries,
                 ) {
                     Ok(v) => ok(v),
                     Err(e) => err(e),
@@ -878,21 +884,28 @@ impl Runtime {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
-            "memory.push" => match self.memory.push(
-                &self.durable,
-                args["key"].as_str().unwrap_or(""),
-                args.get("value").cloned().unwrap_or(Value::Null),
-                Some(&by),
-            ) {
-                Ok(v) => ok(v),
-                Err(e) => err(e),
-            },
+            "memory.push" => {
+                let carries = self.caller_carries(caller);
+                match self.memory.push_carrying(
+                    &self.durable,
+                    args["key"].as_str().unwrap_or(""),
+                    args.get("value").cloned().unwrap_or(Value::Null),
+                    Some(&by),
+                    &carries,
+                ) {
+                    Ok(v) => ok(v),
+                    Err(e) => err(e),
+                }
+            }
             "memory.shift" => match self.memory.shift(
                 &self.durable,
                 args["key"].as_str().unwrap_or(""),
                 Some(&by),
             ) {
-                Ok(v) => ok(v),
+                Ok((v, held)) => {
+                    self.hand_caller(caller, &held);
+                    ok(v)
+                }
                 Err(e) => err(e),
             },
             "memory.pop" => {
@@ -900,7 +913,10 @@ impl Runtime {
                     .memory
                     .pop(&self.durable, args["key"].as_str().unwrap_or(""), Some(&by))
                 {
-                    Ok(v) => ok(v),
+                    Ok((v, held)) => {
+                        self.hand_caller(caller, &held);
+                        ok(v)
+                    }
                     Err(e) => err(e),
                 }
             }
@@ -937,6 +953,9 @@ impl Runtime {
                     }
                 };
                 let owner = caller.run.clone().or_else(|| caller.ctx.clone());
+                // The content is what the caller read: its readers take on
+                // what the caller carries (RFC 0044 §5.13).
+                let carries = self.caller_carries(caller);
                 match self.artifacts.create(
                     &self.durable,
                     super::artifacts::NewArtifact {
@@ -949,16 +968,28 @@ impl Runtime {
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
                         owner: owner.as_deref(),
+                        carries: &carries,
                     },
                 ) {
                     Ok(v) => ok(v),
                     Err(e) => err(e),
                 }
             }
-            "artifact.get" => match self.artifacts.get_value(args["id"].as_str().unwrap_or("")) {
-                Ok(v) => ok(v),
-                Err(e) => err(e),
-            },
+            "artifact.get" => {
+                let id = args["id"].as_str().unwrap_or("");
+                match self.artifacts.get_value(id) {
+                    Ok(v) => {
+                        let held = self
+                            .artifacts
+                            .get(id)
+                            .map(|a| a.carries.clone())
+                            .unwrap_or_default();
+                        self.hand_caller(caller, &held);
+                        ok(v)
+                    }
+                    Err(e) => err(e),
+                }
+            }
             "artifact.delete" => match self
                 .artifacts
                 .delete(&self.durable, args["id"].as_str().unwrap_or(""))
@@ -1229,6 +1260,25 @@ impl Runtime {
         };
         #[cfg(not(feature = "companies"))]
         let view: Option<Value> = None;
+        // What the taint engine knows of the work making the call (RFC 0044
+        // §5.13 item 6): read only when a rule asks.
+        let facts = if self
+            .settings
+            .security
+            .policies
+            .iter()
+            .any(|p| p.matcher.tainted.is_some() || p.matcher.holds_delegated_data.is_some())
+        {
+            let f = self.caller_facts(caller);
+            (f.tainted, f.holds_delegated_data)
+        } else {
+            (false, false)
+        };
+        let facts = crate::sec::policy::Facts {
+            delegated: self.delegated_tool(name),
+            tainted: facts.0,
+            holds_delegated_data: facts.1,
+        };
         let as_api = view.as_ref().map(|v| crate::sec::policy::Call {
             tool: "company.api",
             tags: &tags,
@@ -1236,6 +1286,7 @@ impl Runtime {
             principal: caller.principal.as_deref(),
             args: v,
             also: None,
+            facts,
         });
         let call = crate::sec::policy::Call {
             tool: name,
@@ -1244,6 +1295,7 @@ impl Runtime {
             principal: caller.principal.as_deref(),
             args,
             also: as_api.as_ref(),
+            facts,
         };
         let verdict = match crate::sec::policy::evaluate(&self.settings.security.policies, &call) {
             Ok(None) => return None,
@@ -1339,21 +1391,12 @@ impl Runtime {
         passed: super::reactor::Passed,
     ) -> Option<ToolOutcome> {
         use crate::config::settings::PolicyAction;
-        let question = verdict
-            .question
-            .clone()
-            .unwrap_or_else(|| {
-                format!(
-                    "{} wants to call {name} — allow?",
-                    crate::sec::policy::caller_name(Self::policy_caller(caller))
-                )
-            })
-            .replace("{{tool}}", name)
-            .replace(
-                "{{caller}}",
-                crate::sec::policy::caller_name(Self::policy_caller(caller)),
-            )
-            .replace("{{args}}", &args.to_string());
+        let question = crate::sec::policy::question(
+            verdict.question.as_deref(),
+            name,
+            Self::policy_caller(caller),
+            args,
+        );
         // The same ownership test `ask_human` uses: the caller who owns the
         // asking unit is on core A2A and can be put in front of the gate; an
         // unowned call gates only where the operator said they will be asked.
@@ -1596,9 +1639,11 @@ impl Runtime {
         if owner_checked {
             payload["owner_checked"] = Value::Bool(true);
         }
-        // The text may be a Company's: whatever it reaches carries the
-        // Companies whose content the sender holds (RFC 0047 §6.2).
-        let carried = super::withhold::companies_of(&self.caller_carries(caller));
+        // The text may hold whatever the sender read: the conversation it
+        // reaches carries the Companies whose content the sender holds (RFC
+        // 0047 §6.2), its delegated data and its taint (RFC 0044 §5.13) —
+        // what a conversation keeps of a record (`Carries::kept_by_holder`).
+        let carried = self.caller_carries(caller).kept_by_holder(true);
         if !carried.is_empty() {
             payload["carries"] = json!(carried);
         }
@@ -1855,13 +1900,14 @@ impl Runtime {
         // `reads`: memory keys folded into the prompt.
         if let Some(reads) = args.get("reads").and_then(Value::as_array) {
             for k in reads.iter().filter_map(Value::as_str) {
-                if let Ok(v) = self.memory.get(&self.durable, k)
+                if let Ok((v, held)) = self.memory.get_carrying(&self.durable, k)
                     && v["found"] == json!(true)
                 {
                     messages.push(crate::context::Msg::system(format!(
                         "memory[{k}] = {}",
                         v["value"]
                     )));
+                    self.hand_caller(caller, &held);
                 }
             }
         }

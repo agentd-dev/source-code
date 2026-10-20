@@ -18,7 +18,7 @@
 //! where each one lives is learned at discovery, and only the supervisor
 //! ever dials one.
 
-use super::{Diagnostics, McpServer, Secret, ServiceKind, Settings, StoreKind};
+use super::{Diagnostics, Dur, McpServer, Secret, ServiceKind, Settings, StoreKind};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -48,8 +48,15 @@ pub struct Companies {
     pub client: Option<Client>,
     /// 32 random bytes, as a secret reference: the Account Tokens are sealed
     /// with it, and when it is set the User ID records too, so a store that
-    /// holds them cannot read them.
+    /// holds them cannot read them. `key_custody: local` only.
     pub seal_key: Option<Secret>,
+    /// Who holds the seal key: the supervisor, read from `seal_key`
+    /// (`local`, the default), or the external signer `signer` names
+    /// (`external`), which wraps each record's data key and derives the
+    /// record-id keys, so agentd holds neither.
+    pub key_custody: super::delegation::KeyCustody,
+    /// The external signer, under `key_custody: external`.
+    pub signer: Option<Signer>,
     /// What the messages agentd sends in a Company's conversations tell it
     /// of the User's situation (draft §7.4): nothing it does not set.
     pub context: Option<Context>,
@@ -60,6 +67,48 @@ pub struct Companies {
     /// operation without asking the User (RFC 0047 §5.8.1): restart-only,
     /// never written by anything but this configuration.
     pub standing: Vec<Standing>,
+}
+
+/// `security.companies.signer`: the external signer that holds the seal key
+/// (RFC 0044 §7.P2b, `docs/external-signer.md`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Signer {
+    /// The signer's unix socket, an absolute path.
+    pub socket: String,
+    /// The uid the signer process runs as: the socket's peer must be it.
+    pub uid: u32,
+    /// The bound on one request; default 5s.
+    #[serde(default)]
+    pub timeout: Option<Dur>,
+    /// The signer's key-encryption key each record's data key is wrapped
+    /// under.
+    pub seal_key: String,
+    /// The signer's HMAC-SHA256 key the record-id keys are derived under.
+    pub derive_key: String,
+}
+
+impl Signer {
+    /// The signer client this names.
+    #[cfg(feature = "oauth")]
+    pub fn signer(&self) -> crate::sec::signer::Signer {
+        crate::sec::signer::Signer::new(&self.socket, self.uid, self.timeout.map(|d| d.0))
+    }
+}
+
+impl Companies {
+    /// The signer that holds the seal key, under `key_custody: external`.
+    pub fn external(&self) -> Option<&Signer> {
+        match self.key_custody {
+            super::delegation::KeyCustody::External => self.signer.as_ref(),
+            super::delegation::KeyCustody::Local => None,
+        }
+    }
+
+    /// Whether the records are sealed: a seal key, wherever it is held.
+    pub fn sealed(&self) -> bool {
+        self.seal_key.is_some() || self.external().is_some()
+    }
 }
 
 /// An extension agentd lists in its client metadata document (draft §3.3,
@@ -914,9 +963,57 @@ pub fn unknown_operation_tool(s: &Settings, pattern: &str) -> Option<String> {
     })
 }
 
+/// Who holds the seal key: under `key_custody: external` the signer, named
+/// by an absolute socket, a uid, its key-encryption and derivation keys —
+/// and no `seal_key` beside it; under `local`, no signer.
+fn validate_custody(c: &Companies, d: &mut Diagnostics) {
+    use super::delegation::KeyCustody;
+    match (c.key_custody, &c.signer) {
+        (KeyCustody::External, None) => d.errors.push(
+            "security.companies.key_custody external needs security.companies.signer {socket, uid, seal_key, derive_key}".into(),
+        ),
+        (KeyCustody::Local, Some(_)) => d.errors.push(
+            "security.companies.signer is read under key_custody: external alone — say key_custody: external, or drop the signer".into(),
+        ),
+        (KeyCustody::External, Some(sg)) => {
+            if !std::path::Path::new(&sg.socket).is_absolute() {
+                d.errors.push(format!(
+                    "security.companies.signer.socket {:?} is not an absolute path to the signer's unix socket",
+                    sg.socket
+                ));
+            }
+            // SAFETY: geteuid has no failure mode.
+            if sg.uid == unsafe { libc::geteuid() } {
+                d.warnings.push(format!(
+                    "security.companies.signer.uid {} is agentd's own: the peer check cannot tell the signer from a process of agentd's uid, which can also read a same-uid signer's memory and key files — run the signer as another uid",
+                    sg.uid
+                ));
+            }
+            if let Some(t) = sg.timeout
+                && (t.0.is_zero() || t.0 > std::time::Duration::from_secs(60))
+            {
+                d.errors
+                    .push("security.companies.signer.timeout: between 1ms and 60s".into());
+            }
+            if sg.seal_key.trim().is_empty() || sg.derive_key.trim().is_empty() {
+                d.errors.push(
+                    "security.companies.signer names the signer's key-encryption key (seal_key) and its derivation key (derive_key)".into(),
+                );
+            }
+            if c.seal_key.is_some() {
+                d.errors.push(
+                    "security.companies.seal_key: under key_custody external the signer holds the seal key — name its key-encryption key as security.companies.signer.seal_key, and give no key".into(),
+                );
+            }
+        }
+        (KeyCustody::Local, None) => {}
+    }
+}
+
 /// Every check RFC 0047 §5.3 makes at load, on `security.companies` and the
 /// company entries.
 pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
+    validate_custody(&s.security.companies, d);
     let mut err = |m: String| d.errors.push(m);
     let c = &s.security.companies;
     let declared = c != &Companies::default();
@@ -1050,8 +1147,8 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             "store.kind {} forgets every User ID when the process ends, and a Company must see the same User ID across Sessions (draft §4.2) — use store.kind file, mcp or http",
             if s.store.kind == StoreKind::None { "none" } else { "memory" }
         )),
-        StoreKind::Mcp | StoreKind::Http if c.seal_key.is_none() => err(
-            "a `kind: company` entry with a remote store (store.kind mcp or http) needs security.companies.seal_key, so the store holds the User IDs sealed".into(),
+        StoreKind::Mcp | StoreKind::Http if !c.sealed() => err(
+            "a `kind: company` entry with a remote store (store.kind mcp or http) needs security.companies.seal_key (or key_custody: external), so the store holds the User IDs sealed".into(),
         ),
         _ => {}
     }
@@ -1067,10 +1164,10 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
         .map(|(n, _)| n.as_str())
         .collect();
     if let Some(first) = signing_in.first()
-        && c.seal_key.is_none()
+        && !c.sealed()
     {
         err(format!(
-            "services.{first}.sign_in needs security.companies.seal_key: the Account Token a sign-in gives agentd is kept only sealed with it"
+            "services.{first}.sign_in needs security.companies.seal_key (or key_custody: external): the Account Token a sign-in gives agentd is kept only sealed with it"
         ));
     }
     let direct = entries
@@ -1890,6 +1987,72 @@ mod tests {
             "store: {kind: http, http: {base_url: \"https://store.example\"}}\n",
         );
         refused(&remote, "needs security.companies.seal_key");
+    }
+
+    /// The seal key is held as its custody says: under `external` by the
+    /// signer, named by an absolute socket, its uid and its two keys, with no
+    /// `seal_key` beside it — which then stands for one where a sign-in and
+    /// a remote store need it — and its socket is among the paths a child is
+    /// denied; under `local`, no signer.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn the_seal_key_is_held_as_its_custody_says() {
+        let with = |custody: &str| {
+            company(", sign_in: [device], scopes: [\"poppy:read\"]")
+                .replace("name: Agent}", &format!("name: Agent}}\n{custody}"))
+        };
+        let signer = "    key_custody: external\n    signer: {socket: /run/signer/s.sock, uid: 991, seal_key: kek, derive_key: ids}\n";
+        let s = load(&with(signer)).unwrap();
+        assert_eq!(
+            s.security
+                .companies
+                .external()
+                .map(|g| g.derive_key.as_str()),
+            Some("ids")
+        );
+        assert!(s.security.companies.sealed());
+        assert!(
+            s.supervisor_only_paths()
+                .iter()
+                .any(|p| p.path == std::path::Path::new("/run/signer/s.sock")),
+            "the signer's socket is denied to every child"
+        );
+        // A remote store is sealed through the signer as well.
+        let remote = with(signer).replace(
+            STORE,
+            "store: {kind: mcp, mcp: {server: state}}\nmcp:\n  servers:\n    - {name: state, endpoint: \"https://state.example/mcp\"}\n",
+        );
+        load(&remote).unwrap();
+        let refused = |yaml: &str, why: &str| {
+            let e = load(yaml).expect_err(yaml);
+            assert!(e.contains(why), "want {why:?} in:\n{e}");
+        };
+        refused(
+            &with("    key_custody: external\n"),
+            "key_custody external needs security.companies.signer",
+        );
+        refused(
+            &with("    signer: {socket: /run/s.sock, uid: 991, seal_key: kek, derive_key: ids}\n"),
+            "security.companies.signer is read under key_custody: external alone",
+        );
+        refused(
+            &with(&format!(
+                "{signer}    seal_key: \"{{{{secret-file:/run/k}}}}\"\n"
+            )),
+            "under key_custody external the signer holds the seal key",
+        );
+        refused(
+            &with(
+                "    key_custody: external\n    signer: {socket: s.sock, uid: 991, seal_key: kek, derive_key: ids}\n",
+            ),
+            "is not an absolute path",
+        );
+        refused(
+            &with(
+                "    key_custody: external\n    signer: {socket: /s.sock, uid: 991, seal_key: kek, derive_key: \"\"}\n",
+            ),
+            "its derivation key (derive_key)",
+        );
     }
 
     /// [`load`], with `__DIR__/seal` holding a seal key.

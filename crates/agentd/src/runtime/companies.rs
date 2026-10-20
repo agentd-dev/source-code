@@ -293,14 +293,12 @@ impl Runtime {
             .then(|| Reads::Conversation(caller.context_id()))
     }
 
-    /// A Company call's result reached `into`: its record gains `origin`.
-    pub(crate) fn company_read(&mut self, into: Reads, origin: String, why: String) {
-        let mut c = crate::engine::run::Carries::default();
-        c.add([origin], || why);
+    /// A result reached `into`: its record gains what the result `carries`.
+    pub(crate) fn read_into(&mut self, into: Reads, carries: &crate::engine::run::Carries) {
         match into {
-            Reads::Run(id) => self.hand_run(&id, &c),
-            Reads::Child(h) => self.steer_carries(&h, &c),
-            Reads::Conversation(ctx) => self.hand_conversation(&ctx, &c),
+            Reads::Run(id) => self.hand_run(&id, carries),
+            Reads::Child(h) => self.steer_carries(&h, carries),
+            Reads::Conversation(ctx) => self.hand_conversation(&ctx, carries),
         }
     }
 

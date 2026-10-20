@@ -363,6 +363,22 @@ impl Runtime {
                 return self.company_direct_relay(&id, tid, principal, text, message);
             }
         }
+        // A person's consent gate on the addressed task's work (RFC 0044
+        // §5.10 rule 1, T8): no message is a consent answer — not the
+        // person's, not an upstream agent's holding their token — so it is
+        // refused, recorded, and the gate left open for the person.
+        #[cfg(feature = "xaa")]
+        if let Some((tid, _)) = &existing
+            && let Some(gate) = self.consent_on_task(tid)
+        {
+            self.consent_refused(&gate, &principal.id, "a_message_is_no_answer");
+            return err_obj(
+                ::mcp::rpc::INVALID_PARAMS,
+                &format!(
+                    "task {tid} waits on consent gate {gate}, which only the person answers, with agentd --delegation-approve {gate} or agentd --delegation-deny {gate}: a message is no consent answer, and this one was not taken as one"
+                ),
+            );
+        }
         // A LIVE human gate on the addressed task: the reply
         // resolves the suspended asker directly — the tool call returns the
         // text to the model, the `human` step completes with it — instead of

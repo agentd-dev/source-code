@@ -11,8 +11,10 @@
 //! `security.companies.seal_key` the record is sealed (AES-256-GCM,
 //! associated data `("company-ledger", client_id, issuer, principal, "1")`)
 //! under an id that is an HMAC-SHA256 of `issuer|principal` under a key
-//! derived from the seal key, so a store that holds it can read neither the
-//! conversations nor which Company they are at; without one it is plain
+//! derived from the seal key — agentd's, or the external signer's under
+//! `key_custody: external` ([`super::keys`]) — so a store that holds it can
+//! read neither the conversations nor which Company they are at; without
+//! one it is plain
 //! under `sha256("company-ledger|" + issuer + "|" + principal)`, which load
 //! allows only with a local store, as it does the User ID records.
 //!
@@ -34,9 +36,12 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::auth::seal::{SealKey, associated_data};
-use crate::b64;
+use super::keys::{KeyError, Keyring};
+use crate::auth::seal::associated_data;
 use crate::state::{Durable, Kind};
+
+/// The label the record-id key is derived from.
+pub const ID_LABEL: &[u8] = b"agentd company-ledger record id";
 
 /// The record version the associated data names.
 const VERSION: &str = "1";
@@ -417,43 +422,27 @@ pub fn uuid_v4() -> Result<String, String> {
 pub struct Ledger {
     durable: Arc<Durable>,
     client_id: String,
-    seal: Option<(SealKey, [u8; 32])>,
+    seal: Option<Arc<Keyring>>,
     lock: Mutex<()>,
 }
 
 impl Ledger {
-    /// `seal`, when given, is `security.companies.seal_key`'s bytes.
-    pub fn new(
-        durable: Arc<Durable>,
-        client_id: &str,
-        seal: Option<[u8; 32]>,
-    ) -> Result<Ledger, String> {
-        let seal = match seal {
-            Some(raw) => Some((
-                SealKey::new(&raw).map_err(|e| format!("security.companies.seal_key: {e}"))?,
-                crate::sha::hmac_sha256(&raw, b"agentd company-ledger record id"),
-            )),
-            None => None,
-        };
-        Ok(Ledger {
+    /// `seal`, when given, is the seal key.
+    pub fn new(durable: Arc<Durable>, client_id: &str, seal: Option<Arc<Keyring>>) -> Ledger {
+        Ledger {
             durable,
             client_id: client_id.to_string(),
             seal,
             lock: Mutex::new(()),
-        })
+        }
     }
 
-    fn id(&self, issuer: &str, principal: &str) -> String {
+    fn id(&self, issuer: &str, principal: &str) -> Result<String, KeyError> {
         match &self.seal {
-            Some((_, key)) => {
-                crate::sha::hmac_sha256(key, format!("{issuer}|{principal}").as_bytes())
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect()
-            }
-            None => {
-                crate::sha::sha256_hex(format!("company-ledger|{issuer}|{principal}").as_bytes())
-            }
+            Some(key) => key.record_id(ID_LABEL, &format!("{issuer}|{principal}")),
+            None => Ok(crate::sha::sha256_hex(
+                format!("company-ledger|{issuer}|{principal}").as_bytes(),
+            )),
         }
     }
 
@@ -470,20 +459,23 @@ impl Ledger {
     fn read(&self, principal: &str, issuer: &str) -> Result<Book, String> {
         let Some(env) = self
             .durable
-            .get(Kind::Company, &self.id(issuer, principal))
+            .get(Kind::Company, &self.id(issuer, principal)?)
             .map_err(|e| format!("company ledger: {e}"))?
             .filter(|env| !env.state.is_null())
         else {
             return Ok(Book::default());
         };
         let bytes = match &self.seal {
-            Some((key, _)) => {
-                let sealed = b64::url_decode(env.state["sealed"].as_str().unwrap_or_default())
-                    .unwrap_or_default();
-                key.open(&self.ad(issuer, principal), &sealed)
-                    .map_err(|_| {
-                        "a company ledger record does not open with security.companies.seal_key"
+            Some(key) => {
+                key.open(&self.ad(issuer, principal), &env.state)
+                    .map_err(|e| {
+                        match e {
+                    KeyError::Unavailable(e) => e,
+                    KeyError::Refused(_) => {
+                        "a company ledger record does not open with security.companies' seal key"
                             .to_string()
+                    }
+                }
                     })?
             }
             None => serde_json::to_vec(&env.state["book"]).map_err(|e| e.to_string())?,
@@ -493,15 +485,16 @@ impl Ledger {
 
     fn write(&self, principal: &str, issuer: &str, book: &Book) -> Result<(), String> {
         let state = match &self.seal {
-            Some((key, _)) => {
+            Some(key) => {
                 let bytes = serde_json::to_vec(book).map_err(|e| e.to_string())?;
-                let sealed = key.seal(&self.ad(issuer, principal), &bytes)?;
-                json!({"v": VERSION, "sealed": b64::url_nopad(&sealed)})
+                let mut sealed = key.seal(&self.ad(issuer, principal), &bytes)?;
+                sealed.insert("v".into(), json!(VERSION));
+                Value::Object(sealed)
             }
             None => json!({"v": VERSION, "book": book}),
         };
         self.durable
-            .put(Kind::Company, &self.id(issuer, principal), state, None)
+            .put(Kind::Company, &self.id(issuer, principal)?, state, None)
             .map(|_| ())
             .map_err(|e| format!("company ledger: {e}"))
     }
@@ -535,7 +528,7 @@ impl Ledger {
     pub fn forget(&self, principal: &str, issuer: &str) -> Result<(), String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.durable
-            .delete(Kind::Company, &self.id(issuer, principal))
+            .delete(Kind::Company, &self.id(issuer, principal)?)
             .map_err(|e| format!("company ledger: {e}"))
     }
 }
@@ -554,7 +547,11 @@ mod tests {
             crate::state::Policy::default(),
             None,
         ));
-        Ledger::new(durable, "https://a.example/c.json", seal.map(|s| [s; 32])).unwrap()
+        Ledger::new(
+            durable,
+            "https://a.example/c.json",
+            seal.map(|s| Arc::new(crate::companies::keys::Keyring::local([s; 32]).unwrap())),
+        )
     }
 
     fn dump(store: &MemoryStore) -> String {

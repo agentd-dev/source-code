@@ -216,6 +216,10 @@ These behave as designed, and surprise people anyway:
   `No such key` on a variable that has not been written yet.
 - **`cache` never stores a step that suspends or nests**: waits, gates,
   sleeps, subagents and every body kind. A cached result is still read.
+- **`cache` stores nothing for a run that holds a person's delegated
+  data** (`step.cache.not_kept`): the cache is shared by every run, and
+  would hand their data to another. A cached output keeps the taint of the
+  run that produced it.
 - **A secret reference is literal outside headers.** `{{secret:NAME}}`
   resolves in an `http` step's `headers` and `sign.secret` and a webhook's
   `auth`; in a `json` body or an `mcp.tool` argument it is sent as written.

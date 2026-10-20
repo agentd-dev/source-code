@@ -1043,7 +1043,7 @@ impl Runtime {
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
             Event::McpReachable(r) => self.on_mcp_reachable(*r),
             Event::McpTask(n) => self.on_mcp_task(*n),
-            Event::CompanyRead { into, origin, why } => self.company_read(into, origin, why),
+            Event::Read { into, carries } => self.read_into(into, &carries),
             #[cfg(feature = "xaa")]
             Event::Delegation(n) => self.on_delegation_note(*n),
             #[cfg(all(feature = "xaa", feature = "a2a"))]
@@ -1495,9 +1495,14 @@ impl Runtime {
         let msg = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                          "text": text, "message_id": ev.payload.get("message_id").cloned()});
         // The Companies whose content the sender held (`message.send`, a
-        // `message` step): whichever reader takes the message carries them
-        // (RFC 0047 §6.2).
-        let carried = super::withhold::companies_of(&super::starts::event_carries(&ev.payload));
+        // `message` step), its delegated data and its taint: whichever
+        // reader takes the message carries them (RFC 0047 §6.2, RFC 0044
+        // §5.13) — and the taint of a person's own message. A peer agent's
+        // text is the origin each reader records of it already.
+        let mut carried = super::starts::event_carries(&ev.payload).kept_by_holder(true);
+        if let Some(p) = principal.as_deref() {
+            carried.taint(self.principal_message_carries(p, "handed a message").taint);
+        }
         let woken = self.deliver_a2a_message(
             &ctx,
             &wire,

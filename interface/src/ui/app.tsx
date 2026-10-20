@@ -45,6 +45,7 @@ import {
   applySuggestion,
   askAnswer,
   askForm,
+  gateBadge,
   availableCommands,
   cardUrlOf,
   commandHelp,
@@ -268,7 +269,9 @@ function Chat({ mirror, gate, onSend }: { mirror: Mirror; gate: TaskView | undef
             ⠿{' '}
             {active[0].state === 'TASK_STATE_INPUT_REQUIRED'
               ? // Where else the question went: someone may already be
-                // answering there.
+                // answering there. A gate agentd raised itself leads with its
+                // badge, which no question's text earns.
+                gateBadge(active[0]) +
                 'waiting for your answer' +
                 (active[0].askChannel ? ` · also asked on ${active[0].askChannel}` : '')
               : activityLine(mirror.activityFor(active[0].id), tick)}

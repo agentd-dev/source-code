@@ -37,6 +37,14 @@ pub fn why(company: &str) -> String {
     format!("it read a result of company {company}")
 }
 
+/// What a result of the Company `company` at `issuer` hands the context it
+/// reaches.
+pub fn read(issuer: &str, company: &str) -> Carries {
+    let mut c = Carries::default();
+    c.add([origin(issuer)], || why(company));
+    c
+}
+
 /// The issuers of the Companies `carries` holds content from.
 pub fn issuers(carries: &Carries) -> impl Iterator<Item = &str> {
     carries
@@ -67,13 +75,15 @@ const ARGS_CAP: usize = 1500;
 
 /// The question of the cross-Company gate: whose content the work holds,
 /// the call it is about to make, and how to answer. Every word but the
-/// quoted names, the tool's name and the arguments is agentd's.
+/// quoted names, the tool's name and the arguments is agentd's; the
+/// arguments are printable-ASCII JSON (`sec::render::ascii_json`), so no
+/// character in them reads as another.
 pub fn question(from: &[String], to: &str, tool: &str, args: &serde_json::Value) -> String {
     let tool: String = tool
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .collect();
-    let mut shown = serde_json::to_string(args).unwrap_or_default();
+    let mut shown = crate::sec::render::ascii_json(args);
     if let Some((at, _)) = shown.char_indices().nth(ARGS_CAP) {
         shown.truncate(at);
         shown.push('…');
@@ -119,7 +129,7 @@ mod tests {
             &[from],
             &named("", "b.example"),
             "travel.book`\n_flight",
-            &json!({"to": "x".repeat(4000), "note": "line\nbreak"}),
+            &json!({"to": "x".repeat(4000), "note": "line\nbreak\u{202e}"}),
         );
         let lines: Vec<&str> = q.lines().collect();
         assert!(
@@ -132,7 +142,10 @@ mod tests {
             ),
             "{q}"
         );
-        assert!(lines[1].starts_with("{\"note\":\"line\\nbreak\""), "{q}");
+        assert!(
+            lines[1].starts_with("{\"note\":\"line\\nbreak\\u202e\""),
+            "{q}"
+        );
         assert!(lines[1].ends_with('…') && lines[1].chars().count() == ARGS_CAP + 1);
         assert!(q.ends_with("answer `approve` to make this call, or `deny` to refuse it."));
     }

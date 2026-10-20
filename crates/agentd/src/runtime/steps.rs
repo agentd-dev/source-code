@@ -1330,12 +1330,19 @@ impl Runtime {
                 }
                 self.memory_keys.insert(hash.clone(), keys);
             }
+            let mut held = crate::engine::run::Carries::default();
             for k in self.memory_keys.get(&hash).cloned().unwrap_or_default() {
-                if let Ok(v) = self.memory.get(&self.durable, &k)
+                if let Ok((v, c)) = self.memory.get_carrying(&self.durable, &k)
                     && v["found"] == json!(true)
                 {
                     memory.insert(k, v["value"].clone());
+                    held.union(&c);
                 }
+            }
+            // What the entries a step's templates read carried, its run
+            // carries (RFC 0044 §5.13).
+            if !held.is_empty() {
+                self.hand_run(run_id, &held);
             }
         }
         let mut data = self
@@ -1345,32 +1352,39 @@ impl Runtime {
             .unwrap_or_default();
         // Artifact-backed values (`{"$artifact": id}`) dereference transparently
         // so a template sees the content, not the reference — a step never has
-        // to know whether an upstream output was spilled to an artifact.
+        // to know whether an upstream output was spilled to an artifact. What
+        // each artifact's maker carried, the run now does.
+        let mut held = super::withhold::Carries::default();
         for key in ["steps", "vars", "inputs"] {
             if let Some(v) = data.get_mut(key) {
-                self.deref_artifacts(v);
+                self.deref_artifacts(v, &mut held);
             }
+        }
+        if !held.is_empty() {
+            self.hand_run(run_id, &held);
         }
         data
     }
 
-    /// Replace `{"$artifact": id, …}` objects with the artifact's content.
-    pub(crate) fn deref_artifacts(&self, v: &mut Value) {
+    /// Replace `{"$artifact": id, …}` objects with the artifact's content,
+    /// adding to `held` what each one carries.
+    pub(crate) fn deref_artifacts(&self, v: &mut Value, held: &mut super::withhold::Carries) {
         match v {
             Value::Object(o) => {
                 if let Some(id) = o.get("$artifact").and_then(Value::as_str) {
                     if let Some(a) = self.artifacts.get(id) {
+                        held.union(&a.carries);
                         *v = a.content.clone();
                     }
                     return;
                 }
                 for x in o.values_mut() {
-                    self.deref_artifacts(x);
+                    self.deref_artifacts(x, held);
                 }
             }
             Value::Array(a) => {
                 for x in a.iter_mut() {
-                    self.deref_artifacts(x);
+                    self.deref_artifacts(x, held);
                 }
             }
             _ => {}
@@ -1543,9 +1557,12 @@ impl Runtime {
         };
         // `cache {key, ttl}`: a fresh memoized output skips the effect.
         let cache_key = match self.cache_lookup(&step, &spec, &data) {
-            Some((_key, Some(hit))) => {
+            Some((_key, Some((hit, carried)))) => {
                 self.run_log(run_id)
                     .info("step.cache_hit", json!({"run": run_id, "step": step_id}));
+                // What the run that produced it carried, this one now does,
+                // before a step after it reads the output.
+                self.hand_run(run_id, &carried);
                 self.finish_step(run_id, step_id, StepStatus::Done, Some(hit), None, 0);
                 return;
             }
@@ -3146,6 +3163,7 @@ impl Runtime {
             Some(v) if !v.is_null() => {
                 let cap = self.settings.limits.inline_max_bytes.unwrap_or(65_536) as usize;
                 if v.to_string().len() > cap {
+                    let carries = self.run_carries(run_id);
                     match self.artifacts.create(
                         &self.durable,
                         super::artifacts::NewArtifact {
@@ -3155,6 +3173,7 @@ impl Runtime {
                             created_by: Some("engine"),
                             sensitive: false,
                             owner: Some(run_id),
+                            carries: &carries,
                         },
                     ) {
                         Ok(meta) => {
@@ -3202,6 +3221,12 @@ impl Runtime {
         // now — a retry is an attempt of its own.
         let slog = self.step_log(run_id, step_id);
         slog.info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        // Outside text the step read — an http response, a peer's answer, an
+        // untrusted_input tool's result — taints its run before any step
+        // after it reads it (`runtime::taint`).
+        if matches!(status, StepStatus::Done | StepStatus::Failed) {
+            self.taint_step(run_id, &step.kind, &step.spec);
+        }
         self.end_step_span(
             run_id,
             step_id,
@@ -3459,7 +3484,7 @@ impl Runtime {
                     .and_then(|st| st.cache_key.clone())
                 && let Some(out) = &output
             {
-                self.cache_store(&key, out);
+                self.cache_store(run_id, step_id, &key, out);
             }
             self.runs
                 .get_mut(run_id)
@@ -3937,10 +3962,17 @@ impl Runtime {
                     args.get("run").and_then(Value::as_str),
                     args.get("name").and_then(Value::as_str),
                 ) {
+                    // One run in full, with what the taint engine knows of
+                    // it — why a step of it met a consent gate or a policy
+                    // fact (RFC 0044 §5.13).
                     (Some(id), _) => self
                         .runs
                         .get(id)
-                        .map(|r| vec![run_detail(r)])
+                        .map(|r| {
+                            let mut d = run_detail(r);
+                            d["taint"] = self.run_facts(id).to_value();
+                            vec![d]
+                        })
                         .unwrap_or_default(),
                     (None, Some(n)) => self
                         .runs
@@ -4145,6 +4177,7 @@ impl Runtime {
                             ts: now_ms(),
                             ttl_ms: None,
                             by: Some(caller.label_pub()),
+                            carries: Default::default(),
                         };
                         if let Err(e) = self.durable.put(
                             Kind::Memory,

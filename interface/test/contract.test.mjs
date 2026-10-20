@@ -130,6 +130,8 @@ const SEND = {
   [OPS.delegationApprove]: (c, e) => c.delegationApprove(e.gate, e.nonce, e.args_hash),
   [OPS.delegationDeny]: (c, e) => c.delegationDeny(e.gate, e.nonce),
   [OPS.delegationRevoke]: (c, e) => c.delegationRevoke(e.target),
+  [OPS.delegationForget]: (c, e) => c.delegationForget(e.principal),
+  [OPS.delegationAudit]: (c, e) => c.delegationAudit(e.principal, e.limit),
 };
 
 /**
@@ -183,6 +185,9 @@ const MORE = [
   { op: OPS.delegationApprove, gate: 'consent-1', nonce: 'n0nce', args_hash: 'ab12' },
   { op: OPS.delegationDeny, gate: 'consent-1', nonce: 'n0nce' },
   { op: OPS.delegationRevoke, target: 'operator:ada' },
+  { op: OPS.delegationForget, principal: 'operator:ada' },
+  { op: OPS.delegationAudit },
+  { op: OPS.delegationAudit, principal: 'operator:ada', limit: 10 },
 ];
 
 /** Replace fetch for one test: record each JSON-RPC body, answer `reply(body)` with the echo `echo`. */
@@ -335,6 +340,10 @@ test("a command's reply is read from where the extension puts it", () => {
     examplesOf(TASK_ANNOTATIONS_EXTENSION).some(([, ann]) => ann.askChannel !== undefined),
     'an example carries askChannel',
   );
+  assert.ok(
+    examplesOf(TASK_ANNOTATIONS_EXTENSION).some(([, ann]) => ann.securityGate === true),
+    'an example carries securityGate',
+  );
   for (const [f, ann] of examplesOf(TASK_ANNOTATIONS_EXTENSION)) {
     check(annotations, ann, f);
     const wire = {
@@ -355,6 +364,7 @@ test("a command's reply is read from where the extension puts it", () => {
     assert.equal(r.task.command, ann.command, f);
     assert.deepEqual(r.task.askSchema, ann.askSchema, f);
     assert.equal(r.task.askChannel, ann.askChannel, f);
+    assert.equal(r.task.securityGate, ann.securityGate, f);
     // An answer that did not activate the extension: what sits under the
     // key was not written under its contract, and is not read.
     const bare = commandReply({ task: wire }, { annotations: false });

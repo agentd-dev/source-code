@@ -491,6 +491,11 @@ impl Runtime {
         if security.as_object().is_some_and(|o| !o.is_empty()) {
             doc["security"] = security;
         }
+        // Its own workers run as this one's do (`sec::worker`). The child
+        // itself keeps this process's uid: it answers here as the operator.
+        if let Some((uid, gid)) = crate::sec::worker::get() {
+            doc["spawn"] = json!({"uid": uid, "gid": gid});
+        }
         // MCP Events bindings and grants are the parent operator's alone
         // (RFC 0045 §5.11.6): a child subscribing would make subscriptions
         // the model's to create by spawning children, and a mirror would

@@ -219,6 +219,46 @@ pub fn checks() -> Vec<Check> {
             "the EMA extension is declared in initialize's capabilities at 2025-11-25, and in every request's _meta client capabilities at 2026-07-28",
             both_dialects,
         ),
+        check(
+            "ema/taint-gates-the-delegated-write-and-the-egress",
+            "a run that read nothing makes its delegated sensitive write unasked; after a delegated read it is tainted and holds the person's data, so the same write asks under the tainted rule, saying why, and the run's own http POST asks under the egress rule: denied, neither is made",
+            p2b::taint_gates_write_and_egress,
+        ),
+        check(
+            "ema/trusted-output-holds-data-and-taints-nothing",
+            "with auth.trusted_output, a delegated read leaves the run holding the person's data and untainted: the sensitive write and the http POST after it go ahead unasked",
+            p2b::trusted_output_taints_nothing,
+        ),
+        check(
+            "ema/consent-is-the-persons-alone",
+            "a message on the task a consent gate holds is refused and decides nothing, and an operator who is not the person is refused the answer though it holds the gate's nonce and hash; both are recorded, the gate denies at its deadline, and the call is never made",
+            p2b::consent_is_the_persons_alone,
+        ),
+        check(
+            "ema/the-signer-signs-only-an-assertion",
+            "the reference signer denies a payload that is no client assertion, and the authorization server's assertion when its key signs for another audience: the call fails signer_unavailable and nothing reaches the authorization server",
+            p2b::signer_signs_only_assertions,
+        ),
+        check(
+            "ema/forgotten-content-unreadable-chain-verifies",
+            "what a consent gate showed is in the audit chain only sealed under the person's key and reads back whole; after --delegation-forget it is unreadable, and the chain still verifies at the next start",
+            p2b::forgotten_content_unreadable,
+        ),
+        check(
+            "ema/a-message-carries-what-its-sender-read",
+            "a run that read the person's data sends a message step, and an agent step's model message.send, into a new conversation: that conversation's delegated sensitive write asks under the tainted rule, while the same write from a conversation the person opened goes ahead unasked; denied, the carried writes are never made",
+            p2b::a_message_carries_what_its_sender_read,
+        ),
+        check(
+            "ema/a-cached-step-keeps-no-delegated-data",
+            "a run holding the person's delegated data keeps nothing in the step cache: the second run of a cached delegated read reads the server again, and each says its output was not kept",
+            p2b::a_cached_step_keeps_no_delegated_data,
+        ),
+        check(
+            "ema/forgetting-closes-the-persons-gates",
+            "under the external signer the person's key is opened off the loop when their gate opens, so an approval is sealed and reads back; --delegation-forget then denies the call waiting on their open gate at once, records it under the key it destroys, and every record of theirs is unreadable",
+            p2b::forgetting_closes_the_persons_gates,
+        ),
     ]
 }
 
@@ -357,6 +397,13 @@ struct Opts {
     /// The reference signer fails the request after the first `sign:idp`
     /// once `<dir>/outage` exists.
     signer_outage: bool,
+    /// The delegated servers' `tags`, when not every tool's `tags`.
+    tag_map: Option<&'static str>,
+    /// `auth.trusted_output` on the delegated servers.
+    trusted_output: bool,
+    /// The reference signer's `ras` key signs for this audience instead of
+    /// the authorization server's token endpoint.
+    ras_audience: Option<&'static str>,
     extra: String,
 }
 
@@ -376,6 +423,9 @@ impl Default for Opts {
             signer_uid: None,
             audit_chain: false,
             signer_outage: false,
+            tag_map: None,
+            trusted_output: false,
+            ras_audience: None,
             extra: String::new(),
         }
     }
@@ -452,10 +502,19 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
         Some(_) => "{method: private_key_jwt, kid: ras}".to_string(),
         None => format!("{{method: private_key_jwt, key: \"{{{{secret-file:{d}/ras.pem}}}}\"}}"),
     };
+    let tags = o
+        .tag_map
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{{\"*\": {}}}", o.tags));
+    let trusted = if o.trusted_output {
+        "        trusted_output: true\n"
+    } else {
+        ""
+    };
     let server = |name: &str, url: &str| {
         format!(
-            "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {{\"*\": {}}}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {ras_auth}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n",
-            o.tags, x.ras
+            "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {tags}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {ras_auth}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n{trusted}",
+            x.ras
         )
     };
     let mut servers = server("linear", &x.mcp);
@@ -498,6 +557,10 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
     if o.two_servers {
         workflows.push_str(&wf("who2", "linear2", "whoami", "{}"));
     }
+    // A delegated read, then a delegated write of what it read.
+    workflows.push_str(
+        "  - name: read-write\n    steps:\n      start: {kind: manual}\n      read: {kind: mcp.tool, depends_on: [start], server: linear, tool: whoami, args: {}}\n      call: {kind: mcp.tool, depends_on: [read], server: linear, tool: create_issue, args: {title: \"From agentd\"}}\n      done: {kind: finish, depends_on: [call]}\n",
+    );
     workflows.push_str("  - name: quick\n    steps:\n      start: {kind: manual}\n      done: {kind: finish, depends_on: [start]}\n");
     let observability = if o.audit_chain {
         format!("{{log_level: info, audit: {{chain: {{path: \"{d}/audit/audit.log\"}}}}}}")
@@ -533,12 +596,22 @@ impl Setup {
             let outage = o.signer_outage.then(
                 || json!({"file": tmp.path().join("outage"), "after": "sign:idp", "refuse": 1}),
             );
+            // Each signing key signs only for the authorization server it is
+            // registered at: the signer's own policy.
+            let ras_audience = o
+                .ras_audience
+                .map_or_else(|| format!("{}/token", xaa.ras), str::to_string);
+            let keys = json!({
+                "idp": {"alg": "ES256", "audiences": [format!("{}/token", xaa.idp)]},
+                "ras": {"alg": "ES256", "audiences": [ras_audience]},
+                "seal": {"use": "wrap"},
+            });
             let child = Command::new(h.agentd())
                 .args([
                     "--internal-mock-signer",
                     socket.to_str().expect("utf8"),
                     "--knobs",
-                    &json!({"record": record, "outage": outage}).to_string(),
+                    &json!({"keys": keys, "record": record, "outage": outage}).to_string(),
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1984,7 +2057,8 @@ fn egress_from_delegated_data(h: &Harness) -> Outcome {
     let no = s.cli(h, &["--delegation-deny", &gate]);
     let denied = tryo!(s.ended("leak", n, Duration::from_secs(30)));
     let o = Outcome::require(
-        asked["tool"] == "http" && asked["rule"] == "egress_holding_delegated_data",
+        asked["tool"] == "http"
+            && asked["rule"] == "egress_from_tainted_work_holding_delegated_data",
         format!("the gate is the http step's, under the egress rule: {doc}"),
     )
     .and(|| {
@@ -2699,3 +2773,5 @@ fn restored_vault_refused(h: &Harness) -> Outcome {
             )
         })
 }
+
+mod p2b;

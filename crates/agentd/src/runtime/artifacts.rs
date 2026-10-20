@@ -4,8 +4,12 @@
 //! as `{"$artifact": id}` so a big payload travels by reference rather than
 //! being copied into every message that mentions it. Content is stored inline
 //! (JSON or text) up to [`MAX_INLINE_BYTES`]; the record carries
-//! `{name, mime, size, sha256, content, created_by, sensitive}`.
+//! `{name, mime, size, sha256, content, created_by, sensitive}`, and what
+//! the work that made it carried — its taint and its delegated data, which
+//! every reader of the content takes on, as a memory entry's (RFC 0044
+//! §5.13).
 
+use crate::engine::run::Carries;
 use crate::state::{Durable, Kind, now_ms, ulid};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,6 +35,9 @@ pub struct Artifact {
     /// The A2A task / run this artifact belongs to (delivery target).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// What the work that made it carried ([`Carries::kept_by_holder`]).
+    #[serde(default, skip_serializing_if = "Carries::is_empty")]
+    pub carries: Carries,
 }
 
 impl Artifact {
@@ -47,6 +54,8 @@ pub struct NewArtifact<'a> {
     pub created_by: Option<&'a str>,
     pub sensitive: bool,
     pub owner: Option<&'a str>,
+    /// What the work that makes it carries.
+    pub carries: &'a Carries,
 }
 
 /// The artifact registry (in-memory index of the durable records).
@@ -81,6 +90,7 @@ impl Artifacts {
             created_by,
             sensitive,
             owner,
+            carries,
         } = spec;
         if name.trim().is_empty() {
             return Err("artifact.create: name must be non-empty".into());
@@ -113,6 +123,7 @@ impl Artifacts {
             sensitive,
             created: now_ms(),
             owner: owner.map(str::to_string),
+            carries: carries.kept_by_holder(false),
         };
         d.put(
             Kind::Artifact,
@@ -183,8 +194,18 @@ mod tests {
     use crate::store::memory::MemoryStore;
     use std::sync::Arc;
 
+    /// An artifact keeps what its maker carried, as a holder keeps it, across
+    /// a restore: its delegated data and every other origin as taint.
     #[test]
     fn create_get_list_delete_and_restore() {
+        let mut tainted = Carries::default();
+        tainted.add(
+            [
+                "delegated:linear".to_string(),
+                "the route of workflow \"hook\"".to_string(),
+            ],
+            || "why".into(),
+        );
         let d = Durable::new(
             Arc::new(MemoryStore::new()),
             "agentd",
@@ -203,6 +224,7 @@ mod tests {
                     created_by: Some("root"),
                     sensitive: false,
                     owner: Some("task-1"),
+                    carries: &tainted,
                 },
             )
             .unwrap();
@@ -219,6 +241,7 @@ mod tests {
                     created_by: None,
                     sensitive: true,
                     owner: None,
+                    carries: &Carries::default(),
                 },
             )
             .unwrap();
@@ -249,14 +272,24 @@ mod tests {
                     created_by: None,
                     sensitive: false,
                     owner: None,
+                    carries: &Carries::default(),
                 },
             )
             .is_err()
         );
+        assert_eq!(a.get(&id).unwrap().carries, tainted.kept_by_holder(false));
+        assert!(a.get_value(&id).unwrap().get("carries").is_none());
         // Restore.
         let mut b = Artifacts::new();
         assert_eq!(b.restore(d.restore().unwrap().of(Kind::Artifact)), 2);
-        assert!(b.get(&id).is_some());
+        let kept = &b.get(&id).unwrap().carries;
+        assert!(kept.holds_delegated_data() && kept.tainted(), "{kept:?}");
+        assert!(
+            b.get(m2["id"].as_str().unwrap())
+                .unwrap()
+                .carries
+                .is_empty()
+        );
         b.delete(&d, &id).unwrap();
         assert!(b.delete(&d, &id).is_err());
         assert_eq!(d.restore().unwrap().of(Kind::Artifact).len(), 1);

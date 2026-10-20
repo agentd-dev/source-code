@@ -161,6 +161,9 @@ pub fn spawn(
     // Its environment is the allow-list: the baseline, what its payload
     // names, the operator's passthrough — never a supervisor-only variable.
     let env = crate::sec::harden::confine(&mut cmd, &crate::sec::harden::wanted_by_spawn(payload));
+    // It runs as the worker uid, when one is configured (`sec::worker`) —
+    // dropped first, so it enters the Landlock domain as that uid.
+    let worker = crate::sec::worker::confine(&mut cmd);
     // And, where the configuration holds a supervisor-only key, it can open
     // neither the vault nor a key file (Landlock, `sec::landlock`).
     let confined = crate::sec::landlock::confine(&mut cmd)?;
@@ -207,7 +210,7 @@ pub fn spawn(
     let spawn = ControlMsg::Spawn(Box::new(payload.clone()));
     tap(node, "spawn", || {
         serde_json::json!({"payload": serde_json::to_value(&spawn).unwrap_or_default(), "env": env,
-                           "landlock": confined})
+                           "landlock": confined, "worker": worker})
     });
     frame::write_frame(&mut writer, &spawn)?;
 

@@ -266,6 +266,10 @@
             "file"
           ]
         },
+        "trusted_output": {
+          "description": "grant id_jag: nobody outside can write what this server answers, so its results mark the work as holding delegated data and do not taint it (default false: delegated SaaS content is attacker-writable)",
+          "type": "boolean"
+        },
         "value": {
           "description": "a secret — from a file it MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference; env/flag values may be inline",
           "type": "string"
@@ -4854,6 +4858,13 @@
               },
               "type": "object"
             },
+            "key_custody": {
+              "description": "who holds the seal key: agentd, from seal_key (local, the default), or the external signer (external, with signer and no seal_key), which wraps each record's data key and derives the record-id keys",
+              "enum": [
+                "local",
+                "external"
+              ]
+            },
             "limits": {
               "additionalProperties": false,
               "properties": {
@@ -4871,8 +4882,45 @@
               "type": "object"
             },
             "seal_key": {
-              "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http)",
+              "description": "32 random bytes as hex or base64, given as a secret reference: seals the Account Tokens a sign-in gives agentd, and the User ID records, so a store cannot read them. Required with a sign_in, and with a remote store (mcp, http), unless key_custody is external",
               "type": "string"
+            },
+            "signer": {
+              "additionalProperties": false,
+              "description": "the external signer that holds the seal key (key_custody external; docs/external-signer.md): agentd never holds the key-encryption key or the derivation key",
+              "properties": {
+                "derive_key": {
+                  "description": "the signer's HMAC-SHA256 key the record-id keys are derived under (the derive op)",
+                  "type": "string"
+                },
+                "seal_key": {
+                  "description": "the signer's key-encryption key each record's data key is wrapped under",
+                  "type": "string"
+                },
+                "socket": {
+                  "description": "the signer's unix socket, an absolute path",
+                  "type": "string"
+                },
+                "timeout": {
+                  "description": "the bound on one request, 1ms to 60s, a duration: `5s`, `500ms`, or bare seconds; default 5s",
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                },
+                "uid": {
+                  "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "socket",
+                "uid",
+                "seal_key",
+                "derive_key"
+              ],
+              "type": "object"
             },
             "standing": {
               "description": "standing permissions: an operation one of them covers is confirmed with approved_by standing_permission, without asking the User. Each covers one Company, one channel and every term key of the revision; never when the Company requires the User's approval. Needs client.extensions [operations] and the cel feature",
@@ -5046,6 +5094,10 @@
                     "description": "the call is made with an enrolled person's grant (RFC 0044)",
                     "type": "boolean"
                   },
+                  "holds_delegated_data": {
+                    "description": "a delegated server's result has reached the work making the call",
+                    "type": "boolean"
+                  },
                   "principal": {
                     "description": "principal-id glob, for calls carrying one",
                     "type": "string"
@@ -5062,7 +5114,7 @@
                     "type": "array"
                   },
                   "tainted": {
-                    "description": "the work holds outside input; until the taint engine, every unit that touched a delegated server",
+                    "description": "the work making the call has read outside text: an untrusted_input tool's result, a delegated server's (unless trusted_output), a webhook's or a non-operator's A2A message, a peer's answer, knowledge context, a served instruction, a tainted memory entry",
                     "type": "boolean"
                   },
                   "tool": {
@@ -5176,7 +5228,7 @@
     },
     "spawn": {
       "additionalProperties": false,
-      "description": "what every child process — turn worker, subagent, think child, instance — is started with beyond its allow-listed environment: the baseline (PATH, HOME, TMPDIR, TZ, LANG, AGENTD_CRED_DIR, RUST_LOG, NO_PROXY, XDG_*, LC_*, SSL_CERT_*, OTEL_*, *_PROXY), the variables its own secret references and routed aws credentials read. Operator-only, reloadable",
+      "description": "what every child process — turn worker, subagent, think child, instance — is started with: beyond its allow-listed environment, the baseline (PATH, HOME, TMPDIR, TZ, LANG, AGENTD_CRED_DIR, RUST_LOG, NO_PROXY, XDG_*, LC_*, SSL_CERT_*, OTEL_*, *_PROXY) and the variables its own secret references and routed aws credentials read, the passthrough (reloadable); and the uid and gid a worker runs as (restart-only). Operator-only",
       "properties": {
         "env_passthrough": {
           "description": "variables every child also gets, each a name or a PREFIX* pattern; one a supervisor-only secret is read from is refused",
@@ -5184,6 +5236,16 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "gid": {
+          "description": "the gid every worker runs as, with uid. Restart-only",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "uid": {
+          "description": "the uid every worker runs as instead of agentd's — turn workers, subagents, think children, an instance child's own workers, exec commands — with gid and no supplementary group; needs root, or CAP_SETUID and CAP_SETGID (instance-tier templates need root), and is refused at load where agentd cannot. Restart-only",
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "type": "object"

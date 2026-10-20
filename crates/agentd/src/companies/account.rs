@@ -18,7 +18,9 @@
 //! HMAC-SHA256 of `issuer|principal|label` under a key derived from the seal
 //! key, so a store that holds it can read neither the token nor which Company
 //! or account it is for. The record also keeps the `session_id` of the
-//! account's own Session. Which labels are held at a Company is one more
+//! account's own Session. The seal key and the keys the ids are derived
+//! under are agentd's, or the external signer's under `key_custody:
+//! external` ([`super::keys`]). Which labels are held at a Company is one more
 //! sealed record per (principal, issuer), under an id of its own key, and so
 //! is which labels held an account that was given up since — signed out of,
 //! lost to `invalid_grant` or taken by a reset — at most [`GONE_KEPT`], so a
@@ -41,12 +43,15 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::auth::seal::{SealKey, associated_data};
-use crate::b64;
+use super::keys::{KeyError, Keyring};
+use crate::auth::seal::associated_data;
 use crate::state::{Durable, Kind};
 
 /// The record version the associated data names.
 const VERSION: &str = "1";
+/// The labels the record-id keys are derived from.
+pub const ID_LABEL: &[u8] = b"agentd company-account record id";
+pub const INDEX_LABEL: &[u8] = b"agentd company-account index id";
 /// The label of an account a sign-in names none for.
 pub const DEFAULT_LABEL: &str = crate::config::settings::companies::DEFAULT_ACCOUNT;
 /// The most accounts the User holds at one Company.
@@ -109,12 +114,9 @@ impl Account {
 pub struct Accounts {
     durable: Arc<Durable>,
     client_id: String,
-    key: SealKey,
-    /// The key record ids are derived under.
-    ids: [u8; 32],
-    /// The key the ids of the records of which labels are held are derived
-    /// under.
-    index: [u8; 32],
+    /// The seal key, and the keys the ids of the records and of which
+    /// labels are held are derived under ([`ID_LABEL`], [`INDEX_LABEL`]).
+    key: Arc<Keyring>,
     /// Held while a record of which labels are held is read and written.
     lock: Mutex<()>,
 }
@@ -133,27 +135,19 @@ struct Held {
 }
 
 impl Accounts {
-    /// `seal` is `security.companies.seal_key`'s bytes.
-    pub fn new(durable: Arc<Durable>, client_id: &str, seal: [u8; 32]) -> Result<Accounts, String> {
-        Ok(Accounts {
+    /// `key` is the seal key.
+    pub fn new(durable: Arc<Durable>, client_id: &str, key: Arc<Keyring>) -> Accounts {
+        Accounts {
             durable,
             client_id: client_id.to_string(),
-            key: SealKey::new(&seal).map_err(|e| format!("security.companies.seal_key: {e}"))?,
-            ids: crate::sha::hmac_sha256(&seal, b"agentd company-account record id"),
-            index: crate::sha::hmac_sha256(&seal, b"agentd company-account index id"),
+            key,
             lock: Mutex::new(()),
-        })
+        }
     }
 
-    fn hex(key: &[u8; 32], text: &str) -> String {
-        crate::sha::hmac_sha256(key, text.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
-    fn id(&self, issuer: &str, principal: &str, label: &str) -> String {
-        Self::hex(&self.ids, &format!("{issuer}|{principal}|{label}"))
+    fn id(&self, issuer: &str, principal: &str, label: &str) -> Result<String, KeyError> {
+        self.key
+            .record_id(ID_LABEL, &format!("{issuer}|{principal}|{label}"))
     }
 
     fn ad(&self, issuer: &str, principal: &str, label: &str) -> Vec<u8> {
@@ -167,8 +161,9 @@ impl Accounts {
         ])
     }
 
-    fn index_id(&self, issuer: &str, principal: &str) -> String {
-        Self::hex(&self.index, &format!("{issuer}|{principal}"))
+    fn index_id(&self, issuer: &str, principal: &str) -> Result<String, KeyError> {
+        self.key
+            .record_id(INDEX_LABEL, &format!("{issuer}|{principal}"))
     }
 
     fn index_ad(&self, issuer: &str, principal: &str) -> Vec<u8> {
@@ -193,30 +188,29 @@ impl Accounts {
         else {
             return Ok(None);
         };
-        let bytes =
-            b64::url_decode(env.state["sealed"].as_str().unwrap_or_default()).unwrap_or_default();
         self.key
-            .open(ad, &bytes)
+            .open(ad, &env.state)
             .map(Some)
-            .map_err(|_| format!("{what} record does not open with security.companies.seal_key"))
+            .map_err(|e| match e {
+                KeyError::Unavailable(e) => e,
+                KeyError::Refused(_) => {
+                    format!("{what} record does not open with security.companies' seal key")
+                }
+            })
     }
 
     fn put(&self, id: &str, ad: &[u8], bytes: &[u8]) -> Result<(), String> {
-        let sealed = self.key.seal(ad, bytes)?;
+        let mut sealed = self.key.seal(ad, bytes)?;
+        sealed.insert("v".into(), json!(VERSION));
         self.durable
-            .put(
-                Kind::Cred,
-                id,
-                json!({"v": VERSION, "sealed": b64::url_nopad(&sealed)}),
-                None,
-            )
+            .put(Kind::Cred, id, serde_json::Value::Object(sealed), None)
             .map(|_| ())
             .map_err(|e| format!("company account tokens: {e}"))
     }
 
     fn read_held(&self, principal: &str, issuer: &str) -> Result<Held, String> {
         match self.open(
-            &self.index_id(issuer, principal),
+            &self.index_id(issuer, principal)?,
             &self.index_ad(issuer, principal),
             "a held-accounts",
         )? {
@@ -230,7 +224,7 @@ impl Accounts {
     fn write_held(&self, principal: &str, issuer: &str, held: &Held) -> Result<(), String> {
         let bytes = serde_json::to_vec(held).map_err(|e| e.to_string())?;
         self.put(
-            &self.index_id(issuer, principal),
+            &self.index_id(issuer, principal)?,
             &self.index_ad(issuer, principal),
             &bytes,
         )
@@ -264,7 +258,7 @@ impl Accounts {
         label: &str,
     ) -> Result<Option<Account>, String> {
         let Some(open) = self.open(
-            &self.id(issuer, principal, label),
+            &self.id(issuer, principal, label)?,
             &self.ad(issuer, principal, label),
             "an Account Token",
         )?
@@ -294,7 +288,7 @@ impl Accounts {
         }
         let bytes = serde_json::to_vec(account).map_err(|e| e.to_string())?;
         self.put(
-            &self.id(issuer, principal, label),
+            &self.id(issuer, principal, label)?,
             &self.ad(issuer, principal, label),
             &bytes,
         )?;
@@ -311,7 +305,7 @@ impl Accounts {
     pub fn forget(&self, principal: &str, issuer: &str, label: &str) -> Result<(), String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.durable
-            .delete(Kind::Cred, &self.id(issuer, principal, label))
+            .delete(Kind::Cred, &self.id(issuer, principal, label)?)
             .map_err(|e| format!("company account tokens: {e}"))?;
         let mut held = self.read_held(principal, issuer)?;
         if held.labels.iter().any(|l| l == label) {
@@ -350,7 +344,11 @@ mod tests {
             crate::state::Policy::default(),
             None,
         ));
-        Accounts::new(durable, "https://a.example/c.json", [seal; 32]).unwrap()
+        Accounts::new(
+            durable,
+            "https://a.example/c.json",
+            Arc::new(Keyring::local([seal; 32]).unwrap()),
+        )
     }
 
     fn account(token: &str) -> Account {
@@ -412,8 +410,8 @@ mod tests {
         assert_eq!(e, None, "another key derives other ids");
         // The record moved to another label's id does not open there.
         let (from, to) = (
-            a.id("https://as.one", "user:dana", "work-lbl"),
-            a.id("https://as.one", "user:dana", "default"),
+            a.id("https://as.one", "user:dana", "work-lbl").unwrap(),
+            a.id("https://as.one", "user:dana", "default").unwrap(),
         );
         let env = a.durable.get(Kind::Cred, &from).unwrap().unwrap();
         a.durable.put(Kind::Cred, &to, env.state, None).unwrap();

@@ -202,6 +202,20 @@ pub struct Spawn {
     /// `PREFIX*` pattern. A variable a supervisor-only secret is read from
     /// is never passed, and naming one is refused.
     pub env_passthrough: Vec<String>,
+    /// The uid every worker — turn worker, subagent, think child, an
+    /// instance child's own workers, an `exec` command — runs as, instead of
+    /// agentd's (`sec::worker`). With `gid`; needs root, or `CAP_SETUID` and
+    /// `CAP_SETGID`.
+    pub uid: Option<u32>,
+    /// The gid every worker runs as, with no supplementary group.
+    pub gid: Option<u32>,
+}
+
+impl Spawn {
+    /// The uid and gid every worker runs as, when both are set.
+    pub fn worker(&self) -> Option<(u32, u32)> {
+        self.uid.zip(self.gid)
+    }
 }
 
 /// Recipient-key material for encrypted instruction envelopes.
@@ -1184,6 +1198,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "mcp.servers[].auth.allow_unbound_at",
     "mcp.servers[].auth.attribution",
     "mcp.servers[].auth.max_at_age",
+    "mcp.servers[].auth.trusted_output",
     // Who may talk to THIS agent and as what, over which socket, with which
     // credential. Enumerated rather than taken as a section, because
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
@@ -2870,6 +2885,12 @@ pub struct Auth {
     /// `identity.delegation.at_cache_cap`.
     #[serde(default)]
     pub max_at_age: Option<Dur>,
+    /// The operator vouches that nobody outside can write what this
+    /// delegated server answers (RFC 0044 §5.13 item 5): its results still
+    /// mark the work as holding delegated data, and no longer taint it.
+    /// Default false — a Linear issue body is anyone's to write.
+    #[serde(default)]
+    pub trusted_output: Option<bool>,
 }
 
 impl Auth {
@@ -4382,9 +4403,12 @@ pub struct PolicyMatch {
     pub args: Option<String>,
     /// Whether the call is made with an enrolled person's grant (RFC 0044).
     pub delegated: Option<bool>,
-    /// Whether the work holds outside input. Until the taint engine, every
-    /// unit that has touched a delegated server is tainted.
+    /// Whether the work making the call has read outside text (RFC 0044
+    /// §5.13 item 5, `runtime::taint`).
     pub tainted: Option<bool>,
+    /// Whether a delegated server's result has reached the work making the
+    /// call.
+    pub holds_delegated_data: Option<bool>,
     /// At least one listed trifecta tag is on the tool.
     pub any_tags: Vec<String>,
 }
@@ -4724,16 +4748,18 @@ impl Settings {
 
     /// What no child may open (RFC 0044 P2a, `sec::landlock`), where the
     /// configuration holds a supervisor-only key — a delegation is declared,
-    /// or the companies preview's seal key is: the file store's root, where
-    /// the vault is; every `{{secret-file:…}}` a supervisor-only secret is
-    /// read from; and the audit chain with its closed segments. With no such
-    /// key, the audit chain alone, when it is set; else nothing.
+    /// or the companies preview's records are sealed, by a key agentd reads
+    /// or one an external signer holds: the file store's root, where the
+    /// vault and the sealed records are; every `{{secret-file:…}}` a
+    /// supervisor-only secret is read from; each external signer's socket;
+    /// and the audit chain with its closed segments. With no such key, the
+    /// audit chain alone, when it is set; else nothing.
     pub fn supervisor_only_paths(&self) -> Vec<crate::sec::landlock::Protected> {
         use crate::sec::landlock::Protected;
         let mut out = Vec::new();
         let keyed = !self.identity.providers.is_empty()
             || delegation::delegated_servers(self).next().is_some()
-            || self.security.companies.seal_key.is_some();
+            || self.security.companies.sealed();
         if keyed {
             if self.store.kind == StoreKind::File {
                 out.push(Protected {
@@ -4760,11 +4786,25 @@ impl Settings {
             // The external signer's socket: a child can still connect to
             // it (no Landlock right covers that), and can neither remove it
             // nor bind another in its place.
-            if let Some(sg) = self.identity.delegation.external() {
-                out.push(Protected {
-                    path: std::path::PathBuf::from(&sg.socket),
-                    with_suffixes: false,
-                });
+            let sockets = self
+                .identity
+                .delegation
+                .external()
+                .map(|sg| sg.socket.as_str())
+                .into_iter()
+                .chain(
+                    self.security
+                        .companies
+                        .external()
+                        .map(|sg| sg.socket.as_str()),
+                );
+            for socket in sockets {
+                if !out.iter().any(|p| p.path.as_os_str() == socket) {
+                    out.push(Protected {
+                        path: std::path::PathBuf::from(socket),
+                        with_suffixes: false,
+                    });
+                }
             }
         }
         if let Some(c) = &self.observability.audit.chain {
@@ -6042,6 +6082,12 @@ pub enum Ask {
     DelegationDeny(String),
     /// `--delegation-revoke <principal | idp:<name>#<sub>>`.
     DelegationRevoke(String),
+    /// `--delegation-forget <principal>`: erase a person — their grants
+    /// revoked, their personal key destroyed (RFC 0044 §6.4).
+    DelegationForget(String),
+    /// `--delegation-audit`: the caller's own consent records from the
+    /// audit chain, what each gate showed opened under their personal key.
+    DelegationAudit,
     /// `--delegation-lint`: the Resource connections each IdP must have,
     /// from the configuration alone. Dials nothing.
     DelegationLint,
@@ -6070,6 +6116,8 @@ fn ask_flag(flag: &str) -> Option<Ask> {
         "--delegation-approve" => Ask::DelegationApprove(String::new()),
         "--delegation-deny" => Ask::DelegationDeny(String::new()),
         "--delegation-revoke" => Ask::DelegationRevoke(String::new()),
+        "--delegation-forget" => Ask::DelegationForget(String::new()),
+        "--delegation-audit" => Ask::DelegationAudit,
         "--delegation-lint" => Ask::DelegationLint,
         _ => return None,
     })
@@ -6274,6 +6322,11 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                         usage("--delegation-revoke requires a principal or idp:<name>#<sub>".into())
                     })?)
                 }
+                Ask::DelegationForget(_) => Ask::DelegationForget(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| usage("--delegation-forget requires a principal".into()))?,
+                ),
                 other => other,
             };
             continue;
@@ -7811,6 +7864,35 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             );
         }
     }
+    // `spawn.uid` and `spawn.gid`: both or neither, and only where agentd
+    // can start a child as them — never a configuration it would not honour.
+    match (s.spawn.uid, s.spawn.gid) {
+        (Some(_), None) | (None, Some(_)) => err(
+            &mut d,
+            "spawn.uid and spawn.gid name the worker's uid and gid together: give both".into(),
+        ),
+        (Some(uid), Some(gid)) => {
+            let signers: Vec<u32> = s
+                .identity
+                .delegation
+                .external()
+                .map(|g| g.uid)
+                .into_iter()
+                .chain(s.security.companies.external().map(|g| g.uid))
+                .collect();
+            let instances = crate::config::templates::compile_templates(s)
+                .unwrap_or_default()
+                .values()
+                .any(|c| c.tier == crate::config::templates::Tier::Instance);
+            if let Some(why) = crate::sec::worker::refusal_here(uid, gid, &signers, instances) {
+                err(
+                    &mut d,
+                    format!("spawn.uid {uid}: workers cannot run as {uid}:{gid} — {why}"),
+                );
+            }
+        }
+        (None, None) => {}
+    }
     if let Some(c) = &s.observability.audit.chain {
         if !std::path::Path::new(&c.path).is_absolute() {
             err(
@@ -8236,7 +8318,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(&mut d, format!("{at}: match.args: {e}"));
             }
         }
-        for t in &p.matcher.tags {
+        for t in p.matcher.tags.iter().chain(&p.matcher.any_tags) {
             if !["untrusted_input", "sensitive", "egress"].contains(&t.as_str()) {
                 err(
                     &mut d,
@@ -10462,6 +10544,11 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // Restart-only INSIDE the reloadable `observability.audit`.
     "observability.audit.chain",
     "security",
+    // The uid and gid every worker runs as (RFC 0044 P2b): which process
+    // identity a child has is decided once, at start, beside the Landlock
+    // domain it enters.
+    "spawn.gid",
+    "spawn.uid",
     // The IdPs a grant is held at and the key it is sealed with (RFC 0044):
     // a grant sealed under one key, or bound to one issuer, is never moved
     // under another by a reload. Templates are restart-only in P1 too, so a
@@ -13956,6 +14043,42 @@ mod tests {
         };
         assert!(warned("memory") && warned("none"));
         assert!(!warned("file"));
+    }
+
+    /// The worker uid is given whole and is never one that would not
+    /// separate a worker: not root, not agentd's own uid; and where agentd
+    /// cannot drop to it the load says why. Each rule holds as any uid.
+    #[test]
+    fn a_worker_uid_is_held_to_its_rules() {
+        // SAFETY: geteuid has no failure mode.
+        let me = unsafe { libc::geteuid() };
+        let own = format!("spawn: {{uid: {me}, gid: 65534}}\n");
+        let own_says = if me == 0 {
+            "never run as root"
+        } else {
+            "agentd's own uid"
+        };
+        for (yaml, says) in [
+            ("spawn: {uid: 65534}\n", "give both"),
+            ("spawn: {gid: 65534}\n", "give both"),
+            ("spawn: {uid: 0, gid: 65534}\n", "never run as root"),
+            ("spawn: {uid: 65534, gid: 0}\n", "never run as root"),
+            (own.as_str(), own_says),
+        ] {
+            let e = load_errors(yaml);
+            assert!(e.contains(says), "{yaml}: want {says:?} in {e}");
+        }
+        // Another uid: root drops to it; any other uid is told why it cannot
+        // (unless it holds both capabilities).
+        let other = load_errors("spawn: {uid: 65534, gid: 65534}\n");
+        if me == 0 {
+            assert_eq!(other, "", "root drops to any other uid");
+        } else if !other.is_empty() {
+            assert!(
+                other.contains("without CAP_SETUID and CAP_SETGID"),
+                "{other}"
+            );
+        }
     }
 
     /// A passthrough that names the companies preview's seal key variable —

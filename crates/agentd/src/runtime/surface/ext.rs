@@ -390,6 +390,10 @@ pub fn task_annotations_bundle() -> Value {
                 "description": "where an INPUT_REQUIRED gate is also announced: the channel of the instruction document's human it is addressed to",
                 "type": "string",
             },
+            "securityGate": {
+                "description": "the INPUT_REQUIRED gate is one agentd raised itself — a security.policies ask, a Company's gate — never a model's ask_human or a workflow's human step; a client shows it with a badge no question text can earn",
+                "const": true,
+            },
             "command": {"description": "the command op that started the task", "type": "string"},
             "traceId": {
                 "description": "the W3C trace id of the task's work, 32 lowercase hex digits",
@@ -1251,6 +1255,7 @@ mod tests {
         );
         full.ask_schema = Some(json!({"type": "object"}));
         full.ask_channel = Some("@channel/ops".into());
+        full.security_gate = true;
         full.command = Some("workflow.run".into());
         full.transition(State::Working, None);
         full.transition(State::InputRequired, Some("which one?".into()));

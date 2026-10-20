@@ -95,9 +95,12 @@ fn dispatch() -> i32 {
     }
 
     // Hidden reference external signer (tests, and operators writing their
-    // own; RFC 0044 P2a): the signer protocol on the unix socket named,
-    // with keys made at start.
-    #[cfg(all(feature = "xaa", any(feature = "internal-mocks", debug_assertions)))]
+    // own; RFC 0044 P2a, and the companies preview's seal key since P2b):
+    // the signer protocol on the unix socket named, with keys made at start.
+    #[cfg(all(
+        any(feature = "xaa", feature = "companies"),
+        any(feature = "internal-mocks", debug_assertions)
+    ))]
     if argv.get(1).map(String::as_str) == Some("--internal-mock-signer") {
         let Some(socket) = argv.get(2) else {
             eprintln!("--internal-mock-signer <socket> [--knobs <json>]");
@@ -496,6 +499,10 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
         Ask::DelegationRevoke(target) => {
             delegation_cli(&loaded.settings, Delegating::Revoke(target))
         }
+        Ask::DelegationForget(target) => {
+            delegation_cli(&loaded.settings, Delegating::Forget(target))
+        }
+        Ask::DelegationAudit => delegation_cli(&loaded.settings, Delegating::Audit),
         Ask::DelegationLint => {
             #[cfg(feature = "xaa")]
             {
@@ -599,11 +606,14 @@ enum Delegating {
     List,
     Answer(String, bool),
     Revoke(String),
+    Forget(String),
+    Audit,
 }
 
 /// `--login idp:<name>`, `--delegation-list`, `--delegation-approve`,
-/// `--delegation-deny` and `--delegation-revoke`: thin clients of the running
-/// daemon over its unix A2A listener.
+/// `--delegation-deny`, `--delegation-revoke`, `--delegation-forget` and
+/// `--delegation-audit`: thin clients of the running daemon over its unix
+/// A2A listener.
 fn delegation_cli(settings: &agentd::config::settings::Settings, ask: Delegating) -> i32 {
     #[cfg(all(feature = "xaa", feature = "a2a"))]
     {
@@ -620,6 +630,8 @@ fn delegation_cli(settings: &agentd::config::settings::Settings, ask: Delegating
                 cli::answer(settings, gate, *approve, out),
             ),
             Delegating::Revoke(target) => (target.clone(), cli::revoke(settings, target, out)),
+            Delegating::Forget(target) => (target.clone(), cli::forget(settings, target, out)),
+            Delegating::Audit => ("--delegation-audit".to_string(), cli::audit(settings, out)),
         };
         match done {
             Ok(_) => exit::SUCCESS,

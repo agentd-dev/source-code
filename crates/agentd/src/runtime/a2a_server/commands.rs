@@ -374,12 +374,13 @@ impl Runtime {
                     operator: principal.is_operator(),
                 };
                 // A peer agent's payload is its text, and the runs it wakes
-                // or starts carry it (`withhold`).
-                let carries = if principal.role == crate::config::settings::Role::Agent {
-                    crate::runtime::withhold::peer_carries(&principal.id, "signalled")
-                } else {
-                    Default::default()
-                };
+                // or starts carry it (`withhold`); any other caller's but an
+                // operator's taints them (RFC 0044 §5.13).
+                let carries = crate::runtime::withhold::principal_carries(
+                    &principal.id,
+                    Some(principal.role),
+                    "signalled",
+                );
                 // A run the signal starts continues the caller's trace; a run
                 // it wakes keeps its own and records the caller's as a link.
                 let trace = self.a2a_upstream(message);
@@ -462,15 +463,18 @@ impl Runtime {
             "conversation": ctx,
         });
         // A peer agent's request is another agent's output, as an `a2a`
-        // start's is: the run carries it (`withhold`). Decided here, where
+        // start's is: the run carries it (`withhold`); any other caller's
+        // but an operator's taints it (RFC 0044 §5.13). Decided here, where
         // the principal's role is known, and recorded with the start — not
         // looked up when the result is read, after a restart or a reload
         // may have forgotten who asked.
-        if principal.role == crate::config::settings::Role::Agent {
-            payload["carries"] = json!(crate::runtime::withhold::peer_carries(
-                &principal.id,
-                "started"
-            ));
+        let carries = crate::runtime::withhold::principal_carries(
+            &principal.id,
+            Some(principal.role),
+            "started",
+        );
+        if !carries.is_empty() {
+            payload["carries"] = json!(carries);
         }
         // The run is the request's unit of work: it continues the caller's
         // trace, and its task is done in the run's span.

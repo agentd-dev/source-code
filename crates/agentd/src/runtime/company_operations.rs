@@ -208,10 +208,9 @@ impl Runtime {
                 crate::obs::metrics::record_company_request(slot.company(), "operations", outcome);
                 let read = res.as_ref().map_or_else(|e| e.read_the_company(), |_| true);
                 if read && let (Some(into), Some(issuer)) = (reads, slot.issuer()) {
-                    let _ = tx.send(super::events::Event::CompanyRead {
+                    let _ = tx.send(super::events::Event::Read {
                         into,
-                        origin: crate::companies::carry::origin(&issuer),
-                        why: crate::companies::carry::why(slot.company()),
+                        carries: crate::companies::carry::read(&issuer, slot.company()),
                     });
                 }
                 drop(slot);
@@ -503,6 +502,7 @@ impl Runtime {
             if let Some(rec) = self.tasks.get_mut(&task) {
                 rec.company_gate = None;
                 rec.ask_schema = None;
+                rec.security_gate = false;
                 if !rec.state.is_terminal() {
                     rec.transition(State::Failed, Some(said.clone()));
                 }
@@ -611,6 +611,7 @@ impl Runtime {
         }
         if let Some(t) = self.tasks.get_mut(&task) {
             t.ask_schema = Some(operation_answer_schema());
+            t.security_gate = true;
             t.ask_channel = None;
             t.company_gate = Some(CompanyGate {
                 company: company.clone(),
@@ -697,6 +698,7 @@ impl Runtime {
         if let Some(rec) = self.tasks.get_mut(old) {
             rec.company_gate = None;
             rec.ask_schema = None;
+            rec.security_gate = false;
             if !rec.state.is_terminal() {
                 rec.transition(
                     if standalone {
@@ -943,6 +945,7 @@ impl Runtime {
             if let Some(task_rec) = self.tasks.get_mut(&task) {
                 task_rec.company_gate = None;
                 task_rec.ask_schema = None;
+                task_rec.security_gate = false;
                 if task_rec.state.is_terminal() {
                     // Its work ended first.
                 } else if standalone && let Some(r) = ended {
@@ -999,11 +1002,7 @@ impl Runtime {
         if let (Some(into), Some(sup)) = (t.reads.clone(), self.companies.clone())
             && let Some(issuer) = sup.company(&t.company).and_then(|c| c.issuer())
         {
-            self.company_read(
-                into,
-                crate::companies::carry::origin(&issuer),
-                crate::companies::carry::why(&t.company),
-            );
+            self.read_into(into, &crate::companies::carry::read(&issuer, &t.company));
         }
         let outcome = match &result {
             Ok(_) => "ok",
@@ -1204,6 +1203,7 @@ impl Runtime {
             if let Some(t) = self.tasks.get_mut(&task) {
                 t.company_gate = None;
                 t.ask_schema = None;
+                t.security_gate = false;
                 t.transition(
                     if standalone {
                         State::Failed

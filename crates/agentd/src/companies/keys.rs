@@ -110,6 +110,17 @@ impl Keyring {
         })
     }
 
+    /// Where an operator sets the key, for a message that tells them to
+    /// restore it: the local key's setting, or the signer's key id.
+    pub fn setting(&self) -> String {
+        match self {
+            Keyring::Local { .. } => "security.companies.seal_key".into(),
+            Keyring::External { seal_key, .. } => {
+                format!("the signer's key {seal_key:?} (security.companies.signer.seal_key)")
+            }
+        }
+    }
+
     /// The signer that holds `seal_key` and `derive_key`.
     pub fn external(signer: Signer, seal_key: &str, derive_key: &str) -> Keyring {
         Keyring::External {

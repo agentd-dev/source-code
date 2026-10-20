@@ -132,7 +132,7 @@ impl UserIds {
         match check {
             Some(env) => key.open(&ad, &env.state).map(|_| ()).map_err(|e| match e {
                 KeyError::Unavailable(_) => e,
-                KeyError::Refused(_) => KeyError::Refused("security.companies' seal key opens none of the sealed User ID records: restore the key, or the custody, the store was sealed with (a new key would make a new User at every Company)".to_string()),
+                KeyError::Refused(_) => KeyError::Refused(format!("{} opens none of the sealed User ID records: restore the key, or the custody, the store was sealed with (a new key would make a new User at every Company)", key.setting())),
             }),
             _ => {
                 let sealed = key.seal(&ad, b"ok")?;

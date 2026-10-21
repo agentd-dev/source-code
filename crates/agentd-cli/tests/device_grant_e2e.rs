@@ -584,11 +584,17 @@ fn ownership_survives_re_login() {
     let (first, first_sid) = session(&addr, "alice");
     let run = command_as(&addr, &first, "workflow.run", json!({"workflow": "waiter"}));
     assert!(run.get("error").is_none(), "{run}");
-    let runs = command_as(&addr, &first, "workflow.status", json!({}));
-    let run_id = answer(&runs)["runs"][0]["run"]
-        .as_str()
-        .unwrap_or_else(|| panic!("alice's run: {runs}"))
-        .to_string();
+    // workflow.run answers once the start is accepted; the run itself
+    // begins on the loop's next pass.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let run_id = loop {
+        let runs = command_as(&addr, &first, "workflow.status", json!({}));
+        if let Some(id) = answer(&runs)["runs"][0]["run"].as_str() {
+            break id.to_string();
+        }
+        assert!(std::time::Instant::now() < deadline, "alice's run: {runs}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let said = SendMessage::text("hello").bearer(&first).result(&addr);
     let ctx = said["task"]["contextId"].as_str().unwrap().to_string();
     assert_eq!(revoke(&addr, json!({"sid": first_sid})), 1);

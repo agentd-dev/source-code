@@ -4374,13 +4374,18 @@ fn at_path(f: &Fake, path: &str) -> Vec<Value> {
         .collect()
 }
 
-/// What reached the fake since its `from`th request, but the reads
-/// `reader` says are a conversation reader's, which go on beside a test.
+/// What reached the fake since its `from`th request, but a conversation
+/// reader's reads, which go on beside a test: its streams, and the reads
+/// `reader` names.
 fn sent_since(f: &Fake, from: usize, reader: impl Fn(&Value) -> bool) -> Vec<Value> {
     f.record()
         .into_iter()
         .skip(from)
-        .filter(|r| !(r["method"] == "GET" && path_of(r).ends_with("/events") && reader(r)))
+        .filter(|r| {
+            !(r["method"] == "GET"
+                && path_of(r).ends_with("/events")
+                && (r["stream"] == true || reader(r)))
+        })
         .collect()
 }
 

@@ -376,10 +376,12 @@ impl Runtime {
                 };
                 // A peer agent's payload is its text, and the runs it wakes
                 // or starts carry it (`withhold`); any other caller's but an
-                // operator's taints them (RFC 0044 §5.13).
+                // operator's taints them (RFC 0044 §5.13), as theirs when
+                // their session proves them the holder of their grant.
                 let carries = crate::runtime::withhold::principal_carries(
                     &principal.id,
                     Some(principal.role),
+                    self.message_is_own(&principal.id, principal.session.as_deref()),
                     "signalled",
                 );
                 // A run the signal starts continues the caller's trace; a run
@@ -468,10 +470,12 @@ impl Runtime {
         // but an operator's taints it (RFC 0044 §5.13). Decided here, where
         // the principal's role is known, and recorded with the start — not
         // looked up when the result is read, after a restart or a reload
-        // may have forgotten who asked.
+        // may have forgotten who asked. A person's start through a session
+        // that proves them the holder of their grant is theirs.
         let carries = crate::runtime::withhold::principal_carries(
             &principal.id,
             Some(principal.role),
+            self.message_is_own(&principal.id, principal.session.as_deref()),
             "started",
         );
         if !carries.is_empty() {

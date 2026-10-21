@@ -398,12 +398,19 @@ impl Runtime {
             // already rewrite the config, the store or the definition; what
             // actually matters is that the record names who really answered,
             // so an override is marked as one and audited as one.
+            // A Company gate is the User's alone, and a delegated server's
+            // question the grant's person's (RFC 0044 T24): no operator
+            // answers either for them.
             let (addressee, users_own) = match &self.pending[i].kind {
                 PendingKind::Human {
                     addressee, policy, ..
                 } => (
                     addressee.clone(),
-                    policy.as_ref().is_some_and(|c| c.company.is_some()),
+                    policy.as_ref().is_some_and(|c| c.company.is_some())
+                        || matches!(
+                            self.pending[i].target,
+                            crate::runtime::reactor::Target::Elicit(_)
+                        ),
                 ),
                 _ => (None, false),
             };
@@ -451,6 +458,21 @@ impl Runtime {
                     "human.answer.override",
                     json!({"task": tid, "by": principal.id, "sid": principal.session,
                            "addressee": a.describe(), "link": linked}),
+                );
+            }
+            // A delegated server's question is answered as its person would
+            // answer their consent gate, and only through a session that
+            // holds the grant it was asked through: an answer acts as them
+            // at the server (RFC 0044 T24).
+            #[cfg(feature = "xaa")]
+            if let crate::runtime::reactor::Target::Elicit(eid) = &self.pending[i].target
+                && let Err((why, said)) = self.elicit_answerer(eid, principal)
+            {
+                let eid = eid.clone();
+                self.elicitation_refused(&eid, &principal.id, why);
+                return err_obj(
+                    ::mcp::rpc::INVALID_PARAMS,
+                    &format!("{said}; your answer was not recorded and the gate is still open"),
                 );
             }
             // The answer enters the gate task's history before the gate

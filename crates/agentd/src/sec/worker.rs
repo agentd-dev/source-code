@@ -307,9 +307,236 @@ mod caps {
     }
 }
 
+/// Who makes a supervisor-only path, as [`unopenable`] judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// The operator: it is judged as it is, and must exist (a key file,
+    /// the external signer's socket).
+    Operator,
+    /// agentd, owner-only, when it is absent (the audit chain, `0600` in a
+    /// `0700` directory).
+    WhenAbsent,
+    /// agentd, which restricts it to its owner at every start (the file
+    /// store's root, `0700`) — where it can: one agentd's own uid does not
+    /// own is judged as it is, since that restriction may fail unsaid.
+    Restricted,
+}
+
+/// What a process of `uid`:`gid`, in no other group, may do to an entry of
+/// mode `mode` owned by `owner`:`group`: read, write, and search or run.
+pub fn access(mode: u32, owner: u32, group: u32, uid: u32, gid: u32) -> (bool, bool, bool) {
+    let bits = if owner == uid {
+        (mode >> 6) & 7
+    } else if group == gid {
+        (mode >> 3) & 7
+    } else {
+        mode & 7
+    };
+    (bits & 4 != 0, bits & 2 != 0, bits & 1 != 0)
+}
+
+/// Whether `path` carries a POSIX access ACL, which a mode does not say.
+#[cfg(target_os = "linux")]
+fn has_acl(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: a NUL-terminated path and attribute name, and no buffer: the
+    // size alone is asked.
+    let n = unsafe {
+        libc::getxattr(
+            p.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    n >= 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_acl(_: &std::path::Path) -> bool {
+    false
+}
+
+/// Why a process of `uid`:`gid` — a worker, in no supplementary group —
+/// could open supervisor-only `path`, judged by the mode and ownership of
+/// it and of every directory above it (the user's decision of 2026-10-20,
+/// RFC 0044 T4); `Ok` when it could not. A directory above that the uid
+/// cannot search closes everything below; one it could write, and so empty
+/// and refill, without the sticky bit, opens it; anything the uid owns, or
+/// that carries a POSIX ACL, it is not judged safe — an owner may change a
+/// mode, and an ACL is not read. A directory is open when the uid may
+/// search it, a socket when it may write it, anything else when it may read
+/// or write it. `made` says who makes it.
+pub fn unopenable(path: &std::path::Path, uid: u32, gid: u32, made: Made) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut nearest = path.to_path_buf();
+    while std::fs::symlink_metadata(&nearest).is_err() {
+        if !nearest.pop() {
+            return Err(format!("{} names nothing on this host", path.display()));
+        }
+    }
+    let exists = nearest.as_path() == path;
+    if !exists && made == Made::Operator {
+        return Err(format!(
+            "{} does not exist, so its mode cannot be judged",
+            path.display()
+        ));
+    }
+    let real = nearest
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", nearest.display()))?;
+    let mut dirs: Vec<&std::path::Path> = real.ancestors().collect();
+    dirs.reverse();
+    for (i, d) in dirs.iter().enumerate() {
+        let m = std::fs::metadata(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        if m.uid() == uid {
+            return Err(format!(
+                "{} is owned by the worker uid {uid}, which may change its mode",
+                d.display()
+            ));
+        }
+        if has_acl(d) {
+            return Err(format!(
+                "{} carries a POSIX ACL, which this check does not read",
+                d.display()
+            ));
+        }
+        // SAFETY: geteuid has no failure mode.
+        let restricted = made == Made::Restricted && m.uid() == unsafe { libc::geteuid() };
+        let mode = match (exists && i + 1 == dirs.len(), restricted) {
+            (true, true) => m.mode() & 0o700,
+            _ => m.mode(),
+        };
+        let (r, w, x) = access(mode, m.uid(), m.gid(), uid, gid);
+        if exists && i + 1 == dirs.len() {
+            let t = m.file_type();
+            let open = if t.is_dir() {
+                x.then_some("enter")
+            } else if t.is_socket() {
+                w.then_some("connect to")
+            } else {
+                (r || w).then_some("read or write")
+            };
+            return match open {
+                Some(how) => Err(format!(
+                    "the worker uid {uid} can {how} {} (mode {:o})",
+                    d.display(),
+                    m.mode() & 0o7777
+                )),
+                None => Ok(()),
+            };
+        }
+        if w && m.mode() & 0o1000 == 0 {
+            return Err(format!(
+                "the worker uid {uid} can write {}, and so replace what is in it",
+                d.display()
+            ));
+        }
+        if !x {
+            return Ok(());
+        }
+    }
+    // Absent, beneath directories the uid can search: agentd makes it,
+    // owner-only.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a uid may do follows the owner bits for its owner, the group
+    /// bits for its group alone, and the other bits for anyone else.
+    #[test]
+    fn access_follows_the_bits_that_apply() {
+        assert_eq!(access(0o740, 10, 20, 10, 99), (true, true, true));
+        assert_eq!(access(0o640, 10, 20, 10, 99), (true, true, false));
+        assert_eq!(access(0o740, 10, 20, 11, 20), (true, false, false));
+        assert_eq!(access(0o741, 10, 20, 11, 21), (false, false, true));
+        assert_eq!(access(0o700, 10, 20, 11, 21), (false, false, false));
+    }
+
+    /// A supervisor-only path is closed to the worker uid by a directory
+    /// above it the uid cannot search, or by its own mode; open where the
+    /// uid can read it, enter it, or write a directory above it; a path the
+    /// operator makes must exist, one agentd makes need not; a store root
+    /// is judged owner-only, as agentd makes it at every start, where its
+    /// own uid owns it, and as it is where not.
+    #[test]
+    fn a_path_is_closed_to_the_worker_uid_by_its_mode_and_its_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &std::path::Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let base = std::env::temp_dir().join(format!(
+            "agentd-unopenable-{}-{}",
+            std::process::id(),
+            crate::state::now_ms()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        set(&base, 0o755);
+        // SAFETY: getuid has no failure mode.
+        let me = unsafe { libc::getuid() };
+        // Never the uid running the test, nor root.
+        let (uid, gid) = if me == 65534 {
+            (65533, 65533)
+        } else {
+            (65534, 65534)
+        };
+        let key = base.join("key.pem");
+        std::fs::write(&key, "k").unwrap();
+        set(&key, 0o644);
+        let err = unopenable(&key, uid, gid, Made::Operator).unwrap_err();
+        assert!(err.contains("can read or write"), "{err}");
+        set(&key, 0o600);
+        assert_eq!(unopenable(&key, uid, gid, Made::Operator), Ok(()));
+        // A closed directory above closes what is beneath it.
+        let closed = base.join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        let inside = closed.join("seal");
+        std::fs::write(&inside, "s").unwrap();
+        set(&inside, 0o644);
+        set(&closed, 0o700);
+        assert_eq!(unopenable(&inside, uid, gid, Made::Operator), Ok(()));
+        // A directory the uid can write lets it swap what is in it.
+        set(&closed, 0o777);
+        let err = unopenable(&inside, uid, gid, Made::Operator).unwrap_err();
+        assert!(err.contains("and so replace"), "{err}");
+        set(&closed, 0o711);
+        let err = unopenable(&closed, uid, gid, Made::Operator).unwrap_err();
+        assert!(err.contains("can enter"), "{err}");
+        // agentd makes the store root owner-only at every start…
+        assert_eq!(unopenable(&closed, uid, gid, Made::Restricted), Ok(()));
+        // …where it can: a root its own uid does not own is judged as it
+        // is, for the restriction could fail unsaid.
+        if me == 0 {
+            let other = if uid == 65533 { 65532 } else { 65533 };
+            std::os::unix::fs::chown(&closed, Some(other), Some(other)).unwrap();
+            let err = unopenable(&closed, uid, gid, Made::Restricted).unwrap_err();
+            assert!(err.contains("can enter"), "{err}");
+            std::os::unix::fs::chown(&closed, Some(0), Some(0)).unwrap();
+        } else {
+            use std::os::unix::fs::MetadataExt;
+            let root = std::path::Path::new("/");
+            if std::fs::metadata(root).unwrap().mode() & 0o001 != 0 {
+                let err = unopenable(root, uid, gid, Made::Restricted).unwrap_err();
+                assert!(err.contains("can enter"), "{err}");
+            }
+        }
+        // Absent: the operator's must exist; agentd's is made owner-only.
+        let absent = base.join("absent").join("audit.log");
+        let err = unopenable(&absent, uid, gid, Made::Operator).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert_eq!(unopenable(&absent, uid, gid, Made::WhenAbsent), Ok(()));
+        // Anything the worker uid owns is not judged safe.
+        let err = unopenable(&key, me, me, Made::Operator).unwrap_err();
+        assert!(err.contains("owned by the worker uid"), "{err}");
+        set(&closed, 0o700);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// An instance child's own uid is never root's, agentd's own, a
     /// signer's or the workers', and needs agentd to run as root to make the

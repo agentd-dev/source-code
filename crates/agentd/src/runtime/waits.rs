@@ -202,10 +202,12 @@ impl Runtime {
                 let payload = spec.get("payload").cloned().unwrap_or(Value::Null);
                 let target_run = spec.get("run").and_then(Value::as_str).map(str::to_string);
                 // A workflow's own step signals as the runtime: the operator
-                // wrote it, whoever the run happens to be working for.
+                // wrote it, whoever the run happens to be working for — and
+                // in a run a model asked for, with the model's payload.
                 let carries = self.run_carries(run_id);
                 let trace = self.step_trace(run_id, step_id);
-                let delivered = self.deliver_signal(
+                let by_model = self.runs.get(run_id).is_some_and(|r| r.by_model);
+                let delivered = self.deliver_signal_from(
                     &name,
                     payload,
                     target_run.as_deref(),
@@ -213,6 +215,8 @@ impl Runtime {
                     &SignalSender::Runtime,
                     &carries,
                     trace.as_ref(),
+                    None,
+                    by_model,
                 );
                 self.finish_step_pub(
                     run_id,
@@ -1227,7 +1231,7 @@ impl Runtime {
         conversation: &str,
         wire: &str,
         message: &Value,
-        principal: Option<&str>,
+        (principal, session): (Option<&str>, Option<&str>),
         carried: &super::withhold::Carries,
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> Vec<String> {
@@ -1252,9 +1256,16 @@ impl Runtime {
         }
         // A peer agent's message is another agent's output: the run it wakes
         // carries it (`withhold`), decided now, while who sent it is known;
-        // any other sender's but an operator's taints it (RFC 0044 §5.13).
+        // any other sender's but an operator's taints it (RFC 0044 §5.13),
+        // recorded as theirs when the session it came through proves them
+        // the holder of their grant.
         let mut carries = match &sender {
-            Some(p) => super::withhold::principal_carries(&p.id, Some(p.role), "handed a message"),
+            Some(p) => super::withhold::principal_carries(
+                &p.id,
+                Some(p.role),
+                self.message_is_own(&p.id, session),
+                "handed a message",
+            ),
             None => super::withhold::Carries::default(),
         };
         carries.union(carried);
@@ -1313,6 +1324,7 @@ impl Runtime {
     /// a run it wakes keeps its own trace and records it as a `link` on its
     /// `signal.delivered` line — the waiting run was not caused by the sender,
     /// only resumed by it.
+    #[cfg(feature = "a2a")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver_signal(
         &mut self,
@@ -1325,12 +1337,14 @@ impl Runtime {
         trace: Option<&crate::obs::trace::TraceContext>,
     ) -> u64 {
         self.deliver_signal_from(
-            name, payload, target_run, from_run, sender, carries, trace, None,
+            name, payload, target_run, from_run, sender, carries, trace, None, false,
         )
     }
 
     /// [`Runtime::deliver_signal`], for a signal a subagent's work sent: a
-    /// run it starts records `subagent` (RFC 0044 P1).
+    /// run it starts records `subagent` (RFC 0044 P1); and for one a model
+    /// asked for (`by_model`): a run it starts or wakes records that, for
+    /// its payload is the model's (§5.12 I).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn deliver_signal_from(
         &mut self,
@@ -1342,6 +1356,7 @@ impl Runtime {
         carries: &super::withhold::Carries,
         trace: Option<&crate::obs::trace::TraceContext>,
         subagent: Option<&str>,
+        by_model: bool,
     ) -> u64 {
         let mut delivered = 0u64;
         let mut hits: Vec<(String, String)> = Vec::new();
@@ -1373,8 +1388,12 @@ impl Runtime {
                 );
             }
             // The payload is the sender's text: the run carries what the
-            // sender did (`withhold`).
+            // sender did (`withhold`), and a model's is the model's.
             self.hand_run(&rid, carries);
+            if by_model && let Some(r) = self.runs.get_mut(&rid) {
+                r.by_model = true;
+                r.dirty = true;
+            }
             self.finish_step_pub(
                 &rid,
                 &sid,
@@ -1404,6 +1423,7 @@ impl Runtime {
             carries,
             trace,
             subagent,
+            by_model,
         );
         // When this signal is the configured `lifecycle.until_signal` it is the
         // retirement trigger: stop admitting, drain live runs, exit cleanly.
@@ -1650,9 +1670,13 @@ impl Runtime {
         };
         let cascade = spec.get("cascade").and_then(Value::as_bool).unwrap_or(true);
         let mut payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0), "carries": self.run_carries(run_id)});
-        // A subagent's run hands that on to the runs it starts.
+        // A subagent's run hands that on to the runs it starts, and a run a
+        // model asked for that it did.
         if let Some(h) = self.runs.get(run_id).and_then(|r| r.subagent.clone()) {
             payload["subagent"] = json!(h);
+        }
+        if self.runs.get(run_id).is_some_and(|r| r.by_model) {
+            payload["by_model"] = json!(true);
         }
         // The child run continues the parent's trace, under the step's span.
         let trace = self.step_trace(run_id, step_id);

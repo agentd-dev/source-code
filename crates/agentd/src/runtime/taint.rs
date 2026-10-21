@@ -51,11 +51,30 @@ pub(crate) struct Facts {
     pub sources: Vec<String>,
 }
 
+/// What a person's own message is recorded as when the session it came
+/// through proves them the holder of their grant: the session's principal
+/// is the grant's, and — for a device name — the session itself signed in
+/// as the identity the name is bound to (the user's decision of
+/// 2026-10-21). Outside text to every unit but work that acts with that
+/// person's grant ([`Facts::of`]).
+const OWN_MESSAGE: &str = "a message of the signed-in grant holder ";
+
+/// [`OWN_MESSAGE`] for principal `id`.
+pub(crate) fn own_message(id: &str) -> String {
+    format!("{OWN_MESSAGE}{id}")
+}
+
 impl Facts {
     /// The facts of a unit whose record is `c`, in a deployment whose
-    /// instruction is `served` from outside, when it is.
-    pub(crate) fn of(c: &Carries, served: Option<&str>) -> Facts {
+    /// instruction is `served` from outside, when it is, for work that acts
+    /// with `own`'s grant, when it does: `own`'s own messages are not
+    /// outside text to it.
+    pub(crate) fn of(c: &Carries, served: Option<&str>, own: Option<&str>) -> Facts {
         let mut sources = c.taint_sources();
+        if let Some(own) = own {
+            let mine = own_message(own);
+            sources.retain(|s| *s != mine);
+        }
         if let Some(s) = served {
             sources.push(format!("the served instruction {s}"));
         }
@@ -100,15 +119,162 @@ impl Runtime {
 
     /// The facts of the unit behind `caller`.
     pub(crate) fn caller_facts(&self, caller: &ToolCaller) -> Facts {
+        let own = self
+            .delegated_work(caller)
+            .then_some(caller.principal.as_deref())
+            .flatten();
         Facts::of(
             &self.caller_carries(caller),
             self.served_instruction().as_deref(),
+            own,
         )
     }
 
     /// The facts of run `run`.
     pub(crate) fn run_facts(&self, run: &str) -> Facts {
-        Facts::of(&self.run_carries(run), self.served_instruction().as_deref())
+        self.caller_facts(&self.run_caller(run))
+    }
+
+    /// Who run `run`'s own work is, as a call it makes is.
+    pub(crate) fn run_caller(&self, run: &str) -> ToolCaller {
+        let r = self.runs.get(run);
+        ToolCaller {
+            run: Some(run.to_string()),
+            principal: r.and_then(|r| r.principal.clone()),
+            ctx: r.and_then(|r| r.conversation.clone()),
+            session: r.and_then(|r| r.session.clone()),
+            ..ToolCaller::default()
+        }
+    }
+
+    /// Whether `caller`'s work acts with an enrolled person's grant (RFC
+    /// 0044 §5.3, the `mode` fact): the person it is for holds one usable
+    /// through the session it acts through — and a subagent's work, or a
+    /// run one started, only where their template says `subagents:
+    /// inherit`.
+    pub(crate) fn delegated_work(&self, caller: &ToolCaller) -> bool {
+        #[cfg(feature = "xaa")]
+        {
+            self.work_templates(caller).is_some()
+        }
+        #[cfg(not(feature = "xaa"))]
+        {
+            let _ = caller;
+            false
+        }
+    }
+
+    /// Whether a message principal `id` sent through `session` is their
+    /// own as the holder of their grant: work for them acting through that
+    /// session would act with it — the session's proven principal is the
+    /// grant's — a per-person operator's over the unix listener as much as a
+    /// display session's. Never the bare operator's, who holds no grant.
+    pub(crate) fn message_is_own(&self, id: &str, session: Option<&str>) -> bool {
+        #[cfg(feature = "xaa")]
+        {
+            self.delegation.as_ref().is_some_and(|d| {
+                d.acting_templates(crate::delegation::Acting::new(Some(id), session))
+                    .is_some()
+            })
+        }
+        #[cfg(not(feature = "xaa"))]
+        {
+            let _ = (id, session);
+            false
+        }
+    }
+
+    /// Everything a rule may know of `caller`'s call of `name` beside its
+    /// tool and tags (RFC 0044 §5.13 item 6): whether it is made with a
+    /// person's grant, what the work read and holds, whether anyone is
+    /// there, whether a document's workflow makes it, and whose authority
+    /// the work acts with.
+    pub(crate) fn policy_facts(
+        &self,
+        caller: &ToolCaller,
+        name: &str,
+    ) -> crate::sec::policy::Facts {
+        let f = self.caller_facts(caller);
+        crate::sec::policy::Facts {
+            delegated: self.delegated_tool(name),
+            tainted: f.tainted,
+            holds_delegated_data: f.holds_delegated_data,
+            unattended: self.unattended(caller.principal.as_deref()),
+            document_sourced: self.document_sourced(caller, self.delegated_server_name(name)),
+            delegated_work: self.delegated_work(caller),
+        }
+    }
+
+    /// Whether work for `principal` has nobody there to answer: a trigger
+    /// started it, and it runs as `identity.autonomous_as` or as nobody.
+    pub(crate) fn unattended(&self, principal: Option<&str>) -> bool {
+        principal.is_none_or(|p| p == self.settings.identity.autonomous_id())
+    }
+
+    /// The run `caller`'s work is part of: its own, or for a subagent's the
+    /// run that spawned it, through every subagent between as their
+    /// `requested_by` records them; `None` for work of no run.
+    pub(crate) fn originating_run(
+        &self,
+        caller: &ToolCaller,
+    ) -> Option<&crate::engine::run::RunState> {
+        if let Some(r) = caller.run.as_deref() {
+            return self.runs.get(r);
+        }
+        let mut handle = caller.subagent.clone()?;
+        // Each hop is a distinct record: the bound only guards a cycle.
+        for _ in 0..=self.subagents.len() {
+            let by = self.subagents.get(&handle)?.requested_by.as_ref()?;
+            if let Some(r) = by["run"].as_str() {
+                return self.runs.get(r);
+            }
+            handle = by["subagent"].as_str()?.to_string();
+        }
+        None
+    }
+
+    /// Whether `caller`'s call is made in a run of a workflow an instruction
+    /// document defined — by the run's own step or turn, or by a subagent
+    /// one of them spawned — and, for a call to the delegated server
+    /// `server`, one the person's template does not list there by name and
+    /// digest (`document_workflows`, RFC 0044 §5.12 I).
+    pub(crate) fn document_sourced(&self, caller: &ToolCaller, server: Option<String>) -> bool {
+        let Some(run) = self.originating_run(caller) else {
+            return false;
+        };
+        if !self
+            .definition_for_run_ref(&run.workflow, &run.workflow_hash)
+            .is_some_and(|w| w.document)
+        {
+            return false;
+        }
+        #[cfg(feature = "xaa")]
+        if let (Some(server), Some(d)) = (server, &self.delegation)
+            && let Ok(a) = self.delegation_admit(d, caller, &server)
+            && a.template.servers.get(&server).is_some_and(|s| {
+                s.document_workflows
+                    .iter()
+                    .any(|w| w.name == run.workflow && w.digest == run.workflow_hash)
+            })
+        {
+            return false;
+        }
+        #[cfg(not(feature = "xaa"))]
+        let _ = server;
+        true
+    }
+
+    /// The delegated server whose tool `name` is, when it is one.
+    pub(crate) fn delegated_server_name(&self, name: &str) -> Option<String> {
+        match self.registry.route(name)? {
+            crate::registry::Route::Mcp { server, .. } if self.delegated(server) => {
+                Some(server.to_string())
+            }
+            crate::registry::Route::Mapped(m) if self.delegated(&m.server) => {
+                Some(m.server.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Add `carries` to the record of the context `reader` is.
@@ -286,22 +452,66 @@ mod tests {
     fn the_facts_follow_the_record() {
         let mut trusted = Carries::default();
         trusted.add(["delegated:linear".to_string()], || "read".into());
-        let f = Facts::of(&trusted, None);
+        let f = Facts::of(&trusted, None, None);
         assert!(f.holds_delegated_data && !f.tainted, "{f:?}");
         let mut untrusted = trusted.clone();
         untrusted.taint(["delegated:linear".to_string()]);
-        assert!(Facts::of(&untrusted, None).tainted);
+        assert!(Facts::of(&untrusted, None, None).tainted);
         let mut peer = Carries::default();
         peer.add(["the A2A peer agent:x".to_string()], || "peer".into());
-        let f = Facts::of(&peer, None);
+        let f = Facts::of(&peer, None, None);
         assert!(f.tainted && !f.holds_delegated_data, "{f:?}");
         assert_eq!(f.sources, ["the A2A peer agent:x"]);
-        let f = Facts::of(&Carries::default(), Some("https://x.example/a.md"));
+        let f = Facts::of(&Carries::default(), Some("https://x.example/a.md"), None);
         assert!(
             f.tainted && f.sources[0].contains("served instruction"),
             "{f:?}"
         );
-        assert_eq!(Facts::of(&Carries::default(), None), Facts::default());
+        assert_eq!(Facts::of(&Carries::default(), None, None), Facts::default());
+    }
+
+    /// A person's own message, sent through a session that proves them the
+    /// holder of their grant, is not outside text to work acting with that
+    /// grant — and is to work for anyone else, and to work acting with no
+    /// grant at all; a tool's result beside it still taints their own work.
+    /// A per-person operator holding a grant is held the same way.
+    #[test]
+    fn a_persons_own_message_is_outside_text_to_anyone_else() {
+        let alice = "user:oidc:https://idp.example#alice";
+        let mut c = Carries::default();
+        c.taint([own_message(alice)]);
+        assert!(!Facts::of(&c, None, Some(alice)).tainted, "her own work");
+        assert!(Facts::of(&c, None, Some("user:oidc:https://idp.example#bob")).tainted);
+        assert!(
+            Facts::of(&c, None, None).tainted,
+            "work acting with no grant"
+        );
+        c.taint([tool_source("web.fetch")]);
+        let f = Facts::of(&c, None, Some(alice));
+        assert!(
+            f.tainted && f.sources == [tool_source("web.fetch")],
+            "{f:?}"
+        );
+        // A per-person operator holding a grant is a person too: their own
+        // message is theirs alone, never trusted text to another's grant.
+        use crate::config::settings::Role;
+        use crate::runtime::withhold::principal_carries;
+        let op = "operator:carol";
+        let theirs = principal_carries(op, Some(Role::Operator), true, "a message");
+        assert!(
+            !Facts::of(&theirs, None, Some(op)).tainted,
+            "their own work"
+        );
+        assert!(
+            Facts::of(&theirs, None, Some(alice)).tainted,
+            "another's work"
+        );
+        // An operator who holds no grant writes nothing outside.
+        let bare = principal_carries("operator", Some(Role::Operator), false, "a message");
+        assert!(!Facts::of(&bare, None, Some(alice)).tainted);
+        // A person who does not prove the holder's session is anyone.
+        let anyone = principal_carries(alice, Some(Role::User), false, "a message");
+        assert!(Facts::of(&anyone, None, Some(alice)).tainted);
     }
 
     /// What a conversation or a memory entry keeps of a record: delegated

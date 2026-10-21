@@ -1037,6 +1037,36 @@
               "minLength": 1,
               "type": "string"
             },
+            "gates": {
+              "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args_hash": {
+                    "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+                    "type": "string"
+                  },
+                  "gate": {
+                    "description": "The consent gate",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "description": "The gate's nonce, as delegation.list gives it",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "gate",
+                  "nonce"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "type": "array"
+            },
             "nonce": {
               "description": "The gate's nonce, as delegation.list gives it",
               "minLength": 1,
@@ -1047,9 +1077,7 @@
             }
           },
           "required": [
-            "op",
-            "gate",
-            "nonce"
+            "op"
           ],
           "type": "object"
         },
@@ -1088,6 +1116,36 @@
               "minLength": 1,
               "type": "string"
             },
+            "gates": {
+              "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args_hash": {
+                    "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+                    "type": "string"
+                  },
+                  "gate": {
+                    "description": "The consent gate",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "description": "The gate's nonce, as delegation.list gives it",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "gate",
+                  "nonce"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "type": "array"
+            },
             "nonce": {
               "description": "The gate's nonce, as delegation.list gives it",
               "minLength": 1,
@@ -1098,9 +1156,7 @@
             }
           },
           "required": [
-            "op",
-            "gate",
-            "nonce"
+            "op"
           ],
           "type": "object"
         },
@@ -1166,14 +1222,13 @@
               "const": "delegation.revoke"
             },
             "target": {
-              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject",
+              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject; the caller's own grants when absent. Anyone but an operator revokes their own alone",
               "minLength": 1,
               "type": "string"
             }
           },
           "required": [
-            "op",
-            "target"
+            "op"
           ],
           "type": "object"
         },
@@ -2532,19 +2587,46 @@
               "minLength": 1,
               "type": "string"
             },
+            "gates": {
+              "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args_hash": {
+                    "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+                    "type": "string"
+                  },
+                  "gate": {
+                    "description": "The consent gate",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "description": "The gate's nonce, as delegation.list gives it",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "gate",
+                  "nonce"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "type": "array"
+            },
             "nonce": {
               "description": "The gate's nonce, as delegation.list gives it",
               "minLength": 1,
               "type": "string"
             }
           },
-          "required": [
-            "gate",
-            "nonce"
-          ],
+          "required": [],
           "type": "object"
         },
-        "description": "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
+        "description": "Approve one consent gate {gate, nonce, args_hash}, or several of one shape {gates: [...]}: the calls they hold run. Each bound to its gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
         "reply": "task",
         "result": false
       },
@@ -2601,19 +2683,46 @@
               "minLength": 1,
               "type": "string"
             },
+            "gates": {
+              "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args_hash": {
+                    "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+                    "type": "string"
+                  },
+                  "gate": {
+                    "description": "The consent gate",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "description": "The gate's nonce, as delegation.list gives it",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "gate",
+                  "nonce"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "type": "array"
+            },
             "nonce": {
               "description": "The gate's nonce, as delegation.list gives it",
               "minLength": 1,
               "type": "string"
             }
           },
-          "required": [
-            "gate",
-            "nonce"
-          ],
+          "required": [],
           "type": "object"
         },
-        "description": "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
+        "description": "Deny one consent gate {gate, nonce}, or several of one shape {gates: [...]}: the calls they hold are refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
         "reply": "task",
         "result": false
       },
@@ -2698,17 +2807,15 @@
           "additionalProperties": false,
           "properties": {
             "target": {
-              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject",
+              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject; the caller's own grants when absent. Anyone but an operator revokes their own alone",
               "minLength": 1,
               "type": "string"
             }
           },
-          "required": [
-            "target"
-          ],
+          "required": [],
           "type": "object"
         },
-        "description": "Revoke the grants {target} names — a principal, or idp:<name>#<sub> for every grant of that subject: RFC 7009 at the IdP, then the tombstone, the record and every token",
+        "description": "Revoke the grants {target?} names — a principal, or idp:<name>#<sub> for every grant of that subject; the caller's own when absent: RFC 7009 at the IdP, then the tombstone, the record and every token. An operator revokes anyone's; anyone else their own alone",
         "reply": "task",
         "result": false
       },

@@ -323,6 +323,13 @@ pub struct RunState {
     /// whatever principal it runs as. Durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
+    /// Whether a model asked for this run — a turn's or a subagent's
+    /// `workflow.run` or `workflow.signal`, directly or through the runs
+    /// those started: its inputs are the model's, so while the instruction
+    /// is frozen it acts with no person's grant, as the turn would not (RFC
+    /// 0044 §5.12 I). Durable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_model: bool,
     /// The RFC 0043 session a signed-in person started this run through
     /// (RFC 0044 §5.12): the run's delegated calls act through it while it
     /// lives, and fail `revoked` once it has ended — revoked, expired, or
@@ -422,6 +429,7 @@ impl RunState {
             task: None,
             principal: None,
             subagent: None,
+            by_model: false,
             session: None,
             conversation: None,
             children: Vec::new(),

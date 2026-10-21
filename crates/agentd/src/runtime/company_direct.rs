@@ -956,7 +956,7 @@ impl Runtime {
                     .and_then(|r| r.steps.get(step))
                     .is_some_and(|s| s.status == crate::engine::run::StepStatus::Suspended),
                 // A tool call asks to talk directly, never a task's question.
-                Some(Target::McpTask(..)) => true,
+                Some(Target::McpTask(..) | Target::Elicit(_)) => true,
                 None => false,
             })
             .map(|(id, _)| id.clone())

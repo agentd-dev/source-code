@@ -4176,6 +4176,10 @@ pub struct PrincipalMatch {
     /// The unix A2A listener's peer, by the uid the kernel names
     /// (`SO_PEERCRED`): the per-person operator `operator:<id>` (RFC 0044).
     pub uid: Option<u32>,
+    /// A client certificate's key: the SHA-256 of its SubjectPublicKeyInfo,
+    /// 64 lowercase hex. A rule naming it admits that one key alone — what a
+    /// certificate principal that delegates is pinned by (RFC 0044 §5.2).
+    pub spki: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4386,20 +4390,54 @@ pub struct Policy {
     /// `{id, role, labels}`. Unset, the gate is addressed to `{role:
     /// operator}` — a policy exists because the operator wanted a say, so the
     /// caller whose call is being judged does not get to approve it unless
-    /// the operator names them here.
-    #[serde(deserialize_with = "addressee_opt")]
-    pub to: Option<crate::a2a::principals::Addressee>,
+    /// the operator names them here. `principal` is the person whose grant
+    /// the work acts with: the gate is their consent gate (RFC 0044 §5.10).
+    #[serde(deserialize_with = "policy_to_opt")]
+    pub to: Option<PolicyTo>,
+    /// `run_tool`: a `to: principal` rule asks on the first use per run and
+    /// tool alone — once the person approved a call of the tool there, its
+    /// later calls in the same unit pass this rule (RFC 0044 §5.10 rule 6).
+    pub once_per: Option<OncePer>,
+}
+
+/// Who answers a rule's gate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicyTo {
+    /// The person the work acts for with their grant: a consent gate,
+    /// answered by them alone (or an operator their template lists), never
+    /// judged, denied unanswered.
+    Principal,
+    /// A principal-id glob or `{id, role, labels}`.
+    Addressee(crate::a2a::principals::Addressee),
+}
+
+impl PolicyTo {
+    /// The addressee of a policy gate; `None` for the person's own.
+    pub fn addressee(&self) -> Option<&crate::a2a::principals::Addressee> {
+        match self {
+            PolicyTo::Principal => None,
+            PolicyTo::Addressee(a) => Some(a),
+        }
+    }
+}
+
+/// `security.policies[].once_per`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OncePer {
+    /// The first use per tool in a run, a conversation or a subagent.
+    RunTool,
 }
 
 /// `to:` parsed with the one addressee parser, so a policy gate and an
-/// `ask_human`/`human` gate accept exactly the same spellings.
-fn addressee_opt<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<crate::a2a::principals::Addressee>, D::Error> {
+/// `ask_human`/`human` gate accept exactly the same spellings — and
+/// `principal`, the person the work acts for.
+fn policy_to_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<PolicyTo>, D::Error> {
     match Option::<Value>::deserialize(d)? {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim() == "principal" => Ok(Some(PolicyTo::Principal)),
         Some(v) => crate::a2a::principals::Addressee::parse(&v)
-            .map(Some)
+            .map(|a| Some(PolicyTo::Addressee(a)))
             .map_err(serde::de::Error::custom),
     }
 }
@@ -4429,6 +4467,25 @@ pub struct PolicyMatch {
     pub holds_delegated_data: Option<bool>,
     /// At least one listed trifecta tag is on the tool.
     pub any_tags: Vec<String>,
+    /// Whether nobody is there to answer: a trigger started the work — a
+    /// schedule, a webhook, a stream — not a principal's request.
+    pub unattended: Option<bool>,
+    /// Whether the call is made in a run of a workflow an instruction
+    /// document defined, which — for a delegated call — the person's
+    /// template does not list for the call's server by name and digest
+    /// (RFC 0044 §5.12 I).
+    pub document_sourced: Option<bool>,
+    /// Whose authority the work acts with: `delegated` when an enrolled
+    /// person's grant, `agent` when agentd's own (RFC 0044 §5.3).
+    pub mode: Option<AuthorityMode>,
+}
+
+/// Whose authority work acts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorityMode {
+    Agent,
+    Delegated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -6094,8 +6151,9 @@ pub enum Ask {
     /// `--delegation-list`: the running daemon's delegation grants and open
     /// consent gates (RFC 0044).
     DelegationList,
-    /// `--delegation-approve <gate>` / `--delegation-deny <gate>`: the
-    /// per-person operator's answer to one consent gate.
+    /// `--delegation-approve <gate>[,<gate>…]` / `--delegation-deny
+    /// <gate>[,<gate>…]`: the per-person operator's answer to one consent
+    /// gate, or to several of one shape together.
     DelegationApprove(String),
     DelegationDeny(String),
     /// `--delegation-revoke <principal | idp:<name>#<sub>>`.
@@ -8396,10 +8454,46 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         // …and whether the one it names could ever answer. A policy gate
         // lands on a task, which only its owner and operators can see.
-        if let Some(to) = &p.to
+        if let Some(to) = p.to.as_ref().and_then(PolicyTo::addressee)
             && let Err(e) = to.check_gate()
         {
             err(&mut d, format!("{at}: {e}"));
+        }
+        // The person's consent gate (RFC 0044 §5.10): agentd's own text,
+        // denied unanswered, and only where someone's grant is acted with.
+        if p.to == Some(PolicyTo::Principal) {
+            if p.question.is_some() {
+                err(
+                    &mut d,
+                    format!(
+                        "{at}: `question` beside `to: principal` — the person's consent gate is agentd's own text, which says why it asks"
+                    ),
+                );
+            }
+            if p.on_timeout.is_some_and(|o| o != PolicyAction::Deny) {
+                err(
+                    &mut d,
+                    format!(
+                        "{at}: `to: principal` with an `on_timeout` other than deny — an unanswered consent gate has not been approved"
+                    ),
+                );
+            }
+            if !cfg!(feature = "xaa") || delegation::delegated_servers(s).next().is_none() {
+                err(
+                    &mut d,
+                    format!(
+                        "{at}: `to: principal` asks the person whose grant the work acts with, and no delegated server is declared (RFC 0044, the `xaa` feature)"
+                    ),
+                );
+            }
+        }
+        if p.once_per.is_some() && p.to != Some(PolicyTo::Principal) {
+            err(
+                &mut d,
+                format!(
+                    "{at}: `once_per` is a `to: principal` rule's: the person's first use per run and tool"
+                ),
+            );
         }
     }
 
@@ -9637,6 +9731,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             // The unix listener's peer (RFC 0044): its own rules are
             // `delegation::validate`'s.
             m.uid.is_some(),
+            m.spki.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
@@ -9645,7 +9740,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!(
-                    "a2a.principals[{i}]: match needs one of san | sub | bearer_ref | any | uid"
+                    "a2a.principals[{i}]: match needs one of san | sub | spki | bearer_ref | any | uid"
                 ),
             );
         } else if m.any && set > 1 {
@@ -9654,7 +9749,28 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!(
-                    "a2a.principals[{i}]: `any` matches every caller left, so it is the rule's only matcher — drop san | sub | bearer_ref, or write two rules"
+                    "a2a.principals[{i}]: `any` matches every caller left, so it is the rule's only matcher — drop san | sub | spki | bearer_ref, or write two rules"
+                ),
+            );
+        }
+        if let Some(k) = &m.spki
+            && (k.len() != 64
+                || !k
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        {
+            err(
+                &mut d,
+                format!(
+                    "a2a.principals[{i}].match.spki: the SHA-256 of the certificate's SubjectPublicKeyInfo, 64 lowercase hex"
+                ),
+            );
+        }
+        if m.spki.is_some() && (m.bearer_ref.is_some() || m.uid.is_some()) {
+            err(
+                &mut d,
+                format!(
+                    "a2a.principals[{i}].match.spki names a client certificate's key, and bearer_ref and uid are other evidence — say spki with san or sub, or alone"
                 ),
             );
         }
@@ -9668,11 +9784,12 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         // listener verified, and only `client_ca` makes the listener ask for
         // one: without it the rule loads and admits nobody, ever. (`any`
         // also names every caller left over, certificate or not.)
-        if (m.san.is_some() || m.sub.is_some()) && s.a2a.tls.client_ca.is_none() {
+        if (m.san.is_some() || m.sub.is_some() || m.spki.is_some()) && s.a2a.tls.client_ca.is_none()
+        {
             err(
                 &mut d,
                 format!(
-                    "a2a.principals[{i}]: a certificate rule (san | sub) matches only a client certificate the listener verifies — set a2a.tls.client_ca, or match a bearer with bearer_ref"
+                    "a2a.principals[{i}]: a certificate rule (san | sub | spki) matches only a client certificate the listener verifies — set a2a.tls.client_ca, or match a bearer with bearer_ref"
                 ),
             );
         }
@@ -10677,6 +10794,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "goal.stuck_after",
     "identity.autonomous_as",
     // Read at each consent gate and each answer.
+    "identity.delegation.consent_per_minute",
     "identity.delegation.consent_session_max_age",
     "identity.delegation.consent_timeout",
     // Applied by the reload (RFC 0044 §5.14): narrowing takes effect at the
@@ -10885,8 +11003,8 @@ pub fn help_text() -> String {
          \x20 --login idp:<name>[/<grant>]  the running daemon signs the per-person operator in at an IdP and\n\
          \x20                            keeps their delegation grant (needs xaa; unix A2A listener)\n\
          \x20 --delegation-list          the running daemon's delegation grants and open consent gates (needs xaa)\n\
-         \x20 --delegation-approve <gate> / --delegation-deny <gate>\n\
-         \x20                            the per-person operator's answer to one consent gate (needs xaa)\n\
+         \x20 --delegation-approve <gate>[,<gate>...] / --delegation-deny <gate>[,<gate>...]\n\
+         \x20                            the per-person operator's answer to consent gates, several of one shape together (needs xaa)\n\
          \x20 --delegation-revoke <principal|idp:<name>#<sub>>  revoke grants: RFC 7009 at the IdP, then here\n\
          \x20 --delegation-lint          the Resource connections each IdP must have; dials nothing (needs xaa)\n\
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
@@ -14792,7 +14910,7 @@ mod tests {
         ));
         assert!(
             e.contains(
-                "a2a.principals[0]: a certificate rule (san | sub) matches only a client certificate the listener verifies"
+                "a2a.principals[0]: a certificate rule (san | sub | spki) matches only a client certificate the listener verifies"
             ),
             "{e}"
         );
@@ -15290,8 +15408,19 @@ mod tests {
         )
         .unwrap();
         let p = &l.settings.security.policies;
-        assert_eq!(p[0].to.as_ref().unwrap().role, Some(Role::Operator));
-        assert_eq!(p[1].to.as_ref().unwrap().id.as_deref(), Some("operator"));
+        assert_eq!(
+            p[0].to.as_ref().and_then(PolicyTo::addressee).unwrap().role,
+            Some(Role::Operator)
+        );
+        assert_eq!(
+            p[1].to
+                .as_ref()
+                .and_then(PolicyTo::addressee)
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("operator")
+        );
         // A `to` naming anyone but an operator waits for someone who can
         // never see the task: refused at load, naming who it named.
         for (to, named) in [

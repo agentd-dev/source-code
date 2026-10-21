@@ -13,41 +13,46 @@ use crate::checks::util::{self, header};
 
 /// The login grant, form-encoded.
 const LOGIN_GRANT: &str = "https%3A%2F%2Fagentd.dev%2Foauth%2Fgrant-type%2Flogin";
-const ALICE: &str = "00u1alice";
-const BOB: &str = "00u2bob";
-const PEOPLE: &str = "{name: people, principals: {source: oidc}, idp: okta, servers: {linear: {scopes: [\"issues:read\"]}, gated: {scopes: [\"issues:read\", \"issues:write\"]}}}";
-const DEVICES: &str = "{name: devices, principals: {source: device}, idp: okta, servers: {linear: {scopes: [\"issues:read\"]}, gated: {scopes: [\"issues:read\", \"issues:write\"]}}}";
-/// A call to `linear` asks nothing; every call to `gated` is the person's to
-/// approve.
-const READ_TAGS: &str = "{\"*\": [untrusted_input]}";
-const GATED_TAGS: &str = "{\"*\": [sensitive]}";
+pub(super) const ALICE: &str = "00u1alice";
+pub(super) const BOB: &str = "00u2bob";
+pub(super) const PEOPLE: &str = "{name: people, principals: {source: oidc}, idp: okta, servers: {linear: {scopes: [\"issues:read\"]}, gated: {scopes: [\"issues:read\", \"issues:write\"]}}}";
+pub(super) const DEVICES: &str = "{name: devices, principals: {source: device}, idp: okta, servers: {linear: {scopes: [\"issues:read\"]}, gated: {scopes: [\"issues:read\", \"issues:write\"]}}}";
+/// A call to `linear` asks nothing; a call to `gated` is the person's to
+/// approve, at its first use in each run (`delegated_egress`) — their own
+/// start of the run is no outside text to it.
+pub(super) const READ_TAGS: &str = "{\"*\": [untrusted_input]}";
+pub(super) const GATED_TAGS: &str = "{\"*\": [egress]}";
 
 /// What a TCP deployment's configuration says.
 #[derive(Default)]
-struct FedOpts {
+pub(super) struct FedOpts {
     /// `a2a.login` at the IdP.
-    login: bool,
+    pub(super) login: bool,
     /// RFC 0043's device grant.
-    device: bool,
+    pub(super) device: bool,
     /// `identity.delegation.templates`, one flow mapping each.
-    templates: Vec<&'static str>,
+    pub(super) templates: Vec<&'static str>,
     /// `identity.delegation.device_pins`, as a flow mapping; `__ISS__` is
     /// the mock IdP's issuer.
-    pins: Option<&'static str>,
-    first_binding: bool,
+    pub(super) pins: Option<&'static str>,
+    pub(super) first_binding: bool,
     /// `identity.delegation.consent_session_max_age`.
-    consent_max_age: Option<&'static str>,
+    pub(super) consent_max_age: Option<&'static str>,
+    /// The `gated` server's tags, when not [`GATED_TAGS`].
+    pub(super) gated_tags: Option<&'static str>,
+    /// Appended to the configuration: workflows, then any other section.
+    pub(super) extra: String,
 }
 
 /// A deployment on a loopback TCP listener: the operator's bearer, and the
 /// people's own sessions.
-struct Fed {
-    tmp: TempDir,
-    xaa: Xaa,
-    cfg: PathBuf,
-    port: u16,
-    ops: String,
-    log: PathBuf,
+pub(super) struct Fed {
+    pub(super) tmp: TempDir,
+    pub(super) xaa: Xaa,
+    pub(super) cfg: PathBuf,
+    pub(super) port: u16,
+    pub(super) ops: String,
+    pub(super) log: PathBuf,
 }
 
 fn fed_config(x: &Xaa, dir: &Path, port: u16, o: &FedOpts) -> String {
@@ -90,10 +95,11 @@ fn fed_config(x: &Xaa, dir: &Path, port: u16, o: &FedOpts) -> String {
         )
     };
     format!(
-        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {{log_level: info}}\na2a:\n{a2a}security:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{idp}\"\n      client_id: agentd-idp\n      client_auth: {{method: private_key_jwt, key: \"{{{{secret-file:{d}/idp.pem}}}}\"}}\n      subject: refresh_token\n      sign_in: {{grants: [authorization_code, device]}}\n  delegation:\n{delegation}mcp:\n  servers:\n{read}{gated}workflows:\n{who}{write}{via}",
+        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {{log_level: info}}\na2a:\n{a2a}security:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{idp}\"\n      client_id: agentd-idp\n      client_auth: {{method: private_key_jwt, key: \"{{{{secret-file:{d}/idp.pem}}}}\"}}\n      subject: refresh_token\n      sign_in: {{grants: [authorization_code, device]}}\n  delegation:\n{delegation}mcp:\n  servers:\n{read}{gated}workflows:\n{who}{write}{via}{extra}",
         idp = x.idp,
         read = server("linear", &x.mcp, READ_TAGS),
-        gated = server("gated", &x.mcp2, GATED_TAGS),
+        gated = server("gated", &x.mcp2, o.gated_tags.unwrap_or(GATED_TAGS)),
+        extra = o.extra,
         who = wf("who", "linear", "whoami", "{}"),
         write = wf("write", "gated", "create_issue", "{title: \"From agentd\"}"),
         // A run that starts `who` as its child: the child acts through the
@@ -103,7 +109,7 @@ fn fed_config(x: &Xaa, dir: &Path, port: u16, o: &FedOpts) -> String {
 }
 
 /// A daemon started by hand: stopped as the harness stops its own.
-struct Framed(Child);
+pub(super) struct Framed(Child);
 
 impl Drop for Framed {
     fn drop(&mut self) {
@@ -188,7 +194,7 @@ fn sign_in_at(uri: &str) -> Result<(u16, String), String> {
 
 /// The document a command answered with: a read's message data, or the data
 /// of the task it completed as.
-fn doc(v: &Value) -> Value {
+pub(super) fn doc(v: &Value) -> Value {
     let r = &v["result"];
     if let Some(d) = r["message"]["parts"][0].get("data") {
         return d.clone();
@@ -197,7 +203,7 @@ fn doc(v: &Value) -> Value {
 }
 
 impl Fed {
-    fn new(h: &Harness, o: &FedOpts) -> Fed {
+    pub(super) fn new(h: &Harness, o: &FedOpts) -> Fed {
         let tmp = h.tempdir();
         let xaa = Xaa::spawn(h, &tmp, json!({}));
         std::fs::write(tmp.path().join("idp.pem"), key_pem()).expect("write");
@@ -219,16 +225,16 @@ impl Fed {
         }
     }
 
-    fn addr(&self) -> String {
+    pub(super) fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
 
-    fn cfg(&self) -> &str {
+    pub(super) fn cfg(&self) -> &str {
         self.cfg.to_str().expect("utf8")
     }
 
     /// The daemon, its listener answering; its log appended to.
-    fn daemon(&self, h: &Harness) -> crate::harness::Daemon {
+    pub(super) fn daemon(&self, h: &Harness) -> crate::harness::Daemon {
         let n = std::fs::read_dir(self.tmp.path())
             .map(|d| d.count())
             .unwrap_or(0);
@@ -239,7 +245,7 @@ impl Fed {
     }
 
     /// The daemon, every frame it sends a child written to `frames`.
-    fn daemon_framed(&self, h: &Harness, frames: &Path) -> Framed {
+    pub(super) fn daemon_framed(&self, h: &Harness, frames: &Path) -> Framed {
         let log = self.tmp.path().join("daemon-framed.log");
         let child = Command::new(h.agentd())
             .args(["--config", self.cfg()])
@@ -254,7 +260,7 @@ impl Fed {
     }
 
     /// Wait for the listener to answer, then read the daemon's log at `log`.
-    fn listening(&self, log: &Path) {
+    pub(super) fn listening(&self, log: &Path) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let (status, _, _) = if std::net::TcpStream::connect(self.addr()).is_ok() {
@@ -276,11 +282,11 @@ impl Fed {
         let _ = std::os::unix::fs::symlink(log, &self.log);
     }
 
-    fn log_text(&self) -> String {
+    pub(super) fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    fn events(&self, name: &str) -> Vec<Value> {
+    pub(super) fn events(&self, name: &str) -> Vec<Value> {
         self.log_text()
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -289,7 +295,7 @@ impl Fed {
     }
 
     /// `method` as `bearer`: the envelope.
-    fn rpc_as(&self, bearer: &str, method: &str, params: Value) -> Value {
+    pub(super) fn rpc_as(&self, bearer: &str, method: &str, params: Value) -> Value {
         let auth = format!("Bearer {bearer}");
         let exts = format!("{}, {}", util::COMMAND, util::ANNOTATIONS);
         let mut headers = vec![("A2A-Extensions", exts.as_str())];
@@ -302,17 +308,17 @@ impl Fed {
     }
 
     /// Command `op` as `bearer`: the envelope.
-    fn op_as(&self, bearer: &str, op: &str, args: Value) -> Value {
+    pub(super) fn op_as(&self, bearer: &str, op: &str, args: Value) -> Value {
         self.rpc_as(bearer, "SendMessage", util::command_send_params(op, &args))
     }
 
     /// Command `op` as the operator.
-    fn operator(&self, op: &str, args: Value) -> Value {
+    pub(super) fn operator(&self, op: &str, args: Value) -> Value {
         self.op_as(&self.ops, op, args)
     }
 
     /// Every live session, as the operator lists them.
-    fn sessions(&self) -> Vec<Value> {
+    pub(super) fn sessions(&self) -> Vec<Value> {
         doc(&self.operator("auth.sessions", json!({})))["sessions"]
             .as_array()
             .cloned()
@@ -321,7 +327,7 @@ impl Fed {
 
     /// Task `id` once it has ended, as `bearer` reads it: its state and its
     /// status text.
-    fn task_end(&self, bearer: &str, id: &str) -> Result<(String, String), String> {
+    pub(super) fn task_end(&self, bearer: &str, id: &str) -> Result<(String, String), String> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let t = self.rpc_as(bearer, "GetTask", json!({"id": id}));
@@ -352,7 +358,7 @@ impl Fed {
 
     /// A display client signing in at `a2a.login` as `sub`: its session
     /// token, once the browser came back to the callback.
-    fn login(&self, sub: &str) -> Result<String, String> {
+    pub(super) fn login(&self, sub: &str) -> Result<String, String> {
         self.xaa.control(json!({"sub": sub}));
         let (status, asked) = form_post(
             &self.addr(),
@@ -381,7 +387,7 @@ impl Fed {
 
     /// A device-grant session the operator approved as `name`: its token and
     /// its sid.
-    fn device_session(&self, name: &str) -> Result<(String, String), String> {
+    pub(super) fn device_session(&self, name: &str) -> Result<(String, String), String> {
         let before: Vec<Value> = self.sessions().iter().map(|s| s["sid"].clone()).collect();
         let (_, code) = form_post(
             &self.addr(),
@@ -419,7 +425,11 @@ impl Fed {
 
     /// `delegation.enrol` from session `bearer` through its start link, the
     /// IdP signing in `sub`: how the enrolment's task ended.
-    fn enrol_signed_in(&self, bearer: &str, sub: &str) -> Result<(String, String), String> {
+    pub(super) fn enrol_signed_in(
+        &self,
+        bearer: &str,
+        sub: &str,
+    ) -> Result<(String, String), String> {
         self.xaa.control(json!({"sub": sub}));
         let r = self.op_as(bearer, "delegation.enrol", json!({"idp": "okta"}));
         let task = &r["result"]["task"];
@@ -435,7 +445,11 @@ impl Fed {
 
     /// `delegation.enrol` from session `bearer` with the IdP's device grant,
     /// the device code approved by `sub`: how the enrolment's task ended.
-    fn enrol_by_device_code(&self, bearer: &str, sub: &str) -> Result<(String, String), String> {
+    pub(super) fn enrol_by_device_code(
+        &self,
+        bearer: &str,
+        sub: &str,
+    ) -> Result<(String, String), String> {
         self.xaa.control(json!({"sub": sub}));
         let r = self.op_as(
             bearer,
@@ -449,11 +463,11 @@ impl Fed {
     }
 
     /// What `delegation.list` shows `bearer`.
-    fn listed(&self, bearer: &str) -> Value {
+    pub(super) fn listed(&self, bearer: &str) -> Value {
         doc(&self.op_as(bearer, "delegation.list", json!({})))
     }
 
-    fn runs_done(&self, name: &str) -> Vec<Value> {
+    pub(super) fn runs_done(&self, name: &str) -> Vec<Value> {
         self.events("run.done")
             .into_iter()
             .filter(|e| e["workflow"] == name)
@@ -461,7 +475,7 @@ impl Fed {
     }
 
     /// Start workflow `name` as `bearer`: how many runs of it had ended.
-    fn start_as(&self, bearer: &str, name: &str) -> Result<usize, String> {
+    pub(super) fn start_as(&self, bearer: &str, name: &str) -> Result<usize, String> {
         let before = self.runs_done(name).len();
         let r = self.op_as(bearer, "workflow.run", json!({"workflow": name}));
         match r.get("error") {
@@ -470,7 +484,7 @@ impl Fed {
         }
     }
 
-    fn ended(&self, name: &str, n: usize) -> Result<Value, String> {
+    pub(super) fn ended(&self, name: &str, n: usize) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(e) = self.runs_done(name).get(n) {
@@ -487,13 +501,13 @@ impl Fed {
     }
 
     /// Run `name` as `bearer` to its end.
-    fn run_as(&self, bearer: &str, name: &str) -> Result<Value, String> {
+    pub(super) fn run_as(&self, bearer: &str, name: &str) -> Result<Value, String> {
         let n = self.start_as(bearer, name)?;
         self.ended(name, n)
     }
 
     /// The gate `bearer`'s own list shows, once one is open.
-    fn gate_of(&self, bearer: &str) -> Result<Value, String> {
+    pub(super) fn gate_of(&self, bearer: &str) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let l = self.listed(bearer);
@@ -509,7 +523,7 @@ impl Fed {
 
     /// The subject of each ID-JAG the authorization server was presented, in
     /// order: whose grant each call was made with.
-    fn minted_for(&self) -> Vec<String> {
+    pub(super) fn minted_for(&self) -> Vec<String> {
         self.xaa
             .grants("ras", JWT_BEARER)
             .iter()
@@ -1352,7 +1366,7 @@ pub(super) fn a_reload_narrows_then_revokes(h: &Harness) -> Outcome {
                 format!("the removal revokes, at the IdP, tombstoned: {revoked:?}"),
             )
         })
-        .and(|| failed_with(&gone, "not_enrolled"))
+        .and(|| failed_with(&gone, "revoked"))
 }
 
 /// With `subagents: inherit` in the person's template, a run a subagent

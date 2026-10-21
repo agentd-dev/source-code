@@ -1415,6 +1415,114 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   warm_personal, warm}`, `delegation::enrol::Said::Answered` and
   `delegation::vault::Vault::{personal_key, forget_personal, external}`;
   `a2a::tasks::Task::security_gate`.
+- The policy each person's grant is held to (RFC 0044 P2, part 2, the
+  `xaa` feature). `security.policies[].match` gains the facts
+  `unattended` (the work runs for nobody, or for
+  `identity.autonomous_as`), `document_sourced` (a run of a workflow an
+  instruction document defined, at a server whose template does not list
+  it) and `mode` (`delegated` where the work acts with a person's grant,
+  else `agent`). An `ask` with `to: principal` is the person's consent gate
+  on any matcher — no `question`, since its text is agentd's; denied
+  unanswered; refused without a delegated server — and `once_per:
+  run_tool` makes it ask at the first use per run and tool alone. A gate
+  names an operator's rule `security.policies[<i>]`, and shows the
+  workflow, `document_sourced` and `unattended`.
+- Gates of one shape answered together: `delegation.list` shows each
+  gate's `shape` (its rule, server, tool and argument names, never their
+  values); `delegation.approve` and `delegation.deny` take `gates: [{gate,
+  nonce, args_hash}, …]` — 1 to 50 open gates of one shape, each held to
+  its own binding and recorded on its own, a batch naming any other
+  deciding nothing; `agentd --delegation-approve <gate>,<gate>` sends one.
+  `identity.delegation.consent_per_minute` (10, reloadable) caps the gates
+  opened for one person in any minute: a call past it is refused, never
+  asked (`delegation.consent.rate_limited`, warned and audited).
+- A signed-in person's own message is theirs: a message, signal or run
+  start a person sends through a session whose principal is their grant's
+  — a device session having itself signed in as the identity its name is
+  bound to — taints no work acting with their grant, and is outside text
+  to anyone else's work (`a message of the signed-in grant holder <id>`
+  among its taint sources).
+- Certificate principals that delegate: `a2a.principals[].match.spki`, the
+  SHA-256 of a client certificate's SubjectPublicKeyInfo (64 lowercase
+  hex), admits that key alone; with an `id` and an `idp_subject` pin it is
+  a person (`user:<id>`, or `operator:<id>` for an operator rule), admitted
+  by a template's `principals.source: x509`, enrolling with the IdP's
+  device grant over its certificate and answering its gates over it (`via:
+  certificate`). Its grant is the key's.
+- `delegation.revoke` is open to any named caller: a person revokes their
+  own grants from their own session (`delegation.revoke {}`) — the grants
+  that session holds, so a device session under the same name that never
+  signed in as the name's identity revokes nothing — and only an operator
+  revokes another's.
+- `templates[].budget.per_minute` (4) caps a person's mints at one server in
+  any minute, every mint asked for counted: past it a call is
+  `budget_exhausted` before the IdP is asked.
+- `templates[].agent_mode_servers` takes effect: work acting with a
+  person's grant is not offered an agent-mode MCP server tagged `sensitive`
+  or `egress`, and its call of one — a tool, or an `mcp.tool` or
+  `mcp.resource` step — is refused (`mode_mixing`,
+  `delegation.agent_mode.refused`) unless the template lists the server;
+  each such call is an audit record (`delegation.agent_mode_call`, outcome
+  `admitted` or `refused`).
+- `servers.<name>.document_workflows` takes effect: a workflow an
+  instruction document defined asks before every delegated `egress` call
+  (`document_sourced_delegated_egress`) until the person's template lists
+  it there by name and the definition digest `workflow.list` shows; a
+  subagent such a workflow spawns asks as the workflow does. While the
+  instruction is frozen (`agent.instruction.unavailable: freeze` past its
+  deadline), no model turn or subagent, no run a model asked for — by
+  `workflow.run`, a workflow tool or a `workflow.signal` that starts or
+  wakes it, and every run those start — and no run of a workflow it
+  defined makes a delegated call, and no model writes a workflow
+  (`workflow.create`, `workflow.update`).
+- A delegated server's elicitation asks the grant's person alone: a
+  connection made with a person's grant declares the elicitation
+  capability, and a server's `elicitation/create` becomes a gate owned by
+  and addressed to that person, in agentd's words with the server's quoted
+  (`delegation.elicitation`). It is answered as the person's consent gates
+  are, and only through a session that holds the grant it was asked
+  through: a device session under the same name that never signed in at
+  the IdP is refused (`delegation.elicitation.refused`, warned and
+  audited). No operator, judge or approval policy answers it, the answer is
+  shaped to the server's schema, and unanswered within the server's call
+  timeout it is cancelled. A URL elicitation is declined.
+- A worker uses the delegated tools it was offered alone: a turn worker
+  those its plan offered, a subagent those of the delegated servers it
+  declares that its `tools:` grant admits; any other is refused before any
+  check or mint (`tool.refused`, `why: not_offered`).
+- `security.exec.enabled` loads beside a delegation's keys under the whole
+  isolation set: `spawn.uid` and `spawn.gid`, Landlock, and every path only
+  the supervisor may open — the store, each key file, a signer's socket,
+  the audit chain and its segments — closed to the worker uid by its mode,
+  its ownership and every directory above it, the store's root judged as
+  agentd restricts it only where agentd's own uid owns it; the load names
+  each piece missing. A command from work holding delegated data asks the
+  person (`exec_holding_delegated_data`).
+- Fifteen `ema` conformance checks of the second part of P2: a person's own
+  message is theirs, the person's rules ask as shipped and configured,
+  gates of one shape are answered together and paced, agent-mode servers
+  are hidden from delegated work, a document's workflow asks unless
+  listed, a document's subagent is its workflow's work, pairwise subjects
+  are recorded not compared, a person's mints are paced, an elicitation
+  asks the grant's person and is answered through the grant, a person
+  revokes their own grant, a certificate principal delegates, a command
+  beside a delegation runs isolated and asks, a stale instruction makes no
+  delegated call, and a worker uses only what it was offered. The suite's
+  binary is built with `exec` too, and a debug build's worker asks the
+  supervisor for the calls `AGENTD_TEST_WORKER_ASK` names (`test.worker_ask`).
+- `agentd-core`: `sec::policy::{ConsentRule, consent_rules, consent_rule,
+  evaluate_past}` and `Facts::{unattended, document_sourced,
+  delegated_work, mode}`; `config::settings::{PolicyTo, OncePer,
+  AuthorityMode}`, `Policy::once_per`, `PolicyMatch::{unattended,
+  document_sourced, mode}` and `PrincipalMatch::spki`;
+  `config::settings::delegation::{certificates, pinned, PER_MINUTE,
+  CONSENT_PER_MINUTE}`, `Delegation::consent_per_minute` and
+  `TemplateBudget::per_minute`; `sec::worker::{Made, access, unopenable}`;
+  `delegation::{Elicitation, Note::Elicit}`, `Person::{principal, role}`,
+  `Who::via_self` and `Delegation::{acting_templates, holds,
+  revoke_held}`; `engine::model::Workflow::document` and
+  `engine::run::RunState::by_model`. `agentd-conformance`:
+  `Harness::{at, spawn_logged_env}`.
 
 **Changed.**
 
@@ -1488,6 +1596,39 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   device grant for a per-person operator's where the provider's
   `sign_in.grants` offers it — rather than failing the call `step_up`; it
   still fails `step_up` where neither is offered.
+- **Breaking:** a revoked grant's calls fail `revoked`, no longer
+  `not_enrolled`, for as long as the tombstone register keeps the
+  revocation — a restart and a store restored from before it included —
+  whoever revoked it: the person, an operator, a reload,
+  `--delegation-forget` or a dead liveness probe.
+- **Breaking:** `delegated_egress` asks at the first use per run — or
+  conversation, or subagent — and tool, not at every call; an approval of
+  it is kept in memory, so a restart asks again. The person's rules are
+  held in this order, after every rule of the operator's:
+  `egress_from_tainted_work_holding_delegated_data`,
+  `delegated_call_from_tainted_work`, `exec_holding_delegated_data`,
+  `document_sourced_delegated_egress`, `delegated_egress`.
+- **Breaking:** a person's own start of their run, and their own message
+  in it, no longer taint it: a delegated `sensitive` call the person's own
+  run makes before it reads outside text goes ahead unasked. A per-person
+  operator who holds a grant is held the same way, so their message,
+  signal or run start now taints any work that does not act with their
+  grant — another person's run it reaches, a subagent that does not
+  inherit — where an operator's text tainted nothing; the bare operator's
+  still taints nothing.
+- **Breaking:** work acting with a person's grant is refused an agent-mode
+  MCP server tagged `sensitive` or `egress` (`mode_mixing`) unless their
+  template's `agent_mode_servers` lists it.
+- **Breaking:** a delegation several people can hold grants under — more
+  than one pinned person or device name, `a2a.login`, or
+  `device_first_binding` — is refused at load on a kernel without Landlock,
+  unless workers run as a `spawn.uid` every supervisor-only path is closed
+  to.
+- **Breaking:** `security.policies[].to` is an addressee or `principal`, and
+  `Policy::to` and `Verdict::to` are `Option<PolicyTo>` in `agentd-core`.
+- `security.exec.enabled` beside a delegation's keys is no longer refused
+  outright: it loads under the isolation set above, and the refusal
+  otherwise names what is missing.
 - `--delegation-list` shows a gate's arguments, its text and its binding
   only to the person who answers it; anyone else sees its id, tool, server,
   principal and deadline. The `delegation.consent` log line carries a

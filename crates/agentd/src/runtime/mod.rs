@@ -752,6 +752,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         consents: BTreeMap::new(),
         #[cfg(feature = "xaa")]
         consented_steps: BTreeMap::new(),
+        #[cfg(feature = "xaa")]
+        consented_once: BTreeMap::new(),
+        #[cfg(feature = "xaa")]
+        consents_asked: BTreeMap::new(),
+        #[cfg(feature = "xaa")]
+        elicits: BTreeMap::new(),
         mcp,
         mcp_specs,
         resubscribe_retry: BTreeMap::new(),

@@ -614,6 +614,14 @@ admits, by the principal's `source` — nobody else:
 - `oidc` — a person who **signed in at the IdP from a display client**
   (`a2a.login`, below): `user:oidc:<iss>#<sub>`, whatever their IdP says
   they are. Signing in is their enrolment.
+- `x509` — a **certificate principal**: an `a2a.principals` rule on an mTLS
+  listener (`a2a.tls.client_ca`) that admits one client certificate's key —
+  `match.spki`, the SHA-256 of its SubjectPublicKeyInfo — with an `id` and
+  an exact `idp_subject` pin. Over that certificate it enrols with
+  `delegation.enrol {idp}` (the IdP's device grant, since it is pinned), and
+  its grant is the key's (`x509:<SPKI SHA-256>`): a reissued certificate
+  with another key is not this principal. An operator one is the person
+  `operator:<id>`; a user one is `user:<id>`.
 - `device` — an RFC 0043 **device session** an operator approved under a
   name, and only a name an operator has bound to one person: pinned
   (`identity.delegation.device_pins.<name>: {iss, sub}`), or — opted in —
@@ -625,8 +633,7 @@ admits, by the principal's `source` — nobody else:
   name, or one that proved someone else, is `not_enrolled`, and its sign-in
   as someone else is `binding_mismatch` and leaves the grant alone.
 
-A certificate principal (`source: x509`) delegates in P2's second part; a
-bearer principal never does (`principal_not_delegable`), since a
+A bearer principal never delegates (`principal_not_delegable`), since a
 `bearer_ref` secret is typically shared. A template's principal is checked
 at every call, as it stands then: a run is the person's who started it,
 through the session it was started through, and a delegated server's tools
@@ -673,8 +680,9 @@ session enrols the same way from its display client: `delegation.enrol
 {idp}` answers with a task whose `signIn` annotation is the start link
 ([Display clients](interface.md#acting-for-you-at-an-mcp-server)).
 [`examples/okta-xaa-mcp.yaml`](../examples/okta-xaa-mcp.yaml) is a whole
-configuration of it: people signing in through `a2a.login`, and a pinned
-laptop.
+configuration of it: people signing in through `a2a.login`, a pinned
+laptop, an agent-mode chat server their template lets their work use, and
+an operator's `to: principal` rule.
 
 **Ending a session ends what it delegated.** A run, a conversation turn and
 a subagent started through a session act through it: `auth.sessions.revoke`,
@@ -689,14 +697,44 @@ server's results are both — anyone can write a Linear issue body — unless
 the operator sets `auth.trusted_output: true` on it, when they hold data and
 taint nothing; an `untrusted_input` tool's result, a webhook's or a
 non-operator's message, a peer's answer and the rest taint
-([Security model](security.md#acting-for-an-enrolled-person)). Then these
-wait for the person: any `egress` call — delegated or under agentd's own
-credential, a workflow step that sends the run's data out by its own effect
-too (an `http` step, `a2a.send`, `a2a.delegate`, an `emit` forwarded to a
-webhook or a peer, an `mcp.tool` or `mcp.resource` step at a server tagged
-`egress`) — from work that is tainted and holds delegated data; a delegated
-call to a `sensitive` or `egress` tool from tainted work; and every
-delegated `egress` call. The call gates, `agentd --delegation-list` shows it
+([Security model](security.md#acting-for-an-enrolled-person)). A person's
+own message — sent through a session whose principal is the grant's, a
+device session having itself signed in as the identity its name is bound
+to, or by a per-person operator over the unix listener — is theirs: it
+taints no work acting with their grant, and taints any other work it
+reaches. Then, after every `security.policies` rule of the
+operator's, these wait for the person, in this order: any `egress` call —
+delegated or under agentd's own credential, a workflow step that sends the
+run's data out by its own effect too (an `http` step, `a2a.send`,
+`a2a.delegate`, an `emit` forwarded to a webhook or a peer, an `mcp.tool`
+or `mcp.resource` step at a server tagged `egress`) — from work that is
+tainted and holds delegated data
+(`egress_from_tainted_work_holding_delegated_data`); a delegated call to a
+`sensitive` or `egress` tool from tainted work
+(`delegated_call_from_tainted_work`); an `exec` command from work holding
+delegated data (`exec_holding_delegated_data`); a delegated `egress` call
+from a workflow an instruction document defined, unless the person's
+template lists it for the server by name and definition digest
+(`templates[].servers.<name>.document_workflows`, the `hash`
+`workflow.list` shows; `document_sourced_delegated_egress`); and a
+delegated `egress` call at its first use per run — or conversation, or
+subagent — and tool (`delegated_egress`). An operator adds rules of their
+own: an `ask` with `to: principal` is the person's gate as these are, on
+any `security.policies` matcher — the facts `delegated`, `tainted`,
+`holds_delegated_data`, `unattended`, `document_sourced` and `mode`
+included — and `once_per: run_tool` makes it ask at the first use alone; it
+takes no `question` (the text is agentd's) and denies unanswered.
+
+```yaml
+# fragment: under security:
+policies:
+  # Every delegated write to the tracker asks, at its first use in a run.
+  - {match: {tool: "create_*", mode: delegated}, action: ask, to: principal, once_per: run_tool}
+  # Nothing a schedule started sends anything out.
+  - {match: {unattended: true, any_tags: [egress]}, action: deny}
+```
+
+The call gates, `agentd --delegation-list` shows it
 — agentd's own text of it, with the server, the tool, the arguments quoted
 and escaped, the scopes the token carries, the run, and what tainted it —
 and the person answers it: a per-person operator with `agentd
@@ -706,9 +744,17 @@ the task of the work it holds (`input-required`, badged as agentd's
 security gate, its `consentGate` annotation naming it) and answered with
 `delegation.approve` / `delegation.deny` through a session whose own IdP
 sign-in is younger than `identity.delegation.consent_session_max_age` (12
-hours by default; sign in again for an older one). An answer is bound to
+hours by default; sign in again for an older one); a certificate principal
+over the connection its certificate authenticates. An answer is bound to
 the gate's nonce and the hash of its arguments, and an approved step runs
-with the spec the person saw. No operator answers for the person unless
+with the spec the person saw. Gates of one shape — the same `shape` in
+`delegation.list`: rule, server, tool and argument names alike — may be
+answered together (`delegation.approve {gates: [{gate, nonce, args_hash},
+…]}`, `agentd --delegation-approve <gate>,<gate>`), each bound and recorded
+on its own. At most `identity.delegation.consent_per_minute` gates (10 by
+default) open for one person a minute; a call past that is refused rather
+than asked (`delegation.consent.rate_limited`). An approved first use is
+remembered for the unit of work and the tool until a restart. No operator answers for the person unless
 their template lists `approvers: [principal, operator]` (recorded `via:
 operator`), no message on the gate's task is an answer — each is refused and
 recorded — no judge answers whatever `agent.ask_human_fallback` says, and an
@@ -757,13 +803,52 @@ rotating token twice. `insufficient_user_authentication` is `step_up`: the
 call waits on a sign-in gate (above) — or a per-person operator runs
 `agentd --login idp:<name>` again — and the next mint presents that fresh ID
 token. Mints are budgeted per day and month per server
-(`templates[].budget`, 16 and 200 by default, 80% of Okta's 250 a month) and
-per run (12); `delegation.quota_warn` fires at 80%.
+(`templates[].budget`, 16 and 200 by default, 80% of Okta's 250 a month),
+per run (12), and per person and server in any minute (`per_minute`, 4 by
+default, every mint asked for counted, whatever the IdP answers), so a
+steered loop over scope sets or a server's string of refusals spends
+minutes of mints, never the day's; `delegation.quota_warn` fires at 80%.
+
+**Pairwise subjects.** With `identity.providers.<name>.subjects: pairwise`,
+an ID-JAG's `sub` is recorded and not compared with the grant's: the IdP
+may give each resource its own subject for the person. A server is sent the
+ID-JAG's own `sub` as `agent/acting_for` (`attribution: none` sends nothing)
+and `agent/grant`, a random handle per grant and server kept in memory —
+never the grant's id or the person's principal — so two servers share no
+handle to correlate the person by.
+
+**Agent-mode servers beside a delegation.** Work acting with a person's
+grant — their run, their conversation's turn, a subagent that inherits —
+is not offered an agent-mode MCP server tagged `sensitive` or `egress`, and
+a call to one is refused (`mode_mixing`): agentd's own credential there is
+broader than the person's grant, and a steered model would reach for it.
+`templates[].agent_mode_servers` lists the ones the person's work may still
+use; each of their calls comes back to the supervisor and is recorded
+(`delegation.agent_mode_call`). The load refuses the same resource or
+authorization server under a delegated and an agent-mode server.
+
+**A delegated server's questions.** A server that sends an elicitation on a
+connection made with a person's grant asks that person alone: the question
+is a gate of its own, owned by and addressed to them, in agentd's words with
+the server's quoted. It is answered as their consent gates are — over the
+unix listener, over their certificate, or from a display session whose own
+IdP sign-in is recent enough — and only through a session that holds the
+grant it was asked through: a device session under the same name that never
+signed in as the identity the name is bound to is refused
+(`delegation.elicitation.refused`). No operator answers it for them — an
+attempt is refused — no judge and no approval policy does, and unanswered
+within the server's wait it is cancelled. A URL elicitation is declined.
 
 **Revocation.** `agentd --delegation-revoke operator:alice`, or
 `--delegation-revoke idp:okta#00u1alice` for every grant of that IdP
 subject, revokes the refresh token at the IdP (RFC 7009, retried), writes the
-tombstone, deletes the sealed record and drops every token. An
+tombstone, deletes the sealed record and drops every token. A person revokes
+their own grant from their own session with `delegation.revoke {}`; anyone
+but an operator revokes their own alone — the grants the session they ask
+through holds, so a device session under the same name that never signed in
+as the identity the name is bound to revokes nothing. A revoked grant's calls fail
+`revoked` for as long as the tombstone register keeps the revocation, a
+restart included; enrolling again makes a new grant one epoch up. An
 `invalid_grant` from an exchange runs the liveness probe: if the refresh
 token is dead too, the grant is revoked the same way; if it is alive, the
 error is that server's alone and is backed off. `agentd --delegation-lint`
@@ -784,10 +869,16 @@ document may not declare a delegated server, set any of its pins or its
 client authentication, or reference any of those secrets by any spelling —
 a reference is compared by what it resolves to, and a `*_file` field's path
 as a file (RFC 0042, as RFC 0044 §5.14.1 amends it). `security.exec.enabled`
-is refused beside `identity.providers` or a seal key, as beside a delegated
-server. Where the kernel has Landlock, no child can open the store's
-directory, where the vault is, a mounted key file or the audit chain
-([Security model](security.md#secrets)).
+beside `identity.providers`, a seal key or a delegated server loads only
+under the whole isolation set — `spawn.uid` and `spawn.gid`, Landlock, and
+every path only the supervisor may open closed to the worker uid by mode
+and ownership — and the load names each piece missing. Where the kernel has
+Landlock, no child can open the store's directory, where the vault is, a
+mounted key file or the audit chain ([Security model](security.md#secrets));
+a delegation several people can hold grants under is refused on a kernel
+without it unless the worker uid closes them. While the instruction is
+frozen — its trust `freshness` deadline passed unconfirmed — no model turn
+and no run of a workflow it defined makes a delegated call.
 
 **Keys an external signer holds.** With `identity.delegation.key_custody:
 external`, agentd holds none of the keys: a signer process on a unix socket
@@ -820,26 +911,25 @@ set, enrolments, mints, uses, refusals, revocations and the person's consent
 answers are lines of a hash-chained log verified at every start, and each
 revocation and refresh-token version is anchored there before the store is
 written. A store restored from before a revocation then refuses the revoked
-grant as it loads: the person is `not_enrolled` and enrols again, and nothing
-is presented to the IdP.
+grant as it loads: the person's calls are `revoked` until they enrol again,
+and nothing is presented to the IdP.
 
 **A reload** applies `identity.delegation.templates`, `device_pins`,
-`device_first_binding`, `consent_session_max_age` and `consent_timeout`: a
+`device_first_binding`, `consent_per_minute`, `consent_session_max_age` and
+`consent_timeout`: a
 narrowed template holds every grant it allowed to the new ceilings at the
 next call; a template removed, a server removed from one, a pin changed or
 removed, and first binding turned off revoke the grants they allowed — at
 the IdP, tombstoned, `why` said in `delegation.revoked` — and drop the IdP
 proofs of those device names' sessions. Adding or changing a per-person
-operator's rule is a restart.
+operator's or a certificate principal's rule is a restart, and so is a
+change to `security.policies`, whose `to: principal` rules and facts are
+read with the rest of the section.
 
-**What this preview does not do yet** (RFC 0044 P2's second part and
-later): certificate principals that delegate, the hiding of agent-mode
-servers from delegated work (`templates[].agent_mode_servers` loads and
-changes nothing yet), the document-sourced consent rule
-(`servers.<name>.document_workflows`, likewise), consent rules an operator
-configures (`once_per`), CIBA, unattended runs (`act_for`, refused at load),
-same-domain token exchange (`grant: token_exchange`), and live interop
-against an Okta Integrator org or xaa.dev.
+**What this preview does not do yet** (RFC 0044 P3 and later): CIBA,
+unattended runs (`act_for`, refused at load), same-domain token exchange
+(`grant: token_exchange`), `on_revoked: ask`, and live interop against an
+Okta Integrator org or xaa.dev.
 
 ### Fields
 
@@ -852,8 +942,8 @@ against an Okta Integrator org or xaa.dev.
 | `subject`, `subjects`, `jwks_uri` | `identity.providers.<name>` | what the exchange presents; whether an ID-JAG's `sub` must be the person's; the key set's pin |
 | `seal_key`, `seal_key_previous` | `identity.delegation` | 32 bytes, hex or base64, as a secret reference (`key_custody: local`) |
 | `key_custody`, `signer` | `identity.delegation` | `local` (default) or `external`; the signer's `{socket, uid, timeout, seal_key, seal_key_previous}` |
-| `at_cache_cap`, `liveness_interval`, `consent_timeout`, `consent_session_max_age` | `identity.delegation` | `60m`, `15m`, `24h`, `12h` |
-| `templates` | `identity.delegation` | `{name, principals: {source, role, labels}, idp, servers: {<name>: {scopes, document_workflows}}, ttl, budget, subagents, approvers, agent_mode_servers}`: `source` is `operator`, `oidc` or `device`; `subagents` `none` (default) or `inherit`; `approvers` `[principal]` (default) or `[principal, operator]` |
+| `at_cache_cap`, `liveness_interval`, `consent_timeout`, `consent_session_max_age`, `consent_per_minute` | `identity.delegation` | `60m`, `15m`, `24h`, `12h`, `10` |
+| `templates` | `identity.delegation` | `{name, principals: {source, role, labels}, idp, servers: {<name>: {scopes, document_workflows}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers}`: `source` is `operator`, `oidc`, `x509` or `device`; `subagents` `none` (default) or `inherit`; `approvers` `[principal]` (default) or `[principal, operator]` |
 | `device_pins`, `device_first_binding` | `identity.delegation` | `<device name>: {iss, sub}`, each name bound to one person; `false` (an unpinned name binds to its first enrolment when `true`) |
 | `idp`, `token_ttl` | `a2a.login` | the IdP display clients sign people in at; their sessions' lifetime (`8h`, `5m`–`30d`) |
 | `grant: id_jag`, `idp`, `audience`, `resource`, `client_id` | `mcp.servers[].auth` | the delegated server's IdP, its authorization server, itself, and agentd's client there (all required) |
@@ -862,7 +952,8 @@ against an Okta Integrator org or xaa.dev.
 | `tools_from`, `tools_file` | `mcp.servers[].auth` | `first_grant` (default) or `file` |
 | `id_jag`, `id_jag_reuse`, `allow_unbound_at`, `attribution`, `max_at_age` | `mcp.servers[].auth` | `discover`/`assume`; `auto`/`never`; accept an ID-JAG that names no resource; `sub`/`none`; a stricter cap |
 | `trusted_output` | `mcp.servers[].auth` | the operator vouches nobody outside writes what the server answers: its results hold the person's data and taint nothing (default `false`) |
-| `uid`, `idp_subject` | `a2a.principals[]` | the per-person operator: the unix peer's uid, and their exact IdP identity |
+| `uid`, `spki`, `idp_subject` | `a2a.principals[]` | the person a rule pins: a per-person operator by the unix peer's uid, or a certificate principal by its key's SPKI SHA-256 (`match.spki`), and their exact IdP identity |
+| `to: principal`, `once_per` | `security.policies[]` | an `ask` that is the person's consent gate; `run_tool`: at the first use per run and tool alone |
 
 ## AWS SigV4
 

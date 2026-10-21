@@ -303,18 +303,92 @@ pub enum Note {
         server: String,
         tools: Vec<::mcp::wire::Tool>,
     },
+    /// A delegated server asks the person whose grant its connection
+    /// carries (`elicitation/create`).
+    Elicit(Box<Elicitation>),
 }
 
 /// Where notes go.
 pub type Notify = Arc<dyn Fn(Note) + Send + Sync>;
 
-/// A per-person operator.
+/// A delegated server's elicitation (RFC 0044 §5.13 item 10, T24): what it
+/// asks goes to the person whose grant the connection carries, and to no
+/// one else.
+#[derive(Debug)]
+pub struct Elicitation {
+    /// The principal id the person acts as: the gate's owner, and the one
+    /// who answers it.
+    pub principal: String,
+    /// The grant the connection was made with: whoever answers must hold
+    /// it, as a consent gate's answerer does.
+    pub grant: String,
+    pub server: String,
+    /// The server's words, which agentd does not vouch for.
+    pub message: String,
+    pub schema: Value,
+    /// How long the server waits for the answer.
+    pub timeout: Duration,
+    /// The person's answer, or `None`: cancelled.
+    pub reply: std::sync::mpsc::SyncSender<Option<Value>>,
+}
+
+/// The elicitation handler of a connection on a person's grant: a form the
+/// server sends is put to that person alone, and nothing answers it for
+/// them — unanswered within the server's wait, it is cancelled. A URL
+/// elicitation is declined by the client before it reaches here: agentd
+/// never opens a link a server sends.
+struct ElicitPerson {
+    notify: Option<Notify>,
+    principal: String,
+    grant: String,
+    server: String,
+    timeout: Duration,
+}
+
+impl ::mcp::inbound::Handler for ElicitPerson {
+    fn handle(&self, req: ::mcp::inbound::Inbound) -> Option<::mcp::inbound::Answer> {
+        use ::mcp::inbound::{Answer, Inbound};
+        let Inbound::Elicit {
+            message,
+            requested_schema,
+        } = req
+        else {
+            return None;
+        };
+        let Some(notify) = &self.notify else {
+            return Some(Answer::Cancel);
+        };
+        let (reply, answered) = std::sync::mpsc::sync_channel(1);
+        notify(Note::Elicit(Box::new(Elicitation {
+            principal: self.principal.clone(),
+            grant: self.grant.clone(),
+            server: self.server.clone(),
+            message,
+            schema: requested_schema.clone(),
+            timeout: self.timeout,
+            reply,
+        })));
+        match answered.recv_timeout(self.timeout) {
+            Ok(Some(a)) => Some(crate::mcp::elicit::shape_reply(&a, &requested_schema)),
+            _ => Some(Answer::Cancel),
+        }
+    }
+}
+
+/// A person an `a2a.principals` rule pins: a per-person operator, by the
+/// unix listener peer's uid, or a certificate principal, by the one client
+/// certificate key its rule admits — each with an exact `idp_subject`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Person {
-    /// `operator:<id>`: the principal id a run's authority names.
+    /// The typed principal's display string: `operator:<id>`, or
+    /// `x509:<SPKI SHA-256>` — what a grant and a gate name.
     pub id: String,
+    /// The principal id the listener names the caller by, and a run's
+    /// authority records: `operator:<id>`, or `<role>:<id>`.
+    pub principal: String,
     pub typed: PrincipalRef,
-    /// `unix-uid:<n>`.
+    pub role: crate::config::settings::Role,
+    /// `unix-uid:<n>`, or `x509:<SPKI SHA-256>`.
     pub fingerprint: String,
     pub iss: String,
     pub sub: String,
@@ -322,16 +396,41 @@ pub struct Person {
 }
 
 impl Person {
-    /// Every per-person operator `settings` declare.
+    /// Every person `settings` pin.
     pub fn all(settings: &Settings) -> Vec<Person> {
-        cfg::persons(settings)
+        use crate::config::settings::Role;
+        cfg::pinned(settings)
             .filter_map(|rule| {
                 let id = rule.id.clone()?;
                 let pin = rule.idp_subject.clone()?;
+                let (principal, typed, fingerprint) = match (&rule.matcher.uid, &rule.matcher.spki)
+                {
+                    (Some(uid), _) => (
+                        format!("operator:{id}"),
+                        PrincipalRef::local(Source::Operator, &id),
+                        format!("unix-uid:{uid}"),
+                    ),
+                    (None, Some(spki)) => (
+                        format!(
+                            "{}:{id}",
+                            if rule.role == Role::Operator {
+                                "operator"
+                            } else {
+                                "user"
+                            }
+                        ),
+                        PrincipalRef::local(Source::X509, spki),
+                        format!("x509:{spki}"),
+                    ),
+                    // The validation refuses a pin on any other rule.
+                    (None, None) => return None,
+                };
                 Some(Person {
-                    id: format!("operator:{id}"),
-                    typed: PrincipalRef::local(Source::Operator, &id),
-                    fingerprint: format!("unix-uid:{}", rule.matcher.uid?),
+                    id: typed.display(),
+                    principal,
+                    typed,
+                    role: rule.role,
+                    fingerprint,
                     iss: pin.iss,
                     sub: pin.sub,
                     labels: rule.labels.clone(),
@@ -406,9 +505,21 @@ impl Who {
     /// The template `source` this principal is.
     fn source(&self) -> &'static str {
         match self.kind {
+            WhoKind::Person { .. } if self.typed.source == Source::X509 => "x509",
             WhoKind::Person { .. } => "operator",
             WhoKind::Oidc => "oidc",
             WhoKind::Device { .. } => "device",
+        }
+    }
+
+    /// How this person answers their consent gates without a display
+    /// session: a per-person operator over the unix listener, a certificate
+    /// principal over the connection its certificate authenticates.
+    pub fn via_self(&self) -> &'static str {
+        if self.typed.source == Source::X509 {
+            "certificate"
+        } else {
+            "operator_self"
         }
     }
 }
@@ -770,6 +881,8 @@ pub struct Delegation {
     breakers: Mutex<BTreeMap<String, Fault>>,
     /// Mints per run (or conversation).
     runs: Mutex<BTreeMap<String, u32>>,
+    /// When each `(grant, resource)` minted in the last minute.
+    minted: Mutex<BTreeMap<String, std::collections::VecDeque<u64>>>,
     /// The random handle each `(grant, server)` is named by to its server.
     handles: Mutex<BTreeMap<String, String>>,
     /// Servers whose catalogue is being listed.
@@ -939,6 +1052,9 @@ fn admits(t: &Template, who: &Who, idp: &str) -> bool {
 /// How `who` enrols at `idp`, for a notice.
 fn enrol_hint(who: &Who, idp: &str) -> String {
     match who.kind {
+        WhoKind::Person { .. } if who.typed.source == Source::X509 => {
+            format!("they enrol with delegation.enrol {{idp: {idp}}} over their certificate")
+        }
         WhoKind::Person { .. } => format!("they enrol with `agentd --login idp:{idp}`"),
         WhoKind::Oidc => "they sign in at the IdP again from the display client".into(),
         WhoKind::Device { .. } => {
@@ -1041,6 +1157,7 @@ impl Delegation {
             faults: Mutex::new(BTreeMap::new()),
             breakers: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(BTreeMap::new()),
+            minted: Mutex::new(BTreeMap::new()),
             handles: Mutex::new(BTreeMap::new()),
             listing: Mutex::new(BTreeSet::new()),
             confirmed: Mutex::new(BTreeSet::new()),
@@ -1144,9 +1261,9 @@ impl Delegation {
         self.first_binding.load(Ordering::SeqCst)
     }
 
-    /// The per-person operator `id` names.
-    pub fn person(&self, id: &str) -> Option<&Person> {
-        self.persons.iter().find(|p| p.id == id)
+    /// The pinned person the listener names `principal`.
+    pub fn person(&self, principal: &str) -> Option<&Person> {
+        self.persons.iter().find(|p| p.principal == principal)
     }
 
     /// Who `acting` is, as its session or the configuration says now: a
@@ -1206,7 +1323,7 @@ impl Delegation {
         Ok(Who {
             id: p.id.clone(),
             typed: p.typed.clone(),
-            role: Role::Operator,
+            role: p.role,
             labels: p.labels.clone(),
             kind: WhoKind::Person {
                 fingerprint: p.fingerprint.clone(),
@@ -1222,6 +1339,37 @@ impl Delegation {
     /// network: what decides whether its tools are offered at all.
     pub fn usable(&self, acting: Acting<'_>, server: &str) -> bool {
         self.admit(acting, server).is_ok()
+    }
+
+    /// The templates of the grants `acting` acts with now — each grant the
+    /// person holds at any IdP that is theirs to use through the session the
+    /// work acts through, unexpired, under the template that admits them —
+    /// or `None` when it acts with nobody's: agentd's own authority (RFC
+    /// 0044 §5.3). With no network.
+    pub fn acting_templates(&self, acting: Acting<'_>) -> Option<Vec<Template>> {
+        let who = self.who(acting).ok()?;
+        let held: Vec<(String, Grant)> = {
+            let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            self.providers
+                .iter()
+                .filter_map(|(name, idp)| {
+                    let g = grants.get(&who.typed.grant_id(&idp.cfg.issuer))?;
+                    Some((name.clone(), g.clone()))
+                })
+                .collect()
+        };
+        let templates = self.templates.read().unwrap_or_else(|e| e.into_inner());
+        let out: Vec<Template> = held
+            .iter()
+            .filter(|(idp, g)| self.held_to(&who, g, idp).is_ok() && now_ms() < g.expires_ms)
+            .filter_map(|(idp, g)| {
+                templates
+                    .iter()
+                    .find(|t| t.name == g.template && admits(t, &who, idp))
+                    .cloned()
+            })
+            .collect();
+        (!out.is_empty()).then_some(out)
     }
 
     /// The checks a delegated call passes before anything is dispatched:
@@ -1267,6 +1415,9 @@ impl Delegation {
             .get(&gid)
             .cloned();
         let Some(grant) = held else {
+            // A revocation is said as one for as long as the tombstone
+            // register keeps its record, a restart included: the person
+            // enrols again, and nothing is presented meanwhile.
             if self
                 .vault
                 .floors()
@@ -1274,7 +1425,7 @@ impl Delegation {
                 .is_some_and(|f| f.revoked_epoch.is_some())
             {
                 return Err(refuse(
-                    Code::NotEnrolled,
+                    Code::Revoked,
                     format!(
                         "{}'s grant at {} was revoked: they enrol again to act through it",
                         who.id, s.idp
@@ -1383,6 +1534,26 @@ impl Delegation {
                 Ok(())
             }
         }
+    }
+
+    /// Whether grant `grant_id` is `who`'s to act with as they stand now —
+    /// theirs, and for a device name bound to the very identity their
+    /// session proved ([`Self::held_to`]): what answering a question the
+    /// grant's connection was asked takes (RFC 0044 T24).
+    pub fn holds(&self, who: &Who, grant_id: &str) -> Result<(), DelegationError> {
+        let held = self
+            .grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(grant_id)
+            .cloned();
+        let Some(grant) = held.filter(|g| g.principal == who.typed) else {
+            return Err(refuse(
+                Code::NotEnrolled,
+                format!("{} holds no such grant", who.id),
+            ));
+        };
+        self.held_to(who, &grant, &grant.idp)
     }
 
     /// The template that admits `who` at `idp`.
@@ -1824,6 +1995,34 @@ impl Delegation {
                     budget.per_run()
                 ),
             ));
+        }
+        // The rate per person and resource (§5.13 item 7): a steered loop
+        // over scope sets, or a server's string of refusals, spends minutes
+        // of mints, never the day's budget in seconds. Every mint asked for
+        // counts, whatever the IdP answers.
+        {
+            let now = now_ms();
+            let mut minted = self.minted.lock().unwrap_or_else(|e| e.into_inner());
+            minted.retain(|_, q| q.back().is_some_and(|t| now.saturating_sub(*t) < 60_000));
+            let q = minted
+                .entry(pair(&grant.grant_id, &s.resource))
+                .or_default();
+            while q.front().is_some_and(|t| now.saturating_sub(*t) >= 60_000) {
+                q.pop_front();
+            }
+            if q.len() >= budget.per_minute() as usize {
+                return Err(refuse(
+                    Code::BudgetExhausted,
+                    format!(
+                        "{} asked for {} mints at {} in the last minute (budget.per_minute {}): tried again once the minute has passed",
+                        grant.principal.display(),
+                        q.len(),
+                        s.resource,
+                        budget.per_minute()
+                    ),
+                ));
+            }
+            q.push_back(now);
         }
         let idp = self
             .providers
@@ -2367,7 +2566,7 @@ impl Delegation {
         for _attempt in 0..2 {
             self.token(s, &grant, &scopes, &entry, c, true)?;
             *entry.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let client = match self.client(s, &entry) {
+            let client = match self.client(s, &entry, &grant) {
                 Ok(client) => client,
                 // The server refused the token at the handshake: the same
                 // ladder as a refused call.
@@ -2482,11 +2681,23 @@ impl Delegation {
         ))
     }
 
-    /// The connection of `entry`, made with the EMA extension declared.
+    /// The principal id the listener names the holder of a grant for
+    /// `typed` by: a pinned person's rule id, else the typed principal's
+    /// display string.
+    fn principal_of(&self, typed: &PrincipalRef) -> String {
+        self.persons
+            .iter()
+            .find(|p| &p.typed == typed)
+            .map_or_else(|| typed.display(), |p| p.principal.clone())
+    }
+
+    /// The connection of `entry`, on `grant`, made with the EMA extension
+    /// declared and an elicitation handler that asks the grant's person.
     fn client(
         &self,
         s: &Server,
         entry: &Entry,
+        grant: &Grant,
     ) -> Result<Arc<::mcp::client::McpClient>, DelegationError> {
         if let Some(c) = entry
             .client
@@ -2519,7 +2730,18 @@ impl Delegation {
             version: crate::VERSION.into(),
             title: None,
         })
-        .with_extension(idjag::wire::EMA_EXTENSION);
+        .with_extension(idjag::wire::EMA_EXTENSION)
+        .with_elicitation(Arc::new(ElicitPerson {
+            notify: self
+                .notify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            principal: self.principal_of(&grant.principal),
+            grant: grant.grant_id.clone(),
+            server: s.name.clone(),
+            timeout: s.timeout,
+        }));
         client
             .initialize()
             .map_err(|e| refuse(Code::ResourceFault, format!("{}: {e}", s.name)))?;
@@ -2632,7 +2854,7 @@ impl Delegation {
             step: None,
         };
         self.token(s, &grant, &scopes, &entry, &c, true)?;
-        let client = self.client(s, &entry)?;
+        let client = self.client(s, &entry, &grant)?;
         let tools = client
             .list_tools()
             .map_err(|e| refuse(Code::ResourceFault, format!("{server}: tools/list: {e}")))?;
@@ -2907,6 +3129,35 @@ impl Delegation {
             return Err(format!("no grant names {target}"));
         }
         Ok(matching
+            .iter()
+            .map(|g| self.revoke_grant(g, by, None))
+            .collect())
+    }
+
+    /// Revoke the grants `who` holds as they stand now (self-service, RFC
+    /// 0044 §5.8): each of theirs that is theirs to use through the session
+    /// they ask through — for a device name, one bound to the very identity
+    /// that session proved — and no other. A device session under the same
+    /// name that never signed in as that identity holds none, so revokes
+    /// none.
+    pub fn revoke_held(&self, who: &Who, by: &str) -> Result<Vec<Value>, String> {
+        let held: Vec<Grant> = {
+            let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            self.providers
+                .iter()
+                .filter_map(|(name, idp)| {
+                    let g = grants.get(&who.typed.grant_id(&idp.cfg.issuer))?;
+                    self.held_to(who, g, name).is_ok().then(|| g.clone())
+                })
+                .collect()
+        };
+        if held.is_empty() {
+            return Err(format!(
+                "{} holds no grant this session may use: a session revokes the grants it acts with, once it has signed in at the IdP as their holder",
+                who.id
+            ));
+        }
+        Ok(held
             .iter()
             .map(|g| self.revoke_grant(g, by, None))
             .collect())
@@ -3870,6 +4121,96 @@ mod tests {
             d.bind(&who("s4"), idp, &claims("00u3carol")).unwrap(),
             Some(BOUND_BY_PIN)
         );
+    }
+
+    /// A certificate principal pinned by its key and its IdP identity is a
+    /// person who delegates (RFC 0044 §5.2): named by the listener's id,
+    /// held to the key its rule admits and the pin; work for them acts with
+    /// their grant, and work for nobody with a grant does not; once their
+    /// grant is revoked, every later call says `revoked` for as long as the
+    /// register keeps the revocation (the user's decision of 2026-10-21).
+    #[test]
+    fn a_certificate_principal_delegates_and_a_revoked_grant_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "ab".repeat(32);
+        let mut settings = people(
+            dir.path(),
+            json!({"templates": [template("certs", "x509", &["issues:read", "issues:write"])]}),
+        );
+        settings.a2a.principals = serde_json::from_value(json!([
+            {"match": {"spki": key}, "role": "user", "id": "alice",
+             "idp_subject": {"iss": ISS, "sub": "00u1alice"}}
+        ]))
+        .unwrap();
+        let book = Arc::new(Book::default());
+        let d = supervisor(&settings, Arc::clone(&book));
+        let alice = Acting::new(Some("user:alice"), None);
+        let who = d.who(alice).unwrap();
+        assert_eq!(who.id, format!("x509:{key}"));
+        assert_eq!((who.source(), who.via_self()), ("x509", "certificate"));
+        assert_eq!(
+            code(d.admit(alice, "linear")),
+            Some(Code::NotEnrolled),
+            "no grant yet"
+        );
+        assert!(d.acting_templates(alice).is_none());
+        let g = Grant {
+            grant_id: who.typed.grant_id(ISS),
+            principal: who.typed.clone(),
+            fingerprint: who.fingerprint(ISS, "00u1alice"),
+            idp: "okta".into(),
+            idp_iss: ISS.into(),
+            sub: "00u1alice".into(),
+            email_hash: None,
+            template: "certs".into(),
+            ceilings: [("linear".to_string(), vec!["issues:read".to_string()])].into(),
+            created_ms: now_ms(),
+            expires_ms: now_ms() + 3_600_000,
+            epoch: 1,
+            rt_version: 1,
+            quota: BTreeMap::new(),
+            bound_by: None,
+        };
+        d.grants
+            .lock()
+            .unwrap()
+            .insert(g.grant_id.clone(), g.clone());
+        assert!(d.admit(alice, "linear").is_ok());
+        assert_eq!(
+            d.acting_templates(alice).map(|t| t[0].name.clone()),
+            Some("certs".to_string())
+        );
+        assert!(d.who(Acting::new(Some("user:mallory"), None)).is_err());
+        // The grant is held by its own principal alone: a device named
+        // alice is `user:alice` to the listener too, signed in at the IdP
+        // as the very same identity, and holds none of it — it answers none
+        // of its questions and revokes nothing.
+        let device = Who {
+            id: "user:alice".into(),
+            typed: PrincipalRef::local(Source::Device, "alice"),
+            kind: WhoKind::Device {
+                name: "alice".into(),
+            },
+            session: Some("ds_laptop".into()),
+            proof: Some(crate::a2a::principals::typed::IdpProof {
+                idp: "okta".into(),
+                iss: ISS.into(),
+                sub: "00u1alice".into(),
+                at_ms: now_ms(),
+            }),
+            ..who.clone()
+        };
+        assert!(d.holds(&who, &g.grant_id).is_ok());
+        assert!(d.holds(&device, &g.grant_id).is_err());
+        assert!(d.holds(&who, "no-such-grant").is_err());
+        assert!(d.revoke_held(&device, "user:alice").is_err());
+        assert!(d.admit(alice, "linear").is_ok(), "untouched");
+        // Revoked by its holder: said as one, and the work no longer acts
+        // with a grant.
+        let done = d.revoke_held(&who, "user:alice").unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(code(d.admit(alice, "linear")), Some(Code::Revoked));
+        assert!(d.acting_templates(alice).is_none());
     }
 
     /// A reload takes the templates, pins and first binding at once: a

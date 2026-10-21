@@ -16,8 +16,17 @@
 //!
 //! First match wins and no match is allow, so an empty list is exactly today's
 //! behaviour and the common path pays one `is_empty` check.
+//!
+//! **The person's consent rules** (RFC 0044 §5.13 item 6) are rules of the
+//! same shape, matched by the same code ([`consent_rules`]): agentd ships
+//! them, and where a delegation is declared every call is held to them
+//! after the operator's own list — an operator's `allow` decides the
+//! operator's list alone, never the person's consent. An operator adds to
+//! them with `to: principal` rules of their own.
 
-use crate::config::settings::{Policy, PolicyAction, PolicyCaller};
+use crate::config::settings::{
+    AuthorityMode, OncePer, Policy, PolicyAction, PolicyCaller, PolicyMatch, PolicyTo,
+};
 use crate::sec::scope::TrifectaTag;
 use serde_json::Value;
 
@@ -48,6 +57,25 @@ pub struct Facts {
     pub tainted: bool,
     /// A delegated server's result reached the work making it.
     pub holds_delegated_data: bool,
+    /// Nobody is there to answer: a trigger started the work.
+    pub unattended: bool,
+    /// The call is made in a run of a workflow an instruction document
+    /// defined, and — for a delegated call — the person's template does not
+    /// list that workflow for the call's server.
+    pub document_sourced: bool,
+    /// The work acts with an enrolled person's grant.
+    pub delegated_work: bool,
+}
+
+impl Facts {
+    /// The work's authority, as the `mode` matcher reads it.
+    pub fn mode(&self) -> AuthorityMode {
+        if self.delegated_work {
+            AuthorityMode::Delegated
+        } else {
+            AuthorityMode::Agent
+        }
+    }
 }
 
 /// Whether `want`, when a rule says it, is `have`.
@@ -71,7 +99,9 @@ pub struct Verdict {
     /// Who may answer an `ask` verdict, as the rule declared it (`to:`).
     /// `None` here is "the rule named nobody"; the gate then addresses the
     /// operator, never the caller whose call is being judged.
-    pub to: Option<crate::a2a::principals::Addressee>,
+    pub to: Option<PolicyTo>,
+    /// The rule asks on the first use per run and tool alone.
+    pub once_per: Option<OncePer>,
 }
 
 /// The tag name an operator writes in `match: {tags: [...]}`.
@@ -106,6 +136,9 @@ fn matches(p: &Policy, call: &Call<'_>, cel_ok: &mut bool) -> bool {
             p.matcher.holds_delegated_data,
             call.facts.holds_delegated_data,
         )
+        || !fact(p.matcher.unattended, call.facts.unattended)
+        || !fact(p.matcher.document_sourced, call.facts.document_sourced)
+        || p.matcher.mode.is_some_and(|m| m != call.facts.mode())
     {
         return false;
     }
@@ -181,7 +214,21 @@ pub fn question(asked: Option<&str>, tool: &str, caller: PolicyCaller, args: &Va
 /// fail-closed rather than a pass. A call that is also another's
 /// ([`Call::also`]) is held by the first rule that matches it as either.
 pub fn evaluate(policies: &[Policy], call: &Call<'_>) -> Result<Option<Verdict>, usize> {
+    evaluate_past(policies, call, &|_| false)
+}
+
+/// [`evaluate`], with the rules `passed` says the call is past — a
+/// `once_per` rule whose first use the person approved — read as matching
+/// nothing, so the scan goes on to the rules after them.
+pub fn evaluate_past(
+    policies: &[Policy],
+    call: &Call<'_>,
+    passed: &dyn Fn(usize) -> bool,
+) -> Result<Option<Verdict>, usize> {
     for (i, p) in policies.iter().enumerate() {
+        if passed(i) {
+            continue;
+        }
         let mut cel_ok = true;
         let hit = matches(p, call, &mut cel_ok)
             || (cel_ok && call.also.is_some_and(|a| matches(p, a, &mut cel_ok)));
@@ -201,6 +248,7 @@ pub fn evaluate(policies: &[Policy], call: &Call<'_>) -> Result<Option<Verdict>,
                 on_timeout: PolicyAction::Deny,
                 timeout_ms: None,
                 to: None,
+                once_per: None,
             }));
         }
         return Ok(Some(Verdict {
@@ -211,9 +259,124 @@ pub fn evaluate(policies: &[Policy], call: &Call<'_>) -> Result<Option<Verdict>,
             on_timeout: p.on_timeout.unwrap_or(PolicyAction::Deny),
             timeout_ms: p.timeout.as_ref().map(|d| d.0.as_millis() as u64),
             to: p.to.clone(),
+            once_per: p.once_per,
         }));
     }
     Ok(None)
+}
+
+/// One of the person's consent rules agentd ships (RFC 0044 §5.13 item 6):
+/// the name a gate and its record give it, and the rule.
+pub struct ConsentRule {
+    pub name: &'static str,
+    pub rule: Policy,
+}
+
+/// The person's consent rules, in the order they are held to, each an
+/// `ask` to the person that denies unanswered — the rules that ask at
+/// every use first, then the one that asks at the first use per run and
+/// tool:
+///
+/// 1. `egress_from_tainted_work_holding_delegated_data` — any `egress`
+///    call, delegated or under agentd's own credential, from work that has
+///    read outside text and holds the person's data;
+/// 2. `delegated_call_from_tainted_work` — a delegated `sensitive` or
+///    `egress` call from work that has read outside text;
+/// 3. `exec_holding_delegated_data` — a local command (`exec`, which is
+///    egress: a command can send anything anywhere) from work that holds
+///    the person's data, tainted or not;
+/// 4. `document_sourced_delegated_egress` — a delegated `egress` call from
+///    a run of a workflow an instruction document defined, which the
+///    person's template does not list for the server;
+/// 5. `delegated_egress` — a delegated `egress` call, at its first use per
+///    run and tool.
+pub fn consent_rules() -> &'static [ConsentRule] {
+    static RULES: std::sync::OnceLock<Vec<ConsentRule>> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let tags = |t: &[&str]| t.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let ask = |matcher: PolicyMatch, once_per: Option<OncePer>| Policy {
+            matcher,
+            action: PolicyAction::Ask,
+            on_timeout: Some(PolicyAction::Deny),
+            to: Some(PolicyTo::Principal),
+            once_per,
+            ..Policy::default()
+        };
+        vec![
+            ConsentRule {
+                name: "egress_from_tainted_work_holding_delegated_data",
+                rule: ask(
+                    PolicyMatch {
+                        tainted: Some(true),
+                        holds_delegated_data: Some(true),
+                        any_tags: tags(&["egress"]),
+                        ..PolicyMatch::default()
+                    },
+                    None,
+                ),
+            },
+            ConsentRule {
+                name: "delegated_call_from_tainted_work",
+                rule: ask(
+                    PolicyMatch {
+                        delegated: Some(true),
+                        tainted: Some(true),
+                        any_tags: tags(&["egress", "sensitive"]),
+                        ..PolicyMatch::default()
+                    },
+                    None,
+                ),
+            },
+            ConsentRule {
+                name: "exec_holding_delegated_data",
+                rule: ask(
+                    PolicyMatch {
+                        tool: Some("exec".into()),
+                        holds_delegated_data: Some(true),
+                        ..PolicyMatch::default()
+                    },
+                    None,
+                ),
+            },
+            ConsentRule {
+                name: "document_sourced_delegated_egress",
+                rule: ask(
+                    PolicyMatch {
+                        delegated: Some(true),
+                        document_sourced: Some(true),
+                        any_tags: tags(&["egress"]),
+                        ..PolicyMatch::default()
+                    },
+                    None,
+                ),
+            },
+            ConsentRule {
+                name: "delegated_egress",
+                rule: ask(
+                    PolicyMatch {
+                        delegated: Some(true),
+                        any_tags: tags(&["egress"]),
+                        ..PolicyMatch::default()
+                    },
+                    Some(OncePer::RunTool),
+                ),
+            },
+        ]
+    })
+}
+
+/// The first of the person's consent rules `call` meets, past those
+/// `passed` says it is past: its name, and whether it asks only at the
+/// first use per run and tool.
+pub fn consent_rule(
+    call: &Call<'_>,
+    passed: &dyn Fn(&str) -> bool,
+) -> Option<(&'static str, bool)> {
+    consent_rules()
+        .iter()
+        .filter(|r| !passed(r.name))
+        .find(|r| matches(&r.rule, call, &mut true))
+        .map(|r| (r.name, r.rule.once_per.is_some()))
 }
 
 /// Whether any rule could apply to this tool for this caller, ignoring the
@@ -347,7 +510,7 @@ mod tests {
         let both = Facts {
             tainted: true,
             holds_delegated_data: true,
-            delegated: false,
+            ..Facts::default()
         };
         let hit = |c: &Call| evaluate(std::slice::from_ref(&rule), c).unwrap().is_some();
         assert!(hit(&with(&[TrifectaTag::Egress], both)));
@@ -413,6 +576,164 @@ mod tests {
             &[TrifectaTag::UntrustedInput],
             PolicyCaller::Root
         ));
+    }
+
+    /// `unattended`, `document_sourced` and `mode` narrow a rule as the
+    /// other facts do: each holds only the call it names, and a rule saying
+    /// none of them holds every call; a `once_per` rule the call is past is
+    /// read as matching nothing, and the scan goes on.
+    #[test]
+    fn unattended_document_sourced_and_mode_narrow_a_rule() {
+        use crate::config::settings::AuthorityMode;
+        let args = Value::Null;
+        let hit = |m: PolicyMatch, f: Facts| {
+            let c = Call {
+                facts: f,
+                ..call("t", &[], PolicyCaller::Workflow, &args)
+            };
+            evaluate(&[pol(m, PolicyAction::Deny)], &c)
+                .unwrap()
+                .is_some()
+        };
+        let unattended = PolicyMatch {
+            unattended: Some(true),
+            ..Default::default()
+        };
+        let f = |unattended, document_sourced, delegated_work| Facts {
+            unattended,
+            document_sourced,
+            delegated_work,
+            ..Facts::default()
+        };
+        assert!(hit(unattended.clone(), f(true, false, false)));
+        assert!(!hit(unattended, f(false, false, false)));
+        let doc = PolicyMatch {
+            document_sourced: Some(true),
+            ..Default::default()
+        };
+        assert!(hit(doc.clone(), f(false, true, false)));
+        assert!(!hit(doc, f(false, false, false)));
+        let delegated = PolicyMatch {
+            mode: Some(AuthorityMode::Delegated),
+            ..Default::default()
+        };
+        let agent = PolicyMatch {
+            mode: Some(AuthorityMode::Agent),
+            ..Default::default()
+        };
+        assert!(hit(delegated.clone(), f(false, false, true)));
+        assert!(!hit(delegated, f(false, false, false)));
+        assert!(hit(agent.clone(), f(false, false, false)));
+        assert!(!hit(agent, f(false, false, true)));
+        assert!(hit(PolicyMatch::default(), f(true, true, true)));
+        // Past the first rule, the second decides.
+        let rules = [
+            pol(PolicyMatch::default(), PolicyAction::Ask),
+            pol(PolicyMatch::default(), PolicyAction::Deny),
+        ];
+        let c = call("t", &[], PolicyCaller::Root, &args);
+        let v = evaluate_past(&rules, &c, &|i| i == 0).unwrap().unwrap();
+        assert_eq!((v.action, v.rule), (PolicyAction::Deny, 1));
+    }
+
+    /// The person's shipped rules, each on the facts it names, in their
+    /// order: tainted work holding the person's data asks before any egress,
+    /// tainted work before a delegated sensitive or egress call, a command
+    /// from work holding the data whether tainted or not, a document's
+    /// workflow before a delegated egress call, and a delegated egress call
+    /// at its first use alone — once past, nothing of theirs asks.
+    #[test]
+    fn the_persons_consent_rules_ask_as_shipped() {
+        let args = Value::Null;
+        let rule = |tool: &str, tags: &[TrifectaTag], f: Facts, past: &[&str]| {
+            let c = Call {
+                facts: f,
+                ..call(tool, tags, PolicyCaller::Root, &args)
+            };
+            consent_rule(&c, &|n| past.contains(&n)).map(|(n, _)| n)
+        };
+        let egress = [TrifectaTag::Egress];
+        let sensitive = [TrifectaTag::Sensitive];
+        let data = Facts {
+            holds_delegated_data: true,
+            ..Facts::default()
+        };
+        let tainted = Facts {
+            tainted: true,
+            ..Facts::default()
+        };
+        let both = Facts {
+            tainted: true,
+            ..data
+        };
+        let delegated = |f: Facts| Facts {
+            delegated: true,
+            ..f
+        };
+        assert_eq!(
+            rule("slack.post", &egress, both, &[]),
+            Some("egress_from_tainted_work_holding_delegated_data")
+        );
+        assert_eq!(rule("slack.post", &egress, data, &[]), None, "untainted");
+        assert_eq!(rule("slack.post", &egress, tainted, &[]), None, "no data");
+        assert_eq!(
+            rule("linear.create_issue", &sensitive, delegated(tainted), &[]),
+            Some("delegated_call_from_tainted_work")
+        );
+        assert_eq!(
+            rule(
+                "linear.create_issue",
+                &sensitive,
+                delegated(Facts::default()),
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            rule("exec", &[], data, &[]),
+            Some("exec_holding_delegated_data")
+        );
+        assert_eq!(rule("exec", &[], Facts::default(), &[]), None);
+        let doc = Facts {
+            document_sourced: true,
+            ..delegated(Facts::default())
+        };
+        assert_eq!(
+            rule("linear.comment", &egress, doc, &[]),
+            Some("document_sourced_delegated_egress")
+        );
+        assert_eq!(
+            rule("linear.comment", &egress, delegated(Facts::default()), &[]),
+            Some("delegated_egress")
+        );
+        assert_eq!(
+            rule(
+                "linear.comment",
+                &egress,
+                delegated(Facts::default()),
+                &["delegated_egress"]
+            ),
+            None,
+            "the first use approved"
+        );
+        assert_eq!(
+            rule("linear.comment", &egress, doc, &["delegated_egress"]),
+            Some("document_sourced_delegated_egress"),
+            "a document's step asks at every use"
+        );
+        for r in consent_rules() {
+            assert_eq!(r.rule.action, PolicyAction::Ask, "{}", r.name);
+            assert_eq!(r.rule.to, Some(PolicyTo::Principal), "{}", r.name);
+            assert_eq!(r.rule.on_timeout, Some(PolicyAction::Deny), "{}", r.name);
+        }
+        assert_eq!(
+            consent_rules()
+                .iter()
+                .filter(|r| r.rule.once_per.is_some())
+                .map(|r| r.name)
+                .collect::<Vec<_>>(),
+            ["delegated_egress"]
+        );
     }
 
     #[test]
@@ -536,7 +857,7 @@ mod tests {
         let finance =
             crate::a2a::principals::Addressee::parse(&serde_json::json!("*@fin.example")).unwrap();
         let rules = vec![Policy {
-            to: Some(finance.clone()),
+            to: Some(PolicyTo::Addressee(finance.clone())),
             ..pol(
                 PolicyMatch {
                     tool: Some("pay.*".into()),
@@ -548,7 +869,7 @@ mod tests {
         let v = evaluate(&rules, &call("pay.out", &[], PolicyCaller::Root, &args))
             .unwrap()
             .expect("matched");
-        assert_eq!(v.to, Some(finance));
+        assert_eq!(v.to, Some(PolicyTo::Addressee(finance)));
     }
 
     /// An argument guard that will not evaluate is fail-closed. Returning "no

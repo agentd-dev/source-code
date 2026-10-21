@@ -85,6 +85,13 @@ pub struct Child {
     /// for the next life, never failed. A child already cancelled for a reason
     /// of its own (a run's cancel, a liveness verdict) keeps that reason.
     pub parked: bool,
+    /// For a turn worker, the delegated servers' tools its plan offered — a
+    /// step's `tools:` and `servers:` narrowed; for a subagent, those of the
+    /// delegated servers it declares that its `tools:` grant admits: the
+    /// supervisor makes a delegated call for it of these alone (RFC 0044
+    /// §5.7, per-`(step, tool)` use-authorisation). `None` for any other
+    /// child.
+    pub offered: Option<std::collections::BTreeSet<String>>,
 }
 
 /// The children registry.
@@ -207,6 +214,7 @@ impl Children {
             settled: false,
             stop: None,
             parked: false,
+            offered: None,
         };
         self.pid_to_node.insert(child.sub.pid(), node);
         self.map.insert(node, child);

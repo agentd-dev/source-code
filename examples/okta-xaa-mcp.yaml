@@ -15,16 +15,26 @@
 # session has signed in at the IdP. The operator's bearer approves device
 # codes and offboards people; it never acts as anyone.
 #
+# What a person sends from their own session is theirs: it is no outside
+# text to their own work. What Linear answers is (anyone can write an
+# issue), so after a read every later Linear call in the run asks them
+# first; and every Linear tool is tagged egress, so each one's first use in
+# a run — a read's too — asks them. The team chat is agentd's own server: people's
+# work may post to it — their template lists it — and its first post in a
+# run asks them, by the operator's rule below.
+#
 # The keys are files the deployment mounts under /run/agentd/ — never the
 # environment, which agentd refuses for a delegation key. On a host other than
-# this one, listen on https:// with `a2a.url` and `a2a.tls`.
+# this one, listen on https:// with `a2a.url` and `a2a.tls`. Several people
+# hold grants here, so the kernel must have Landlock — or workers run as
+# `spawn.uid`, with the keys and the store closed to that uid.
 
 agent:
   name: assistant
   instruction: |
     You help each person with their Linear issues, acting as them. Before
-    you call Linear, say what you will do: agentd asks them to approve each
-    call it makes as them, in their own display client.
+    you call Linear, say what you will do: agentd asks them to approve the
+    calls it makes as them, in their own display client.
   preflight: never
 
 intelligence:
@@ -43,6 +53,13 @@ a2a:
 
 security:
   experimental: {id_jag: true}
+  policies:
+    # A person's work posting with agentd's own credential asks them, at its
+    # first post in each run.
+    - match: {mode: delegated, delegated: false, any_tags: [egress]}
+      action: ask
+      to: principal
+      once_per: run_tool
 
 identity:
   providers:
@@ -59,6 +76,8 @@ identity:
     seal_key: "{{secret-file:/run/agentd/delegation-seal}}"
     # A gate is approved from a session whose own IdP sign-in is this recent.
     consent_session_max_age: 8h
+    # At most this many gates a minute for one person; past it, refused.
+    consent_per_minute: 6
     device_pins:
       alice-laptop: {iss: https://acme.okta.com, sub: 00u1alice}
     templates:
@@ -67,6 +86,10 @@ identity:
         idp: okta
         servers:
           linear: {scopes: ["issues:read", "issues:write"]}
+        # An agent-mode server tagged egress stays hidden from people's work
+        # unless listed here.
+        agent_mode_servers: [team-chat]
+        budget: {per_minute: 4}
       - name: laptops
         principals: {source: device}
         idp: okta
@@ -91,3 +114,7 @@ mcp:
           kid: agentd-ras-1
         scopes: ["issues:read"]
         tool_scopes: {create_issue: ["issues:write"]}
+    - name: team-chat
+      endpoint: https://chat-mcp.acme.example/mcp
+      tags: {"*": [egress]}
+      auth: {kind: static, token: "{{secret-file:/run/agentd/chat-token}}"}

@@ -385,6 +385,45 @@ pub fn run() -> i32 {
         }
     }
 
+    // A test hook (debug and `internal-mocks` builds only): the worker asks
+    // the supervisor for each call a test names — a JSON array of `{tool,
+    // args}` — as a worker that ignored what it was offered would, and says
+    // the answer on stderr as `test.worker_ask`: so a test sees what the
+    // supervisor holds a worker to, not what the worker's own catalogue
+    // lets its model name.
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    if let Ok(calls) = std::env::var("AGENTD_TEST_WORKER_ASK") {
+        let calls: Vec<serde_json::Value> = serde_json::from_str(&calls).unwrap_or_default();
+        for c in &calls {
+            let name = c["tool"].as_str().unwrap_or_default();
+            let id = replies.next_id();
+            send_up(
+                &up,
+                &AgentMsg::ToolRequest {
+                    id,
+                    name: name.to_string(),
+                    args: c
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                },
+            );
+            let (result, is_error) =
+                match replies.wait(id, Instant::now() + Duration::from_secs(10), &cancel) {
+                    Some(crate::subagent::replies::Reply::Tool { result, is_error }) => {
+                        (result, is_error)
+                    }
+                    _ => (serde_json::Value::Null, true),
+                };
+            eprintln!(
+                "{}",
+                serde_json::json!({"event": "test.worker_ask",
+                                   "turn": payload.role == crate::subagent::protocol::Role::Turn,
+                                   "tool": name, "result": result, "is_error": is_error})
+            );
+        }
+    }
+
     // A TURN WORKER runs one turn over the supplied context slice, with internal
     // tools round-tripping to the supervisor. It reuses the connections and
     // supervision set up above; only the loop it runs differs.

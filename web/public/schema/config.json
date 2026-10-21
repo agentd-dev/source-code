@@ -684,7 +684,7 @@
         },
         "idp_subject": {
           "additionalProperties": false,
-          "description": "the one IdP identity this principal is, exact: required to delegate (RFC 0044; needs the xaa feature)",
+          "description": "the one IdP identity this principal is, exact: required to delegate, on a uid or an spki rule (RFC 0044; needs the xaa feature)",
           "properties": {
             "iss": {
               "type": "string"
@@ -716,6 +716,11 @@
               "type": "string"
             },
             "san": {
+              "type": "string"
+            },
+            "spki": {
+              "description": "a client certificate's key, the SHA-256 of its SubjectPublicKeyInfo: the rule admits that key alone. Needs a2a.tls.client_ca; with idp_subject, a certificate principal that delegates — an operator one is operator:<id> (RFC 0044)",
+              "pattern": "^[0-9a-f]{64}$",
               "type": "string"
             },
             "sub": {
@@ -3697,6 +3702,11 @@
                 "integer"
               ]
             },
+            "consent_per_minute": {
+              "description": "how many consent gates may open for one person a minute (default 10); a call past that is refused rather than asked. Reloadable",
+              "minimum": 1,
+              "type": "integer"
+            },
             "consent_session_max_age": {
               "description": "how recent a display session's IdP sign-in must be for it to answer a consent gate (default 12h). Reloadable",
               "type": [
@@ -3799,7 +3809,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "agent_mode_servers": {
-                    "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work",
+                    "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work; every other one is hidden from it (mode mixing, RFC 0044 §5.3)",
                     "items": {
                       "type": "string"
                     },
@@ -3820,6 +3830,11 @@
                     "properties": {
                       "per_day": {
                         "description": "mints per day per server; default 16",
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "per_minute": {
+                        "description": "mints asked for per person and server in any minute; default 4",
                         "minimum": 1,
                         "type": "integer"
                       },
@@ -3860,7 +3875,7 @@
                         ]
                       },
                       "source": {
-                        "description": "operator (a per-person operator), oidc (an a2a.login session) or device (an RFC 0043 device session); x509 is refused until a certificate principal's pin is built",
+                        "description": "operator (a per-person operator), oidc (an a2a.login session), x509 (a certificate principal its a2a.principals rule pins by key and idp_subject) or device (an RFC 0043 device session)",
                         "enum": [
                           "operator",
                           "oidc",
@@ -3876,7 +3891,7 @@
                       "additionalProperties": false,
                       "properties": {
                         "document_workflows": {
-                          "description": "workflows from served instruction documents, by name and definition digest, that the document-sourced consent rule lets call this server unasked",
+                          "description": "workflows an instruction document defined, by name and definition digest, whose calls to this server are not document_sourced: the document-sourced consent rule does not ask about them",
                           "items": {
                             "additionalProperties": false,
                             "properties": {
@@ -5228,9 +5243,20 @@
                     "description": "the call is made with an enrolled person's grant (RFC 0044)",
                     "type": "boolean"
                   },
+                  "document_sourced": {
+                    "description": "the call is made in a run of a workflow an instruction document defined — for a delegated call, one the person's template does not list for the server by name and digest (document_workflows)",
+                    "type": "boolean"
+                  },
                   "holds_delegated_data": {
                     "description": "a delegated server's result has reached the work making the call",
                     "type": "boolean"
+                  },
+                  "mode": {
+                    "description": "whose authority the work acts with: an enrolled person's grant (delegated) or agentd's own (agent)",
+                    "enum": [
+                      "agent",
+                      "delegated"
+                    ]
                   },
                   "principal": {
                     "description": "principal-id glob, for calls carrying one",
@@ -5254,6 +5280,10 @@
                   "tool": {
                     "description": "tool-name glob; absent matches every tool",
                     "type": "string"
+                  },
+                  "unattended": {
+                    "description": "nobody is there to answer: a trigger started the work (a schedule, a webhook, a stream), not a principal's request",
+                    "type": "boolean"
                   }
                 },
                 "type": "object"
@@ -5267,6 +5297,12 @@
                   "shadow"
                 ]
               },
+              "once_per": {
+                "description": "a `to: principal` rule asks at the first use per run (or conversation, or subagent) and tool alone: the person's approval passes later calls of the tool there",
+                "enum": [
+                  "run_tool"
+                ]
+              },
               "question": {
                 "description": "the question put to a person for `ask`; {{tool}}, {{caller}} and {{args}} are substituted",
                 "type": "string"
@@ -5275,10 +5311,10 @@
                 "type": "string"
               },
               "to": {
-                "description": "which operator may answer an `ask` gate (only with action: ask): {role: operator} narrowed by labels, or the id `operator` — anyone else could never see the task and is refused (docs/configuration.md §12.6); unset = {role: operator}",
+                "description": "who may answer an `ask` gate (only with action: ask): {role: operator} narrowed by labels, or the id `operator` — anyone else could never see the task and is refused (docs/configuration.md §12.6); `principal` opens the person's consent gate — agentd's own text, never judged, denied unanswered (no `question`, on_timeout deny); unset = {role: operator}",
                 "oneOf": [
                   {
-                    "description": "an operator addressee: the id `operator` (docs/configuration.md §12.6)",
+                    "description": "an operator addressee: the id `operator` (docs/configuration.md §12.6); or `principal`, the person whose grant the work acts with (RFC 0044)",
                     "type": "string"
                   },
                   {

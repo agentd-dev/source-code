@@ -532,7 +532,7 @@ pub const OPS: &[OpSpec] = &[
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
+        "Approve one consent gate {gate, nonce, args_hash}, or several of one shape {gates: [...]}: the calls they hold run. Each bound to its gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
         delegation_answer_args,
         no_result,
     ),
@@ -544,19 +544,19 @@ pub const OPS: &[OpSpec] = &[
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
+        "Deny one consent gate {gate, nonce}, or several of one shape {gates: [...]}: the calls they hold are refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
         delegation_answer_args,
         no_result,
     ),
     op(
         "delegation.revoke",
         Task,
-        Operator,
+        AnyNamed,
         &[],
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "Revoke the grants {target} names — a principal, or idp:<name>#<sub> for every grant of that subject: RFC 7009 at the IdP, then the tombstone, the record and every token",
+        "Revoke the grants {target?} names — a principal, or idp:<name>#<sub> for every grant of that subject; the caller's own when absent: RFC 7009 at the IdP, then the tombstone, the record and every token. An operator revokes anyone's; anyone else their own alone",
         delegation_revoke_args,
         no_result,
     ),
@@ -1323,20 +1323,26 @@ fn delegation_enrol_args() -> Value {
 }
 
 fn delegation_answer_args() -> Value {
-    closed(
-        &["gate", "nonce"],
-        json!({
-            "gate": named("The consent gate"),
-            "nonce": named("The gate's nonce, as delegation.list gives it"),
-            "args_hash": string("The hash of the call's canonical arguments, as delegation.list gives it; required to approve"),
-        }),
-    )
+    let one = json!({
+        "gate": named("The consent gate"),
+        "nonce": named("The gate's nonce, as delegation.list gives it"),
+        "args_hash": string("The hash of the call's canonical arguments, as delegation.list gives it; required to approve"),
+    });
+    let mut props = one.clone();
+    props["gates"] = json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 50,
+        "items": closed(&["gate", "nonce"], one),
+        "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+    });
+    closed(&[], props)
 }
 
 fn delegation_revoke_args() -> Value {
     closed(
-        &["target"],
-        json!({"target": named("A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject")}),
+        &[],
+        json!({"target": named("A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject; the caller's own grants when absent. Anyone but an operator revokes their own alone")}),
     )
 }
 

@@ -279,6 +279,9 @@ impl Runtime {
                     if let Some(ch) = self.settings.agent.document_gate_channels.get(&w.name) {
                         w.gate_channels = ch.clone();
                     }
+                    // A document's definition: its runs' calls are
+                    // `document_sourced` (RFC 0044 §5.12 I).
+                    w.document = from_document;
                     if let Some(first) = staged.defined.get(&w.name) {
                         errs.push(crate::config::settings::duplicate_workflow(
                             &w.name, first, &source,
@@ -888,6 +891,7 @@ impl Runtime {
             .get("subagent")
             .and_then(Value::as_str)
             .map(str::to_string);
+        run.by_model = ev.payload.get("by_model") == Some(&Value::Bool(true));
         run.parent = ev.payload.get("parent").cloned().filter(|p| !p.is_null());
         // What the run carries, on its own record from the start
         // (`withhold`): what its definition can be handed, and what whoever
@@ -1578,6 +1582,36 @@ impl Runtime {
                 .and_then(|r| r.steps.get_mut(step_id))
         {
             st.cache_key = Some(k);
+        }
+        // A run acting with a person's grant does not reach agentd's own,
+        // broader authority at an agent-mode server tagged `sensitive` or
+        // `egress` the person's template does not list (RFC 0044 §5.3), and
+        // its every step there is recorded as an agent-mode call made from
+        // delegated work.
+        #[cfg(feature = "xaa")]
+        if matches!(step.kind.as_str(), "mcp.tool" | "mcp.resource")
+            && !self
+                .consented_steps
+                .contains_key(&format!("{run_id}/{step_id}"))
+            && let Some(server) = spec.get("server").and_then(Value::as_str)
+            && !self.is_delegated_server(server)
+            && !self.is_company_server(server)
+        {
+            let tool = spec.get("tool").and_then(Value::as_str);
+            let name = tool.and_then(|t| {
+                self.registry
+                    .iter()
+                    .find(|d| {
+                        matches!(&d.imp, crate::registry::Impl::Mcp { server: s, tool: n }
+                            if s == server && n == t)
+                    })
+                    .map(|d| d.name.clone())
+            });
+            let what = format!("{server}.{}", tool.unwrap_or(step.kind.as_str()));
+            if let Some(e) = self.mode_mixing(&step_caller, server, name.as_deref(), &what) {
+                self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                return;
+            }
         }
         // A step whose own effect would send a run's delegated data off the
         // box waits for the person (RFC 0044 §5.13 item 6); approved, it runs
@@ -3932,6 +3966,10 @@ impl Runtime {
                 if let Some(h) = self.subagent_lineage(caller) {
                     payload["subagent"] = json!(h);
                 }
+                // A model's call starts a run whose inputs are the model's.
+                if self.model_asked(caller) {
+                    payload["by_model"] = json!(true);
+                }
                 // The run continues its caller's trace.
                 let trace = self.caller_trace(caller);
                 match self.accept_event_in(
@@ -4103,6 +4141,16 @@ impl Runtime {
                 if let Some(e) = self.workflows_locked(name) {
                     return e;
                 }
+                // While the instruction is frozen, what a model writes is the
+                // document's, and a definition outlives the freeze: a person
+                // who later runs it would act with their grant on it (RFC
+                // 0044 §5.12 I).
+                #[cfg(feature = "xaa")]
+                if self.freshness_frozen && self.delegation.is_some() && self.model_asked(caller) {
+                    return err(format!(
+                        "{name} refused: the instruction document could not be confirmed current (agent.instruction.trust freshness), and until it is no model writes a workflow a person's grant could act on"
+                    ));
+                }
                 let def = args["definition"].clone();
                 // The `name` argument names the workflow the call is aimed
                 // at, so an update of a configured workflow is refused as
@@ -4246,6 +4294,11 @@ impl Runtime {
                 if let Some(h) = self.subagent_lineage(caller) {
                     signal["subagent"] = json!(h);
                 }
+                // A run a model's signal starts or wakes has the model's
+                // payload.
+                if self.model_asked(caller) {
+                    signal["by_model"] = json!(true);
+                }
                 let _ = self.accept_event_in(
                     kinds::SIGNAL,
                     caller.principal.clone(),
@@ -4278,6 +4331,19 @@ impl Runtime {
                 .and_then(|r| self.runs.get(r))
                 .and_then(|r| r.subagent.clone())
         })
+    }
+
+    /// Whether a model asked for what `caller` asks for: a turn's or a
+    /// subagent's call, or a step of a run a model asked for
+    /// ([`RunState::by_model`]).
+    pub(crate) fn model_asked(&self, caller: &ToolCaller) -> bool {
+        caller.node.is_some()
+            || self.subagent_lineage(caller).is_some()
+            || caller
+                .run
+                .as_ref()
+                .and_then(|r| self.runs.get(r))
+                .is_some_and(|r| r.by_model)
     }
 }
 

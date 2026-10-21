@@ -13,9 +13,10 @@
 //! their own grants and gates, and answers their own gates; no operator
 //! signs in as them or answers for them unless the person's template lists
 //! `approvers: [principal, operator]`, and an attempt is refused and
-//! recorded. An operator lists everything, and revokes, forgets and reads a
-//! person's consent records — those three stay on the operator floor: an
-//! operator offboards, and keeps the audit. An enrolment's task says where
+//! recorded. A person revokes their own grants; an operator lists
+//! everything, revokes anyone's, and forgets and reads a person's consent
+//! records — those two stay on the operator floor: an operator offboards,
+//! and keeps the audit. An enrolment's task says where
 //! to sign in and how it ended; a revocation's and an erasure's say what
 //! was done; a read of the consent records answers with them as its
 //! result, read off the loop.
@@ -179,38 +180,71 @@ fn served(
                 Ok(DelegationAnswer::Task(rt.task_reply(&task)))
             }
             "delegation.approve" | "delegation.deny" => {
-                let gate = args["gate"].as_str().unwrap_or_default().to_string();
-                // Who answers, and how (RFC 0044 §5.10 rule 1): the person
-                // through a display session whose IdP sign-in is recent
-                // enough, a per-person operator over the unix listener, or —
-                // where the person's template lists them — an operator.
-                let answerer = match rt.consent_answerer(&d, principal, who.as_ref(), &gate) {
-                    Ok(a) => a,
-                    Err(why) => {
-                        rt.consent_refused(&gate, &principal.id, why.0);
-                        return Err(refusal(
-                            errors::PERMISSION_DENIED,
-                            reason::PERMISSION_DENIED,
-                            &format!("{op}: {}", why.1),
-                            &[("op", op)],
-                        ));
+                // One gate, or several of one shape answered together (§5.10
+                // rule 6), each bound to its own nonce and argument hash.
+                let answers: Vec<Value> = match (args.get("gates"), args.get("gate")) {
+                    (Some(Value::Array(g)), None) if !g.is_empty() && g.len() <= 50 => g.clone(),
+                    (None, Some(_)) => vec![args.clone()],
+                    _ => {
+                        return Err(bad(format!(
+                            "{op}: {{gate, nonce, args_hash}}, or {{gates: [...]}} of 1 to 50 — not both"
+                        )));
                     }
                 };
-                let task = new_task(rt);
-                let answered = rt.consent_answer(
-                    &gate,
-                    &answerer,
-                    args["nonce"].as_str(),
-                    args["args_hash"].as_str(),
-                    op == "delegation.approve",
-                );
-                match answered {
-                    Ok(text) => {
-                        if let Some(t) = rt.tasks.get_mut(&task) {
-                            t.transition(State::Completed, Some(text));
+                let shapes: std::collections::BTreeSet<Option<String>> = answers
+                    .iter()
+                    .map(|a| rt.consent_shape(a["gate"].as_str().unwrap_or_default()))
+                    .collect();
+                if answers.len() > 1 && (shapes.len() != 1 || shapes.contains(&None)) {
+                    return Err(bad(format!(
+                        "{op}: gates answered together are open gates of one shape (delegation.list's `shape`): nothing was decided"
+                    )));
+                }
+                // Who answers, and how (RFC 0044 §5.10 rule 1): the person
+                // through a display session whose IdP sign-in is recent
+                // enough, a per-person operator over the unix listener, a
+                // certificate principal over its certificate, or — where the
+                // person's template lists them — an operator. Every gate is
+                // held to it before any is answered.
+                let mut answerers = Vec::with_capacity(answers.len());
+                for a in &answers {
+                    let gate = a["gate"].as_str().unwrap_or_default();
+                    match rt.consent_answerer(&d, principal, who.as_ref(), gate) {
+                        Ok(by) => answerers.push(by),
+                        Err(why) => {
+                            rt.consent_refused(gate, &principal.id, why.0);
+                            return Err(refusal(
+                                errors::PERMISSION_DENIED,
+                                reason::PERMISSION_DENIED,
+                                &format!("{op}: {}", why.1),
+                                &[("op", op)],
+                            ));
                         }
                     }
-                    Err(e) => rt.a2a_task_fail(&task, &format!("{op}: {e}")),
+                }
+                let task = new_task(rt);
+                let mut said = Vec::new();
+                let mut failed = Vec::new();
+                for (a, by) in answers.iter().zip(&answerers) {
+                    let gate = a["gate"].as_str().unwrap_or_default();
+                    match rt.consent_answer(
+                        gate,
+                        by,
+                        a["nonce"].as_str(),
+                        a["args_hash"].as_str(),
+                        op == "delegation.approve",
+                    ) {
+                        Ok(text) => said.push(text),
+                        Err(e) => failed.push(e),
+                    }
+                }
+                if failed.is_empty() {
+                    if let Some(t) = rt.tasks.get_mut(&task) {
+                        t.transition(State::Completed, Some(said.join("\n")));
+                    }
+                } else {
+                    said.extend(failed);
+                    rt.a2a_task_fail(&task, &format!("{op}: {}", said.join("\n")));
                 }
                 rt.task_persist(&task);
                 rt.task_sync(&task);
@@ -293,10 +327,30 @@ fn served(
                 Ok(DelegationAnswer::Task(rt.task_reply(&task)))
             }
             "delegation.revoke" => {
-                let target = args["target"].as_str().unwrap_or_default().to_string();
-                if target.is_empty() {
-                    return Err(bad(format!("{op}: target is required")));
+                // An operator revokes the grants a target names — anyone's,
+                // offboarding by IdP subject too; anyone else the grants
+                // their own session holds alone (self-service, RFC 0044
+                // §5.8): a device session under the same name that never
+                // proved the grant's identity holds none, and revokes none.
+                enum Whose {
+                    Named(String),
+                    Held(Box<crate::delegation::Who>),
                 }
+                let whose = match (args["target"].as_str(), principal.is_operator(), &who) {
+                    (Some(""), ..) => return Err(bad(format!("{op}: target is required"))),
+                    (Some(t), true, _) => Whose::Named(t.to_string()),
+                    (None, _, Some(w)) => Whose::Held(Box::new(w.clone())),
+                    (None, _, None) => {
+                        return Err(bad(format!(
+                            "{op}: target is required: {} holds no grant of its own",
+                            principal.id
+                        )));
+                    }
+                    (Some(t), false, Some(w)) if w.id == t => Whose::Held(Box::new(w.clone())),
+                    (Some(_), false, _) => {
+                        return Err(not_theirs("revokes another's grants"));
+                    }
+                };
                 let task = new_task(rt);
                 let tx = rt.events_tx.clone();
                 let (t, by) = (task.clone(), principal.id.clone());
@@ -304,7 +358,11 @@ fn served(
                 std::thread::Builder::new()
                     .name("delegation-revoke".into())
                     .spawn(move || {
-                        let end = d.revoke(&target, &by).map(|done| {
+                        let done = match &whose {
+                            Whose::Named(target) => d.revoke(target, &by),
+                            Whose::Held(w) => d.revoke_held(w, &by),
+                        };
+                        let end = done.map(|done| {
                             done.iter()
                                 .map(|r| {
                                     format!(

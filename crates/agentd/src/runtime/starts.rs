@@ -687,9 +687,10 @@ impl Runtime {
         // Fields the TRIGGER payload carries that belong on the run itself.
         // `msg_depth` is here because a run started by a delivered message
         // continues that chain; a trigger that carries none starts at zero.
-        // `subagent` names the subagent whose signal fired it (RFC 0044 P1);
-        // a payload that claims one only ever takes delegation away.
-        for k in ["conversation", "task", "msg_depth", "subagent"] {
+        // `subagent` names the subagent whose signal fired it (RFC 0044 P1),
+        // and `by_model` says a model's signal did (§5.12 I); a payload that
+        // claims either only ever takes delegation away.
+        for k in ["conversation", "task", "msg_depth", "subagent", "by_model"] {
             if let Some(v) = ev["payload"].get(k).filter(|v| !v.is_null()).cloned() {
                 ev[k] = v;
             }
@@ -1012,6 +1013,7 @@ impl Runtime {
         carries: &super::withhold::Carries,
         trace: Option<&TraceContext>,
         subagent: Option<&str>,
+        by_model: bool,
     ) -> u64 {
         let (by, may_start, session) = match sender {
             super::waits::SignalSender::Runtime => (None, None, None),
@@ -1061,6 +1063,10 @@ impl Runtime {
             // The subagent whose work sent it: the run is no delegated call's.
             if let Some(h) = subagent {
                 trigger["subagent"] = json!(h);
+            }
+            // A model's signal: the run's payload is the model's.
+            if by_model {
+                trigger["by_model"] = json!(true);
             }
             self.fire_start_carrying(
                 &workflow,

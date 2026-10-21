@@ -528,7 +528,7 @@ impl Runtime {
             .filter(|p| matches!(&p.kind, PendingKind::Subagent { handle: h } if h == handle))
             .filter_map(|p| match p.target {
                 Target::Child(n, _) => Some(n),
-                Target::Step(..) | Target::McpTask(..) => None,
+                Target::Step(..) | Target::McpTask(..) | Target::Elicit(_) => None,
             })
             .collect();
         for n in waiters {

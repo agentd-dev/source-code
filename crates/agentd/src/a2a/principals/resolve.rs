@@ -374,24 +374,31 @@ impl Resolver {
 
 impl Compiled {
     /// Whether this rule's certificate matcher admits `cert`. `any` admits
-    /// every certificate the CA signed; a rule naming neither `san` nor
-    /// `sub` admits none. A rule naming both admits only a certificate both
-    /// admit: every field a rule names must match.
+    /// every certificate the CA signed; a rule naming none of `san`, `sub`
+    /// and `spki` admits none. A rule naming several admits only a
+    /// certificate all of them admit: every field a rule names must match.
     fn matches_cert(&self, cert: &CertId) -> bool {
         let m = &self.matcher;
         if m.any {
             return true;
         }
-        if m.san.is_none() && m.sub.is_none() {
+        if m.san.is_none() && m.sub.is_none() && m.spki.is_none() {
             return false;
         }
         self.cert_fields_match(cert)
     }
 
     /// Whether every certificate field the rule names — `san` and `sub`,
-    /// each a glob — matches `cert`. True for a rule that names none.
+    /// each a glob, and `spki`, the key exactly — matches `cert`. True for a
+    /// rule that names none.
     fn cert_fields_match(&self, cert: &CertId) -> bool {
         let m = &self.matcher;
+        if m.spki
+            .as_ref()
+            .is_some_and(|k| cert.spki_sha256.as_deref() != Some(k.as_str()))
+        {
+            return false;
+        }
         let san = m.san.as_ref().is_none_or(|san| {
             cert.sans.iter().any(|s| glob(san, s))
                 || cert.subject.as_deref().is_some_and(|s| glob(san, s))
@@ -412,7 +419,13 @@ impl Compiled {
     /// keeps `user:unknown` — one principal every such caller merged into —
     /// impossible rather than merely unconfigured.
     fn principal(&self, cert: Option<&CertId>) -> Option<Principal> {
-        let id = principal_id(self.role, self.id.as_deref(), cert)?;
+        let id = match (&self.matcher.spki, self.role, &self.id) {
+            // A certificate rule that admits one key alone names one person:
+            // an operator one is that person, `operator:<id>`, as a unix
+            // peer's uid rule names its own (RFC 0044 §5.2).
+            (Some(_), Role::Operator, Some(declared)) => format!("operator:{declared}"),
+            _ => principal_id(self.role, self.id.as_deref(), cert)?,
+        };
         // A bearer or an `any` rule is the rule; a certificate rule is the
         // certificate's key, or — where none was read — what named it.
         let typed = match cert {
@@ -534,6 +547,9 @@ fn matcher_desc(m: &settings::PrincipalMatch) -> Value {
     if let Some(s) = &m.sub {
         out.insert("sub".into(), json!(s));
     }
+    if let Some(s) = &m.spki {
+        out.insert("spki".into(), json!(s));
+    }
     if m.bearer_ref.is_some() {
         out.insert("bearer_ref".into(), json!("***"));
     }
@@ -602,6 +618,50 @@ mod tests {
                 SessionCheck::Invalid
             }
         }
+    }
+
+    /// A certificate rule naming a key admits that key alone, whatever else
+    /// the certificate says, and its caller is typed by the key; an operator
+    /// one is the person `operator:<id>` (RFC 0044 §5.2).
+    #[test]
+    fn a_rule_naming_a_key_admits_that_key_alone() {
+        let key = "ab".repeat(32);
+        let settings = a2a(json!({
+            "listen": "https://127.0.0.1:0",
+            "principals": [
+                {"match": {"san": "alice@acme.example", "spki": key}, "role": "user", "id": "alice"},
+                {"match": {"spki": "cd".repeat(32)}, "role": "operator", "id": "bob"}
+            ]
+        }));
+        let r = Resolver::build(&settings, &secrets).unwrap();
+        let with_key = |sans: &[&str], spki: String| CertId {
+            spki_sha256: Some(spki),
+            ..cert(sans, None).unwrap()
+        };
+        let alice = r.resolve(
+            &ev(None, Some(with_key(&["alice@acme.example"], key.clone()))),
+            false,
+            None,
+        );
+        assert_eq!(named(&alice), ("user:alice", Via::Cert));
+        let Resolution::Named(p, _) = &alice else {
+            unreachable!()
+        };
+        assert_eq!(p.typed, Some(PrincipalRef::local(Source::X509, &key)));
+        // The same name on another key is nobody.
+        assert!(matches!(
+            r.resolve(
+                &ev(
+                    None,
+                    Some(with_key(&["alice@acme.example"], "ef".repeat(32)))
+                ),
+                false,
+                None
+            ),
+            Resolution::NoRole
+        ));
+        let bob = r.resolve(&ev(None, Some(with_key(&[], "cd".repeat(32)))), false, None);
+        assert_eq!(named(&bob), ("operator:bob", Via::Cert));
     }
 
     /// A unix peer of the uid a rule names is that rule's per-person operator

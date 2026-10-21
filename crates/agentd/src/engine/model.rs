@@ -1268,6 +1268,12 @@ pub struct Workflow {
     /// carries none, so a run of it announces nothing.
     #[serde(skip)]
     pub gate_channels: BTreeMap<String, String>,
+    /// Whether an instruction document defined this definition (RFC 0042):
+    /// a call its runs make is `document_sourced` (RFC 0044 §5.12 I). Set,
+    /// like `gate_channels`, only on a definition loaded from the
+    /// configuration.
+    #[serde(skip)]
+    pub document: bool,
 }
 
 fn default_true() -> bool {
@@ -1836,6 +1842,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         hash: String::new(),
         definition: doc.clone(),
         gate_channels: BTreeMap::new(),
+        document: false,
     };
     validate_graph(&wf, &mut errs);
     check_step_paths(&wf, &mut errs);

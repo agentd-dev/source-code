@@ -422,17 +422,21 @@ fn top_level_properties(
                             "delegated": { "type": "boolean", "description": "the call is made with an enrolled person's grant (RFC 0044)" },
                             "tainted": { "type": "boolean", "description": "the work making the call has read outside text: an untrusted_input tool's result, a delegated server's (unless trusted_output), a webhook's or a non-operator's A2A message, a peer's answer, knowledge context, a served instruction, a tainted memory entry" },
                             "holds_delegated_data": { "type": "boolean", "description": "a delegated server's result has reached the work making the call" },
-                            "any_tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "at least one listed trifecta tag is on the tool" } } },
+                            "any_tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "at least one listed trifecta tag is on the tool" },
+                            "unattended": { "type": "boolean", "description": "nobody is there to answer: a trigger started the work (a schedule, a webhook, a stream), not a principal's request" },
+                            "document_sourced": { "type": "boolean", "description": "the call is made in a run of a workflow an instruction document defined — for a delegated call, one the person's template does not list for the server by name and digest (document_workflows)" },
+                            "mode": { "enum": ["agent", "delegated"], "description": "whose authority the work acts with: an enrolled person's grant (delegated) or agentd's own (agent)" } } },
                         "action": { "enum": ["allow", "deny", "ask", "shadow"], "description": "shadow refuses and says the call was held; it never fabricates a result" },
                         "question": { "type": "string", "description": "the question put to a person for `ask`; {{tool}}, {{caller}} and {{args}} are substituted" },
                         "on_timeout": { "enum": ["allow", "deny", "ask", "shadow"], "description": "what an unanswered `ask` becomes (default deny)" },
                         "timeout": { "type": "string" },
                         "to": { "oneOf": [
-                            { "type": "string", "description": "an operator addressee: the id `operator` (docs/configuration.md §12.6)" },
+                            { "type": "string", "description": "an operator addressee: the id `operator` (docs/configuration.md §12.6); or `principal`, the person whose grant the work acts with (RFC 0044)" },
                             { "type": "object", "additionalProperties": false, "properties": {
                                 "id": { "type": "string" }, "role": { "enum": ["operator", "user", "agent"] },
                                 "labels": { "type": "object", "additionalProperties": { "type": "string" } } } } ],
-                            "description": "which operator may answer an `ask` gate (only with action: ask): {role: operator} narrowed by labels, or the id `operator` — anyone else could never see the task and is refused (docs/configuration.md §12.6); unset = {role: operator}" } } } },
+                            "description": "who may answer an `ask` gate (only with action: ask): {role: operator} narrowed by labels, or the id `operator` — anyone else could never see the task and is refused (docs/configuration.md §12.6); `principal` opens the person's consent gate — agentd's own text, never judged, denied unanswered (no `question`, on_timeout deny); unset = {role: operator}" },
+                        "once_per": { "enum": ["run_tool"], "description": "a `to: principal` rule asks at the first use per run (or conversation, or subagent) and tool alone: the person's approval passes later calls of the tool there" } } } },
                 "workflows": { "type": "object", "additionalProperties": false, "properties": {
                     "immutable": { "type": "boolean", "description": "refuse workflow.create/update/delete at runtime — definitions become read-only for the model, subagents and operators alike; loading from config/file/url/dir is unaffected" } } },
                 "tls_ca": { "type": "string" },
@@ -526,6 +530,7 @@ fn delegation() -> Value {
             "liveness_interval": duration,
             "consent_timeout": duration,
             "consent_session_max_age": { "type": ["string", "integer"], "description": "how recent a display session's IdP sign-in must be for it to answer a consent gate (default 12h). Reloadable" },
+            "consent_per_minute": { "type": "integer", "minimum": 1, "description": "how many consent gates may open for one person a minute (default 10); a call past that is refused rather than asked. Reloadable" },
             "device_pins": { "type": "object", "description": "RFC 0043 device names (auth.device.approve as:), each pinned to the one IdP identity that may enrol it; each session using the grant proves it again. Reloadable: a changed or removed pin revokes the name's grant and drops its sessions' proofs",
                 "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["iss", "sub"], "properties": {
                     "iss": { "type": "string" }, "sub": { "type": "string" } } } },
@@ -541,24 +546,25 @@ fn template_schema(duration: &Value) -> Value {
     json!({ "type": "object", "additionalProperties": false, "required": ["name", "principals", "idp", "servers"], "properties": {
                     "name": { "type": "string" },
                     "principals": { "type": "object", "additionalProperties": false, "description": "every field named must match", "properties": {
-                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "operator (a per-person operator), oidc (an a2a.login session) or device (an RFC 0043 device session); x509 is refused until a certificate principal's pin is built" },
+                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "operator (a per-person operator), oidc (an a2a.login session), x509 (a certificate principal its a2a.principals rule pins by key and idp_subject) or device (an RFC 0043 device session)" },
                         "role": { "enum": ["operator", "user"] },
                         "labels": { "type": "object", "additionalProperties": { "type": "string" } } } },
                     "idp": { "type": "string", "description": "the identity.providers entry its principals bind to" },
                     "servers": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
                         "scopes": { "type": "array", "items": { "type": "string" }, "description": "the scope ceiling on this server" },
-                        "document_workflows": { "type": "array", "description": "workflows from served instruction documents, by name and definition digest, that the document-sourced consent rule lets call this server unasked",
+                        "document_workflows": { "type": "array", "description": "workflows an instruction document defined, by name and definition digest, whose calls to this server are not document_sourced: the document-sourced consent rule does not ask about them",
                             "items": { "type": "object", "additionalProperties": false, "required": ["name", "digest"], "properties": {
                                 "name": { "type": "string" }, "digest": { "type": "string", "description": "the definition digest workflow.list shows: 64 lowercase hex" } } } } } },
                         "description": "each grant: id_jag server it allows, by name" },
                     "subagents": { "enum": ["none", "inherit"], "description": "whether a subagent, think child or workflow-as-tool run of the person's work acts with their grant: none (default), or inherit — on the delegated servers the child declares, its calls made by the supervisor, holding no token" },
                     "approvers": { "type": "array", "items": { "enum": ["principal", "operator"] }, "description": "who may answer the person's consent gates: [principal] (default) or [principal, operator], an operator's answer recorded as such" },
-                    "agent_mode_servers": { "type": "array", "items": { "type": "string" }, "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work" },
+                    "agent_mode_servers": { "type": "array", "items": { "type": "string" }, "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work; every other one is hidden from it (mode mixing, RFC 0044 §5.3)" },
                     "ttl": duration,
                     "budget": { "type": "object", "additionalProperties": false, "properties": {
                         "per_day": { "type": "integer", "minimum": 1, "description": "mints per day per server; default 16" },
                         "per_month": { "type": "integer", "minimum": 1, "description": "mints per month per server; default 200" },
-                        "per_run": { "type": "integer", "minimum": 1, "description": "mints per run; default 12" } } } } })
+                        "per_run": { "type": "integer", "minimum": 1, "description": "mints per run; default 12" },
+                        "per_minute": { "type": "integer", "minimum": 1, "description": "mints asked for per person and server in any minute; default 4" } } } } })
 }
 
 /// `security.client` (RFC 0052): agentd's OAuth client where it has no
@@ -815,9 +821,10 @@ fn defs_properties(
                 "id": { "type": "string", "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$", "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules. Required for bearer_ref and any rules; without it a certificate rule derives <role>:cn=<CN> or <role>:san=<first SAN>" },
                 "match": { "type": "object", "additionalProperties": false, "properties": {
                     "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "any": { "type": "boolean" },
-                    "uid": { "type": "integer", "minimum": 0, "description": "the unix A2A listener's peer uid (SO_PEERCRED): the per-person operator operator:<id> (RFC 0044; needs the xaa feature)" } } },
+                    "uid": { "type": "integer", "minimum": 0, "description": "the unix A2A listener's peer uid (SO_PEERCRED): the per-person operator operator:<id> (RFC 0044; needs the xaa feature)" },
+                    "spki": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "a client certificate's key, the SHA-256 of its SubjectPublicKeyInfo: the rule admits that key alone. Needs a2a.tls.client_ca; with idp_subject, a certificate principal that delegates — an operator one is operator:<id> (RFC 0044)" } } },
                 "idp_subject": { "type": "object", "additionalProperties": false, "required": ["iss", "sub"],
-                    "description": "the one IdP identity this principal is, exact: required to delegate (RFC 0044; needs the xaa feature)",
+                    "description": "the one IdP identity this principal is, exact: required to delegate, on a uid or an spki rule (RFC 0044; needs the xaa feature)",
                     "properties": { "iss": { "type": "string" }, "sub": { "type": "string" } } },
                 "role": { "enum": ["operator", "user", "agent", "anonymous"] },
                 "grants": { "type": "array", "items": { "type": "string" } },

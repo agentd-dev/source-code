@@ -53,13 +53,14 @@ fn binary() -> &'static PathBuf {
         // Personal Agent the `companies` family holds to the draft; `xaa`
         // is agentd acting for an enrolled person, which the `ema` family
         // drives against its mock IdP, authorization server and MCP server;
-        // `hot-reload` is the SIGHUP reload its template checks send.
+        // `hot-reload` is the SIGHUP reload its template checks send; `exec`
+        // the local command its check runs beside a delegation, as root.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload",
+            "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload,exec",
         ]);
         let agentd = target_dir().join("agentd");
         assert!(
@@ -111,6 +112,12 @@ impl Harness {
 
     pub fn agentd(&self) -> &Path {
         &self.agentd
+    }
+
+    /// The same harness driving the agentd binary at `agentd` — a copy of
+    /// the built one where another uid must run it.
+    pub fn at(agentd: PathBuf) -> Harness {
+        Harness { agentd }
     }
 
     /// Launch the built-in agentd Streamable HTTP mock MCP server, serving one
@@ -255,8 +262,18 @@ impl Harness {
 
     /// Like [`Harness::spawn`], its stderr — agentd's log — written to `log`.
     pub fn spawn_logged(&self, args: &[&str], log: &Path) -> Daemon {
-        let child = Command::new(&self.agentd)
-            .args(args)
+        self.spawn_logged_env(args, &[], log)
+    }
+
+    /// Like [`Harness::spawn_logged`], with extra environment variables — a
+    /// debug build's test hooks among them.
+    pub fn spawn_logged_env(&self, args: &[&str], env: &[(&str, &str)], log: &Path) -> Daemon {
+        let mut cmd = Command::new(&self.agentd);
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(log).expect("a log file for the daemon"))
             .spawn()

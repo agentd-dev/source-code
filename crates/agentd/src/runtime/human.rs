@@ -180,6 +180,20 @@ impl Runtime {
             .cloned()
     }
 
+    /// Whether a delegated server's connection still waits on the answer to
+    /// elicitation gate `id`.
+    fn elicit_waiting(&self, id: &str) -> bool {
+        #[cfg(feature = "xaa")]
+        {
+            self.elicits.contains_key(id)
+        }
+        #[cfg(not(feature = "xaa"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
     /// The `ask_human` internal tool.
     pub(crate) fn ask_human_tool(
         &mut self,
@@ -739,7 +753,7 @@ impl Runtime {
         // shaped to the request's schema, which is the gate's.
         let result = match &p.target {
             Target::Child(..) => json!({"reply": text, "timed_out": false, "via": via}),
-            Target::Step(..) | Target::McpTask(..) => shaped
+            Target::Step(..) | Target::McpTask(..) | Target::Elicit(_) => shaped
                 .clone()
                 .unwrap_or_else(|| Value::String(text.to_string())),
         };
@@ -925,6 +939,16 @@ impl Runtime {
                     continue;
                 }
                 Target::McpTask(..) => {}
+                // A delegated server's question whose connection stopped
+                // waiting for the answer.
+                Target::Elicit(id) if !self.elicit_waiting(id) => {
+                    ends.push((
+                        p.target.clone(),
+                        End::Prune(task.clone(), "the server stopped waiting for the answer"),
+                    ));
+                    continue;
+                }
+                Target::Elicit(_) => {}
             }
             if now >= *deadline_ms {
                 // Never for an ADDRESSED gate, for the reason `ask_human`

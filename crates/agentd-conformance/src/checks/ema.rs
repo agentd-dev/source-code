@@ -81,7 +81,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check(
             "ema/invalid-grant-dead-probe",
-            "invalid_grant from an exchange with a dead probe revokes the grant: tombstoned, purged, and every later call not_enrolled — after a restart too",
+            "invalid_grant from an exchange with a dead probe revokes the grant: tombstoned, purged, and every later call revoked — after a restart too, for as long as the register keeps the revocation",
             invalid_grant_dead,
         ),
         check(
@@ -211,7 +211,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check(
             "ema/restored-vault-refused-by-the-audit-chain",
-            "with observability.audit.chain set, a store restored from before a revocation — the grant and the register both — is refused as revoked at load through the register the chain anchors, so the person is not_enrolled and nothing is sent to the IdP; the enrolment, mint, revocation and register records are in the chain",
+            "with observability.audit.chain set, a store restored from before a revocation — the grant and the register both — is refused as revoked at load through the register the chain anchors, so the person's calls are revoked and nothing is sent to the IdP; the enrolment, mint, revocation and register records are in the chain",
             restored_vault_refused,
         ),
         check(
@@ -328,6 +328,81 @@ pub fn checks() -> Vec<Check> {
             "ema/a-subagent-inherits-what-it-declares",
             "with subagents: inherit, a run a subagent starts is made with the person's grant at the server the subagent declared, refused (delegation_not_permitted) at one it did not, and no frame to a child carries a token",
             p2c::a_subagent_inherits_what_it_declares,
+        ),
+        check(
+            "ema/a-persons-own-message-is-theirs",
+            "a signed-in person's own start is no outside text to work acting with their grant — their delegated sensitive write goes ahead unasked — while a delegated read's result still taints it, and what they started reaches another person's run as outside text, naming their message",
+            p2d::a_persons_own_message_is_theirs,
+        ),
+        check(
+            "ema/the-persons-rules-ask-as-shipped-and-configured",
+            "a delegated egress call asks at its first use per run and tool: the approval passes the run's second call unasked and the next run asks again; an operator's to: principal rule on the mode fact asks the person as security.policies[i], and a rule on a fact the call does not have holds nothing",
+            p2d::the_persons_rules_ask_as_shipped_and_configured,
+        ),
+        check(
+            "ema/gates-of-one-shape-are-answered-together-and-paced",
+            "three parallel writes' gates share one shape and are approved together, each recorded; a batch naming a gate not open decides nothing; past identity.delegation.consent_per_minute a call is refused rather than asked, and the refusal recorded",
+            p2d::gates_of_one_shape_are_answered_together_and_paced,
+        ),
+        check(
+            "ema/agent-mode-servers-are-hidden-from-delegated-work",
+            "work acting with a person's grant is refused an agent-mode server tagged egress (mode_mixing), which is sent nothing; listed in the template's agent_mode_servers, the call is made and recorded as an agent-mode call from delegated work, and after a delegated read it asks the person (egress_from_tainted_work_holding_delegated_data)",
+            p2d::agent_mode_servers_are_hidden_from_delegated_work,
+        ),
+        check(
+            "ema/a-documents-workflow-asks-unless-listed",
+            "a workflow an instruction document defined asks before every delegated egress call (document_sourced_delegated_egress); listed in the template's document_workflows by name and digest, it asks at the first use per run and tool alone",
+            p2d::a_documents_workflow_asks_unless_listed,
+        ),
+        check(
+            "ema/a-documents-subagent-is-its-workflows-work",
+            "under subagents: inherit, a subagent a document's workflow spawns asks before its delegated egress call under document_sourced_delegated_egress, naming the workflow, as the run's own step would; denied, the call is not made",
+            p2d::a_documents_subagent_is_its_workflows_work,
+        ),
+        check(
+            "ema/pairwise-subjects-are-recorded-not-compared",
+            "under subjects: pairwise an ID-JAG naming another sub is taken: agent/acting_for carries its sub, and agent/grant is a random handle per server — stable at one, another at the next, never the grant's id",
+            p2d::pairwise_subjects_are_recorded_not_compared,
+        ),
+        check(
+            "ema/a-persons-mints-are-paced",
+            "with budget.per_minute 1 and a token per scope set, the read the catalogue mint covers is made and the write needing a second mint within the minute is budget_exhausted before the IdP is asked",
+            p2d::a_persons_mints_are_paced,
+        ),
+        check(
+            "ema/an-elicitation-asks-the-grants-person",
+            "a delegated server's elicitation is put to the grant's person alone, in agentd's words with the server's quoted: an operator's answer is refused and the gate stays open; the person's answer is shaped to the schema and handed to the server, and the call goes on",
+            p2d::an_elicitation_asks_the_grants_person,
+        ),
+        check(
+            "ema/an-elicitation-is-answered-through-the-grant",
+            "of two devices approved under one name, the one that never signed in at the IdP as the name's identity is refused an answer to the grant's elicitation (no_idp_sign_in), the gate left open and the server handed nothing; the bound one's answer is taken",
+            p2d::an_elicitation_is_answered_through_the_grant,
+        ),
+        check(
+            "ema/a-person-revokes-their-own-grant",
+            "a person revokes their own grant from their own session and their next call is revoked; another person may not revoke it for them; an operator revokes anyone's; a device under the same name that never proved the binding revokes nothing",
+            p2d::a_person_revokes_their_own_grant,
+        ),
+        check(
+            "ema/a-certificate-principal-delegates",
+            "a principal rule admitting one client certificate's key, with an idp_subject pin, delegates under a template admitting x509: over that certificate it enrols with the IdP's device grant and its run is made with its own grant, the key's",
+            p2d::a_certificate_principal_delegates,
+        ),
+        check(
+            "ema/a-command-beside-a-delegation-runs-isolated-and-asks",
+            "security.exec beside a delegation is refused without spawn.uid, naming it, and loads as spawn.uid inside Landlock with every supervisor-only path closed to that uid; a command from a run holding the person's data asks them (exec_holding_delegated_data), then runs as the worker uid, and a command copying the seal key or the store copies nothing (as root; skipped otherwise)",
+            p2d::a_command_beside_a_delegation_runs_isolated_and_asks,
+        ),
+        check(
+            "ema/a-stale-instruction-makes-no-delegated-call",
+            "once the instruction's registry stops answering past its freshness deadline (unavailable: freeze), a model turn in a run already in flight is refused its delegated call (policy_denied) and the server is sent nothing, as are the operator's workflow the turn starts and the run its signal wakes, and a conversation's turn writes no workflow; the operator's own run of their workflow still makes its call",
+            p2d::a_stale_instruction_makes_no_delegated_call,
+        ),
+        check(
+            "ema/a-worker-uses-only-what-it-was-offered",
+            "a turn worker and an inheriting subagent each asking the supervisor for a delegated tool their step or spawn did not offer are refused (tool.refused, why: not_offered) and the server is sent nothing, while the tool they were offered is made",
+            p2d::a_worker_uses_only_what_it_was_offered,
         ),
     ]
 }
@@ -749,12 +824,17 @@ impl Setup {
 
     /// The daemon, ready on its socket; its log appended to.
     fn daemon(&self, h: &Harness) -> crate::harness::Daemon {
+        self.daemon_env(h, &[])
+    }
+
+    /// [`Setup::daemon`] with extra environment variables.
+    fn daemon_env(&self, h: &Harness, env: &[(&str, &str)]) -> crate::harness::Daemon {
         let _ = std::fs::remove_file(&self.sock);
         let n = std::fs::read_dir(self.tmp.path())
             .map(|d| d.count())
             .unwrap_or(0);
         let log = self.tmp.path().join(format!("daemon-{n}.log"));
-        let d = h.spawn_logged(&["--config", self.cfg()], &log);
+        let d = h.spawn_logged_env(&["--config", self.cfg()], env, &log);
         let deadline = Instant::now() + Duration::from_secs(15);
         while !self.sock.exists() {
             assert!(
@@ -1356,8 +1436,10 @@ fn invalid_grant_dead(h: &Harness) -> Outcome {
         if !o.passed {
             return o;
         }
+        // Revoked for as long as the register keeps the revocation, a
+        // restart included (the user's decision of 2026-10-21).
         let again = tryo!(s.run("who"));
-        let o = failed_with(&again, "not_enrolled");
+        let o = failed_with(&again, "revoked");
         if !o.passed {
             return o;
         }
@@ -1367,7 +1449,7 @@ fn invalid_grant_dead(h: &Harness) -> Outcome {
     let _d = s.daemon(h);
     let after = tryo!(s.run("who"));
     let list = s.cli(h, &["--delegation-list"]);
-    failed_with(&after, "not_enrolled").and(|| {
+    failed_with(&after, "revoked").and(|| {
         Outcome::require(
             !list.stdout.contains("00u1alice"),
             format!("the grant must be gone: {}", list.stdout),
@@ -2811,7 +2893,7 @@ fn restored_vault_refused(h: &Harness) -> Outcome {
         .events("delegation.grant.unreadable")
         .iter()
         .any(|e| e["err"].as_str().is_some_and(|x| x.contains("Revoked")));
-    failed_with(&run, "not_enrolled")
+    failed_with(&run, "revoked")
         .and(|| {
             Outcome::require(
                 refused_at_load,
@@ -2850,3 +2932,4 @@ fn restored_vault_refused(h: &Harness) -> Outcome {
 
 mod p2b;
 mod p2c;
+mod p2d;

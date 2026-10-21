@@ -196,6 +196,7 @@ fn the_delegation_example_validates_with_its_keys_mounted() {
         "okta-agent-key.pem",
         "delegation-seal",
         "linear-ras-key.pem",
+        "chat-token",
     ] {
         assert!(text.contains(f), "the example names {f}");
         std::fs::write(dir.path().join(f), "placeholder").unwrap();

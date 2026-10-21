@@ -397,13 +397,19 @@ and no match is allow.
 A rule matches on any combination of the tool name (a glob), the tool's tags
 (`tags`, every one listed; `any_tags`, at least one), the caller kind
 (`root`, `workflow`, `subagent`), the principal id (a glob, for calls made on
-a principal's behalf), a CEL expression over the arguments, and three facts
+a principal's behalf), a CEL expression over the arguments, and the facts
 of the call: `delegated` (it is made with an enrolled person's grant),
-`tainted` (the work making it has read outside text) and
-`holds_delegated_data` (a delegated server's result reached that work) — see
+`tainted` (the work making it has read outside text),
+`holds_delegated_data` (a delegated server's result reached that work),
+`unattended` (a trigger started the work, nobody is there to answer),
+`document_sourced` (a workflow an instruction document defined makes it)
+and `mode` (`delegated` when the work acts with a person's grant, `agent`
+when with agentd's own) — see
 [Acting for an enrolled person](#acting-for-an-enrolled-person). Conditions
 are ANDed, so adding one always narrows a rule. The verdict is `allow`,
-`deny`, `ask` or `shadow`.
+`deny`, `ask` or `shadow`; an `ask` with `to: principal` is the person's
+consent gate, and `once_per: run_tool` makes it ask at the first use per
+run and tool alone.
 
 Policies run at one chokepoint every call passes, after the arguments are
 validated against the tool's schema, so a guard judges arguments that already
@@ -798,6 +804,11 @@ The local runner and skills from an MCP server do not load together:
 `security.exec.enabled` with any `skills.sources` refuses the configuration.
 A server's skill may tell the model to run a command, and agentd has no
 per-skill approval to put between that text and the host.
+
+Beside a delegation the runner loads only under the whole isolation set —
+a worker uid of its own, Landlock, every supervisor-only path closed to that
+uid — and a command from work holding a person's delegated data asks them
+first ([Acting for an enrolled person](#acting-for-an-enrolled-person)).
 
 ## Secrets
 
@@ -1319,11 +1330,21 @@ What holds:
   that would resolve from the environment
   (`delegation_secret_in_environment`) — and no child is started with the
   variables such a secret names. No child opens a mounted key file or the
-  vault where the kernel has Landlock (above). `security.exec.enabled`
-  beside a delegated server, `identity.providers` or a seal key is refused
-  all the same: a command is model-chosen, and the external signer's socket
-  is no Landlock right — even under a worker uid of its own, the exclusivity
-  stays until it is weighed again.
+  vault where the kernel has Landlock (above). A delegation several people
+  can hold grants under is refused on a kernel without Landlock unless
+  workers run as `spawn.uid` with every supervisor-only path closed to that
+  uid. `security.exec.enabled` beside a delegated server,
+  `identity.providers` or a seal key — a command is model-chosen — loads
+  only under the whole isolation set: `spawn.uid` and `spawn.gid` set,
+  Landlock active, and the store's root, every key file, the audit chain and
+  its segments and each signer's socket closed to the worker uid by the mode
+  and ownership of each path and every directory above it — none owned by
+  that uid, none carrying a POSIX ACL, none above it writable by it without
+  the sticky bit; the store's root is judged as agentd restricts it at every
+  start (`0700`) only where agentd's own uid owns it, and as it is
+  otherwise. The load names each piece missing. A command from work
+  holding a person's delegated data asks them first, tainted or not
+  (`exec_holding_delegated_data`, below).
 - **Keys agentd never holds.** Under `identity.delegation.key_custody:
   external` an external signer holds the IdP and resource client keys and
   the key-encryption key, on a unix socket whose peer must be the uid
@@ -1337,7 +1358,9 @@ What holds:
   ([The external signer protocol](external-signer.md)).
 - **Authority from the transport.** A person is who the transport says:
   the unix listener's peer the kernel names by uid, on a rule with an exact
-  `idp_subject` pin; a session a display client was issued by signing in at
+  `idp_subject` pin; a client certificate whose key a rule admits alone
+  (`match.spki`), with an `idp_subject` pin — its grant held to that key;
+  a session a display client was issued by signing in at
   the IdP (`a2a.login`), the person their IdP names; or a device session
   whose name an operator bound to one person (a pin, or — opted in — its
   first enrolment). A template admits each by that source. A run's authority
@@ -1365,7 +1388,12 @@ What holds:
   pin, or first binding turned off, revokes what it bound. A session's end
   — revoked, expired, or lost to a restart — ends what it delegated at once:
   its work's next delegated call fails `revoked`, and a gate it waits on
-  closes `revoked`, the call never made. Every authorization-code sign-in —
+  closes `revoked`, the call never made. A revoked grant's calls fail
+  `revoked` too, for as long as the tombstone register keeps the
+  revocation; a person revokes their own grant from their own session
+  (`delegation.revoke`) — the grants that session holds, so a device
+  session under the name that never signed in revokes nothing — and an
+  operator anyone's. Every authorization-code sign-in —
   a display client's login, a device session's enrolment, a step-up —
   goes through a one-time start link on the listener origin that sets a
   cookie bound to it, and the callback is taken only with that cookie: an
@@ -1391,7 +1419,18 @@ What holds:
   for it. The scopes are the configured ones within the template's ceiling
   as it is now, then whatever the IdP narrows them to. An ID-JAG for another authorization
   server, client, issuer, subject or resource, one that grants a scope not
-  asked for, or one that names no resource, is refused and never redeemed.
+  asked for, or one that names no resource, is refused and never redeemed;
+  under a provider's `subjects: pairwise` its `sub` is recorded, not
+  compared. A server is told the ID-JAG's own `sub` (`agent/acting_for`)
+  and a random handle per grant and server (`agent/grant`), never the
+  person's principal or the grant's id, so two servers share no handle to
+  correlate. Mints are budgeted per person and resource per day, month and
+  minute (`budget.per_minute`, every mint asked for counted) and per run.
+- **Each use is authorised.** A delegated call is admitted at every use —
+  a pooled token skips none of it: a turn uses a delegated tool only where
+  its plan offered it (a step's `tools:` and `servers:` narrow it), the
+  tool's scopes must be within the ceiling, and the operator's
+  `security.policies` and the person's consent rules hold the call.
 - **Freshness.** A delegated success is a live exchange, or a token agentd
   minted within `at_cache_cap` for a grant whose refresh token was proved
   alive within `liveness_interval`. An IdP that stops answering stops
@@ -1403,7 +1442,8 @@ What holds:
   result (unless the operator sets `auth.trusted_output: true` on it), an
   `untrusted_input` tool's result — through a model's call, a `tool` step or
   a built-in `search.*` step — a webhook's or a stream's events, a
-  non-operator principal's A2A message, an A2A peer's answer, an `http`
+  non-operator principal's A2A message or a per-person operator's (each
+  but to work acting with their own grant, below), an A2A peer's answer, an `http`
   step's response, an `mcp.tool` or `mcp.resource` result from a server
   whose `tags` name `untrusted_input` (whether or not it serves a tool),
   knowledge context or a `knowledge.*` step's result, a served instruction,
@@ -1421,21 +1461,57 @@ What holds:
   `security.policies` match them as `tainted` and `holds_delegated_data`,
   beside `delegated` and `any_tags`; a single run's `workflow.status` shows
   them under `taint`.
-- **Consent from the person.** These ask the person: any `egress` call —
-  delegated or under agentd's own credential, from a turn, a subagent or a
-  workflow step that sends the run's data out by its own effect (`http`,
-  `a2a.send`, `a2a.delegate`, a forwarded `emit`, an `mcp.tool` or
-  `mcp.resource` step at an `egress` server) — from work that is tainted and
-  holds delegated data; a delegated `sensitive` or `egress` call from
-  tainted work; and every delegated `egress` call. Where a delegation is
-  declared every `egress` tool comes back to the supervisor, so no worker
-  dials one past the rule. An approved step runs with the spec the person
-  saw. Only they answer, bound to the gate's nonce and argument hash — over
-  the unix listener, or from a display session whose own IdP sign-in is
-  younger than `identity.delegation.consent_session_max_age`; an operator
-  answers too only where the person's template lists `approvers:
-  [principal, operator]`. Anyone else is refused, a message on the task the
-  gate holds is refused, and each is recorded
+- **A person's own message is theirs.** A message, a signal or a start a
+  person sends through a session that proves them the holder of their
+  grant — the session's principal is the grant's, and a device session has
+  itself signed in at the IdP as the identity its name is bound to — or a
+  per-person operator sends over the unix listener, is recorded as theirs:
+  it does not taint work that acts with that person's grant. It is outside
+  text to everything else — another person's work it reaches through an
+  event or a message, work for no grant, a subagent that does not inherit
+  the grant — and a tool's result, a fetched page, a served document and
+  anyone else's text taint the person's work as before. A message through
+  a device session that has not proved the binding taints as anyone's.
+- **Consent from the person.** After every rule of the operator's —
+  whose `allow` decides the operator's list alone — each call is held to
+  the person's consent rules, which agentd ships, in this order: any
+  `egress` call, delegated or under agentd's own credential, from work that
+  is tainted and holds delegated data
+  (`egress_from_tainted_work_holding_delegated_data`); a delegated
+  `sensitive` or `egress` call from tainted work
+  (`delegated_call_from_tainted_work`); a local command (`exec`) from work
+  holding delegated data (`exec_holding_delegated_data`); a delegated
+  `egress` call from a workflow an instruction document defined that the
+  person's template does not list for the server by name and definition
+  digest (`document_sourced_delegated_egress`); and a delegated `egress`
+  call at its first use per run — or conversation, or subagent — and tool
+  (`delegated_egress`), the person's approval passing later calls of the
+  tool there until a restart. A workflow step that sends the run's data out
+  by its own effect (`http`, `a2a.send`, `a2a.delegate`, a forwarded
+  `emit`, an `mcp.tool` or `mcp.resource` step at an `egress` server) meets
+  them as an `egress` call; an approved step runs with the spec the person
+  saw. An operator adds rules of their own with `to: principal` — on any
+  matcher, the facts `unattended`, `document_sourced` and `mode` among them,
+  and `once_per: run_tool` — whose gate is the person's in the same way.
+  Where a delegation is declared every `egress` tool comes back to the
+  supervisor, so no worker dials one past a rule. A subagent a document's
+  workflow spawns is that workflow's work, and asks as it does. While the
+  instruction is frozen — its source not confirmed current before its trust
+  `freshness` deadline — no model turn or subagent, no run a model asked
+  for (`workflow.run`, a workflow tool, a signal that starts or wakes it,
+  and the runs those start) and no run of a workflow the document defined
+  makes a delegated call, and no model writes a workflow. Only the person answers, bound to the gate's nonce and
+  argument hash — over the unix listener, over the connection their
+  certificate authenticates, or from a display session whose own IdP
+  sign-in is younger than `identity.delegation.consent_session_max_age`;
+  an operator answers too only where the person's template lists
+  `approvers: [principal, operator]`. Gates of one shape — rule, server,
+  tool and argument names alike — may be answered together, each still
+  bound to its own nonce and hash, and each recorded; at most
+  `identity.delegation.consent_per_minute` gates open for one person a
+  minute, and a call past that is refused rather than asked
+  (`delegation.consent.rate_limited`). Anyone else is refused, a message on
+  the task the gate holds is refused, and each is recorded
   (`delegation.consent.refused`); no judge answers whatever
   `agent.ask_human_fallback` says, and an unanswered gate denies. What they
   read is agentd's own text: fixed lines, and every value the work chose —
@@ -1448,6 +1524,30 @@ What holds:
   no question a model asks can earn; under it, a policy `ask` shows the
   call's `{{args}}` as printable-ASCII JSON, capped, and `{{tool}}` quoted,
   and the cross-Company gate its arguments the same way.
+- **No reach for agentd's own authority.** Work acting with a person's
+  grant — the person's run, turn, conversation, a subagent that inherits —
+  is not offered, and is refused (`mode_mixing`), an agent-mode MCP server
+  tagged `sensitive` or `egress` unless the person's template lists it in
+  `agent_mode_servers`; every agent-mode call it makes comes back to the
+  supervisor and is recorded (`delegation.agent_mode_call`). The load
+  refuses the same resource or authorization server under a delegated and
+  an agent-mode server.
+- **A server's questions reach its person alone.** An elicitation a
+  delegated server sends on a connection made with a person's grant is a
+  gate of its own, owned by and addressed to that person, in agentd's words
+  with the server's quoted as the server's. It is answered as their consent
+  gates are, and only through a session that holds that grant: a device
+  session under the same name that never signed in at the IdP as the
+  identity the name is bound to is refused, and recorded
+  (`delegation.elicitation.refused`). No operator answers it for them, no
+  judge and no approval policy does, and unanswered within the server's
+  wait it is cancelled. A URL elicitation is declined; agentd never opens a
+  link a server sends.
+- **A worker uses what it was offered.** A turn worker makes a delegated
+  call only of a tool its plan offered — its step's `tools:` and
+  `servers:` — and a subagent only of one on a delegated server it declares
+  that its `tools:` grant admits; a worker asking for any other is refused
+  before any check or mint (`tool.refused`, `why: not_offered`).
 - **Documents cannot configure authority.** A served document, a
   `:::!config` or `:::!mcp` fragment and a subagent template's machinery may
   not declare a delegated server, set its pins or its client
@@ -1486,12 +1586,13 @@ What holds:
   A2A listener of its parent's it finds, which the kernel names as the
   operator: that is what the uid of its own closes.
 
-What this preview does not do: a certificate principal does not delegate
-yet; a grant held by a person stays usable after the IdP removes a Resource
-connection until the next mint (at most `at_cache_cap`); taint does not
-follow text inside an instance child, which keeps a record of its own; and
-on a kernel without Landlock, with no separate worker uid, the vault and a
-mounted key file are readable by any same-uid process.
+What this preview does not do: a grant held by a person stays usable after
+the IdP removes a Resource connection until the next mint (at most
+`at_cache_cap`); taint does not follow text inside an instance child, which
+keeps a record of its own; a first use the person approved is remembered in
+memory, so a restart asks again; and for one person on a kernel without
+Landlock, with no separate worker uid, the vault and a mounted key file are
+readable by any same-uid process.
 
 ### A container deployment with a worker uid
 

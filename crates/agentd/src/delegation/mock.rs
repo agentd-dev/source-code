@@ -93,6 +93,10 @@ pub fn default_knobs() -> Value {
         // authorization servers, instead of its own.
         "prm_resource": null,
         "prm_authorization_servers": null,
+        // A tools/call of `{tool}` first asks the client `{message}` in the
+        // shape `{schema}` (`elicitation/create`, over the call's own event
+        // stream), and answers with what the client said.
+        "elicit": null,
     })
 }
 
@@ -128,6 +132,8 @@ struct State {
     ats: BTreeMap<String, At>,
     record: Vec<Value>,
     serial: u64,
+    /// The client's answer to the last elicitation.
+    elicited: Option<Value>,
 }
 
 impl State {
@@ -235,6 +241,7 @@ pub fn start(knobs: &Value) -> std::io::Result<Mock> {
         ats: BTreeMap::new(),
         record: Vec::new(),
         serial: 0,
+        elicited: None,
     }));
     for (l, role) in [(li, Role::Idp), (lr, Role::Ras), (lm, Role::Mcp)] {
         let state = Arc::clone(&state);
@@ -985,10 +992,21 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
         );
     };
     let echo = s.flag("mcp_error_echo");
-    drop(s);
+    let elicit = s.knob("elicit").clone();
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    // The client's answer to an elicitation this server sent.
+    if body.get("method").is_none() && (body.get("result").is_some() || body.get("error").is_some())
+    {
+        s.elicited = Some(body);
+        drop(s);
+        return write(stream, 202, &[], b"");
+    }
+    drop(s);
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let m = body["method"].as_str().unwrap_or_default();
+    if m == "tools/call" && body["params"]["name"] == elicit["tool"] {
+        return ask_then_answer(stream, &id, &elicit, state);
+    }
     let session = vec![
         ("Mcp-Session-Id", "s-ema".to_string()),
         ("Content-Type", "application/json".to_string()),
@@ -1039,6 +1057,46 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
             json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Method not found"}}),
         ),
     }
+}
+
+/// A tools/call answered over an event stream: `elicitation/create` with
+/// the knob's message and schema first, then — once the client answers, or
+/// after 60 s — the call's result, which says what the client answered.
+fn ask_then_answer(mut stream: &TcpStream, id: &Value, elicit: &Value, state: &Arc<Mutex<State>>) {
+    state.lock().unwrap_or_else(|e| e.into_inner()).elicited = None;
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nMcp-Session-Id: s-ema\r\nConnection: close\r\n\r\n";
+    let ask = json!({"jsonrpc": "2.0", "id": "elicit-1", "method": "elicitation/create",
+                     "params": {"message": elicit["message"], "requestedSchema": elicit["schema"]}});
+    if stream
+        .write_all(format!("{head}data: {ask}\n\n").as_bytes())
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let answered = loop {
+        if let Some(a) = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elicited
+            .take()
+        {
+            break a;
+        }
+        if std::time::Instant::now() >= deadline {
+            break Value::Null;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = json!({"answered": answered["result"]});
+    let result = rpc(
+        id,
+        json!({"content": [{"type": "text", "text": out.to_string()}], "structuredContent": out,
+               "isError": false}),
+    );
+    let _ = stream.write_all(format!("data: {result}\n\n").as_bytes());
+    let _ = stream.flush();
 }
 
 /// A knob set as a `Map`, for a test that builds one up.

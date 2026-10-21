@@ -415,6 +415,35 @@ impl Runtime {
                 gated_tools.push(d.name);
             }
         }
+        // A child that acts with its person's grant (`subagents: inherit`)
+        // makes every agent-mode call through the supervisor, which hides
+        // the servers its person's template does not list and records the
+        // rest (RFC 0044 §5.3).
+        #[cfg(feature = "xaa")]
+        if self
+            .delegation
+            .as_ref()
+            .and_then(|d| d.acting_templates(caller.acting()))
+            .is_some_and(|t| {
+                t.iter().any(|t| {
+                    t.subagents == crate::config::settings::delegation::SubagentsMode::Inherit
+                })
+            })
+        {
+            for d in self
+                .registry
+                .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
+            {
+                let agent_mode = matches!(
+                    self.registry.get(&d.name).map(|t| &t.imp),
+                    Some(crate::registry::Impl::Mcp { server, .. })
+                        if servers.contains(server) && !self.is_delegated_server(server)
+                );
+                if agent_mode && !gated_tools.contains(&d.name) {
+                    gated_tools.push(d.name);
+                }
+            }
+        }
         // A Company's tools on the servers it was handed come back to the
         // supervisor whatever the policies say, and only in work the
         // Company's User owns (RFC 0047 §5.6): the child has no connection
@@ -593,6 +622,7 @@ impl Runtime {
             payload.telemetry.attribution = m;
             record.payload = Some(secret_free_payload(&payload));
         }
+        let offered = self.subagent_offered(&record.delegated_servers, allow.as_deref());
         match self.children.spawn(
             &payload,
             ChildKind::Subagent {
@@ -602,6 +632,9 @@ impl Runtime {
             Duration::from_millis(deadline_ms),
         ) {
             Ok(node) => {
+                if let Some(c) = self.children.get_mut(node) {
+                    c.offered = Some(offered);
+                }
                 record.node = Some(node);
                 record.status = "running".into();
                 self.log.in_trace(Some(&trace)).info("subagent.spawn", json!({"handle": handle, "mode": mode, "node": node.0, "pid": self.children.pid_of(node), "depth": depth + 1, "servers": servers.len(), "priority": priority.as_str(), "memory_bytes": memory_bytes, "cpu_seconds": cpu_seconds}));
@@ -631,6 +664,29 @@ impl Runtime {
                 err(format!("subagent.run: spawn failed: {e}"))
             }
         }
+    }
+
+    /// The delegated tools a subagent's spawn offered it: each the registry
+    /// has on a delegated server it declares (`servers`) that its `tools:`
+    /// grant (`allow`) admits — the only ones the supervisor makes a
+    /// delegated call of for it (RFC 0044 §5.12 F).
+    fn subagent_offered(
+        &self,
+        servers: &[String],
+        allow: Option<&[String]>,
+    ) -> std::collections::BTreeSet<String> {
+        self.registry
+            .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|n| {
+                self.delegated_server_name(n)
+                    .is_some_and(|s| servers.contains(&s))
+            })
+            .filter(|n| {
+                allow.is_none_or(|a| a.iter().any(|p| crate::registry::pattern_matches(p, n)))
+            })
+            .collect()
     }
 
     /// Resolve `template:`/`params:` into effective spawn args.
@@ -1029,6 +1085,13 @@ impl Runtime {
                 payload.telemetry.set_trace(t);
             }
             let deadline = Duration::from_millis(payload.limits.deadline_ms.max(1000));
+            let offered = self.subagent_offered(
+                self.subagents
+                    .get(&handle)
+                    .map(|s| s.delegated_servers.as_slice())
+                    .unwrap_or_default(),
+                payload.allowed_tools().as_deref(),
+            );
             match self.children.spawn(
                 &payload,
                 ChildKind::Subagent {
@@ -1038,6 +1101,9 @@ impl Runtime {
                 deadline,
             ) {
                 Ok(node) => {
+                    if let Some(c) = self.children.get_mut(node) {
+                        c.offered = Some(offered);
+                    }
                     if let Some(s) = self.subagents.get_mut(&handle) {
                         s.node = Some(node);
                         s.attempt += 1;

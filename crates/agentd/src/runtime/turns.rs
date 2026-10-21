@@ -237,6 +237,29 @@ impl Runtime {
             }
             _ => true,
         });
+        // In work that acts with a person's grant, agent-mode servers tagged
+        // `sensitive` or `egress` are not offered unless the person's
+        // template lists them (RFC 0044 §5.3, T10), and every agent-mode
+        // call comes back to the supervisor, which records it as one made
+        // from delegated work.
+        #[cfg(feature = "xaa")]
+        let delegated_work = !matches!(caller, Caller::Subagent { .. })
+            && match self
+                .delegation
+                .as_ref()
+                .and_then(|d| d.acting_templates(crate::delegation::Acting::new(owner, session)))
+            {
+                Some(templates) => {
+                    defs.retain(|d| match self.agent_mode_server_of(&d.name) {
+                        Some(server) => !self.agent_mode_hidden(&templates, &server, Some(&d.name)),
+                        None => true,
+                    });
+                    true
+                }
+                None => false,
+            };
+        #[cfg(not(feature = "xaa"))]
+        let delegated_work = false;
         // Which policy caller this plan is being built for. A plan is per
         // turn, so this is fixed for every call the child will make.
         let who = match caller {
@@ -290,6 +313,7 @@ impl Runtime {
                     if (!policies.is_empty()
                         && crate::sec::policy::could_apply(policies, &d.name, &tags, who))
                         || self.egress_round_trips(&tags)
+                        || delegated_work
                     {
                         internal.push(d.name.clone());
                     } else {
@@ -1282,6 +1306,15 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
     /// Spawn a turn worker child.
     pub(crate) fn spawn_turn(&mut self, launch: TurnLaunch) -> Result<NodeId, String> {
         let tlog = self.log.in_trace(launch.trace.as_ref());
+        // The delegated tools this turn's plan offers: the only ones the
+        // supervisor makes a delegated call of for it.
+        let offered: std::collections::BTreeSet<String> = launch
+            .spec
+            .internal
+            .iter()
+            .filter(|n| self.delegated_tool(n))
+            .cloned()
+            .collect();
         let servers: Vec<crate::config::McpServerSpec> = launch
             .servers
             .iter()
@@ -1380,6 +1413,9 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                 Duration::from_millis(launch.deadline_ms),
             )
             .map_err(|e| e.to_string())?;
+        if let Some(c) = self.children.get_mut(node) {
+            c.offered = Some(offered);
+        }
         crate::obs::metrics::record_turn(kind);
         Ok(node)
     }

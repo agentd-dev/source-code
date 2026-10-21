@@ -53,6 +53,11 @@ pub enum Target {
     /// or detached the task (RFC 0054): the task's handle and the input key,
     /// answered back to the server with `tasks/update`.
     McpTask(String, String),
+    /// A delegated server's elicitation, put to the person whose grant its
+    /// connection carries (RFC 0044 T24), answered back to the connection
+    /// waiting on it.
+    #[cfg_attr(not(all(feature = "xaa", feature = "a2a")), allow(dead_code))]
+    Elicit(String),
 }
 
 /// A deferred internal-tool request (answered when its wait resolves).
@@ -528,6 +533,19 @@ pub struct Runtime {
     /// restart asks again.
     #[cfg(feature = "xaa")]
     pub(crate) consented_steps: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// The first uses the person approved of a `once_per: run_tool` rule,
+    /// by `unit|tool|rule`, with when (`delegated::once_key`). In memory: a
+    /// restart asks again.
+    #[cfg(feature = "xaa")]
+    pub(crate) consented_once: BTreeMap<String, u64>,
+    /// When each person's recent consent gates opened, for
+    /// `identity.delegation.consent_per_minute`.
+    #[cfg(feature = "xaa")]
+    pub(crate) consents_asked: BTreeMap<String, std::collections::VecDeque<u64>>,
+    /// The connections waiting on a person's answer to a delegated server's
+    /// elicitation, by gate.
+    #[cfg(feature = "xaa")]
+    pub(crate) elicits: BTreeMap<String, super::delegated::ElicitWait>,
     /// The Company sign-ins in progress, by id (`runtime::company_sign_in`).
     /// In memory: a sign-in does not outlive the process that started it.
     #[cfg(feature = "companies")]
@@ -1359,6 +1377,7 @@ impl Runtime {
             Target::Step(run, step) => self.step_trace(run, step),
             Target::Child(node, _) => self.children.get(*node).and_then(|c| c.trace.clone()),
             Target::McpTask(h, _) => self.mcp_tasks.records.get(h).and_then(|r| r.trace.clone()),
+            Target::Elicit(_) => None,
         }
     }
 
@@ -1436,6 +1455,7 @@ impl Runtime {
                         .get("subagent")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    let by_model = ev.payload.get("by_model") == Some(&Value::Bool(true));
                     let delivered = self.deliver_signal_from(
                         &name,
                         payload,
@@ -1445,6 +1465,7 @@ impl Runtime {
                         &carries,
                         ev.trace.as_ref(),
                         subagent.as_deref(),
+                        by_model,
                     );
                     self.log.in_trace(ev.trace.as_ref()).info(
                         "signal.received",
@@ -1564,17 +1585,22 @@ impl Runtime {
         // The Companies whose content the sender held (`message.send`, a
         // `message` step), its delegated data and its taint: whichever
         // reader takes the message carries them (RFC 0047 §6.2, RFC 0044
-        // §5.13) — and the taint of a person's own message. A peer agent's
-        // text is the origin each reader records of it already.
+        // §5.13) — and the taint of a person's own message, recorded as
+        // theirs when the session it came through proves them the holder of
+        // their grant. A peer agent's text is the origin each reader records
+        // of it already.
         let mut carried = super::starts::event_carries(&ev.payload).kept_by_holder(true);
         if let Some(p) = principal.as_deref() {
-            carried.taint(self.principal_message_carries(p, "handed a message").taint);
+            carried.taint(
+                self.principal_message_carries(p, ev.session.as_deref(), "handed a message")
+                    .taint,
+            );
         }
         let woken = self.deliver_a2a_message(
             &ctx,
             &wire,
             &msg,
-            principal.as_deref(),
+            (principal.as_deref(), ev.session.as_deref()),
             &carried,
             ev.trace.as_ref(),
         );

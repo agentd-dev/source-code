@@ -12,39 +12,43 @@
 //! declared `auth.trusted_output`, its taint — written before the result is
 //! read (`runtime::taint`).
 //!
-//! **Consent** (§5.10, §5.13 item 6). The rules read the unit's facts from
-//! the taint engine — whether it is tainted, whether it holds delegated
-//! data — and are hard-coded until P2 makes them configurable:
-//!
-//! 1. an `egress` call of any kind — delegated or under agentd's own
-//!    credential — from a unit that is tainted and holds delegated data
-//!    asks the person, so the data does not leave through another server.
-//!    A workflow step that sends the run's data out by its own effect
-//!    rather than a tool call is one too: an `http` call, an `a2a.send` or
-//!    `a2a.delegate`, an `emit` that forwards the event out, an `mcp.tool`
-//!    or `mcp.resource` at a server whose tools are tagged `egress`
-//!    ([`Runtime::step_consent`]). Approved, the step runs again past the
-//!    gate with the spec the person saw;
-//! 2. a delegated call to a `sensitive` or `egress` tool from a tainted
-//!    unit asks;
-//! 3. a delegated `egress` call asks whatever the unit read — at every use,
-//!    the first use per run and tool of §5.13 until P2's `once_per`.
+//! **Consent** (§5.10, §5.13 item 6). Every call is held, after the
+//! operator's `security.policies`, to the person's consent rules agentd
+//! ships (`sec::policy::consent_rules`), on the facts of the call and of the
+//! work making it ([`Runtime::policy_facts`]): an `egress` call from tainted
+//! work holding the person's data, a delegated `sensitive` or `egress` call
+//! from tainted work, a command from work holding the data, a delegated
+//! `egress` call from a document's workflow its template does not list, and
+//! a delegated `egress` call at its first use per run and tool. A workflow
+//! step that sends the run's data out by its own effect rather than a tool
+//! call meets them as an `egress` call: an `http` call, an `a2a.send` or
+//! `a2a.delegate`, an `emit` that forwards the event out, an `mcp.tool` or
+//! `mcp.resource` at a server whose tools are tagged `egress`
+//! ([`Runtime::step_consent`]); approved, the step runs again past the gate
+//! with the spec the person saw. An operator's own `to: principal` rule
+//! asks the person the same way.
 //!
 //! A gate is a [`PendingKind::Consent`]: addressed to the person, answered
-//! only by them over the unix A2A listener (`agentd --delegation-approve
-//! <gate>` / `--delegation-deny <gate>`, recorded `via: operator_self`),
-//! bound to its `nonce` and the hash of the call's canonical arguments, and
-//! never answered by a judge, an operator, or a message on the asking task
-//! (refused there, the gate left open). What the person reads is agentd's
-//! text ([`gate_text`]): its own lines, the values the work chose quoted and
-//! escaped, the arguments in full up to a cap with their length, whether
-//! the work is tainted and by what. Unanswered within
-//! `identity.delegation.consent_timeout` it denies. Each decision is an
-//! audit-chain record whose personal content — what the person was shown —
-//! is sealed under their personal key (§6.4), so forgetting them leaves it
-//! unreadable and the chain whole. A workflow step's gate is kept in the
-//! step's wait record and re-armed at the next start; a turn's dies with
-//! its turn.
+//! by them — over the unix A2A listener (`agentd --delegation-approve
+//! <gate>` / `--delegation-deny <gate>`, `via: operator_self`), or through a
+//! display session recently signed in at the IdP (`via: gate`) — or by an
+//! operator their template lists among its approvers; bound to its `nonce`
+//! and the hash of the call's canonical arguments, and never answered by a
+//! judge, by anyone else, or by a message on the asking task (refused
+//! there, the gate left open). Gates of one shape — rule, server, tool and
+//! argument names alike — may be answered together, each still bound to
+//! its own nonce and hash. At most `identity.delegation.consent_per_minute`
+//! gates open for one person a minute; a call past that is refused, never
+//! asked. What the person reads is agentd's text ([`gate_text`]): its own
+//! lines, the values the work chose quoted and escaped, the arguments in
+//! full up to a cap with their length, whether the work is tainted and by
+//! what. Unanswered within `identity.delegation.consent_timeout` it denies.
+//! Each decision is an audit-chain record whose personal content — what the
+//! person was shown — is sealed under their personal key (§6.4), so
+//! forgetting them leaves it unreadable and the chain whole. A workflow
+//! step's gate is kept in the step's wait record and re-armed at the next
+//! start; a turn's dies with its turn. An approval of a first use is
+//! remembered for the unit and tool in memory: a restart asks again.
 
 use std::sync::Arc;
 
@@ -80,18 +84,66 @@ pub(crate) fn read_carries(server: &str, trusted: bool) -> crate::engine::run::C
 pub(crate) const ARGS_SHOWN: usize = 4000;
 
 /// What each consent rule asks about, in the gate's words.
-fn rule_words(rule: &str) -> &'static str {
+fn rule_words(rule: &str) -> String {
     match rule {
         "egress_from_tainted_work_holding_delegated_data" => {
-            "the work holds your delegated data and has read outside text, and this call sends data off the box"
+            "the work holds your delegated data and has read outside text, and this call sends data off the box".into()
         }
         "delegated_call_from_tainted_work" => {
-            "this call acts with your grant at a sensitive or egress tool, from work that has read outside text"
+            "this call acts with your grant at a sensitive or egress tool, from work that has read outside text".into()
         }
-        "delegated_egress" => "this call sends data off the box with your grant",
-        _ => "a consent rule asks",
+        "exec_holding_delegated_data" => {
+            "the work holds your delegated data, and this call runs a command on the box, which can send it anywhere".into()
+        }
+        "document_sourced_delegated_egress" => {
+            "this call sends data off the box with your grant, from a workflow an instruction document defined that your template does not list".into()
+        }
+        "delegated_egress" => {
+            "this call sends data off the box with your grant, its first use of this tool in this work".into()
+        }
+        r if r.starts_with("security.policies[") => {
+            format!("the operator's rule {r} asks for your consent before this call")
+        }
+        _ => "a consent rule asks".into(),
     }
 }
+
+/// The key a first use the person approved is remembered by: the unit of
+/// work, the tool and the rule.
+pub(crate) fn once_key(unit: &str, tool: &str, rule: &str) -> String {
+    format!("{unit}|{tool}|{rule}")
+}
+
+/// The unit of work a call is made in, as a first use is counted: the run,
+/// the subagent, or the conversation.
+pub(crate) fn unit_of(caller: &ToolCaller) -> String {
+    match (&caller.subagent, &caller.run) {
+        (Some(h), _) => format!("subagent:{h}"),
+        (None, Some(r)) => format!("run:{r}"),
+        _ => format!("ctx:{}", caller.context_id()),
+    }
+}
+
+/// The shape of a gate, which gates answered together share: its rule,
+/// server and tool, and the names of its arguments — never their values.
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+pub(crate) fn shape_of(rendered: &Value) -> String {
+    let mut names: Vec<&str> = rendered["args"]
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    let s = json!({"rule": rendered["rule"], "server": rendered["server"],
+                   "tool": rendered["tool"], "args": names});
+    crate::sha::sha256_hex(s.to_string().as_bytes())[..16].to_string()
+}
+
+/// How long a remembered first use is kept, at most.
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+const ONCE_KEPT_MS: u64 = 24 * 60 * 60 * 1000;
+/// The most first uses remembered at once.
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+const ONCE_CAP: usize = 4096;
 
 /// What the person reads of gate `id`, rendered `r` (RFC 0044 §5.10 rule
 /// 5, T29): every line agentd's own, each value the work chose — a server,
@@ -110,6 +162,12 @@ pub(crate) fn gate_text(id: &str, r: &Value) -> String {
         lines.push(format!("Server: {v}"));
     }
     lines.push(format!("Tool: {}", s("tool").unwrap_or_default()));
+    if r["document_sourced"] == true {
+        lines.push(format!(
+            "Workflow: {}, defined by an instruction document",
+            s("workflow").unwrap_or_default()
+        ));
+    }
     if let Some(sc) = r["scope"].as_array() {
         let shown: Vec<String> = sc
             .iter()
@@ -183,6 +241,15 @@ pub(crate) struct Answerer {
     pub via: &'static str,
 }
 
+/// A delegated server's connection waiting on its person's answer.
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+pub(crate) struct ElicitWait {
+    pub reply: std::sync::mpsc::SyncSender<Option<Value>>,
+    /// The grant the connection was made with, which the answerer must
+    /// hold.
+    pub grant: String,
+}
+
 /// One open consent gate.
 #[derive(Debug, Clone)]
 pub(crate) struct ConsentGate {
@@ -211,6 +278,25 @@ pub(crate) struct ConsentGate {
     /// revoked, expired, or lost to a restart — the gate closes `revoked`
     /// at the next pass, since no answer could make the call.
     pub session: Option<String>,
+    /// The first use an approval stands for, when the rule asks at the
+    /// first use per run and tool alone ([`once_key`]).
+    pub once: Option<String>,
+}
+
+/// What a gate about to open asks under.
+struct Ask {
+    /// The rule's name: a shipped one's, or `security.policies[<i>]`.
+    rule: String,
+    /// The delegated server the call goes to, when it does.
+    server: Option<String>,
+    /// The gates the call passed before this one asked.
+    passed: super::reactor::Passed,
+    /// A workflow step's own effect, not a tool call.
+    effect: bool,
+    /// The first use an approval stands for.
+    once: Option<String>,
+    /// The rule's own `timeout`, over `identity.delegation.consent_timeout`.
+    timeout_ms: Option<u64>,
 }
 
 /// The hash a gate is bound to: SHA-256 of `{tool, args}` as compact JSON,
@@ -266,6 +352,29 @@ impl Runtime {
             code: crate::delegation::Code::DelegationNotPermitted,
             message,
         };
+        // A revoked document makes no delegated call (T27): while the
+        // instruction is frozen — its source not confirmed current before
+        // its deadline — nothing it wrote acts with a person's grant: no
+        // model turn or subagent, whose prompt holds it; no run a model
+        // asked for, whose inputs are the model's; and no run of a workflow
+        // it defined, nor a subagent such a run spawned.
+        let steered = self.freshness_frozen
+            && (caller.node.is_some()
+                || self.subagent_lineage(caller).is_some()
+                || self.originating_run(caller).is_some_and(|r| {
+                    r.by_model
+                        || self
+                            .definition_for_run_ref(&r.workflow, &r.workflow_hash)
+                            .is_some_and(|w| w.document)
+                }));
+        if steered {
+            return Err(crate::delegation::DelegationError {
+                code: crate::delegation::Code::PolicyDenied,
+                message: format!(
+                    "the instruction document could not be confirmed current (agent.instruction.trust freshness): nothing it wrote acts with a person's grant at {server} until it is"
+                ),
+            });
+        }
         let admitted = d.admit(caller.acting(), server);
         let Some(h) = self.subagent_lineage(caller) else {
             return admitted;
@@ -316,41 +425,162 @@ impl Runtime {
         }
     }
 
-    /// The consent rule a call meets, if any (the module's rules 1–3): an
-    /// `egress` call from tainted work holding delegated data, a delegated
-    /// `sensitive` or `egress` call from tainted work, a delegated `egress`
-    /// call.
-    fn consent_rule(
+    /// The templates of the grants `caller`'s work acts with, when it acts
+    /// with any (RFC 0044 §5.3): the person's, through the session the work
+    /// acts through — and for a subagent's work, or a run one started, only
+    /// those that say `subagents: inherit`.
+    pub(crate) fn work_templates(
         &self,
         caller: &ToolCaller,
-        name: &str,
-    ) -> Option<(&'static str, Option<String>)> {
+    ) -> Option<Vec<crate::config::settings::delegation::Template>> {
+        let mut t = self
+            .delegation
+            .as_ref()?
+            .acting_templates(caller.acting())?;
+        if self.subagent_lineage(caller).is_some() {
+            t.retain(|t| {
+                t.subagents == crate::config::settings::delegation::SubagentsMode::Inherit
+            });
+        }
+        (!t.is_empty()).then_some(t)
+    }
+
+    /// The agent-mode MCP server tool `name` is served by, when it is one —
+    /// not a delegated server, nor a Company's, whose tools act for its
+    /// User alone.
+    pub(crate) fn agent_mode_server_of(&self, name: &str) -> Option<String> {
+        let server = match self.registry.route(name)? {
+            crate::registry::Route::Mcp { server, .. } => server.to_string(),
+            crate::registry::Route::Mapped(m) => m.server.clone(),
+            _ => return None,
+        };
+        (!self.is_delegated_server(&server) && !self.is_company_server(&server)).then_some(server)
+    }
+
+    /// Whether agent-mode `server` — its tool `name`, or for a step any of
+    /// its tools — is hidden from work acting with `templates` (RFC 0044
+    /// §5.3, T10): tagged `sensitive` or `egress`, and listed in none of
+    /// their `agent_mode_servers`. Agentd's own credential there is broader
+    /// than the person's grant, and a steered model would reach for it.
+    pub(crate) fn agent_mode_hidden(
+        &self,
+        templates: &[crate::config::settings::delegation::Template],
+        server: &str,
+        name: Option<&str>,
+    ) -> bool {
         use crate::sec::scope::TrifectaTag;
-        let tags = self
-            .registry
-            .tags_of(std::slice::from_ref(&name.to_string()));
-        let server = self.delegated_server_of(name);
-        let egress = tags.contains(&TrifectaTag::Egress);
-        let sensitive = tags.contains(&TrifectaTag::Sensitive);
-        if !egress && !(server.is_some() && sensitive) {
-            return None;
+        if templates
+            .iter()
+            .any(|t| t.agent_mode_servers.iter().any(|s| s == server))
+        {
+            return false;
         }
-        let facts = self.caller_facts(caller);
-        if egress && facts.tainted && facts.holds_delegated_data {
-            return Some(("egress_from_tainted_work_holding_delegated_data", server));
+        let names: Vec<String> = match name {
+            Some(n) => vec![n.to_string()],
+            None => self
+                .registry
+                .iter()
+                .filter(|t| t.server.as_deref() == Some(server))
+                .map(|t| t.name.clone())
+                .collect(),
+        };
+        let mut tags = self.registry.tags_of(&names);
+        if name.is_none()
+            && let Some(declared) = self
+                .settings
+                .mcp
+                .servers
+                .iter()
+                .find(|s| s.name == server)
+                .and_then(|s| s.tag_set().ok())
+        {
+            tags.extend(declared);
         }
-        if server.is_some() && facts.tainted {
-            return Some(("delegated_call_from_tainted_work", server));
+        tags.iter()
+            .any(|t| matches!(t, TrifectaTag::Sensitive | TrifectaTag::Egress))
+    }
+
+    /// A call of agent-mode `server` from `caller`'s work, which acts with
+    /// an enrolled person's grant: refused when the server is hidden from it
+    /// (`mode_mixing`), else recorded as such (`delegation.agent_mode_call`)
+    /// and let through. `None` for work acting with nobody's grant. `name`
+    /// is the tool, or `None` for a step's `mcp.tool` or `mcp.resource`.
+    pub(crate) fn mode_mixing(
+        &self,
+        caller: &ToolCaller,
+        server: &str,
+        name: Option<&str>,
+        what: &str,
+    ) -> Option<String> {
+        let templates = self.work_templates(caller)?;
+        let principal = caller.principal.as_deref().unwrap_or_default();
+        if self.agent_mode_hidden(&templates, server, name) {
+            let target = json!({"server": server, "tool": what, "principal": principal,
+                                "run": caller.run, "step": caller.step, "why": "mode_mixing"});
+            self.log
+                .warn("delegation.agent_mode.refused", target.clone());
+            self.audit(super::audit::AuditEvent {
+                action: "delegation.agent_mode_call",
+                target,
+                outcome: "refused",
+                principal: Some(principal),
+                role: None,
+                request_id: None,
+                sid: None,
+                trace: self.caller_trace(caller).as_ref(),
+                link: None,
+            });
+            return Some(format!(
+                "{what}: refused (mode_mixing): {server} is an agent-mode server tagged sensitive or egress, and this work acts with {principal}'s delegated grant — agentd's own credential there is hidden from it unless the person's template lists {server} in agent_mode_servers"
+            ));
         }
-        if server.is_some() && egress {
-            return Some(("delegated_egress", server));
-        }
+        self.audit(super::audit::AuditEvent {
+            action: "delegation.agent_mode_call",
+            target: json!({"server": server, "tool": what, "principal": principal,
+                           "run": caller.run, "step": caller.step}),
+            outcome: "admitted",
+            principal: Some(principal),
+            role: None,
+            request_id: None,
+            sid: None,
+            trace: self.caller_trace(caller).as_ref(),
+            link: None,
+        });
         None
     }
 
-    /// The person's consent before `name`: `None` to go on, or the gate (or
-    /// the refusal) the call meets. A delegated call that could not be made
-    /// at all is refused here, before anyone is asked.
+    /// Whether `caller`'s unit is past the first use of `name` that `rule`
+    /// asks about: the person approved one.
+    fn once_passed(&self, caller: &ToolCaller, name: &str, rule: &str) -> bool {
+        self.consented_once
+            .contains_key(&once_key(&unit_of(caller), name, rule))
+    }
+
+    /// Remember the first use gate `g` stood for, approved.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    fn remember_once(&mut self, g: &ConsentGate) {
+        let Some(k) = &g.once else { return };
+        let now = now_ms();
+        self.consented_once
+            .retain(|_, at| now.saturating_sub(*at) < ONCE_KEPT_MS);
+        if self.consented_once.len() >= ONCE_CAP
+            && let Some(oldest) = self
+                .consented_once
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+        {
+            self.consented_once.remove(&oldest);
+        }
+        self.consented_once.insert(k.clone(), now);
+    }
+
+    /// The person's consent before `name`, after every rule of the
+    /// operator's (§5.13 item 6): `None` to go on, or the gate (or the
+    /// refusal) the first of the shipped consent rules it meets opens — on
+    /// the facts of the call and of the work making it. A delegated call
+    /// that could not be made at all is refused here, before anyone is
+    /// asked.
     pub(crate) fn consent_check(
         &mut self,
         caller: &ToolCaller,
@@ -359,7 +589,22 @@ impl Runtime {
         passed: super::reactor::Passed,
     ) -> Option<ToolOutcome> {
         let d = self.delegation.clone()?;
-        let (rule, server) = self.consent_rule(caller, name)?;
+        let tags = self
+            .registry
+            .tags_of(std::slice::from_ref(&name.to_string()));
+        let facts = self.policy_facts(caller, name);
+        let call = crate::sec::policy::Call {
+            tool: name,
+            tags: &tags,
+            caller: Self::policy_caller(caller),
+            principal: caller.principal.as_deref(),
+            args,
+            also: None,
+            facts,
+        };
+        let (rule, once) =
+            crate::sec::policy::consent_rule(&call, &|r| self.once_passed(caller, name, r))?;
+        let server = self.delegated_server_of(name);
         if let Some(s) = &server
             && let Err(e) = self.delegation_admit(&d, caller, s)
         {
@@ -368,7 +613,76 @@ impl Runtime {
                 true,
             ));
         }
-        Some(self.open_consent(&d, caller, name, args, rule, server, passed, false))
+        let once = once.then(|| once_key(&unit_of(caller), name, rule));
+        Some(self.open_consent(
+            &d,
+            caller,
+            name,
+            args,
+            Ask {
+                rule: rule.to_string(),
+                server,
+                passed,
+                effect: false,
+                once,
+                timeout_ms: None,
+            },
+        ))
+    }
+
+    /// An operator's `to: principal` rule asked about `name` (`verdict`):
+    /// the person's consent gate, as a shipped rule's, the rule named
+    /// `security.policies[<i>]`. Approved, the call runs past the
+    /// operator's rules and the person's alike.
+    pub(crate) fn rule_consent(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        args: &Value,
+        verdict: &crate::sec::policy::Verdict,
+        passed: super::reactor::Passed,
+    ) -> ToolOutcome {
+        let rule = format!("security.policies[{}]", verdict.rule);
+        let Some(d) = self.delegation.clone() else {
+            return ToolOutcome::Ready(
+                Value::String(format!(
+                    "{name}: refused by {rule}: it asks the person the work acts for, and no delegation is configured"
+                )),
+                true,
+            );
+        };
+        let server = self.delegated_server_of(name);
+        if let Some(s) = &server
+            && let Err(e) = self.delegation_admit(&d, caller, s)
+        {
+            return ToolOutcome::Ready(Value::String(format!("{name}: {e}")), true);
+        }
+        let once = verdict
+            .once_per
+            .map(|_| once_key(&unit_of(caller), name, &rule));
+        self.open_consent(
+            &d,
+            caller,
+            name,
+            args,
+            Ask {
+                rule,
+                server,
+                passed: super::reactor::Passed {
+                    policy: true,
+                    ..passed
+                },
+                effect: false,
+                once,
+                timeout_ms: verdict.timeout_ms,
+            },
+        )
+    }
+
+    /// Whether `caller`'s unit is past the first use of `name` the
+    /// operator's rule `i` asks about.
+    pub(crate) fn rule_once_passed(&self, caller: &ToolCaller, name: &str, i: usize) -> bool {
+        self.once_passed(caller, name, &format!("security.policies[{i}]"))
     }
 
     /// Whether a workflow step of `kind`, its spec rendered, sends the run's
@@ -401,11 +715,12 @@ impl Runtime {
         }
     }
 
-    /// A workflow step whose own effect would send a run's delegated data
-    /// off the box, from a run that is tainted, waits for the person, as an
-    /// egress tool call from that run does (§5.13 item 6: "otherwise the
-    /// exfiltration simply moves to an `http` node"). `true` when the step
-    /// was suspended on the gate.
+    /// A workflow step whose own effect sends the run's data off the box —
+    /// an `egress` call made by the step itself — meets the person's
+    /// consent rules as an `egress` tool call from that run does (§5.13
+    /// item 6: "otherwise the exfiltration simply moves to an `http`
+    /// node"): from a run that is tainted and holds their data, it waits
+    /// for them. `true` when the step was suspended on the gate.
     pub(crate) fn step_consent(
         &mut self,
         run_id: &str,
@@ -414,43 +729,68 @@ impl Runtime {
         spec: &Map<String, Value>,
         caller: &ToolCaller,
     ) -> bool {
+        use crate::sec::scope::TrifectaTag;
         let Some(d) = self.delegation.clone() else {
             return false;
         };
         if !self.step_egress(kind, spec) {
             return false;
         }
-        let facts = self.run_facts(run_id);
-        if !(facts.tainted && facts.holds_delegated_data) {
+        let args = Value::Object(spec.clone());
+        let facts = crate::sec::policy::Facts {
+            delegated: false,
+            ..self.policy_facts(caller, kind)
+        };
+        let call = crate::sec::policy::Call {
+            tool: kind,
+            tags: &[TrifectaTag::Egress],
+            caller: crate::config::settings::PolicyCaller::Workflow,
+            principal: caller.principal.as_deref(),
+            args: &args,
+            also: None,
+            facts,
+        };
+        let Some((rule, once)) =
+            crate::sec::policy::consent_rule(&call, &|r| self.once_passed(caller, kind, r))
+        else {
             return false;
-        }
+        };
+        let once = once.then(|| once_key(&unit_of(caller), kind, rule));
         let outcome = self.open_consent(
             &d,
             caller,
             kind,
-            &Value::Object(spec.clone()),
-            "egress_from_tainted_work_holding_delegated_data",
-            None,
-            super::reactor::Passed::default(),
-            true,
+            &args,
+            Ask {
+                rule: rule.to_string(),
+                server: None,
+                passed: super::reactor::Passed::default(),
+                effect: true,
+                once,
+                timeout_ms: None,
+            },
         );
         self.step_tool_outcome(run_id, step_id, kind, outcome);
         true
     }
 
-    /// Open the person's gate on `name` with `args` under `rule`.
-    #[allow(clippy::too_many_arguments)]
+    /// Open the person's gate on `name` with `args`, as `ask` says.
     fn open_consent(
         &mut self,
         d: &Delegation,
         caller: &ToolCaller,
         name: &str,
         args: &Value,
-        rule: &'static str,
-        server: Option<String>,
-        passed: super::reactor::Passed,
-        effect: bool,
+        ask: Ask,
     ) -> ToolOutcome {
+        let Ask {
+            rule,
+            server,
+            passed,
+            effect,
+            once,
+            timeout_ms,
+        } = ask;
         // Answered by the person the work is for, as their session or the
         // configuration names them now. Work for nobody who could answer
         // is denied.
@@ -465,6 +805,11 @@ impl Runtime {
                 );
             }
         };
+        // Not a firehose (§5.10 rule 6): past the person's gates a minute,
+        // a call is refused rather than asked.
+        if let Some(refused) = self.consent_rate(&person, name, &rule) {
+            return refused;
+        }
         let id = crate::sec::random::b64url_token(9).unwrap_or_default();
         let nonce = crate::sec::random::b64url_token(16).unwrap_or_default();
         let scope = server.as_ref().and_then(|s| {
@@ -476,15 +821,21 @@ impl Runtime {
         });
         let text = args.to_string();
         let facts = self.caller_facts(caller);
+        let workflow = self.originating_run(caller).map(|r| r.workflow.clone());
         let mut rendered = json!({
             "server": server, "tool": name, "args": args, "args_length": text.len(),
             "scope": scope, "run": caller.run, "step": caller.step, "context": caller.ctx,
-            "rule": rule, "principal": person,
+            "rule": rule, "principal": person, "workflow": workflow,
+            "document_sourced": self.document_sourced(caller, server.clone()),
+            "unattended": self.unattended(caller.principal.as_deref()),
         });
         if let (Value::Object(r), Value::Object(f)) = (&mut rendered, facts.to_value()) {
             r.extend(f);
         }
-        let timeout = self.settings.identity.delegation.consent_timeout();
+        let timeout = timeout_ms.map_or_else(
+            || self.settings.identity.delegation.consent_timeout(),
+            std::time::Duration::from_millis,
+        );
         // An operator answers too only where the person's own template for
         // the server says so.
         let operator_approves = server.as_ref().is_some_and(|s| {
@@ -514,6 +865,7 @@ impl Runtime {
             task,
             signin: None,
             session: caller.session.clone(),
+            once,
         };
         self.consents.insert(id.clone(), gate);
         // Its record is sealed under the person's key on the loop: held by
@@ -535,6 +887,47 @@ impl Runtime {
                    "answer": format!("agentd --delegation-approve {id} | --delegation-deny {id}")}),
         );
         ToolOutcome::Deferred(PendingKind::Consent { id })
+    }
+
+    /// The refusal of a gate for `person` past
+    /// `identity.delegation.consent_per_minute`, said and recorded; `None`,
+    /// and the gate counted, while under it.
+    fn consent_rate(&mut self, person: &str, name: &str, rule: &str) -> Option<ToolOutcome> {
+        let per_minute = self.settings.identity.delegation.consent_per_minute() as usize;
+        let now = now_ms();
+        let asked = self.consents_asked.entry(person.to_string()).or_default();
+        while asked
+            .front()
+            .is_some_and(|t| now.saturating_sub(*t) >= 60_000)
+        {
+            asked.pop_front();
+        }
+        if asked.len() < per_minute {
+            asked.push_back(now);
+            return None;
+        }
+        let n = asked.len();
+        let target = json!({"principal": person, "tool": name, "rule": rule, "asked": n,
+                            "per_minute": per_minute});
+        self.log
+            .warn("delegation.consent.rate_limited", target.clone());
+        self.audit(super::audit::AuditEvent {
+            action: "delegation.consent.rate_limited",
+            target,
+            outcome: "refused",
+            principal: Some(person),
+            role: None,
+            request_id: None,
+            sid: None,
+            trace: None,
+            link: None,
+        });
+        Some(ToolOutcome::Ready(
+            Value::String(format!(
+                "{name}: delegation refused (policy_denied): {person} was asked for consent {n} times in the last minute (identity.delegation.consent_per_minute), so this call is refused rather than asked — it was NOT executed"
+            )),
+            true,
+        ))
     }
 
     /// The A2A task a gate for `caller`'s work is shown on, when a caller
@@ -616,40 +1009,7 @@ impl Runtime {
             });
         };
         if let Some(w) = who.filter(|w| w.id == g.principal) {
-            let Some(_sid) = &w.session else {
-                return Ok(Answerer {
-                    id: w.id.clone(),
-                    via: "operator_self",
-                });
-            };
-            let Some(proof) = &w.proof else {
-                return Err((
-                    "no_idp_sign_in",
-                    format!(
-                        "gate {gate} is {}'s, and this session has not signed in at the IdP: a session answers the person's gates only once it has proved, at the IdP, that it is them",
-                        g.principal
-                    ),
-                ));
-            };
-            let max_age = self
-                .settings
-                .identity
-                .delegation
-                .consent_session_max_age()
-                .as_millis() as u64;
-            if now_ms().saturating_sub(proof.at_ms) > max_age {
-                return Err((
-                    "stale_session",
-                    format!(
-                        "this session's IdP sign-in is older than identity.delegation.consent_session_max_age ({}s): sign in at the IdP again to answer gate {gate}",
-                        max_age / 1000
-                    ),
-                ));
-            }
-            return Ok(Answerer {
-                id: w.id.clone(),
-                via: "gate",
-            });
+            return self.person_answers(w, &format!("gate {gate}"));
         }
         if principal.is_operator() && g.operator_approves {
             return Ok(Answerer {
@@ -664,6 +1024,54 @@ impl Runtime {
                 g.principal, principal.id
             ),
         ))
+    }
+
+    #[cfg(feature = "a2a")]
+    /// How person `w` answers `what` — one of their own gates: over their
+    /// own listener (`operator_self`, `certificate`), or through a display
+    /// session whose own IdP sign-in is younger than
+    /// `identity.delegation.consent_session_max_age` (`gate`); a session
+    /// that never signed in there, or did too long ago, is refused, and why
+    /// is said.
+    fn person_answers(
+        &self,
+        w: &crate::delegation::Who,
+        what: &str,
+    ) -> Result<Answerer, (&'static str, String)> {
+        let Some(_sid) = &w.session else {
+            return Ok(Answerer {
+                id: w.id.clone(),
+                via: w.via_self(),
+            });
+        };
+        let Some(proof) = &w.proof else {
+            return Err((
+                "no_idp_sign_in",
+                format!(
+                    "{what} is {}'s, and this session has not signed in at the IdP: a session answers the person's gates only once it has proved, at the IdP, that it is them",
+                    w.id
+                ),
+            ));
+        };
+        let max_age = self
+            .settings
+            .identity
+            .delegation
+            .consent_session_max_age()
+            .as_millis() as u64;
+        if now_ms().saturating_sub(proof.at_ms) > max_age {
+            return Err((
+                "stale_session",
+                format!(
+                    "this session's IdP sign-in is older than identity.delegation.consent_session_max_age ({}s): sign in at the IdP again to answer {what}",
+                    max_age / 1000
+                ),
+            ));
+        }
+        Ok(Answerer {
+            id: w.id.clone(),
+            via: "gate",
+        })
     }
 
     #[cfg(feature = "a2a")]
@@ -745,6 +1153,7 @@ impl Runtime {
             ));
         }
         if approve {
+            self.remember_once(&gate);
             if gate.effect {
                 self.approve_step(&gate);
             } else {
@@ -885,6 +1294,27 @@ impl Runtime {
         });
     }
 
+    /// An answer `by` gave to elicitation gate `id`, refused for `why`, the
+    /// gate left open: said and recorded.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn elicitation_refused(&self, id: &str, by: &str, why: &str) {
+        self.log.warn(
+            "delegation.elicitation.refused",
+            json!({"gate": id, "by": by, "why": why}),
+        );
+        self.audit(super::audit::AuditEvent {
+            action: "delegation.elicitation.refused",
+            target: json!({"gate": id, "by": by, "why": why}),
+            outcome: "refused",
+            principal: Some(by),
+            role: None,
+            request_id: None,
+            sid: None,
+            trace: None,
+            link: None,
+        });
+    }
+
     /// The open consent gate the A2A task `task` waits behind, when its
     /// work is one: a message on it is no answer (§5.10 rule 1).
     #[cfg(feature = "a2a")]
@@ -1012,11 +1442,18 @@ impl Runtime {
     }
 
     #[cfg(feature = "a2a")]
+    /// The shape of open gate `id`, when it is open ([`shape_of`]).
+    pub(crate) fn consent_shape(&self, id: &str) -> Option<String> {
+        self.consents.get(id).map(|g| shape_of(&g.rendered))
+    }
+
+    #[cfg(feature = "a2a")]
     /// The open gates `who` sees — every gate, or only `mine`'s: each by
-    /// its tool and server; what it shows — the arguments, the text the
-    /// person reads — and its binding only for whoever may answer it: the
-    /// person, and an `operator` where the person's template lists one
-    /// among its approvers.
+    /// its tool and server, and its shape, which gates answered together
+    /// share; what it shows — the arguments, the text the person reads —
+    /// and its binding only for whoever may answer it: the person, and an
+    /// `operator` where the person's template lists one among its
+    /// approvers.
     pub(crate) fn consent_list(&self, who: &str, operator: bool, mine: Option<&str>) -> Vec<Value> {
         self.consents
             .iter()
@@ -1024,7 +1461,7 @@ impl Runtime {
             .map(|(id, g)| {
                 let mut v = json!({"gate": id, "principal": g.principal,
                                    "tool": g.rendered["tool"], "server": g.rendered["server"],
-                                   "deadline_ms": g.deadline_ms});
+                                   "shape": shape_of(&g.rendered), "deadline_ms": g.deadline_ms});
                 if g.principal == who || (operator && g.operator_approves) {
                     v["rendered"] = g.rendered.clone();
                     v["text"] = json!(gate_text(id, &g.rendered));
@@ -1044,7 +1481,7 @@ impl Runtime {
                               "principal": g.principal, "deadline_ms": g.deadline_ms,
                               "policy": super::human::policy_call_json(&g.call),
                               "effect": g.effect, "operator_approves": g.operator_approves,
-                              "task": g.task, "session": g.session,
+                              "task": g.task, "session": g.session, "once": g.once,
                               "signin": g.signin.as_ref().map(super::stepup::signin_wait)}),
             None => json!({"kind": "consent", "gate": id}),
         }
@@ -1091,6 +1528,7 @@ impl Runtime {
                         task: w["task"].as_str().map(str::to_string),
                         signin: None,
                         session: w["session"].as_str().map(str::to_string),
+                        once: w["once"].as_str().map(str::to_string),
                     },
                 ));
             }
@@ -1281,7 +1719,128 @@ impl Runtime {
                     ),
                 }
             }
+            Note::Elicit(e) => self.delegated_elicit(*e),
         }
+    }
+
+    /// A delegated server asks the person whose grant its connection
+    /// carries (RFC 0044 §5.13 item 10, T24): a gate of its own, owned by
+    /// and addressed to that person — no operator answers it for them, no
+    /// judge and no approval policy does — in agentd's words, the server's
+    /// quoted as the server's. Unanswered within the server's wait it is
+    /// cancelled; nobody to ask, cancelled at once.
+    pub(crate) fn delegated_elicit(&mut self, e: crate::delegation::Elicitation) {
+        #[cfg(feature = "a2a")]
+        {
+            use crate::sec::render::quoted;
+            let id = self.next_id("elicit");
+            let question = format!(
+                "agentd: the delegated server {} asks you, through your grant — its words follow, quoted; agentd does not vouch for them, and nobody answers this for you: {}",
+                quoted(&e.server, 128),
+                quoted(&e.message, 2000)
+            );
+            let caller = ToolCaller {
+                principal: Some(e.principal.clone()),
+                ctx: Some(format!("elicit-{id}")),
+                ..ToolCaller::default()
+            };
+            let to = crate::a2a::principals::Addressee {
+                id: Some(e.principal.clone()),
+                ..Default::default()
+            };
+            let deadline = now_ms() + e.timeout.as_millis() as u64;
+            let asked = if self.a2a_sink.is_some() {
+                self.human_gate(
+                    &caller,
+                    super::human::GateOn::Unit,
+                    question,
+                    deadline,
+                    Some(e.schema.clone()),
+                    Some(to),
+                    None,
+                )
+            } else {
+                ToolOutcome::Ready(Value::Null, true)
+            };
+            self.log.info(
+                "delegation.elicitation",
+                json!({"gate": id, "server": e.server, "principal": e.principal,
+                       "asked": matches!(asked, ToolOutcome::Deferred(_))}),
+            );
+            match asked {
+                ToolOutcome::Deferred(kind) => {
+                    self.elicits.insert(
+                        id.clone(),
+                        ElicitWait {
+                            reply: e.reply,
+                            grant: e.grant,
+                        },
+                    );
+                    self.push_pending(super::reactor::PendingTool {
+                        target: Target::Elicit(id),
+                        name: "elicitation".into(),
+                        kind,
+                        started_ms: now_ms(),
+                    });
+                }
+                _ => {
+                    let _ = e.reply.try_send(None);
+                }
+            }
+        }
+        #[cfg(not(feature = "a2a"))]
+        {
+            let _ = e.reply.try_send(None);
+        }
+    }
+
+    /// The person's answer to elicitation gate `id`, or its end unanswered
+    /// (`is_error`, or timed out): handed to the connection that waits.
+    pub(crate) fn elicit_answered(&mut self, id: &str, result: Value, is_error: bool) {
+        let Some(wait) = self.elicits.remove(id) else {
+            return;
+        };
+        let answered = !is_error && result.get("timed_out").and_then(Value::as_bool) != Some(true);
+        let answer = answered.then(|| result.get("reply").cloned().unwrap_or(result));
+        let _ = wait.reply.try_send(answer);
+    }
+
+    #[cfg(feature = "a2a")]
+    /// Whether `principal` may answer elicitation gate `id` (RFC 0044 T24):
+    /// held to the answerer rule of a consent gate — the grant's person,
+    /// through a session whose own IdP sign-in is recent enough, or over
+    /// their own listener — and to the grant itself: a device session under
+    /// the same name that never proved the identity the grant is bound to
+    /// answers nothing, for its answer would act as the person. Why not,
+    /// when not. A gate no connection waits on any more is not judged here.
+    pub(crate) fn elicit_answerer(
+        &self,
+        id: &str,
+        principal: &crate::a2a::Principal,
+    ) -> Result<(), (&'static str, String)> {
+        let (Some(wait), Some(d)) = (self.elicits.get(id), &self.delegation) else {
+            return Ok(());
+        };
+        let acting =
+            crate::delegation::Acting::new(Some(&principal.id), principal.session.as_deref());
+        let who = d.who(acting).map_err(|e| {
+            (
+                "not_the_person",
+                format!(
+                    "elicitation {id} is for the person whose grant the server asked through, and {} is not them: {e}",
+                    principal.id
+                ),
+            )
+        })?;
+        self.person_answers(&who, &format!("elicitation {id}"))?;
+        d.holds(&who, &wait.grant).map_err(|e| {
+            (
+                "not_the_holder",
+                format!(
+                    "elicitation {id} was asked through a grant this session does not hold: {e}"
+                ),
+            )
+        })
     }
 
     /// Where the delegation supervisor's notes go: the loop — and each

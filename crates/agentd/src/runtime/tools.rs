@@ -101,6 +101,22 @@ fn call_key(instance: &str, nonce: &str, caller: &ToolCaller) -> String {
     )
 }
 
+/// Why a worker may not use tool `name` — `delegated`, a delegated
+/// server's — when what it was started with did not offer it: the refusal
+/// said to the model. `None` for any other tool, and for one it was
+/// offered.
+fn use_unauthorised(
+    offered: &std::collections::BTreeSet<String>,
+    name: &str,
+    delegated: bool,
+) -> Option<String> {
+    (delegated && !offered.contains(name)).then(|| {
+        format!(
+            "{name}: refused: what this worker was started with did not offer it — a delegated server's tool is used only where a turn's plan, or a subagent's spawn, offers it by its tools and servers"
+        )
+    })
+}
+
 /// The result of executing a tool.
 pub(crate) enum ToolOutcome {
     Ready(Value, bool),
@@ -124,6 +140,29 @@ impl Runtime {
             return;
         }
         self.child_log(node).info("tool.request", json!({"node": node.0, "req": id, "tool": name, "caller": caller.label(), "args": if self.log.content_capture() { args.clone() } else { Value::Null }}));
+        // A delegated server's tool is used where the turn's plan or the
+        // subagent's spawn offered it alone — `tools:` and `servers:` held
+        // at every use, a pooled token or no (RFC 0044 §5.7): a worker
+        // asking for one it was not offered is refused before any check or
+        // mint.
+        if let Some(refused) = self
+            .children
+            .get(node)
+            .and_then(|c| c.offered.as_ref())
+            .and_then(|offered| use_unauthorised(offered, name, self.delegated_tool(name)))
+        {
+            self.child_log(node).warn(
+                "tool.refused",
+                json!({"node": node.0, "req": id, "tool": name, "why": "not_offered"}),
+            );
+            self.child_tool_outcome(
+                node,
+                id,
+                name,
+                ToolOutcome::Ready(Value::String(refused), true),
+            );
+            return;
+        }
         let outcome = self.execute_tool(&caller, name, args);
         self.child_tool_outcome(node, id, name, outcome);
     }
@@ -272,6 +311,12 @@ impl Runtime {
                 let (h, key) = (h.clone(), key.clone());
                 self.mcp_task_answered(&h, &key, result, is_error);
             }
+            Target::Elicit(id) => {
+                #[cfg(feature = "xaa")]
+                self.elicit_answered(id, result, is_error);
+                #[cfg(not(feature = "xaa"))]
+                let _ = (id, result, is_error);
+            }
         }
     }
 
@@ -371,6 +416,18 @@ impl Runtime {
         #[cfg(feature = "companies")]
         if let Some(outcome) = self.company_cross_check(caller, name, &args, passed) {
             return outcome;
+        }
+        // Work acting with a person's grant does not reach agentd's own,
+        // broader authority at an agent-mode server tagged `sensitive` or
+        // `egress` its template does not list, and every agent-mode call it
+        // makes is recorded as one (RFC 0044 §5.3, T10).
+        #[cfg(feature = "xaa")]
+        if !passed.policy
+            && !passed.consent
+            && let Some(server) = self.agent_mode_server_of(name)
+            && let Some(e) = self.mode_mixing(caller, &server, Some(name), name)
+        {
+            return ToolOutcome::Ready(Value::String(e), true);
         }
         // The policy verdict, at the one chokepoint every call passes — and
         // deliberately AFTER `validate_args`, so an argument guard judges
@@ -1293,24 +1350,22 @@ impl Runtime {
         };
         #[cfg(not(feature = "companies"))]
         let view: Option<Value> = None;
-        // What the taint engine knows of the work making the call (RFC 0044
-        // §5.13 item 6): read only when a rule asks.
-        let facts = if self
-            .settings
-            .security
-            .policies
-            .iter()
-            .any(|p| p.matcher.tainted.is_some() || p.matcher.holds_delegated_data.is_some())
-        {
-            let f = self.caller_facts(caller);
-            (f.tainted, f.holds_delegated_data)
+        // What the taint engine and the delegation know of the call and the
+        // work making it (RFC 0044 §5.13 item 6): read only when a rule asks.
+        let facts = if self.settings.security.policies.iter().any(|p| {
+            let m = &p.matcher;
+            m.tainted.is_some()
+                || m.holds_delegated_data.is_some()
+                || m.unattended.is_some()
+                || m.document_sourced.is_some()
+                || m.mode.is_some()
+        }) {
+            self.policy_facts(caller, name)
         } else {
-            (false, false)
-        };
-        let facts = crate::sec::policy::Facts {
-            delegated: self.delegated_tool(name),
-            tainted: facts.0,
-            holds_delegated_data: facts.1,
+            crate::sec::policy::Facts {
+                delegated: self.delegated_tool(name),
+                ..Default::default()
+            }
         };
         let as_api = view.as_ref().map(|v| crate::sec::policy::Call {
             tool: "company.api",
@@ -1330,7 +1385,21 @@ impl Runtime {
             also: as_api.as_ref(),
             facts,
         };
-        let verdict = match crate::sec::policy::evaluate(&self.settings.security.policies, &call) {
+        // A `to: principal` rule whose first use in this unit the person
+        // approved is past for every later call of the tool there.
+        let policies = &self.settings.security.policies;
+        let passed_once = |i: usize| {
+            #[cfg(feature = "xaa")]
+            {
+                policies[i].once_per.is_some() && self.rule_once_passed(caller, name, i)
+            }
+            #[cfg(not(feature = "xaa"))]
+            {
+                let _ = i;
+                false
+            }
+        };
+        let verdict = match crate::sec::policy::evaluate_past(policies, &call, &passed_once) {
             Ok(None) => return None,
             Ok(Some(v)) => v,
             Err(rule) => {
@@ -1384,6 +1453,13 @@ impl Runtime {
                     format!("denied by security.policies[{}]", verdict.rule)
                 };
                 Some(ToolOutcome::Ready(Value::String(msg), true))
+            }
+            // The person's consent, asked as the shipped rules ask it.
+            #[cfg(feature = "xaa")]
+            PolicyAction::Ask
+                if verdict.to == Some(crate::config::settings::PolicyTo::Principal) =>
+            {
+                Some(self.rule_consent(caller, name, args, &verdict, passed))
             }
             PolicyAction::Ask => self.policy_gate(caller, name, args, &verdict, passed),
         }
@@ -1463,7 +1539,9 @@ impl Runtime {
                 // check. A policy is the operator wanting a say.
                 let to = verdict
                     .to
-                    .clone()
+                    .as_ref()
+                    .and_then(crate::config::settings::PolicyTo::addressee)
+                    .cloned()
                     .unwrap_or_else(|| crate::a2a::principals::Addressee {
                         role: Some(crate::config::settings::Role::Operator),
                         ..Default::default()
@@ -1612,7 +1690,7 @@ impl Runtime {
             }
             // A task's question is a gate of its own, never one holding a
             // call.
-            Target::McpTask(..) => {}
+            Target::McpTask(..) | Target::Elicit(_) => {}
         }
     }
 
@@ -2233,6 +2311,22 @@ impl ExecTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn uses a delegated server's tool only where its plan offered
+    /// it; a tool of no delegated server is not this check's.
+    #[test]
+    fn a_turn_uses_only_the_delegated_tools_its_plan_offered() {
+        let offered: std::collections::BTreeSet<String> = ["linear.list_issues".to_string()].into();
+        assert_eq!(use_unauthorised(&offered, "linear.list_issues", true), None);
+        let refused = use_unauthorised(&offered, "linear.create_issue", true);
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|r| r.starts_with("linear.create_issue: refused")),
+            "{refused:?}"
+        );
+        assert_eq!(use_unauthorised(&offered, "status", false), None);
+    }
 
     /// A step's own call keeps its key across its attempts; a model's call
     /// inside the step is its child's, so two attempts — two children, each

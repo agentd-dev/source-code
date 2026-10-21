@@ -352,6 +352,54 @@ security:
 
 [Harden a deployment](harden.md) covers policies in full.
 
+## A person's consent gates
+
+Where agentd acts for an enrolled person at MCP servers through their IdP
+(the `xaa` feature, [Enterprise-managed
+authorization](authentication.md#enterprise-managed-authorization)), some
+calls wait for that person instead of an operator: rules agentd ships — an
+`egress` call from work that read outside text and holds their data, a
+delegated `sensitive` or `egress` call from such work, a local command from
+work holding their data, a delegated `egress` call from a workflow an
+instruction document defined, and a delegated `egress` call at its first use
+in a run — and any `security.policies` rule with `to: principal`:
+
+```yaml
+# fragment: under security:
+policies:
+  - match: {tool: "create_*", mode: delegated}
+    action: ask
+    to: principal
+    once_per: run_tool
+```
+
+- The gate is the person's alone: they answer it from their display client
+  or with `agentd --delegation-approve <gate>`, bound to its nonce and
+  argument hash; an operator answers only where the person's template lists
+  `approvers: [principal, operator]`. A message on the gate's task is no
+  answer, no judge ever answers, and an unanswered gate denies after
+  `identity.delegation.consent_timeout`.
+- Its text is agentd's own, so a `to: principal` rule takes no `question`
+  and no `on_timeout` but `deny`.
+- `once_per: run_tool` asks at the first use per run — or conversation, or
+  subagent — and tool alone; an approval passes later calls of the tool
+  there until a restart.
+- Gates of one shape (`delegation.list` shows each gate's `shape`) may be
+  answered together: `delegation.approve {gates: [...]}`, or
+  `agentd --delegation-approve <gate>,<gate>`. Each is still bound and
+  recorded on its own.
+- At most `identity.delegation.consent_per_minute` gates (10) open for one
+  person a minute; a call past that is refused rather than asked, and
+  logged as `delegation.consent.rate_limited`.
+- A question a delegated server sends (an MCP elicitation) on a connection
+  made with a person's grant is a gate too, of its own: owned by and
+  addressed to that person, in agentd's words with the server's quoted. It
+  is answered as their consent gates are, through a session that holds that
+  grant — a device session under the same name that never signed in at the
+  IdP is refused (`delegation.elicitation.refused`), the gate left open. No
+  operator answers it for them, and unanswered within the server's wait it
+  is cancelled.
+
 ## Company gates
 
 An instance that acts at Companies for a person (the `companies` feature,
@@ -597,6 +645,8 @@ fires when a gate is answered, with `{task, via}`.
 | `agent.ask_human_unowned` | `gate`, `fallback` | `fallback` |
 | `intelligence.roles.approve` | a model, or `{model, confidence}` | the turn model |
 | `agent.gate_channels` | workflow → step path → channel, for configured workflows | none |
+| `identity.delegation.consent_timeout` | a duration | `24h` |
+| `identity.delegation.consent_per_minute` | gates a minute per person | `10` |
 
 ## Next steps
 

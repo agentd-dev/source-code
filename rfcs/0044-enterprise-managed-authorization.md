@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. P2's part 2 is next
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. **P2 complete** 2026-10-21 (§7 "P2d — P2 built, part 2: policy"): certificate principals that delegate; the policy facts `unattended`, `document_sourced` and `mode`, `to: principal` and `once_per: run_tool` on an operator's rules, and the person's consent rules shipped as data — first use per run and tool, gates of one shape answered together, a person's gates paced; a signed-in person's own message no outside text to work acting with their grant; per-`(step, tool)` use-authorisation; self-service revocation, and `revoked` after any revocation; the per-(principal, resource) mint rate; agent-mode servers hidden from delegated work unless listed; document workflows asked about unless listed; elicitations put to the grant's person alone; and a local command beside a delegation under a worker uid the keys are closed to. Every P2 exit criterion holds. P3 is next
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -1872,6 +1872,7 @@ otherwise the error belongs to that `(grant, server)` alone.
 | The resource rejects a fresh token | `delegation_rejected_by_resource` | after backoff | None; negative cache (step 4). |
 | CIBA approval denied or expired | `ciba_denied` | no | None. |
 | No grant for this principal and IdP, or this session holds no IdP proof for it (a same-name device session that has not signed in, or whose proof no longer matches the binding) | `not_enrolled` | no | Notice only (§5.4); the notice offers the IdP sign-in. |
+| The grant was revoked — by the person, an operator, a reload, `--delegation-forget` or a dead liveness probe — and the tombstone register still holds the revocation, after a restart too | `revoked` | no | None; the person enrols again, a new grant one epoch up (§7.P2d). |
 | An enrolment or per-session IdP sign-in yields an `iss` + `sub` other than the name's binding or pin | `binding_mismatch` | no | None. The proof and the enrolment are refused; the session keeps its non-delegated access and the grant is untouched (§5.2, §5.4). |
 | The run's session ended (`token_ttl`, `auth.sessions.revoke`, `/oauth2/revoke`, daemon restart) | `revoked` | no | None to the grant; the run loses delegated authority (§5.2, §5.12). With `on_revoked: ask` the run may re-bind only to a live session of the same principal that holds a proof for the same `iss` + `sub`, audited. |
 | Run authority is agent mode on a delegated server | `no_delegation` | no | — |
@@ -4739,6 +4740,396 @@ origin rule and the consent gate's exclusion from the gate a reply answers
 were broken too (each, `test/delegation.test.mjs`). Not checked by a running
 test here: the root e2e's spawn under the instance uid as a non-root uid,
 which skips (the refusal is the `sec::worker` unit's).
+
+#### §7.P2d — P2 built, part 2: policy (2026-10-21)
+
+This part builds the second half of P2's scope — the policy each person's
+grant is held to — on `main` at `125a9ca3`, behind `xaa` (and `a2a` for
+everything a listener serves), with three decisions of the user's:
+
+- **A command beside a delegation** (2026-10-20, "Do them"). P1's refusal of
+  `security.exec.enabled` beside a delegation's keys is relaxed only under
+  the whole isolation set: `spawn.uid`/`spawn.gid` set (neither agentd's
+  uid nor a signer's, as P2b's rules already hold), Landlock active, and the
+  load verifying that the worker uid can open none of the paths only the
+  supervisor may — the vault, every key file, the audit chain and its
+  segments, a signer's socket — by the mode and ownership of each and of
+  every directory above it. An `exec` call counts as egress: from work
+  holding delegated data it asks the person. Otherwise the refusal stays,
+  naming each piece missing.
+- **A signed-in person's own message is theirs** (2026-10-21). A display
+  session's person's, or a per-person operator's, own command or message
+  does not taint work acting with that person's grant; tool results,
+  fetched pages, served documents and other people's text still taint, and
+  work acting for anyone else still reads it as outside text.
+- **After a revocation, `revoked`** (2026-10-21). Every later call of a
+  revoked grant fails `revoked`, not `not_enrolled`, until the tombstone
+  register's record of it is gone; the P1/P2 checks that pinned
+  `not_enrolled` for this case pin `revoked` now.
+
+With it every P2 exit criterion holds (the table after the checks).
+
+| Scope item | State | Where |
+|---|---|---|
+| Certificate principals that delegate (`x509`) | built: a rule admitting one key (`match.spki`) with an `idp_subject` pin | `config::settings`, `a2a::principals::resolve`, `delegation` |
+| The full, configurable policy facts and shipped defaults | built: `unattended`, `document_sourced`, `mode`; `to: principal`, `once_per: run_tool`; the person's consent rules as data | `sec::policy`, `runtime::taint`, `runtime::delegated`, `runtime::tools` |
+| §5.10 rule 6: first use per run and tool, batching, per-principal rate limits | built | `runtime::delegated`, `runtime::a2a_server::delegation_ops`, `delegation::cli` |
+| Per-`(step, tool)` use-authorisation | built: a turn uses the delegated tools its plan offered alone, a subagent those its spawn offered; every call held to the policies, a pooled token or no | `runtime::tools`, `runtime::turns`, `runtime::subagents`, `runtime::children` |
+| Self-service and operator revoke | built | `runtime::a2a_server::delegation_ops`, `runtime::surface::ops` |
+| Per-(principal, resource) mint rate limit | built: `budget.per_minute` | `delegation` |
+| Mode-mixing validation and hiding (T10) — `agent_mode_servers` takes effect | built | `runtime::delegated`, `runtime::turns`, `runtime::steps`, `runtime::subagents` |
+| Document-sourced gating (T27) — `document_workflows` takes effect | built | `runtime::taint`, `runtime::delegated`, `engine::model` |
+| `subjects: pairwise` and the opaque `agent/grant` (T25) | built in P1; checked here | `delegation` |
+| Elicitation addressing (T24) | built | `delegation`, `runtime::delegated`, `runtime::human` |
+| Reload classification | built: `consent_per_minute` and `budget.per_minute` reload; `security.policies` stays restart-only | `config::settings` |
+| A command beside a delegation (decision) | built | `config::settings::delegation`, `sec::worker` |
+| A person's own message (decision) | built | `runtime::taint`, `runtime::withhold`, `runtime::waits` |
+| `revoked` after a revocation (decision) | built | `delegation` |
+
+**1. Certificate principals.** `a2a.principals[].match.spki` names one
+client certificate's key: the SHA-256 of its DER SubjectPublicKeyInfo, 64
+lowercase hex, on an mTLS listener (`a2a.tls.client_ca`, as every
+certificate matcher needs). A rule naming it admits that key alone — every
+other field it names must match too — and its caller is typed by the key
+(`x509:<SPKI SHA-256>`). With an `id` and an exact `idp_subject` pin (not
+`role: agent` or `anonymous`, not beside `bearer_ref` or `uid`) it is a
+person, as a per-person operator's `uid` rule is: `user:<id>`, or
+`operator:<id>` for an operator rule. `principals: {source: x509}` admits
+them to a template, which a deployment with no such rule refuses ("no
+certificate principal can delegate"). Over its certificate the principal
+enrols with `delegation.enrol {idp}` — the IdP's device grant, its pin the
+binding — lists and answers its own gates (`via: certificate`), and its
+grant's fingerprint is the key's. **Deviation, said:** §5.2's certificate
+principal is keyed by its key, not its SAN or subject: a CA can issue a
+name again to another key, and the key is the credential. A certificate
+reissued under another key is another principal, refused until a rule
+names it.
+
+**2. The policy facts and the person's rules.** `security.policies[].match`
+gains `unattended` (the work's principal is nobody, or
+`identity.autonomous_as`: no one is there to answer), `document_sourced` (the
+call is made in a run of a workflow an instruction document defined, and is
+not to a delegated server whose template lists that workflow) and `mode`
+(`delegated` when the work acts with a person's grant — theirs, through the
+session it acts through, a subagent's only under `subagents: inherit` —
+else `agent`), beside P2b's `delegated`, `tainted`, `holds_delegated_data`
+and `any_tags`. An `ask` may say `to: principal`: the person's consent gate,
+as agentd's own rules raise it — no `question` (the text is agentd's), an
+`on_timeout` of `deny` alone, and refused without a delegated server — and
+`once_per: run_tool` makes such a rule ask at the first use alone. The
+person's rules (§5.13 item 6) ship as data (`sec::policy::consent_rules`)
+and are held, in this order, after every rule of the operator's — an
+operator's `allow` decides the operator's rules, never the person's (L3:
+an operator cannot consent for a user):
+
+| Rule | Asks before |
+|---|---|
+| `egress_from_tainted_work_holding_delegated_data` | any `egress` call — delegated or under agentd's own credential, a step's own effect too — from tainted work holding delegated data |
+| `delegated_call_from_tainted_work` | a delegated `sensitive` or `egress` call from tainted work |
+| `exec_holding_delegated_data` | an `exec` command from work holding delegated data, tainted or not (the user's decision) |
+| `document_sourced_delegated_egress` | a delegated `egress` call from a document's workflow its template does not list |
+| `delegated_egress` | a delegated `egress` call, at its first use per run and tool |
+
+Each asks `to: principal` and denies unanswered. The rules that ask at every
+use come first, so a call that meets one is asked under it; a gate names its
+rule (`rendered.rule`, an operator's as `security.policies[<i>]`) and says
+why in agentd's words, with the workflow, `document_sourced` and
+`unattended` among what it shows. **Deviations, said:** the
+exec rule is added by the user's decision; and `security.policies` — its new
+facts, `to` and `once_per` with it — stays restart-only where §5.14 says
+reloadable: the whole section is read once into the policy engine at start,
+every rule of it and not the delegation's alone, and a reload that changes
+it says `restart_required` rather than half-applying.
+
+**3. Not a firehose (§5.10 rule 6).** *First use:* counted per unit of work
+— a run, a subagent, a conversation — tool and rule; an approval passes
+that unit's later uses of the tool under the rule, and is kept in memory
+for a day at most, 4096 at once. **Deviation, said:** a restart forgets
+them and asks again, the safe side of an approval nobody wrote down.
+*Batching:* `delegation.list` shows each gate's `shape` (16 hex of the
+SHA-256 over its rule, server, tool and sorted argument names — never their
+values); `delegation.approve`/`deny` take `gates: [{gate, nonce, args_hash},
+…]` (1 to 50), all open and of one shape, each answerer held to the rules
+before any gate is decided, each gate decided on its own binding and
+recorded on its own; `agentd --delegation-approve <gate>,<gate>` sends one.
+A batch naming a gate that is not open, or of another shape, decides
+nothing. *Pacing:* at most `identity.delegation.consent_per_minute` gates
+(10; 0 refused; reloadable) open for one person in any minute; past it a
+call is refused `policy_denied` with the knob named, never asked, and
+`delegation.consent.rate_limited` is warned and audited — a flood of asks
+cannot bury the one that matters.
+
+**4. A person's own message.** At ingestion, a message or command a
+principal sends through a session — a display session's `SendMessage`, a
+signal, a `workflow.run`, a message delivered to a wait — is recorded as
+the taint source `a message of the signed-in grant holder <principal>` when
+`Delegation::acting_templates(Acting {principal, session})` holds: the
+session's proven principal is the grant's, a device session having itself
+signed in as the identity its name is bound to. That is how the taint
+engine knows the message is the grant holder's own. At judging,
+`Facts::of` drops that one source — and only it — where the work judged
+acts with that same principal's grant (`delegated_work`, the subagent
+filter included); for anyone else's work, and for work acting with no
+grant, it is outside text as before. A per-person operator who holds a
+grant is a person too: their own command over the unix listener is
+recorded the same way — theirs to their own work, outside text to anyone
+else's — where an operator's text used to taint nothing anywhere; the bare
+operator's, who holds no grant, still taints nothing. A person's own start
+no longer taints their run, so the P2c checks that relied on it to raise a
+gate now tag the gated server's tools `egress` (`ema/p2c` `GATED_TAGS`).
+
+**5. Use-authorisation per `(step, tool)`.** A workflow step names its
+server and tool in its definition, held to the policies at the call. A
+turn's plan (`tool_plan`) is recorded on its child as the delegated tools
+it offered (`Child.offered`), and so is a subagent's spawn — at the spawn
+and at a respawn after a restart — as the tools of the delegated servers it
+declares that its `tools:` grant admits (§5.12 F's children); a worker
+asking for a delegated tool it was not offered is refused (`tool.refused`,
+`why: not_offered`) before any check or mint. An honest worker never asks
+for one — its own catalogue is narrowed alike — so this holds a worker
+that ignores its catalogue, as a debug build's `AGENTD_TEST_WORKER_ASK`
+hook makes one. Every delegated call — a cached access token or a fresh one
+— passes the operator's policies and the person's rules first (§5.7's
+preconditions).
+
+**6. Revocation.** `delegation.revoke` is `AnyNamed` now: a person revokes
+their own grants (`delegation.revoke {}`, or naming their own principal) —
+the grants the session they ask through holds as it stands
+(`Delegation::revoke_held`, the per-session re-check of every call), so of
+two devices approved under one name the one that never signed in as the
+identity the name is bound to revokes nothing; anyone but an operator naming
+another's is refused (`not_theirs`); an operator revokes anyone's,
+offboarding by IdP subject too. After any
+revocation — by the person, an operator, a reload, `--delegation-forget`,
+a dead liveness probe — the grant's calls fail `revoked` while the
+register keeps the tombstone, a restart and a restored store included
+(§5.8's table, amended): `ema/invalid-grant-dead-probe`,
+`ema/restored-vault-refused-by-the-audit-chain` and
+`ema/a-reload-narrows-then-revokes` say `revoked` now.
+
+**7. The mint rate.** `templates[].budget.per_minute` (4; 0 refused) bounds a
+person's mints at one server in any minute, beside the per-day, per-month
+and per-run budgets: every mint asked for counts, whatever the IdP answers,
+and past it a call is `budget_exhausted` before the IdP is asked (§5.13 item
+7).
+
+**8. Agent-mode servers beside a delegation (T10).** Work acting with a
+person's grant — their run, their conversation's turn, a subagent that
+inherits — is not offered a tool of an agent-mode MCP server tagged
+`sensitive` or `egress` (`tool_plan`, the subagent's round-trip), and a
+call of one, or an `mcp.tool`/`mcp.resource` step at one, is refused
+(`mode_mixing`; `delegation.agent_mode.refused`, and a
+`delegation.agent_mode_call` audit record `refused`). The template's
+`agent_mode_servers` lists the servers that work may still use: their tools
+are offered round-tripped through the supervisor, and each call is recorded
+`admitted`. A Company's server is not agent mode here: it acts for its User
+alone. The load rules of P1 (`mode_mixing` for one resource or
+authorization server under both modes) stand, and P2c's "changes nothing
+yet" warning is gone.
+
+**9. Document-sourced gating (T27).** A workflow an instruction document
+contributed (`Workflow.document`, set at staging, never written by a
+document) makes its runs `document_sourced` for every delegated server
+except one whose template lists it in `servers.<name>.document_workflows`
+by name and definition digest (the `hash` `workflow.list` and `status`
+show; a changed body is another digest, so listing is per definition). Its
+delegated `egress` calls then ask at every use, not the first alone — a
+subagent such a run spawns too, its work traced to the run through
+`requested_by` (`originating_run`). While the instruction is frozen — its
+trust `freshness` deadline passed unconfirmed (the instruction spec's §7.7
+watch, whose defect P2a found fixed) — nothing the document steered makes a
+delegated call (`policy_denied`), whatever was in flight: no model turn or
+subagent; no run a model asked for (`RunState::by_model`, durable: a
+turn's or subagent's `workflow.run` or workflow tool, a `workflow.signal`
+that starts or wakes a run, and every run such a run starts or signals),
+whose inputs are the model's; and no run of a document's workflow, nor a
+subagent it spawned — §5.12 I's "a revoked document makes no delegated
+call". Nor does a model write a workflow then (`workflow.create`,
+`workflow.update`), which would outlive the freeze for a person to run. An
+operator's own run of their own workflow, which the document did not write,
+still makes its call. P2c's warning is gone here too.
+
+**10. Pairwise subjects (T25).** Built in P1 and held here by a check:
+under `subjects: pairwise` an ID-JAG's `sub` is recorded and not compared
+with the grant's; the server is sent that `sub` as `agent/acting_for`, and
+`agent/grant` is a random handle per grant and server kept in memory —
+never the grant's id or the person's principal.
+
+**11. Elicitation addressing (T24).** A connection made with a person's
+grant declares the elicitation capability and answers the server's
+`elicitation/create` through `ElicitPerson`: the question becomes a human
+gate of its own (`Target::Elicit`), owned by and addressed to the grant's
+principal, in agentd's words with the server's quoted ("…agentd does not
+vouch for them, and nobody answers this for you"), logged as
+`delegation.elicitation`. It is answered as the person's consent gates are
+(`person_answers`, the rule `consent_answerer` holds a gate's answerer to):
+over their own listener, or through a display session whose own IdP sign-in
+is younger than `consent_session_max_age` — and only by a session that
+holds the very grant the connection was made with (`Delegation::holds`):
+the gate's addressee is a principal id, which two devices approved under one
+name share, and an answer acts as the person at the server. A refused answer
+is `delegation.elicitation.refused` (`not_the_person`, `no_idp_sign_in`,
+`stale_session`, `not_the_holder`), warned and audited, the gate left open.
+The gate's task is the principal's, as each of their tasks is: two devices
+under one name read each other's tasks, a run's output included — what the
+binding guards is acting with the grant, which an answer does. No
+operator answers it — `operator_override` does not reach it, and an
+operator's reply is refused with the gate left open — nor any judge or
+approval policy; the answer is shaped to the server's
+schema (`mcp::elicit::shape_reply`); unanswered within the server's call
+timeout, or with nobody to ask, it is cancelled, and a gate whose
+connection stopped waiting is pruned. A URL elicitation is declined by the
+client before it is asked (§5.13 item 10).
+
+**12. A command beside a delegation (the decision).** `exec_isolation`
+refuses `security.exec.enabled` beside `identity.providers`, a seal key or
+a delegated server unless `spawn.worker()` is set, Landlock is active, and
+`closed_to(uid, gid)` is empty: for each of `supervisor_only_paths()`,
+`sec::worker::unopenable` walks the path and every directory above it —
+refused where the worker uid owns one, where one carries a POSIX ACL
+(`system.posix_acl_access`), where an ancestor is writable by it without
+the sticky bit (it could replace what is in it), or where it can enter the
+store's root, connect to a signer's socket, or read or write a key file or
+the chain; passed where any directory above is closed to its search. A key
+file and a signer's socket must exist, to be judged at all; the store's
+root is judged as agentd leaves it at every start (restricted to its
+owner) where agentd's own uid owns it, and by its mode as it is otherwise —
+a chmod of another's directory may fail unsaid — and the chain may be
+absent (agentd makes it `0600`), each closed
+segment `<path>.<seq>` held as the chain is. The message names each piece missing. The same walk serves the
+multi-user rule P2a recorded for P2: **a delegation several people can hold
+grants under** — more than one pinned person or device name, `a2a.login`,
+or first binding — **is refused on a kernel without Landlock** unless
+workers run as a `spawn.uid` every one of those paths is closed to
+(`vault_isolation`). An `exec` call is egress (`exec_holding_delegated_data`
+above) and runs as the worker uid inside Landlock.
+
+**13. Workflows.** What a workflow sees, and what was added because it
+means something there:
+
+- *Policy facts in steps.* A step whose own effect sends the run's data out
+  — `http`, `a2a.send`, `a2a.delegate`, an `emit` forwarded out, an
+  `mcp.tool` or `mcp.resource` step at a server tagged `egress` — is held to
+  the person's rules as an `egress` call (P2b's `step_consent`), now with
+  the new facts: its gate names the workflow and says whether it is
+  document-sourced or unattended. Of the shipped rules only the first can
+  hold a step's own effect — the rest are a delegated call's — so it asks at
+  every use; only an operator's `to: principal` rule with `once_per:
+  run_tool` counts its first use, per run and step kind. An `mcp.tool` step
+  at a delegated server is a tool call, judged as one. **Added:** the
+  mode-mixing refusal for `mcp.tool` and
+  `mcp.resource` steps at a hidden agent-mode server, before the consent
+  check — without it a workflow step would reach agentd's own credential
+  where a turn could not.
+- *Use-authorisation.* A step's tool is its definition's; nothing a model
+  writes chooses it, so no per-step list was added. A turn inside a step
+  (`agent`) is held to its plan as every turn is, and a `subagent` step's
+  child to its spawn's `tools:` and `servers:`.
+- *Document workflows.* `document_workflows` lists a workflow by the digest
+  a run records (`workflow_hash`), so an edited document's workflow is
+  asked about at every use again. **Not added:** a `workflow.status` field
+  for `document_sourced`: the gate shows it where it matters.
+- *Exec.* An `exec` tool step from a run holding the person's data waits
+  for them as a turn's call does (`ema/a-command-beside-a-delegation-runs-isolated-and-asks`).
+
+| Check | What it proves |
+|---|---|
+| settings units `the_persons_rules_rates_and_certificate_people_load_as_their_rules_say`, `exec_runs_beside_a_delegation_only_under_the_whole_isolation_set`, `without_landlock_the_worker_uid_keeps_the_vault_closed`; `every_config_path_is_classified` | `to: principal`, `once_per`, the facts, `consent_per_minute`, `budget.per_minute`, `spki` and `x509` load rules by name; exec beside the keys refused naming `spawn.uid`, a key file the worker uid can read, or Landlock, and loaded with the set; several people without Landlock refused until the worker uid closes the paths; the new path classified |
+| `sec::worker` units `access_follows_the_bits_that_apply`, `a_path_is_closed_to_the_worker_uid_by_its_mode_and_its_directories` | owner, group and other bits as the kernel applies them; a path open to the uid by its own mode, a writable directory above it, an enterable directory, an absent key file, the uid's ownership; closed beneath an unsearchable directory, as a store root agentd's uid owns and restricts, as an absent chain; a store root another uid owns judged by its own mode |
+| `sec::policy` units `unattended_document_sourced_and_mode_narrow_a_rule`, `the_persons_consent_rules_ask_as_shipped` | each new fact narrows a rule; the five rules in order, the first-use rule passed once approved |
+| `a2a::principals` unit `a_rule_naming_a_key_admits_that_key_alone` | `spki` admits one key whatever the certificate's names; typed `x509:<spki>`; an operator rule names `operator:<id>` |
+| `delegation` unit `a_certificate_principal_delegates_and_a_revoked_grant_says_so` | a certificate person is a person, their grant the key's; a device under the same listener name, signed in as the same identity, holds none of it and revokes nothing; revoked by its holder, its call is `revoked` |
+| `runtime::taint` unit `a_persons_own_message_is_outside_text_to_anyone_else`; `runtime::tools` unit `a_turn_uses_only_the_delegated_tools_its_plan_offered` | the own-message source dropped for the holder's work alone, a tool result beside it still tainting; a delegated tool the plan left out refused, any other tool untouched |
+| `ema/a-persons-own-message-is-theirs` | her start taints nothing she does (her write made unasked); a delegated read still taints her run; what she started reaches Bob's run as outside text, naming her message |
+| `ema/the-persons-rules-ask-as-shipped-and-configured` | `delegated_egress` asks once per run and tool, the next run again; an operator's `to: principal` rule on `mode` asks as `security.policies[1]`; a rule on `unattended` holds nothing attended |
+| `ema/gates-of-one-shape-are-answered-together-and-paced` | three gates of one shape approved in one call, each recorded; a batch with a gate not open decides nothing; past `consent_per_minute` refused and recorded |
+| `ema/agent-mode-servers-are-hidden-from-delegated-work` | an agent-mode `egress` server refused (`mode_mixing`), sent nothing, recorded; listed, called and recorded `admitted`; after a delegated read its call asks (`egress_from_tainted_work_holding_delegated_data`) |
+| `ema/a-documents-workflow-asks-unless-listed` | a document's workflow asks at every use; listed by name and digest, at the first use alone |
+| `ema/a-documents-subagent-is-its-workflows-work` | a subagent a document's workflow spawns asks under `document_sourced_delegated_egress`, naming the workflow; denied, not made |
+| `ema/pairwise-subjects-are-recorded-not-compared` | another `sub` taken and sent as `agent/acting_for`; `agent/grant` stable per server, different across servers, never the grant id |
+| `ema/a-persons-mints-are-paced` | `budget.per_minute: 1`: the second mint in the minute `budget_exhausted`, the IdP not asked |
+| `ema/an-elicitation-asks-the-grants-person` | the question on the person's own gate in agentd's words; an operator's answer refused and the gate kept; the person's answer shaped and handed back, the call completed |
+| `ema/an-elicitation-is-answered-through-the-grant` | of two devices under one name, the unbound one's answer refused (`no_idp_sign_in`), recorded, the server handed nothing; the bound one's taken |
+| `ema/a-person-revokes-their-own-grant` | self-service revoke, then `revoked`; another person refused; an operator revokes anyone's; an unbound device under the name revokes nothing, the bound one's run still made |
+| `ema/a-certificate-principal-delegates` | over mTLS a key-pinned principal enrols by device grant, its run made with its grant, listed as `x509:<spki>` |
+| `ema/a-command-beside-a-delegation-runs-isolated-and-asks` (as root; skips otherwise) | refused without `spawn.uid`, naming it; loaded under the set; the command from a run holding data asks and runs as uid 65534; a command copying the seal key or the store copies nothing |
+| `ema/a-stale-instruction-makes-no-delegated-call` | the registry gone past the deadline (`freeze`): an in-flight turn's delegated call `policy_denied`, nothing sent; so is the child of the run the turn starts with `workflow.run`, and the operator's run its `workflow.signal` wakes; a conversation turn's `workflow.create` writes nothing; the operator's own run's call made |
+| `ema/a-worker-uses-only-what-it-was-offered` | a turn worker and an inheriting subagent asking for a delegated tool not offered are refused (`not_offered`), recorded, nothing sent; the tool offered is made |
+| `ema/invalid-grant-dead-probe`, `ema/restored-vault-refused-by-the-audit-chain`, `ema/a-reload-narrows-then-revokes` (changed) | `revoked` after each revocation, a restart included |
+
+| P2 exit criterion | Held by |
+|---|---|
+| Two-principal isolation on one server | `ema/two-people-two-grants`; the `delegation` units of P2c |
+| Enrolment refused without a template, on an `iss`/`sub` mismatch, and for a device code another `sub` approved | `ema/no-template-no-grant`, `ema/a-pinned-device-binds-its-pin-alone` |
+| Two devices under one name; a pinned name; an unpinned name without first binding | `ema/one-device-name-one-binding`, `ema/a-pinned-device-binds-its-pin-alone`, `ema/an-unpinned-device-needs-first-binding` |
+| Revoking the enrolling session ends delegated access at once, in flight and after a restart | `ema/an-ended-session-ends-its-delegation` |
+| A forwarded IdP authorization URL fails at the callback | `ema/a-forwarded-sign-in-fails-at-the-callback` |
+| The login listener's posture; `a2a.login` with `client_ca` and `act_for` naming a device refused | `ema/the-login-listener-rules` |
+| A restart mid-gate resumes and resolves it | `ema/a-gate-survives-a-restart` |
+| Reload narrowing at the next mint; removal revokes, bumps the epoch, tombstones | `ema/a-reload-narrows-then-revokes` |
+| A restored pre-revocation blob is refused | `ema/restored-vault-refused-by-the-audit-chain` |
+| A delegated read then a delegated write gates; then an agent-mode egress gates | `ema/taint-gates-the-delegated-write-and-the-egress` (an `http` POST under agentd's credential), `ema/agent-mode-servers-are-hidden-from-delegated-work` (a listed agent-mode MCP server) |
+| A `subagents: inherit` child has intersected authority and no token | `ema/a-subagent-inherits-what-it-declares` |
+| An operator's answer and an A2A message answering a consent gate are both rejected | `ema/consent-is-the-persons-alone`; an elicitation's in `ema/an-elicitation-asks-the-grants-person`, and an unbound device's in `ema/an-elicitation-is-answered-through-the-grant` |
+| A worker cannot open the vault | e2e `worker_confinement_e2e` (Landlock); under a worker uid, `ema/a-command-beside-a-delegation-runs-isolated-and-asks` and the `sec::worker` unit |
+| Docs and `examples/okta-xaa-mcp.yaml` validate | cli `docs_samples`, `examples_validate_e2e::the_delegation_example_validates_with_its_keys_mounted` (`xaa`) |
+
+Each new test was mutation-checked: with the code it guards broken, it
+fails. Broken were: the key compared by a `spki` rule (the `a2a::principals`
+unit); the `once_per` load rule (the settings unit); the several-people
+rule without Landlock and the path walk behind exec's isolation (each, its
+settings unit); the `revoked` code after a revocation (the `delegation`
+unit, and `ema/invalid-grant-dead-probe`); certificate rules among the
+pinned people (the `delegation` unit, and
+`ema/a-certificate-principal-delegates`); the own-message source dropped
+for the holder's work, and kept for a per-person operator (each, the
+`runtime::taint` unit); the plan's offer to a turn (the `runtime::tools`
+unit); the `mode` fact and the exec rule (each, its `sec::policy` unit);
+the group bits and a writable directory above a path (each, its
+`sec::worker` unit); a session's message recognised as the holder's own
+(`ema/a-persons-own-message-is-theirs`); a first use remembered once
+approved (`ema/the-persons-rules-ask-as-shipped-and-configured`); the
+per-person pacing and a batch held to one shape (each,
+`ema/gates-of-one-shape-are-answered-together-and-paced`); an agent-mode
+server hidden, and the first rule holding agent-mode egress as well as
+delegated (each, `ema/agent-mode-servers-are-hidden-from-delegated-work`);
+a document's workflow judged document-sourced, and its listing clearing
+that (each, `ema/a-documents-workflow-asks-unless-listed`); the per-server
+handle in place of the grant id
+(`ema/pairwise-subjects-are-recorded-not-compared`); the per-minute mint
+cap (`ema/a-persons-mints-are-paced`); the elicitation gate closed to an
+operator's override (`ema/an-elicitation-asks-the-grants-person`); a
+non-operator held to their own grant at revocation
+(`ema/a-person-revokes-their-own-grant`); the exec rule, and a command
+started as neither the worker uid nor inside Landlock (each,
+`ema/a-command-beside-a-delegation-runs-isolated-and-asks`); and the frozen
+instruction's refusal (`ema/a-stale-instruction-makes-no-delegated-call`).
+After review: an elicitation answer held to the person's answerer rule
+(`ema/an-elicitation-is-answered-through-the-grant`); the grant held by its
+own principal alone (the `delegation` unit); a self-service revoke held to
+the grants the session holds, by its principal and by the binding the
+session proved (each, `ema/a-person-revokes-their-own-grant`; the unit's
+device holds no grant to revoke, so the binding's mutation passes it); a
+run a model asked for refused while frozen, its marking at `workflow.run`,
+its inheritance by a child run,
+a model's signal marking the run it wakes, and the refusal of a model's
+`workflow.create` (each, `ema/a-stale-instruction-makes-no-delegated-call`);
+the offer recorded on a turn's child and on a subagent's, a subagent's
+`tools:` grant narrowing it, and the supervisor's check itself (each,
+`ema/a-worker-uses-only-what-it-was-offered`); a subagent's work traced to
+its document's run (`ema/a-documents-subagent-is-its-workflows-work`); and
+a store root another uid owns judged by its mode (the `sec::worker` unit).
+The unit tests pass as uid 65534 as well as root, as CI runs them. Not
+checked by a running test here: the command check as a non-root uid,
+which skips (its load rules are the settings units'); a frozen
+instruction's refusal of a document workflow's own step, which the mock
+registry's document cannot make (the turn's refusal and the code path
+they share are); and the exec check's copy of the vault with only one of
+the uid and Landlock taken away, where the other still closes it. With
+both gone the check fails, and its copy assertion alone, the uid one set
+aside, fails too: the key and the store are copied.
+
+### P3 — Inbound identity, A2A in-task auth, CIBA and unattended opt-ins
 
 **Scope.** A2A resource-server JWT validation (`a2a.inbound_tokens` with
 per-issuer `profile`, `typ` and `subject_claim`, `token_iss` matcher, scope to

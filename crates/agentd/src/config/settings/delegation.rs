@@ -53,6 +53,13 @@ pub const MAX_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 
 pub const PER_DAY: u32 = 16;
 pub const PER_MONTH: u32 = 200;
 pub const PER_RUN: u32 = 12;
+/// The default mint rate per person and resource (RFC 0044 §5.13 item 7):
+/// a renewal, a restart's mint and a second scope set fit; a steered loop
+/// does not spend a day's budget in seconds.
+pub const PER_MINUTE: u32 = 4;
+/// How many consent gates may open for one person a minute, by default
+/// (RFC 0044 §5.10 rule 6).
+pub const CONSENT_PER_MINUTE: u32 = 10;
 
 /// `identity.providers.<name>`: an enterprise IdP agentd is a client of.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -215,6 +222,9 @@ pub struct Delegation {
     /// How recent a display session's IdP sign-in must be for that session
     /// to answer a consent gate; default 12h.
     pub consent_session_max_age: Option<Dur>,
+    /// How many consent gates may open for one person a minute; a call past
+    /// that is refused rather than asked. Default 10.
+    pub consent_per_minute: Option<u32>,
     /// RFC 0043 device names (`auth.device.approve {as: <name>}`), each
     /// pinned to the one IdP identity that may enrol it: `user:<name>`
     /// delegates only as that `iss` + `sub`, and each session using the
@@ -288,6 +298,9 @@ impl Delegation {
     pub fn consent_session_max_age(&self) -> std::time::Duration {
         self.consent_session_max_age
             .map_or(CONSENT_SESSION_MAX_AGE, |d| d.0)
+    }
+    pub fn consent_per_minute(&self) -> u32 {
+        self.consent_per_minute.unwrap_or(CONSENT_PER_MINUTE)
     }
 }
 
@@ -421,11 +434,16 @@ pub struct TemplateBudget {
     pub per_day: Option<u32>,
     pub per_month: Option<u32>,
     pub per_run: Option<u32>,
+    /// Mints per person and resource in any minute.
+    pub per_minute: Option<u32>,
 }
 
 impl TemplateBudget {
     pub fn per_day(&self) -> u32 {
         self.per_day.unwrap_or(PER_DAY)
+    }
+    pub fn per_minute(&self) -> u32 {
+        self.per_minute.unwrap_or(PER_MINUTE)
     }
     pub fn per_month(&self) -> u32 {
         self.per_month.unwrap_or(PER_MONTH)
@@ -565,6 +583,21 @@ pub fn persons(s: &Settings) -> impl Iterator<Item = &super::Principal> {
         .principals
         .iter()
         .filter(|p| p.matcher.uid.is_some() && p.idp_subject.is_some())
+}
+
+/// The certificate principals that delegate: each rule admits one client
+/// certificate's key (`match.spki`), with an exact `idp_subject` pin.
+pub fn certificates(s: &Settings) -> impl Iterator<Item = &super::Principal> {
+    s.a2a
+        .principals
+        .iter()
+        .filter(|p| p.matcher.spki.is_some() && p.matcher.uid.is_none() && p.idp_subject.is_some())
+}
+
+/// Every rule that pins one person: the per-person operators and the
+/// certificate principals.
+pub fn pinned(s: &Settings) -> impl Iterator<Item = &super::Principal> {
+    persons(s).chain(certificates(s))
 }
 
 /// Every secret reference under `identity.*` and on a delegated server: the
@@ -849,6 +882,108 @@ fn check_custody(at: &str, c: Option<&ClientAuth>, external: bool, err: &mut dyn
     }
 }
 
+/// Why a process of the worker uid `uid`:`gid` could open a path only the
+/// supervisor may ([`Settings::supervisor_only_paths`]) — the file store's
+/// root, a key file, a signer's socket, the audit chain and its closed
+/// segments — each by its mode and ownership and its directories'
+/// (`sec::worker::unopenable`); empty when it could open none.
+pub(crate) fn closed_to(s: &Settings, uid: u32, gid: u32) -> Vec<String> {
+    use crate::sec::worker::{Made, unopenable};
+    let root = (s.store.kind == super::StoreKind::File).then(|| super::file_store_root(&s.store));
+    let mut open = Vec::new();
+    for p in s.supervisor_only_paths() {
+        let made = if Some(&p.path) == root.as_ref() {
+            Made::Restricted
+        } else if p.with_suffixes {
+            Made::WhenAbsent
+        } else {
+            Made::Operator
+        };
+        let path = std::path::absolute(&p.path).unwrap_or_else(|_| p.path.clone());
+        if let Err(e) = unopenable(&path, uid, gid, made) {
+            open.push(e);
+        }
+        // The chain's closed segments, `<path>.<first seq>`.
+        if p.with_suffixes
+            && let (Some(dir), Some(name)) = (path.parent(), path.file_name())
+        {
+            let prefix = format!("{}.", name.to_string_lossy());
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix)
+                    && let Err(e) = unopenable(&e.path(), uid, gid, Made::Operator)
+                {
+                    open.push(e);
+                }
+            }
+        }
+    }
+    open
+}
+
+/// Why `security.exec.enabled` may not run beside a delegation's keys, on a
+/// kernel with (`landlock`) or without Landlock, or `None` when it may: the
+/// keys are mounted whenever they are configured, a delegated server or
+/// none, and a command is model-chosen, so it runs beside them only under
+/// the whole isolation set (the user's decision of 2026-10-20) — its own
+/// uid, inside Landlock, with every path only the supervisor may open
+/// closed to that uid. Each piece missing is named.
+pub(crate) fn exec_isolation(s: &Settings, landlock: bool) -> Option<String> {
+    let dl = &s.identity.delegation;
+    let keyed = delegated_servers(s).next().is_some()
+        || !s.identity.providers.is_empty()
+        || dl.seal_key.is_some()
+        || dl.seal_key_previous.is_some();
+    if !s.security.exec.enabled || !keyed {
+        return None;
+    }
+    let mut missing = Vec::new();
+    match s.spawn.worker() {
+        None => missing
+            .push("spawn.uid and spawn.gid — a command would run as agentd's own uid".to_string()),
+        Some((uid, gid)) => missing.extend(closed_to(s, uid, gid)),
+    }
+    if !landlock {
+        missing.push("Landlock — this kernel has none, so a command would not be confined".into());
+    }
+    (!missing.is_empty()).then(|| {
+        format!(
+            "security.exec.enabled beside identity.providers, identity.delegation's seal keys or a delegated server: a local command could reach the mounted keys (RFC 0044 T4), and runs beside them only as a worker uid of its own, inside Landlock, with every supervisor-only path closed to that uid; missing: {}",
+            missing.join("; ")
+        )
+    })
+}
+
+/// Why a delegation several people can hold grants under — more than one
+/// pinned person or device name, `a2a.login`, or first binding — leaves the
+/// vault open to a worker on a kernel without Landlock, or `None`: on such a
+/// kernel only workers of `spawn.uid`, with every supervisor-only path
+/// closed to that uid, keep one person's work from every other person's
+/// sealed grant (RFC 0044 invariant 1, §7.P2a's record for P2).
+pub(crate) fn vault_isolation(s: &Settings, landlock: bool) -> Option<String> {
+    let dl = &s.identity.delegation;
+    let people = s
+        .a2a
+        .principals
+        .iter()
+        .filter(|p| p.idp_subject.is_some())
+        .count()
+        + dl.device_pins.len();
+    let several = people > 1 || s.a2a.login.is_some() || dl.device_first_binding;
+    if landlock || !several || delegated_servers(s).next().is_none() {
+        return None;
+    }
+    let open = match s.spawn.worker() {
+        None => vec!["spawn.uid and spawn.gid are not set".to_string()],
+        Some((uid, gid)) => closed_to(s, uid, gid),
+    };
+    (!open.is_empty()).then(|| {
+        format!(
+            "a delegation several people hold grants under, on a kernel without Landlock: a worker could open the vault and every person's sealed grant — run workers as spawn.uid with every supervisor-only path closed to it, or on a kernel with Landlock; {}",
+            open.join("; ")
+        )
+    })
+}
+
 /// Every rule above, collected.
 pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     let mut err = |m: String| d.errors.push(m);
@@ -999,6 +1134,9 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             ));
         }
     }
+    if dl.consent_per_minute == Some(0) {
+        err("identity.delegation.consent_per_minute: 0 would refuse every call a consent rule asks about — at least 1".into());
+    }
     let mut names = BTreeSet::new();
     for (i, t) in dl.templates.iter().enumerate() {
         let at = format!("identity.delegation.templates[{i}]");
@@ -1038,9 +1176,13 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 }
                 unlabelled("device", &mut err);
             }
-            Some("x509") => err(format!(
-                "{at}.principals.source x509: a certificate principal with an idp_subject pin delegates in RFC 0044 P2's second part, not yet"
-            )),
+            Some("x509") => {
+                if certificates(s).next().is_none() {
+                    err(format!(
+                        "{at}.principals.source x509: no a2a.principals rule pins a certificate's key (match.spki) and an idp_subject, so no certificate principal can delegate and this template would admit nobody"
+                    ));
+                }
+            }
             Some("bearer") => err(format!(
                 "{at}.principals.source bearer: a bearer_ref secret is typically shared, so a bearer principal never delegates (principal_not_delegable)"
             )),
@@ -1079,11 +1221,6 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 )),
             }
         }
-        if !t.agent_mode_servers.is_empty() {
-            warn.push(format!(
-                "{at}.agent_mode_servers is read by the hiding of agent-mode sensitive and egress servers from delegated work, RFC 0044 P2's second part: until it is built, it changes nothing"
-            ));
-        }
         for (srv, ceiling) in &t.servers {
             for (j, w) in ceiling.document_workflows.iter().enumerate() {
                 if w.name.trim().is_empty()
@@ -1097,11 +1234,6 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                         "{at}.servers.{srv}.document_workflows[{j}]: a workflow name and its definition digest, 64 lowercase hex as workflow.list shows it"
                     ));
                 }
-            }
-            if !ceiling.document_workflows.is_empty() {
-                warn.push(format!(
-                    "{at}.servers.{srv}.document_workflows is read by the document-sourced consent rule, RFC 0044 P2's second part: until it is built, every delegated egress call asks, a listed workflow's too"
-                ));
             }
         }
         if !s.identity.providers.contains_key(&t.idp) {
@@ -1144,6 +1276,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             ("per_day", t.budget.per_day),
             ("per_month", t.budget.per_month),
             ("per_run", t.budget.per_run),
+            ("per_minute", t.budget.per_minute),
         ] {
             if v == Some(0) {
                 err(format!("{at}.budget.{field}: 0 would let no mint happen"));
@@ -1183,10 +1316,25 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             }
         }
         if let Some(pin) = &p.idp_subject {
-            if p.matcher.uid.is_none() {
-                err(format!(
-                    "{at}.idp_subject pins a per-person operator on the unix listener (match.uid); a certificate principal's pin is RFC 0044 P2's second part"
-                ));
+            match (p.matcher.uid.is_some(), p.matcher.spki.is_some()) {
+                (true, _) => {}
+                // A certificate principal delegates pinned twice: by the one
+                // key its rule admits, and by the IdP identity it is.
+                (false, true) => {
+                    if p.id.is_none() {
+                        err(format!(
+                            "{at}.match.spki with idp_subject needs `id`: the certificate principal that delegates is <role>:<id>"
+                        ));
+                    }
+                    if matches!(p.role, Role::Agent | Role::Anonymous) {
+                        err(format!(
+                            "{at}.idp_subject: an agent or anonymous principal never delegates"
+                        ));
+                    }
+                }
+                (false, false) => err(format!(
+                    "{at}.idp_subject pins a per-person operator on the unix listener (match.uid), or a certificate principal by its key (match.spki): a rule matching anything wider names no one person"
+                )),
             }
             if !s.identity.providers.values().any(|v| v.issuer == pin.iss) {
                 err(format!(
@@ -1200,11 +1348,15 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             // Autonomous work — a schedule, a webhook, a stream — runs as
             // `identity.autonomous_as`; named the person, every firing would
             // act with their grant with nobody there.
+            let role = match p.role {
+                Role::Operator => "operator",
+                _ => "user",
+            };
             if let Some(id) = &p.id
-                && s.identity.autonomous_as.as_deref() == Some(format!("operator:{id}").as_str())
+                && s.identity.autonomous_as.as_deref() == Some(format!("{role}:{id}").as_str())
             {
                 err(format!(
-                    "identity.autonomous_as is operator:{id}, the per-person operator {at} pins: autonomous runs never act with an enrolled person's grant (RFC 0044 P1) — name another principal"
+                    "identity.autonomous_as is {role}:{id}, the person {at} pins: autonomous runs never act with an enrolled person's grant (RFC 0044 P1) — name another principal"
                 ));
             }
             persons += 1;
@@ -1290,14 +1442,19 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     }
     // The keys are mounted whenever they are configured, a delegated server
     // or none: a sealed grant stays in the store, and the IdP key and the
-    // seal key open it.
-    if s.security.exec.enabled
-        && (!delegated.is_empty()
-            || !s.identity.providers.is_empty()
-            || dl.seal_key.is_some()
-            || dl.seal_key_previous.is_some())
-    {
-        err("security.exec.enabled beside identity.providers, identity.delegation's seal keys or a delegated server: a local command runs as the supervisor's uid and could read the mounted keys (RFC 0044 T4) — they are exclusive in P1".into());
+    // seal key open it. A local command — model-chosen — runs beside them
+    // only under the whole isolation set (the user's decision of
+    // 2026-10-20): its own uid, inside Landlock, with every path only the
+    // supervisor may open closed to that uid by mode and ownership.
+    let landlock = crate::sec::landlock::abi().is_some();
+    if let Some(e) = exec_isolation(s, landlock) {
+        err(e);
+    }
+    // A delegation several people can hold grants under keeps the vault
+    // closed to every worker (P2a's record, RFC 0044 invariant 1): by
+    // Landlock, or by a worker uid that cannot open it.
+    if let Some(e) = vault_isolation(s, landlock) {
+        err(e);
     }
     let agent_mode: Vec<&super::McpServer> =
         s.mcp.servers.iter().filter(|m| !is_delegated(m)).collect();
@@ -1598,6 +1755,257 @@ mcp:
             .map_err(|e| e.to_string())
     }
 
+    /// The person's own rules, the facts and the rates load as they say: a
+    /// `to: principal` rule is agentd's text and denies unanswered, `once_per`
+    /// is such a rule's, and the facts parse; the rates are at least one; a
+    /// certificate principal delegates pinned by its key, its id and its IdP
+    /// identity, and a template admitting `x509` needs one.
+    #[cfg(feature = "xaa")]
+    #[test]
+    fn the_persons_rules_rates_and_certificate_people_load_as_their_rules_say() {
+        if !cfg!(feature = "a2a") {
+            return;
+        }
+        let policy = |p: &'static str| {
+            move |y: String| {
+                y.replace(
+                    "  experimental: {id_jag: true}\n",
+                    &format!("  experimental: {{id_jag: true}}\n  policies:\n    - {p}\n"),
+                )
+            }
+        };
+        assert_eq!(
+            load_error(&policy(
+                "{match: {delegated: true, mode: delegated, unattended: false, document_sourced: true, any_tags: [egress]}, action: ask, to: principal, once_per: run_tool, on_timeout: deny}"
+            )),
+            "",
+            "the facts and a first-use rule load"
+        );
+        for (p, says) in [
+            (
+                "{match: {tool: \"linear.*\"}, action: ask, to: principal, question: \"ok?\"}",
+                "agentd's own text",
+            ),
+            (
+                "{match: {tool: \"linear.*\"}, action: ask, to: principal, on_timeout: allow}",
+                "an unanswered consent gate",
+            ),
+            (
+                "{match: {tool: \"linear.*\"}, action: ask, once_per: run_tool}",
+                "`once_per` is a `to: principal` rule's",
+            ),
+            (
+                "{match: {tool: \"linear.*\"}, action: deny, to: principal}",
+                "this rule never asks",
+            ),
+            (
+                "{match: {mode: sometimes}, action: deny}",
+                "expected `agent` or `delegated`",
+            ),
+        ] {
+            let e = load_error(&policy(p));
+            assert!(e.contains(says), "{p}: want {says:?} in:\n{e}");
+        }
+        // No delegated server: nobody's grant is acted with.
+        let e = load_error(&|y| {
+            policy("{match: {tool: \"x\"}, action: ask, to: principal}")(y)
+                .split("mcp:\n")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(e.contains("no delegated server is declared"), "{e}");
+        let e = load_error(&|y| {
+            y.replace(
+                "    templates:\n",
+                "    consent_per_minute: 0\n    templates:\n",
+            )
+        });
+        assert!(e.contains("consent_per_minute"), "{e}");
+        let e = load_error(&|y| {
+            y.replace(
+                "servers: {linear: {scopes: [\"issues:read\"]}}}",
+                "servers: {linear: {scopes: [\"issues:read\"]}}, budget: {per_minute: 0}}",
+            )
+        });
+        assert!(e.contains("budget.per_minute"), "{e}");
+        // A certificate principal: an mTLS listener, the key, an id and a pin.
+        let spki = "ab".repeat(32);
+        let cert = |m: String| {
+            move |y: String| {
+                y.replace("  listen: \"unix://__D__/a.sock\"\n", "  listen: \"https://127.0.0.1:0\"\n  tls: {cert: \"__D__/idp.pem\", key: \"__D__/idp.pem\", client_ca: \"__D__/idp.pem\"}\n")
+                    .replace(
+                        "    - {match: {uid: 1000}, role: operator, id: alice, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u1alice}}\n",
+                        &format!("    - {m}\n"),
+                    )
+                    .replace("principals: {source: operator}", "principals: {source: x509}")
+            }
+        };
+        let e = load_error(&cert(format!(
+            "{{match: {{spki: \"{spki}\"}}, role: user, id: alice, idp_subject: {{iss: \"https://acme.okta.com\", sub: 00u1alice}}}}"
+        )));
+        assert!(
+            !e.contains("source x509") && !e.contains("idp_subject") && !e.contains("spki"),
+            "a certificate principal pinned by its key delegates: {e}"
+        );
+        for (m, says) in [
+            (
+                "{match: {san: \"alice@acme\"}, role: user, id: alice, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u1alice}}".to_string(),
+                "match.spki",
+            ),
+            (
+                format!("{{match: {{spki: \"{spki}\"}}, role: user, idp_subject: {{iss: \"https://acme.okta.com\", sub: 00u1alice}}}}"),
+                "needs `id`",
+            ),
+            (
+                "{match: {spki: \"AB\"}, role: user, id: alice, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u1alice}}".to_string(),
+                "64 lowercase hex",
+            ),
+            (
+                format!("{{match: {{spki: \"{spki}\"}}, role: user, id: alice}}"),
+                "no certificate principal can delegate",
+            ),
+        ] {
+            let e = load_error(&cert(m.clone()));
+            assert!(e.contains(says), "{m}: want {says:?} in:\n{e}");
+        }
+    }
+
+    /// A worker uid that is not the one running the test, nor root.
+    #[cfg(feature = "xaa")]
+    fn other_uid() -> u32 {
+        // SAFETY: geteuid has no failure mode.
+        if unsafe { libc::geteuid() } == 65534 {
+            65533
+        } else {
+            65534
+        }
+    }
+
+    /// On a kernel without Landlock, a delegation several people hold
+    /// grants under is refused unless workers run as `spawn.uid` with every
+    /// supervisor-only path closed to that uid; one person's is not; and a
+    /// local command beside the keys names Landlock missing there.
+    #[cfg(feature = "xaa")]
+    #[test]
+    fn without_landlock_the_worker_uid_keeps_the_vault_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["idp.pem", "ras.pem", "seal"] {
+            std::fs::write(dir.path().join(f), "x").unwrap();
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = |edit: &dyn Fn(String) -> String| {
+            let yaml = edit(BASE.to_string()).replace("__D__", &dir.path().display().to_string());
+            Settings::from_document(
+                crate::config::file::parse_document(&yaml, crate::config::file::Format::Yaml)
+                    .unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        let second = |y: String| {
+            y.replace(
+                "    - {match: {uid: 1000}",
+                "    - {match: {uid: 1001}, role: operator, id: bob, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u2bob}}\n    - {match: {uid: 1000}",
+            )
+        };
+        let one = settings(&|y| y);
+        assert_eq!(vault_isolation(&one, false), None, "one person");
+        let two = settings(&second);
+        let e = vault_isolation(&two, false).unwrap_or_default();
+        assert!(e.contains("spawn.uid and spawn.gid are not set"), "{e}");
+        assert_eq!(vault_isolation(&two, true), None, "Landlock closes it");
+        let w = other_uid();
+        let isolated = settings(&|y| format!("spawn: {{uid: {w}, gid: {w}}}\n{}", second(y)));
+        assert_eq!(
+            vault_isolation(&isolated, false),
+            None,
+            "the worker uid closes it"
+        );
+        let exec = settings(&|y| {
+            format!(
+                "spawn: {{uid: {w}, gid: {w}}}\n{}",
+                y.replace(
+                    "  experimental: {id_jag: true}\n",
+                    "  experimental: {id_jag: true}\n  exec: {enabled: true, allow: [id]}\n",
+                )
+            )
+        });
+        let e = exec_isolation(&exec, false).unwrap_or_default();
+        assert!(e.contains("missing: Landlock"), "{e}");
+        assert_eq!(exec_isolation(&exec, true), None, "the whole set");
+    }
+
+    /// A local command runs beside a delegation only under the whole
+    /// isolation set (the user's decision of 2026-10-20): as `spawn.uid`,
+    /// inside Landlock, with every supervisor-only path closed to that uid by
+    /// mode and ownership — and the load names each piece missing: no worker
+    /// uid; a key file the worker uid could read; a kernel without Landlock.
+    #[cfg(feature = "xaa")]
+    #[test]
+    fn exec_runs_beside_a_delegation_only_under_the_whole_isolation_set() {
+        use std::os::unix::fs::PermissionsExt;
+        if !cfg!(feature = "a2a") {
+            return;
+        }
+        let refusal = |spawn: bool, open: bool| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            for f in ["idp.pem", "ras.pem", "seal"] {
+                std::fs::write(dir.path().join(f), "x").unwrap();
+                std::fs::set_permissions(
+                    dir.path().join(f),
+                    std::fs::Permissions::from_mode(if open { 0o644 } else { 0o600 }),
+                )
+                .unwrap();
+            }
+            std::fs::set_permissions(
+                dir.path(),
+                std::fs::Permissions::from_mode(if open { 0o755 } else { 0o700 }),
+            )
+            .unwrap();
+            let mut yaml = BASE.replace(
+                "  experimental: {id_jag: true}\n",
+                "  experimental: {id_jag: true}\n  exec: {enabled: true, allow: [id]}\n",
+            );
+            if spawn {
+                let w = other_uid();
+                yaml = format!("spawn: {{uid: {w}, gid: {w}}}\n{yaml}");
+            }
+            let yaml = yaml.replace("__D__", &dir.path().display().to_string());
+            let path = dir.path().join("c.yaml");
+            std::fs::write(&path, yaml).unwrap();
+            let e = crate::config::settings::load(
+                &["--config".to_string(), path.display().to_string()],
+                &[],
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+            e.lines()
+                .find(|l| l.contains("security.exec.enabled beside"))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let none = refusal(false, false);
+        assert!(none.contains("missing: spawn.uid and spawn.gid"), "{none}");
+        let open = refusal(true, true);
+        assert!(
+            open.contains("idp.pem") && open.contains("can read or write"),
+            "a key file the worker uid can read: {open}"
+        );
+        assert!(!open.contains("spawn.uid and spawn.gid"), "{open}");
+        let closed = refusal(true, false);
+        if crate::sec::landlock::abi().is_some() {
+            assert_eq!(
+                closed, "",
+                "the whole set: exec loads beside the delegation"
+            );
+        } else {
+            assert!(closed.contains("Landlock"), "{closed}");
+        }
+    }
+
     /// Under `key_custody: external` the signer holds every key: the
     /// configuration names them by `kid` and gives no key and no seal key,
     /// and the signer is a socket by absolute path; under `local`, a signer
@@ -1781,7 +2189,7 @@ mcp:
                         "  experimental: {id_jag: true}\n  exec: {enabled: true}\n",
                     )
                 }),
-                "exclusive",
+                "missing: spawn.uid and spawn.gid",
             ),
             (
                 "exec beside the keys, with no delegated server",
@@ -1791,7 +2199,7 @@ mcp:
                         "  experimental: {id_jag: true}\n  exec: {enabled: true}\n",
                     )
                 }),
-                "exclusive",
+                "missing: spawn.uid and spawn.gid",
             ),
             (
                 "autonomous work as the person",

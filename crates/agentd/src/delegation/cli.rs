@@ -205,11 +205,13 @@ pub fn list(settings: &Settings, out: &mut dyn Write) -> Result<String, Failed> 
     Ok(text)
 }
 
-/// `--delegation-approve <gate>` and `--delegation-deny <gate>`: the
-/// person's answer to one consent gate, bound to its nonce and arguments.
+/// `--delegation-approve <gate>[,<gate>…]` and `--delegation-deny
+/// <gate>[,<gate>…]`: the person's answer to one consent gate, or to
+/// several of one shape together, each bound to its own nonce and
+/// arguments.
 pub fn answer(
     settings: &Settings,
-    gate: &str,
+    gates: &str,
     approve: bool,
     out: &mut dyn Write,
 ) -> Result<String, Failed> {
@@ -222,35 +224,34 @@ pub fn answer(
     let deadline = Instant::now() + Duration::from_secs(30);
     let listed = send(&endpoint, "delegation.list", json!({}), deadline).map_err(Failed::Ended)?;
     let doc = doc_of(&listed).map_err(Failed::Ended)?;
-    let Some(g) = doc["gates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|g| g["gate"].as_str() == Some(gate))
-        .cloned()
-    else {
-        return Err(Failed::Ended(format!("no open consent gate is {gate:?}")));
-    };
-    // What the person answers is what agentd rendered: its own lines, and
-    // what the work chose quoted and escaped.
-    let _ = writeln!(
-        out,
-        "{}\n{}",
-        g["text"].as_str().unwrap_or_default(),
-        if approve { "approving" } else { "denying" },
-    );
+    let mut bound = Vec::new();
+    for gate in gates.split(',').map(str::trim).filter(|g| !g.is_empty()) {
+        let Some(g) = doc["gates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|g| g["gate"].as_str() == Some(gate))
+            .cloned()
+        else {
+            return Err(Failed::Ended(format!("no open consent gate is {gate:?}")));
+        };
+        // What the person answers is what agentd rendered: its own lines,
+        // and what the work chose quoted and escaped.
+        let _ = writeln!(out, "{}", g["text"].as_str().unwrap_or_default());
+        bound.push(json!({"gate": gate, "nonce": g["nonce"], "args_hash": g["args_hash"]}));
+    }
+    let _ = writeln!(out, "{}", if approve { "approving" } else { "denying" });
     let op = if approve {
         "delegation.approve"
     } else {
         "delegation.deny"
     };
-    let sent = send(
-        &endpoint,
-        op,
-        json!({"gate": gate, "nonce": g["nonce"], "args_hash": g["args_hash"]}),
-        deadline,
-    )
-    .map_err(Failed::Ended)?;
+    let args = match bound.len() {
+        0 => return Err(Failed::Usage(format!("{what} names a gate"))),
+        1 => bound.remove(0),
+        _ => json!({"gates": bound}),
+    };
+    let sent = send(&endpoint, op, args, deadline).map_err(Failed::Ended)?;
     follow(&endpoint, sent, out).map_err(Failed::Ended)
 }
 

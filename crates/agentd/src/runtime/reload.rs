@@ -1144,16 +1144,17 @@ fn delegated_servers_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<Stri
     moved
 }
 
-/// The per-person operators' `a2a.principals` rules a reload changes while
-/// the running process delegates (RFC 0044 P1): the delegation supervisor
-/// holds every grant to the rules as it read them at start — the uid, the
-/// `idp_subject` pin, the id and the labels — so a change to one is a
-/// restart, after which a grant enrolled under the old rule is unusable
+/// The pinned persons' `a2a.principals` rules — per-person operators and
+/// certificate principals — a reload changes while the running process
+/// delegates (RFC 0044 P1, P2): the delegation supervisor holds every grant
+/// to the rules as it read them at start — the uid or the certificate's
+/// key, the `idp_subject` pin, the id and the labels — so a change to one is
+/// a restart, after which a grant enrolled under the old rule is unusable
 /// (`not_enrolled`) rather than lent to whoever the new one names.
 fn person_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String> {
     let delegates = cfg::delegation::delegated_servers(old).next().is_some()
         || !old.identity.providers.is_empty();
-    let persons = |s: &cfg::Settings| cfg::delegation::persons(s).cloned().collect::<Vec<_>>();
+    let persons = |s: &cfg::Settings| cfg::delegation::pinned(s).cloned().collect::<Vec<_>>();
     if !delegates || persons(old) == persons(new) {
         return Vec::new();
     }

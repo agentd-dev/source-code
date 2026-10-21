@@ -97,13 +97,20 @@ fn is_operator(id: &str, role: Option<Role>) -> bool {
 /// §5.13 item 5): an A2A peer agent's is outside input, an origin withheld
 /// as one ([`peer_carries`]); anyone else's but an operator's — a person's
 /// A2A message, which may hold whatever they pasted or a front end relayed
-/// — taints it; an operator's, nothing.
-pub(crate) fn principal_carries(id: &str, role: Option<Role>, how: &str) -> Carries {
+/// — taints it; an operator's, nothing. A person's `own` message — sent
+/// through a session that proves them the holder of their grant, or by a
+/// per-person operator who holds one — is recorded as theirs: outside text
+/// to every unit but work acting with that grant
+/// (`runtime::taint::Facts::of`), so one person's text steers no one
+/// else's grant.
+pub(crate) fn principal_carries(id: &str, role: Option<Role>, own: bool, how: &str) -> Carries {
     if role == Some(Role::Agent) {
         return peer_carries(id, how);
     }
     let mut c = Carries::default();
-    if !is_operator(id, role) {
+    if own {
+        c.taint([super::taint::own_message(id)]);
+    } else if !is_operator(id, role) {
         c.taint([format!("the A2A principal {id}")]);
     }
     c
@@ -153,6 +160,8 @@ impl Runtime {
                 Some(run) => Reader::Run(run),
                 None => Reader::Conversation(None),
             },
+            // A server's question to a person: their answer reaches no model.
+            Target::Elicit(_) => Reader::Conversation(None),
         }
     }
 
@@ -444,15 +453,25 @@ impl Runtime {
             );
         }
         if let Some(p) = caller.principal.as_deref() {
-            c.union(&self.principal_message_carries(p, "handed text"));
+            c.union(&self.principal_message_carries(p, caller.session.as_deref(), "handed text"));
         }
         c
     }
 
     /// [`principal_carries`] for the principal `id`, by the role the rules
-    /// in force give it.
-    pub(crate) fn principal_message_carries(&self, id: &str, how: &str) -> Carries {
-        principal_carries(id, self.principal_index.get(id).map(|p| p.role), how)
+    /// in force give it, for text it sent through `session`.
+    pub(crate) fn principal_message_carries(
+        &self,
+        id: &str,
+        session: Option<&str>,
+        how: &str,
+    ) -> Carries {
+        principal_carries(
+            id,
+            self.principal_index.get(id).map(|p| p.role),
+            self.message_is_own(id, session),
+            how,
+        )
     }
 
     /// What the asker behind a deferred reply to `target` carries — a run's
@@ -471,7 +490,18 @@ impl Runtime {
                     &mut c,
                 );
                 if let Some(p) = principal.as_deref() {
-                    c.union(&self.principal_message_carries(p, "handed text"));
+                    let session = match target {
+                        Target::Child(node, _) => {
+                            self.children.get(*node).and_then(|c| match &c.kind {
+                                super::children::ChildKind::RootTurn { session, .. } => {
+                                    session.clone()
+                                }
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    };
+                    c.union(&self.principal_message_carries(p, session.as_deref(), "handed text"));
                 }
                 c
             }

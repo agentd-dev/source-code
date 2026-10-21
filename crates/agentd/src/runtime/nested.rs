@@ -1408,6 +1408,7 @@ fn unreachable_wf() -> std::sync::Arc<Workflow> {
         hash: String::new(),
         definition: Value::Null,
         gate_channels: BTreeMap::new(),
+        document: false,
     })
 }
 

@@ -55,12 +55,12 @@ use serde_json::json;
 
 use super::account::{Account, Accounts};
 use super::discover::Verified;
-use super::dpop::{DpopKey, Nonces};
 use super::http::Dialer;
 use super::identity::Identity;
 use super::token::{self, Request, TokenError, TokenResponse};
 use super::user_id::{UserIds, UserRecord};
 use super::wire::error as err;
+use crate::auth::dpop::{DpopKey, Nonces};
 use crate::obs::log::Logger;
 
 /// A token, when it was issued and for how long.

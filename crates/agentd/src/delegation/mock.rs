@@ -14,7 +14,10 @@
 //!   identity-chaining member only in the RFC 8414 one — and serves the
 //!   device grant (approved at once), the authorization code (approved at
 //!   once: `/authorize` redirects straight back), refresh, RFC 8693 token
-//!   exchange for an ID-JAG, and RFC 7009 revocation. Its ID tokens and
+//!   exchange for an ID-JAG, RFC 7009 revocation, and OpenID CIBA in poll
+//!   mode: `/bc/authorize` takes an `id_token_hint` it issued or the
+//!   `login_hint` it knows the person by, and the poll answers pending,
+//!   `slow_down`, denied, expired or approved as steered. Its ID tokens and
 //!   ID-JAGs are ES256, signed with a key it makes at start. Refresh tokens
 //!   belong to families: with `rotate`, every use issues a new one and a
 //!   used one presented again revokes its family, as reuse detection does.
@@ -26,12 +29,16 @@
 //!   A2A caller presents.
 //! - **The authorization server** takes the JWT bearer grant: it verifies
 //!   the ID-JAG with the IdP's key and holds it to `typ`, `aud`, `exp` and
-//!   `client_id`, then issues an access token for the ID-JAG's `resource`.
+//!   `client_id`, then issues an access token for the ID-JAG's `resource` —
+//!   with `dpop`, bound to the key a DPoP proof sent with the request holds
+//!   (RFC 9449), after demanding a nonce once with `dpop_nonce`.
 //! - **The MCP server** (2025-11-25, `initialize`) takes only a token the
-//!   authorization server issued for its URL, serves `list_issues`,
-//!   `create_issue` and `whoami`, and records what each request declared. It
-//!   answers at `/mcp` and at `/mcp2`, two resources behind one
-//!   authorization server.
+//!   authorization server issued for its URL — a DPoP-bound one only as
+//!   `DPoP`, with a proof of its key for that very request — serves
+//!   `list_issues`, `create_issue` and `whoami`, and records what each
+//!   request declared — with `mcp_dpop_nonce`, after demanding a DPoP
+//!   nonce once. It answers at `/mcp` and at `/mcp2`, two resources behind
+//!   one authorization server.
 //! - **The A2A peer** (JSON-RPC, no streaming) answers every `SendMessage`
 //!   with a task, completed at once — or, with `peer_auth`, in
 //!   `TASK_STATE_AUTH_REQUIRED` saying where to sign in, until the test sets
@@ -55,7 +62,7 @@ use crate::b64;
 
 /// What a test can change, and the defaults.
 pub fn default_knobs() -> Value {
-    json!({
+    let mut knobs = json!({
         "sub": "00u1alice",
         "email": "alice@acme.example",
         "idp_client_id": "agentd-idp",
@@ -114,6 +121,45 @@ pub fn default_knobs() -> Value {
         // The peer's tasks wait on a sign-in, until `peer_authorized`.
         "peer_auth": false,
         "peer_authorized": false,
+    });
+    merge(&mut knobs, &unattended_knobs());
+    knobs
+}
+
+/// The knobs of CIBA, sign-in recency and DPoP: a `json!` of their own,
+/// which one literal with the rest would pass the macro's recursion limit.
+fn unattended_knobs() -> Value {
+    json!({
+        // The name ID tokens carry as `preferred_username`, which a CIBA
+        // `login_hint` names the person by.
+        "preferred_username": "alice@acme.example",
+        // A refresh answers with an ID token.
+        "refresh_id_token": true,
+        // How a sign-in's ID token says the person authenticated: now
+        // (null), this many seconds ago, or — false — not at all.
+        "signin_auth_time": null,
+        // How a CIBA poll answers once `ciba_pending` polls have answered
+        // `authorization_pending` and `ciba_slow_down` `slow_down`:
+        // approve, deny, expire, or pending for ever.
+        "ciba": "approve",
+        "ciba_pending": 1,
+        "ciba_slow_down": 0,
+        "ciba_expires_in": 120,
+        // The approval's ID token names this subject instead of the hint's.
+        "ciba_sub": null,
+        // The approval comes with a refresh token, though none was asked.
+        "ciba_refresh_token": false,
+        // The authorization server's, and the MCP server's, metadata
+        // advertise ES256 DPoP proofs; the MCP server takes bound tokens
+        // alone; the authorization server, and the MCP server, demand these
+        // nonces once.
+        "dpop": false,
+        "prm_dpop": false,
+        "dpop_required": false,
+        "dpop_nonce": null,
+        "mcp_dpop_nonce": null,
+        // How long the IdP takes to answer a `refresh_token` grant.
+        "slow_refresh_ms": 0,
     })
 }
 
@@ -132,6 +178,16 @@ struct At {
     sub: String,
     resource: String,
     scope: String,
+    exp: u64,
+    /// The thumbprint of the DPoP key it is bound to.
+    jkt: Option<String>,
+}
+
+/// A CIBA request the IdP took: whom it named, and how often it was polled.
+#[derive(Clone)]
+struct Ciba {
+    sub: String,
+    polls: u32,
     exp: u64,
 }
 
@@ -156,6 +212,11 @@ struct State {
     serial: u64,
     /// The client's answer to the last elicitation.
     elicited: Option<Value>,
+    /// The CIBA requests taken, by `auth_req_id`.
+    cibas: BTreeMap<String, Ciba>,
+    /// Whether the authorization server demanded its DPoP nonce yet.
+    nonce_asked: bool,
+    mcp_nonce_asked: bool,
 }
 
 impl State {
@@ -174,11 +235,21 @@ impl State {
         )
     }
     fn new_rt(&mut self, sub: &str, family: Option<u64>, auth_time: u64) -> String {
+        self.new_rt_as("rt", sub, family, auth_time)
+    }
+    /// A refresh token named `prefix-…`: a CIBA approval's says so.
+    fn new_rt_as(
+        &mut self,
+        prefix: &str,
+        sub: &str,
+        family: Option<u64>,
+        auth_time: u64,
+    ) -> String {
         let family = family.unwrap_or_else(|| {
             self.families += 1;
             self.families
         });
-        let rt = self.next("rt");
+        let rt = self.next(prefix);
         self.rts.insert(
             rt.clone(),
             Rt {
@@ -270,6 +341,9 @@ pub fn start(knobs: &Value) -> std::io::Result<Mock> {
         record: Vec::new(),
         serial: 0,
         elicited: None,
+        cibas: BTreeMap::new(),
+        nonce_asked: false,
+        mcp_nonce_asked: false,
     }));
     for (l, role) in [
         (li, Role::Idp),
@@ -487,7 +561,7 @@ fn serve(stream: TcpStream, role: Role, state: &Arc<Mutex<State>>) {
         let pick = |k: &str| req.header(k).map(str::to_string);
         s.record.push(json!({
             "at": format!("{role:?}").to_lowercase(), "method": req.method, "path": req.path,
-            "body": body, "authorization": pick("authorization"),
+            "body": body, "authorization": pick("authorization"), "dpop": pick("dpop"),
             "mcp_protocol_version": pick("mcp-protocol-version"), "t": crate::auth::cache::now_ms(),
         }));
     }
@@ -548,27 +622,110 @@ fn sign(s: &State, typ: &str, claims: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn id_token(s: &State, sub: &str, nonce: Option<&str>, auth_time: u64) -> String {
+fn id_token(s: &State, sub: &str, nonce: Option<&str>, auth_time: Option<u64>) -> String {
     let t = now();
     let mut c = json!({"iss": s.idp, "aud": s.knob("idp_client_id"), "sub": sub,
-                       "iat": t, "exp": t + 3600, "auth_time": auth_time,
-                       "email": s.knob("email")});
+                       "iat": t, "exp": t + 3600, "email": s.knob("email"),
+                       "preferred_username": s.knob("preferred_username")});
+    if let Some(a) = auth_time {
+        c["auth_time"] = json!(a);
+    }
     if let Some(n) = nonce {
         c["nonce"] = json!(n);
     }
     sign(s, "JWT", &c)
 }
 
+/// When a sign-in's ID token says the person authenticated
+/// (`signin_auth_time`): now, some seconds ago, or not at all.
+fn signin_auth_time(s: &State) -> Option<u64> {
+    match s.knob("signin_auth_time") {
+        Value::Bool(false) => None,
+        Value::Number(n) => Some(now().saturating_sub(n.as_u64().unwrap_or(0))),
+        _ => Some(now()),
+    }
+}
+
+/// The public key `jwk` (P-256) verifies the compact JWS `jws`.
+fn es256_verifies(jws: &str, jwk: &Value) -> bool {
+    let Some((input, sig)) = jws.rsplit_once('.') else {
+        return false;
+    };
+    let mut point = vec![0x04];
+    for m in ["x", "y"] {
+        match b64::url_decode(jwk[m].as_str().unwrap_or_default()) {
+            Ok(b) => point.extend(b),
+            Err(_) => return false,
+        }
+    }
+    let Ok(sig) = b64::url_decode(sig) else {
+        return false;
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &point)
+        .verify(input.as_bytes(), &sig)
+        .is_ok()
+}
+
+/// A DPoP proof (RFC 9449 §4.3) for `method` at `url` — with `ath` over
+/// `token` when one is presented with it, and `nonce` when one is due —
+/// held to its header's key: that key's thumbprint, or why not.
+fn dpop_proof(
+    proof: &str,
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    nonce: Option<&str>,
+) -> Result<String, String> {
+    let (h, c) = crate::auth::idjag::decode_unverified(proof)?;
+    if h["typ"] != "dpop+jwt" || h["alg"] != "ES256" || h["jwk"].get("d").is_some() {
+        return Err("header".into());
+    }
+    if !es256_verifies(proof, &h["jwk"]) {
+        return Err("signature".into());
+    }
+    if c["htm"] != method || c["htu"] != url {
+        return Err(format!("htm/htu {} {}", c["htm"], c["htu"]));
+    }
+    if c["iat"]
+        .as_u64()
+        .is_none_or(|t| t + 60 < now() || t > now() + 60)
+        || c["jti"].as_str().is_none()
+    {
+        return Err("iat/jti".into());
+    }
+    if let Some(t) = token
+        && c["ath"].as_str() != Some(b64::url_nopad(&crate::sha::sha256(t.as_bytes())).as_str())
+    {
+        return Err("ath".into());
+    }
+    if let Some(n) = nonce
+        && c["nonce"].as_str() != Some(n)
+    {
+        return Err("nonce".into());
+    }
+    crate::auth::jwk::thumbprint(&h["jwk"])
+}
+
 fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
-    let (down, slow) = {
+    let (down, slow, slow_refresh) = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        (s.flag("idp_down"), s.knob("slow_ms").as_u64().unwrap_or(0))
+        (
+            s.flag("idp_down"),
+            s.knob("slow_ms").as_u64().unwrap_or(0),
+            s.knob("slow_refresh_ms").as_u64().unwrap_or(0),
+        )
     };
     if down {
         return write(stream, 503, &[], b"down");
     }
     if req.path == "/token" && slow > 0 {
         std::thread::sleep(std::time::Duration::from_millis(slow));
+    }
+    if req.path == "/token"
+        && slow_refresh > 0
+        && req.form().get("grant_type").map(String::as_str) == Some("refresh_token")
+    {
+        std::thread::sleep(std::time::Duration::from_millis(slow_refresh));
     }
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     let iss = s.idp.clone();
@@ -579,16 +736,68 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                 "device_authorization_endpoint": format!("{iss}/device"),
                 "authorization_endpoint": format!("{iss}/authorize"),
                 "revocation_endpoint": format!("{iss}/revoke"),
+                "backchannel_authentication_endpoint": format!("{iss}/bc/authorize"),
+                "backchannel_token_delivery_modes_supported": ["poll"],
                 "grant_types_supported": ["authorization_code", "refresh_token",
-                    "urn:ietf:params:oauth:grant-type:device_code", wire::GRANT_TOKEN_EXCHANGE],
+                    "urn:ietf:params:oauth:grant-type:device_code", wire::GRANT_TOKEN_EXCHANGE,
+                    crate::auth::ciba::GRANT_CIBA],
                 "code_challenge_methods_supported": ["S256"],
                 wire::METADATA_IDENTITY_CHAINING: [wire::TOKEN_TYPE_ID_JAG]});
             drop(s);
             json_reply(stream, 200, &v);
         }
+        ("POST", "/bc/authorize") => {
+            if let Err(e) = client_of(req, &token_endpoint, &iss) {
+                drop(s);
+                return oauth_error(
+                    stream,
+                    401,
+                    "invalid_client",
+                    json!({"error_description": e}),
+                );
+            }
+            let form = req.form();
+            if form.get("scope").map(String::as_str) != Some("openid") {
+                drop(s);
+                return oauth_error(stream, 400, "invalid_scope", json!({}));
+            }
+            // The person: an ID token this IdP issued, or the name it knows
+            // them by — exactly one.
+            let sub = match (form.get("id_token_hint"), form.get("login_hint")) {
+                (Some(h), None) => {
+                    own_claims(&s, h).and_then(|c| c["sub"].as_str().map(str::to_string))
+                }
+                (None, Some(l)) if s.knob("preferred_username").as_str() == Some(l.as_str()) => {
+                    s.knob("sub").as_str().map(str::to_string)
+                }
+                _ => None,
+            };
+            let Some(sub) = sub else {
+                drop(s);
+                return oauth_error(stream, 400, "unknown_user_id", json!({}));
+            };
+            let id = s.next("ciba");
+            let expires_in = s.knob("ciba_expires_in").as_u64().unwrap_or(120);
+            s.cibas.insert(
+                id.clone(),
+                Ciba {
+                    sub,
+                    polls: 0,
+                    exp: now() + expires_in,
+                },
+            );
+            drop(s);
+            json_reply(
+                stream,
+                200,
+                &json!({"auth_req_id": id, "expires_in": expires_in, "interval": 1}),
+            );
+        }
         ("GET", "/.well-known/openid-configuration") => {
             let v = json!({"issuer": iss, "token_endpoint": token_endpoint,
                 "authorization_endpoint": format!("{iss}/authorize"),
+                "backchannel_authentication_endpoint": format!("{iss}/bc/authorize"),
+                "backchannel_token_delivery_modes_supported": ["poll"],
                 "jwks_uri": format!("{iss}/keys"),
                 "code_challenge_methods_supported": ["S256"],
                 "authorization_response_iss_parameter_supported": true});
@@ -666,7 +875,12 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                     };
                     let t = now();
                     let rt = s.new_rt(&sub, None, t);
-                    let it = id_token(&s, &id_sub(&s, &sub), nonce.as_deref(), t);
+                    let it = id_token(
+                        &s,
+                        &id_sub(&s, &sub),
+                        nonce.as_deref(),
+                        signin_auth_time(&s),
+                    );
                     let at = s.next("idp-at");
                     s.idp_ats.insert(at.clone(), sub);
                     drop(s);
@@ -685,11 +899,14 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                             oauth_error(stream, 400, "invalid_grant", json!({}))
                         }
                         Ok((rt, next)) => {
-                            let it = id_token(&s, &id_sub(&s, &rt.sub), None, rt.auth_time);
+                            let it = id_token(&s, &id_sub(&s, &rt.sub), None, Some(rt.auth_time));
                             let at = s.next("idp-at");
                             s.idp_ats.insert(at.clone(), rt.sub.clone());
                             let mut v = json!({"access_token": at, "token_type": "Bearer",
                                                "expires_in": 3600, "id_token": it});
+                            if !s.flag("refresh_id_token") {
+                                v.as_object_mut().map(|o| o.remove("id_token"));
+                            }
                             if let Some(n) = next {
                                 v["refresh_token"] = json!(n);
                             }
@@ -699,6 +916,7 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                     }
                 }
                 wire::GRANT_TOKEN_EXCHANGE => exchange(stream, &form, s),
+                crate::auth::ciba::GRANT_CIBA => ciba_poll(stream, &form, s),
                 _ => {
                     drop(s);
                     oauth_error(stream, 400, "unsupported_grant_type", json!({}))
@@ -710,6 +928,67 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
             write(stream, 404, &[], b"");
         }
     }
+}
+
+/// A poll of a CIBA request (CIBA §10.1): `ciba_pending` polls answer
+/// pending and `ciba_slow_down` more `slow_down`, then as `ciba` says — an
+/// approval an ID token for the person the request named (or `ciba_sub`),
+/// authenticated now, with a refresh token beside it under
+/// `ciba_refresh_token`.
+fn ciba_poll(
+    stream: &TcpStream,
+    form: &BTreeMap<String, String>,
+    mut s: std::sync::MutexGuard<'_, State>,
+) {
+    let id = form.get("auth_req_id").cloned().unwrap_or_default();
+    let (pending, slow) = (
+        s.knob("ciba_pending").as_u64().unwrap_or(0) as u32,
+        s.knob("ciba_slow_down").as_u64().unwrap_or(0) as u32,
+    );
+    let answer = s.knob("ciba").as_str().unwrap_or("approve").to_string();
+    let Some(c) = s.cibas.get_mut(&id) else {
+        drop(s);
+        return oauth_error(stream, 400, "invalid_grant", json!({}));
+    };
+    c.polls += 1;
+    let c = c.clone();
+    if now() >= c.exp {
+        drop(s);
+        return oauth_error(stream, 400, "expired_token", json!({}));
+    }
+    let code = if c.polls <= pending {
+        Some("authorization_pending")
+    } else if c.polls <= pending + slow {
+        Some("slow_down")
+    } else {
+        match answer.as_str() {
+            "approve" => None,
+            "deny" => Some("access_denied"),
+            "expire" => Some("expired_token"),
+            _ => Some("authorization_pending"),
+        }
+    };
+    if let Some(code) = code {
+        drop(s);
+        return oauth_error(stream, 400, code, json!({}));
+    }
+    let sub = s
+        .knob("ciba_sub")
+        .as_str()
+        .map_or(c.sub.clone(), str::to_string);
+    let t = now();
+    let it = id_token(&s, &sub, None, Some(t));
+    let at = s.next("idp-at");
+    s.idp_ats.insert(at.clone(), sub.clone());
+    let mut v = json!({"access_token": at, "token_type": "Bearer", "expires_in": 3600,
+                       "id_token": it, "scope": "openid"});
+    if s.flag("ciba_refresh_token") {
+        let rt = s.new_rt_as("ciba-rt", &sub, None, t);
+        v["refresh_token"] = json!(rt);
+    }
+    s.cibas.remove(&id);
+    drop(s);
+    json_reply(stream, 200, &v);
 }
 
 /// Present refresh token `rt`: refused when unknown, dead, revoked or
@@ -944,6 +1223,7 @@ fn access_exchange(
             resource: get("resource"),
             scope: scope.clone(),
             exp: t + 300,
+            jkt: None,
         },
     );
     let mut v = json!({"issued_token_type": wire::TOKEN_TYPE_ACCESS_TOKEN, "access_token": at,
@@ -1044,6 +1324,9 @@ fn ras(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                 v.as_object_mut()
                     .map(|o| o.remove(wire::METADATA_GRANT_PROFILES));
             }
+            if s.flag("dpop") {
+                v["dpop_signing_alg_values_supported"] = json!(["ES256"]);
+            }
             drop(s);
             json_reply(stream, 200, &v);
         }
@@ -1065,6 +1348,43 @@ fn ras(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                 drop(s);
                 return oauth_error(stream, 400, "unsupported_grant_type", json!({}));
             }
+            // A DPoP proof binds the token to its key; the nonce, when one
+            // is demanded, is asked for once.
+            let jkt = match req.header("dpop") {
+                Some(proof) if s.flag("dpop") => {
+                    let nonce = s.knob("dpop_nonce").as_str().map(str::to_string);
+                    if let Some(n) = &nonce
+                        && !s.nonce_asked
+                    {
+                        s.nonce_asked = true;
+                        drop(s);
+                        let mut v = json!({"error": wire::USE_DPOP_NONCE});
+                        v["error_description"] = json!("a nonce is required");
+                        return write(
+                            stream,
+                            400,
+                            &[
+                                ("Content-Type", "application/json".into()),
+                                ("DPoP-Nonce", n.clone()),
+                            ],
+                            v.to_string().as_bytes(),
+                        );
+                    }
+                    match dpop_proof(proof, "POST", &token_endpoint, None, nonce.as_deref()) {
+                        Ok(j) => Some(j),
+                        Err(e) => {
+                            drop(s);
+                            return oauth_error(
+                                stream,
+                                400,
+                                "invalid_dpop_proof",
+                                json!({"error_description": e}),
+                            );
+                        }
+                    }
+                }
+                _ => None,
+            };
             let assertion = form.get("assertion").cloned().unwrap_or_default();
             let jwks = json!({"keys": [s.key.public_jwk()]});
             // The ID-JAG: the IdP's signature, then its claims.
@@ -1141,14 +1461,15 @@ fn ras(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                     resource,
                     scope: scope.clone(),
                     exp: now() + ttl,
+                    jkt: jkt.clone(),
                 },
             );
             drop(s);
             json_reply(
                 stream,
                 200,
-                &json!({"access_token": at, "token_type": "Bearer", "expires_in": ttl, "scope": scope,
-                        "refresh_token": "never-to-be-kept"}),
+                &json!({"access_token": at, "token_type": if jkt.is_some() { "DPoP" } else { "Bearer" },
+                        "expires_in": ttl, "scope": scope, "refresh_token": "never-to-be-kept"}),
             );
         }
         _ => {
@@ -1182,7 +1503,13 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
             Value::Array(a) => Value::Array(a.clone()),
             _ => json!([s.ras]),
         };
-        let v = json!({"resource": resource, "authorization_servers": servers});
+        let mut v = json!({"resource": resource, "authorization_servers": servers});
+        if s.flag("prm_dpop") {
+            v["dpop_signing_alg_values_supported"] = json!(["ES256"]);
+        }
+        if s.flag("dpop_required") {
+            v["dpop_bound_access_tokens_required"] = json!(true);
+        }
         drop(s);
         return json_reply(stream, 200, &v);
     }
@@ -1190,17 +1517,51 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
         drop(s);
         return write(stream, 405, &[], b"");
     }
-    let token = req
-        .header("authorization")
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .unwrap_or_default()
-        .to_string();
+    let authorization = req.header("authorization").unwrap_or_default();
+    let (scheme, token) = authorization
+        .split_once(' ')
+        .map_or(("", ""), |(s, t)| (s, t));
+    let token = token.to_string();
     let reject_once = s.flag("mcp_reject_once");
+    // A DPoP request is first answered with the nonce, when one is
+    // demanded, and its proofs carry it from then on (RFC 9449 §9).
+    let nonce = s.knob("mcp_dpop_nonce").as_str().map(str::to_string);
+    if let Some(n) = &nonce
+        && scheme == "DPoP"
+        && !s.mcp_nonce_asked
+    {
+        s.mcp_nonce_asked = true;
+        drop(s);
+        return write(
+            stream,
+            401,
+            &[
+                (
+                    "WWW-Authenticate",
+                    format!("DPoP error=\"{}\", algs=\"ES256\"", wire::USE_DPOP_NONCE),
+                ),
+                ("DPoP-Nonce", n.clone()),
+            ],
+            b"",
+        );
+    }
+    // A DPoP-bound token is taken only as `DPoP`, with a proof of its key
+    // for this request; any other only as `Bearer`.
+    let proven = |a: &At| match &a.jkt {
+        Some(jkt) => {
+            scheme == "DPoP"
+                && req.header("dpop").is_some_and(|p| {
+                    dpop_proof(p, &req.method, &url, Some(&token), nonce.as_deref()).as_deref()
+                        == Ok(jkt.as_str())
+                })
+        }
+        None => scheme == "Bearer",
+    };
     let at = s
         .ats
         .get(&token)
         .cloned()
-        .filter(|a| a.resource == url && a.exp > now());
+        .filter(|a| a.resource == url && a.exp > now() && proven(a));
     let Some(at) = at.filter(|_| !s.flag("mcp_reject") && !reject_once) else {
         if reject_once {
             s.knobs["mcp_reject_once"] = json!(false);

@@ -1174,6 +1174,15 @@ local files and folders; `url` and `uri` definitions are checked at startup.
 `security.workflows.immutable: true` makes the loaded set read-only to the
 agent's `workflow.*` tools. The how-to is [Author workflows](author-workflows.md).
 
+A definition's `act_for: {principal, via}` names the person its `schedule`,
+`loop` and `once` firings act for with nobody there (needs `xaa`; [Work nobody
+is there for](authentication.md#work-nobody-is-there-for)). It is the
+operator's alone: an instruction document, a subagent template's machinery
+and a definition `workflow.create` or `workflow.update` stored may not carry
+one. It is part of the definition its digest is over, so a reload that
+changes it, or anything else in the workflow, suspends its firings until the
+person signs in again.
+
 ```yaml
 # fragment: under workflows:
 - name: inline-one
@@ -1449,7 +1458,8 @@ Who autonomous work is done for. All paths are live · op.
 |---|---|---|---|
 | `identity.autonomous_as` | string | `system` | The principal a schedule, webhook, stream or `once` firing runs as. It may not be the per-person operator of a delegation (`operator:<id>`, the `xaa` feature): autonomous work never acts with an enrolled person's grant. |
 | `identity.labels` | map | `{}` | Labels stamped on that work. |
-| `identity.providers.<name>` | object | — | An enterprise IdP agentd is a client of: `issuer`, `client_id` (required), `profile` (`generic \| okta`), `client_auth`, `client_secret`, `sign_in`, `subject`, `subjects`, `jwks_uri`, `equivalent_issuers` (the `a2a.inbound_tokens` issuers whose subjects are this provider's). Restart. Needs `xaa`; see [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization). |
+| `identity.providers.<name>` | object | — | An enterprise IdP agentd is a client of: `issuer`, `client_id` (required), `profile` (`generic \| okta`), `client_auth`, `client_secret`, `sign_in`, `subject`, `subjects`, `jwks_uri`, `equivalent_issuers` (the `a2a.inbound_tokens` issuers whose subjects are this provider's), `ciba`. Restart. Needs `xaa`; see [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization). |
+| `identity.providers.<name>.ciba` | `{enabled, request_expiry, per_day}` | `{false, 300s, 10}` | OpenID CIBA in poll mode at this IdP: how a `via: ciba` firing asks its person on their own device. `request_expiry` (1s–1h) is sent as `request_expiry` under `profile: okta`, else `requested_expiry`; `per_day` caps the requests one person is sent a day. The IdP's metadata must name its `backchannel_authentication_endpoint` and list `poll`. Restart. |
 | `identity.delegation.seal_key`, `.seal_key_previous` | secret reference | — | 32 random bytes, hex or base64, from a mounted file or the startup prompt — never the environment. Every grant's refresh token is sealed with `seal_key`; `seal_key_previous` only opens. Required with a `grant: id_jag` or `token_exchange` server under `key_custody: local`; refused under `external`. Restart. |
 | `identity.delegation.key_custody` | `local \| external` | `local` | Who holds the seal key and every `private_key_jwt` key under `identity.providers` and on a delegated server: agentd, from secret references, or the external signer. Under `external` each such key is named by `client_auth.kid` with no `key`. Changing it means enrolling again. Restart. |
 | `identity.delegation.signer` | `{socket, uid, timeout, seal_key, seal_key_previous}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (the socket's peer must be it; agentd's own uid is a load warning, since the peer check cannot then tell the signer from agentd's workers), the bound on a whole request, the connect included (`5s`, at most `60s`), and the ids of its key-encryption key and of the one before a rotation, which only unwraps ([The external signer protocol](external-signer.md)). Restart. |
@@ -1458,7 +1468,7 @@ Who autonomous work is done for. All paths are live · op.
 | `identity.delegation.consent_timeout` | duration | `24h` | How long a consent gate waits before it denies. Reload. |
 | `identity.delegation.consent_session_max_age` | duration | `12h` | A display session answers a consent gate only while its own IdP sign-in is younger than this. Reload. |
 | `identity.delegation.consent_per_minute` | int | `10` | How many consent gates may open for one person a minute; a call past that is refused rather than asked. At least 1. Reload. |
-| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source, role?, labels?}, idp, servers: {<name>: {scopes, document_workflows?}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers}`. `source` is `operator` (a per-person operator), `oidc` (an `a2a.login` session), `x509` (a certificate principal its rule pins by key) or `device` (a device session a pin or the first binding makes eligible); `subagents` is `none` (default) or `inherit` (a subagent acts with the grant at the delegated servers it declared); `approvers` is `[principal]` (default) or `[principal, operator]`; `agent_mode_servers` are the agent-mode servers tagged `sensitive` or `egress` the person's work may still use (every other one is hidden from it); `document_workflows` (`{name, digest}`, the `hash` `workflow.list` shows) are workflows an instruction document defined whose calls to the server are not `document_sourced`; `per_minute` (default 4) paces mints per person and server; `clients` admits only the callers whose enterprise access token one of these front ends was issued (`source: oidc`). No template matching, no enrolment. Reload: a narrowed one holds its grants at the next call; one removed, or a server removed from one, revokes what it allowed. |
+| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source, role?, labels?}, idp, servers: {<name>: {scopes, document_workflows?}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers}`. `source` is `operator` (a per-person operator), `oidc` (an `a2a.login` session), `x509` (a certificate principal its rule pins by key) or `device` (a device session a pin or the first binding makes eligible); `subagents` is `none` (default) or `inherit` (a subagent acts with the grant at the delegated servers it declared); `approvers` is `[principal]` (default) or `[principal, operator]`; `agent_mode_servers` are the agent-mode servers tagged `sensitive` or `egress` the person's work may still use (every other one is hidden from it); `document_workflows` (`{name, digest}`, the `hash` `workflow.list` shows) are workflows an instruction document defined whose calls to the server are not `document_sourced`; `per_minute` (default 4) paces mints per person and server; `clients` admits only the callers whose enterprise access token one of these front ends was issued (`source: oidc`); `unattended` (`never`, the default, `ciba` or `standing`, which allows `ciba` too) lets an `act_for` workflow's firings act with the grant with nobody there, `standing` at a `profile: okta` IdP only with `allow_against_idp_guidance: true`; `unattended_tools` are the delegated `<server>.<tool>`s tagged `egress` a firing may call (every other is refused). No template matching, no enrolment. Reload: a narrowed one holds its grants at the next call; one removed, or a server removed from one, revokes what it allowed. |
 | `identity.delegation.device_pins.<name>` | `{iss, sub}` | — | The one IdP identity a device name delegates as. Needs `a2a.device_grant`. Reload: a changed or removed pin revokes what it bound. |
 | `identity.delegation.device_first_binding` | bool | `false` | An unpinned device name binds to the identity of its first enrolment (a load warning: a forwarded sign-in link binds it to whoever completes it). Reload: turned off, it revokes what it bound. |
 
@@ -1665,7 +1675,8 @@ Every other path is applied live, as follows:
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
 | `security.policies` | Swapped whole at the next call (`security.policies.reloaded`); a list that does not load, or whose rules could hold a tool a running turn or subagent dials itself, refuses the reload and the old one stands. A gate already open keeps the rule that raised it. |
-| `identity.delegation` templates, pins, first binding, consent timing | Taken at once: a narrowed template holds every grant it allowed to the new ceilings at the next call; a removed template, a server removed from one, a changed or removed pin and first binding turned off revoke the grants they allowed — at the IdP, tombstoned, off the loop — and drop the IdP proofs of those device names' sessions (`delegation.bindings.cleared`). |
+| `identity.delegation` templates, pins, first binding, consent timing | Taken at once: a narrowed template holds every grant it allowed to the new ceilings at the next call; a removed template, a server removed from one, a changed or removed pin and first binding turned off revoke the grants they allowed — at the IdP, tombstoned, off the loop — and drop the IdP proofs of those device names' sessions (`delegation.bindings.cleared`). A template's `unattended` and `unattended_tools` hold every firing from its next call. |
+| a workflow's `act_for`, and the definition it is in | A firing acts only while its workflow's digest is the one the person consented to when they last signed in: a changed definition's firings start nothing (`start.unattended.suspended`) until they sign in again. A firing already running keeps the definition it started on. |
 | `a2a.cors.origins` | Replaced in the live listener; removing an origin revokes it. |
 | `webhooks.default_auth` and the `webhook` routes | The route table is rebuilt on every reload, so a rotated `{{secret-file:…}}` is picked up; each route's in-flight count and rate bucket carry over. |
 | `store.retention` | The next sweep applies the new bound. |
@@ -1692,10 +1703,10 @@ naming the line:
   `.client_auth`, `.tool_scopes`,
   `.scope_mode`, `.tools_from`, `.tools_file`, `.id_jag`, `.id_jag_reuse`,
   `.on_revoked`, `.allow_unbound_at`, `.attribution`, `.max_at_age`,
-  `.trusted_output` — on any
+  `.trusted_output`, `.dpop` — on any
   server, nor a reference to a secret under `identity.*` or on a delegated
-  server), `vars`, `context`, `goal`, `knowledge`, `search`, `memory`,
-  `limits`
+  server; nor a workflow's `act_for`), `vars`, `context`, `goal`,
+  `knowledge`, `search`, `memory`, `limits`
 - `intelligence.model`, `intelligence.models` (a model it declares may not name
   a `provider`), `intelligence.roles.turn`, `.think`, `.decide`, `.preflight`,
   `.compaction`, `.goal`, `intelligence.dialect`, `intelligence.budget`,

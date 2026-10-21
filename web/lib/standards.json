@@ -94,7 +94,7 @@
     "name": "DPoP",
     "version": "RFC 9449",
     "mark": "preview",
-    "full": "DPoP-bound tokens at companies: a build-from-source preview",
+    "full": "DPoP-bound tokens at companies, and at delegated MCP servers whose metadata advertise them: a build-from-source preview",
     "href": "/docs/interoperability/#personal-agent-protocol",
     "tier": 2
   },
@@ -190,6 +190,14 @@
     "mark": "preview",
     "full": "Identity Assertion JWT Authorization Grant, checked claim by claim and redeemed with the JWT bearer grant, a build-from-source preview",
     "href": "/docs/authentication/#enterprise-managed-authorization",
+    "tier": 2
+  },
+  {
+    "name": "CIBA",
+    "version": "Core 1.0",
+    "mark": "preview",
+    "full": "OpenID Client-Initiated Backchannel Authentication in poll mode: a scheduled workflow's firing asks its person to approve it on their own device, a build-from-source preview",
+    "href": "/docs/authentication/#work-nobody-is-there-for",
     "tier": 2
   },
   {

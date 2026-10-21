@@ -639,8 +639,10 @@ at every call, as it stands then: a run is the person's who started it,
 through the session it was started through, and a delegated server's tools
 are not offered at all in work for someone without a usable grant there.
 A run started by a schedule, a webhook, another operator or anyone else
-fails `no_delegation` at a delegated server; `identity.autonomous_as` may
-not name a person. A subagent's call is `delegation_not_permitted`, and so
+fails `no_delegation` at a delegated server — unless its workflow's
+`act_for` names the person and their template allows it ([Work nobody is
+there for](#work-nobody-is-there-for)); `identity.autonomous_as` may not
+name a person. A subagent's call is `delegation_not_permitted`, and so
 is a call in a run a subagent's call started — through a workflow tool,
 `workflow.run` or `workflow.signal` — or in a run that one started, unless
 the person's template says `subagents: inherit`: then the subagent acts
@@ -768,7 +770,12 @@ operator's, where `sign_in.grants` offers the device grant — and the call
 is made with the fresh ID token — that call alone: its server, its run or
 conversation and its step; another call to the same server, even the
 person's own in another task, mints as it would have; a sign-in as anyone
-but the grant's own person is `binding_mismatch`. Each decision is a record of the audit chain whose content — what
+but the grant's own person is `binding_mismatch`. The start link asks the
+IdP for `max_age` and `prompt=login`, and the sign-in must be as recent as
+the IdP asked: its ID token's `auth_time` within that `max_age` — or, where
+the IdP named none, after it asked, a moment the gate's wait record keeps
+for a device grant a restart resumes. A sign-in older than that, or whose ID
+token carries no `auth_time`, is refused and the call fails `step_up`. Each decision is a record of the audit chain whose content — what
 the person saw — is sealed under their own key: `agentd --delegation-audit`
 reads it back, and `agentd --delegation-forget <principal>` erases the
 person — the gates open for them denied first, then their grants revoked
@@ -1002,9 +1009,164 @@ and the person, no scope beyond those asked, and any refresh token in it
 dropped unread — renewal is a new exchange. The server's RFC 9728 metadata
 must name the provider's issuer among its authorization servers.
 
-**What this preview does not do yet** (RFC 0044 P3 part 2 and later): CIBA,
-unattended runs (`act_for`, refused at load), `on_revoked: ask`, DPoP, and
-live interop against an Okta Integrator org or xaa.dev.
+### Work nobody is there for
+
+A workflow's `act_for` names the person its `schedule`, `loop` and `once`
+firings act for with nobody there, and how:
+
+- **`via: ciba`** (preferred): each firing asks the person to approve it on
+  their own device, by OpenID CIBA in poll mode, and acts with that
+  approval alone.
+- **`via: standing`**: each firing acts with the person's grant — their
+  sealed refresh token — and nobody is asked.
+
+```yaml
+# fragment: under identity:
+providers:
+  okta:
+    issuer: https://acme.okta.com
+    ciba: {enabled: true}          # request_expiry 300s, per_day 10 by default
+delegation:
+  templates:
+    - name: eng-tools
+      principals: {source: operator}
+      idp: okta
+      servers: {linear: {scopes: ["issues:read", "issues:write"]}}
+      unattended: ciba             # never (default), ciba, or standing
+      unattended_tools: [linear.create_comment]
+```
+
+```yaml
+# fragment: under workflows:
+- name: weekly-report
+  act_for:
+    principal: {source: operator, id: alice}   # or {source: oidc, issuer, sub}
+    via: ciba
+  steps:
+    tick:  {kind: schedule, cron: "0 7 * * MON"}
+    issues: {kind: mcp.tool, depends_on: [tick], server: linear, tool: list_issues, args: {}}
+    done:  {kind: finish, depends_on: [issues]}
+```
+
+**Who and when.** `principal` is typed, never a display string: a
+pinned per-person operator or certificate principal by its
+`a2a.principals` rule's `id`, or an IdP subject (`source: oidc`, `issuer`,
+`sub`); a device principal is refused (`act_for_device_principal`), since a
+device delegates only through a live session. Only the operator's own
+configuration declares `act_for` — never an instruction document or a
+definition `workflow.create` stored. A firing acts for the person; a
+`manual` start's `workflow.run` runs as whoever asked. `act_for` beside a
+`webhook`, `stream`, `correlate`, `subscribe`, `signal`, `event` or `a2a`
+start, or a `webhook` wait, is refused at load (`act_for_trigger_not_allowed`):
+whoever can fire one could make the person's phone buzz at every firing,
+and drive an approved run with a payload of their own. The person's
+template must allow the `via`: `unattended: ciba` allows `ciba`;
+`unattended: standing` allows both. `standing` at a `profile: okta` IdP is
+refused without `allow_against_idp_guidance: true`
+(`standing_against_idp_guidance`) — Okta advises against XAA for work no
+user started — and warned with it.
+
+**Consent is to the definition.** Signing in — enrolling, or signing in
+again — consents to every `act_for` workflow that names the person and
+whose `via` their template allows, at the definition digest it has then
+(`delegation.list` shows each grant's `unattended`). A firing acts only
+while its workflow is that definition: a reload that changes it — an edit,
+or a `url:` or `dir:` body that changed — suspends its firings until the
+person signs in again. A firing that may not act — no grant, an expired or
+revoked one, a template that no longer allows it, a changed definition —
+starts no run and asks nobody; it logs `start.unattended.suspended` with
+the code (`unattended_suspended` for a changed definition) and is audited.
+
+**What a firing may do.** A firing's run acts through an authority of its
+own, which every turn and child of its work acts through too, and which
+ends with the run — a call on its way included: one whose firing ended
+meanwhile mints nothing and is not made. A run its work starts — a
+`workflow` step, `workflow.run`, or a signal or message that starts one —
+is a firing of its own for the same person (`start.unattended.carried`),
+acting for them only where its own workflow declares an `act_for` naming
+them that they consented to (`unattended_suspended` otherwise); a
+conversation turn the work starts by message acts with no one's grant.
+Its work is unattended — the `unattended` policy
+fact — and tainted, so the person's consent rules ask them, through their
+display client or `--delegation-approve`, and deny unanswered after
+`consent_timeout`. A delegated tool tagged `egress` is refused unasked
+(`policy_denied`) unless the template lists that very tool, `<server>.<tool>`,
+in `unattended_tools`. No step-up is asked for: nobody is there to sign in.
+Every mint is recorded `unattended: true`, with its `via`.
+
+**How `via: ciba` asks.** At a firing's first delegated call at the
+person's IdP, the call waits while agentd asks them: a CIBA request for
+`scope=openid` alone, its hint a fresh ID token from a `refresh_token`
+grant — discarded once sent — or, where the IdP returns none on refresh, the
+`preferred_username` they enrolled with, kept sealed under their personal
+key. The `binding_message` their device shows is agentd's own: the
+instance, the workflow, the run and the tool, never a payload. agentd polls
+the token endpoint at the IdP's `interval`, 5 s longer after each
+`slow_down`; `requested_expiry` (`request_expiry` under `profile: okta`) is
+`ciba.request_expiry`, 300 s by default. The approval's ID token must name
+the grant's own `iss` and `sub`, or the firing fails closed
+(`binding_mismatch`): a hint can resolve to another account. It is then the
+subject of that firing's exchanges alone — kept in memory, and the tokens
+minted with it pooled for that firing alone — until it expires, after which
+the firing's calls fail `subject_expired`. A firing asks once at a grant —
+its run's record says so before the request is sent: another call it makes
+while the request waits waits on the same request, and a refused, expired
+or lost approval is never asked again. At most one request per person and
+workflow waits at a time — once a firing's wait closes, however it closes,
+another firing may ask — and at most `ciba.per_day` (10) are sent a person
+a day (`budget_exhausted` past either). A refresh token the IdP issued with
+an approval anyway is revoked (RFC 7009) when the run ends; it is held in
+memory alone, so a restart before then leaves it alive at the IdP until it
+expires.
+
+**How a waiting run shows.** The step is suspended on its wait —
+`{kind: consent, signin: {how: ciba}}` in its wait record — for up to the
+request's expiry; the gate is among the person's own in
+`delegation.list`, and the run's task, when it has one, is in
+`auth-required` with agentd's words. A denial or an expiry fails the call
+`ciba_denied`; the person may also deny the gate itself
+(`--delegation-deny`). A restart ends the wait and fails the call closed —
+the request id is never written down — and an approval, held in memory
+alone, is gone with it: the firing's next delegated call fails
+`subject_expired`.
+
+### When a grant is gone mid-run
+
+`auth.on_revoked: ask` on a delegated server lets a workflow step wait for
+the person rather than fail, when the grant it needs was revoked or has
+expired, or the session its run acts through has ended: the step waits —
+among the person's gates, and on the run's task in `auth-required` with
+agentd's words — for at most `identity.delegation.consent_timeout`, and is
+made again, with no message, once the person enrols again (the same
+principal and IdP subject) or, for a run whose session ended, once a live
+session of theirs holds an IdP proof of that very identity: the run moves
+to it, logged and audited as `delegation.session.rebound`. Only a workflow
+step's own call waits; a model's call, and a call from work that has read
+outside text or that nobody is there for, fails `revoked` as with
+`on_revoked: fail` (the default) — so a steered model cannot make anyone
+sign in. A call that waited before any rule was consulted meets the
+operator's rules and the person's consent rules when it is made again.
+Unanswered, or denied, the step fails `revoked`.
+
+### Sender-constrained tokens
+
+Where a delegated server's RFC 9728 metadata and its authorization
+server's metadata both advertise ES256 DPoP proofs
+(`dpop_signing_alg_values_supported`), its access token is bound to a key
+agentd makes in memory at first use and never writes down (RFC 9449): the
+redemption carries a proof — sent once more with the nonce the server asks
+for (`use_dpop_nonce`) — and must come back `token_type: DPoP`; each MCP
+request presents the token as `Authorization: DPoP` with a proof of that
+request, sent once more with the nonce an MCP server's `use_dpop_nonce`
+challenge issues. Where they do not, neither leg has one. `auth.dpop: off` never
+binds; a server whose metadata takes bound tokens alone
+(`dpop_bound_access_tokens_required`) is then refused, as it is behind an
+authorization server that advertises no DPoP, before anything is minted
+for it.
+
+**What this preview does not do yet:** live interop against an Okta
+Integrator org or xaa.dev; DPoP on the exchange leg at the IdP, and the
+other deferred items of RFC 0044 P4.
 
 ### Fields
 
@@ -1016,10 +1178,11 @@ live interop against an Okta Integrator org or xaa.dev.
 | `sign_in` | `identity.providers.<name>` | `grants` (`device`, `authorization_code`), `scopes` (default `[openid, offline_access]`) |
 | `subject`, `subjects`, `jwks_uri` | `identity.providers.<name>` | what the exchange presents; whether an ID-JAG's `sub` must be the person's; the key set's pin |
 | `equivalent_issuers` | `identity.providers.<name>` | `a2a.inbound_tokens` issuers whose subjects are this provider's: a caller's token from one finds the grant enrolled here |
+| `ciba` | `identity.providers.<name>` | `{enabled, request_expiry, per_day}`: OpenID CIBA in poll mode for `via: ciba` firings (`false`, `300s`, `10`) |
 | `seal_key`, `seal_key_previous` | `identity.delegation` | 32 bytes, hex or base64, as a secret reference (`key_custody: local`) |
 | `key_custody`, `signer` | `identity.delegation` | `local` (default) or `external`; the signer's `{socket, uid, timeout, seal_key, seal_key_previous}` |
 | `at_cache_cap`, `liveness_interval`, `consent_timeout`, `consent_session_max_age`, `consent_per_minute` | `identity.delegation` | `60m`, `15m`, `24h`, `12h`, `10` |
-| `templates` | `identity.delegation` | `{name, principals: {source, role, labels}, idp, servers: {<name>: {scopes, document_workflows}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers, clients}`: `source` is `operator`, `oidc`, `x509` or `device`; `subagents` `none` (default) or `inherit`; `approvers` `[principal]` (default) or `[principal, operator]`; `clients`, the front ends whose callers' tokens it admits (default any the issuer lists) |
+| `templates` | `identity.delegation` | `{name, principals: {source, role, labels}, idp, servers: {<name>: {scopes, document_workflows}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers, clients, unattended, unattended_tools, allow_against_idp_guidance}`: `source` is `operator`, `oidc`, `x509` or `device`; `subagents` `none` (default) or `inherit`; `approvers` `[principal]` (default) or `[principal, operator]`; `clients`, the front ends whose callers' tokens it admits (default any the issuer lists); `unattended` `never` (default), `ciba` or `standing`; `unattended_tools`, the `<server>.<tool>`s tagged `egress` a firing may call |
 | `device_pins`, `device_first_binding` | `identity.delegation` | `<device name>: {iss, sub}`, each name bound to one person; `false` (an unpinned name binds to its first enrolment when `true`) |
 | `idp`, `token_ttl` | `a2a.login` | the IdP display clients sign people in at; their sessions' lifetime (`8h`, `5m`–`30d`) |
 | `grant: id_jag`, `idp`, `audience`, `resource`, `client_id` | `mcp.servers[].auth` | the delegated server's IdP, its authorization server, itself, and agentd's client there (all required) |
@@ -1029,6 +1192,9 @@ live interop against an Okta Integrator org or xaa.dev.
 | `tools_from`, `tools_file` | `mcp.servers[].auth` | `first_grant` (default) or `file` |
 | `id_jag`, `id_jag_reuse`, `allow_unbound_at`, `attribution`, `max_at_age` | `mcp.servers[].auth` | `discover`/`assume`; `auto`/`never`; accept an ID-JAG that names no resource; `sub`/`none`; a stricter cap |
 | `trusted_output` | `mcp.servers[].auth` | the operator vouches nobody outside writes what the server answers: its results hold the person's data and taint nothing (default `false`) |
+| `on_revoked` | `mcp.servers[].auth` | `fail` (default), or `ask`: a workflow step whose grant is gone waits for the person to sign in again |
+| `dpop` | `mcp.servers[].auth` | `auto` (default): DPoP-bound tokens where the server and its authorization server advertise ES256 proofs; `off` |
+| `act_for` | `workflows[]` | `{principal, via}`: the person a workflow's `schedule`, `loop` and `once` firings act for with nobody there; `via` `ciba` or `standing` |
 | `uid`, `spki`, `idp_subject` | `a2a.principals[]` | the person a rule pins: a per-person operator by the unix peer's uid, or a certificate principal by its key's SPKI SHA-256 (`match.spki`), and their exact IdP identity |
 | `to: principal`, `once_per` | `security.policies[]` | an `ask` that is the person's consent gate; `run_tool`: at the first use per run and tool alone |
 

@@ -29,6 +29,7 @@ unknown key is a parse error.
 | `state` | `{<var>: {schema?, reducer?}}`: a schema every write to the run variable must match, and how concurrent writes combine (`overwrite`, `append`, `merge`, `union`) |
 | `unload` | `{policy, timeout}`: what retirement does to live runs: `drain` (default; `timeout` bounds it, then the rest are cancelled), `cancel` or `detach` |
 | `tool` | `{name, mode, grant}`: register the workflow as a tool; configuration only. `mode` is `sync` (default) or `async`; `grant` keys are `root`, `workflows`, `subagents`, `user`, `agent` |
+| `act_for` | `{principal, via}`: the person the workflow's `schedule`, `loop` and `once` firings act for with nobody there (needs `xaa`); `principal` is `{source: oidc, issuer, sub}` or `{source: operator \| x509, id}`, `via` is `ciba` or `standing`; the operator's configuration only. See [Acting for a person](modes-and-triggers.md#acting-for-a-person) |
 
 A `workflows:` entry can name a document instead of holding it:
 
@@ -222,6 +223,9 @@ deadline, 4 for an unreachable model, 1 otherwise. The full table is in
 | `human.to: \`to\` names role user, who could never see the task` | a gate addressed to someone who cannot see it |
 | `a \`webhook\` node (start or wait) is used but webhooks.listen is not set` | no webhook listener |
 | `subscribes to "…" on mcp server "…", which no \`event_grants\` entry grants` | a subscribing wait outside an operator grant |
+| `act_for beside a webhook start (act_for_trigger_not_allowed)` | `act_for` beside a start an outsider can fire, or a `webhook` wait |
+| `act_for names a device principal (act_for_device_principal)` | a device principal, which delegates only through a live session |
+| `act_for.via …: the template … allows no such firing` | the person's template does not allow the `via` |
 
 Some checks need the live registry and run at startup rather than in
 `--validate-config`; each exits `2`:

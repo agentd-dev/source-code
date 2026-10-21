@@ -38,3 +38,6 @@ pub const INSUFFICIENT_USER_AUTHENTICATION: &str = "insufficient_user_authentica
 pub const MAX_AGE: &str = "max_age";
 /// The OAuth error that means a grant or assertion is no good.
 pub const INVALID_GRANT: &str = "invalid_grant";
+/// The OAuth error a server answers a DPoP proof without its nonce with
+/// (RFC 9449 §8).
+pub const USE_DPOP_NONCE: &str = "use_dpop_nonce";

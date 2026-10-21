@@ -117,17 +117,33 @@ impl Runtime {
             .then(|| self.settings.agent.instruction.clone().unwrap_or_default())
     }
 
-    /// The facts of the unit behind `caller`.
+    /// The facts of the unit behind `caller`: a firing's work, which
+    /// nobody reads as it runs, is tainted whatever it read (RFC 0044 §5.12
+    /// E), so the person's consent rules ask them — and deny unanswered.
     pub(crate) fn caller_facts(&self, caller: &ToolCaller) -> Facts {
         let own = self
             .delegated_work(caller)
             .then_some(caller.principal.as_deref())
             .flatten();
-        Facts::of(
+        let mut f = Facts::of(
             &self.caller_carries(caller),
             self.served_instruction().as_deref(),
             own,
-        )
+        );
+        if self.firing_caller(caller) {
+            f.sources
+                .push("nobody there: a firing acting for its person with nobody there".into());
+            f.tainted = true;
+        }
+        f
+    }
+
+    /// Whether `caller`'s work is a firing of an `act_for` workflow's.
+    fn firing_caller(&self, caller: &ToolCaller) -> bool {
+        caller
+            .session
+            .as_deref()
+            .is_some_and(|s| s.starts_with(crate::engine::run::UNATTENDED_SID_PREFIX))
     }
 
     /// The facts of run `run`.
@@ -199,16 +215,21 @@ impl Runtime {
             delegated: self.delegated_tool(name),
             tainted: f.tainted,
             holds_delegated_data: f.holds_delegated_data,
-            unattended: self.unattended(caller.principal.as_deref()),
+            unattended: self.unattended(caller),
             document_sourced: self.document_sourced(caller, self.delegated_server_name(name)),
             delegated_work: self.delegated_work(caller),
         }
     }
 
-    /// Whether work for `principal` has nobody there to answer: a trigger
-    /// started it, and it runs as `identity.autonomous_as` or as nobody.
-    pub(crate) fn unattended(&self, principal: Option<&str>) -> bool {
-        principal.is_none_or(|p| p == self.settings.identity.autonomous_id())
+    /// Whether `caller`'s work has nobody there to answer: a trigger started
+    /// it, and it runs as `identity.autonomous_as` or as nobody — or it is a
+    /// firing acting for its person with nobody there (RFC 0044 M4).
+    pub(crate) fn unattended(&self, caller: &ToolCaller) -> bool {
+        self.firing_caller(caller)
+            || caller
+                .principal
+                .as_deref()
+                .is_none_or(|p| p == self.settings.identity.autonomous_id())
     }
 
     /// The run `caller`'s work is part of: its own, or for a subagent's the

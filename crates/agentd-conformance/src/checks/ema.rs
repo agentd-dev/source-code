@@ -540,6 +540,76 @@ pub fn checks() -> Vec<Check> {
             "a first-use approval is bound to the templates the work acts under: after a restart onto a changed template the run's second use asks again",
             p3a::a_first_use_approval_ends_with_its_template,
         ),
+        check(
+            "ema/ciba-firing-acts-on-its-persons-approval",
+            "a scheduled act_for firing, via ciba, asks its person by CIBA — an ID token fresh from a refresh as the hint, openid alone, agentd's binding message, the expiry — waits through pending and slow_down, and on approval exchanges with the approval's ID token; the run completes, the mint is recorded unattended, and the refresh token the IdP issued with the approval is revoked at the run's end",
+            p3b::a_ciba_firing_acts_on_its_persons_approval,
+        ),
+        check(
+            "ema/ciba-firing-denied-or-expired-fails-closed",
+            "a firing its person denies, or whose request expires unanswered, fails ciba_denied and is exchanged for nothing; past ciba.per_day requests a firing asks no more",
+            p3b::a_ciba_firing_denied_or_expired_fails_closed,
+        ),
+        check(
+            "ema/ciba-hint-falls-back-and-binds-its-person",
+            "an IdP that returns no ID token on refresh is sent the login hint the person enrolled with, kept sealed; an approval by another identity than the grant's fails the firing closed (binding_mismatch)",
+            p3b::a_ciba_hint_falls_back_and_binds_its_person,
+        ),
+        check(
+            "ema/ciba-firing-fails-closed-on-restart",
+            "a restart fails a via ciba firing closed — one waiting on its person's answer fails ciba_denied, one approved fails its next call subject_expired — and never asks again",
+            p3b::a_ciba_firing_fails_closed_on_restart,
+        ),
+        check(
+            "ema/act-for-on-a-webhook-refused",
+            "act_for beside a webhook start, or a signal start, is refused by --validate-config (act_for_trigger_not_allowed); beside a schedule it loads",
+            p3b::act_for_on_a_webhook_is_refused,
+        ),
+        check(
+            "ema/standing-under-okta-needs-the-override",
+            "unattended: standing at a profile okta IdP is refused by --validate-config without allow_against_idp_guidance (standing_against_idp_guidance), and loads with it, warned",
+            p3b::standing_under_okta_needs_the_override,
+        ),
+        check(
+            "ema/changed-digest-suspends-unattended-use",
+            "a via standing firing acts with its person's grant, recorded unattended; after a reload changes the workflow its firings start nothing and mint nothing (unattended_suspended) until the person signs in again",
+            p3b::a_changed_digest_suspends_unattended_use,
+        ),
+        check(
+            "ema/unattended-egress-denied-by-default",
+            "a firing's delegated egress tool is refused unasked and never made unless the template lists it in unattended_tools; listed, it asks the person and is made once approved",
+            p3b::unattended_egress_is_denied_by_default,
+        ),
+        check(
+            "ema/on-revoked-ask-waits-for-re-enrolment",
+            "with on_revoked: ask a workflow step whose grant was revoked waits, among the person's gates; once they enrol again the step is made again and the run completes",
+            p3b::on_revoked_ask_waits_for_re_enrolment,
+        ),
+        check(
+            "ema/step-up-held-to-its-max-age",
+            "a step-up sign-in older than the IdP's max_age, or whose ID token carries no auth_time, is refused (step_up); a fresh one is the retried call's subject",
+            p3b::a_step_up_is_held_to_its_max_age,
+        ),
+        check(
+            "ema/dpop-where-advertised",
+            "where the MCP server's and its authorization server's metadata advertise ES256 DPoP, the redemption carries a proof (again with the nonce asked for) and every MCP request presents a DPoP token with a proof, the one refused for want of the MCP server's nonce sent again at once with it; otherwise neither leg has one; a server that takes bound tokens alone behind an authorization server without DPoP is refused before anything is redeemed",
+            p3b::dpop_where_advertised_and_absent_otherwise,
+        ),
+        check(
+            "ema/firing-ended-mid-call-mints-nothing",
+            "a via ciba firing whose run ends while its approved call proves the grant alive mints nothing: the call keeps the firing it was admitted as, fails subject_expired, and never falls back to the person's refresh token",
+            p3b::a_firing_ended_mid_call_mints_nothing,
+        ),
+        check(
+            "ema/work-a-firing-starts-acts-only-as-consented",
+            "a run a firing's work starts is a firing of its own: one of a workflow declaring no act_for for the person fails unattended_suspended and mints nothing; once it declares one and they sign in again, it acts for them",
+            p3b::work_a_firing_starts_acts_only_as_consented,
+        ),
+        check(
+            "ema/ciba-firing-waits-on-one-request-at-a-time",
+            "a second call a via ciba firing makes while its request waits waits on that request, and both are made on one approval; once a firing's wait closes unanswered another firing of the workflow may ask, though the first firing's run goes on",
+            p3b::a_ciba_firing_waits_on_one_request_at_a_time,
+        ),
     ]
 }
 
@@ -702,6 +772,12 @@ struct Opts {
     /// The reference signer's `ras` key signs for this audience instead of
     /// the authorization server's token endpoint.
     ras_audience: Option<&'static str>,
+    /// More of the template's fields, `, key: value` each.
+    template_extra: &'static str,
+    /// More of the IdP's fields, one line each, at its indentation.
+    provider_extra: &'static str,
+    /// More of each delegated server's `auth` fields, one line each.
+    server_extra: &'static str,
     extra: String,
 }
 
@@ -724,6 +800,9 @@ impl Default for Opts {
             tag_map: None,
             trusted_output: false,
             ras_audience: None,
+            template_extra: "",
+            provider_extra: "",
+            server_extra: "",
             extra: String::new(),
         }
     }
@@ -809,9 +888,10 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
     } else {
         ""
     };
+    let server_extra = o.server_extra;
     let server = |name: &str, url: &str| {
         format!(
-            "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {tags}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {ras_auth}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n{trusted}",
+            "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {tags}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {ras_auth}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n{trusted}{server_extra}",
             x.ras
         )
     };
@@ -832,7 +912,8 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
         None => format!("    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n"),
     };
     let mut delegation = format!(
-        "{custody}    templates:\n      - {{name: eng, principals: {{source: operator}}, idp: okta, servers: {{{template_servers}}}{ttl}}}\n"
+        "{custody}    templates:\n      - {{name: eng, principals: {{source: operator}}, idp: okta, servers: {{{template_servers}}}{ttl}{}}}\n",
+        o.template_extra
     );
     if let Some(l) = o.liveness {
         delegation.push_str(&format!("    liveness_interval: {l}\n"));
@@ -866,12 +947,13 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
         "{log_level: info}".to_string()
     };
     format!(
-        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {observability}\na2a:\n  listen: \"unix://{}\"\n  principals:\n    - {{match: {{uid: {person_uid}}}, role: operator, id: alice, idp_subject: {{iss: \"{}\", sub: {}}}}}\nsecurity:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{}\"\n      client_id: agentd-idp\n      {idp_auth}\n      subject: {}\n  delegation:\n{delegation}mcp:\n  servers:\n{servers}workflows:\n{workflows}{}",
+        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {observability}\na2a:\n  listen: \"unix://{}\"\n  principals:\n    - {{match: {{uid: {person_uid}}}, role: operator, id: alice, idp_subject: {{iss: \"{}\", sub: {}}}}}\nsecurity:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{}\"\n      client_id: agentd-idp\n      {idp_auth}\n      subject: {}\n{}  delegation:\n{delegation}mcp:\n  servers:\n{servers}workflows:\n{workflows}{}",
         sock.display(),
         x.idp,
         o.sub,
         x.idp,
         o.subject,
+        o.provider_extra,
         o.extra
     )
 }
@@ -3087,3 +3169,4 @@ mod p2b;
 mod p2c;
 mod p2d;
 mod p3a;
+mod p3b;

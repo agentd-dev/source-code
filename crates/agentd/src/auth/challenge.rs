@@ -31,6 +31,12 @@ pub struct ResourceMetadata {
     pub resource: Option<String>,
     #[serde(default)]
     pub authorization_servers: Vec<String>,
+    /// The DPoP proof algorithms the resource takes (RFC 9728 §2).
+    #[serde(default)]
+    pub dpop_signing_alg_values_supported: Vec<String>,
+    /// The resource takes DPoP-bound access tokens alone (RFC 9728 §2).
+    #[serde(default)]
+    pub dpop_bound_access_tokens_required: bool,
 }
 
 /// The authorization server `resource`'s RFC 9728 metadata names, and how

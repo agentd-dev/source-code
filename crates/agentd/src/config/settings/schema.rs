@@ -481,12 +481,13 @@ fn auth_delegation_properties(duration: &Value) -> Map<String, Value> {
         "tools_file": { "type": "string", "description": "grant id_jag, tools_from file: a tools/list result" },
         "id_jag": { "enum": ["discover", "assume"], "description": "grant id_jag: require the ID-JAG profile in the authorization server's metadata (default), or assume it" },
         "id_jag_reuse": { "enum": ["auto", "never"], "description": "grant id_jag: present an unexpired ID-JAG again after a 401 (default auto)" },
-        "on_revoked": { "enum": ["fail", "ask"], "description": "grant id_jag: a revoked grant fails the call; ask is P2" },
+        "on_revoked": { "enum": ["fail", "ask"], "description": "a workflow step's call when the grant it needs was revoked or has expired, or the session its run acted through ended: fail (default), or ask — the step waits, up to identity.delegation.consent_timeout, for the person to enrol again or sign in through a live session, and is made again; never for a model's call or work that read outside text" },
         "allow_unbound_at": { "type": "boolean", "description": "grant id_jag: accept an ID-JAG that does not name the pinned resource (warned and recorded)" },
         "attribution": { "enum": ["sub", "none"], "description": "grant id_jag: what agent/acting_for carries — the ID-JAG's sub (default), or nothing" },
         "max_at_age": duration,
         "trusted_output": { "type": "boolean", "description": "grant id_jag: nobody outside can write what this server answers, so its results mark the work as holding delegated data and do not taint it (default false: delegated SaaS content is attacker-writable)" },
-        "subject": { "enum": ["grant", "inbound"], "description": "grant token_exchange: what is exchanged — an access token for agentd the enrolled grant's refresh token gets at this authorization server (grant, the default), or the caller's verified inbound A2A token, whose issuer must be this authorization server (inbound): held in memory for the work, never sent anywhere else, and the call fails subject_expired once it expires" }
+        "subject": { "enum": ["grant", "inbound"], "description": "grant token_exchange: what is exchanged — an access token for agentd the enrolled grant's refresh token gets at this authorization server (grant, the default), or the caller's verified inbound A2A token, whose issuer must be this authorization server (inbound): held in memory for the work, never sent anywhere else, and the call fails subject_expired once it expires" },
+        "dpop": { "enum": ["auto", "off"], "description": "grant id_jag: DPoP (RFC 9449) on the authorization-server and MCP legs — auto (default) binds the access token to a key agentd holds in memory where the server's protected-resource metadata and its authorization server's metadata both advertise ES256 proofs; off never does, and a server that takes bound tokens alone is then refused" }
     });
     match v {
         Value::Object(m) => m,
@@ -509,7 +510,12 @@ fn provider() -> Value {
         "subject": { "enum": ["refresh_token", "id_token"], "description": "what the token exchange presents: the sealed refresh token, or a fresh ID token from a refresh with no scope. Default refresh_token under okta, id_token otherwise" },
         "subjects": { "enum": ["public", "pairwise"], "description": "public (default): an ID-JAG's sub must equal the grant's; pairwise: recorded, not compared" },
         "jwks_uri": { "type": "string", "description": "the IdP's key set, pinned; default the OpenID metadata's (okta: {issuer}/oauth2/v1/keys)" },
-        "equivalent_issuers": { "type": "array", "items": { "type": "string" }, "description": "a2a.inbound_tokens issuers whose subject claim is this IdP's sub (RFC 0044 §5.9): a caller such a token names holds the grant its subject holds here. Subjects are never matched across issuers not listed; an issuer is one provider's at most" } } })
+        "equivalent_issuers": { "type": "array", "items": { "type": "string" }, "description": "a2a.inbound_tokens issuers whose subject claim is this IdP's sub (RFC 0044 §5.9): a caller such a token names holds the grant its subject holds here. Subjects are never matched across issuers not listed; an issuer is one provider's at most" },
+        "ciba": { "type": "object", "additionalProperties": false, "description": "OpenID CIBA in poll mode at this IdP (RFC 0044 §2.8): how a firing of an act_for workflow with via ciba asks its person to approve it on their own device. The IdP's metadata names its backchannel_authentication_endpoint and lists poll",
+            "properties": {
+                "enabled": { "type": "boolean", "description": "default false" },
+                "request_expiry": { "type": ["string", "integer"], "description": "how long a request waits for the person, 1s to 1h (default 300s); sent as request_expiry under profile okta, else requested_expiry" },
+                "per_day": { "type": "integer", "minimum": 1, "description": "how many requests one person is sent a day (default 10)" } } } } })
 }
 
 /// `a2a.inbound_tokens` (RFC 0044 §5.9): hoisted out of the `a2a` literal,
@@ -588,6 +594,9 @@ fn template_schema(duration: &Value) -> Value {
                     "approvers": { "type": "array", "items": { "enum": ["principal", "operator"] }, "description": "who may answer the person's consent gates: [principal] (default) or [principal, operator], an operator's answer recorded as such" },
                     "agent_mode_servers": { "type": "array", "items": { "type": "string" }, "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work; every other one is hidden from it (mode mixing, RFC 0044 §5.3)" },
                     "clients": { "type": "array", "items": { "type": "string" }, "description": "the front-end clients whose inbound tokens may act with these grants (an oidc template at an IdP an a2a.inbound_tokens issuer maps to); a caller another client's token names is admitted by no template. Empty, every client the issuer allows" },
+                    "unattended": { "enum": ["never", "ciba", "standing"], "description": "whether a firing of an act_for workflow may act with these grants with nobody there (RFC 0044 §5.12 E): never (default); ciba, each firing approved by the person on their own device; standing, the grant used with nobody asked — which allows via ciba too. A firing acts only while the workflow is the definition the person consented to when they last signed in" },
+                    "unattended_tools": { "type": "array", "items": { "type": "string" }, "description": "the delegated tools, <server>.<tool>, a firing may call when they are tagged egress; every other is refused" },
+                    "allow_against_idp_guidance": { "type": "boolean", "description": "unattended standing at a profile okta IdP, which Okta advises against: refused without this (default false)" },
                     "ttl": duration,
                     "budget": { "type": "object", "additionalProperties": false, "properties": {
                         "per_day": { "type": "integer", "minimum": 1, "description": "mints per day per server; default 16" },

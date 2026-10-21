@@ -239,7 +239,10 @@ too: in the release binaries, the [Client ID Metadata Document](authentication.m
 draft-ietf-oauth-client-id-metadata-document-02, agentd's client where it
 has no registration; in the `xaa` preview, the Identity Assertion JWT
 Authorization Grant ([ID-JAG](authentication.md#enterprise-managed-authorization)),
-draft-ietf-oauth-identity-assertion-authz-grant-04.
+draft-ietf-oauth-identity-assertion-authz-grant-04. The `xaa` preview also
+speaks OpenID Client-Initiated Backchannel Authentication Core 1.0 in poll
+mode ([CIBA](authentication.md#work-nobody-is-there-for)): a scheduled
+workflow's firing asks its person to approve it on their own device.
 
 | RFC | What | Where agentd uses it |
 |---|---|---|
@@ -252,11 +255,11 @@ draft-ietf-oauth-identity-assertion-authz-grant-04.
 | RFC 8707 | Resource indicators | every authorization, token, refresh and client-credentials request to an MCP server's authorization server; the Bearer token for a company's MCP server |
 | RFC 9207 | `iss` in authorization responses | browser logins |
 | RFC 7523 | JWT client assertions (`private_key_jwt`), and the JWT bearer grant | client authentication at a token endpoint; redeeming an ID-JAG (the `xaa` preview) |
-| RFC 7009 | Token revocation | `agentd --logout` |
+| RFC 7009 | Token revocation | `agentd --logout`; a delegation's refresh tokens, and one a CIBA approval came with (the `xaa` preview) |
 | RFC 9421 | HTTP Message Signatures | every request agentd signs with [AAuth](aauth.md) |
 | RFC 7748, RFC 7516 | X25519 and JWE Compact | encrypted instruction documents |
 | RFC 8446 | TLS 1.3 | every HTTPS connection, in and out |
-| RFC 9449 | DPoP | requests to a company (the `companies` preview) |
+| RFC 9449 | DPoP | requests to a company (the `companies` preview); the authorization-server and MCP legs of a delegated server whose metadata advertise it (the `xaa` preview) |
 | RFC 8693 | Token exchange | exchanging an enrolled person's grant at their IdP for an ID-JAG, and a grant's or a caller's access token for a same-domain MCP server's (the `xaa` preview) |
 
 ## Platforms and distribution

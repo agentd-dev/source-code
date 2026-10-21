@@ -186,6 +186,29 @@ pub struct Carries {
 /// person's own data, `delegated:<server>` (RFC 0044).
 pub const DELEGATED: &str = "delegated:";
 
+/// The prefix of the session id a firing of an `act_for` workflow acts
+/// through (RFC 0044 §5.12 E): not an RFC 0043 session, but the firing's
+/// own authority, alive while its run is.
+pub const UNATTENDED_SID_PREFIX: &str = "ua_";
+
+/// The session a conversation turn a firing's work started by message acts
+/// through: a firing's own authority stays with its run's work, and what
+/// a conversation runs is no definition the person consented to. No
+/// firing is ever registered under it, so the turn acts for nobody's grant.
+pub const HANDED_ON_SID: &str = "ua_handed-on";
+
+/// What a firing of an `act_for` workflow acts with (RFC 0044 §5.12 E): the
+/// person, as its workflow named them; how it acts for them; and the grants
+/// it has asked them about by CIBA — at each, one request per firing, a
+/// restart included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unattended {
+    pub principal: crate::engine::model::ActForPrincipal,
+    pub via: crate::config::settings::delegation::Via,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asked: Vec<String>,
+}
+
 impl Carries {
     pub fn is_empty(&self) -> bool {
         self.origins.is_empty() && self.taint.is_empty()
@@ -337,6 +360,14 @@ pub struct RunState {
     /// outlives its session outlives its delegated authority too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// What a firing of an `act_for` workflow acts with, when this run is
+    /// one (RFC 0044 §5.12 E): its `session` is then the firing's own
+    /// ([`UNATTENDED_SID_PREFIX`]), which every turn and child of its work
+    /// acts through too, and which ends with this run. A run its work
+    /// starts is a firing of its own, held to the person's consent to that
+    /// run's own definition. Durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattended: Option<Unattended>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -431,6 +462,7 @@ impl RunState {
             subagent: None,
             by_model: false,
             session: None,
+            unattended: None,
             conversation: None,
             children: Vec::new(),
             parent: None,

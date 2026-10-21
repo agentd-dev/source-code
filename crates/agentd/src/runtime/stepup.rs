@@ -20,9 +20,17 @@
 //!   The device code is sealed under the person's personal key in a
 //!   workflow step's wait record, so a restart resumes the polling.
 //!
-//! Either way the sign-in must be the grant's own `iss` + `sub`, and a
-//! refusal or an expiry denies the call. Denying the gate cancels it; no
-//! approval answers it.
+//! Either way the sign-in must be the grant's own `iss` + `sub`, as recent
+//! as the IdP asked — its ID token's `auth_time` within the `max_age`, or
+//! after the ask where the IdP named none — and a refusal or an expiry
+//! denies the call. Denying the gate cancels it; no approval answers it.
+//!
+//! Two more kinds of gate wait the same way, on something the person does
+//! elsewhere ([`crate::runtime::firings`]): **`ciba`**, a firing of an
+//! `act_for` workflow waiting on its person's approval on their own device;
+//! and **`reenrol`**, a workflow step whose grant was revoked or expired —
+//! or whose run's session ended — waiting, under `on_revoked: ask`, for the
+//! person to sign in again.
 
 // Every step-up gate is opened and answered over the A2A listener: a build
 // without it keeps the types for the consent gate's record alone.
@@ -45,6 +53,10 @@ pub(crate) enum How {
     Authorize,
     /// By the IdP's device grant, polled on the reactor's passes.
     Device,
+    /// A firing's CIBA request, polled on the reactor's passes.
+    Ciba,
+    /// The person enrols again, or signs in through a live session.
+    Reenrol,
 }
 
 impl How {
@@ -52,13 +64,27 @@ impl How {
         match self {
             How::Authorize => "authorize",
             How::Device => "device",
+            How::Ciba => "ciba",
+            How::Reenrol => "reenrol",
         }
     }
     fn of(s: &str) -> Option<How> {
         match s {
             "authorize" => Some(How::Authorize),
             "device" => Some(How::Device),
+            "ciba" => Some(How::Ciba),
+            "reenrol" => Some(How::Reenrol),
             _ => None,
+        }
+    }
+
+    /// The code a call this gate held is refused with when it closes
+    /// without the person.
+    pub(crate) fn refusal(self) -> &'static str {
+        match self {
+            How::Authorize | How::Device => "step_up",
+            How::Ciba => "ciba_denied",
+            How::Reenrol => "revoked",
         }
     }
 }
@@ -76,6 +102,31 @@ pub(crate) struct SignIn {
     pub start_uri: Option<String>,
     /// The IdP's device grant, once it answered.
     pub device: Option<DeviceWait>,
+    /// A `ciba` gate's request, once the IdP took it: memory only.
+    pub ciba: Option<CibaWait>,
+    /// The session id of the firing a `ciba` gate asks for.
+    pub firing: Option<String>,
+    /// The gate whose request this `ciba` gate's call waits on: another
+    /// call of the same firing asked first.
+    pub follows: Option<String>,
+    /// When the IdP asked for the step-up, in seconds since the epoch: a
+    /// sign-in must come after it where the IdP named no `max_age`.
+    pub asked_s: u64,
+    /// A `reenrol` gate whose call waited before the operator's rules and
+    /// the person's consent were consulted: once the person may act again
+    /// it goes through them all.
+    pub before_rules: bool,
+}
+
+/// A firing's CIBA request the IdP took, and its polling. The request id
+/// is never written down: a restart ends the wait.
+#[derive(Debug, Clone)]
+pub struct CibaWait {
+    pub auth_req_id: String,
+    pub interval_ms: u64,
+    pub next_ms: u64,
+    pub expires_ms: u64,
+    pub polling: bool,
 }
 
 /// A device grant the IdP answered, and its polling.
@@ -104,11 +155,36 @@ pub enum Polled {
 /// A step-up gate's durable part, for a step's wait record: never the
 /// device code but sealed.
 pub(crate) fn signin_wait(s: &SignIn) -> Value {
-    json!({"how": s.how.as_str(), "idp": s.idp, "server": s.server, "grant": s.grant,
-           "max_age": s.max_age,
+    let mut w = json!({"how": s.how.as_str(), "idp": s.idp, "server": s.server, "grant": s.grant,
+           "max_age": s.max_age, "firing": s.firing, "follows": s.follows,
            "device": s.device.as_ref().map(|d| json!({
                "user_code": d.user_code, "verification_uri": d.verification_uri,
-               "interval_ms": d.interval_ms, "expires_ms": d.expires_ms, "sealed": d.sealed}))})
+               "interval_ms": d.interval_ms, "expires_ms": d.expires_ms, "sealed": d.sealed}))});
+    if s.asked_s > 0 {
+        w["asked_at"] = json!(s.asked_s);
+    }
+    if s.before_rules {
+        w["before_rules"] = json!(true);
+    }
+    w
+}
+
+/// A step-up gate's sign-in as its wait record [`signin_wait`] wrote it.
+pub(crate) fn signin_of(w: &Value) -> Option<SignIn> {
+    Some(SignIn {
+        how: How::of(w["how"].as_str()?)?,
+        idp: w["idp"].as_str()?.to_string(),
+        server: w["server"].as_str().unwrap_or_default().to_string(),
+        grant: w["grant"].as_str()?.to_string(),
+        max_age: w["max_age"].as_u64().unwrap_or(0),
+        start_uri: None,
+        device: None,
+        ciba: None,
+        firing: w["firing"].as_str().map(str::to_string),
+        follows: w["follows"].as_str().map(str::to_string),
+        asked_s: w["asked_at"].as_u64().unwrap_or(0),
+        before_rules: w["before_rules"].as_bool() == Some(true),
+    })
 }
 
 /// What a step-up gate shows, as data.
@@ -122,6 +198,34 @@ fn rendered_of(name: &str, server: &str, how: How, max_age: u64, principal: &str
 pub(crate) fn signin_text(id: &str, r: &Value, link: &Value) -> String {
     use crate::sec::render::quoted;
     let s = |k: &str| r[k].as_str().map(|v| quoted(v, 128)).unwrap_or_default();
+    match r["kind"].as_str() {
+        Some("ciba") => {
+            return [
+                "agentd security gate: a firing of a workflow that acts for you with nobody there waits for your approval on your own device. Every word here is agentd's but the quoted values, which the work chose.".to_string(),
+                format!("Workflow: {}, run {}", s("workflow"), s("run")),
+                format!("Server: {}", s("server")),
+                format!("Tool: {}", s("tool")),
+                "Approve or deny it where your identity provider asks you; unanswered, the firing fails.".to_string(),
+                format!("Deny gate {id} in your display client, or with agentd --delegation-deny {id}, to end it here."),
+            ]
+            .join("\n");
+        }
+        Some("reenrol") => {
+            return [
+                "agentd security gate: the grant this step acts with is gone — revoked, expired, or the session it acted through ended. Every word here is agentd's but the quoted values, which the work chose.".to_string(),
+                format!("Server: {}", s("server")),
+                format!("Tool: {}", s("tool")),
+                format!(
+                    "Sign in again at {} — from your display client (delegation.enrol), or with agentd --login idp:{} — and the step is made again.",
+                    s("idp"),
+                    r["idp"].as_str().unwrap_or_default()
+                ),
+                format!("Deny gate {id} in your display client, or with agentd --delegation-deny {id}, to end it."),
+            ]
+            .join("\n");
+        }
+        _ => {}
+    }
     let mut lines = vec![
         "agentd security gate: your identity provider asks you to sign in again before this call. Every word here is agentd's but the quoted values, which the work chose.".to_string(),
         format!("Server: {}", s("server")),
@@ -177,6 +281,16 @@ impl Runtime {
             Ok(a) => a,
             Err(e) => return fail(self, format!("{name}: {e}")),
         };
+        // A firing acting for its person with nobody there has nobody to
+        // sign in again (RFC 0044 §5.12 E).
+        if admitted.who.firing.is_some() {
+            return fail(
+                self,
+                format!(
+                    "{error}; nobody is there to sign in again: a firing acting for its person with nobody there asks for no step-up"
+                ),
+            );
+        }
         let grant = admitted.grant.grant_id.clone();
         let idp = admitted.grant.idp.clone();
         let max_age = d.step_up_of(&grant).unwrap_or(0);
@@ -220,6 +334,11 @@ impl Runtime {
             max_age,
             start_uri: None,
             device: None,
+            ciba: None,
+            firing: None,
+            follows: None,
+            asked_s: d.step_up_at(&grant),
+            before_rules: false,
         };
         match how {
             How::Authorize => {
@@ -242,6 +361,8 @@ impl Runtime {
                 }
             }
             How::Device => self.start_device_step_up(&d, &id, &idp, &person),
+            // A step-up is signed in for, never approved or re-enrolled.
+            How::Ciba | How::Reenrol => return fail(self, error),
         }
         let rendered = rendered_of(&name, &server, how, max_age, &person);
         let deadline = now_ms() + crate::a2a::login::SIGN_IN_FOR.as_millis() as u64;
@@ -295,7 +416,7 @@ impl Runtime {
     /// action gate's is, its `consentGate` saying where to sign in — in
     /// `TASK_STATE_AUTH_REQUIRED` (A2A §7.6): the person signs in out of
     /// band, directly to agentd, and the call goes on without a message.
-    fn signin_task(
+    pub(crate) fn signin_task(
         &mut self,
         caller: &ToolCaller,
         id: &str,
@@ -422,8 +543,11 @@ impl Runtime {
     }
 
     /// Every pass: each step-up gate's device grant due a poll is polled,
-    /// off the loop, and one past its expiry denies its call.
+    /// off the loop, and one past its expiry denies its call; so is each
+    /// firing's CIBA request, and each re-enrolment gate is checked.
     pub(crate) fn poll_step_ups(&mut self) {
+        self.poll_cibas();
+        self.poll_reenrols();
         let now = now_ms();
         let mut expired = Vec::new();
         let mut due = Vec::new();
@@ -438,7 +562,9 @@ impl Runtime {
                 due.push((
                     id.clone(),
                     d.device_code.clone(),
-                    g.signin.as_ref().map(|s| (s.idp.clone(), s.max_age)),
+                    g.signin
+                        .as_ref()
+                        .map(|s| (s.idp.clone(), (s.max_age, s.asked_s))),
                 ));
             }
         }
@@ -449,12 +575,12 @@ impl Runtime {
             return;
         };
         for (id, code, idp) in due {
-            let Some((idp, max_age)) = idp else { continue };
+            let Some((idp, asked)) = idp else { continue };
             let (d, tx) = (std::sync::Arc::clone(&d), self.events_tx.clone());
             std::thread::Builder::new()
                 .name("delegation-step-up-poll".into())
                 .spawn(move || {
-                    let ev = match d.poll_step_up(&id, &idp, &code, max_age) {
+                    let ev = match d.poll_step_up(&id, &idp, &code, asked) {
                         Ok(Some(polled)) => super::events::Event::StepUpPolled { gate: id, polled },
                         Ok(None) => super::events::Event::ConsentSignedIn {
                             gate: id,
@@ -515,13 +641,18 @@ impl Runtime {
     }
 
     /// Close step-up gate `gate` unsigned: its call is refused, `why`.
-    fn close_signin(&mut self, gate: &str, why: &str) {
+    pub(crate) fn close_signin(&mut self, gate: &str, why: &str) {
         let Some(g) = self.consents.remove(gate) else {
             return;
         };
         self.consent_task_closed(g.task.as_deref(), gate);
+        let how = g.signin.as_ref().map_or(How::Authorize, |s| s.how);
         self.log.info(
-            "delegation.step_up",
+            match how {
+                How::Ciba => "delegation.ciba",
+                How::Reenrol => "delegation.reenrol",
+                How::Authorize | How::Device => "delegation.step_up",
+            },
             json!({"gate": gate, "decision": "denied", "why": why}),
         );
         let found = self.pending.iter().position(|p| {
@@ -532,11 +663,26 @@ impl Runtime {
             self.reply(
                 &g.target,
                 Value::String(format!(
-                    "{}: delegation refused (step_up): {why}; it was NOT executed",
-                    g.call.tool
+                    "{}: delegation refused ({}): {why}; it was NOT executed",
+                    g.call.tool,
+                    how.refusal()
                 )),
                 true,
             );
+        }
+        // Calls that waited on this gate's request end with it.
+        let followers: Vec<String> = self
+            .consents
+            .iter()
+            .filter(|(_, f)| {
+                f.signin
+                    .as_ref()
+                    .is_some_and(|s| s.follows.as_deref() == Some(gate))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for f in followers {
+            self.close_signin(&f, why);
         }
     }
 
@@ -551,16 +697,14 @@ impl Runtime {
         principal: &str,
         (run, step): (String, String),
     ) -> Option<SignIn> {
-        let how = How::of(w["how"].as_str()?)?;
-        let s = SignIn {
-            how,
-            idp: w["idp"].as_str()?.to_string(),
-            server: w["server"].as_str().unwrap_or_default().to_string(),
-            grant: w["grant"].as_str()?.to_string(),
-            max_age: w["max_age"].as_u64().unwrap_or(0),
-            start_uri: None,
-            device: None,
-        };
+        let s = signin_of(w)?;
+        let how = s.how;
+        // A firing's wait on its person, and a wait for them to sign in
+        // again, need nothing reopened: the first is ended by the start
+        // (`end_rebuilt_signins`), the second is checked at every pass.
+        if matches!(how, How::Ciba | How::Reenrol) {
+            return Some(s);
+        }
         let d = self.delegation.clone()?;
         // The step's call, as its resume makes it again.
         d.stepping_up(
@@ -620,12 +764,17 @@ impl Runtime {
     }
 
     /// After a restart: a rebuilt `authorize` step-up gate's sign-in ended
-    /// with the last life.
-    pub(crate) fn end_rebuilt_authorize(&mut self, ids: &[String]) {
-        for id in ids {
+    /// with the last life, and so did a firing's wait on its person's
+    /// approval — a firing asks once, so the call fails closed.
+    pub(crate) fn end_rebuilt_signins(&mut self, ids: &[(String, How)]) {
+        for (id, how) in ids {
             self.close_signin(
                 id,
-                "a restart ended the sign-in it asked for, and the session it was for with it",
+                if *how == How::Ciba {
+                    "a restart ended the wait for the person's approval of this firing, and a firing asks once"
+                } else {
+                    "a restart ended the sign-in it asked for, and the session it was for with it"
+                },
             );
         }
     }
@@ -647,4 +796,43 @@ pub struct StepUpAsk {
     pub(crate) server: String,
     pub(crate) args: Value,
     pub(crate) error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sign-in gate's wait record keeps what a restart rebuilds it with:
+    /// when the IdP asked for the step-up, and that a re-enrolment gate's
+    /// call met none of the operator's rules or the person's consent yet.
+    #[test]
+    fn a_signin_wait_keeps_when_it_was_asked_and_what_it_met() {
+        let s = SignIn {
+            how: How::Device,
+            idp: "okta".into(),
+            server: "linear".into(),
+            grant: "g".into(),
+            max_age: 0,
+            start_uri: None,
+            device: None,
+            ciba: None,
+            firing: None,
+            follows: None,
+            asked_s: 1_700_000_000,
+            before_rules: false,
+        };
+        let back = signin_of(&signin_wait(&s)).unwrap();
+        assert_eq!(
+            (back.how, back.asked_s, back.before_rules),
+            (How::Device, 1_700_000_000, false)
+        );
+        let reenrol = SignIn {
+            how: How::Reenrol,
+            asked_s: 0,
+            before_rules: true,
+            ..s
+        };
+        let back = signin_of(&signin_wait(&reenrol)).unwrap();
+        assert_eq!((back.how, back.before_rules), (How::Reenrol, true));
+    }
 }

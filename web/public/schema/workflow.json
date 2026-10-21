@@ -1175,11 +1175,11 @@
   "properties": {
     "act_for": {
       "additionalProperties": false,
-      "description": "pre-authorised unattended runs (RFC 0044 M4): refused until RFC 0044 P3 builds them; one naming a device principal is refused as act_for_device_principal",
+      "description": "the person this workflow's schedule, loop and once firings act for with nobody there (RFC 0044 M4): each firing approved by them on their own device (ciba), or with their grant and nobody asked (standing) — as their identity.delegation template allows. Only the operator's own configuration declares it; beside any other start, or a webhook wait, it is refused (act_for_trigger_not_allowed), and a device principal is refused as act_for_device_principal",
       "properties": {
         "principal": {
           "additionalProperties": false,
-          "description": "the typed principal, never a display string",
+          "description": "the typed principal, never a display string: an oidc subject (issuer, sub), or a pinned operator or x509 principal by its a2a.principals rule's id",
           "properties": {
             "id": {
               "type": "string"
@@ -1191,8 +1191,7 @@
               "enum": [
                 "oidc",
                 "x509",
-                "operator",
-                "device"
+                "operator"
               ]
             },
             "sub": {
@@ -1208,6 +1207,10 @@
           ]
         }
       },
+      "required": [
+        "principal",
+        "via"
+      ],
       "type": "object"
     },
     "armed": {

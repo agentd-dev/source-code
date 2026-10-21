@@ -32,11 +32,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::dpop::{DpopKey, Nonces};
 use super::http::{ATTEMPTS, Dialer, backoff};
 use super::identity::Identity;
 use super::wire::{self, error as err, grant, param};
 use crate::auth::client_assertion::ASSERTION_TYPE;
+use crate::auth::dpop::{DpopKey, Nonces};
 
 /// What a token request is made with.
 pub struct Ctx<'a> {

@@ -18,12 +18,12 @@ const EGRESS_WRITES: &str = "{whoami: [], create_issue: [egress], list_issues: [
 
 impl Setup {
     /// What `--delegation-list` says, as JSON.
-    fn listing(&self, h: &Harness) -> Value {
+    pub(super) fn listing(&self, h: &Harness) -> Value {
         serde_json::from_str(&self.cli(h, &["--delegation-list"]).stdout).unwrap_or(Value::Null)
     }
 
     /// The open gates, once `n` are.
-    fn gates(&self, h: &Harness, n: usize) -> Result<Vec<Value>, String> {
+    pub(super) fn gates(&self, h: &Harness, n: usize) -> Result<Vec<Value>, String> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let l = self.listing(h);
@@ -42,7 +42,7 @@ impl Setup {
     }
 
     /// The `tools/call`s of `tool` the server was sent.
-    fn made(&self, tool: &str) -> usize {
+    pub(super) fn made(&self, tool: &str) -> usize {
         self.xaa
             .mcp_calls("tools/call")
             .iter()
@@ -51,7 +51,7 @@ impl Setup {
     }
 
     /// Edit the configuration in place.
-    fn edit(&self, f: impl Fn(String) -> String) {
+    pub(super) fn edit(&self, f: impl Fn(String) -> String) {
         let cfg = std::fs::read_to_string(&self.cfg).expect("read");
         std::fs::write(&self.cfg, f(cfg)).expect("write");
     }

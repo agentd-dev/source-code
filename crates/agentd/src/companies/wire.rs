@@ -119,10 +119,9 @@ pub const API_OPENAPI: &str = "openapi";
 /// The oldest MCP revision a listed MCP server may speak (§6).
 pub const MCP_MIN_VERSION: &str = "2025-06-18";
 
-/// The DPoP request and response headers, and a proof's `typ` (§4.3).
+/// The DPoP request and response headers (§4.3).
 pub const DPOP_HEADER: &str = "DPoP";
 pub const DPOP_NONCE_HEADER: &str = "DPoP-Nonce";
-pub const DPOP_TYP: &str = "dpop+jwt";
 
 /// The grant types of the token endpoint (§4.2, §4.5, §4.6, §4.8).
 pub mod grant {

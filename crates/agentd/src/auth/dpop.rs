@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! DPoP (RFC 9449) as the draft profiles it (§4.3): one P-256 key per User
-//! at each Company, made in supervisor memory when the process starts and
-//! written nowhere, and a fresh proof for every request it signs — at the
-//! last moment, once the method and URL are final.
+//! DPoP (RFC 9449): a P-256 key made in supervisor memory and written
+//! nowhere, and a fresh proof for every request it signs — at the last
+//! moment, once the method and URL are final. The Personal Agent Protocol
+//! draft (RFC 0047, §4.3) binds a User's Session at each Company to one;
+//! a delegated MCP server whose authorization server and protected-resource
+//! metadata advertise DPoP (RFC 0044 T23) binds the access token it is
+//! called with to another.
 //!
 //! A proof is a JWT with the public key in its header (`typ: dpop+jwt`,
 //! `alg: ES256`, `jwk`) and the claims `jti` (128 random bits), `htm`,
-//! `htu` (the URL without query or fragment), `iat`, `ath` over a Session
-//! Token sent with it, and `nonce` when the Company asked for one. A proof
-//! to the token endpoint never has `ath` (§4.3: "Proofs sent to the token
-//! endpoint don't have one").
+//! `htu` (the URL without query or fragment), `iat`, `ath` over an access
+//! token sent with it, and `nonce` when the server asked for one. A proof
+//! to a token endpoint never has `ath` (RFC 9449 §4.3).
 //!
 //! Nonces are kept per origin: learned from any `DPoP-Nonce` a response
 //! carries, and used in every proof to that origin from then on.
@@ -20,9 +22,13 @@ use std::sync::Mutex;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde_json::{Value, json};
 
-use super::wire;
 use crate::auth::jwk;
 use crate::b64;
+
+/// A proof's JOSE `typ` (RFC 9449 §4.2).
+pub const TYP: &str = "dpop+jwt";
+/// The one algorithm agentd signs proofs with.
+pub const ALG: &str = "ES256";
 
 /// A DPoP key: the pair, its public JWK and that JWK's RFC 7638 thumbprint.
 pub struct DpopKey {
@@ -72,7 +78,7 @@ impl DpopKey {
         if let Some(n) = nonce {
             claims["nonce"] = json!(n);
         }
-        let header = json!({"typ": wire::DPOP_TYP, "alg": wire::ES256, "jwk": self.jwk});
+        let header = json!({"typ": TYP, "alg": ALG, "jwk": self.jwk});
         let input = format!(
             "{}.{}",
             b64::url_nopad(header.to_string().as_bytes()),
@@ -94,7 +100,7 @@ pub fn htu(url: &str) -> Result<String, String> {
     Ok(format!("{}://{}{path}", u.scheme, u.host_header()))
 }
 
-/// The nonces Companies issued, by origin.
+/// The nonces servers issued, by origin.
 #[derive(Default)]
 pub struct Nonces(Mutex<BTreeMap<String, String>>);
 

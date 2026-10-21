@@ -467,6 +467,7 @@ mod tests {
             max_at_age: None,
             trusted_output: None,
             subject: None,
+            dpop: None,
         }
     }
 

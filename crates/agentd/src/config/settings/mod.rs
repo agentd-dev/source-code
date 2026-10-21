@@ -1214,6 +1214,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "mcp.servers[].auth.max_at_age",
     "mcp.servers[].auth.trusted_output",
     "mcp.servers[].auth.subject",
+    "mcp.servers[].auth.dpop",
     // Who may talk to THIS agent and as what, over which socket, with which
     // credential. Enumerated rather than taken as a section, because
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
@@ -2943,6 +2944,10 @@ pub struct Auth {
     /// (`inbound`), which goes nowhere but back to its issuer.
     #[serde(default)]
     pub subject: Option<delegation::ExchangeSubject>,
+    /// DPoP on a delegated server's authorization-server and MCP legs:
+    /// `auto` (the default) where both advertise it, or `off`.
+    #[serde(default)]
+    pub dpop: Option<delegation::DpopMode>,
 }
 
 impl Auth {
@@ -5484,6 +5489,21 @@ impl Settings {
                         return Err(format!(
                             "{source}: the instruction declares {} — MCP Events bindings and grants are the operator's to declare: a document would choose an upstream subscription and decide how often runs start (RFC 0045 §5.11.6)",
                             events.join(", ")
+                        ));
+                    }
+                    let acting = delegation::document_act_for(
+                        ex.workflows.iter().chain(
+                            ex.config
+                                .get("workflows")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten(),
+                        ),
+                    );
+                    if !acting.is_empty() {
+                        return Err(format!(
+                            "{source}: the instruction declares {} — acting for a person with nobody there is the operator's to declare (RFC 0044 §5.14)",
+                            acting.join(", ")
                         ));
                     }
                     // `workflows` is the document's to write, but a route on
@@ -10171,6 +10191,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         for e in undeclared_references(s, w) {
             err(&mut d, e);
         }
+        if let Some(a) = &w.act_for {
+            for e in delegation::act_for_refusals(s, &w.name, a) {
+                err(&mut d, e);
+            }
+        }
         for e in companies::workflow_refusals(s, w) {
             err(&mut d, e);
         }
@@ -10955,8 +10980,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "tools.narrow",
     "vars",
     "webhooks.default_auth",
-    // Refused at load (RFC 0044 P3), so a reload that adds one is refused
-    // with it.
+    // Part of the definition its digest is over: a reload that changes it,
+    // like any other change to the workflow, suspends its firings until the
+    // person signs in again (RFC 0044 §5.12 E).
     "workflows.act_for",
     "workflows.allow_private",
     "workflows.armed",

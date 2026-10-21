@@ -1659,6 +1659,17 @@ impl Runtime {
     /// Run the call an approved gate held, past that gate and those it had
     /// passed already, and hand the asker its outcome.
     pub(crate) fn run_approved(&mut self, target: &Target, call: &super::reactor::PolicyCall) {
+        self.run_again(target, call, call.passed.and(call));
+    }
+
+    /// The call a gate held, made again past the checks `passed` says it
+    /// passed.
+    pub(crate) fn run_again(
+        &mut self,
+        target: &Target,
+        call: &super::reactor::PolicyCall,
+        passed: super::reactor::Passed,
+    ) {
         if let Some(judged) = &call.judged
             && self.judged_call(&call.tool, &call.args).as_ref() != Some(judged)
         {
@@ -1669,7 +1680,6 @@ impl Runtime {
             self.reply(target, Value::String(msg), true);
             return;
         }
-        let passed = call.passed.and(call);
         match target {
             Target::Child(node, req) => {
                 let (node, req) = (*node, *req);

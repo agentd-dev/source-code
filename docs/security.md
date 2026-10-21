@@ -1622,6 +1622,56 @@ What holds:
   judge and no approval policy does, and unanswered within the server's
   wait it is cancelled. A URL elicitation is declined; agentd never opens a
   link a server sends.
+- **Nobody there, and less allowed.** A firing of an `act_for` workflow
+  acts for its person only from a `schedule`, `loop` or `once` start —
+  `act_for` beside any start an outsider can fire, or a webhook wait, is
+  refused at load, so no one can make the person's phone buzz at will or
+  drive an approved run with their own payload (T18) — only from the
+  operator's own configuration, and only while the person's grant holds
+  their consent to that very definition: a changed digest suspends its
+  firings until they sign in again. A firing's work is tainted and
+  unattended, so the person's consent rules ask them and deny unanswered;
+  a delegated `egress` tool is refused unasked unless their template lists
+  it in `unattended_tools`; no step-up is asked for. Its authority ends
+  with its run, and work outliving it — a call on its way included —
+  acts for nobody. The authority is that run's alone: a run its work
+  starts — a `workflow` step, `workflow.run`, a signal or a message that
+  starts one — is a firing of its own, held to the person's consent to
+  that run's own workflow, so one that declares no `act_for` for them, or
+  that a reload changed, acts for nobody; a conversation turn its work
+  starts by message acts with no one's grant. `via: standing`
+  uses the grant with nobody asked, and under a `profile: okta` IdP only
+  with `allow_against_idp_guidance`. `via: ciba` asks the person on their
+  own device, once a firing and grant — written to the run's record before
+  the request is sent — every call of the firing waiting on that one
+  request, at most one request waiting per person and workflow and
+  `ciba.per_day` a day; the message their device
+  shows is agentd's identifiers, never a payload; the approval's ID token
+  must name the grant's own `iss` and `sub` — a hint can resolve to another
+  account — or the firing fails closed; it is the subject of that firing's
+  mints alone, held in memory and never written, so a restart fails the
+  firing closed rather than asking again; and a refresh token the IdP
+  issued with it is revoked when the run ends — held in memory alone, a
+  restart before then leaves it alive at the IdP until it expires. The
+  login hint a CIBA
+  request falls back to is kept sealed under the person's personal key.
+- **A gone grant waits only where it is safe to.** Under `auth.on_revoked:
+  ask` a workflow step whose grant was revoked or expired, or whose run's
+  session ended, waits for the person to sign in again; a model's call, and
+  work that has read outside text or that nobody is there for, never does,
+  so no steered model can make anyone sign in. A run whose session ended
+  moves only to a live session of the same principal holding an IdP proof
+  of the very identity its grant is bound to, and the move is audited. A
+  call held before any rule was consulted meets the operator's rules and
+  the person's consent when it is made again.
+- **Sender-constrained where both sides offer it.** A delegated server whose
+  metadata and whose authorization server's both advertise ES256 DPoP
+  proofs gets an access token bound to a key agentd makes in memory and
+  never writes (T23): a stolen token is useless without the key, a
+  redemption answered with a `Bearer` token to a DPoP request is refused as
+  a downgrade, and a server that takes bound tokens alone is refused where
+  agentd cannot bind one. The key lives as long as the process; the ID-JAG
+  exchange at the IdP is not bound (RFC 0044 P4).
 - **A worker uses what it was offered.** A turn worker makes a delegated
   call only of a tool its plan offered — its step's `tools:` and
   `servers:` — and a subagent only of one on a delegated server it declares
@@ -1668,9 +1718,13 @@ What holds:
 What this preview does not do: a grant held by a person stays usable after
 the IdP removes a Resource connection until the next mint (at most
 `at_cache_cap`); taint does not follow text inside an instance child, which
-keeps a record of its own; and for one person on a kernel without
-Landlock, with no separate worker uid, the vault and a mounted key file are
-readable by any same-uid process.
+keeps a record of its own; for one person on a kernel without Landlock,
+with no separate worker uid, the vault and a mounted key file are readable
+by any same-uid process; a `via: ciba` approval answers for every
+delegated call of its firing at the person's IdP, not for each; a refresh
+token an IdP issues with a CIBA approval outlives a restart at the IdP
+until it expires; and DPoP binds the authorization-server and MCP legs,
+not the exchange at the IdP.
 
 ### A container deployment with a worker uid
 

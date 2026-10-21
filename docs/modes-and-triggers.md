@@ -205,6 +205,73 @@ per order, per ticket, per customer. Across all workflows, `limits.max_runs`
 overflow handling. [Author workflows](author-workflows.md) has worked
 examples.
 
+## Acting for a person
+
+A firing's run is agentd's own work, attributed to
+`identity.autonomous_as`: it makes no call with anyone's grant, and a
+delegated server refuses it (`no_delegation`). A workflow's `act_for`
+changes that for its `schedule`, `loop` and `once` starts: their firings
+act for the person it names, with nobody there — `via: ciba`, each firing
+approved by them on their own device, or `via: standing`, with their grant
+and nobody asked — as far as that person's
+`identity.delegation.templates` entry allows (needs the `xaa` build
+feature; [Work nobody is there for](authentication.md#work-nobody-is-there-for)).
+
+```yaml
+# fragment: under workflows:
+- name: weekly-report
+  act_for:
+    principal: {source: operator, id: alice}   # a pinned person, or {source: oidc, issuer, sub}
+    via: ciba
+  concurrency: {max_runs: 1, on_overflow: drop}
+  steps:
+    tick:   {kind: schedule, cron: "0 7 * * MON"}
+    issues: {kind: mcp.tool, depends_on: [tick], server: linear, tool: list_issues, args: {}}
+    done:   {kind: finish, depends_on: [issues]}
+```
+
+- **Where it is declared.** On the workflow, not on a start node: it holds
+  for every `schedule`, `loop` and `once` start the workflow has, and only
+  the operator's own configuration may carry it. A `manual` start's
+  `workflow.run` runs as whoever asked for it, never as the person.
+  `act_for` beside a `webhook`, `stream`, `correlate`, `subscribe`,
+  `signal`, `event` or `a2a` start, or beside a `webhook` wait, is refused
+  at load (`act_for_trigger_not_allowed`): whoever can fire one could make
+  the person's phone buzz at every firing, and drive an approved run with a
+  payload of their own.
+- **Consent is to the definition.** The person consents by signing in, to
+  the workflow as it is then. A firing whose workflow has changed since —
+  an edit, or a `url:` or `dir:` body that changed — starts no run and asks
+  nobody: `start.unattended.suspended` says why
+  (`unattended_suspended`), and the next firing after they sign in again
+  runs. So does one for a person with no usable grant, or whose template no
+  longer allows the `via`. A `loop` that started nothing fires again after
+  its `interval`, or a minute.
+- **A run waiting on approval.** A `via: ciba` firing's first delegated
+  call waits on the person's answer: the step is suspended on its wait for
+  up to the CIBA request's expiry (300 s by default), the person sees the
+  request on their device with agentd's message — the instance, the
+  workflow, the run and the tool — and the gate among their own in
+  `delegation.list`. Another call the firing makes meanwhile waits on the
+  same request. Denied or expired, the call fails `ciba_denied`; a
+  restart fails it closed, and a firing never asks twice. Give the
+  workflow a `concurrency` that drops overlapping firings: at most one
+  request per person and workflow waits at a time, and another firing may
+  ask once that wait has closed.
+- **What it may do.** The work is unattended and tainted: the person's
+  consent rules ask them and deny unanswered, a delegated tool tagged
+  `egress` is refused unless their template lists it in `unattended_tools`,
+  and the firing's authority ends with its run.
+- **What its work starts.** The authority is the firing's run's alone. A
+  run its work starts — a `workflow` step, `workflow.run`, or a signal or
+  message that starts one — is a firing of its own for the same person
+  (`start.unattended.carried`): it acts for them only where its own
+  workflow declares an `act_for` naming them that they consented to by
+  signing in, and its delegated calls fail `unattended_suspended`
+  otherwise. Give a workflow a firing calls its own `act_for` (a `manual`
+  start beside it is enough) when it should act for the person too. A
+  conversation turn the work starts by message acts with no one's grant.
+
 ## Init and deinit
 
 Two start kinds let a daemon run work at the edges of its own life.

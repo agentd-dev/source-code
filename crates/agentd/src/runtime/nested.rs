@@ -1410,6 +1410,7 @@ fn unreachable_wf() -> std::sync::Arc<Workflow> {
         gate_channels: BTreeMap::new(),
         document: false,
         configured: false,
+        act_for: None,
     })
 }
 

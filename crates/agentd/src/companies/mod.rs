@@ -8,7 +8,7 @@
 //! one ([`discover`]), presents the one client identity every Company sees
 //! ([`identity`]), keeps the User's pseudonymous ID there ([`user_id`]),
 //! holds a Session with DPoP-bound tokens ([`session`], [`token`],
-//! [`dpop`]) over requests held to the host rule, the SSRF guard and the
+//! [`crate::auth::dpop`]) over requests held to the host rule, the SSRF guard and the
 //! Company's not-before instant ([`http`]), and connects to the Company's
 //! MCP servers with a Bearer token for each ([`mcp`]). It talks with the
 //! Company's agent in conversations a reader follows ([`conversation`]) and
@@ -50,8 +50,6 @@ pub mod conversation;
 pub mod direct;
 #[cfg(feature = "companies")]
 pub mod discover;
-#[cfg(feature = "companies")]
-pub mod dpop;
 #[cfg(feature = "companies")]
 pub mod http;
 #[cfg(feature = "companies")]

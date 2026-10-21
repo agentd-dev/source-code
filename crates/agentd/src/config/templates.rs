@@ -446,6 +446,21 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
             events.join(", ")
         )));
     }
+    let acting = crate::config::settings::delegation::document_act_for(
+        ex.workflows.iter().chain(
+            ex.config
+                .get("workflows")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        ),
+    );
+    if !acting.is_empty() {
+        errs.push(at(format!(
+            "machinery declares {} — acting for a person with nobody there is the operator's to declare (RFC 0044 §5.14)",
+            acting.join(", ")
+        )));
+    }
     for k in CHILD_COMPOSED_SECTIONS {
         if ex.config.contains_key(*k) {
             errs.push(at(format!(

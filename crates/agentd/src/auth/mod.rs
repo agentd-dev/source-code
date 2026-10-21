@@ -38,6 +38,9 @@ pub mod client_metadata;
 pub mod jwk;
 
 #[cfg(feature = "oauth")]
+pub mod dpop;
+
+#[cfg(feature = "oauth")]
 pub mod seal;
 
 #[cfg(feature = "oauth")]
@@ -61,6 +64,10 @@ pub mod browser;
 /// The ID-JAG exchange, its redemption and their checks (RFC 0044).
 #[cfg(feature = "xaa")]
 pub mod idjag;
+
+/// OpenID CIBA in poll mode: how a firing asks its person (RFC 0044 M4).
+#[cfg(feature = "xaa")]
+pub mod ciba;
 
 /// Canonicalize a login/logout target: `mcp:<name>` on a server that references
 /// a service-catalog entry becomes `service:<entry>`, the key the daemon's

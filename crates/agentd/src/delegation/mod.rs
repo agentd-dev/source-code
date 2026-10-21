@@ -69,6 +69,7 @@ pub mod enrol;
 #[cfg(feature = "a2a")]
 pub mod federation;
 pub mod lint;
+pub mod unattended;
 pub mod vault;
 
 #[cfg(feature = "a2a")]
@@ -134,14 +135,26 @@ pub enum Code {
     DelegationNotPermitted,
     PrincipalNotDelegable,
     /// The caller's inbound token a `subject: inbound` exchange presents
-    /// has expired (RFC 0044 §5.7, M1b).
+    /// has expired (RFC 0044 §5.7, M1b); or a firing's CIBA approval has,
+    /// or a restart lost it, and a firing asks once (§5.12 E).
     SubjectExpired,
+    /// A `via: ciba` firing has not asked its person yet: the loop asks
+    /// them, and the call waits (RFC 0044 §5.12 E).
+    CibaRequired,
+    /// The person denied a firing's CIBA request, or it expired unanswered.
+    CibaDenied,
+    /// The `act_for` workflow is not the definition the person consented
+    /// to run for them: its firings act again once they sign in again.
+    UnattendedSuspended,
 }
 
 impl Code {
     pub fn as_str(self) -> &'static str {
         match self {
             Code::SubjectExpired => "subject_expired",
+            Code::CibaRequired => "ciba_required",
+            Code::CibaDenied => "ciba_denied",
+            Code::UnattendedSuspended => "unattended_suspended",
             Code::Revoked => "revoked",
             Code::PolicyDenied => "policy_denied",
             Code::Config => "config",
@@ -390,6 +403,8 @@ pub struct Person {
     /// The principal id the listener names the caller by, and a run's
     /// authority records: `operator:<id>`, or `<role>:<id>`.
     pub principal: String,
+    /// Its rule's `id`, as an `act_for` names it.
+    pub rule: String,
     pub typed: PrincipalRef,
     pub role: crate::config::settings::Role,
     /// `unix-uid:<n>`, or `x509:<SPKI SHA-256>`.
@@ -432,6 +447,7 @@ impl Person {
                 Some(Person {
                     id: typed.display(),
                     principal,
+                    rule: id,
                     typed,
                     role: rule.role,
                     fingerprint,
@@ -475,6 +491,9 @@ pub struct Who {
     /// device name's grant is held to at every call, and what lets a
     /// session answer the person's consent gates.
     pub proof: Option<IdpProof>,
+    /// The firing of an `act_for` workflow the work is, when it is one:
+    /// nobody is there (RFC 0044 §5.12 E).
+    pub firing: Option<unattended::Firing>,
 }
 
 /// What kind of principal a [`Who`] is, and what its grant is held to.
@@ -578,6 +597,10 @@ pub trait SessionBook: Send + Sync {
     fn set_proof(&self, sid: &str, proof: IdpProof) -> bool;
     /// Drop the proof of every session of the device name `name`.
     fn drop_device_proofs(&self, name: &str) -> Vec<String>;
+    /// Every live RFC 0043 session, oldest first, by sid.
+    fn sessions(&self) -> Vec<(String, SessionInfo)> {
+        Vec::new()
+    }
 }
 
 #[cfg(feature = "a2a")]
@@ -615,6 +638,23 @@ impl SessionBook for crate::a2a::oauth::Sessions {
     }
     fn drop_device_proofs(&self, name: &str) -> Vec<String> {
         self.drop_proofs(|s| s.typed.source == Source::Device && s.typed.stable_id == name)
+    }
+    fn sessions(&self) -> Vec<(String, SessionInfo)> {
+        self.list()
+            .into_iter()
+            .map(|s| {
+                (
+                    s.sid.clone(),
+                    SessionInfo {
+                        principal: s.principal,
+                        typed: s.typed,
+                        role: s.role,
+                        proof: s.proof,
+                        inbound: None,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -739,6 +779,11 @@ pub struct Server {
     /// Whether nobody outside can write what it answers (`auth.trusted_output`):
     /// its results then hold the person's data and taint nothing.
     pub trusted_output: bool,
+    /// Whether its token is bound to agentd's DPoP key where its metadata
+    /// and its authorization server's advertise it.
+    pub dpop: cfg::DpopMode,
+    /// What a workflow step's call does when the grant it needs is gone.
+    pub on_revoked: cfg::OnRevoked,
     headers: Vec<(String, String)>,
     timeout: Duration,
 }
@@ -782,6 +827,8 @@ impl Server {
             attribution: a.attribution.unwrap_or_default(),
             max_at_age: a.max_at_age.map(|d| d.0),
             trusted_output: a.trusted_output == Some(true),
+            dpop: a.dpop.unwrap_or_default(),
+            on_revoked: a.on_revoked.unwrap_or_default(),
             headers: m
                 .headers
                 .iter()
@@ -839,6 +886,8 @@ struct Held {
     /// The ID-JAG's `sub`: whom the server's authorization server issued
     /// it for, as `agent/acting_for` names them.
     sub: Option<String>,
+    /// Bound to agentd's DPoP key: presented as `DPoP`, with a proof.
+    dpop: bool,
 }
 
 /// The last status a server refused a pooled token with, and its
@@ -854,35 +903,73 @@ struct Entry {
     used_ms: Mutex<u64>,
 }
 
-/// The pool's signer: a read of the token minted before the request.
+/// The pool's signer: a read of the token minted before the request —
+/// with, for a DPoP-bound one, a fresh proof of agentd's key for this very
+/// request.
 struct Signer {
     token: Arc<Mutex<Option<Held>>>,
     refused: Refused401,
+    dpop: Option<SignerDpop>,
+}
+
+/// What a signer proves a DPoP-bound token with: the key, the nonces the
+/// server issued, and the scheme of its endpoint (a proof names the URL).
+struct SignerDpop {
+    key: Arc<crate::auth::dpop::DpopKey>,
+    nonces: Arc<crate::auth::dpop::Nonces>,
+    scheme: String,
 }
 
 impl ::mcp::http::RequestSigner for Signer {
     fn sign(
         &self,
-        _method: &str,
-        _authority: &str,
-        _path: &str,
+        method: &str,
+        authority: &str,
+        path: &str,
         _body: &[u8],
     ) -> Result<Vec<(String, String)>, String> {
-        match self
+        let held = self
             .token
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            Some(h) => Ok(vec![(
+            .clone()
+            .ok_or("no delegated token is held for this request")?;
+        match (&self.dpop, held.dpop) {
+            (Some(d), true) => {
+                let url = format!("{}://{authority}{path}", d.scheme);
+                let proof =
+                    d.key
+                        .proof(method, &url, Some(&held.at), d.nonces.get(&url).as_deref())?;
+                Ok(vec![
+                    ("Authorization".to_string(), format!("DPoP {}", held.at)),
+                    ("DPoP".to_string(), proof),
+                ])
+            }
+            (None, true) => Err("a DPoP-bound token is held, and no key to prove it with".into()),
+            _ => Ok(vec![(
                 "Authorization".to_string(),
-                format!("Bearer {}", h.at),
+                format!("Bearer {}", held.at),
             )]),
-            None => Err("no delegated token is held for this request".into()),
         }
     }
 
-    fn on_response(&self, resp: &::mcp::http::AuthResponse, _authority: &str) -> bool {
+    fn on_response(&self, resp: &::mcp::http::AuthResponse, authority: &str) -> bool {
+        // A nonce the server issued is used from the next proof on, and a
+        // proof it refused for want of one is sent once more with it.
+        if let (Some(d), Some(n)) = (&self.dpop, &resp.dpop_nonce) {
+            let url = format!("{}://{authority}/", d.scheme);
+            let fresh = d.nonces.get(&url).as_deref() != Some(n.as_str());
+            d.nonces.learn(&url, n);
+            if fresh
+                && resp.status == 401
+                && resp
+                    .www_authenticate
+                    .as_deref()
+                    .is_some_and(|w| w.contains(idjag::wire::USE_DPOP_NONCE))
+            {
+                return true;
+            }
+        }
         if matches!(resp.status, 401 | 403) {
             *self.refused.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some((resp.status, resp.www_authenticate.clone()));
@@ -900,8 +987,10 @@ struct Live {
     proved_ms: u64,
     /// The last delegated call.
     used_ms: u64,
-    /// The `max_age` an IdP asked a step-up for, until a sign-in meets it.
+    /// The `max_age` an IdP asked a step-up for, until a sign-in meets it,
+    /// and when it asked, seconds since the epoch.
     step_up: Option<u64>,
+    step_up_at: u64,
     /// A fresh ID token from a step-up, its `auth_time` and `exp`, and the
     /// call it was signed in for: the subject of that call's mint and no
     /// other's (A2A §7.6.4).
@@ -936,6 +1025,43 @@ impl FreshIdToken {
             && self.call.as_ref().is_none_or(|k| k == call)
             && step_up.is_none_or(|m| m == 0 || self.auth_time + m >= now_s)
     }
+}
+
+/// How far a sign-in's `auth_time` may be ahead of the moment a step-up was
+/// asked, the clocks of agentd and the IdP apart.
+const AUTH_TIME_SKEW_S: u64 = 60;
+
+/// Whether a sign-in authenticated at `auth_time` meets a step-up the IdP
+/// asked at `asked_s` with `max_age` (RFC 0044 §5.10 L4): its ID token says
+/// when the person authenticated (OIDC Core §3.1.2.1 requires `auth_time`
+/// beside a `max_age`), within `max_age` of `now_s` — or, for an IdP that
+/// named no `max_age`, no earlier than the ask: a session the IdP reused
+/// from before raises no assurance. Why not, when not.
+pub(crate) fn auth_time_meets(
+    auth_time: Option<u64>,
+    max_age: u64,
+    asked_s: u64,
+    now_s: u64,
+) -> Result<(), String> {
+    let Some(t) = auth_time else {
+        return Err(
+            "its ID token carries no auth_time, so it cannot show it is as recent as the IdP asked"
+                .into(),
+        );
+    };
+    if max_age > 0 && t + max_age < now_s {
+        return Err(format!(
+            "the person authenticated {}s ago, and the IdP asked for a sign-in within {max_age}s",
+            now_s.saturating_sub(t)
+        ));
+    }
+    if max_age == 0 && t + AUTH_TIME_SKEW_S < asked_s {
+        return Err(format!(
+            "the person authenticated {}s before the IdP asked them to sign in again",
+            asked_s - t
+        ));
+    }
+    Ok(())
 }
 
 /// A delegated call as a step-up sign-in is bound to it: its server, the
@@ -1010,6 +1136,18 @@ pub struct Delegation {
     /// while one is forgotten: a key opened as it is destroyed is never
     /// kept behind it.
     personal_open: Mutex<()>,
+    /// The `act_for` workflows installed: reloaded with them.
+    acts: RwLock<Vec<unattended::ActForDecl>>,
+    /// The firings acting now, by the session id their work acts through.
+    firings: Mutex<BTreeMap<String, unattended::Running>>,
+    /// The key DPoP-bound tokens are bound to, made at its first use and
+    /// held in memory alone (RFC 0044 T23).
+    dpop: OnceLock<Arc<crate::auth::dpop::DpopKey>>,
+    /// The DPoP nonces servers issued, by origin.
+    nonces: Arc<crate::auth::dpop::Nonces>,
+    /// The servers whose tokens are bound to that key: their metadata and
+    /// their authorization server's advertise ES256 proofs.
+    bound_servers: Mutex<BTreeSet<String>>,
 }
 
 /// A personal key opened: its id and its bytes.
@@ -1296,6 +1434,11 @@ impl Delegation {
             confirmed: Mutex::new(BTreeSet::new()),
             personal: Mutex::new(BTreeMap::new()),
             personal_open: Mutex::new(()),
+            acts: RwLock::new(Vec::new()),
+            firings: Mutex::new(BTreeMap::new()),
+            dpop: OnceLock::new(),
+            nonces: Arc::default(),
+            bound_servers: Mutex::new(BTreeSet::new()),
         };
         d.load_grants();
         Ok(Some(Arc::new(d)))
@@ -1370,7 +1513,32 @@ impl Delegation {
     /// expired, or lost to a restart, and none is where no listener issues
     /// sessions.
     pub fn session_live(&self, sid: &str) -> bool {
+        if sid.starts_with(crate::engine::run::UNATTENDED_SID_PREFIX) {
+            return self.firing_live(sid);
+        }
         self.book().is_some_and(|b| b.session(sid).is_some())
+    }
+
+    /// The newest live session of `principal` holding a proof of the very
+    /// identity their grant for `server` is bound to: what a run whose
+    /// session ended moves to (RFC 0044 §5.12 C).
+    pub fn rebind(&self, principal: &str, server: &str) -> Option<String> {
+        let s = self.servers.get(server)?;
+        let issuer = &self.providers.get(&s.idp)?.cfg.issuer;
+        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        self.book()?
+            .sessions()
+            .into_iter()
+            .rev()
+            .find(|(_, info)| {
+                info.principal == principal
+                    && info.proof.as_ref().is_some_and(|p| {
+                        grants
+                            .get(&info.typed.grant_id(issuer))
+                            .is_some_and(|g| g.idp_iss == p.iss && g.sub == p.sub)
+                    })
+            })
+            .map(|(sid, _)| sid)
     }
 
     /// The templates in force.
@@ -1406,6 +1574,14 @@ impl Delegation {
     pub fn who(&self, acting: Acting<'_>) -> Result<Who, DelegationError> {
         use crate::config::settings::Role;
         let nobody = |why: String| refuse(Code::NoDelegation, why);
+        // A firing of an `act_for` workflow acts for the person it names,
+        // while its run lives (RFC 0044 §5.12 E).
+        if let Some(sid) = acting
+            .session
+            .filter(|s| s.starts_with(crate::engine::run::UNATTENDED_SID_PREFIX))
+        {
+            return self.firing_who(sid);
+        }
         if let Some(sid) = acting.session {
             let Some(s) = self.book().and_then(|b| b.session(sid)) else {
                 return Err(refuse(
@@ -1451,6 +1627,7 @@ impl Delegation {
                     },
                     session: Some(sid.to_string()),
                     proof: None,
+                    firing: None,
                 });
             }
             let kind = match s.typed.source {
@@ -1477,6 +1654,7 @@ impl Delegation {
                 kind,
                 session: Some(sid.to_string()),
                 proof: s.proof,
+                firing: None,
             });
         }
         let Some(p) = acting.principal.and_then(|id| self.person(id)) else {
@@ -1497,6 +1675,7 @@ impl Delegation {
             },
             session: None,
             proof: None,
+            firing: None,
         })
     }
 
@@ -1693,6 +1872,11 @@ impl Delegation {
         grant.ceilings = narrowed(&grant.ceilings, template);
         let template = template.clone();
         drop(templates);
+        // A firing acts only as the template allows it to, and only while
+        // its workflow is the definition the person consented to.
+        if let Some(f) = &who.firing {
+            self.firing_allowed(&who.id, f, &grant, &template)?;
+        }
         if !grant.ceilings.contains_key(server) {
             return Err(refuse(
                 Code::DelegationNotPermitted,
@@ -1791,6 +1975,8 @@ impl Delegation {
             rt_version: 0,
             quota: Default::default(),
             bound_by: None,
+            unattended: BTreeMap::new(),
+            ciba: None,
         };
         Ok(Admitted {
             grant,
@@ -1997,11 +2183,82 @@ impl Delegation {
                 m.authorization_servers
             )));
         }
+        // DPoP on the authorization-server and MCP legs (T23): where the
+        // server and its authorization server both take ES256 proofs, unless
+        // `auth.dpop: off`; a server that takes bound tokens alone is
+        // refused when its token cannot be bound.
+        if s.kind == ServerKind::IdJag {
+            let prm = m
+                .dpop_signing_alg_values_supported
+                .iter()
+                .any(|a| a == crate::auth::dpop::ALG);
+            let ras = self.ras(s)?;
+            let on = s.dpop == cfg::DpopMode::Auto && prm && ras.dpop;
+            if m.dpop_bound_access_tokens_required && !on {
+                return Err(not(format!(
+                    "its protected-resource metadata takes DPoP-bound tokens alone, and {}",
+                    if s.dpop == cfg::DpopMode::Off {
+                        "auth.dpop is off".to_string()
+                    } else if !prm {
+                        "lists no ES256 proofs".to_string()
+                    } else {
+                        format!("{} advertises no ES256 DPoP proofs", ras.issuer)
+                    }
+                )));
+            }
+            if on {
+                self.dpop_key().map_err(not)?;
+                self.bound_servers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(s.name.clone());
+            }
+        }
         self.confirmed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(s.name.clone());
         Ok(())
+    }
+
+    /// The key DPoP-bound tokens are bound to: made once a process, never
+    /// written anywhere.
+    fn dpop_key(&self) -> Result<Arc<crate::auth::dpop::DpopKey>, String> {
+        if let Some(k) = self.dpop.get() {
+            return Ok(Arc::clone(k));
+        }
+        let made = Arc::new(crate::auth::dpop::DpopKey::generate()?);
+        Ok(Arc::clone(self.dpop.get_or_init(|| made)))
+    }
+
+    /// Whether server `s`'s tokens are DPoP-bound.
+    fn dpop_bound(&self, s: &Server) -> bool {
+        self.bound_servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&s.name)
+    }
+
+    /// Redeem `jag` at `s`'s authorization server `ras`: with a DPoP proof
+    /// where its token is to be bound.
+    fn redeem(
+        &self,
+        s: &Server,
+        ras: &idjag::RasMeta,
+        jag: &str,
+    ) -> Result<idjag::Redeemed, Refusal> {
+        let key = if self.dpop_bound(s) {
+            Some(self.dpop_key().map_err(Refusal::Unavailable)?)
+        } else {
+            None
+        };
+        idjag::redeem(
+            &s.params(&ras.token_endpoint),
+            jag,
+            &s.resource,
+            key.as_deref().map(|k| (k, &*self.nonces)),
+            self.timeout,
+        )
     }
 
     /// The pinned authorization server's metadata, read once.
@@ -2010,6 +2267,7 @@ impl Delegation {
             return Ok(idjag::RasMeta {
                 issuer: s.audience.clone(),
                 token_endpoint: t.clone(),
+                dpop: false,
             });
         }
         if let Some(m) = self
@@ -2110,9 +2368,20 @@ impl Delegation {
             .clone()
     }
 
-    /// The pool entry `(server, grant, scopes)`.
-    fn entry(&self, server: &str, grant: &str, scopes: &[String]) -> (String, Arc<Entry>) {
-        let key = format!("{server}|{grant}|{}", scopes.join(" "));
+    /// The pool entry `(server, grant, scopes)` — a `via: ciba` firing's
+    /// own, under `scope`.
+    fn entry(
+        &self,
+        server: &str,
+        grant: &str,
+        scopes: &[String],
+        scope: Option<&str>,
+    ) -> (String, Arc<Entry>) {
+        let mut key = format!("{server}|{grant}|{}", scopes.join(" "));
+        if let Some(sid) = scope {
+            key.push('|');
+            key.push_str(sid);
+        }
         let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if !pool.contains_key(&key) && pool.len() >= POOL_CAP {
             let oldest = pool
@@ -2171,6 +2440,9 @@ impl Delegation {
         {
             out.push(t);
         }
+        if let Some(sid) = self.ciba_scope(acting) {
+            out.extend(self.firing_values(&sid));
+        }
         out
     }
 
@@ -2196,6 +2468,7 @@ impl Delegation {
     /// The token a request to `s` for `tool` presents: the pooled one while
     /// it may be used, a re-presented ID-JAG's, or a new mint. `fresh`
     /// excludes re-presentation after a 401.
+    #[allow(clippy::too_many_arguments)]
     fn token(
         &self,
         s: &Server,
@@ -2203,10 +2476,11 @@ impl Delegation {
         scopes: &[String],
         entry: &Entry,
         c: &Call<'_>,
+        firing: Option<&unattended::Firing>,
         allow_reuse: bool,
     ) -> Result<(), DelegationError> {
         if let ServerKind::Exchange(subject) = s.kind {
-            return self.exchanged(s, subject, grant, scopes, entry, c);
+            return self.exchanged(s, subject, grant, scopes, entry, c, firing);
         }
         let now = now_ms();
         // Freshness first: no token is used for a grant whose refresh token
@@ -2226,7 +2500,17 @@ impl Delegation {
         }
         *entry.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let ras = self.ras(s)?;
-        let jag_key = format!("{}|{}|{}", ras.issuer, s.resource, scopes.join(" "));
+        // A `via: ciba` firing's approval is its own: no other work
+        // re-presents what was minted with it, and it re-presents nothing
+        // minted without it. The firing is the one the call was admitted
+        // as: one that ended meanwhile has no approval, and mints nothing.
+        let scope = unattended::ciba_sid(firing);
+        let approval = self.approval(scope, grant)?;
+        let mut jag_key = format!("{}|{}|{}", ras.issuer, s.resource, scopes.join(" "));
+        if let Some(sid) = scope {
+            jag_key.push('|');
+            jag_key.push_str(sid);
+        }
         // Re-present an unexpired ID-JAG (§4.4.3): no new mint.
         let cached = self.with_live(&grant.grant_id, |l| l.id_jags.get(&jag_key).cloned());
         let reuse_ok = allow_reuse
@@ -2239,17 +2523,19 @@ impl Delegation {
         if let (true, Some((jag, exp))) = (reuse_ok, cached)
             && exp * 1000 > now + 5_000
         {
-            match idjag::redeem(
-                &s.params(&ras.token_endpoint),
-                &jag,
-                &s.resource,
-                self.timeout,
-            ) {
+            match self.redeem(s, &ras, &jag) {
                 Ok(r) => {
                     let sub = idjag::decode_unverified(&jag)
                         .ok()
                         .and_then(|(_, cl)| cl["sub"].as_str().map(str::to_string));
-                    self.hold(s, grant, entry, &r, sub);
+                    self.hold(
+                        s,
+                        grant,
+                        entry,
+                        &r,
+                        sub,
+                        approval.as_ref().map(|(_, exp)| *exp),
+                    );
                     self.audit(
                         "delegation.minted",
                         "reused",
@@ -2270,10 +2556,12 @@ impl Delegation {
                 Err(_) => {}
             }
         }
-        self.mint(s, grant, scopes, entry, c, &ras, &jag_key)
+        self.mint(s, grant, scopes, entry, c, firing, &ras, &jag_key)
     }
 
-    /// Put a redeemed access token in the pool.
+    /// Put a redeemed access token in the pool: used no longer than the
+    /// caps allow, nor past `approval_exp`, the expiry of the approval a
+    /// `via: ciba` firing minted it with.
     fn hold(
         &self,
         s: &Server,
@@ -2281,6 +2569,7 @@ impl Delegation {
         entry: &Entry,
         r: &idjag::Redeemed,
         sub: Option<String>,
+        approval_exp: Option<u64>,
     ) {
         let now = now_ms();
         let cap = s
@@ -2291,12 +2580,14 @@ impl Delegation {
             .map_or(u64::MAX, |e| (now + e * 1000).saturating_sub(EXP_SKEW_MS));
         let until = by_exp
             .min(now + cap.as_millis() as u64)
-            .min(grant.expires_ms);
+            .min(grant.expires_ms)
+            .min(approval_exp.map_or(u64::MAX, |e| e * 1000));
         *entry.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(Held {
             at: r.access_token.clone(),
             until_ms: until,
             fresh: true,
             sub,
+            dpop: r.dpop,
         });
     }
 
@@ -2310,9 +2601,12 @@ impl Delegation {
         scopes: &[String],
         entry: &Entry,
         c: &Call<'_>,
+        firing: Option<&unattended::Firing>,
         ras: &idjag::RasMeta,
         jag_key: &str,
     ) -> Result<(), DelegationError> {
+        let approval = self.approval(unattended::ciba_sid(firing), grant)?;
+        let via = firing.map(|f| f.via);
         let budget = self.paced(grant, s, c)?;
         let idp = self
             .providers
@@ -2354,7 +2648,14 @@ impl Delegation {
                     unit: c.unit.clone(),
                     step: c.step.clone(),
                 };
-                let (subject, subject_type) = self.subject(idp, &params, &mut g, &mut rt, &call)?;
+                let (subject, subject_type) = self.subject(
+                    idp,
+                    &params,
+                    &mut g,
+                    &mut rt,
+                    &call,
+                    approval.as_ref().map(|(t, _)| t.as_str()),
+                )?;
                 // Presenting the refresh token may rotate it.
                 let ahead = match subject_type {
                     SubjectType::RefreshToken => self.ahead(&g)?,
@@ -2417,6 +2718,7 @@ impl Delegation {
                         // that call's still.
                         self.with_live(&g.grant_id, |l| {
                             l.step_up = Some(max_age.unwrap_or(0));
+                            l.step_up_at = now_ms() / 1000;
                             if l.fresh_id_token
                                 .as_ref()
                                 .is_some_and(|f| f.call.as_ref().is_none_or(|k| k == &call))
@@ -2484,16 +2786,19 @@ impl Delegation {
                    "ras_iss": ras.issuer, "resource": s.resource, "scope_granted": x.scopes,
                    "narrowed": x.narrowed, "jti_sha256": crate::sha::sha256_hex(x.jti.as_bytes()),
                    "exp": x.exp, "auth_time": x.auth_time, "act": x.act,
-                   "reused_id_jag": false, "month_to_date": month, "unattended": false}),
+                   "reused_id_jag": false, "month_to_date": month,
+                   "unattended": via.is_some(), "via": via.map(|v| v.as_str())}),
         );
-        match idjag::redeem(
-            &s.params(&ras.token_endpoint),
-            &x.id_jag,
-            &s.resource,
-            self.timeout,
-        ) {
+        match self.redeem(s, ras, &x.id_jag) {
             Ok(r) => {
-                self.hold(s, grant, entry, &r, Some(x.sub.clone()));
+                self.hold(
+                    s,
+                    grant,
+                    entry,
+                    &r,
+                    Some(x.sub.clone()),
+                    approval.map(|(_, exp)| exp),
+                );
                 Ok(())
             }
             Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
@@ -2594,6 +2899,7 @@ impl Delegation {
     /// which is sent to its issuer and nowhere else. The result is held to
     /// the pinned audience and the person, and any refresh token in it is
     /// dropped: renewal is a new exchange.
+    #[allow(clippy::too_many_arguments)]
     fn exchanged(
         &self,
         s: &Server,
@@ -2602,6 +2908,7 @@ impl Delegation {
         scopes: &[String],
         entry: &Entry,
         c: &Call<'_>,
+        firing: Option<&unattended::Firing>,
     ) -> Result<(), DelegationError> {
         let now = now_ms();
         if subject == cfg::ExchangeSubject::Grant {
@@ -2620,6 +2927,11 @@ impl Delegation {
             return Ok(());
         }
         *entry.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // A `via: ciba` firing exchanges only once its person approved it:
+        // the exchange's subject is still the grant's access token, which
+        // the approval's ID token is not.
+        let approval = self.approval(unattended::ciba_sid(firing), grant)?;
+        let via = firing.map(|f| f.via);
         let budget = self.paced(grant, s, c)?;
         let idp = self
             .providers
@@ -2763,7 +3075,8 @@ impl Delegation {
                    "grant": "token_exchange",
                    "subject": match subject { cfg::ExchangeSubject::Grant => "grant", cfg::ExchangeSubject::Inbound => "inbound" },
                    "as_iss": idp.cfg.issuer, "audience": s.audience, "resource": s.resource,
-                   "scope_granted": redeemed.scope, "month_to_date": month, "unattended": false}),
+                   "scope_granted": redeemed.scope, "month_to_date": month,
+                   "unattended": via.is_some(), "via": via.map(|v| v.as_str())}),
         );
         self.hold(
             s,
@@ -2771,6 +3084,7 @@ impl Delegation {
             entry,
             &redeemed,
             sub.or_else(|| Some(grant.sub.clone())),
+            approval.map(|(_, exp)| exp),
         );
         Ok(())
     }
@@ -2816,7 +3130,13 @@ impl Delegation {
         g: &mut Grant,
         rt: &mut String,
         call: &CallOf,
+        approval: Option<&str>,
     ) -> Result<(String, SubjectType), DelegationError> {
+        // A `via: ciba` firing mints with its person's approval of it, and
+        // nothing else (RFC 0044 §5.12 E).
+        if let Some(t) = approval {
+            return Ok((t.to_string(), SubjectType::IdToken));
+        }
         let now_s = now_ms() / 1000;
         let fresh = self.with_live(&g.grant_id, |l| {
             let step_up = l.step_up;
@@ -2828,26 +3148,7 @@ impl Delegation {
         match idp.cfg.subject() {
             SubjectKind::RefreshToken => Ok((rt.clone(), SubjectType::RefreshToken)),
             SubjectKind::IdToken => {
-                let ahead = self.ahead(g)?;
-                let t = match idjag::refresh(params, rt, self.timeout) {
-                    Ok(t) => t,
-                    Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
-                        return Err(self.revoke_dead(g, "the refresh token is no longer good"));
-                    }
-                    Err(r) => {
-                        self.keep_ahead(g, ahead);
-                        return Err(refuse(
-                            unavailable(&r),
-                            format!("{}: refresh: {r}", idp.name),
-                        ));
-                    }
-                };
-                match &t.refresh_token {
-                    Some(new) => self.rotate(g, rt, new, ahead)?,
-                    None => self.keep_ahead(g, ahead),
-                }
-                self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
-                let id = t.id_token.ok_or_else(|| {
+                let id = self.fresh_id_token(idp, params, g, rt)?.ok_or_else(|| {
                     refuse(
                         Code::IdpNoIdTokenOnRefresh,
                         format!(
@@ -2858,6 +3159,78 @@ impl Delegation {
                 })?;
                 Ok((id, SubjectType::IdToken))
             }
+        }
+    }
+
+    /// A fresh ID token from a `refresh_token` grant with no `scope`, made
+    /// under the grant's lock its caller holds: a rotated refresh token is
+    /// kept before anything else, and the grant proved alive. `None` when
+    /// the IdP returned no ID token.
+    fn fresh_id_token(
+        &self,
+        idp: &Idp,
+        params: &OAuth2Params,
+        g: &mut Grant,
+        rt: &mut String,
+    ) -> Result<Option<String>, DelegationError> {
+        let ahead = self.ahead(g)?;
+        let t = match idjag::refresh(params, rt, self.timeout) {
+            Ok(t) => t,
+            Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
+                return Err(self.revoke_dead(g, "the refresh token is no longer good"));
+            }
+            Err(r) => {
+                self.keep_ahead(g, ahead);
+                return Err(refuse(
+                    unavailable(&r),
+                    format!("{}: refresh: {r}", idp.name),
+                ));
+            }
+        };
+        match &t.refresh_token {
+            Some(new) => self.rotate(g, rt, new, ahead)?,
+            None => self.keep_ahead(g, ahead),
+        }
+        self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
+        Ok(t.id_token)
+    }
+
+    /// The approval a `via: ciba` firing mints with at `grant`, when
+    /// `scope` is one: `Err` while it has none — `ciba_required` when it
+    /// has not asked its person yet or its request waits on their answer,
+    /// else `subject_expired`, for a firing asks once.
+    fn approval(
+        &self,
+        scope: Option<&str>,
+        grant: &Grant,
+    ) -> Result<Option<(String, u64)>, DelegationError> {
+        let Some(sid) = scope else {
+            return Ok(None);
+        };
+        let who = grant.principal.display();
+        match self.firing_subject(sid, &grant.grant_id, now_ms() / 1000) {
+            unattended::FiringSubject::Approved(t, exp) => Ok(Some((t, exp))),
+            unattended::FiringSubject::Asked => Err(refuse(
+                Code::SubjectExpired,
+                format!(
+                    "this firing's approval by {who} at {} has expired, was refused, or was lost to a restart, and a firing asks its person once",
+                    grant.idp
+                ),
+            )),
+            unattended::FiringSubject::Unasked => Err(refuse(
+                Code::CibaRequired,
+                format!(
+                    "this firing has not asked {who} at {} yet: they are asked on their own device, and the call waits",
+                    grant.idp
+                ),
+            )),
+            unattended::FiringSubject::Asking => Err(refuse(
+                Code::CibaRequired,
+                format!(
+                    "this firing's request to {who} at {} waits on their answer, and the call waits on it too",
+                    grant.idp
+                ),
+            )),
         }
     }
 
@@ -3061,6 +3434,7 @@ impl Delegation {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&g.grant_id);
         self.purge(&g.grant_id);
+        self.drop_hint(&g.grant_id);
         self.audit(
             "delegation.revoked",
             "revoked",
@@ -3127,7 +3501,11 @@ impl Delegation {
     }
 
     fn call_inner(&self, c: &Call<'_>) -> Result<::mcp::wire::CallToolResult, DelegationError> {
-        let Admitted { grant, .. } = self.admit(c.acting, c.server)?;
+        let Admitted { grant, who, .. } = self.admit(c.acting, c.server)?;
+        // The firing the call acts for is the one it was admitted as, to the
+        // end: never looked up again by its session id, which a firing that
+        // ends meanwhile no longer answers to.
+        let firing = who.firing;
         let s = self
             .servers
             .get(c.server)
@@ -3146,9 +3524,10 @@ impl Delegation {
             return Err(refuse(Code::ResourceFault, why));
         }
         self.confirm(s)?;
-        let (_, entry) = self.entry(c.server, &grant.grant_id, &scopes);
+        let scope = unattended::ciba_sid(firing.as_ref());
+        let (_, entry) = self.entry(c.server, &grant.grant_id, &scopes, scope);
         for _attempt in 0..2 {
-            self.token(s, &grant, &scopes, &entry, c, true)?;
+            self.token(s, &grant, &scopes, &entry, c, firing.as_ref(), true)?;
             *entry.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let client = match self.client(s, &entry, &grant) {
                 Ok(client) => client,
@@ -3181,6 +3560,18 @@ impl Delegation {
                     "agent/grant".into(),
                     json!(self.handle(&grant.grant_id, c.server)),
                 );
+            }
+            // A firing that ended while its token was got acts for nobody.
+            if let Some(f) = &firing
+                && !self.firing_live(&f.sid)
+            {
+                return Err(refuse(
+                    Code::Revoked,
+                    format!(
+                        "the firing this work acted for ({}) ended before the call was made, and its authority with it",
+                        f.sid
+                    ),
+                ));
             }
             let res = client.call_tool_reaching(c.tool, Some(c.args.clone()), meta);
             let refused = entry
@@ -3297,9 +3688,23 @@ impl Delegation {
             .map(|(k, v)| Ok((k.clone(), resolve_secret(v)?)))
             .collect::<Result<Vec<_>, String>>()
             .map_err(|e| refuse(Code::Config, format!("{}: a header: {e}", s.name)))?;
+        let dpop = if self.dpop_bound(s) {
+            Some(SignerDpop {
+                key: self.dpop_key().map_err(|e| refuse(Code::Config, e))?,
+                nonces: Arc::clone(&self.nonces),
+                scheme: s
+                    .endpoint
+                    .split_once("://")
+                    .map_or("https", |(scheme, _)| scheme)
+                    .to_string(),
+            })
+        } else {
+            None
+        };
         let signer = Arc::new(Signer {
             token: Arc::clone(&entry.token),
             refused: Arc::clone(&entry.refused),
+            dpop,
         });
         let mut client = ::mcp::client::McpClient::connect_signed(
             &s.name,
@@ -3415,7 +3820,10 @@ impl Delegation {
     }
 
     fn list_with_grant(&self, server: &str, who: &Who) -> Result<usize, DelegationError> {
-        let Admitted { grant, .. } = self.admit_who(who.clone(), server)?;
+        let Admitted {
+            grant, who: as_now, ..
+        } = self.admit_who(who.clone(), server)?;
+        let firing = as_now.firing;
         let acting = Acting::new(Some(&who.id), who.session.as_deref());
         let s = self
             .servers
@@ -3426,7 +3834,12 @@ impl Delegation {
             .scope_set("", &ceiling)
             .map_err(|over| refuse(Code::ScopeBeyondCeiling, format!("{server} needs {over:?}")))?;
         self.confirm(s)?;
-        let (_, entry) = self.entry(server, &grant.grant_id, &scopes);
+        let (_, entry) = self.entry(
+            server,
+            &grant.grant_id,
+            &scopes,
+            unattended::ciba_sid(firing.as_ref()),
+        );
         let c = Call {
             server,
             tool: "tools/list",
@@ -3437,7 +3850,7 @@ impl Delegation {
             run: None,
             step: None,
         };
-        self.token(s, &grant, &scopes, &entry, &c, true)?;
+        self.token(s, &grant, &scopes, &entry, &c, firing.as_ref(), true)?;
         let client = self.client(s, &entry, &grant)?;
         let tools = client
             .list_tools()
@@ -3487,7 +3900,8 @@ impl Delegation {
                        "idp_iss": g.idp_iss, "sub": g.sub, "template": g.template,
                        "servers": g.ceilings, "created_ms": g.created_ms, "expires_ms": g.expires_ms,
                        "epoch": g.epoch, "rt_version": g.rt_version, "quota": g.quota,
-                       "bound_by": g.bound_by,
+                       "bound_by": g.bound_by, "unattended": g.unattended,
+                       "ciba_today": g.ciba.as_ref().map(|q| q.at(now_ms()).day_count),
                        "proved_ms": live.0, "used_ms": live.1, "step_up_max_age": live.2})
             })
             .collect()
@@ -3770,6 +4184,7 @@ impl Delegation {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&g.grant_id);
         self.purge(&g.grant_id);
+        self.drop_hint(&g.grant_id);
         self.audit(
             "delegation.revoked",
             "revoked",
@@ -3976,6 +4391,9 @@ impl Delegation {
         })?;
         let fingerprint = who.fingerprint(&claims.iss, &claims.sub);
         let gid = who.typed.grant_id(&idp.cfg.issuer);
+        // Signing in is consenting to the `act_for` workflows that name the
+        // person, as they are now (RFC 0044 §5.12 E).
+        let consented = self.consented(who, idp, &template);
         let lock = self.lock_of(&gid);
         let held = lock.lock().unwrap_or_else(|e| e.into_inner());
         // A grant the signer cannot open now is not taken for none: the
@@ -4005,6 +4423,7 @@ impl Delegation {
                 let over = g.rt_version;
                 g.rt_version += 1;
                 g.bound_by = bound_by.map(str::to_string);
+                g.unattended = consented;
                 self.vault
                     .store(&g, rt, Some(over))
                     .map_err(|e| not_stored(e, Code::Config, "the grant was not kept"))?;
@@ -4049,6 +4468,8 @@ impl Delegation {
                     rt_version: floor.rt_version + 1,
                     quota: Default::default(),
                     bound_by: bound_by.map(str::to_string),
+                    unattended: consented,
+                    ciba: None,
                 };
                 self.vault
                     .store(&g, rt, None)
@@ -4069,14 +4490,20 @@ impl Delegation {
                        "at_idp_error": at_idp.err()}),
             );
         }
+        // The name the person signed in as, for a CIBA request whose IdP
+        // returns no ID token to hint it with.
+        self.keep_hint(&grant, claims.preferred_username.as_deref());
         let now_s = now / 1000;
         self.with_live(&gid, |l| {
             l.proved_ms = now;
-            // A sign-in that meets the step-up asked is the next subject.
-            if l.step_up.is_some() {
+            // A sign-in that meets the step-up asked is the next subject: as
+            // recent as its `max_age`, its `auth_time` said.
+            if let (Some(m), Some(t)) = (l.step_up, claims.auth_time)
+                && auth_time_meets(Some(t), m, l.step_up_at, now_s).is_ok()
+            {
                 l.fresh_id_token = Some(FreshIdToken {
                     token: id_token.to_string(),
-                    auth_time: claims.auth_time.unwrap_or(now_s),
+                    auth_time: t,
                     exp: claims.exp,
                     call: None,
                 });
@@ -4100,6 +4527,12 @@ impl Delegation {
         self.with_live(grant, |l| l.step_up)
     }
 
+    /// When the IdP last asked grant `grant`'s person to sign in again, in
+    /// seconds since the epoch: 0 in this life when it has not.
+    pub fn step_up_at(&self, grant: &str) -> u64 {
+        self.with_live(grant, |l| l.step_up_at)
+    }
+
     /// Start the IdP's device grant at `idp`, for a step-up sign-in.
     pub fn start_device(&self, idp: &str) -> Result<oauth2::DeviceAuth, String> {
         let i = self
@@ -4121,7 +4554,7 @@ impl Delegation {
         gate: &str,
         idp: &str,
         device_code: &str,
-        max_age: u64,
+        (max_age, asked_s): (u64, u64),
     ) -> Result<Option<crate::runtime::stepup::Polled>, String> {
         use crate::runtime::stepup::Polled;
         let i = self
@@ -4137,7 +4570,7 @@ impl Delegation {
             oauth2::PollOutcome::SlowDown => Ok(Some(Polled::SlowDown)),
             oauth2::PollOutcome::Token(t) => {
                 let signed = enrol::verify(self, idp, &t, None).map_err(|e| e.to_string())?;
-                self.stepped_up_by(gate, signed, idp, Some(max_age))
+                self.stepped_up_by(gate, signed, idp, Some(max_age), asked_s)
                     .map(|_| None)
             }
         }
@@ -4208,14 +4641,17 @@ impl Delegation {
 impl Delegation {
     /// A step-up sign-in for gate `gate` at `idp` (RFC 0044 §5.10 L4): the
     /// grant the gate's call needs is held to the same `iss` + `sub`, and
-    /// the sign-in must be as recent as the IdP asked; its fresh ID token is
-    /// then the next mint's subject. The gate's principal.
+    /// the sign-in must be as recent as the IdP asked — after `asked_s`,
+    /// when the gate's record says the IdP asked, where it named no
+    /// `max_age`, a restart included; its fresh ID token is then the next
+    /// mint's subject. The gate's principal.
     pub(crate) fn stepped_up_by(
         &self,
         gate: &str,
         signed: enrol::SignedIn,
         idp: &str,
         max_age: Option<u64>,
+        asked_s: u64,
     ) -> Result<PrincipalRef, String> {
         let (grant, call) = self
             .stepping
@@ -4242,15 +4678,12 @@ impl Delegation {
             .to_string());
         }
         let now_s = now_ms() / 1000;
-        let auth_time = signed.claims.auth_time.unwrap_or(now_s);
-        if let Some(m) = max_age.filter(|m| *m > 0)
-            && auth_time + m < now_s
-        {
-            return Err(format!(
-                "the sign-in at {idp} was {}s ago, and the IdP asked for one within {m}s",
-                now_s.saturating_sub(auth_time)
-            ));
+        let asked_s = asked_s.max(self.with_live(&grant, |l| l.step_up_at));
+        if let Some(m) = max_age {
+            auth_time_meets(signed.claims.auth_time, m, asked_s, now_s)
+                .map_err(|e| format!("the sign-in at {idp}: {e}"))?;
         }
+        let auth_time = signed.claims.auth_time.unwrap_or(now_s);
         // A refresh token the step-up sign-in handed back is the grant's next
         // one, kept one version up under the grant's lock; the one it
         // replaces is revoked at the IdP.
@@ -4372,6 +4805,8 @@ mod tests {
             attribution: Attribution::Sub,
             max_at_age: None,
             trusted_output: false,
+            dpop: cfg::DpopMode::Auto,
+            on_revoked: cfg::OnRevoked::Fail,
             headers: Vec::new(),
             timeout: Duration::from_secs(5),
         }
@@ -4647,6 +5082,8 @@ mod tests {
             rt_version: 1,
             quota: BTreeMap::new(),
             bound_by: bound_by.map(str::to_string),
+            unattended: BTreeMap::new(),
+            ciba: None,
         };
         d.grants
             .lock()
@@ -4796,6 +5233,8 @@ mod tests {
             rt_version: 1,
             quota: BTreeMap::new(),
             bound_by: None,
+            unattended: BTreeMap::new(),
+            ciba: None,
         };
         d.grants
             .lock()
@@ -4837,6 +5276,227 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(code(d.admit(alice, "linear")), Some(Code::Revoked));
         assert!(d.acting_templates(alice).is_none());
+    }
+
+    /// A step-up's sign-in is held to the `max_age` the IdP asked by its ID
+    /// token's `auth_time` (RFC 0044 §5.10 L4): one without it shows
+    /// nothing; one older than `max_age` is too old; with no `max_age` the
+    /// person authenticated after the IdP asked — give or take the clocks.
+    #[test]
+    fn a_step_up_sign_in_is_as_recent_as_the_idp_asked() {
+        assert!(
+            auth_time_meets(None, 300, 1_000, 1_010).is_err(),
+            "no auth_time"
+        );
+        assert!(auth_time_meets(Some(1_000), 300, 900, 1_200).is_ok());
+        let old = auth_time_meets(Some(800), 300, 900, 1_200).unwrap_err();
+        assert!(old.contains("400s ago"), "{old}");
+        assert!(
+            auth_time_meets(Some(950), 0, 1_000, 1_010).is_ok(),
+            "within the skew"
+        );
+        let before = auth_time_meets(Some(500), 0, 1_000, 1_010).unwrap_err();
+        assert!(before.contains("before the IdP asked"), "{before}");
+    }
+
+    /// A firing acts for its person only as their grant consents (RFC 0044
+    /// §5.12 E): a sign-in consents to the `act_for` workflows naming them
+    /// whose `via` the template allows, at their digests then; a firing of
+    /// another digest is `unattended_suspended`, and of a `via` the template
+    /// no longer allows `delegation_not_permitted`; a run a firing's work
+    /// started, a firing of a workflow declaring no `act_for` for them, is
+    /// `unattended_suspended` too; a turn it handed on by message acts for
+    /// nobody. A firing's work acts as its person while the firing lives
+    /// and for nobody once it ended; a `via: ciba` firing has no approval
+    /// until it asks, its calls wait while its request does — one request
+    /// waiting per person and workflow — and it asks once. A call admitted
+    /// as a firing that ended meanwhile has no approval, never the grant's
+    /// own subject.
+    #[test]
+    fn a_firing_acts_only_as_its_persons_consent_says() {
+        use crate::config::settings::delegation::Via;
+        use crate::engine::model::ActForPrincipal;
+        let dir = tempfile::tempdir().unwrap();
+        let with = |unattended: &str| {
+            let mut t = template("people", "oidc", &["issues:read", "issues:write"]);
+            t["unattended"] = json!(unattended);
+            people(dir.path(), json!({"templates": [t]}))
+        };
+        let book = Arc::new(Book::default());
+        book.add("a", oidc("00u1alice"), None);
+        let d = supervisor(&with("ciba"), Arc::clone(&book));
+        hold(&d, "a", "00u1alice", "people", None);
+        let alice = ActForPrincipal {
+            source: "oidc".into(),
+            issuer: Some(ISS.into()),
+            sub: Some("00u1alice".into()),
+            id: None,
+        };
+        let decl = |digest: &str, via| unattended::ActForDecl {
+            workflow: "nightly".into(),
+            digest: digest.into(),
+            via,
+            principal: alice.clone(),
+        };
+        d.act_fors(vec![decl("d1", Via::Ciba), {
+            let mut other = decl("d9", Via::Standing);
+            other.workflow = "weekly".into();
+            other
+        }]);
+        let who = d.who(Acting::new(None, Some("a"))).unwrap();
+        let idp = d.providers.get("okta").unwrap();
+        let t = d.template_for(&who, "okta").unwrap();
+        let consented = d.consented(&who, idp, &t);
+        assert_eq!(
+            consented,
+            [("nightly".to_string(), "d1".to_string())].into(),
+            "standing is not ciba's to consent to"
+        );
+        assert_eq!(
+            code(d.firing_ready(&decl("d1", Via::Ciba))),
+            Some(Code::UnattendedSuspended),
+            "nothing consented yet"
+        );
+        let gid = who.typed.grant_id(ISS);
+        d.grants.lock().unwrap().get_mut(&gid).unwrap().unattended = consented;
+        assert_eq!(
+            d.firing_ready(&decl("d1", Via::Ciba)).unwrap(),
+            who.typed.display()
+        );
+        assert_eq!(
+            code(d.firing_ready(&decl("d2", Via::Ciba))),
+            Some(Code::UnattendedSuspended),
+            "a changed digest"
+        );
+        // The firing's work acts as the person, held to the same consent.
+        let firing = |sid: &str, digest: &str| unattended::Firing {
+            sid: sid.into(),
+            run: format!("run-{sid}"),
+            workflow: "nightly".into(),
+            digest: digest.into(),
+            via: Via::Ciba,
+        };
+        d.firing_started(firing("ua_1", "d1"), alice.clone(), &[]);
+        d.firing_started(firing("ua_2", "d2"), alice.clone(), &[]);
+        let at = |sid: &str| d.admit(Acting::new(None, Some(sid)), "linear");
+        let ok = at("ua_1").unwrap();
+        assert_eq!(ok.who.id, who.id);
+        assert_eq!(
+            ok.who.firing.as_ref().map(|f| f.run.as_str()),
+            Some("run-ua_1")
+        );
+        assert_eq!(code(at("ua_2")), Some(Code::UnattendedSuspended));
+        assert!(d.session_live("ua_1"));
+        // A run its work started: a firing of a workflow with no act_for.
+        d.firing_started(
+            unattended::Firing {
+                workflow: "body".into(),
+                ..firing("ua_4", "b1")
+            },
+            alice.clone(),
+            &[],
+        );
+        let e = at("ua_4").err().unwrap();
+        assert_eq!(e.code, Code::UnattendedSuspended);
+        assert!(e.message.contains("declares no act_for"), "{e}");
+        assert_eq!(
+            code(at(crate::engine::run::HANDED_ON_SID)),
+            Some(Code::NoDelegation)
+        );
+        assert_eq!(
+            crate::runtime::reactor::turn_session(Some("ua_1".into())).as_deref(),
+            Some(crate::engine::run::HANDED_ON_SID),
+            "a turn its work started by message"
+        );
+        assert_eq!(
+            crate::runtime::reactor::turn_session(Some("s1".into())).as_deref(),
+            Some("s1")
+        );
+        // No approval before asking; while the request waits the call waits
+        // on it — and another firing of the workflow for her asks nothing
+        // meanwhile; once the wait closed, none: a firing asks once.
+        let g = d.grants.lock().unwrap().get(&gid).cloned().unwrap();
+        assert_eq!(code(d.approval(Some("ua_1"), &g)), Some(Code::CibaRequired));
+        d.ciba_asking("ua_1", &gid).unwrap();
+        assert_eq!(code(d.approval(Some("ua_1"), &g)), Some(Code::CibaRequired));
+        d.firing_started(firing("ua_3", "d1"), alice.clone(), &[]);
+        assert_eq!(
+            code(d.ciba_asking("ua_3", &gid)),
+            Some(Code::BudgetExhausted)
+        );
+        assert_eq!(d.firings_asking(), vec![("ua_1".to_string(), gid.clone())]);
+        d.not_asking("ua_1", &gid);
+        assert_eq!(
+            code(d.approval(Some("ua_1"), &g)),
+            Some(Code::SubjectExpired)
+        );
+        d.ciba_asking("ua_3", &gid).unwrap();
+        assert_eq!(
+            d.ciba_scope(Acting::new(None, Some("ua_1"))).as_deref(),
+            Some("ua_1")
+        );
+        // A call admitted as firing ua_3 keeps it: once the firing ended, it
+        // is no firing's by its session id, and still has no approval.
+        let admitted = at("ua_3").unwrap();
+        d.firing_ended("ua_3");
+        let kept = unattended::ciba_sid(admitted.who.firing.as_ref());
+        assert_eq!(kept, Some("ua_3"));
+        assert_eq!(d.ciba_scope(Acting::new(None, Some("ua_3"))), None);
+        assert_eq!(code(d.approval(kept, &g)), Some(Code::SubjectExpired));
+        // The template no longer allows it: refused as that.
+        d.reload(&with("never"));
+        assert_eq!(code(at("ua_1")), Some(Code::DelegationNotPermitted));
+        // Ended, the firing acts for nobody.
+        d.firing_ended("ua_1");
+        assert_eq!(code(at("ua_1")), Some(Code::Revoked));
+        assert!(!d.session_live("ua_1"));
+    }
+
+    /// A step-up sign-in is held to when the IdP asked as its gate's record
+    /// says (RFC 0044 §5.10 L4): where the IdP named no `max_age`, one of an
+    /// authentication from before the ask is refused although this life
+    /// never saw the ask — a device grant a restart resumed — and one after
+    /// it is the call's.
+    #[test]
+    fn a_step_up_is_held_to_the_ask_its_gate_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = Arc::new(Book::default());
+        book.add("a", oidc("00u1alice"), None);
+        let d = supervisor(
+            &people(
+                dir.path(),
+                json!({"templates": [template("people", "oidc", &["issues:read"])]}),
+            ),
+            Arc::clone(&book),
+        );
+        let g = hold(&d, "a", "00u1alice", "people", None);
+        assert_eq!(d.step_up_at(&g.grant_id), 0, "a new life saw no ask");
+        let now = now_ms() / 1000;
+        let signed = |auth_time: u64| enrol::SignedIn {
+            claims: idjag::IdClaims {
+                auth_time: Some(auth_time),
+                ..claims("00u1alice")
+            },
+            id_token: "it".into(),
+            refresh_token: None,
+        };
+        d.stepping_up(
+            "g1",
+            &g.grant_id,
+            CallOf {
+                server: "linear".into(),
+                unit: "r".into(),
+                step: Some("s".into()),
+            },
+        );
+        let old = d
+            .stepped_up_by("g1", signed(now - 3_600), "okta", Some(0), now - 60)
+            .unwrap_err();
+        assert!(old.contains("before the IdP asked"), "{old}");
+        assert!(
+            d.stepped_up_by("g1", signed(now), "okta", Some(0), now - 60)
+                .is_ok()
+        );
     }
 
     /// A reload takes the templates, pins and first binding at once: a

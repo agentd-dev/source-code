@@ -23,6 +23,14 @@
 # work may post to it — their template lists it — and its first post in a
 # run asks them, by the operator's rule below.
 #
+# Every Monday the weekly summary runs for Alice with nobody there: each
+# firing asks her to approve it on her phone (Okta CIBA, which needs an Okta
+# Custom Authenticator), and reads her Linear issues with that approval
+# alone. She consented to the workflow as it is when she last signed in; an
+# edit to it suspends its firings until she signs in again. A grant revoked
+# mid-run makes a Linear step wait for its person to sign in again
+# (`on_revoked: ask`) rather than fail.
+#
 # The keys are files the deployment mounts under /run/agentd/ — never the
 # environment, which agentd refuses for a delegation key. On a host other than
 # this one, listen on https:// with `a2a.url` and `a2a.tls`. Several people
@@ -72,6 +80,8 @@ identity:
         key: "{{secret-file:/run/agentd/okta-agent-key.pem}}"
         kid: agentd-2026-10
       sign_in: {grants: [authorization_code, device], scopes: [openid, offline_access]}
+      # How a firing asks its person on their own device; Okta polls only.
+      ciba: {enabled: true, request_expiry: 300s, per_day: 4}
   delegation:
     seal_key: "{{secret-file:/run/agentd/delegation-seal}}"
     # A gate is approved from a session whose own IdP sign-in is this recent.
@@ -90,6 +100,9 @@ identity:
         # unless listed here.
         agent_mode_servers: [team-chat]
         budget: {per_minute: 4}
+        # Firings of an act_for workflow naming one of these people may act
+        # for them, each approved on their own device; none may write.
+        unattended: ciba
       - name: laptops
         principals: {source: device}
         idp: okta
@@ -114,7 +127,21 @@ mcp:
           kid: agentd-ras-1
         scopes: ["issues:read"]
         tool_scopes: {create_issue: ["issues:write"]}
+        # A workflow step whose grant is gone waits for its person.
+        on_revoked: ask
     - name: team-chat
       endpoint: https://chat-mcp.acme.example/mcp
       tags: {"*": [egress]}
       auth: {kind: static, token: "{{secret-file:/run/agentd/chat-token}}"}
+
+workflows:
+  - name: weekly-summary
+    # Acts for Alice, her own IdP subject: only this configuration may say so.
+    act_for:
+      principal: {source: oidc, issuer: https://acme.okta.com, sub: 00u1alice}
+      via: ciba
+    concurrency: {max_runs: 1, on_overflow: drop}
+    steps:
+      tick: {kind: schedule, every: 168h}
+      issues: {kind: mcp.tool, depends_on: [tick], server: linear, tool: list_issues, args: {}}
+      done: {kind: finish, depends_on: [issues], output: "{{steps.issues.output}}"}

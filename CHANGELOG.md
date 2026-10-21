@@ -1618,6 +1618,94 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   inbound_list, inbound_revoke}`; `a2a::INBOUND_SID_PREFIX`;
   `a2a::login::SignIns::end_where`; `Resolver::token_principal` is public;
   `mcp::a2a_client::{PeerWait, Follow}`.
+- Work nobody is there for (RFC 0044 §7.P3b, `xaa`): a workflow's
+  `act_for: {principal, via}` names the person its `schedule`, `loop` and
+  `once` firings act for with nobody there — `via: ciba`, each firing
+  approved by them on their own device, or `via: standing`, with their
+  grant and nobody asked — as their template's `unattended: never | ciba |
+  standing` allows. Only the operator's own configuration declares one;
+  beside a `webhook`, `stream`, `correlate`, `subscribe`, `signal`, `event`
+  or `a2a` start, or a webhook wait, it is refused at load
+  (`act_for_trigger_not_allowed`), and `standing` at a `profile: okta` IdP
+  needs `allow_against_idp_guidance: true` (`standing_against_idp_guidance`).
+  Signing in consents to every `act_for` workflow naming the person, at its
+  definition digest then; a firing of another digest, or for a person with
+  no usable grant, starts no run (`start.unattended.suspended`,
+  `unattended_suspended`) until they sign in again. A firing's work acts
+  through an authority of its own that ends with its run — a call on its
+  way included, which then mints nothing and is not made — is tainted and
+  unattended, and is refused a delegated tool tagged `egress` unless the
+  template lists it in `unattended_tools` (`delegation.unattended.refused`);
+  every mint it makes is recorded `unattended`, with its `via`. A run its
+  work starts — a `workflow` step, `workflow.run`, or a signal or message
+  that starts one — is a firing of its own for the same person
+  (`start.unattended.carried`), acting for them only where its own
+  workflow declares an `act_for` naming them that they consented to; a
+  conversation turn the work starts by message acts with no one's grant.
+- OpenID CIBA Core 1.0 in poll mode (`identity.providers.<name>.ciba:
+  {enabled, request_expiry, per_day}`): a `via: ciba` firing's first
+  delegated call at its person's IdP waits while agentd asks them — `scope`
+  `openid` alone, an ID token fresh from a refresh as the hint, or the
+  `preferred_username` they enrolled with, kept sealed under their personal
+  key, where the IdP returns none; agentd's own binding message; the expiry
+  as `requested_expiry`, or `request_expiry` under `profile: okta` — and
+  polls through `authorization_pending` and `slow_down`. The approval's ID
+  token must name the grant's own `iss` and `sub` (`binding_mismatch`
+  otherwise) and is the subject of that firing's exchanges alone, in
+  memory; its tokens are pooled for the firing alone. A firing asks once at
+  a grant — its run's record says so before the request is sent; another
+  call it makes while the request waits waits on the same request, and a
+  restart fails it closed — at most one request per person and workflow
+  waits, another firing asking once that wait closes, and at most
+  `per_day` (10) a day are sent (`budget_exhausted`); a denial or an expiry
+  is `ciba_denied`; a refresh token the IdP issued with an approval is
+  revoked when the run ends (`delegation.ciba`) — held in memory alone, a
+  restart before then leaves it alive at the IdP until it expires.
+- `mcp.servers[].auth.on_revoked: ask` (refused at load until now): a
+  workflow step whose grant was revoked or expired, or whose run's session
+  ended, waits for its person — among their gates, the run's task in
+  `auth-required` — for at most `identity.delegation.consent_timeout`, and
+  is made again with no message once they enrol again, or once a live
+  session of theirs holds a proof of the identity the grant is bound to
+  (the run moves to it, `delegation.session.rebound`). A call that waited
+  before any rule was consulted meets the operator's rules and the person's
+  consent when it is made again. A model's call, and work that read outside
+  text or that nobody is there for, fails `revoked` as before
+  (`delegation.reenrol`).
+- DPoP on a delegated server's authorization-server and MCP legs (RFC 9449,
+  `mcp.servers[].auth.dpop: auto | off`): where the server's RFC 9728
+  metadata and its authorization server's both advertise ES256 proofs, the
+  access token is bound to a key agentd makes in memory — the redemption
+  carries a proof, sent once more with a `use_dpop_nonce` nonce, and must
+  come back `token_type: DPoP`; each MCP request presents it as `DPoP` with
+  a proof of that request, sent once more with the nonce an MCP server's
+  `use_dpop_nonce` challenge issues. A server that takes bound tokens alone
+  (`dpop_bound_access_tokens_required`) is refused before anything is
+  minted where agentd cannot bind one.
+- Fourteen `ema` conformance checks of P3's second part, and the mock IdP's
+  CIBA (`/bc/authorize` and the poll: `ciba`, `ciba_pending`,
+  `ciba_slow_down`, `ciba_expires_in`, `ciba_sub`, `ciba_refresh_token`),
+  sign-in recency (`signin_auth_time`), a refresh with no ID token
+  (`refresh_id_token`), a slow refresh (`slow_refresh_ms`), and DPoP at its
+  authorization server and MCP server (`dpop`, `prm_dpop`, `dpop_required`,
+  `dpop_nonce`, `mcp_dpop_nonce`).
+- `agentd-core`: `auth::ciba::{Ask, Hint, Started, Polled, authorize,
+  poll, binding_message}`; `auth::dpop` (from `companies::dpop`, with
+  `TYP` and `ALG`); `auth::idjag::IdpMeta::ciba_endpoint`,
+  `RasMeta::dpop`, `Redeemed::dpop`, `wire::USE_DPOP_NONCE`;
+  `auth::challenge::ResourceMetadata::{dpop_signing_alg_values_supported,
+  dpop_bound_access_tokens_required}`; `config::settings::delegation::
+  {Ciba, Unattended, Via, DpopMode, Template::{unattended, unattended_tools,
+  allow_against_idp_guidance}, Provider::ciba, document_act_for}`,
+  `Auth::dpop`; `delegation::unattended::{ActForDecl, Firing, CibaOutcome}`,
+  `Who::firing`, `Person::rule`, `Code::{CibaRequired, CibaDenied,
+  UnattendedSuspended}`, `Delegation::{act_fors, firing_ready,
+  firing_started, firing_ended, firing_live, firing_at, ciba_asking,
+  firings_asking, not_asking, start_ciba, poll_ciba, rebind, step_up_at}`,
+  `SessionBook::sessions`, `vault::Grant::{unattended, ciba}`;
+  `engine::model::{ActFor, ActForPrincipal, ACT_FOR_STARTS}` and
+  `Workflow::act_for`; `engine::run::{Unattended, UNATTENDED_SID_PREFIX,
+  HANDED_ON_SID}` and `RunState::unattended`.
 
 **Changed.**
 
@@ -2043,6 +2131,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - `detach` or `input` on a `tool` step whose tool is not on an MCP server's
   route is refused at startup.
 
+- A step-up's sign-in must carry `auth_time` and be as recent as the IdP
+  asked: within its `max_age`, or — where it named none — after it asked
+  (OIDC Core §3.1.2.1). A sign-in older than that, or whose ID token
+  carries no `auth_time`, is refused and the call fails `step_up`; before,
+  a missing `auth_time` was read as now, and a `max_age` of 0 asked for
+  nothing. A sign-in with `agentd --login idp:<name>` answers a step-up the
+  same way, and a device-grant step-up a restart resumes is held to the
+  moment its wait record says the IdP asked.
+- **Breaking:** `agentd-core`'s `companies::dpop` is `auth::dpop`, under
+  the `oauth` feature, and serves delegated servers too;
+  `companies::wire::DPOP_TYP` is `auth::dpop::TYP`.
+  `auth::idjag::redeem` takes the DPoP key and nonces a bound redemption
+  is proved with, and `check_redeemed` whether one was.
 - **Breaking:** a step-up's sign-in gate puts its task in
   `TASK_STATE_AUTH_REQUIRED`, not `TASK_STATE_INPUT_REQUIRED`: the person
   signs in out of band and the call goes on with no message. Its fresh ID

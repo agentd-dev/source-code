@@ -39,6 +39,8 @@ pub mod env; // system-prompt data + the default template
 pub mod events;
 #[cfg(feature = "exec")]
 pub mod exec; // guarded local command runner behind the `exec` tool (default-OFF)
+#[cfg(feature = "xaa")]
+pub(crate) mod firings; // act_for firings, and the waits on a person no one else decides (RFC 0044 M4)
 pub mod freshness; // §7.7 signed-instruction freshness watch: re-fetch + refuse-on-stale
 pub mod goal;
 pub mod http_node;
@@ -1411,6 +1413,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     #[cfg(feature = "xaa")]
     {
         rt.delegation_wire();
+        rt.restore_firings();
         rt.rebuild_consents();
         #[cfg(feature = "a2a")]
         rt.end_restored_admissions();

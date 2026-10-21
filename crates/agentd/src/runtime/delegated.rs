@@ -767,6 +767,11 @@ impl Runtime {
         passed: super::reactor::Passed,
     ) -> Option<ToolOutcome> {
         let d = self.delegation.clone()?;
+        // A firing sends nothing off the box with the person's grant unless
+        // their template lists the very tool (RFC 0044 T18).
+        if let Some(refused) = self.unattended_egress(&d, caller, name) {
+            return Some(refused);
+        }
         let tags = self
             .registry
             .tags_of(std::slice::from_ref(&name.to_string()));
@@ -1016,7 +1021,7 @@ impl Runtime {
             "scope": scope, "run": caller.run, "step": caller.step, "context": caller.ctx,
             "rule": rule, "principal": person, "workflow": workflow,
             "document_sourced": self.document_sourced(caller, server.clone()),
-            "unattended": self.unattended(caller.principal.as_deref()),
+            "unattended": self.unattended(caller),
         });
         if let (Value::Object(r), Value::Object(f)) = (&mut rendered, facts.to_value()) {
             r.extend(f);
@@ -1613,6 +1618,20 @@ impl Runtime {
                 true,
             );
         }
+        // The calls that waited on this gate's request end with it.
+        let followers: Vec<String> = self
+            .consents
+            .iter()
+            .filter(|(_, f)| {
+                f.signin
+                    .as_ref()
+                    .is_some_and(|s| s.follows.as_deref() == Some(id))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for f in followers {
+            self.close_consent_as(&f, via, code, why);
+        }
     }
 
     /// `principal` is being forgotten (§6.4): every gate open for them is
@@ -1748,20 +1767,23 @@ impl Runtime {
         // `authorize` one ended with the session it was for.
         #[cfg(feature = "a2a")]
         {
+            use super::stepup::How;
             let mut ended = Vec::new();
             for (id, w, principal, at) in signins {
                 let rebuilt = self.rebuild_signin(&id, &w, &principal, at);
-                let authorize = rebuilt
-                    .as_ref()
-                    .is_none_or(|s| s.how == super::stepup::How::Authorize);
+                let ends = match rebuilt.as_ref().map(|s| s.how) {
+                    None => Some(How::Authorize),
+                    Some(h @ (How::Authorize | How::Ciba)) => Some(h),
+                    Some(How::Device | How::Reenrol) => None,
+                };
                 if let Some(g) = self.consents.get_mut(&id) {
                     g.signin = rebuilt;
                 }
-                if authorize {
-                    ended.push(id);
+                if let Some(h) = ends {
+                    ended.push((id, h));
                 }
             }
-            self.end_rebuilt_authorize(&ended);
+            self.end_rebuilt_signins(&ended);
         }
         #[cfg(not(feature = "a2a"))]
         let _ = signins;
@@ -1841,19 +1863,44 @@ impl Runtime {
                 );
                 // The IdP wants the person to sign in again: the call waits
                 // on a step-up gate rather than failing (`runtime::stepup`).
+                // A firing that has not asked its person waits on their
+                // approval; a workflow step whose grant is gone, at a server
+                // that says `on_revoked: ask`, may wait for them to sign in
+                // again (`runtime::firings`).
                 #[cfg(feature = "a2a")]
                 if let Err(e) = &res
-                    && e.code == crate::delegation::Code::StepUp
                     && let Some(caller) = step_up_caller.take()
                 {
-                    let _ = tx.send(Event::StepUpAsked(Box::new(super::stepup::StepUpAsk {
-                        caller,
-                        name: name.clone(),
-                        server: server.clone(),
-                        args: step_up_args.take().unwrap_or(Value::Null),
-                        error: format!("{name}: {e}"),
-                    })));
-                    return;
+                    use crate::config::settings::delegation::OnRevoked;
+                    use crate::delegation::Code;
+                    let gone = matches!(e.code, Code::Revoked | Code::NeedsReenroll)
+                        && d.servers
+                            .get(&server)
+                            .is_some_and(|s| s.on_revoked == OnRevoked::Ask);
+                    let mut ask = |caller| {
+                        Box::new(super::stepup::StepUpAsk {
+                            caller,
+                            name: name.clone(),
+                            server: server.clone(),
+                            args: step_up_args.take().unwrap_or(Value::Null),
+                            error: format!("{name}: {e}"),
+                        })
+                    };
+                    match e.code {
+                        Code::StepUp => {
+                            let _ = tx.send(Event::StepUpAsked(ask(caller)));
+                            return;
+                        }
+                        Code::CibaRequired => {
+                            let _ = tx.send(Event::CibaAsked(ask(caller)));
+                            return;
+                        }
+                        _ if gone => {
+                            let _ = tx.send(Event::Reenrol(ask(caller)));
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 let (result, is_error) = match res {
                     Ok(r) => {

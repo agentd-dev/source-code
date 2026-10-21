@@ -60,6 +60,12 @@ pub const PER_MINUTE: u32 = 4;
 /// How many consent gates may open for one person a minute, by default
 /// (RFC 0044 §5.10 rule 6).
 pub const CONSENT_PER_MINUTE: u32 = 10;
+/// How long a CIBA request waits for its person by default (RFC 0044
+/// §5.10), and the longest it may.
+pub const CIBA_REQUEST_EXPIRY: std::time::Duration = std::time::Duration::from_secs(300);
+pub const CIBA_REQUEST_EXPIRY_MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// How many CIBA requests one person is sent a day by default (§5.12 E).
+pub const CIBA_PER_DAY: u32 = 10;
 
 /// `identity.providers.<name>`: an enterprise IdP agentd is a client of.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -97,6 +103,33 @@ pub struct Provider {
     /// listed.
     #[serde(default)]
     pub equivalent_issuers: Vec<String>,
+    /// OpenID CIBA in poll mode at this IdP (RFC 0044 §2.8): how a firing of
+    /// an `act_for` workflow with `via: ciba` asks its person to approve it
+    /// on their own device.
+    #[serde(default)]
+    pub ciba: Ciba,
+}
+
+/// `identity.providers.<name>.ciba`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Ciba {
+    pub enabled: bool,
+    /// How long a request waits for the person; default 300s. Sent as
+    /// `request_expiry` under `profile: okta`, else as CIBA Core's
+    /// `requested_expiry`.
+    pub request_expiry: Option<Dur>,
+    /// How many requests one person is sent a day; default 10.
+    pub per_day: Option<u32>,
+}
+
+impl Ciba {
+    pub fn request_expiry(&self) -> std::time::Duration {
+        self.request_expiry.map_or(CIBA_REQUEST_EXPIRY, |d| d.0)
+    }
+    pub fn per_day(&self) -> u32 {
+        self.per_day.unwrap_or(CIBA_PER_DAY)
+    }
 }
 
 /// A provider's quirks pack.
@@ -366,6 +399,21 @@ pub struct Template {
     /// admitted by no template. Empty, every client the issuer allows.
     #[serde(default)]
     pub clients: Vec<String>,
+    /// Whether a firing of an `act_for` workflow may act with these grants
+    /// with nobody there (RFC 0044 §5.12 E): `never` (the default); `ciba`,
+    /// each firing approved by the person on their own device; `standing`,
+    /// the grant used with nobody asked — which allows `via: ciba` too.
+    #[serde(default)]
+    pub unattended: Unattended,
+    /// The delegated tools, `<server>.<tool>`, a firing acting with nobody
+    /// there may call when they are tagged `egress`: every other is refused
+    /// (T18).
+    #[serde(default)]
+    pub unattended_tools: Vec<String>,
+    /// `unattended: standing` at a `profile: okta` IdP, which Okta advises
+    /// against (XAA is for work a user started): refused without this.
+    #[serde(default)]
+    pub allow_against_idp_guidance: bool,
 }
 
 impl Template {
@@ -373,9 +421,64 @@ impl Template {
         self.ttl.map_or(MAX_TTL, |d| d.0.min(MAX_TTL))
     }
 
+    /// Whether this template lets a firing act `via` with nobody there.
+    pub fn allows_unattended(&self, via: Via) -> bool {
+        match (self.unattended, via) {
+            (Unattended::Never, _) | (Unattended::Ciba, Via::Standing) => false,
+            (Unattended::Ciba, Via::Ciba) | (Unattended::Standing, _) => true,
+        }
+    }
+
     /// Whether an operator may answer this template's consent gates.
     pub fn operator_approves(&self) -> bool {
         self.approvers.contains(&Approver::Operator)
+    }
+}
+
+/// `templates[].unattended`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unattended {
+    #[default]
+    Never,
+    Ciba,
+    Standing,
+}
+
+impl Unattended {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unattended::Never => "never",
+            Unattended::Ciba => "ciba",
+            Unattended::Standing => "standing",
+        }
+    }
+}
+
+/// How a firing of an `act_for` workflow acts for its person (RFC 0044
+/// M4): `ciba`, approved by them for that firing alone; `standing`, with
+/// the grant's refresh token and nobody asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    Ciba,
+    Standing,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Ciba => "ciba",
+            Via::Standing => "standing",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Via> {
+        match s {
+            "ciba" => Some(Via::Ciba),
+            "standing" => Some(Via::Standing),
+            _ => None,
+        }
     }
 }
 
@@ -525,14 +628,34 @@ pub enum IdJagReuse {
     Never,
 }
 
-/// `auth.on_revoked`.
+/// `auth.on_revoked`: what a workflow step's delegated call does when the
+/// grant it needs was revoked or has expired, or the session the run acts
+/// through has ended (RFC 0044 §5.12 C).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnRevoked {
+    /// The step fails `revoked` or `needs_reenroll`.
     #[default]
     Fail,
-    /// Suspend and ask the person to enrol again: P2.
+    /// The step waits — up to `identity.delegation.consent_timeout` — for
+    /// the person to enrol again, or to sign in again through a live
+    /// session, and is then made again; never for a tainted run or a
+    /// model's call.
     Ask,
+}
+
+/// `auth.dpop`: DPoP (RFC 9449) on a delegated server's
+/// authorization-server and MCP legs (RFC 0044 T23).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DpopMode {
+    /// Bind the access token to a key of agentd's when the server's
+    /// protected-resource metadata and its authorization server's metadata
+    /// both advertise ES256 proofs.
+    #[default]
+    Auto,
+    /// Never: a server whose metadata requires DPoP-bound tokens is refused.
+    Off,
 }
 
 /// `auth.subject` of `grant: token_exchange`: what is exchanged.
@@ -755,6 +878,7 @@ pub const SERVER_AUTH_OPERATOR_ONLY: &[&str] = &[
     "max_at_age",
     "trusted_output",
     "subject",
+    "dpop",
 ];
 
 /// What a served document's configuration `fragment` sets that only the
@@ -1126,6 +1250,18 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 p.issuer
             ));
         }
+        if let Some(e) = p.ciba.request_expiry
+            && (e.0 < std::time::Duration::from_secs(1) || e.0 > CIBA_REQUEST_EXPIRY_MAX)
+        {
+            err(format!(
+                "{at}.ciba.request_expiry: between 1s and 1h — how long a request waits for the person"
+            ));
+        }
+        if p.ciba.per_day == Some(0) {
+            err(format!(
+                "{at}.ciba.per_day: 0 would send nobody a request — at least 1"
+            ));
+        }
     }
     // The delegation section.
     match (external, &dl.signer) {
@@ -1364,6 +1500,42 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         ] {
             if v == Some(0) {
                 err(format!("{at}.budget.{field}: 0 would let no mint happen"));
+            }
+        }
+        // Acting with nobody there (RFC 0044 §5.12 E, T18).
+        let provider = s.identity.providers.get(&t.idp);
+        let okta = provider.is_some_and(|p| p.profile == Profile::Okta);
+        match t.unattended {
+            Unattended::Standing if okta && !t.allow_against_idp_guidance => err(format!(
+                "{at}.unattended standing at {:?}, a profile: okta IdP (standing_against_idp_guidance): Okta advises against XAA for work no user started — prefer unattended: ciba, or set allow_against_idp_guidance: true",
+                t.idp
+            )),
+            Unattended::Standing if okta => warn.push(format!(
+                "{at}.unattended standing at {:?}: allowed against Okta's guidance (allow_against_idp_guidance) — every firing acts with the person's refresh token and nobody asked",
+                t.idp
+            )),
+            Unattended::Ciba if provider.is_some_and(|p| !p.ciba.enabled) => err(format!(
+                "{at}.unattended ciba: identity.providers.{}.ciba is not enabled, so no firing could ask the person",
+                t.idp
+            )),
+            _ => {}
+        }
+        if t.allow_against_idp_guidance && t.unattended != Unattended::Standing {
+            err(format!(
+                "{at}.allow_against_idp_guidance is read with unattended: standing alone"
+            ));
+        }
+        if !t.unattended_tools.is_empty() && t.unattended == Unattended::Never {
+            err(format!(
+                "{at}.unattended_tools: the template says unattended: never, so no firing calls them"
+            ));
+        }
+        for tool in &t.unattended_tools {
+            match tool.split_once('.') {
+                Some((srv, name)) if t.servers.contains_key(srv) && !name.is_empty() => {}
+                _ => err(format!(
+                    "{at}.unattended_tools: {tool:?} is no <server>.<tool> of a server the template allows"
+                )),
             }
         }
     }
@@ -1710,9 +1882,9 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 "{at}.auth.tools_file is read with tools_from: file"
             ));
         }
-        if a.on_revoked == Some(OnRevoked::Ask) {
+        if exchange && a.dpop.is_some() {
             err(format!(
-                "{at}.auth.on_revoked: ask suspends the run on a re-enrolment the person starts in a display client, which is the second part of RFC 0044 P3; fail is what is built"
+                "{at}.auth.dpop is for grant: id_jag — DPoP binds the token its authorization server issues for an ID-JAG"
             ));
         }
         // Key reuse between the IdP and this authorization server (T21).
@@ -1769,6 +1941,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 ("max_at_age", a.max_at_age.is_some()),
                 ("trusted_output", a.trusted_output.is_some()),
                 ("subject", a.subject.is_some()),
+                ("dpop", a.dpop.is_some()),
             ] {
                 if set {
                     err(format!(
@@ -1780,6 +1953,121 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
     }
     d.warnings.extend(warn);
+}
+
+/// What the workflows a served document defines — `workflows` — declare
+/// that only the operator may: an `act_for`, which acts for a person with
+/// nobody there (RFC 0044 §5.14). Each named as the document wrote it.
+pub fn document_act_for<'a>(workflows: impl IntoIterator<Item = &'a Value>) -> Vec<String> {
+    workflows
+        .into_iter()
+        .filter(|w| w.get("act_for").is_some())
+        .map(|w| {
+            format!(
+                "workflow {:?}'s act_for",
+                w.get("name").and_then(Value::as_str).unwrap_or("?")
+            )
+        })
+        .collect()
+}
+
+/// Why workflow `name`'s `act_for` may not act for the person it names
+/// (RFC 0044 §5.14): the build; the person — a per-person operator's or a
+/// certificate principal's pinned rule by its `id`, or an IdP subject at a
+/// declared provider; and a template admitting them at that IdP that allows
+/// `via`, with CIBA enabled there for `via: ciba`. The triggers and the
+/// device principal are the workflow parser's to refuse.
+pub(crate) fn act_for_refusals(
+    s: &Settings,
+    name: &str,
+    a: &crate::engine::model::ActFor,
+) -> Vec<String> {
+    let at = format!("workflow {name:?}: act_for");
+    if !cfg!(feature = "xaa") {
+        return vec![format!(
+            "{at} acts for an enrolled person, which needs the `xaa` feature (build with --features xaa)"
+        )];
+    }
+    let p = &a.principal;
+    let found = match p.source.as_str() {
+        "operator" | "x509" => {
+            let rule = pinned(s).find(|r| {
+                r.id.as_deref() == p.id.as_deref()
+                    && (p.source == "operator") == r.matcher.uid.is_some()
+            });
+            match rule {
+                Some(r) => r.idp_subject.as_ref().and_then(|pin| {
+                    let (idp, _) = s
+                        .identity
+                        .providers
+                        .iter()
+                        .find(|(_, v)| v.issuer == pin.iss)?;
+                    Some((idp.clone(), r.role, r.labels.clone()))
+                }),
+                None => {
+                    return vec![format!(
+                        "{at}.principal: no a2a.principals rule pins the {} principal {:?} — a rule with match.{} and an idp_subject",
+                        p.source,
+                        p.id.as_deref().unwrap_or_default(),
+                        if p.source == "operator" {
+                            "uid"
+                        } else {
+                            "spki"
+                        }
+                    )];
+                }
+            }
+        }
+        _ => s
+            .identity
+            .providers
+            .iter()
+            .find(|(_, v)| Some(v.issuer.as_str()) == p.issuer.as_deref())
+            .map(|(idp, _)| (idp.clone(), Role::User, BTreeMap::new())),
+    };
+    let Some((idp, role, labels)) = found else {
+        return vec![format!(
+            "{at}.principal: its issuer is no identity.providers entry's"
+        )];
+    };
+    let admitting: Vec<&Template> = s
+        .identity
+        .delegation
+        .templates
+        .iter()
+        .filter(|t| {
+            t.idp == idp
+                && t.principals.source.as_deref() == Some(p.source.as_str())
+                && t.principals.role.is_none_or(|r| r == role)
+                && t.principals
+                    .labels
+                    .iter()
+                    .all(|(k, v)| labels.get(k) == Some(v))
+        })
+        .collect();
+    let mut out = Vec::new();
+    if admitting.is_empty() {
+        out.push(format!(
+            "{at}: no identity.delegation.templates entry admits its principal at {idp:?}, so it holds no grant to act with"
+        ));
+    } else if !admitting.iter().any(|t| t.allows_unattended(a.via)) {
+        out.push(format!(
+            "{at}.via {}: the template that admits its principal at {idp:?} says unattended: {} — it allows no such firing",
+            a.via.as_str(),
+            admitting[0].unattended.as_str()
+        ));
+    }
+    if a.via == Via::Ciba
+        && s.identity
+            .providers
+            .get(&idp)
+            .is_some_and(|v| !v.ciba.enabled)
+    {
+        out.push(format!(
+            "{at}.via ciba: identity.providers.{idp}.ciba is not enabled, so no firing could ask the person"
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2599,14 +2887,14 @@ mcp:
                 "a2a.login",
             ),
             (
-                "on_revoked: ask",
+                "the Okta override with nothing standing",
                 Box::new(|y| {
                     y.replace(
-                        "        client_id: agentd-at-linear\n",
-                        "        client_id: agentd-at-linear\n        on_revoked: ask\n",
+                        "servers: {linear: {scopes: [\"issues:read\"]}}}",
+                        "servers: {linear: {scopes: [\"issues:read\"]}}, allow_against_idp_guidance: true}",
                     )
                 }),
-                "the second part of RFC 0044 P3",
+                "allow_against_idp_guidance is read with unattended: standing alone",
             ),
             (
                 "a delegation field on an agent-mode server",
@@ -2631,6 +2919,135 @@ mcp:
             )
         });
         assert_eq!(second, "", "a second person loads");
+    }
+
+    /// Acting for a person with nobody there (RFC 0044 §5.12 E, §5.14):
+    /// `unattended: standing` at an Okta IdP needs the override, and warns
+    /// with it; `unattended: ciba` needs CIBA at the IdP; `unattended_tools`
+    /// names the template's own servers' tools; an `act_for` workflow loads
+    /// for a pinned person whose template allows its `via`, and is refused
+    /// beside a webhook start, for a `via` the template does not allow, for
+    /// a person no rule pins, and through CIBA the IdP does not have; and
+    /// `on_revoked: ask` loads.
+    #[cfg(feature = "xaa")]
+    #[test]
+    fn unattended_work_and_act_for_load_as_their_rules_say() {
+        if !cfg!(feature = "a2a") {
+            return;
+        }
+        let template = |extra: &'static str| {
+            move |y: String| {
+                y.replace(
+                    "servers: {linear: {scopes: [\"issues:read\"]}}}",
+                    &format!("servers: {{linear: {{scopes: [\"issues:read\"]}}}}{extra}}}"),
+                )
+            }
+        };
+        let ciba = |y: String| {
+            y.replace(
+                "      profile: okta\n",
+                "      profile: okta\n      ciba: {enabled: true}\n",
+            )
+        };
+        let workflow = |start: &'static str, act_for: &'static str| {
+            move |y: String| {
+                format!(
+                    "{y}workflows:\n  - name: nightly\n    act_for: {act_for}\n    steps:\n      start: {start}\n      call: {{kind: mcp.tool, depends_on: [start], server: linear, tool: whoami, args: {{}}}}\n      done: {{kind: finish, depends_on: [call]}}\n"
+                )
+            }
+        };
+        let alice = "{principal: {source: operator, id: alice}, via: ciba}";
+        let schedule = "{kind: schedule, every: 1h}";
+        let standing = template(", unattended: standing");
+        assert!(
+            load_error(&standing).contains("standing_against_idp_guidance"),
+            "{}",
+            load_error(&standing)
+        );
+        let overridden = loaded(&template(
+            ", unattended: standing, allow_against_idp_guidance: true",
+        ))
+        .expect("the override loads");
+        assert!(
+            overridden
+                .warnings
+                .iter()
+                .any(|w| w.contains("against Okta's guidance")),
+            "the override is warned about: {:?}",
+            overridden.warnings
+        );
+        assert!(
+            load_error(&template(", unattended: ciba")).contains("ciba is not enabled"),
+            "ciba needs CIBA at the IdP"
+        );
+        assert_eq!(
+            load_error(&|y| ciba(template(", unattended: ciba")(y))),
+            "",
+            "ciba at an IdP with CIBA"
+        );
+        assert!(
+            load_error(&|y| ciba(template(
+                ", unattended: ciba, unattended_tools: [other.create_issue]"
+            )(y)))
+            .contains("no <server>.<tool> of a server the template allows")
+        );
+        let acting = |start, act_for| {
+            move |y: String| workflow(start, act_for)(ciba(template(", unattended: ciba")(y)))
+        };
+        assert_eq!(load_error(&acting(schedule, alice)), "", "act_for loads");
+        for (start, act_for, says) in [
+            (
+                "{kind: webhook, path: /hook, auth: {none: true}}",
+                alice,
+                "act_for_trigger_not_allowed",
+            ),
+            (
+                "{kind: signal, name: go}",
+                alice,
+                "act_for_trigger_not_allowed",
+            ),
+            (
+                schedule,
+                "{principal: {source: operator, id: alice}, via: standing}",
+                "allows no such firing",
+            ),
+            (
+                schedule,
+                "{principal: {source: operator, id: bob}, via: ciba}",
+                "no a2a.principals rule pins",
+            ),
+            (
+                schedule,
+                "{principal: {source: device, id: laptop}, via: ciba}",
+                "act_for_device_principal",
+            ),
+            (
+                schedule,
+                "{principal: {source: operator, id: alice}}",
+                "via: ciba or standing",
+            ),
+        ] {
+            let e = load_error(&acting(start, act_for));
+            assert!(
+                e.contains(says),
+                "{start} {act_for}: want {says:?} in:\n{e}"
+            );
+        }
+        // CIBA off at the IdP: no firing could ask.
+        let e = load_error(&|y| {
+            workflow(schedule, alice)(template(
+                ", unattended: standing, allow_against_idp_guidance: true",
+            )(y))
+        });
+        assert!(e.contains("ciba is not enabled"), "{e}");
+        assert_eq!(
+            load_error(&|y| y.replace(
+                "        client_id: agentd-at-linear\n",
+                "        client_id: agentd-at-linear\n        on_revoked: ask\n",
+            )),
+            "",
+            "on_revoked: ask loads"
+        );
     }
 
     /// [`TCP_BASE`] — many people on a TCP listener — as `edit` rewrites it:

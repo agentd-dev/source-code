@@ -400,6 +400,31 @@ policies:
   operator answers it for them, and unanswered within the server's wait it
   is cancelled.
 
+Some waits are on something the person does elsewhere, and show among their
+gates the same way, approve refused — they may deny one to end it:
+
+- **A firing's approval.** A firing of an `act_for` workflow with `via:
+  ciba` asks its person by OpenID CIBA, on their own device, at its first
+  delegated call: the message the device shows names the instance, the
+  workflow, the run and the tool. The step waits — `{kind: consent, signin:
+  {how: ciba}}` — for up to the request's expiry
+  (`identity.providers.<name>.ciba.request_expiry`, 300 s), and fails
+  `ciba_denied` when they deny it or it expires. Another call the firing
+  makes meanwhile waits on the same request. A restart ends the wait and
+  fails the call closed; a firing never asks twice
+  ([Work nobody is there for](authentication.md#work-nobody-is-there-for)).
+- **Signing in again.** A workflow step whose grant was revoked or expired,
+  or whose run's session ended, at a server with `auth.on_revoked: ask`,
+  waits — `{how: reenrol}`, on the run's task in `auth-required` — for the
+  person to enrol again, or to sign in through a live session, for at most
+  `identity.delegation.consent_timeout`; the step is then made again with
+  no message. A step that waited before its call met any rule meets them
+  then: a delegated `egress` call asks the person's consent as it would
+  have.
+- **Nobody there.** A firing's own work is unattended: a consent gate it
+  opens goes to its person as any other does, and unanswered denies at
+  `consent_timeout`; no step-up sign-in is asked for.
+
 ## Company gates
 
 An instance that acts at Companies for a person (the `companies` feature,
@@ -635,6 +660,11 @@ fires when a gate is answered, with `{task, via}`.
   replay opens its own.
 - The policy, timeout and addressee of a policy gate on a workflow step are
   durable too.
+- A firing's wait on its person's CIBA approval does not: the request is
+  never written down, so a restart fails the call `ciba_denied`. A step
+  waiting for its person to sign in again (`on_revoked: ask`) does, and is
+  checked again from the first pass. A device-grant step-up keeps when the
+  IdP asked for it, and the sign-in a restart resumes is held to that.
 
 ## Settings at a glance
 

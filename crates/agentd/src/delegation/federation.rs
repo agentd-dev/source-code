@@ -139,6 +139,7 @@ impl crate::a2a::login::Federation for Federation {
                     kind: WhoKind::Oidc,
                     session: None,
                     proof: Some(proof.clone()),
+                    firing: None,
                 };
                 let sub = signed.claims.sub.clone();
                 let said = if d.template_for(&who, &a.idp).is_some() {
@@ -225,7 +226,7 @@ impl crate::a2a::login::Federation for Federation {
                 }
             }
             Purpose::StepUp { gate } => {
-                let result = self.d.stepped_up_by(gate, signed, &a.idp, a.max_age);
+                let result = self.d.stepped_up_by(gate, signed, &a.idp, a.max_age, 0);
                 let _ = self.tx.send(Event::ConsentSignedIn {
                     gate: gate.clone(),
                     result: result.clone().map(|_| ()),

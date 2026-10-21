@@ -304,7 +304,7 @@ pub(crate) fn keep(
         json!({"grant_id": g.grant_id, "principal": g.principal.display(), "idp": name,
                "approving_sub": claims.sub, "template": g.template, "servers": g.ceilings,
                "expires_ms": g.expires_ms, "grant": how, "step_up": step_up,
-               "session": who.session, "bound_by": g.bound_by}),
+               "session": who.session, "bound_by": g.bound_by, "unattended": g.unattended}),
     );
     // Listed as the person who just signed in — an `a2a.login` session is
     // issued only after this — with the proof this sign-in is.
@@ -336,6 +336,13 @@ pub(crate) fn keep(
     );
     if !listed.is_empty() {
         out.push_str(&format!("; listed {}", listed.join(", ")));
+    }
+    // What this sign-in consented to run for them with nobody there.
+    if !g.unattended.is_empty() {
+        out.push_str(&format!(
+            "; and runs {} for them with nobody there, as each is now",
+            g.unattended.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
     Ok((out, proof))
 }

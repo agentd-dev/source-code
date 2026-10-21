@@ -114,6 +114,21 @@ pub enum Event {
         gate: String,
         polled: super::stepup::Polled,
     },
+    /// A `via: ciba` firing's call needs its person's approval: the loop
+    /// opens a `ciba` gate for it (RFC 0044 §5.12 E).
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    CibaAsked(Box<super::stepup::StepUpAsk>),
+    /// A firing's CIBA request moved on.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    Ciba {
+        gate: String,
+        progress: super::firings::CibaProgress,
+    },
+    /// A workflow step's delegated call found its grant gone at a server
+    /// whose `on_revoked` is `ask`: the loop decides whether it waits for
+    /// the person (RFC 0044 §5.12 C).
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    Reenrol(Box<super::stepup::StepUpAsk>),
     /// An `a2a.delegate` step's peer task entered or left
     /// `TASK_STATE_AUTH_REQUIRED` (A2A §7.6): it waits on a person.
     #[cfg(feature = "a2a")]

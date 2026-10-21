@@ -649,6 +649,23 @@ impl Runtime {
         // Every model a step names, at any depth, is one the catalogue has,
         // of a kind the step can use.
         errs.extend(crate::config::settings::model_refusals(&self.settings, w));
+        // An `act_for` acts for a person with nobody there (RFC 0044 M4):
+        // the operator's own configuration alone declares one, for a person
+        // whose template allows it.
+        if let Some(a) = &w.act_for {
+            if !w.configured || w.document {
+                errs.push(format!(
+                    "workflow {:?}: act_for acts for a person with nobody there, and only the operator's own configuration declares it — never an instruction document, nor a definition workflow.create or workflow.update stored",
+                    w.name
+                ));
+            } else {
+                errs.extend(crate::config::settings::delegation::act_for_refusals(
+                    &self.settings,
+                    &w.name,
+                    a,
+                ));
+            }
+        }
         errs
     }
 
@@ -679,6 +696,26 @@ impl Runtime {
         // Only once the set is accepted: a refused reload keeps the running
         // set, and with it the names that set's configuration owns.
         self.configured_workflows = defined;
+        // What a person's sign-in consents to from now on, and what a
+        // firing is held to (RFC 0044 §5.12 E).
+        #[cfg(feature = "xaa")]
+        if let Some(d) = &self.delegation {
+            d.act_fors(
+                self.workflows
+                    .values()
+                    .filter(|w| w.configured && !w.document)
+                    .filter_map(|w| {
+                        let a = w.act_for.as_ref()?;
+                        Some(crate::delegation::unattended::ActForDecl {
+                            workflow: w.name.clone(),
+                            digest: w.hash.clone(),
+                            via: a.via,
+                            principal: a.principal.clone(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
     }
 
     /// Fetch a workflow definition over HTTP(S).
@@ -796,6 +833,16 @@ impl Runtime {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| default_start(&w).unwrap_or_default());
+        // A firing of an `act_for` workflow acts for the person it names —
+        // or, while it may not, starts nothing (RFC 0044 §5.12 E).
+        #[cfg(feature = "xaa")]
+        let firing = match self.firing_of(ev, &w, &node) {
+            Ok(Some(f)) => Some(f),
+            // A run a firing's work starts acts for its person only as their
+            // consent to this run's own definition says.
+            Ok(None) => self.firing_carried(ev, &w),
+            Err(()) => return true,
+        };
         // Concurrency: a new run must fit both the workflow's own `max_runs`
         // and the instance-wide `limits.max_runs`; whichever binds first
         // decides the `on_overflow` outcome.
@@ -891,6 +938,16 @@ impl Runtime {
         );
         run.principal = ev.principal.clone();
         run.session = ev.session.clone();
+        #[cfg(feature = "xaa")]
+        if let Some((principal, sid, a)) = &firing {
+            run.principal = Some(principal.clone());
+            run.session = Some(sid.clone());
+            run.unattended = Some(crate::engine::run::Unattended {
+                principal: a.principal.clone(),
+                via: a.via,
+                asked: Vec::new(),
+            });
+        }
         run.subagent = ev
             .payload
             .get("subagent")
@@ -953,11 +1010,20 @@ impl Runtime {
             return false;
         }
         run.dirty = false;
+        #[cfg(feature = "xaa")]
+        if let Some((_, sid, a)) = &firing {
+            self.firing_began(&run_id, sid, &w, a);
+        }
         // The actor is on the line: "every effect names the human or the
         // schedule that caused it" is only true if you can read it back.
-        #[cfg_attr(not(feature = "a2a"), allow(unused_mut))]
+        #[cfg_attr(not(any(feature = "a2a", feature = "xaa")), allow(unused_mut))]
         let mut start = json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id,
                                "acting_for": run.principal, "key": run.key});
+        // A firing acting for its person says how.
+        #[cfg(feature = "xaa")]
+        if let Some(u) = &run.unattended {
+            start["unattended"] = json!(u.via.as_str());
+        }
         // A run an enterprise access token's caller started names the
         // agents that token says act for them (its `act` chain).
         #[cfg(feature = "a2a")]
@@ -2159,7 +2225,33 @@ impl Runtime {
                         .as_ref()
                         .map(|d| self.delegation_admit(d, &step_caller, &server).map(|_| ()))
                         .unwrap_or(Ok(()));
+                    // A grant gone at a server that says `on_revoked: ask`
+                    // waits for its person to sign in again (RFC 0044
+                    // §5.12 C).
+                    #[cfg(feature = "a2a")]
+                    let ask = admitted.as_ref().err().is_some_and(|e| {
+                        matches!(
+                            e.code,
+                            crate::delegation::Code::Revoked
+                                | crate::delegation::Code::NeedsReenroll
+                        ) && self.delegation.as_ref().is_some_and(|d| {
+                            d.servers.get(&server).is_some_and(|s| {
+                                s.on_revoked == crate::config::settings::delegation::OnRevoked::Ask
+                            })
+                        })
+                    });
                     match (name, admitted) {
+                        #[cfg(feature = "a2a")]
+                        (Some(name), Err(e)) if ask => self.open_reenrol(
+                            super::stepup::StepUpAsk {
+                                caller: step_caller.clone(),
+                                name,
+                                server: server.clone(),
+                                args,
+                                error: format!("{server}.{tool}: {e}"),
+                            },
+                            true,
+                        ),
                         (_, Err(e)) => self.finish_step(
                             run_id,
                             step_id,
@@ -3681,9 +3773,13 @@ impl Runtime {
         self.counters.runs_finished += 1;
         crate::obs::metrics::record_run(status.as_str());
         self.run_log(run_id).info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
-        // The first uses the person approved in the run end with it.
+        // The first uses the person approved in the run end with it, and a
+        // firing's authority with its run.
         #[cfg(feature = "xaa")]
-        self.forget_once(&format!("run:{run_id}"));
+        {
+            self.forget_once(&format!("run:{run_id}"));
+            self.firing_run_ended(run_id);
+        }
         self.end_run_span(run_id);
         self.governor.drop_scope(&format!("run:{run_id}"));
         // What the table says the run carries now goes on its record before

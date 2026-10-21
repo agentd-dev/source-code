@@ -22,9 +22,11 @@
 //!   resource — agentd asked for one, so one that does not is
 //!   `resource_not_bound`;
 //! - the scope granted is within the scope asked for; narrower is recorded;
-//! - the redemption's `token_type` is `Bearer`, any `refresh_token` in it is
-//!   dropped unread, and an access token that is a JWT names the pinned
-//!   resource in its `aud`.
+//! - the redemption's `token_type` is `Bearer` — or `DPoP` for a
+//!   redemption sent with a DPoP proof (RFC 9449 §5), a `Bearer` answer to
+//!   one refused as a downgrade — any `refresh_token` in it is dropped
+//!   unread, and an access token that is a JWT names the pinned resource in
+//!   its `aud`.
 //!
 //! Every identifier is in [`wire`]. Client authentication — `private_key_jwt`
 //! with an ES256 or RS256 key, or a client secret — is `oauth2`'s, with its
@@ -144,7 +146,7 @@ impl Refusal {
 }
 
 /// An answer that is not a token: the OAuth error it names, or none.
-fn refusal_of(reply: &Reply) -> Refusal {
+pub(crate) fn refusal_of(reply: &Reply) -> Refusal {
     if reply.status >= 500 {
         return Refusal::Unavailable(format!("HTTP {}", reply.status));
     }
@@ -523,6 +525,7 @@ pub fn check_access_exchange(
             access_token: at.to_string(),
             expires_in: body["expires_in"].as_u64(),
             scope: body["scope"].as_str().map(str::to_string),
+            dpop: false,
         },
         sub,
     ))
@@ -560,17 +563,21 @@ pub struct Redeemed {
     pub access_token: String,
     pub expires_in: Option<u64>,
     pub scope: Option<String>,
+    /// Bound to agentd's DPoP key: presented as `DPoP` with a proof.
+    pub dpop: bool,
 }
 
-/// Check a redemption's answer `body` for `resource`.
-pub fn check_redeemed(body: &Value, resource: &str) -> Result<Redeemed, Check> {
+/// Check a redemption's answer `body` for `resource`, a DPoP-bound token's
+/// when `dpop`.
+pub fn check_redeemed(body: &Value, resource: &str, dpop: bool) -> Result<Redeemed, Check> {
+    let want = if dpop { "DPoP" } else { "Bearer" };
     if !body["token_type"]
         .as_str()
-        .is_some_and(|t| t.eq_ignore_ascii_case("bearer"))
+        .is_some_and(|t| t.eq_ignore_ascii_case(want))
     {
         return Err(check(
             CheckKind::TokenType,
-            format!("token_type is {}, not Bearer", body["token_type"]),
+            format!("token_type is {}, not {want}", body["token_type"]),
         ));
     }
     let at = body["access_token"]
@@ -598,23 +605,63 @@ pub fn check_redeemed(body: &Value, resource: &str) -> Result<Redeemed, Check> {
         access_token: at.to_string(),
         expires_in: body["expires_in"].as_u64(),
         scope: body["scope"].as_str().map(str::to_string),
+        dpop,
     })
 }
 
 /// The redemption at the resource's authorization server (RFC 7523 §2.1):
 /// `ras` carries its token endpoint and agentd's client authentication.
+/// With `dpop`, the request carries a proof of that key (RFC 9449 §5), and
+/// one the server answers `use_dpop_nonce` is sent once more with the nonce
+/// it issued, which is kept for the next.
 pub fn redeem(
     ras: &OAuth2Params,
     id_jag: &str,
     resource: &str,
+    dpop: Option<(&crate::auth::dpop::DpopKey, &crate::auth::dpop::Nonces)>,
     timeout: Duration,
 ) -> Result<Redeemed, Refusal> {
-    let mut form = Form::new();
-    form.field("grant_type", wire::GRANT_JWT_BEARER);
-    form.field("assertion", id_jag);
-    form.field("client_id", &ras.client_id);
-    let body = token_request(ras, form, timeout)?;
-    check_redeemed(&body, resource).map_err(Refusal::Checked)
+    let mut retried = false;
+    loop {
+        let mut form = Form::new();
+        form.field("grant_type", wire::GRANT_JWT_BEARER);
+        form.field("assertion", id_jag);
+        form.field("client_id", &ras.client_id);
+        let mut headers = ras.authenticate(&mut form).map_err(|e| {
+            if crate::auth::oauth2::signer_failed(&e) {
+                Refusal::Signer(e)
+            } else {
+                Refusal::Unavailable(e)
+            }
+        })?;
+        if let Some((key, nonces)) = dpop {
+            let proof = key
+                .proof(
+                    "POST",
+                    &ras.token_url,
+                    None,
+                    nonces.get(&ras.token_url).as_deref(),
+                )
+                .map_err(Refusal::Unavailable)?;
+            headers.push(("DPoP".to_string(), proof));
+        }
+        let reply = post_form(&ras.token_url, form, &headers, timeout, ras.dial)
+            .map_err(Refusal::Unavailable)?;
+        if let (Some((_, nonces)), Some(n)) = (dpop, reply.header("dpop-nonce")) {
+            nonces.learn(&ras.token_url, n);
+        }
+        if !reply.is_success() {
+            let r = refusal_of(&reply);
+            if dpop.is_some() && !retried && r.code() == Some(wire::USE_DPOP_NONCE) {
+                retried = true;
+                continue;
+            }
+            return Err(r);
+        }
+        let body: Value = serde_json::from_slice(&reply.body)
+            .map_err(|e| Refusal::Unavailable(format!("not a JSON token response: {e}")))?;
+        return check_redeemed(&body, resource, dpop.is_some()).map_err(Refusal::Checked);
+    }
 }
 
 /// The `refresh_token` grant at the IdP with no `scope`, so the scopes
@@ -662,6 +709,9 @@ pub struct IdpMeta {
     pub lists_id_jag: Option<bool>,
     pub pkce_s256: bool,
     pub iss_supported: bool,
+    /// Where OpenID CIBA requests go, when the IdP takes them in poll mode
+    /// (`backchannel_token_delivery_modes_supported` lists `poll`).
+    pub ciba_endpoint: Option<String>,
 }
 
 /// Merge the RFC 8414 document `asm` and the OpenID one `oidc` of `issuer`
@@ -741,6 +791,12 @@ pub fn merge_idp(
                 .as_bool()
                 .unwrap_or(false)
         }),
+        ciba_endpoint: field(crate::auth::ciba::METADATA_ENDPOINT, oidc, asm).filter(|_| {
+            lists(
+                crate::auth::ciba::METADATA_MODES,
+                crate::auth::ciba::MODE_POLL,
+            )
+        }),
     })
 }
 
@@ -789,6 +845,8 @@ pub fn idp_metadata(
 pub struct RasMeta {
     pub issuer: String,
     pub token_endpoint: String,
+    /// Its `dpop_signing_alg_values_supported` lists ES256 (RFC 9449 §5.1).
+    pub dpop: bool,
 }
 
 /// Hold the authorization server's metadata `doc` to EMA (§5.6 step 4): a
@@ -827,6 +885,7 @@ pub fn ras_of(doc: &Value, audience: &str, assume: bool) -> Result<RasMeta, Stri
     Ok(RasMeta {
         issuer: audience.to_string(),
         token_endpoint: token_endpoint.to_string(),
+        dpop: lists("dpop_signing_alg_values_supported", crate::auth::dpop::ALG),
     })
 }
 
@@ -1136,6 +1195,7 @@ mod tests {
         let ok = check_redeemed(
             &json!({"token_type": "Bearer", "access_token": "opaque", "expires_in": 3600, "refresh_token": "never-kept"}),
             RES,
+            false,
         )
         .unwrap();
         assert_eq!(ok.access_token, "opaque");
@@ -1147,21 +1207,61 @@ mod tests {
         check_redeemed(
             &json!({"token_type": "bearer", "access_token": jwt(RES)}),
             RES,
+            false,
         )
         .unwrap();
         assert_eq!(
             check_redeemed(
                 &json!({"token_type": "Bearer", "access_token": jwt("https://x")}),
-                RES
+                RES,
+                false
             )
             .unwrap_err()
             .kind,
             CheckKind::AccessTokenAudience
         );
         assert_eq!(
-            check_redeemed(&json!({"token_type": "N_A", "access_token": "x"}), RES)
-                .unwrap_err()
-                .kind,
+            check_redeemed(
+                &json!({"token_type": "N_A", "access_token": "x"}),
+                RES,
+                false
+            )
+            .unwrap_err()
+            .kind,
+            CheckKind::TokenType
+        );
+    }
+
+    /// A redemption sent with a DPoP proof takes a `DPoP` token alone: a
+    /// `Bearer` answer to one is a downgrade, refused; one without a proof
+    /// takes a `Bearer` token alone.
+    #[test]
+    fn a_dpop_redemption_takes_a_dpop_token_alone() {
+        let bound = check_redeemed(
+            &json!({"token_type": "DPoP", "access_token": "a"}),
+            RES,
+            true,
+        )
+        .unwrap();
+        assert!(bound.dpop);
+        assert_eq!(
+            check_redeemed(
+                &json!({"token_type": "Bearer", "access_token": "a"}),
+                RES,
+                true
+            )
+            .unwrap_err()
+            .kind,
+            CheckKind::TokenType
+        );
+        assert_eq!(
+            check_redeemed(
+                &json!({"token_type": "DPoP", "access_token": "a"}),
+                RES,
+                false
+            )
+            .unwrap_err()
+            .kind,
             CheckKind::TokenType
         );
     }

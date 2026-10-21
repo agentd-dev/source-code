@@ -87,6 +87,15 @@ pub struct Grant {
     /// §5.4): `pin`, or `first_binding`; none for any other principal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_by: Option<String>,
+    /// The `act_for` workflows the person consented to run for them with
+    /// nobody there, by name, each at the definition digest it had when
+    /// they signed in (RFC 0044 §5.12 E): another digest suspends its
+    /// firings until they sign in again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unattended: BTreeMap<String, String>,
+    /// The CIBA requests sent them today, against `ciba.per_day`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ciba: Option<Quota>,
 }
 
 /// Mints counted against a resource.
@@ -883,6 +892,8 @@ mod tests {
             rt_version: 1,
             quota: Default::default(),
             bound_by: None,
+            unattended: Default::default(),
+            ciba: None,
         }
     }
 

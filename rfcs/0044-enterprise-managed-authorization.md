@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. **P2 complete** 2026-10-21 (§7 "P2d — P2 built, part 2: policy"): certificate principals that delegate; the policy facts `unattended`, `document_sourced` and `mode`, `to: principal` and `once_per: run_tool` on an operator's rules, and the person's consent rules shipped as data — first use per run and tool, gates of one shape answered together, a person's gates paced; a signed-in person's own message no outside text to work acting with their grant; per-`(step, tool)` use-authorisation; self-service revocation, and `revoked` after any revocation; the per-(principal, resource) mint rate; agent-mode servers hidden from delegated work unless listed; document workflows asked about unless listed; elicitations put to the grant's person alone; and a local command beside a delegation under a worker uid the keys are closed to. Every P2 exit criterion holds. P3's scope in part built 2026-10-21 (§7 "P3a — P3 built, part 1: inbound identity"): the A2A listener as a resource server for enterprise JWT access tokens (`a2a.inbound_tokens`, every §5.9 rule, `token_iss`, scopes to skills, the `act` chain), its `oauth2` card schemes and RFC 9728 metadata, `401`/`403` challenges, in the release set; `TASK_STATE_AUTH_REQUIRED` at admission and at a step-up, and a peer's followed to its end; M1b, `grant: token_exchange` with `subject: grant | inbound`; a webhook a person's token signs; `security.policies` reloaded whole; first-use approvals kept with the run. P3 part 2 — CIBA, `act_for`, the unattended opt-ins, `on_revoked: ask`, step-up `max_age`, optional DPoP — is next; live Okta interop not run
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. **P2 complete** 2026-10-21 (§7 "P2d — P2 built, part 2: policy"): certificate principals that delegate; the policy facts `unattended`, `document_sourced` and `mode`, `to: principal` and `once_per: run_tool` on an operator's rules, and the person's consent rules shipped as data — first use per run and tool, gates of one shape answered together, a person's gates paced; a signed-in person's own message no outside text to work acting with their grant; per-`(step, tool)` use-authorisation; self-service revocation, and `revoked` after any revocation; the per-(principal, resource) mint rate; agent-mode servers hidden from delegated work unless listed; document workflows asked about unless listed; elicitations put to the grant's person alone; and a local command beside a delegation under a worker uid the keys are closed to. Every P2 exit criterion holds. P3's scope in part built 2026-10-21 (§7 "P3a — P3 built, part 1: inbound identity"): the A2A listener as a resource server for enterprise JWT access tokens (`a2a.inbound_tokens`, every §5.9 rule, `token_iss`, scopes to skills, the `act` chain), its `oauth2` card schemes and RFC 9728 metadata, `401`/`403` challenges, in the release set; `TASK_STATE_AUTH_REQUIRED` at admission and at a step-up, and a peer's followed to its end; M1b, `grant: token_exchange` with `subject: grant | inbound`; a webhook a person's token signs; `security.policies` reloaded whole; first-use approvals kept with the run. **P3 complete** 2026-10-21 (§7 "P3b — P3 built, part 2: unattended work"): the CIBA poll client with the fresh-ID-token hint, the sealed `login_hint` fallback and the binding check; `act_for` with `via: ciba | standing`, its trigger restrictions, consent bound to the workflow's digest, the CIBA caps and unattended egress default-deny; `on_revoked: ask`; step-up held to `max_age` by `auth_time`; DPoP on the authorization-server and MCP legs where both advertise it. Every P3 exit criterion that needs no Okta tenant holds; live Okta interop not run
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -2453,7 +2453,8 @@ work:
   expires (about an hour), the firing's remaining delegated calls fail
   `subject_expired`; no second CIBA request is sent within a firing (push
   fatigue), so unattended workflows should be short. Any refresh token an IdP
-  issues anyway is revoked (RFC 7009) at run end.
+  issues anyway is revoked (RFC 7009) at run end; it is held in memory alone,
+  so a restart before the run's end leaves it to expire at the IdP.
 - **`via: standing`:** the sealed refresh token without the user present, within
   TTL and budget, every mint flagged `unattended`. Refused under `profile: okta`
   without `allow_against_idp_guidance: true`. Whether it should exist at all is
@@ -2466,6 +2467,13 @@ and the taint flags. Delegated authority passes only with template
 then the child gets no token: its delegated calls route through the supervisor
 under the parent's grant and are use-authorised per `(step, tool)`. With the
 default `subagents: none`, children run in agent mode but keep attribution.
+An M4 firing's authority is its own run's: its turns and subagents act
+through it, but a run its work starts — a `workflow` step, `workflow.run`,
+or a signal or message that starts one — is a firing of its own for the
+same person, held to their consent to **that** run's workflow digest (E),
+so a workflow that declares no `act_for` for them, or one a reload
+changed, acts for nobody; and a conversation turn its work starts by
+message acts with no one's grant.
 
 **G. Cross-instance (A2A peers).** Nothing is forwarded. A peer that later
 suspends obtains its own authority, through its own `AUTH_REQUIRED` or the P4
@@ -5193,7 +5201,7 @@ step-up `max_age`, and optional DPoP.
 | `security.policies` reloaded transactionally | built | `runtime::reload`, `config::settings` |
 | First-use approvals kept durably, bound to the run, the call's shape, the grant and the template | built | `runtime::delegated` |
 | Inbound identity in workflow starts: an A2A-started run's principal and `act` chain; a webhook a person's token signs | built | `runtime::a2a_server::commands`, `runtime::webhooks`, `runtime::starts` |
-| CIBA, `act_for`, unattended opt-ins, `on_revoked: ask`, step-up `max_age`, DPoP | part 2 | — |
+| CIBA, `act_for`, unattended opt-ins, `on_revoked: ask`, step-up `max_age`, DPoP | part 2: built (§7.P3b) | — |
 | Live interop against an Okta tenant | not run: needs an Okta Integrator org this suite does not have | — |
 
 **1. The verifier.** `a2a::inbound` checks a JWT bearer that is no static
@@ -5418,10 +5426,251 @@ settings' refusals (`config::settings::delegation`,
 first-use sweep (`runtime::delegated`), the peer follow
 (`mcp::a2a_client`) and the kept peer wait (`engine::run`). Not
 checked by a running test here: the CIBA, `act_for` and DPoP criteria
-(part 2), and the live Okta criteria — a custom-AS token mapped through
+(part 2, built in §7.P3b), and the live Okta criteria — a custom-AS token mapped through
 `equivalent_issuers` to an org-AS grant, Okta CIBA, a custom-AS-to-custom-AS
 exchange — which need an Okta tenant; the mock IdP plays Okta's token
 shapes.
+
+#### §7.P3b — P3 built, part 2: unattended work (2026-10-21)
+
+This part builds the rest of P3's scope on `main` at `d264cb58`: work
+nobody is there for — a scheduled firing acting for a person, approved by
+them on their own device or by their standing consent — the waits on a
+person no one else may decide, step-up held to `max_age`, and DPoP where
+both sides advertise it. All of it is behind `xaa`, as P1–P3a's delegation
+is; the CIBA client and the DPoP key reuse what agentd already speaks (one
+auth HTTP helper; RFC 0047's `dpop.rs`, moved to `auth::dpop`). With it
+**P3 is complete**: every P3 exit criterion that needs no Okta tenant
+holds.
+
+| Scope item | State | Where |
+|---|---|---|
+| The CIBA poll client: the fresh-ID-token hint, the sealed `login_hint` fallback, the binding check; a CIBA mock (pending, `slow_down`, denied, expired) | built | `auth::ciba`, `delegation::unattended`, `delegation::mock` |
+| `act_for` with `via: ciba \| standing`; the trigger restrictions | built | `engine::model`, `config::settings::delegation`, `runtime::firings` |
+| Digest binding: a changed workflow suspends unattended use | built | `delegation::unattended`, `delegation::enrol`, `runtime::firings` |
+| CIBA caps: one request per firing and grant, one waiting per person and workflow, `ciba.per_day` | built | `delegation::unattended`, `runtime::firings` |
+| Unattended egress default-deny (T18); unattended work tainted | built | `runtime::firings`, `runtime::taint` |
+| `standing` under `profile: okta` refused without the override | built | `config::settings::delegation` |
+| A `via: ciba` run on approval, on denial, across a restart; the approval's refresh token revoked at run end | built | `runtime::firings`, `delegation::unattended` |
+| `on_revoked: ask` (refused at load since P1) | built | `runtime::firings`, `runtime::steps`, `delegation` |
+| Step-up `max_age` requested, `auth_time` checked | built | `delegation`, `delegation::federation` |
+| Optional DPoP on the RAS and MCP legs where metadata advertises it (T23) | built | `auth::dpop`, `auth::idjag`, `delegation` |
+| Live interop against an Okta tenant | not run: needs an Okta Integrator org this suite does not have | — |
+
+**1. Where `act_for` is declared, and what a firing is.** `act_for:
+{principal, via}` is a top-level field of a workflow, not of a start node:
+it holds for every `schedule`, `loop` and `once` start the workflow has,
+and a `manual` start's `workflow.run` runs as whoever asked, never as the
+person. `principal` is typed — `{source: oidc, issuer, sub}`, or `{source:
+operator | x509, id}` naming the `a2a.principals` rule that pins the
+person — and a device principal is refused (`act_for_device_principal`).
+Beside a `webhook`, `stream`, `correlate`, `subscribe`, `signal`, `event` or
+`a2a` start, or a `webhook` wait, `act_for` is refused at load
+(`act_for_trigger_not_allowed`, T18). Only the operator's own
+configuration declares one: an instruction document, a subagent
+template's machinery, and a definition stored by `workflow.create` or
+`workflow.update` are refused. The load also
+refuses a principal no rule pins, an issuer no provider has, a template
+that does not admit the person or allow the `via` (`ciba` allows `ciba`;
+`standing` allows both), and `via: ciba` at an IdP without CIBA.
+
+A **firing** is the run such a start event becomes (`runtime::firings`):
+its principal is the person — the listener's name for a pinned person,
+`user:oidc:<iss>#<sub>` for an IdP subject — and its session is a firing
+id of its own (`ua_…`, `engine::run::UNATTENDED_SID_PREFIX`), which every
+turn and child of its work acts through, since they inherit the run's
+session. The authority is that run's alone (§5.12 F): a run its work
+starts — a `workflow` step's child, `workflow.run`, or a signal or message
+that starts one — is a firing of its own for the same person
+(`Runtime::firing_carried`, `start.unattended.carried`), held to their
+consent to that run's own workflow and digest, which a workflow declaring
+no `act_for` for them never has (`unattended_suspended`), by that
+workflow's own `via` where it declares one; and a conversation turn its
+work starts by message acts through `engine::run::HANDED_ON_SID`, for no
+one's grant (`no_delegation`). The delegation supervisor holds the firing's authority in
+a registry (`delegation::unattended::Running`) from the run's start — and
+again after a restart, from the run record's `unattended {principal, via,
+asked}` — until the run ends; work acting through an ended firing is
+`revoked`. A firing's work is unattended (the `unattended` fact), tainted
+(a source `nobody there`), refused a delegated `egress` tool its
+template's `unattended_tools` does not list (`policy_denied`, unasked),
+and asks for no step-up. Every mint it makes is recorded `unattended:
+true` with its `via`.
+
+**2. Consent is to the digest.** A grant keeps `unattended: {workflow →
+digest}`: every sign-in — enrolment, or a renewal — records the installed
+`act_for` workflows naming the person at that IdP whose `via` the template
+allows, at their definition digests then (`Delegation::consented`). The
+runtime hands the installed set to the delegation supervisor at every load
+and reload (`Delegation::act_fors`). A firing starts only when
+`Delegation::firing_ready` holds — an unexpired grant, held to the person
+as configured, under a template that admits them and allows the `via`,
+keeping their consent to this very digest; otherwise it starts no run,
+logs `start.unattended.suspended` with the code (`unattended_suspended` for
+a changed digest, else `not_enrolled`, `revoked`, `needs_reenroll`,
+`delegation_not_permitted`) and is audited `delegation.unattended
+{outcome: suspended}`; a `loop` that started nothing fires again after its
+`interval`, or a minute. Every delegated call of a firing is held to the
+same consent and template at admission (`Delegation::firing_allowed`).
+
+**3. CIBA, poll mode.** At a `via: ciba` firing's first delegated call at
+a grant, the subject check finds no approval and refuses the call
+`ciba_required`; the call's thread hands it to the loop, which marks the
+firing waiting on its person (`Delegation::ciba_asking`, which refuses
+while another firing of the workflow for them waits), writes to the run's
+record that the firing asked at that grant before anything is sent, opens
+a `ciba` gate for the call, and asks off the loop
+(`Delegation::start_ciba`, only while that gate is open): under the grant's
+lock, a `refresh_token` grant for a fresh ID token as `id_token_hint` —
+rotation kept first, the token sent once and dropped — or, where the IdP
+returns none, `login_hint` from the `preferred_username` kept at enrolment,
+sealed under the person's personal key (§6.4); the day's count (`ciba` in
+the grant, against `ciba.per_day`, every request asked for counted); then
+the request: `scope=openid`, the hint, agentd's `binding_message` (the
+instance, the workflow, the run and the tool, reduced to identifier
+characters and 96 long), `requested_expiry` — `request_expiry` under
+`profile: okta` — and client authentication, to the IdP's
+`backchannel_authentication_endpoint` (its metadata must list `poll`). The
+gate is polled on the reactor's passes, off the loop, at the IdP's
+`interval`, 5 s longer after each `slow_down`; `access_denied` and
+`expired_token`, and the request's expiry seen by agentd, fail the call
+`ciba_denied`. An approval's ID token is verified with the IdP's keys and
+must name the grant's own `iss` and `sub`, or the call fails
+`binding_mismatch` and any refresh token with it is revoked. Approved, the
+ID token is the subject of the firing's mints (`subject_token_type`
+`id_token`) — in memory, until it expires (`subject_expired` after) — its
+ID-JAGs and access tokens pooled under the firing, never re-presented by
+other work, and a token held no longer than the approval. A call keeps the
+firing it was admitted as to its end — never looked up again by its
+session id — so one whose run ends while it is on its way has no approval
+and mints nothing (`subject_expired`), never falling back to the grant's
+own subject, and a call whose token was got is not made once its firing
+has ended (`revoked`). A second call of the firing at the same grant made
+while the request waits, at once or later, waits on the same request (a
+follower gate); another firing of the same workflow for the same person
+while one waits is refused (`budget_exhausted`). Once a firing's wait
+closes — approved, denied on the device or in the display client,
+expired, past its deadline, its session ended — it waits on its person no
+longer (`Runtime::poll_cibas`), and another firing may ask. A restart ends a waiting request — its id is
+never written down, so the gate is closed `ciba_denied` — and an approval
+with it: the run record says the firing asked, so its next call fails
+`subject_expired` and nothing is asked twice. At the run's end the
+firing's approvals are dropped, its pooled tokens purged, and a refresh
+token an IdP issued with an approval revoked (RFC 7009,
+`delegation.ciba {decision: revoked}`); such a refresh token is held in
+memory alone, so a restart before the run's end leaves it alive at the IdP
+until it expires — agentd asks for `openid` alone, so an IdP issues one
+only against the request. A `token_exchange` server's call in
+a `via: ciba` firing waits for the approval too; its exchange presents the
+grant's access token, which the approval's ID token is not.
+
+**4. `on_revoked: ask`.** A workflow step's delegated call that finds its
+grant revoked or expired, or its run's session ended — at dispatch, or in
+the call — at a server with `on_revoked: ask`, waits on a `reenrol` gate
+(`runtime::firings::open_reenrol`): only a step's own call (never a
+model's, T33), from work no outside text reached — the person's own
+message excepted — and no firing. The gate is the person's, among their
+gates, the run's task in `auth-required` with agentd's words; it is
+checked at every pass with no network, and the step's call is made again
+once the person may act again — enrolled again, or, for a run whose
+session ended, a live session of the same principal holding an IdP proof
+of the identity the grant is bound to (`Delegation::rebind`, the run's
+session moved, `delegation.session.rebound`, audited). A call held at its
+dispatch, before the operator's rules and the person's consent were
+consulted, meets them all when it is made again (the gate's
+`before_rules`): a delegated `egress` call asks its person then. Unanswered within
+`consent_timeout`, or denied, the step fails `revoked`. The wait is in the
+step's record and survives a restart.
+
+**5. Step-up `max_age`.** The start link a step-up's `authorize` gate gives
+already asked for `max_age` and `prompt=login` (P2c); now the sign-in is
+held to it (`auth_time_meets`): its ID token must carry `auth_time`, within
+`max_age` of now, or — where the IdP named no `max_age` — no earlier than
+the moment it asked (60 s of skew). A device-grant step-up, and a
+`--login` sign-in that would serve as the next mint's subject, are held the
+same way; the moment the IdP asked is in the gate's wait record
+(`asked_at`), so a device grant a restart resumes is held to it too.
+
+**6. DPoP (T23).** At a delegated server's confirmation (§5.6 step 3) its
+protected-resource metadata's `dpop_signing_alg_values_supported` and its
+authorization server's are read: where both list ES256 and `auth.dpop` is
+`auto` (the default), its tokens are bound to a P-256 key agentd makes in
+memory at first use and never writes (`auth::dpop::DpopKey`, the one RFC
+0047 uses). The redemption carries a proof (`htm` POST, `htu` the token
+endpoint, no `ath`), sent once more with the nonce a `use_dpop_nonce`
+answer issues, and must come back `token_type: DPoP` — a `Bearer` answer is
+refused as a downgrade; every MCP request presents `Authorization: DPoP`
+with a proof of that request (`ath` over the token), a server's nonce
+learned and the request sent once more after a `use_dpop_nonce`
+challenge. A server whose metadata says `dpop_bound_access_tokens_required`
+is refused (`config`) before anything is minted where its token cannot be
+bound — `dpop: off`, no ES256, or an authorization server advertising no
+DPoP. The exchange at the IdP is not bound (P4).
+
+**Decisions taken while building it.** (a) `act_for` is a workflow field,
+as §5.14's sketch has it, holding for all its unattended starts; a
+`manual` start is allowed beside it and never acts for the person. (b)
+Consent to a digest is recorded by the person's sign-in, the RFC's
+`workflow_digests`; there is no separate consent command. (c) A suspended
+firing starts no run rather than a run whose calls fail. (d) `standing`
+allows `via: ciba` too. (e) The CIBA approval is per firing and grant —
+a firing acting at two IdPs asks at each — and its ID token is the subject
+of every mint of that firing there, not of one call. (f) A restart fails a
+`via: ciba` firing closed whether its request was pending or approved:
+the request id is not sealed into the checkpoint, so §5.12 B's
+re-issue-once is not built for CIBA. (g) A firing's work is tainted, so the
+shipped consent rules ask the person — through their display client — and
+deny at `consent_timeout`; a CIBA answer is not a consent gate's answer.
+(h) `ciba.per_day` lives on the provider. (i) DPoP is `auth.dpop: auto |
+off` per delegated server, on by default where both sides advertise it.
+(j) The step-up's `auth_time` is required, never assumed. (k) New codes:
+`ciba_required` (a call waiting on its person's approval),
+`unattended_suspended`, and the §5.8 table's `ciba_denied`. (l) A firing's
+authority is its run's: a run its work starts is a firing of its own, held
+to the person's consent to that run's own workflow (§5.12 F), rather than
+consent recorded for every workflow an `act_for` workflow could reach —
+which `workflow.run` by name makes unknowable at load. (m) A refresh token
+an IdP issues with a CIBA approval is revoked at the run's end, not at once:
+revoking a refresh token may invalidate the tokens issued on the same grant
+with it (RFC 7009 §2.1), and the run still exchanges the approval's ID
+token. Held in memory alone, it outlives a restart at the IdP until it
+expires.
+
+**Exit criteria.** Each holds by a check, mutation-tested by turning its
+rule off and seeing the check fail.
+
+| Criterion | Check |
+|---|---|
+| the CIBA mock's four states: pending and `slow_down` (5 s longer after) | `ema/ciba-firing-acts-on-its-persons-approval` |
+| …denied and expired, by the IdP and by agentd | `ema/ciba-firing-denied-or-expired-fails-closed` |
+| a scheduled `via: ciba` run succeeds on approval, its approval the exchange's subject, the CIBA refresh token revoked at run end | `ema/ciba-firing-acts-on-its-persons-approval` |
+| …fails closed on denial | `ema/ciba-firing-denied-or-expired-fails-closed` |
+| …fails closed on restart, waiting or approved, never asking twice | `ema/ciba-firing-fails-closed-on-restart` |
+| …mints nothing for a firing that ended while its call was on its way, and makes no call for one | `ema/firing-ended-mid-call-mints-nothing` |
+| one request per firing: a later call waits on it; a closed wait lets another firing ask | `ema/ciba-firing-waits-on-one-request-at-a-time` |
+| a run a firing's work starts acts only as consented to its own workflow | `ema/work-a-firing-starts-acts-only-as-consented` |
+| the fresh-ID-token hint, the sealed `login_hint` fallback, the binding check | `ema/ciba-firing-acts-on-its-persons-approval`, `ema/ciba-hint-falls-back-and-binds-its-person` |
+| CIBA caps (`ciba.per_day`) | `ema/ciba-firing-denied-or-expired-fails-closed` |
+| `act_for` on a webhook refused at validate time | `ema/act-for-on-a-webhook-refused` |
+| `standing` under `profile: okta` refused without the override | `ema/standing-under-okta-needs-the-override` |
+| a changed digest suspends unattended use; signing in again resumes it | `ema/changed-digest-suspends-unattended-use` |
+| unattended egress denied by default; listed, asked | `ema/unattended-egress-denied-by-default` |
+| `on_revoked: ask` asks, and the step resumes on re-enrolment, meeting the person's consent rules | `ema/on-revoked-ask-waits-for-re-enrolment` |
+| step-up `max_age` honoured: `auth_time` checked | `ema/step-up-held-to-its-max-age` |
+| DPoP on the RAS and MCP legs when advertised, each leg's nonce sent again at once, absent otherwise; a bound-only server refused where it cannot be bound | `ema/dpop-where-advertised` |
+
+The rules are units as well: the CIBA request's form, its answer, the
+poll's four states and the binding message (`auth::ciba`); a DPoP
+redemption's `token_type` (`auth::idjag`); the load's `act_for` and
+unattended rules (`engine::model`, `config::settings::delegation`); the
+step-up's `auth_time` and the ask its gate recorded, and a firing's
+consent, admission, approval, wait and end (`delegation`); a sign-in
+gate's wait record (`runtime::stepup`). Not checked by a running test here: the live Okta
+criteria — Okta CIBA accepting the chosen hint for an XAA AI-agent client
+(§9 question 16), a custom-AS token mapped through `equivalent_issuers` to
+an org-AS grant, and a custom-AS-to-custom-AS exchange — which need an
+Okta tenant; the mock IdP plays Okta's shapes, `request_expiry` among
+them.
 
 ### P4 — Deferred, each behind a named flag or its own small amendment, only on demand
 

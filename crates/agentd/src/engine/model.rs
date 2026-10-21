@@ -1281,6 +1281,10 @@ pub struct Workflow {
     /// `workflow.update` or the store. Set only at load.
     #[serde(skip)]
     pub configured: bool,
+    /// The person this workflow's `schedule`, `loop` and `once` firings act
+    /// for with nobody there (RFC 0044 M4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act_for: Option<ActFor>,
 }
 
 fn default_true() -> bool {
@@ -1473,15 +1477,108 @@ pub const TOP: &[&str] = &[
     "act_for",
 ];
 
-/// Why a workflow's `act_for` is refused: every value is, until RFC 0044
-/// P3 builds pre-authorised unattended runs (M4) — and one naming an RFC
-/// 0043 device principal is refused by its own code, since such a principal
-/// delegates only through a live session and unattended work has none.
-fn act_for_refusal(v: &Value) -> String {
+/// A workflow's `act_for` (RFC 0044 M4): the person its `schedule`, `loop`
+/// and `once` firings act for with nobody there, and how — each firing
+/// approved by them on their own device (`ciba`), or with their grant and
+/// nobody asked (`standing`). Only the operator's own configuration
+/// declares one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActFor {
+    pub principal: ActForPrincipal,
+    pub via: crate::config::settings::delegation::Via,
+}
+
+/// The typed principal an `act_for` names, never a display string: a
+/// subject at an IdP (`source: oidc`, `issuer`, `sub`), or a pinned
+/// per-person operator or certificate principal by its rule's `id`
+/// (`source: operator | x509`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActForPrincipal {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// The starts an `act_for` workflow may have (RFC 0044 §5.12 E): a clock,
+/// its own loop and the operator's `once` fire as the person, and a
+/// `manual` start runs as whoever asked for the run, never as them. Anyone
+/// who can fire any other — a webhook, a stream, a signal, a message, an
+/// event — could make the person's phone buzz at every firing, and drive an
+/// approved run with a payload of their own (T18).
+pub const ACT_FOR_STARTS: &[&str] = &["schedule", "loop", "once", "manual"];
+
+/// A workflow's `act_for`, parsed: `None`, said in `errs`, when it is not
+/// one — one naming an RFC 0043 device principal by its own code, since
+/// such a principal delegates only through a live session and a firing
+/// has none.
+fn parse_act_for(v: &Value, name: &str, errs: &mut Vec<String>) -> Option<ActFor> {
+    let at = format!("workflow {name:?}: act_for");
     if v.pointer("/principal/source").and_then(Value::as_str) == Some("device") {
-        return "act_for names a device principal (act_for_device_principal): a device principal delegates only through a live session, and an unattended run has none — the person signs in through a2a.login, and act_for names their oidc principal".into();
+        errs.push(format!("{at} names a device principal (act_for_device_principal): a device principal delegates only through a live session, and an unattended run has none — the person signs in through a2a.login, and act_for names their oidc principal"));
+        return None;
     }
-    "act_for (pre-authorised unattended runs, RFC 0044 M4) is RFC 0044 P3's and not built: a schedule, a loop and a once run act as agentd itself".into()
+    let Some(o) = v.as_object() else {
+        errs.push(format!("{at} is {{principal, via}}"));
+        return None;
+    };
+    let before = errs.len();
+    for k in o
+        .keys()
+        .filter(|k| !matches!(k.as_str(), "principal" | "via"))
+    {
+        errs.push(format!("{at}: unknown field {k:?}"));
+    }
+    let via = o
+        .get("via")
+        .and_then(Value::as_str)
+        .and_then(crate::config::settings::delegation::Via::parse);
+    if via.is_none() {
+        errs.push(format!("{at}.via: ciba or standing"));
+    }
+    let p = o.get("principal").and_then(Value::as_object);
+    let field = |k: &str| {
+        p.and_then(|p| p.get(k))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|v| !v.trim().is_empty())
+    };
+    let principal = ActForPrincipal {
+        source: field("source").unwrap_or_default(),
+        issuer: field("issuer"),
+        sub: field("sub"),
+        id: field("id"),
+    };
+    for k in p.into_iter().flat_map(|p| p.keys()) {
+        if !matches!(k.as_str(), "source" | "issuer" | "sub" | "id") {
+            errs.push(format!("{at}.principal: unknown field {k:?}"));
+        }
+    }
+    match principal.source.as_str() {
+        "oidc" => {
+            if principal.issuer.is_none() || principal.sub.is_none() || principal.id.is_some() {
+                errs.push(format!(
+                    "{at}.principal: an oidc principal is its issuer and sub"
+                ));
+            }
+        }
+        "operator" | "x509" => {
+            if principal.id.is_none() || principal.issuer.is_some() || principal.sub.is_some() {
+                errs.push(format!(
+                    "{at}.principal: an {} principal is the id of the a2a.principals rule that pins it",
+                    principal.source
+                ));
+            }
+        }
+        _ => errs.push(format!("{at}.principal.source: oidc, operator or x509")),
+    }
+    match (errs.len() == before, via) {
+        (true, Some(via)) => Some(ActFor { principal, via }),
+        _ => None,
+    }
 }
 
 /// The start kinds that do NOT keep an instance alive. `once` fires when armed
@@ -1551,9 +1648,6 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         if !TOP.contains(&key.as_str()) {
             errs.push(format!("unknown workflow field {key:?}"));
         }
-    }
-    if let Some(a) = obj.get("act_for") {
-        errs.push(act_for_refusal(a));
     }
     let name = obj
         .get("name")
@@ -1828,7 +1922,27 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
             None
         }
     };
+    let act_for = obj
+        .get("act_for")
+        .and_then(|a| parse_act_for(a, &name, &mut errs));
+    if obj.get("act_for").is_some() {
+        for s in steps.values().filter(|s| s.is_start()) {
+            if !ACT_FOR_STARTS.contains(&s.kind.as_str()) {
+                errs.push(format!(
+                    "workflow {name:?}: act_for beside a {} start (act_for_trigger_not_allowed): only its schedule, loop and once firings act for the person — anyone who can fire a {} start could make their phone buzz at every firing, and drive an approved run with a payload of their own",
+                    s.kind, s.kind
+                ));
+            }
+        }
+        for r in inbound_routes(doc) {
+            errs.push(format!(
+                "workflow {name:?}: act_for beside {} at step {:?} (act_for_trigger_not_allowed): a route on the webhook listener would hand a run acting for the person whatever its caller sends",
+                r.what, r.step
+            ));
+        }
+    }
     let mut wf = Workflow {
+        act_for,
         state,
         name,
         priority,
@@ -3606,9 +3720,9 @@ pub fn workflow_schema() -> Value {
                 "description": "declared run variables — {key: {schema, reducer}}"},
             "concurrency": {"type": "object", "properties": {"max_runs": {"type": "integer", "minimum": 1}, "on_overflow": {"enum": ["queue", "drop", "replace"]}, "scope": {"enum": ["workflow", "key"], "description": "what max_runs counts: every run of this workflow (default), or every run about the same `key` — the difference between a queue and a per-entity lock"}}},
             "key": {"type": "string", "description": "the logical thing a run is ABOUT, rendered from the trigger payload (e.g. \"{{payload.account_id}}\"); required by concurrency.scope: key"},
-            "act_for": {"type": "object", "additionalProperties": false, "description": "pre-authorised unattended runs (RFC 0044 M4): refused until RFC 0044 P3 builds them; one naming a device principal is refused as act_for_device_principal", "properties": {
-                "principal": {"type": "object", "additionalProperties": false, "description": "the typed principal, never a display string", "properties": {
-                    "source": {"enum": ["oidc", "x509", "operator", "device"]},
+            "act_for": {"type": "object", "additionalProperties": false, "required": ["principal", "via"], "description": "the person this workflow's schedule, loop and once firings act for with nobody there (RFC 0044 M4): each firing approved by them on their own device (ciba), or with their grant and nobody asked (standing) — as their identity.delegation template allows. Only the operator's own configuration declares it; beside any other start, or a webhook wait, it is refused (act_for_trigger_not_allowed), and a device principal is refused as act_for_device_principal", "properties": {
+                "principal": {"type": "object", "additionalProperties": false, "description": "the typed principal, never a display string: an oidc subject (issuer, sub), or a pinned operator or x509 principal by its a2a.principals rule's id", "properties": {
+                    "source": {"enum": ["oidc", "x509", "operator"]},
                     "issuer": {"type": "string"},
                     "sub": {"type": "string"},
                     "id": {"type": "string"}}},
@@ -4521,6 +4635,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An `act_for` (RFC 0044 M4) names a typed principal and a `via`, and
+    /// sits only beside starts nobody outside can fire: a schedule, a loop,
+    /// the operator's `once`, and `manual`, which runs as whoever asked. A
+    /// webhook, a stream, a signal, a message or an event start beside one,
+    /// or a webhook wait, is refused as `act_for_trigger_not_allowed`; a
+    /// device principal as `act_for_device_principal`.
+    #[test]
+    fn act_for_sits_beside_starts_nobody_outside_can_fire() {
+        let alice = json!({"principal": {"source": "operator", "id": "alice"}, "via": "ciba"});
+        let with = |start: Value, act_for: &Value| {
+            wf(json!({"name": "w", "act_for": act_for, "steps": {
+                "s": start,
+                "f": {"kind": "finish", "depends_on": ["s"]}
+            }}))
+        };
+        for start in [
+            json!({"kind": "schedule", "every": "1h"}),
+            json!({"kind": "loop"}),
+            json!({"kind": "once"}),
+            json!({"kind": "manual"}),
+        ] {
+            let w = with(start.clone(), &alice).unwrap_or_else(|e| panic!("{start}: {e:?}"));
+            let a = w.act_for.expect("parsed");
+            assert_eq!(a.principal.id.as_deref(), Some("alice"));
+            assert_eq!(a.via, crate::config::settings::delegation::Via::Ciba);
+        }
+        for start in [
+            json!({"kind": "webhook", "path": "/h", "auth": {"none": true}}),
+            json!({"kind": "signal", "name": "go"}),
+            json!({"kind": "a2a"}),
+            json!({"kind": "event", "on": "workflow.finished"}),
+            json!({"kind": "stream", "stream": "s"}),
+        ] {
+            let e = with(start.clone(), &alice).unwrap_err();
+            assert!(
+                e.iter().any(|m| m.contains("act_for_trigger_not_allowed")),
+                "{start}: {e:?}"
+            );
+        }
+        let e = wf(json!({"name": "w", "act_for": alice, "steps": {
+            "s": {"kind": "schedule", "every": "1h"},
+            "h": {"kind": "wait", "depends_on": ["s"], "on": "webhook", "webhook": {"auth": {"none": true}}},
+            "f": {"kind": "finish", "depends_on": ["h"]}
+        }}))
+        .unwrap_err();
+        assert!(
+            e.iter().any(|m| m.contains("act_for_trigger_not_allowed")),
+            "a webhook wait: {e:?}"
+        );
+        let schedule = json!({"kind": "schedule", "every": "1h"});
+        for (act_for, says) in [
+            (
+                json!({"principal": {"source": "device", "name": "laptop"}}),
+                "act_for_device_principal",
+            ),
+            (
+                json!({"principal": {"source": "oidc", "sub": "00u1"}, "via": "ciba"}),
+                "an oidc principal is its issuer and sub",
+            ),
+            (
+                json!({"principal": {"source": "operator"}, "via": "standing"}),
+                "the id of the a2a.principals rule",
+            ),
+            (
+                json!({"principal": {"source": "operator", "id": "alice"}, "via": "always"}),
+                "via: ciba or standing",
+            ),
+            (
+                json!({"principal": {"source": "operator", "id": "alice", "name": "x"}, "via": "ciba"}),
+                "unknown field \"name\"",
+            ),
+        ] {
+            let e = with(schedule.clone(), &act_for).unwrap_err();
+            assert!(e.iter().any(|m| m.contains(says)), "{act_for}: {e:?}");
+        }
+        let oidc = json!({"principal": {"source": "oidc", "issuer": "https://idp.example", "sub": "00u1"},
+                          "via": "standing"});
+        assert!(with(schedule, &oidc).is_ok());
     }
 
     /// A schedule that could never fire is refused at load, naming why: the

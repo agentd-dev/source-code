@@ -1127,6 +1127,12 @@ impl Runtime {
             Event::StepUpDevice { gate, device } => self.step_up_device(&gate, *device),
             #[cfg(all(feature = "xaa", feature = "a2a"))]
             Event::StepUpPolled { gate, polled } => self.step_up_polled(&gate, polled),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::CibaAsked(a) => self.open_ciba(*a),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::Ciba { gate, progress } => self.ciba_progress(&gate, progress),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::Reenrol(a) => self.open_reenrol(*a, false),
             #[cfg(feature = "companies")]
             Event::CompanySignIn { id, step } => self.on_company_sign_in(&id, step),
             #[cfg(feature = "companies")]
@@ -1658,7 +1664,7 @@ impl Runtime {
             .at_depth(depth)
             .owner_checked(owner_checked)
             .carrying(carried)
-            .through(ev.session.clone())
+            .through(turn_session(ev.session.clone()))
             .in_trace(ev.trace.clone()),
         );
         "turn"
@@ -2747,6 +2753,20 @@ pub(crate) fn status_summary(status: &Value) -> String {
         parts.push(format!("budget active: {active}"));
     }
     format!("Status: {}", parts.join(", "))
+}
+
+/// The session a conversation turn a message event delivered through
+/// `session` acts through: a firing's own authority stays with its run's
+/// work, so a turn its work started by message acts through
+/// [`HANDED_ON_SID`](crate::engine::run::HANDED_ON_SID), for nobody's grant
+/// (RFC 0044 §5.12 E).
+pub(crate) fn turn_session(session: Option<String>) -> Option<String> {
+    match session {
+        Some(s) if s.starts_with(crate::engine::run::UNATTENDED_SID_PREFIX) => {
+            Some(crate::engine::run::HANDED_ON_SID.to_string())
+        }
+        other => other,
+    }
 }
 
 // ---- ownership: who may act on a run or a subagent -------------------------

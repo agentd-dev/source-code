@@ -288,6 +288,7 @@ Pick a mechanism per kind of caller. They combine, except where noted.
 | Bearer rules | `a2a.principals[]` with `match.bearer_ref` and `id` | peers and scripts, one secret and one principal each |
 | Mutual TLS | `a2a.tls.client_ca`, plus `san` or `sub` rules | a service mesh or SPIFFE workloads |
 | Device grant | `a2a.device_grant` | people at a terminal or a browser |
+| Enterprise access tokens | `a2a.inbound_tokens` and `a2a.resource` | people a front end already signs in at your identity provider |
 | Unix socket | `a2a.listen: unix:///path` | another instance on the same host, as the operator |
 
 Mutual TLS is all or nothing. With `a2a.tls.client_ca` set, every caller
@@ -397,6 +398,52 @@ ops the same way as the approval, with `{"op": "auth.sessions"}` or
 `"all": true`) under the `agentd` key. Revocation closes the session's open
 streams within 100 ms and never deletes what the person owns. A restart ends
 every session, and there are no refresh tokens.
+
+## Take your organization's access tokens
+
+A front end that already signs people in at your identity provider — a
+chat app, a portal — can call the agent as each person, with the access
+token it gets for them. The listener checks the token and the caller is the
+person it names, `user:oidc:<iss>#<subject>`.
+
+```yaml
+# fragment: under a2a: — take an Okta custom authorization server's tokens
+a2a:
+  listen: https://0.0.0.0:8443
+  url: https://helpdesk.example.com:8443
+  bearer: "{{secret:AGENTD_OPERATOR_TOKEN}}"
+  tls:
+    cert: /etc/agentd/tls/server.crt
+    key: /etc/agentd/tls/server.key
+  resource: https://helpdesk.example.com:8443   # the token's aud
+  inbound_tokens:
+    - issuer: https://acme.okta.com/oauth2/aus1helpdesk
+      profile: okta                 # no typ; uid, cid and scp
+      clients: [0oa1chatfrontend]   # the front ends that may call
+      scopes_to_skills:
+        helpdesk.chat: [conversation]
+        helpdesk.run: ["workflow:triage-*"]
+```
+
+1. Register the agent at the authorization server as a resource whose
+   audience is `a2a.resource`, with the scopes `scopes_to_skills` names,
+   and let the front end's client ask for them.
+2. The front end presents the person's token as `Authorization: Bearer`.
+   A request with none is answered `401` naming the agent's protected-resource
+   metadata (`/.well-known/oauth-protected-resource`), where a client finds
+   the issuer; the card declares it as an `oauth2` scheme.
+3. A token the issuer did not sign for this agent and this front end is a
+   `401` (`invalid_token`); one whose scopes do not reach what it asks for is
+   a `403` (`insufficient_scope`) naming the scope that would. The answer to
+   a question a person's own run asks them, sent on the run's task, needs
+   only the scope that started the run.
+
+With `profile: generic` (the default) the issuer's tokens are RFC 9068 ones:
+`typ: at+jwt`, the person in `sub`, the client in `client_id`, the scopes in
+`scope`. A rule `match: {token_iss: <issuer>}` gives an issuer's callers the
+`agent` role instead of `user`, or narrows them by `sub`. The operator lists
+these callers with `auth.sessions`; the token itself is never kept beyond
+its life, never logged and never forwarded.
 
 ## Delegate work to another agent
 

@@ -455,7 +455,13 @@ Three refusals are deliberate:
   guard that does not compile is exit 2 at load, a build without the `cel`
   feature included. One that fails at call time refuses the call.
 
-Policies live in the restart-only `security` section.
+**A reload swaps the whole list or none of it.** `security.policies` is read
+at every call, so a reload's list holds from the next one. A list that does
+not load refuses the reload and the old one stands. A list whose rules could
+hold a tool a running turn worker or subagent dials itself — a call no rule
+would see — is refused too, naming them, until that work ends. A gate
+already open keeps the rule that raised it, and a first use approved under a
+rule stands while that rule, the grant and the template are as they were.
 
 ## Approvals and the judge
 
@@ -510,6 +516,38 @@ rule; then the implicit operator. Bearer secrets are compared in constant
 time. Session tokens, device codes and launch codes are 256 random bits, held
 only as their SHA-256 digest, in memory.
 
+**An enterprise access token is checked rule by rule.** With
+`a2a.inbound_tokens`, a JWT bearer that is no static secret is held to every
+rule of RFC 0044 §5.9 before it names anyone, each refusing rather than
+warning:
+
+- the issuer is a configured one, byte for byte, and its keys are those its
+  own metadata names, on its origin — `jku`, `x5u`, `jwk` and `x5c` in a
+  token's header are never read, and `kid` only picks among them;
+- the algorithm is on the issuer's asymmetric allow-list (RS256, ES256,
+  EdDSA): `none` and every HMAC algorithm are refused, so a public key can
+  never verify as a shared secret, and a `crit` header is refused;
+- the `typ` is one the issuer's profile allows, and the token is an access
+  token for this agent, never an ID token: its `aud` is the listener's
+  resource and names no client, it carries its client and its scopes, and
+  it has no `nonce` or `at_hash`;
+- the client is one the issuer lists, and an `azp` naming another refuses
+  it; `exp`, `nbf` and `iat` hold with a minute's skew, and `iat` is within
+  `max_token_age`;
+- it names a person — a `uid`, a `sub` that is not the client, or
+  `sub_profile: user` — or, issued to a client alone, it is refused (or,
+  with `require_user_token: false`, names an agent and never a user);
+- an `act` chain is recorded as attribution, and one deeper than
+  `max_chain_depth` is refused, never cut.
+
+A refusal is a `401` naming `invalid_token`, logged with the issuer and why
+and never with the token; a token whose scopes reach no skill the request
+asks for is a `403` naming `insufficient_scope`. The token is kept only as
+the caller's inbound session, for as long as it is good, and is never
+forwarded: no peer, MCP server, model or log is sent it. Its one way out is
+a same-domain exchange (`subject: inbound`) at the very issuer that issued
+it.
+
 **Principal ids are what work is owned by.** A `user` or `agent` is
 `<role>:<id>` when its rule declares `id`, and otherwise `<role>:cn=<CN>` or
 `<role>:san=<first SAN>` from its certificate. The `=` is in neither the
@@ -535,9 +573,10 @@ from the tuple, never from the string.
 **Whose a run is comes from the transport.** A run started by an A2A message
 is its authenticated sender's; one started by a principal's signal is that
 principal's; every other run — a schedule, a webhook, a stream, a loop — is
-the autonomous actor's (`identity.autonomous_as`). A `principal` key in a
-trigger's payload is what its sender wrote, and is never the run's
-authority.
+the autonomous actor's (`identity.autonomous_as`) — except a webhook whose
+route takes a person's token (`auth.jwt`), whose run is that person's. A
+`principal` key in a trigger's payload is what its sender wrote, and is
+never the run's authority.
 
 ### The implicit operator
 
@@ -948,9 +987,26 @@ spawns inherits the operator's terminal or a listener socket.
 ## Inbound webhooks
 
 A `webhook` route authenticates per route, by HMAC-SHA256 over the raw body,
-a header match or a bearer, compared in constant time. A non-loopback
-`webhooks.listen` refuses to start while any route is unauthenticated. Once a
-request is in, more rules hold:
+a header match or a bearer, compared in constant time — or by a person's
+access token (`auth.jwt`). A non-loopback `webhooks.listen` refuses to start
+while any route is unauthenticated. Once a request is in, more rules hold:
+
+- **A person's token starts a run as them, once.** `auth.jwt {issuer,
+  audience, max_lifetime}` takes a token from one of `a2a.inbound_tokens`'
+  issuers, checked as the listener checks one, for the webhook's own
+  audience — never one an A2A token is issued for, so a token for the
+  listener starts nothing here — living no longer than `max_lifetime`
+  (5 minutes by default, 15 at most), and carrying a `jti` never presented
+  before — a durable marker of it answers a replay after a restart as a
+  duplicate, whatever idempotency key it carries. The person is the one
+  the listener's own `a2a.principals` rules name: a rule naming the issuer
+  that admits nobody the token names admits no delivery either. The run is
+  theirs, acting through a webhook session of its own, apart from the
+  session their A2A calls keep. Only the operator's own configuration
+  declares such a route: a workflow a served document defines, or one
+  `workflow.create`/`update` stored, takes no `auth.jwt`, nor
+  `webhooks.default_auth.jwt` for a node that names no auth of its own —
+  a document's is refused at load, a stored one is not loaded.
 
 - **Replay markers are agentd's, not the agent's.** A delivery's idempotency
   key is recorded under a `_`-prefixed key in the instance's memory, and the
@@ -1361,7 +1417,10 @@ What holds:
   `idp_subject` pin; a client certificate whose key a rule admits alone
   (`match.spki`), with an `idp_subject` pin — its grant held to that key;
   a session a display client was issued by signing in at
-  the IdP (`a2a.login`), the person their IdP names; or a device session
+  the IdP (`a2a.login`), the person their IdP names; an enterprise access
+  token a front end presents (`a2a.inbound_tokens`), the person it names,
+  whose issuer is the provider's or one of its `equivalent_issuers`; or a
+  device session
   whose name an operator bound to one person (a pin, or — opted in — its
   first enrolment). A template admits each by that source. A run's authority
   is set by the transport that started it, and a session's work acts
@@ -1426,6 +1485,26 @@ What holds:
   person's principal or the grant's id, so two servers share no handle to
   correlate. Mints are budgeted per person and resource per day, month and
   minute (`budget.per_minute`, every mint asked for counted) and per run.
+- **The same-domain exchange stays in its domain.** A server behind the
+  person's IdP (`grant: token_exchange`) gets a token exchanged on their
+  behalf at that IdP, agentd authenticating as the provider's own client:
+  the grant's access token (`subject: grant`), or the caller's own token
+  (`subject: inbound`), which goes to the issuer that issued it and nowhere
+  else and lives no longer there. The result is held to the pinned
+  audience and the person, no scope beyond those asked, and a refresh token
+  in it is dropped unread. A caller's token the IdP will not exchange, or
+  one that has expired, is `subject_expired`.
+- **A sign-in is asked for out of band, and authorizes one thing.** A
+  task that waits on a person's sign-in — at admission, where a caller's
+  token names someone a template admits but who holds no grant, or at a
+  step-up — waits in `auth-required` with a single-use start link on the
+  listener origin. The sign-in is bound to the person the task is for, no
+  message answers it, and what it obtains authorizes the work it resumes
+  alone — an admission's, the run it held; a step-up's, the one call it was
+  asked for, never another to the same server: nothing reaches the caller.
+  Cancelling the task ends its admission sign-in, so a sign-in finished
+  after starts nothing. Offers are paced per person; a delegated call that
+  finds no grant never asks.
 - **Each use is authorised.** A delegated call is admitted at every use —
   a pooled token skips none of it: a turn uses a delegated tool only where
   its plan offered it (a step's `tools:` and `servers:` narrow it), the
@@ -1589,8 +1668,7 @@ What holds:
 What this preview does not do: a grant held by a person stays usable after
 the IdP removes a Resource connection until the next mint (at most
 `at_cache_cap`); taint does not follow text inside an instance child, which
-keeps a record of its own; a first use the person approved is remembered in
-memory, so a restart asks again; and for one person on a kernel without
+keeps a record of its own; and for one person on a kernel without
 Landlock, with no separate worker uid, the vault and a mounted key file are
 readable by any same-uid process.
 

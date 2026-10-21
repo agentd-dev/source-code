@@ -1391,7 +1391,7 @@ impl Runtime {
         let passed_once = |i: usize| {
             #[cfg(feature = "xaa")]
             {
-                policies[i].once_per.is_some() && self.rule_once_passed(caller, name, i)
+                policies[i].once_per.is_some() && self.rule_once_passed(caller, name, i, args)
             }
             #[cfg(not(feature = "xaa"))]
             {

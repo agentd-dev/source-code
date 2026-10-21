@@ -299,6 +299,21 @@ pub fn is_terminal(state: &TaskState) -> bool {
     state.is_terminal()
 }
 
+/// What a task's current status message says, its parts rendered as an
+/// answer's are: the peer's own words, which agentd shows as untrusted text
+/// and never acts on.
+pub fn status_text_of(v: &Value) -> String {
+    let Some(task) = task_of(v) else {
+        return String::new();
+    };
+    let raw = v.get("task").unwrap_or(v).pointer("/status/message/parts");
+    task.status
+        .message
+        .as_ref()
+        .map(|m| rendered(&m.parts, raw).join("\n"))
+        .unwrap_or_default()
+}
+
 /// The readable pieces of `parts`, in order: a text part as its text, a
 /// DataPart as its document in compact JSON. `raw` is the same parts array as
 /// the peer sent it, where a document is taken from so its numbers read as

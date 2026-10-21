@@ -140,6 +140,19 @@ pub struct Opts {
     /// Company may be signed in to directly and the identity is served
     /// here. Mounted only then.
     pub callback: Option<String>,
+    /// The listener's RFC 9728 protected-resource metadata, when
+    /// `a2a.inbound_tokens` names an issuer (RFC 0044 §5.9): served at its
+    /// path, and named in every 401 and insufficient-scope 403.
+    pub resource_metadata: Option<ResourceMetadata>,
+}
+
+/// The listener's RFC 9728 protected-resource metadata: where it is served,
+/// the URL a challenge names, and the document.
+#[derive(Clone)]
+pub struct ResourceMetadata {
+    pub path: String,
+    pub url: String,
+    pub body: Vec<u8>,
 }
 
 /// How long a Company or an authorization server may cache a served document.
@@ -225,6 +238,7 @@ struct App {
     liveness: Option<Liveness>,
     documents: Vec<(String, Vec<u8>)>,
     callback: Option<String>,
+    resource_metadata: Option<ResourceMetadata>,
     log: Logger,
 }
 
@@ -385,6 +399,7 @@ impl App {
             liveness,
             documents: opts.documents,
             callback: opts.callback,
+            resource_metadata: opts.resource_metadata,
             log,
         }
     }
@@ -408,9 +423,13 @@ fn router(app: Arc<App>) -> Router {
             get(card).options(card_preflight),
         );
     if let Some(authority) = &app.auth.authority {
-        r = r
-            .route(oauth::TOKEN_PATH, post(oauth_token).options(preflight))
-            .route(oauth::REVOKE_PATH, post(oauth_revoke).options(preflight));
+        // A listener that only takes inbound tokens issues nothing: its
+        // authority serves the sign-ins of a workflow's admission alone.
+        if authority.device().is_some() || authority.login() || authority.launch().is_some() {
+            r = r
+                .route(oauth::TOKEN_PATH, post(oauth_token).options(preflight))
+                .route(oauth::REVOKE_PATH, post(oauth_revoke).options(preflight));
+        }
         if authority.device().is_some() {
             r = r
                 .route(
@@ -454,6 +473,18 @@ fn router(app: Arc<App>) -> Router {
         let body = body.clone();
         r = r.route(
             path,
+            get(move || {
+                let body = body.clone();
+                async move { document(body) }
+            }),
+        );
+    }
+    // The protected-resource metadata (RFC 9728): the same bytes to every
+    // caller, like the public documents above.
+    if let Some(rm) = &app.resource_metadata {
+        let body = rm.body.clone();
+        r = r.route(
+            &rm.path,
             get(move || {
                 let body = body.clone();
                 async move { document(body) }
@@ -1022,6 +1053,7 @@ mod tests {
             stream_deadline: Duration::from_secs(5),
             documents: Vec::new(),
             callback: None,
+            resource_metadata: None,
         };
         let mut app = App::new(
             A2aBridge::new(tx, resolver),
@@ -1668,6 +1700,8 @@ mod tests {
             Auth {
                 sessions: Some(Arc::clone(&sessions)),
                 authority: None,
+                #[cfg(feature = "oauth")]
+                inbound: None,
             },
             Vec::new(),
             None,
@@ -1725,6 +1759,8 @@ mod tests {
             Auth {
                 sessions: Some(Arc::clone(a.sessions())),
                 authority: Some(Arc::clone(&a)),
+                #[cfg(feature = "oauth")]
+                inbound: None,
             },
             vec!["https://ui.example".into()],
             None,
@@ -1863,6 +1899,7 @@ mod tests {
             &posture,
             Some(&origin),
             &a2a.device_grant.scopes,
+            &[],
         )
         .expect("a declared scheme");
         let scheme = serde_json::to_value(&security.schemes["device_code"]).unwrap();
@@ -1887,6 +1924,8 @@ mod tests {
             Auth {
                 sessions: Some(Arc::clone(a.sessions())),
                 authority: Some(a),
+                #[cfg(feature = "oauth")]
+                inbound: None,
             },
             Vec::new(),
             None,
@@ -2010,6 +2049,8 @@ mod tests {
         Auth {
             sessions: Some(sessions),
             authority: Some(a),
+            #[cfg(feature = "oauth")]
+            inbound: None,
         }
     }
 
@@ -2438,6 +2479,7 @@ mod tests {
                 stream_deadline: Duration::from_secs(5),
                 documents: Vec::new(),
                 callback: None,
+                resource_metadata: None,
             },
             A2aBridge::new(tx, resolver),
             None,

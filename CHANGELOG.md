@@ -1523,6 +1523,101 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   revoke_held}`; `engine::model::Workflow::document` and
   `engine::run::RunState::by_model`. `agentd-conformance`:
   `Harness::{at, spawn_logged_env}`.
+- Enterprise access tokens on the A2A listener (RFC 0044 §7.P3a): with
+  `a2a.inbound_tokens` and `a2a.resource`, a front end that signs people in
+  at the organization's identity provider calls the agent with each
+  person's JWT access token (RFC 9068, or an Okta custom authorization
+  server's under `profile: okta`), and the caller is the person it names,
+  `user:oidc:<iss>#<subject>` — `#<tenant>/<subject>` under a
+  `tenant_claim`, so one subject in two tenants is two people. Every token
+  is held to its issuer, pinned
+  byte for byte; to a key from the key set the issuer's own metadata names
+  (a header's `jku`, `x5u`, `jwk` and `x5c` never read); to an asymmetric
+  algorithm the issuer allows (`none` and every HMAC refused, and a `crit`
+  header); to the `typ` its profile allows; to `aud` naming
+  `a2a.resource` and no client, a client and scopes present and no
+  `nonce` — never an ID token; to a client the issuer lists; to `exp`,
+  `nbf`, `iat` and `max_token_age`; and to naming a person — a
+  `client_credentials` token names no user, and is refused unless
+  `require_user_token: false` makes it an agent. Its `act` chain is
+  recorded, and one deeper than `max_chain_depth` (4) refused. A refusal
+  is a `401` whose challenge says `invalid_token` and names the listener's
+  RFC 9728 metadata, served at `/.well-known/oauth-protected-resource`
+  (`a2a.denied` with `reason: invalid_token`, the issuer and why, never
+  the token). `scopes_to_skills` maps scopes to `conversation`,
+  `workflow:<glob>` and `command:<op>`: a send no scope reaches is a `403`
+  naming `insufficient_scope` and the scope that would; a plain message on
+  a task the caller has answers a question its work asks under the scope
+  that started it, and needs `conversation` to become a turn. Each issuer
+  is an `oauth2` scheme on the card, with `oauth2MetadataUrl` and its
+  authorization-code (PKCE) or device-code flow, declared while its keys
+  are loaded and fresh enough to check a token (`a2a.inbound.ready`); while
+  none is, the card declares `bearer`. `a2a.principals[].match.token_iss` (with
+  `sub`) gives an issuer's callers a role. The caller is kept as an inbound
+  session for as long as the token is good, listed by `auth.sessions` and
+  ended by `auth.sessions.revoke {sid}`; the token is never forwarded. In
+  the release feature set (`a2a`, `oauth`).
+- `TASK_STATE_AUTH_REQUIRED` (A2A §7.6, with `xaa` and `a2a`): a caller an
+  access token named who starts a workflow that calls a delegated server
+  where they hold no usable grant, while a template admits them, waits
+  before any step runs in `auth-required` with a single-use start link on
+  the listener origin; their sign-in at the IdP is bound to the token's
+  subject and kept as their grant, and the work starts with no follow-up
+  message (`a2a.task.auth_required`, `why: admission`, then `decision:
+  signed_in`). Offers are paced to 3 per person in 10 minutes. A message
+  on a task that waits on a sign-in is refused, unless a `human` step of
+  the same run asks on it; nothing the sign-in obtains reaches the caller.
+  Cancelling the task ends its sign-in: finished after, it keeps nothing
+  and starts nothing (`decision: cancelled`).
+- `a2a.delegate` follows a peer's task through `TASK_STATE_AUTH_REQUIRED`:
+  the run's task — or one made for the principal the step's `auth_to`
+  names, else the run's — waits in `auth-required` too, quoting the peer as
+  untrusted text (`a2a.peer.auth_required`); the step polls the peer's task
+  once a second for up to `auth_timeout` (1 h) past `timeout`, and a
+  restart follows the same task rather than sending the objective again.
+- The same-domain exchange (RFC 0044 M1b, `xaa`): `mcp.servers[].auth.grant:
+  token_exchange` reaches a server behind the person's own IdP with an RFC
+  8693 on-behalf-of exchange there — access token for access token, for the
+  pinned `audience` and `resource` — authenticated as the provider's own
+  client. `subject: grant` (default) exchanges an access token the grant's
+  refresh token gets; `subject: inbound` exchanges the caller's own token
+  at the issuer that issued it and nowhere else, its result living no
+  longer, its tools from `tools_from: file`, and `subject_expired` once it
+  has expired or the IdP refuses it. The answer is held to the pinned
+  audience and the person, no scope beyond those asked, and a refresh
+  token in it dropped. `identity.providers.<name>.equivalent_issuers` names
+  the inbound issuers whose subjects are the provider's, and
+  `templates[].clients` the front ends whose callers a template admits.
+- `webhooks.*.auth.jwt {issuer, audience, max_lifetime}`: a webhook start
+  a person's short-lived token from an `a2a.inbound_tokens` issuer signs,
+  for the webhook's own audience — never the listener's — with a `jti`
+  never taken twice, runs as the person the listener's `a2a.principals`
+  rules name, through a webhook session of its own. The token's `jti` is a
+  durable idempotency marker beside the sender's header key, so a replay
+  after a restart is a duplicate whatever header it carries. Only the
+  operator's own configuration takes one, directly or through
+  `webhooks.default_auth.jwt`: a served document's workflow that would is
+  refused at load, and a definition `workflow.create`/`update` would store
+  is refused when written and left out when read back. It is a route's
+  authentication on a non-loopback `webhooks.listen`.
+- Twenty-seven `ema` conformance checks of P3's first part, a mock A2A peer in
+  `agentd --internal-mock-xaa` (`peer_auth`, `peer_authorized`), its IdP
+  signing any token a check asks for (`/_mock/mint`) and exchanging an
+  access token for an MCP server's (`m1b_aud`).
+- `agentd-core`: `a2a::inbound::{Inbound, Verified, Refused, For, Scheme,
+  check, skill_matches}`; `config::settings::inbound::{InboundIssuer,
+  InboundProfile, InboundFlow, TypRule, WebhookJwt}`, `A2a::{resource,
+  inbound_tokens}`, `PrincipalMatch::token_iss`, `OAuthGrant::TokenExchange`,
+  `Auth::subject`, `WebhookAuth::jwt`; `config::settings::delegation::
+  {ExchangeSubject, Provider::equivalent_issuers, Template::clients}`;
+  `delegation::{ServerKind, Server::kind, InboundInfo, Code::SubjectExpired,
+  WhoKind::Inbound}`; `auth::idjag::{AccessExchange, ExpectAccess,
+  check_access_exchange, exchange_access}` and
+  `wire::TOKEN_TYPE_ACCESS_TOKEN`; `a2a::tasks::State::AuthRequired`;
+  `a2a::oauth::InboundSession` and `Sessions::{inbound_upsert, inbound,
+  inbound_list, inbound_revoke}`; `a2a::INBOUND_SID_PREFIX`;
+  `a2a::login::SignIns::end_where`; `Resolver::token_principal` is public;
+  `mcp::a2a_client::{PeerWait, Follow}`.
 
 **Changed.**
 
@@ -1947,6 +2042,31 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   non-empty string is refused at load. Before, it was dropped.
 - `detach` or `input` on a `tool` step whose tool is not on an MCP server's
   route is refused at startup.
+
+- **Breaking:** a step-up's sign-in gate puts its task in
+  `TASK_STATE_AUTH_REQUIRED`, not `TASK_STATE_INPUT_REQUIRED`: the person
+  signs in out of band and the call goes on with no message. Its fresh ID
+  token is the subject of that call alone — its server, run or
+  conversation, and step — never of another call to the same server. The
+  web UI shows its sign-in link and its deny button on the task.
+- `security.policies` reloads: a reload swaps the list whole at the next
+  call (`security.policies.reloaded`); a list that does not load, or whose
+  rules could hold a tool a running turn or subagent dials itself, refuses
+  the reload and the old list stands, and an open gate keeps the rule that
+  raised it. Every other `security` path stays restart-only.
+- A first-use approval (`once_per: run_tool`, `delegated_egress`) is kept
+  in the store with its run, bound to the rule, the call's shape, and the
+  person's grant and templates: a restart no longer asks again, and a
+  revoked grant or a changed template does. It ends with the run, a
+  subagent's with the subagent, and every one is forgotten a day after it
+  was given.
+- **Breaking:** `mcp::a2a_client::delegate` takes a `Follow` (what to tell
+  of a peer's `AUTH_REQUIRED`, how long to wait on it, and a task to resume);
+  `Follow::default()` is the old behaviour. A delegation's poll never
+  sleeps past its deadline.
+- An inbound issuer's metadata is read from every discovery document that
+  answers, the first filling in what a later one adds — Okta's org server
+  names its key set only in the OpenID document.
 
 **Fixed.**
 

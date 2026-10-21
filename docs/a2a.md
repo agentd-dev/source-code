@@ -141,6 +141,7 @@ kind of evidence decides only for itself.
 | 1 | a unix-socket peer with the daemon's own uid, or root | the operator |
 | 2 | a session token the listener issued | that session's principal, or `401` |
 | 2 | any other bearer, on a listener that checks bearers | the operator for the operator bearer, a matching bearer rule's principal, or `401` |
+| 2 | an enterprise access token, after every static bearer | the person it names, or `401` ([Enterprise access tokens](#enterprise-access-tokens)) |
 | 3 | a verified client certificate | the first certificate rule it matches; the operator while no rule exists; else `403` |
 | 4 | none of the above, and an `any` rule exists | that rule's principal |
 | 5 | nothing, from this host, on a loopback listener with nothing configured, and no `Origin` | the operator |
@@ -171,7 +172,8 @@ Two limits keep it from reaching further than the machine:
   post to `127.0.0.1`, so a browser always signs in.
 
 Configuring any credential mechanism ends the implicit operator: a bearer, a
-principal rule, a client CA, the device grant or `a2a.login`. A configuration reload that
+principal rule, a client CA, the device grant, `a2a.login` or
+`a2a.inbound_tokens`. A configuration reload that
 adds the first principal rule ends it in the same instant the new rules apply.
 
 ### Roles, grants and the floor
@@ -223,7 +225,9 @@ person who signs in again under the same name finds what that name started.
 People should not hold the daemon's operator bearer. agentd gives them three
 ways to get a credential of their own: the device grant, a sign-in at their
 organization's identity provider (`a2a.login`), and the launch grant that
-`agentd tui` and `agentd ui` use.
+`agentd tui` and `agentd ui` use. A front end that already signs people in
+at the organization's identity provider needs none of them: it presents
+their own access token ([Enterprise access tokens](#enterprise-access-tokens)).
 
 ### The device authorization grant
 
@@ -305,6 +309,87 @@ sequenceDiagram
   caller is no implicit operator, and `/oauth2/revoke` is served.
   `a2a.login` needs a TCP listener, and is refused beside `a2a.tls.client_ca`.
 
+### Enterprise access tokens
+
+With `a2a.inbound_tokens`, the listener is an OAuth resource server for the
+organization's authorization servers. A front end — a chat app, a portal —
+signs a person in at the identity provider as it already does, asks for an
+access token for this agent (`a2a.resource`), and presents it as a bearer.
+The caller is the person the token names, `user:oidc:<iss>#<subject>` —
+under a multi-tenant issuer's `tenant_claim`, `user:oidc:<iss>#<tenant>/<subject>`,
+so one subject in two tenants is two people. That is the principal their
+own sign-in at `a2a.login` would be only when the token's issuer is the
+login IdP's own issuer and its `subject_claim` is `sub`. Otherwise — an Okta
+custom authorization server's token beside a sign-in at the org server,
+say — the two are different principals, each with its own tasks and
+conversations. The grant they hold at MCP servers is shared:
+`equivalent_issuers` finds it from either.
+
+```mermaid
+sequenceDiagram
+    participant F as Front end
+    participant I as IdP
+    participant L as agentd listener
+    F->>L: a request with no token
+    L-->>F: 401, resource_metadata names the PRM
+    F->>L: GET /.well-known/oauth-protected-resource
+    L-->>F: the resource and its authorization servers
+    F->>I: signs the person in, asks for a token for the resource
+    I-->>F: a JWT access token (RFC 9068)
+    F->>L: A2A requests, Authorization: Bearer <token>
+    L-->>F: answered as the person the token names
+```
+
+A token is checked rule by rule, and every rule refuses rather than warns:
+
+- **Only the issuers configured, only their own keys.** The token's `iss`
+  is one of them byte for byte; its signature verifies with a key from the
+  key set that issuer's metadata names. The token's header can name no key
+  of its own.
+- **Only asymmetric algorithms.** RS256, ES256 or EdDSA, from the issuer's
+  allow-list. `none` and every HMAC algorithm are refused.
+- **An access token for this agent, never an ID token.** Its `typ` is one
+  the issuer's profile allows, its `aud` is `a2a.resource` and names no
+  client, it carries a client and scopes, and it has no `nonce`.
+- **From a client the issuer lists** (`clients`), and **not expired**, not
+  issued in the future, and no older than `max_token_age`.
+- **A person, not a client alone.** A token issued to a client by itself
+  (`client_credentials`) names no user; it is refused unless the issuer
+  says `require_user_token: false`, and then it names an agent.
+
+A token that fails is a `401` whose challenge says `invalid_token`, logged
+with why and never with the token. The **profile** fills in what an issuer
+puts where: `generic` reads RFC 9068 (`typ: at+jwt`, `sub`, `client_id`,
+`scope`); `okta` reads an Okta custom authorization server's tokens (no
+`typ`, the person in `uid`, the client in `cid`, the scopes in `scp`).
+
+**Scopes reach skills.** `scopes_to_skills` maps each scope to what its
+holder may use: `conversation`, `workflow:<name glob>` or `command:<op>`. A
+send no scope of the token reaches is a `403` naming `insufficient_scope`
+and the scope that would. The role still decides first; a scope only
+narrows it. A plain message on a task the caller already has is judged by
+what it does there: an answer to a question the task's work asks — a
+`human` step of a workflow they started — is taken under the scope that
+started the work, and a message that would become a conversation turn on
+the task needs `conversation`.
+
+**The card says so.** Each issuer is an `oauth2` scheme on the card, with
+its metadata URL and its authorization-code flow (or device-code, with
+`flow: device_code`), and the listener serves its RFC 9728 metadata at
+`/.well-known/oauth-protected-resource`. The scheme is declared while the
+issuer's metadata is loaded and its keys are fresh enough to check a token
+— exactly while its tokens can pass. While no issuer is, the card declares
+a `bearer` scheme instead, so it never reads as asking for nothing, and a
+refused token's challenge names the metadata.
+
+**The token stays here.** agentd keeps the caller as an *inbound session*
+for as long as their token is good — the handle the work they start acts
+through, which the operator lists with `auth.sessions` and can end. It
+never forwards the token to a peer, an MCP server or a model. Where an MCP
+server sits behind the same authorization server, the token may be
+exchanged there for one that server takes, and sent nowhere else
+([The same-domain exchange](authentication.md#the-same-domain-exchange)).
+
 ### The launch grant
 
 `agentd tui` and `agentd ui` start the daemon and a display client together,
@@ -379,6 +464,27 @@ answers it. A gate addressed to a particular principal accepts an answer only
 from that principal. An operator may override, and the override is recorded
 as one. [Human in the loop](human-in-the-loop.md) covers asking and answering.
 
+**When a person must sign in**, the task moves to `auth-required`
+(`TASK_STATE_AUTH_REQUIRED`, A2A §7.6) with a start link on the listener
+origin. It happens in two places where agentd acts with a person's grant:
+
+- **At admission.** A caller an access token named asks for a workflow that
+  calls a server they hold no grant for, while a template would admit them.
+  Before any step runs, the task waits on their sign-in at their IdP.
+- **At a step-up.** The IdP wants a fresher sign-in before it acts for the
+  person, and the call waits on it.
+
+The person signs in at the IdP, directly to agentd, and the work goes on by
+itself: no message answers the task, and a message sent to it is refused —
+except the answer to a question another branch of the same run asks there.
+What the sign-in obtains stays with agentd and authorizes the work it
+resumes: an admission's, the run it held; a step-up's, the one call it was
+asked for, never another call to the same server. Nothing of it reaches the
+caller, and every later message is authenticated by the caller's own
+credential. Cancelling a task that waits on an admission sign-in ends the
+sign-in too: finished in a browser tab already open, it comes back to a page
+saying so, and the work never starts.
+
 ## One agent driving another
 
 Composition needs no new protocol. The channel a parent dials is the channel
@@ -404,6 +510,16 @@ refuses them. agentd selects an A2A 1.0 JSON-RPC interface, and refuses a
 peer that offers none or that requires an extension agentd does not
 implement. It streams when the peer streams, and otherwise sends and polls the
 task until it settles.
+
+**A peer that needs a person to sign in.** A peer's task may move to
+`auth-required`: the peer wants a person to authorize it, out of band. The
+delegation does not end there. The run's task — or, for a run with none, a
+task made for the person the step's `auth_to` names, else the run's own
+principal — moves to `auth-required` too, quoting the peer's words as
+untrusted text agentd never opens. agentd keeps following the peer's task,
+for up to `auth_timeout` (default an hour) past the step's own timeout,
+and across a restart without sending the work again. agentd passes the peer
+no credential of the person's: the person authorizes the peer directly.
 
 **The dial always goes to the URL you configured.** The card decides whether
 the peer speaks this protocol and under which tenant, never where agentd

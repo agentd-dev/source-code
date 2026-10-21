@@ -202,7 +202,15 @@ impl Runtime {
         let id = crate::sec::random::b64url_token(9).unwrap_or_default();
         let nonce = crate::sec::random::b64url_token(16).unwrap_or_default();
         let person = admitted.who.id.clone();
-        d.stepping_up(&id, &grant);
+        d.stepping_up(
+            &id,
+            &grant,
+            crate::delegation::CallOf {
+                server: server.clone(),
+                unit: super::delegated::call_unit(&caller),
+                step: caller.step.clone(),
+            },
+        );
         let mut link = json!({});
         let mut signin = SignIn {
             how,
@@ -261,6 +269,7 @@ impl Runtime {
             signin: Some(signin),
             session: caller.session.clone(),
             once: None,
+            once_binding: None,
         };
         self.consents.insert(id.clone(), gate);
         self.log.info(
@@ -283,7 +292,9 @@ impl Runtime {
     }
 
     /// The A2A task a step-up gate for `caller`'s work is shown on: as an
-    /// action gate's is, its `consentGate` saying where to sign in.
+    /// action gate's is, its `consentGate` saying where to sign in — in
+    /// `TASK_STATE_AUTH_REQUIRED` (A2A §7.6): the person signs in out of
+    /// band, directly to agentd, and the call goes on without a message.
     fn signin_task(
         &mut self,
         caller: &ToolCaller,
@@ -306,7 +317,7 @@ impl Runtime {
         }
         t.security_gate = true;
         t.consent_gate = Some(g);
-        t.transition(State::InputRequired, Some(signin_text(id, rendered, link)));
+        t.transition(State::AuthRequired, Some(signin_text(id, rendered, link)));
         self.task_persist(&task);
         self.task_sync(&task);
         Some(task)
@@ -388,7 +399,7 @@ impl Runtime {
                 o.extend(l.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             let text = signin_text(gate, &rendered, &link);
-            t.transition(crate::a2a::tasks::State::InputRequired, Some(text));
+            t.transition(crate::a2a::tasks::State::AuthRequired, Some(text));
         }
         if let Some(task) = task {
             self.task_persist(&task);
@@ -538,6 +549,7 @@ impl Runtime {
         id: &str,
         w: &Value,
         principal: &str,
+        (run, step): (String, String),
     ) -> Option<SignIn> {
         let how = How::of(w["how"].as_str()?)?;
         let s = SignIn {
@@ -550,7 +562,16 @@ impl Runtime {
             device: None,
         };
         let d = self.delegation.clone()?;
-        d.stepping_up(id, &s.grant);
+        // The step's call, as its resume makes it again.
+        d.stepping_up(
+            id,
+            &s.grant,
+            crate::delegation::CallOf {
+                server: s.server.clone(),
+                unit: run,
+                step: Some(step),
+            },
+        );
         let device = w.get("device").filter(|v| v.is_object());
         if let (How::Device, Some(dv)) = (how, device) {
             let (d, tx, id, principal, dv) = (

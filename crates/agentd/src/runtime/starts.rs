@@ -472,6 +472,29 @@ impl Runtime {
         run_id: Option<&str>,
         parent: Option<&TraceContext>,
     ) -> (Admission, Option<TraceContext>) {
+        self.fire_start_run_as(workflow, node, spec, payload, kind, run_id, parent, None)
+    }
+
+    /// [`Runtime::fire_start_run`], for a firing the transport authenticated
+    /// as a principal — a webhook a person's JWT signed (RFC 0044 §5.9): the
+    /// run is theirs, acting through the inbound session the token is kept
+    /// as. `None` runs as `identity.autonomous_as`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fire_start_run_as(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &Map<String, Value>,
+        payload: Value,
+        kind: &str,
+        run_id: Option<&str>,
+        parent: Option<&TraceContext>,
+        authority: Option<(&str, Option<&str>)>,
+    ) -> (Admission, Option<TraceContext>) {
+        let (principal, session) = match authority {
+            Some((p, s)) => (Some(p), s),
+            None => (None, None),
+        };
         self.admit_start(
             workflow,
             node,
@@ -483,7 +506,7 @@ impl Runtime {
             None,
             parent,
             &[],
-            (None, None),
+            (principal, session),
         )
     }
 

@@ -1315,6 +1315,17 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             .filter(|n| self.delegated_tool(n))
             .cloned()
             .collect();
+        // What it dials itself, as the plan's caller: a reload of the
+        // policies is held to it.
+        let direct = super::children::DirectRoutes {
+            caller: match &launch.kind {
+                super::children::ChildKind::StepTurn { .. } => {
+                    crate::config::settings::PolicyCaller::Workflow
+                }
+                _ => crate::config::settings::PolicyCaller::Root,
+            },
+            tools: launch.spec.mcp_routes.keys().cloned().collect(),
+        };
         let servers: Vec<crate::config::McpServerSpec> = launch
             .servers
             .iter()
@@ -1415,6 +1426,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             .map_err(|e| e.to_string())?;
         if let Some(c) = self.children.get_mut(node) {
             c.offered = Some(offered);
+            c.direct = Some(direct);
         }
         crate::obs::metrics::record_turn(kind);
         Ok(node)

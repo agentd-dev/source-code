@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A mock enterprise IdP, a mock resource authorization server and a mock
-//! EMA MCP server, for tests and the `ema` conformance family. Hidden mode:
-//! `agentd --internal-mock-xaa <addr-file> [--knobs <json>]`.
+//! A mock enterprise IdP, a mock resource authorization server, a mock
+//! EMA MCP server and a mock A2A peer, for tests and the `ema` conformance
+//! family. Hidden mode: `agentd --internal-mock-xaa <addr-file> [--knobs
+//! <json>]`.
 //!
-//! Three loopback listeners, announced in `<addr-file>` as
-//! `{"idp": …, "ras": …, "mcp": …}` (the MCP server's URL with its `/mcp`
-//! path); each origin is its own issuer, so the IdP is never the
-//! authorization server.
+//! Four loopback listeners, announced in `<addr-file>` as
+//! `{"idp": …, "ras": …, "mcp": …, "mcp2": …, "peer": …}` (the MCP server's
+//! URL with its `/mcp` path); each origin is its own issuer, so the IdP is
+//! never the authorization server.
 //!
 //! - **The IdP** publishes its metadata split as Okta's org authorization
 //!   server does — `jwks_uri` only in the OpenID document, the
@@ -17,6 +18,12 @@
 //!   ID-JAGs are ES256, signed with a key it makes at start. Refresh tokens
 //!   belong to families: with `rotate`, every use issues a new one and a
 //!   used one presented again revokes its family, as reuse detection does.
+//!   As the MCP server's own authorization server (RFC 0044 M1b) it also
+//!   exchanges an access token it issued — from a refresh, or one it
+//!   signed — for one the MCP server takes (RFC 8693, `requested_token_type`
+//!   access_token), and it signs any token a test asks for
+//!   (`POST <idp>/_mock/mint`, `{header, claims}`): the access tokens an
+//!   A2A caller presents.
 //! - **The authorization server** takes the JWT bearer grant: it verifies
 //!   the ID-JAG with the IdP's key and holds it to `typ`, `aud`, `exp` and
 //!   `client_id`, then issues an access token for the ID-JAG's `resource`.
@@ -25,6 +32,10 @@
 //!   `create_issue` and `whoami`, and records what each request declared. It
 //!   answers at `/mcp` and at `/mcp2`, two resources behind one
 //!   authorization server.
+//! - **The A2A peer** (JSON-RPC, no streaming) answers every `SendMessage`
+//!   with a task, completed at once — or, with `peer_auth`, in
+//!   `TASK_STATE_AUTH_REQUIRED` saying where to sign in, until the test sets
+//!   `peer_authorized`.
 //!
 //! Every request it receives is recorded (`GET <idp>/_mock/record`), with
 //! its form or JSON-RPC body and the headers that matter, and a test steers
@@ -97,6 +108,12 @@ pub fn default_knobs() -> Value {
         // shape `{schema}` (`elicitation/create`, over the call's own event
         // stream), and answers with what the client said.
         "elicit": null,
+        // The access-token exchange (M1b) issues its token for this
+        // audience instead of the one asked.
+        "m1b_aud": null,
+        // The peer's tasks wait on a sign-in, until `peer_authorized`.
+        "peer_auth": false,
+        "peer_authorized": false,
     })
 }
 
@@ -130,6 +147,11 @@ struct State {
     codes: BTreeMap<String, (String, Option<String>)>,
     jtis: BTreeSet<String>,
     ats: BTreeMap<String, At>,
+    /// The access tokens the IdP issued to agentd, by whose they are.
+    idp_ats: BTreeMap<String, String>,
+    /// The peer's tasks.
+    peer_tasks: BTreeSet<String>,
+    peer: String,
     record: Vec<Value>,
     serial: u64,
     /// The client's answer to the last elicitation.
@@ -181,6 +203,8 @@ pub struct Mock {
     pub mcp: String,
     /// The second resource, `/mcp2`.
     pub mcp2: String,
+    /// The A2A peer's URL.
+    pub peer: String,
     state: Arc<Mutex<State>>,
 }
 
@@ -217,10 +241,11 @@ fn merge(into: &mut Value, from: &Value) {
 /// Start the mock in this process, with `knobs` over the defaults.
 pub fn start(knobs: &Value) -> std::io::Result<Mock> {
     let bind = || TcpListener::bind("127.0.0.1:0");
-    let (li, lr, lm) = (bind()?, bind()?, bind()?);
+    let (li, lr, lm, lp) = (bind()?, bind()?, bind()?, bind()?);
     let origin =
         |l: &TcpListener| -> std::io::Result<String> { Ok(format!("http://{}", l.local_addr()?)) };
     let (idp, ras, mcp_origin) = (origin(&li)?, origin(&lr)?, origin(&lm)?);
+    let peer = origin(&lp)?;
     let mcp = format!("{mcp_origin}/mcp");
     let key = ClientKey::from_pkcs8(&ClientKey::generate_pkcs8().map_err(std::io::Error::other)?)
         .map_err(std::io::Error::other)?
@@ -239,11 +264,19 @@ pub fn start(knobs: &Value) -> std::io::Result<Mock> {
         codes: BTreeMap::new(),
         jtis: BTreeSet::new(),
         ats: BTreeMap::new(),
+        idp_ats: BTreeMap::new(),
+        peer_tasks: BTreeSet::new(),
+        peer: peer.clone(),
         record: Vec::new(),
         serial: 0,
         elicited: None,
     }));
-    for (l, role) in [(li, Role::Idp), (lr, Role::Ras), (lm, Role::Mcp)] {
+    for (l, role) in [
+        (li, Role::Idp),
+        (lr, Role::Ras),
+        (lm, Role::Mcp),
+        (lp, Role::Peer),
+    ] {
         let state = Arc::clone(&state);
         std::thread::Builder::new()
             .name(format!("mock-xaa-{role:?}"))
@@ -259,6 +292,7 @@ pub fn start(knobs: &Value) -> std::io::Result<Mock> {
         ras,
         mcp2: format!("{mcp_origin}/mcp2"),
         mcp,
+        peer,
         state,
     })
 }
@@ -272,7 +306,8 @@ pub fn run_with(addr_file: &str, knobs: &Value) -> i32 {
             return crate::exit::USAGE;
         }
     };
-    let doc = json!({"idp": mock.idp, "ras": mock.ras, "mcp": mock.mcp, "mcp2": mock.mcp2});
+    let doc = json!({"idp": mock.idp, "ras": mock.ras, "mcp": mock.mcp, "mcp2": mock.mcp2,
+                     "peer": mock.peer});
     let tmp = format!("{addr_file}.tmp");
     let announced =
         std::fs::write(&tmp, doc.to_string()).and_then(|()| std::fs::rename(&tmp, addr_file));
@@ -290,6 +325,7 @@ enum Role {
     Idp,
     Ras,
     Mcp,
+    Peer,
 }
 
 /// One HTTP request.
@@ -419,6 +455,20 @@ fn serve(stream: TcpStream, role: Role, state: &Arc<Mutex<State>>) {
                 drop(s);
                 json_reply(&stream, 200, &json!({"ok": true}));
             }
+            // A token signed with the IdP's key: the header's members (a
+            // null drops one; `alg` and `kid` are the key's) over the claims.
+            "/_mock/mint" => {
+                let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let mut header = json!({});
+                if let Some(h) = v["header"].as_object() {
+                    for (k, x) in h.iter().filter(|(_, x)| !x.is_null()) {
+                        header[k] = x.clone();
+                    }
+                }
+                let token = s.key.sign_jwt(header, &v["claims"]).unwrap_or_default();
+                drop(s);
+                json_reply(&stream, 200, &json!({"token": token}));
+            }
             _ => write(&stream, 404, &[], b""),
         }
         return;
@@ -445,6 +495,7 @@ fn serve(stream: TcpStream, role: Role, state: &Arc<Mutex<State>>) {
         Role::Idp => idp(&stream, &req, state),
         Role::Ras => ras(&stream, &req, state),
         Role::Mcp => mcp(&stream, &req, state),
+        Role::Peer => peer(&stream, &req, state),
     }
 }
 
@@ -616,11 +667,13 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                     let t = now();
                     let rt = s.new_rt(&sub, None, t);
                     let it = id_token(&s, &id_sub(&s, &sub), nonce.as_deref(), t);
+                    let at = s.next("idp-at");
+                    s.idp_ats.insert(at.clone(), sub);
                     drop(s);
                     json_reply(
                         stream,
                         200,
-                        &json!({"access_token": "idp-at", "token_type": "Bearer", "expires_in": 3600,
+                        &json!({"access_token": at, "token_type": "Bearer", "expires_in": 3600,
                                 "refresh_token": rt, "id_token": it, "scope": "openid offline_access"}),
                     );
                 }
@@ -633,7 +686,9 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                         }
                         Ok((rt, next)) => {
                             let it = id_token(&s, &id_sub(&s, &rt.sub), None, rt.auth_time);
-                            let mut v = json!({"access_token": "idp-at", "token_type": "Bearer",
+                            let at = s.next("idp-at");
+                            s.idp_ats.insert(at.clone(), rt.sub.clone());
+                            let mut v = json!({"access_token": at, "token_type": "Bearer",
                                                "expires_in": 3600, "id_token": it});
                             if let Some(n) = next {
                                 v["refresh_token"] = json!(n);
@@ -689,6 +744,9 @@ fn exchange(
     mut s: std::sync::MutexGuard<'_, State>,
 ) {
     let get = |k: &str| form.get(k).cloned().unwrap_or_default();
+    if get("requested_token_type") == wire::TOKEN_TYPE_ACCESS_TOKEN {
+        return access_exchange(stream, form, s);
+    }
     if get("requested_token_type") != wire::TOKEN_TYPE_ID_JAG || get("audience").is_empty() {
         drop(s);
         return oauth_error(stream, 400, "invalid_request", json!({}));
@@ -804,6 +862,173 @@ fn exchange(
     }
     drop(s);
     json_reply(stream, 200, &v);
+}
+
+/// The claims of `jwt` when this IdP signed it, it names this IdP and it
+/// has not expired.
+fn own_claims(s: &State, jwt: &str) -> Option<Value> {
+    let (input, sig) = jwt.rsplit_once('.')?;
+    let jwk = s.key.public_jwk();
+    let mut point = vec![0x04];
+    point.extend(b64::url_decode(jwk["x"].as_str()?).ok()?);
+    point.extend(b64::url_decode(jwk["y"].as_str()?).ok()?);
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &point)
+        .verify(input.as_bytes(), &b64::url_decode(sig).ok()?)
+        .ok()?;
+    let (_, c) = crate::auth::idjag::decode_unverified(jwt).ok()?;
+    (c["iss"].as_str() == Some(s.idp.as_str()) && c["exp"].as_u64().unwrap_or(0) > now())
+        .then_some(c)
+}
+
+/// The on-behalf-of exchange (RFC 8693, M1b): an access token this IdP
+/// issued for agentd — from a refresh, or a JWT it signed (an A2A caller's
+/// token) — for one the MCP server takes, its `aud` the one asked (or
+/// `m1b_aud`), whose it is in `sub` and `uid`.
+fn access_exchange(
+    stream: &TcpStream,
+    form: &BTreeMap<String, String>,
+    mut s: std::sync::MutexGuard<'_, State>,
+) {
+    let get = |k: &str| form.get(k).cloned().unwrap_or_default();
+    if get("subject_token_type") != wire::TOKEN_TYPE_ACCESS_TOKEN || get("audience").is_empty() {
+        drop(s);
+        return oauth_error(stream, 400, "invalid_request", json!({}));
+    }
+    if let Some(e) = s.knob("exchange_error").as_object().cloned() {
+        drop(s);
+        return oauth_error(
+            stream,
+            400,
+            e.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid_grant"),
+            json!({}),
+        );
+    }
+    let subject = get("subject_token");
+    let sub = s.idp_ats.get(&subject).cloned().or_else(|| {
+        own_claims(&s, &subject).and_then(|c| {
+            c["uid"]
+                .as_str()
+                .or_else(|| c["sub"].as_str())
+                .map(str::to_string)
+        })
+    });
+    let Some(sub) = sub else {
+        drop(s);
+        return oauth_error(stream, 400, "invalid_grant", json!({}));
+    };
+    let t = now();
+    let scope = s
+        .knob("narrow_scope")
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| get("scope"));
+    let aud = s
+        .knob("m1b_aud")
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| get("audience"));
+    let jti = s.next("m1b");
+    let scp: Vec<&str> = scope.split_whitespace().collect();
+    let at = sign(
+        &s,
+        "at+jwt",
+        &json!({"iss": s.idp, "aud": aud, "sub": sub, "uid": sub, "cid": get("client_id"),
+                "scp": scp, "jti": jti, "iat": t, "exp": t + 300}),
+    );
+    s.ats.insert(
+        at.clone(),
+        At {
+            sub,
+            resource: get("resource"),
+            scope: scope.clone(),
+            exp: t + 300,
+        },
+    );
+    let mut v = json!({"issued_token_type": wire::TOKEN_TYPE_ACCESS_TOKEN, "access_token": at,
+                       "token_type": "Bearer", "expires_in": 300, "scope": scope});
+    if s.flag("exchange_refresh_token") {
+        v["refresh_token"] = json!("rt-from-exchange");
+    }
+    drop(s);
+    json_reply(stream, 200, &v);
+}
+
+/// The A2A peer: its card, and `SendMessage` and `GetTask` over JSON-RPC.
+fn peer(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if req.method == "GET" && req.path == "/.well-known/agent-card.json" {
+        let v = json!({"name": "mock-peer", "description": "a mock A2A peer", "version": "1",
+            "supportedInterfaces": [{"url": s.peer, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+            "capabilities": {"streaming": false},
+            "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []});
+        drop(s);
+        return write(
+            stream,
+            200,
+            &[
+                ("Content-Type", "application/json".into()),
+                ("Cache-Control", "no-store".into()),
+            ],
+            v.to_string().as_bytes(),
+        );
+    }
+    if req.method != "POST" {
+        drop(s);
+        return write(stream, 404, &[], b"");
+    }
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    let method = body["method"].as_str().unwrap_or_default();
+    let task = match method {
+        "SendMessage" => {
+            let t = s.next("pt");
+            s.peer_tasks.insert(t.clone());
+            t
+        }
+        "GetTask" => body["params"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        _ => {
+            drop(s);
+            return json_reply(
+                stream,
+                200,
+                &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Method not found"}}),
+            );
+        }
+    };
+    if !s.peer_tasks.contains(&task) {
+        drop(s);
+        return json_reply(
+            stream,
+            200,
+            &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001, "message": "Task not found"}}),
+        );
+    }
+    let waits = s.flag("peer_auth") && !s.flag("peer_authorized");
+    let mut t = json!({"id": task, "contextId": format!("ctx-{task}"),
+                       "status": {"state": "TASK_STATE_COMPLETED", "timestamp": "1970-01-01T00:00:00.000Z"},
+                       "artifacts": [{"artifactId": format!("{task}.answer"), "parts": [{"text": "the peer's answer"}]}]});
+    if waits {
+        t = json!({"id": task, "contextId": format!("ctx-{task}"),
+                   "status": {"state": "TASK_STATE_AUTH_REQUIRED", "timestamp": "1970-01-01T00:00:00.000Z",
+                              "message": {"messageId": format!("{task}.ask"), "role": "ROLE_AGENT",
+                                          "parts": [{"text": format!("Sign in at {}/activate so I may read your calendar", s.idp)}]}}});
+    }
+    drop(s);
+    let result = if method == "SendMessage" {
+        json!({"task": t})
+    } else {
+        t
+    };
+    json_reply(
+        stream,
+        200,
+        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    );
 }
 
 fn ras(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {

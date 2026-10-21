@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. **P2 complete** 2026-10-21 (§7 "P2d — P2 built, part 2: policy"): certificate principals that delegate; the policy facts `unattended`, `document_sourced` and `mode`, `to: principal` and `once_per: run_tool` on an operator's rules, and the person's consent rules shipped as data — first use per run and tool, gates of one shape answered together, a person's gates paced; a signed-in person's own message no outside text to work acting with their grant; per-`(step, tool)` use-authorisation; self-service revocation, and `revoked` after any revocation; the per-(principal, resource) mint rate; agent-mode servers hidden from delegated work unless listed; document workflows asked about unless listed; elicitations put to the grant's person alone; and a local command beside a delegation under a worker uid the keys are closed to. Every P2 exit criterion holds. P3 is next
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. **P2 complete** 2026-10-21 (§7 "P2d — P2 built, part 2: policy"): certificate principals that delegate; the policy facts `unattended`, `document_sourced` and `mode`, `to: principal` and `once_per: run_tool` on an operator's rules, and the person's consent rules shipped as data — first use per run and tool, gates of one shape answered together, a person's gates paced; a signed-in person's own message no outside text to work acting with their grant; per-`(step, tool)` use-authorisation; self-service revocation, and `revoked` after any revocation; the per-(principal, resource) mint rate; agent-mode servers hidden from delegated work unless listed; document workflows asked about unless listed; elicitations put to the grant's person alone; and a local command beside a delegation under a worker uid the keys are closed to. Every P2 exit criterion holds. P3's scope in part built 2026-10-21 (§7 "P3a — P3 built, part 1: inbound identity"): the A2A listener as a resource server for enterprise JWT access tokens (`a2a.inbound_tokens`, every §5.9 rule, `token_iss`, scopes to skills, the `act` chain), its `oauth2` card schemes and RFC 9728 metadata, `401`/`403` challenges, in the release set; `TASK_STATE_AUTH_REQUIRED` at admission and at a step-up, and a peer's followed to its end; M1b, `grant: token_exchange` with `subject: grant | inbound`; a webhook a person's token signs; `security.policies` reloaded whole; first-use approvals kept with the run. P3 part 2 — CIBA, `act_for`, the unattended opt-ins, `on_revoked: ask`, step-up `max_age`, optional DPoP — is next; live Okta interop not run
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -4781,7 +4781,7 @@ With it every P2 exit criterion holds (the table after the checks).
 | Document-sourced gating (T27) — `document_workflows` takes effect | built | `runtime::taint`, `runtime::delegated`, `engine::model` |
 | `subjects: pairwise` and the opaque `agent/grant` (T25) | built in P1; checked here | `delegation` |
 | Elicitation addressing (T24) | built | `delegation`, `runtime::delegated`, `runtime::human` |
-| Reload classification | built: `consent_per_minute` and `budget.per_minute` reload; `security.policies` stays restart-only | `config::settings` |
+| Reload classification | built: `consent_per_minute` and `budget.per_minute` reload; `security.policies` stays restart-only (amended by §7.P3a: it reloads, whole or not at all) | `config::settings` |
 | A command beside a delegation (decision) | built | `config::settings::delegation`, `sec::worker` |
 | A person's own message (decision) | built | `runtime::taint`, `runtime::withhold`, `runtime::waits` |
 | `revoked` after a revocation (decision) | built | `delegation` |
@@ -5166,6 +5166,262 @@ the inbound token expires and is never sent anywhere but its issuer.
 `equivalent_issuers` to the org-AS grant; Okta CIBA accepts the chosen hint for
 an XAA AI-agent client; an Okta custom-AS-to-custom-AS on-behalf-of exchange
 succeeds.
+
+#### §7.P3a — P3 built, part 1: inbound identity (2026-10-21)
+
+This part builds the first half of P3's scope — who calls agentd from
+their enterprise token, the sign-ins a task waits on, and the same-domain
+exchange — on `main` at `6e4d9ee2`. The listener as a resource server
+(RFC 9068 tokens, its RFC 9728 metadata, the card's `oauth2` schemes, the
+`401`/`403` challenges) is behind `a2a` and `oauth`, both in the release
+set; everything that acts with a person's grant — `AUTH_REQUIRED` at
+admission, `grant: token_exchange` — is behind `xaa`, as P1 and P2 are.
+Part 2 follows: CIBA and its mock, `act_for` with its trigger restrictions,
+digest binding and caps, the unattended opt-ins, `on_revoked: ask`,
+step-up `max_age`, and optional DPoP.
+
+| Scope item | State | Where |
+|---|---|---|
+| A2A resource-server JWT validation: `a2a.inbound_tokens` (per-issuer `profile`, `typ`, `subject_claim`), every §5.9 / T19 rule | built | `config::settings::inbound`, `a2a::inbound`, `a2a::serve::dispatch` |
+| `token_iss` matcher, scope to skills, depth-bounded `act` | built | `a2a::principals::resolve`, `a2a::inbound`, `a2a::serve::dispatch` |
+| The `oauth2` scheme with `oauth2MetadataUrl` and an authorization-code or device-code flow; card schemes == verifiers | built | `runtime::a2a_server::card`, `runtime::surface::auth` |
+| RFC 9728 metadata on the A2A endpoint; `401`/`403` with `WWW-Authenticate` | built | `a2a::serve`, `a2a::serve::identity` |
+| `TASK_STATE_AUTH_REQUIRED` at task admission, with §7.6.4 binding | built | `runtime::admission`, `delegation::federation`, `runtime::a2a_server::{commands, send}` |
+| `TASK_STATE_AUTH_REQUIRED` for step-up | built: P2c's sign-in gate's task moves to it | `runtime::stepup` |
+| A peer's `AUTH_REQUIRED` (`a2a.delegate`): shown to its person, followed, resumed across a restart | built | `mcp::a2a_client`, `runtime::waits`, `engine::run` |
+| M1b, `grant: token_exchange` with `subject: grant \| inbound` | built | `delegation`, `auth::idjag`, `config::settings::delegation` |
+| `security.policies` reloaded transactionally | built | `runtime::reload`, `config::settings` |
+| First-use approvals kept durably, bound to the run, the call's shape, the grant and the template | built | `runtime::delegated` |
+| Inbound identity in workflow starts: an A2A-started run's principal and `act` chain; a webhook a person's token signs | built | `runtime::a2a_server::commands`, `runtime::webhooks`, `runtime::starts` |
+| CIBA, `act_for`, unattended opt-ins, `on_revoked: ask`, step-up `max_age`, DPoP | part 2 | — |
+| Live interop against an Okta tenant | not run: needs an Okta Integrator org this suite does not have | — |
+
+**1. The verifier.** `a2a::inbound` checks a JWT bearer that is no static
+secret and no session token, on `ring`, rule by rule: the issuer one of
+`a2a.inbound_tokens` byte for byte; its keys from the key set its own
+metadata names, or a `jwks_uri` pinned on its origin (under `okta`, a
+custom server's `{issuer}/v1/keys`) — a header's `jku`, `x5u`, `jwk` and
+`x5c` never read, `kid` picking among the pinned keys, a key whose `use`
+is not `sig` or whose `alg` is another never used; RS256, ES256 or EdDSA
+from the issuer's allow-list, `none` and every `HS*` refused by name, a
+`crit` header refused; `typ` by profile (`generic`: `at+jwt`; `okta`: none
+or `at+jwt`; or the values configured); `aud` one of the issuer's
+audiences (`a2a.resource` by default) and no client; the client claim
+(`client_id`, `cid` or `azp`) present and listed, an `azp` naming another
+refusing it; the scope claim of the profile's shape; no `nonce` or
+`at_hash`; `exp`, `nbf` and `iat` with 60 s of skew and `iat` within
+`max_token_age` (1 h, at most 24 h); a person — a `uid`, a `sub` that is
+not the client, or `sub_profile: user` — or, issued to a client alone,
+refused (`require_user_token`, default true) or named
+`agent:oidc:<iss>#<client>`; a `tenant_claim` when configured; and an
+`act` chain recorded and refused deeper than `max_chain_depth` (4, at most
+16). Metadata is read from every discovery document that answers, a later
+one filling in what the first leaves out (Okta's org server names its key
+set only in the OpenID document); keys are cached an hour and read again,
+off the listener's threads, when a token names a `kid` the set lacks, at
+most every 30 s. A token the verifier refuses is a `401` naming
+`invalid_token` and `resource_metadata`, logged as `a2a.denied` with the
+issuer and why and never the token; an issuer that is not this listener's
+leaves the bearer a bearer, which then fails as one.
+
+**2. Whom it names.** A token's caller is `user:oidc:<iss>#<subject>` —
+`PrincipalRef { source: oidc, issuer, tenant, stable_id }`; under a
+`tenant_claim` `user:oidc:<iss>#<tenant>/<subject>`, so one subject in two
+tenants is two principals, with two sets of tasks and conversations (T19's
+cross-tenant `sub`); the principal `a2a.login` gives the same person where
+the token's issuer is the login IdP's own and `subject_claim` is `sub` —
+or the first `match.token_iss` rule it
+meets (with `sub`, a glob over the subject), whose role it takes; a rule
+for an issuer whose role is not `user` or `agent`, or that names an `id`,
+an `idp_subject` or other evidence, is refused at load. The caller is kept
+as an **inbound session** (`it_…`, keyed by issuer, tenant, subject and
+client), the handle the work it starts acts through: listed by
+`auth.sessions` (issuer, client, scopes, `act`, never the token), ended by
+`auth.sessions.revoke {sid}`, gone an hour after its token expires. The
+token itself is kept with it only where a `subject: inbound` server
+exchanges that issuer's tokens. A2A-started runs and turns act through
+the session, as through P2c's, and `run.start` names the token's `act`
+chain (`act`, outermost first).
+
+**3. Scopes and the card.** `scopes_to_skills` maps a scope to
+`conversation`, `workflow:<name glob>` or `command:<op>`; a send (a message,
+`workflow.run`, a declared command) whose skill no scope of the token
+reaches is a `403` with `error="insufficient_scope"`, `scope` the issuer's
+scopes that would, and `resource_metadata`. The role decides first; a
+scope only narrows. A plain message naming a task is the runtime's to
+judge, from the scopes the caller's inbound session holds: an answer to a
+gate of the task's work is taken under the scope that admitted the work,
+and a message that becomes a conversation turn needs `conversation` — a
+`403 insufficient_scope` otherwise. Each issuer is an `oauth2` scheme (`enterprise`,
+`enterprise-<n>`, or its `name`) whose `oauth2MetadataUrl` is the document
+its metadata came from and whose flow is `authorizationCode` with
+`pkceRequired: true` (or `deviceCode`, `flow: device_code`); it joins
+`securityRequirements` with its scopes, beside `mtls` where a client CA is
+set. A scheme is declared only while its issuer's metadata is loaded and
+its keys are fresh enough to check a token — the verifier's own test — so
+the card never names a verifier the listener cannot run; while no issuer
+is, the card declares `bearer` instead, so a tokens-only listener's card
+never reads as asking for nothing. `/.well-known/oauth-protected-resource` serves the
+resource, the issuers, `bearer_methods_supported: [header]` and the
+scopes.
+
+**4. `AUTH_REQUIRED` at admission.** A caller an inbound token named who
+asks for a workflow whose steps name a delegated server (an `mcp.tool` or
+`mcp.resource` step at any depth), holding there no grant or an expired or
+revoked one, while a template admits them at its IdP, gets a task in
+`TASK_STATE_AUTH_REQUIRED` before any step runs: its status message
+agentd's words with a single-use start link on the listener origin
+(`Purpose::Admit`), its annotations `signIn` and `securityGate`. The
+sign-in at the IdP is bound to the token's own subject through
+`equivalent_issuers` and kept as the person's grant, and the held start is
+released: the run starts with no follow-up message. The decision reads the
+typed principal and the definition, never the message; a delegated call
+that finds no grant still fails `not_enrolled` and never asks (T33);
+offers are paced to 3 per person in 10 minutes; a message on the waiting
+task is refused, the sign-in still waiting; the held start lives in memory,
+and a restart fails its task saying so. Cancelling the waiting task drops
+the held start and ends its sign-in: a callback after it is refused and
+keeps nothing, and a sign-in that comes back to a task already ended
+starts nothing. What the sign-in obtains reaches
+no caller, and every later message on the task is held to the caller's own
+credential (§7.6.4).
+
+**5. Step-up.** P2c's sign-in gate now moves its task to
+`TASK_STATE_AUTH_REQUIRED` rather than `INPUT_REQUIRED` (a breaking change
+of the state a client sees). Its fresh ID token is single-use and bound to
+the call that asked — its server, its unit of work (`Call::unit`, the run
+or the conversation) and its step — so it authorizes that call alone:
+another call's mint, to the same server for the same person, leaves it.
+
+**6. A peer's `AUTH_REQUIRED`.** `a2a.delegate` no longer ends at a peer's
+task in `TASK_STATE_AUTH_REQUIRED`. The client tells the runtime when the
+wait starts, with the peer's status text, and when it ends; meanwhile it
+polls once a second, for up to `auth_timeout` (default 1 h, at most 24 h)
+past the step's `timeout`. The runtime records `{kind: peer_auth, peer,
+task}` as the step's wait and moves the run's task — or, for a run with
+none, a task it makes for the principal `auth_to` names, else the run's
+own — to `auth-required`, quoting the peer's words as untrusted text. A
+restart replays the step against the same peer task: `begin_step` keeps a
+`peer_auth` wait, and the delegation polls that task instead of sending
+the objective again. agentd gives the peer no credential of the person's.
+`a2a.send`, fire and forget, is unchanged.
+
+**7. M1b.** `grant: token_exchange` names `idp`, `audience` (the exchanged
+token's, any non-empty string), `resource` and `subject`, and no client of
+its own — agentd authenticates at the IdP's token endpoint as the
+provider's client — nor any ID-JAG field. The exchange is RFC 8693
+(`subject_token_type` and `requested_token_type` both access-token).
+`subject: grant` refreshes the grant there for an access token for agentd
+(rotation, quota and the liveness probe as for an ID-JAG mint) and
+exchanges it; `subject: inbound` exchanges the caller's own token at its
+issuer, which must be the provider's exactly (not an equivalent one), with
+no grant stored: admission builds the template's ceiling under the key the
+person's grant would have, alive while the token is, and its tools come
+from `tools_from: file`. The answer must be an access token and a
+`Bearer`; a JWT one must name the pinned audience and the person (`uid`
+under `okta`, else `sub`); no scope beyond those asked; a refresh token
+in it is dropped. The result never outlives the inbound token; an expired
+inbound token, or `invalid_grant` for one, is `subject_expired`. The
+server's RFC 9728 metadata must name the provider's issuer. A document may
+set none of these fields (`subject` joins the operator-only list).
+
+**8. Webhooks.** `auth.jwt {issuer, audience, max_lifetime}` on a webhook
+start (or `webhooks.default_auth`) takes a token from an inbound issuer,
+checked as the listener checks one, for the webhook's own audience — never
+one an A2A token is issued for — living at most `max_lifetime` (5 min, at
+most 15) from `iat` to `exp`, with a `jti` never seen before (an in-memory
+cache of 65 536, kept until each expires). The person is the one the
+listener's own `a2a.principals` rules name (`Resolver::token_principal`):
+a rule naming the issuer that admits nobody the token names refuses the
+delivery. The run is the person's (`fire_start_run_as`), acting through a
+webhook session of its own (`it_…`, keyed apart from the A2A one), so a
+delivery never lowers the labels, expiry or held token of the session
+their A2A work acts through. `jwt:<iss>#<jti>` is a durable idempotency
+marker beside the sender's header key, so the token replayed after a
+restart, under any header value, is a duplicate. Only the operator's own
+configuration declares such a route: the route builder judges the auth a
+route is built with — a node's own `auth.jwt`, or `webhooks.default_auth.jwt`
+for a node naming no auth — and refuses it for a workflow an instruction
+document defined (the load is refused), while a definition
+`workflow.create`/`update` stored that would take one is refused when
+written and left out when the store is read; every such route is held to
+the configuration's issuer, audience and lifetime rules as it is built.
+
+**9. Policies and first use.** `security.policies` moved from the
+restart-only `security` section to the reloadable set (amending §7.P2d's
+"stays restart-only"). A reload swaps the list whole at the next call; a
+list that does not load refuses the reload; a list whose rules could hold
+a tool that a running turn worker or subagent dials directly (the child's
+direct routes, recorded at spawn) is refused too, naming them, since no
+rule would see those calls until the child ends. A gate already open keeps
+its rule. A first-use approval (`once_per: run_tool`) is kept in the store
+under its unit (`delegation/once/…`, at most 256 a unit, a day at most),
+keyed by the rule and the call's shape (tool and argument names) and bound
+to the person's grants (id, epoch, template) and admitting templates: a
+restart asks nothing more, a revoked grant or a changed template asks
+again, and the run's end forgets it — a subagent's, the subagent's end;
+and once an hour the records whose every approval is a day old go.
+
+**Decisions taken while building it.** (a) The resource-server half is in
+the release set, since it needs no ID-JAG machinery and is what a front
+end needs first; (b) `scopes_to_skills` names `conversation`,
+`workflow:<glob>` and `command:<op>` rather than §5.15's bare skill names,
+since those are the skills a send actually asks for; (c) `max_chain_depth`
+is per issuer; (d) a message on any task in `auth-required` that is no
+consent gate's, and on which no `human` step asks, is refused by the
+runtime, a step-up's being refused by its gate as before
+(`a_message_is_no_answer`); (e) `jwks: discover` of the
+§5.15 sketch is `jwks_uri`, unset meaning discovery; (f) the admission
+sign-in is offered for `workflow.run` and a declared command alone, never
+for a conversation turn, whose delegated calls fail `not_enrolled`.
+
+**Exit criteria.** Each holds by a check, mutation-tested by turning its
+rule off and seeing the check fail.
+
+| Criterion | Check |
+|---|---|
+| card schemes match the configured verifiers; RFC 9728 metadata; the challenge names it | `ema/inbound-card-and-metadata-name-the-issuer` |
+| bad `iss` → 401 | `ema/inbound-token-of-another-issuer-refused` |
+| bad `aud` → 401 | `ema/inbound-token-for-another-audience-refused` |
+| bad `exp` → 401 | `ema/inbound-expired-token-refused` |
+| `alg: none` → 401 | `ema/inbound-unsigned-token-refused` |
+| HMAC → 401 | `ema/inbound-hmac-token-refused` |
+| a `typ` the profile forbids → 401 | `ema/inbound-token-of-a-forbidden-typ-refused` |
+| an ID token as an access token, with and without `typ` → 401 | `ema/inbound-id-token-refused` |
+| a disallowed client → 401 | `ema/inbound-token-of-an-unlisted-client-refused` |
+| insufficient scope → 403 | `ema/inbound-scope-reaches-the-skill` |
+| foreign tasks `NotFound` | `ema/inbound-callers-tasks-are-theirs-alone` |
+| a `client_credentials` token never a user | `ema/inbound-client-token-names-no-user` |
+| the inbound token never forwarded or exchanged but at its issuer (asserted on every mock's record) | `ema/token-exchange-of-the-callers-token`, `ema/inbound-token-names-its-person`, `ema/peer-auth-required-waits-for-its-person` |
+| a replayed webhook JWT refused, and a duplicate after a restart under a new idempotency key | `ema/webhook-token-never-taken-twice` |
+| a webhook token's person is the one the listener's rules name, kept in a session of its own | `ema/webhook-token-named-by-the-listeners-rules` |
+| `AUTH_REQUIRED` resumes without a follow-up message; the credential authorizes no later message | `ema/admission-waits-on-the-callers-sign-in`, `ema/step-up-waits-in-auth-required-for-one-call` |
+| a cancelled admission's sign-in starts nothing | `ema/admission-cancelled-starts-nothing` |
+| a token's caller answers their own run's question under the scope that started it; a turn needs `conversation` | `ema/inbound-scope-answers-its-own-run` |
+| M1b yields a token with the pinned `aud` | `ema/token-exchange-of-the-grant`, `ema/token-exchange-pinned-audience` |
+| `subject: inbound` fails `subject_expired`, its token sent nowhere but its issuer | `ema/token-exchange-of-the-callers-token` |
+| a peer's `AUTH_REQUIRED` reaches its person and resumes, across a restart | `ema/peer-auth-required-waits-for-its-person` |
+| a question beside a peer's sign-in on the run's task takes its answer | `ema/peer-auth-required-beside-a-question` |
+| the policies reload transactionally | `ema/policies-reload-whole-or-not-at-all` |
+| a first-use approval survives a restart, and not a changed template | `ema/first-use-approval-outlives-a-restart`, `ema/first-use-approval-ends-with-its-template` |
+
+The verifier's rules are units as well (`a2a::inbound`: both profiles,
+the three algorithms, `none`/HMAC/foreign keys, `typ`, issuer/audience/times,
+ID tokens, clients and a client's own token, tenant and `act`, scopes, the
+card's scheme following key freshness), as are the tenant in a principal's
+id (`a2a::principals::typed`), the exchange's checks (`auth::idjag`), a
+step-up's fresh ID token serving its call alone (`delegation`), the
+settings' refusals (`config::settings::delegation`,
+`config::settings::inbound`, a stored definition's person-token webhook in
+`config::settings`), the route builder's (`runtime::webhooks`), the card's
+`bearer` while no issuer is ready (`runtime::surface::auth`), the
+first-use sweep (`runtime::delegated`), the peer follow
+(`mcp::a2a_client`) and the kept peer wait (`engine::run`). Not
+checked by a running test here: the CIBA, `act_for` and DPoP criteria
+(part 2), and the live Okta criteria — a custom-AS token mapped through
+`equivalent_issuers` to an org-AS grant, Okta CIBA, a custom-AS-to-custom-AS
+exchange — which need an Okta tenant; the mock IdP plays Okta's token
+shapes.
 
 ### P4 — Deferred, each behind a named flag or its own small amendment, only on demand
 

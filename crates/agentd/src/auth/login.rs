@@ -281,7 +281,10 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
     let auth = resolve_auth(settings, target)?;
     // A delegated server holds no login of its own: it is reached with the
     // enrolled person's grant (RFC 0044), which the running daemon keeps.
-    if auth.grant == Some(OAuthGrant::IdJag) {
+    if matches!(
+        auth.grant,
+        Some(OAuthGrant::IdJag | OAuthGrant::TokenExchange)
+    ) {
         return Err(format!(
             "{target} is reached with the enrolled person's grant, not a login of its own: run `agentd --login idp:{}`",
             auth.idp.as_deref().unwrap_or("<name>")
@@ -463,6 +466,7 @@ mod tests {
             attribution: None,
             max_at_age: None,
             trusted_output: None,
+            subject: None,
         }
     }
 

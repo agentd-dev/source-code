@@ -84,6 +84,11 @@ pub enum Purpose {
     /// fresh sign-in of the grant's own person, at least as recent as the
     /// `max_age` asked.
     StepUp { gate: String },
+    /// The caller an inbound token named, `sid`, enrolling for the workflow
+    /// its task `task` holds at admission (RFC 0044 §5.4 Door 2): the
+    /// sign-in must be that very person, and the held work starts once it
+    /// is kept.
+    Admit { sid: String, task: String },
 }
 
 impl Purpose {
@@ -92,6 +97,7 @@ impl Purpose {
             Purpose::Login { .. } => "login",
             Purpose::Enrol { .. } => "enrol",
             Purpose::StepUp { .. } => "step_up",
+            Purpose::Admit { .. } => "admit",
         }
     }
 }
@@ -572,6 +578,18 @@ impl SignIns {
             (Ok(signed), _) => {
                 f.outcome = Outcome::Done;
                 (signed.said, None)
+            }
+        }
+    }
+
+    /// End every sign-in `which` names whose IdP has not answered yet: its
+    /// start link and its callback say it has ended, and nothing it would
+    /// have kept is kept. The work a runtime-begun sign-in was for, gone,
+    /// ends it.
+    pub fn end_where(&self, which: impl Fn(&Purpose) -> bool, why: &str) {
+        for f in self.table().values_mut() {
+            if f.outcome == Outcome::Pending && which(&f.purpose) {
+                f.outcome = Outcome::Failed(why.to_string());
             }
         }
     }

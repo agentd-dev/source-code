@@ -14,6 +14,8 @@
 #[cfg(feature = "a2a")]
 pub mod a2a_server;
 pub mod activity;
+#[cfg(all(feature = "xaa", feature = "a2a"))]
+pub(crate) mod admission; // AUTH_REQUIRED at a workflow's admission (RFC 0044 §5.4 Door 2)
 pub mod artifacts;
 pub mod audit;
 pub mod breaker;
@@ -139,6 +141,30 @@ fn resolve_verify_key(
         }
     }
     None
+}
+
+/// The listener's RFC 9728 protected-resource metadata (RFC 0044 §5.9):
+/// `a2a.resource`, the issuers whose tokens it takes and their scopes,
+/// served at the resource's path-inserted well-known URL.
+#[cfg(all(feature = "a2a", feature = "oauth"))]
+fn resource_metadata_of(
+    inbound: &crate::a2a::inbound::Inbound,
+    settings: &crate::config::settings::Settings,
+) -> Option<crate::a2a::serve::ResourceMetadata> {
+    let url =
+        crate::auth::http::insert_well_known(inbound.resource()?, "oauth-protected-resource")?;
+    let (_, path) = crate::auth::http::split_origin(&url)?;
+    let name = settings
+        .agent
+        .name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or("agentd");
+    Some(crate::a2a::serve::ResourceMetadata {
+        path: path.to_string(),
+        body: serde_json::to_vec(&inbound.resource_metadata(name)).unwrap_or_default(),
+        url,
+    })
 }
 
 /// Where the store keeps the audit chain's head.
@@ -733,6 +759,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             return crate::exit::USAGE;
         }
     };
+    #[cfg(all(feature = "a2a", feature = "oauth"))]
+    let inbound = crate::a2a::inbound::Inbound::build(&settings, &log);
     let mut rt = Runtime {
         instance: instance.clone(),
         run_id: run_id.clone(),
@@ -748,6 +776,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         company_directs: BTreeMap::new(),
         #[cfg(feature = "xaa")]
         delegation,
+        #[cfg(all(feature = "a2a", feature = "oauth"))]
+        inbound,
         #[cfg(feature = "xaa")]
         consents: BTreeMap::new(),
         #[cfg(feature = "xaa")]
@@ -755,7 +785,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         #[cfg(feature = "xaa")]
         consented_once: BTreeMap::new(),
         #[cfg(feature = "xaa")]
+        once_swept_ms: 0,
+        #[cfg(feature = "xaa")]
         consents_asked: BTreeMap::new(),
+        #[cfg(all(feature = "xaa", feature = "a2a"))]
+        held_starts: BTreeMap::new(),
+        #[cfg(all(feature = "xaa", feature = "a2a"))]
+        admission_offers: BTreeMap::new(),
         #[cfg(feature = "xaa")]
         elicits: BTreeMap::new(),
         mcp,
@@ -1376,6 +1412,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     {
         rt.delegation_wire();
         rt.rebuild_consents();
+        #[cfg(feature = "a2a")]
+        rt.end_restored_admissions();
         if let Some(d) = &rt.delegation {
             d.warm_personal();
         }
@@ -1413,6 +1451,21 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         // agentd's Client ID Metadata Document beside it, when served here.
         #[cfg(feature = "oauth")]
         let documents = [documents, client_documents].concat();
+        // The listener as a resource server for the enterprise's tokens
+        // (RFC 0044 §5.9): each issuer's metadata and keys read before the
+        // first request, so the card declares what it can verify.
+        #[cfg(feature = "oauth")]
+        let inbound = rt.inbound.clone();
+        #[cfg(feature = "oauth")]
+        if let Some(i) = &inbound {
+            i.warm();
+        }
+        #[cfg(feature = "oauth")]
+        let resource_metadata = inbound
+            .as_ref()
+            .and_then(|i| resource_metadata_of(i, &rt.settings));
+        #[cfg(not(feature = "oauth"))]
+        let resource_metadata = None;
         match a2a_server::spawn_a2a_listener(
             &rt.settings.a2a,
             rt.events_tx.clone(),
@@ -1423,6 +1476,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             opts.launch.clone(),
             documents,
             callback,
+            #[cfg(feature = "oauth")]
+            inbound,
+            resource_metadata,
         ) {
             Ok(serving) => {
                 rt.a2a_feed = serving.feed.clone();
@@ -1482,7 +1538,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         let nodes = rt.webhook_nodes();
         let write_timeout = rt.settings.lifecycle.drain_timeout();
         match webhooks::spawn_webhook_listener(
-            &rt.settings.webhooks,
+            &rt.settings,
             nodes,
             rt.webhook_callbacks.clone(),
             #[cfg(feature = "mcp-events")]
@@ -1492,6 +1548,12 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             write_timeout,
             rt.pressure.clone(),
             log.clone(),
+            #[cfg(feature = "oauth")]
+            rt.inbound.clone(),
+            #[cfg(feature = "oauth")]
+            rt.a2a_serving.as_ref().and_then(|s| s.sessions.clone()),
+            #[cfg(feature = "oauth")]
+            rt.a2a_serving.as_ref().map(|s| s.bridge.clone()),
         ) {
             // Held so a reload can rebuild the routes into the live handler.
             Ok(h) => rt.webhook_handler = Some(h),

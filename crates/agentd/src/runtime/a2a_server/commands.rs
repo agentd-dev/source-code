@@ -484,6 +484,29 @@ impl Runtime {
         // The run is the request's unit of work: it continues the caller's
         // trace, and its task is done in the run's span.
         let parent = self.a2a_upstream(message);
+        // A caller an inbound token named, for a workflow that acts with a
+        // grant they do not hold yet: the run waits on their sign-in, in
+        // `AUTH_REQUIRED`, and starts once it is kept (RFC 0044 §5.4 Door 2).
+        #[cfg(feature = "xaa")]
+        if let Some(idp) = self.admission_needs(principal, &name) {
+            let held = crate::runtime::admission::HeldStart {
+                kind: kinds::WORKFLOW_RUN,
+                principal: principal.id.clone(),
+                session: principal.session.clone(),
+                payload: payload.clone(),
+                parent: parent.clone(),
+                links_event: false,
+                idp,
+                until_ms: 0,
+            };
+            match self.hold_for_sign_in(&task_id, held) {
+                Ok(()) => return self.task_reply(&task_id),
+                Err(e) => self.log.info(
+                    "a2a.task.auth_required",
+                    json!({"task": task_id, "principal": principal.id, "decision": "not_offered", "why": e}),
+                ),
+            }
+        }
         // A run a signed-in person starts acts through the session they
         // started it through (RFC 0044 §5.12).
         match self

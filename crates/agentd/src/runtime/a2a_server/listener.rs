@@ -44,6 +44,10 @@ pub(crate) struct A2aServing {
     /// daemon: kept so every rebuild of [`A2aServing::origins`] — a reload
     /// that edits `a2a.cors.origins` — admits the UI it launched.
     pub launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
+    /// The inbound-token verifier, when `a2a.inbound_tokens` names an
+    /// issuer (RFC 0044 §5.9): the card declares what it can verify.
+    #[cfg(feature = "oauth")]
+    pub inbound: Option<Arc<crate::a2a::inbound::Inbound>>,
 }
 
 /// The URL a caller reaches this listener at, once it is bound.
@@ -118,6 +122,8 @@ pub(crate) fn spawn_a2a_listener(
     launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
     documents: Vec<(String, Vec<u8>)>,
     callback: Option<String>,
+    #[cfg(feature = "oauth")] inbound: Option<Arc<crate::a2a::inbound::Inbound>>,
+    resource_metadata: Option<crate::a2a::serve::ResourceMetadata>,
 ) -> Result<A2aServing, String> {
     use std::path::Path;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
@@ -195,10 +201,13 @@ pub(crate) fn spawn_a2a_listener(
     });
     // The sign-ins at the IdP on this origin (RFC 0044 §5.4) wherever the
     // listener issues sessions: `a2a.login`'s, and the enrolments and
-    // step-ups a signed-in person starts — completed by the delegation
-    // supervisor once it installs itself as their federation.
+    // step-ups a signed-in person starts — and wherever it takes inbound
+    // tokens, whose callers sign in at a workflow's admission (§5.9) —
+    // completed by the delegation supervisor once it installs itself as
+    // their federation.
     let issues = crate::runtime::surface::auth::listener_auth_of(a2a).issues_sessions();
-    let signins = (issues && !unix_listener).then(|| {
+    let tokens = crate::runtime::surface::auth::listener_auth_of(a2a).tokens;
+    let signins = ((issues || tokens) && !unix_listener).then(|| {
         Arc::new(crate::a2a::login::SignIns::new(
             a2a.login.as_ref().map(|l| crate::a2a::login::LoginCfg {
                 idp: l.idp.clone(),
@@ -210,7 +219,7 @@ pub(crate) fn spawn_a2a_listener(
     });
     let authority = sessions
         .as_ref()
-        .filter(|_| issues || launch.is_some())
+        .filter(|_| issues || tokens || launch.is_some())
         .map(|s| {
             Arc::new(
                 crate::a2a::oauth::Authority::new(
@@ -241,6 +250,8 @@ pub(crate) fn spawn_a2a_listener(
             auth: crate::a2a::serve::Auth {
                 sessions: sessions.clone(),
                 authority: authority.clone(),
+                #[cfg(feature = "oauth")]
+                inbound: inbound.clone(),
             },
             cors_origins: Arc::clone(&origins),
             tls,
@@ -248,6 +259,7 @@ pub(crate) fn spawn_a2a_listener(
             stream_deadline: bridge.stream_deadline,
             documents,
             callback,
+            resource_metadata,
         },
         Arc::clone(&bridge),
         feed.clone(),
@@ -274,6 +286,8 @@ pub(crate) fn spawn_a2a_listener(
         sessions,
         authority,
         launch,
+        #[cfg(feature = "oauth")]
+        inbound,
     };
     log.info(
         "a2a.listen",
@@ -333,6 +347,9 @@ mod tests {
             quiet(),
             launch,
             Vec::new(),
+            None,
+            #[cfg(feature = "oauth")]
+            None,
             None,
         )
         .unwrap()

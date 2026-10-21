@@ -81,6 +81,10 @@ pub struct Auth {
     /// The authorization server, when `a2a.device_grant.enabled`: its routes
     /// are served only while it is here.
     pub authority: Option<Arc<crate::a2a::oauth::Authority>>,
+    /// The inbound-token verifier, when `a2a.inbound_tokens` names an
+    /// issuer (RFC 0044 §5.9): a bearer that is a JWT is checked by it.
+    #[cfg(feature = "oauth")]
+    pub inbound: Option<Arc<crate::a2a::inbound::Inbound>>,
 }
 
 /// The request's evidence: its bearer, its verified certificate, whether the
@@ -109,6 +113,7 @@ pub(super) fn evidence_of(headers: &HeaderMap, peer_id: &PeerId, peer: &Peer) ->
             Peer::Instance(h) => Some(h.to_string()),
             _ => None,
         },
+        token: None,
     }
 }
 
@@ -138,6 +143,18 @@ pub(super) const BROWSER_MUST_AUTHENTICATE: &str = "browser requests must authen
 /// session token; `browser`: nothing was presented and the request was
 /// refused only because it came from a browser.
 pub(super) fn challenge(presented: bool, session: bool, browser: bool) -> Response {
+    challenge_at(presented, session, browser, None)
+}
+
+/// [`challenge`], pointing a client at the listener's RFC 9728 metadata
+/// (`resource_metadata`, RFC 9728 §5.1) where it serves one: how an
+/// OAuth client finds the authorization servers whose tokens it takes.
+pub(super) fn challenge_at(
+    presented: bool,
+    session: bool,
+    browser: bool,
+    resource_metadata: Option<&str>,
+) -> Response {
     let (www, message) = if presented {
         let description = if session {
             "the session token is unknown, expired or revoked"
@@ -161,6 +178,10 @@ pub(super) fn challenge(presented: bool, session: bool, browser: bool) -> Respon
             "authentication required",
         )
     };
+    let www = match resource_metadata {
+        Some(url) => format!("{www}, resource_metadata=\"{url}\""),
+        None => www,
+    };
     let body = errors::rpc_error(
         Value::Null,
         errors::UNAUTHENTICATED,
@@ -172,6 +193,40 @@ pub(super) fn challenge(presented: bool, session: bool, browser: bool) -> Respon
         )],
     );
     let mut resp = json_with(StatusCode::UNAUTHORIZED, &body);
+    if let Ok(v) = HeaderValue::from_str(&www) {
+        resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+    }
+    resp
+}
+
+/// The 403 a token whose scopes do not reach what it asked for gets (RFC
+/// 6750 §3.1): `insufficient_scope`, the scopes that would (`scope`, when
+/// some would), and where the listener's metadata is.
+#[cfg(feature = "oauth")]
+pub(super) fn insufficient_scope(
+    id: Value,
+    message: &str,
+    scopes: &[String],
+    resource_metadata: Option<&str>,
+) -> Response {
+    let body = errors::rpc_error(
+        id,
+        errors::PERMISSION_DENIED,
+        message,
+        vec![errors::error_info(
+            errors::AGENTD_DOMAIN,
+            reason::PERMISSION_DENIED,
+            &[],
+        )],
+    );
+    let mut resp = json_with(StatusCode::FORBIDDEN, &body);
+    let mut www = String::from("Bearer realm=\"agentd\", error=\"insufficient_scope\"");
+    if !scopes.is_empty() {
+        www.push_str(&format!(", scope=\"{}\"", scopes.join(" ")));
+    }
+    if let Some(url) = resource_metadata {
+        www.push_str(&format!(", resource_metadata=\"{url}\""));
+    }
     if let Ok(v) = HeaderValue::from_str(&www) {
         resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
     }

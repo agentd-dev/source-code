@@ -91,6 +91,12 @@ pub struct Provider {
     /// says; under `profile: okta`, `{issuer}/oauth2/v1/keys`.
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// `a2a.inbound_tokens` issuers whose subject claim is this IdP's `sub`
+    /// (RFC 0044 §5.9): a caller such a token names holds the grant its
+    /// subject holds here. Subjects are never matched across issuers not
+    /// listed.
+    #[serde(default)]
+    pub equivalent_issuers: Vec<String>,
 }
 
 /// A provider's quirks pack.
@@ -355,6 +361,11 @@ pub struct Template {
     /// to the person's delegated work (RFC 0044 §5.3).
     #[serde(default)]
     pub agent_mode_servers: Vec<String>,
+    /// The front-end clients whose inbound tokens may act with these grants
+    /// (RFC 0044 §5.9): a caller an inbound token names from any other is
+    /// admitted by no template. Empty, every client the issuer allows.
+    #[serde(default)]
+    pub clients: Vec<String>,
 }
 
 impl Template {
@@ -524,6 +535,20 @@ pub enum OnRevoked {
     Ask,
 }
 
+/// `auth.subject` of `grant: token_exchange`: what is exchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeSubject {
+    /// An access token for agentd from the enrolled grant's refresh token
+    /// at the same authorization server.
+    #[default]
+    Grant,
+    /// The caller's verified inbound A2A token, whose issuer is this
+    /// authorization server: held in memory for the work, never persisted,
+    /// and the call fails `subject_expired` once it expires.
+    Inbound,
+}
+
 /// `auth.attribution`: what `agent/acting_for` carries on a delegated call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -564,16 +589,35 @@ fn declared(s: &Settings) -> bool {
             .any(|p| p.idp_subject.is_some() || p.matcher.uid.is_some())
 }
 
-/// The servers whose `auth` is `grant: id_jag`.
+/// The servers whose `auth` is `grant: id_jag` or `grant: token_exchange`.
 pub fn delegated_servers(s: &Settings) -> impl Iterator<Item = &super::McpServer> {
     s.mcp.servers.iter().filter(|m| is_delegated(m))
 }
 
-/// Whether `m` is a delegated server.
+/// Whether `m` is a delegated server: one an enrolled person's grant, or
+/// the caller's own token, reaches (RFC 0044 §5.7).
 pub fn is_delegated(m: &super::McpServer) -> bool {
     m.auth
         .as_ref()
-        .is_some_and(|a| a.grant == Some(OAuthGrant::IdJag))
+        .is_some_and(|a| matches!(a.grant, Some(OAuthGrant::IdJag | OAuthGrant::TokenExchange)))
+}
+
+/// Whether `m` is a delegated server of `grant: token_exchange` (M1b).
+pub fn is_exchange(m: &super::McpServer) -> bool {
+    m.auth
+        .as_ref()
+        .is_some_and(|a| a.grant == Some(OAuthGrant::TokenExchange))
+}
+
+/// The provider an inbound token issued by `iss` names a person of, if
+/// any: the provider whose issuer it is, or one that lists it among its
+/// `equivalent_issuers` (RFC 0044 §5.9).
+pub fn provider_of_inbound<'a>(s: &'a Settings, iss: &str) -> Option<(&'a str, &'a Provider)> {
+    s.identity
+        .providers
+        .iter()
+        .find(|(_, p)| p.issuer == iss || p.equivalent_issuers.iter().any(|e| e == iss))
+        .map(|(n, p)| (n.as_str(), p))
 }
 
 /// The per-person operator rules: each names one unix listener peer by
@@ -676,7 +720,10 @@ pub fn reserved_refs_of_doc(doc: &Value) -> BTreeSet<String> {
         .into_iter()
         .flatten()
     {
-        if srv.pointer("/auth/grant").and_then(Value::as_str) == Some("id_jag") {
+        if matches!(
+            srv.pointer("/auth/grant").and_then(Value::as_str),
+            Some("id_jag" | "token_exchange")
+        ) {
             for k in ["auth", "headers"] {
                 if let Some(v) = srv.get(k) {
                     strings(v, &mut out);
@@ -707,6 +754,7 @@ pub const SERVER_AUTH_OPERATOR_ONLY: &[&str] = &[
     "attribution",
     "max_at_age",
     "trusted_output",
+    "subject",
 ];
 
 /// What a served document's configuration `fragment` sets that only the
@@ -788,9 +836,22 @@ pub fn document_declared(
     out
 }
 
+/// The `a2a.inbound_tokens` issuers whose subjects are `idp`'s: its own
+/// issuer, and those it lists as equivalent.
+fn inbound_issuers_of<'a>(s: &'a Settings, idp: &str) -> Vec<&'a super::inbound::InboundIssuer> {
+    let Some(p) = s.identity.providers.get(idp) else {
+        return Vec::new();
+    };
+    s.a2a
+        .inbound_tokens
+        .iter()
+        .filter(|t| t.issuer == p.issuer || p.equivalent_issuers.contains(&t.issuer))
+        .collect()
+}
+
 /// Whether `url` is HTTPS, or plain HTTP to a loopback host — a development
 /// IdP or authorization server on this machine.
-fn https_or_loopback(url: &str) -> bool {
+pub(crate) fn https_or_loopback(url: &str) -> bool {
     if let Some(rest) = url.strip_prefix("https://") {
         return !rest
             .split(['/', '?', '#'])
@@ -1054,9 +1115,14 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 "{at}.sign_in.scopes has no offline_access: an IdP that needs it (Okta does) issues no refresh token, and enrolment fails"
             ));
         }
-        if p.profile == Profile::Okta && p.issuer.contains("/oauth2/") {
+        // A custom authorization server issues no ID-JAG, and is the IdP of
+        // the same-domain exchange (`grant: token_exchange`).
+        let for_id_jag = delegated_servers(s).any(|m| {
+            !is_exchange(m) && m.auth.as_ref().and_then(|a| a.idp.as_deref()) == Some(name.as_str())
+        });
+        if p.profile == Profile::Okta && p.issuer.contains("/oauth2/") && for_id_jag {
             err(format!(
-                "{at}.issuer {:?}: Okta issues ID-JAGs only from the org authorization server (an issuer without /oauth2/<id>)",
+                "{at}.issuer {:?}: Okta issues ID-JAGs only from the org authorization server (an issuer without /oauth2/<id>) — a custom authorization server is the IdP of grant: token_exchange",
                 p.issuer
             ));
         }
@@ -1154,10 +1220,12 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             Some("operator") => {}
             Some("oidc") => {
                 // An oidc principal is a session of the IdP-federated login
-                // at this template's IdP; P3's inbound tokens are the other.
-                if s.a2a.login.as_ref().map(|l| l.idp.as_str()) != Some(t.idp.as_str()) {
+                // at this template's IdP, or a caller an inbound token names
+                // whose issuer is that IdP or one it lists as equivalent.
+                let login = s.a2a.login.as_ref().map(|l| l.idp.as_str()) == Some(t.idp.as_str());
+                if !login && inbound_issuers_of(s, &t.idp).is_empty() {
                     err(format!(
-                        "{at}.principals.source oidc: no a2a.login signs people in at {:?}, so no oidc principal of it exists and this template would admit nobody",
+                        "{at}.principals.source oidc: no a2a.login signs people in at {:?} and no a2a.inbound_tokens issuer is it or one of its equivalent_issuers, so no oidc principal of it exists and this template would admit nobody",
                         t.idp
                     ));
                 }
@@ -1205,6 +1273,22 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             err(format!(
                 "{at}.approvers: [principal], or [principal, operator] — the person always answers their own gates"
             ));
+        }
+        if !t.clients.is_empty() {
+            let issuers = inbound_issuers_of(s, &t.idp);
+            if t.principals.source.as_deref() != Some("oidc") || issuers.is_empty() {
+                err(format!(
+                    "{at}.clients names the front ends whose inbound tokens may use these grants, and only an oidc template at an IdP an a2a.inbound_tokens issuer maps to has such callers"
+                ));
+            }
+            for c in &t.clients {
+                if !issuers.iter().any(|i| i.clients.contains(c)) {
+                    err(format!(
+                        "{at}.clients: {c:?} is no client an a2a.inbound_tokens issuer of {:?} allows",
+                        t.idp
+                    ));
+                }
+            }
         }
         let mut seen = BTreeSet::new();
         for srv in &t.agent_mode_servers {
@@ -1258,7 +1342,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                     }
                 }
                 _ => err(format!(
-                    "{at}.servers.{srv} names no mcp.servers entry of grant: id_jag"
+                    "{at}.servers.{srv} names no mcp.servers entry of grant: id_jag or token_exchange"
                 )),
             }
             if ceiling.scopes.is_empty() {
@@ -1418,12 +1502,12 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     if !delegated.is_empty() {
         if !s.security.experimental.id_jag {
             err(
-                "grant: id_jag needs security.experimental.id_jag: true — ID-JAG is an IETF draft"
+                "grant: id_jag and grant: token_exchange need security.experimental.id_jag: true — ID-JAG is an IETF draft, and the exchange rides the same machinery"
                     .into(),
             );
         }
         if dl.seal_key.is_none() && !external {
-            err("grant: id_jag needs identity.delegation.seal_key: the refresh tokens are sealed with it".into());
+            err("grant: id_jag and grant: token_exchange need identity.delegation.seal_key: the refresh tokens are sealed with it".into());
         }
         // Who may answer: a listener that authenticates its callers — a
         // unix socket, whose peer the kernel names, or one that declares a
@@ -1434,10 +1518,11 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
         let enrolable = persons > 0
             || s.a2a.login.is_some()
+            || !s.a2a.inbound_tokens.is_empty()
             || (s.a2a.device_grant.enabled
                 && (!dl.device_pins.is_empty() || dl.device_first_binding));
         if !enrolable {
-            warn.push("delegated servers are declared, and nobody can enrol: no a2a.principals rule with match.uid and idp_subject, no a2a.login, and no device name a pin or the first binding makes eligible — every delegated call fails no_delegation".into());
+            warn.push("delegated servers are declared, and nobody can enrol: no a2a.principals rule with match.uid and idp_subject, no a2a.login, no a2a.inbound_tokens issuer and no device name a pin or the first binding makes eligible — every delegated call fails no_delegation".into());
         }
     }
     // The keys are mounted whenever they are configured, a delegated server
@@ -1461,8 +1546,10 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     for m in &delegated {
         let at = format!("mcp.servers.{}", m.name);
         let Some(a) = &m.auth else { continue };
+        let exchange = is_exchange(m);
+        let grant = if exchange { "token_exchange" } else { "id_jag" };
         if a.kind != AuthKind::Oauth2 {
-            err(format!("{at}.auth: grant id_jag is for auth.kind oauth2"));
+            err(format!("{at}.auth: grant {grant} is for auth.kind oauth2"));
         }
         let provider = match a.idp.as_deref() {
             None => {
@@ -1482,9 +1569,17 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             },
         };
         match a.audience.as_deref() {
+            None if exchange => err(format!(
+                "{at}.auth.audience is required: the audience the exchanged token is issued for, as the server's authorization server names it, pinned (id_jag_missing_pin)"
+            )),
             None => err(format!(
                 "{at}.auth.audience is required: the issuer of the server's authorization server, pinned (id_jag_missing_pin)"
             )),
+            Some(aud) if exchange => {
+                if aud.trim().is_empty() {
+                    err(format!("{at}.auth.audience is empty"));
+                }
+            }
             Some(aud) => {
                 if !https_or_loopback(aud) {
                     err(format!(
@@ -1515,28 +1610,80 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 "{at}.auth.resource is required as the server's URI: auto and omit are not pins (id_jag_missing_pin)"
             )),
         }
-        if a.client_id.as_deref().is_none_or(|c| c.trim().is_empty()) {
-            err(format!(
-                "{at}.auth.client_id is required: agentd's client at the server's authorization server, which the ID-JAG names"
-            ));
+        if exchange {
+            // The authorization server is the IdP: agentd authenticates
+            // there as its client at the IdP, and nowhere else.
+            for (f, set) in [
+                ("client_id", a.client_id.is_some()),
+                ("client_auth", a.client_auth.is_some()),
+                ("client_secret", a.client_secret.is_some()),
+                ("token_url", a.token_url.is_some()),
+            ] {
+                if set {
+                    err(format!(
+                        "{at}.auth.{f}: under grant token_exchange the server's authorization server is identity.providers.{}, and agentd authenticates there as that provider's client",
+                        a.idp.as_deref().unwrap_or_default()
+                    ));
+                }
+            }
+            for (f, set) in [
+                ("id_jag", a.id_jag.is_some()),
+                ("id_jag_reuse", a.id_jag_reuse.is_some()),
+                ("allow_unbound_at", a.allow_unbound_at.is_some()),
+            ] {
+                if set {
+                    err(format!(
+                        "{at}.auth.{f} is for grant: id_jag — an exchange at the server's own authorization server has no ID-JAG"
+                    ));
+                }
+            }
+            // No enrolment lists a server whose subject is the caller's own
+            // token: its catalogue is the operator's file.
+            if a.subject == Some(ExchangeSubject::Inbound) && a.tools_from != Some(ToolsFrom::File)
+            {
+                err(format!(
+                    "{at}.auth.subject inbound: no enrolment lists this server's tools, so they come from tools_from: file with tools_file"
+                ));
+            }
+            if a.subject == Some(ExchangeSubject::Inbound)
+                && let Some(p) = provider
+                && !s.a2a.inbound_tokens.iter().any(|t| t.issuer == p.issuer)
+            {
+                err(format!(
+                    "{at}.auth.subject inbound exchanges the caller's inbound token at its own issuer, and no a2a.inbound_tokens issuer is {:?}, identity.providers.{}'s",
+                    p.issuer,
+                    a.idp.as_deref().unwrap_or_default()
+                ));
+            }
+        } else {
+            if a.subject.is_some() {
+                err(format!(
+                    "{at}.auth.subject is for grant: token_exchange: an ID-JAG's subject is identity.providers.<idp>.subject"
+                ));
+            }
+            if a.client_id.as_deref().is_none_or(|c| c.trim().is_empty()) {
+                err(format!(
+                    "{at}.auth.client_id is required: agentd's client at the server's authorization server, which the ID-JAG names"
+                ));
+            }
+            check_custody(
+                &format!("{at}.auth"),
+                a.client_auth.as_ref(),
+                external,
+                &mut err,
+            );
+            if !confidential(a.client_auth.as_ref(), a.client_secret.as_ref(), external) {
+                err(format!(
+                    "{at}.auth: a public client cannot redeem an ID-JAG (ID-JAG §9.1) — client_auth with a key, or a client_secret"
+                ));
+            }
+            check_client_secrets(
+                &format!("{at}.auth"),
+                a.client_auth.as_ref(),
+                a.client_secret.as_ref(),
+                &mut err,
+            );
         }
-        check_custody(
-            &format!("{at}.auth"),
-            a.client_auth.as_ref(),
-            external,
-            &mut err,
-        );
-        if !confidential(a.client_auth.as_ref(), a.client_secret.as_ref(), external) {
-            err(format!(
-                "{at}.auth: a public client cannot redeem an ID-JAG (ID-JAG §9.1) — client_auth with a key, or a client_secret"
-            ));
-        }
-        check_client_secrets(
-            &format!("{at}.auth"),
-            a.client_auth.as_ref(),
-            a.client_secret.as_ref(),
-            &mut err,
-        );
         for (k, v) in &m.headers {
             if crate::sec::secret::has_secret_ref(v) {
                 env_sourced(&format!("{at}.headers.{k}"), &Secret(v.clone()), &mut err);
@@ -1550,7 +1697,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
         if m.oauth.is_some() || m.aauth == Some(true) {
             err(format!(
-                "{at}: grant id_jag with `oauth:` or `aauth:` on the same server — one credential per server"
+                "{at}: grant {grant} with `oauth:` or `aauth:` on the same server — one credential per server"
             ));
         }
         if a.tools_from == Some(ToolsFrom::File) && a.tools_file.is_none() {
@@ -1565,7 +1712,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
         if a.on_revoked == Some(OnRevoked::Ask) {
             err(format!(
-                "{at}.auth.on_revoked: ask suspends the run on a re-enrolment the person starts in a display client, which is RFC 0044 P3's; fail is what is built"
+                "{at}.auth.on_revoked: ask suspends the run on a re-enrolment the person starts in a display client, which is the second part of RFC 0044 P3; fail is what is built"
             ));
         }
         // Key reuse between the IdP and this authorization server (T21).
@@ -1589,9 +1736,14 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 .and_then(|x| x.resource_for(&o.endpoint, true))
                 .or_else(|| super::canonical_resource(&o.endpoint));
             let o_iss = o.auth.as_ref().and_then(|x| x.issuer.clone());
-            if (resource.is_some() && o_res == resource)
-                || (a.audience.is_some() && o_iss == a.audience)
-            {
+            // The authorization server: the pinned audience of an ID-JAG,
+            // the provider itself of an exchange.
+            let as_iss = if exchange {
+                provider.map(|p| p.issuer.clone())
+            } else {
+                a.audience.clone()
+            };
+            if (resource.is_some() && o_res == resource) || (as_iss.is_some() && o_iss == as_iss) {
                 err(format!(
                     "{at} and mcp.servers.{}: the same resource or authorization server under a delegated and an agent-mode server (mode_mixing) — a steered model would reach agentd's own, broader authority",
                     o.name
@@ -1616,10 +1768,11 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
                 ("attribution", a.attribution.is_some()),
                 ("max_at_age", a.max_at_age.is_some()),
                 ("trusted_output", a.trusted_output.is_some()),
+                ("subject", a.subject.is_some()),
             ] {
                 if set {
                     err(format!(
-                        "mcp.servers.{}.auth.{f} is for grant: id_jag",
+                        "mcp.servers.{}.auth.{f} is for grant: id_jag or token_exchange",
                         m.name
                     ));
                 }
@@ -1753,6 +1906,131 @@ mcp:
         crate::config::settings::load(&["--config".to_string(), path.display().to_string()], &[])
             .map(|(l, _)| l)
             .map_err(|e| e.to_string())
+    }
+
+    /// The same-domain exchange (M1b) and the inbound issuers load as their
+    /// rules say: an exchange server names no client of its own — its IdP's
+    /// is the one — nor an ID-JAG's pins; `subject: inbound` needs an
+    /// inbound issuer that is its IdP and a catalogue from a file; the
+    /// listener that takes inbound tokens is TCP and names its resource; and
+    /// a rule naming an issuer's tokens holds no other evidence and no id.
+    #[cfg(feature = "xaa")]
+    #[test]
+    fn token_exchange_and_inbound_tokens_load_as_their_rules_say() {
+        if !cfg!(feature = "a2a") {
+            return;
+        }
+        const RAS_CLIENT: &str = "        client_id: agentd-at-linear\n        client_auth: {method: private_key_jwt, key: \"{{secret-file:__D__/ras.pem}}\", kid: ras-1}\n";
+        const UNIX: &str = "  listen: \"unix://__D__/a.sock\"\n  principals:\n    - {match: {uid: 1000}, role: operator, id: alice, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u1alice}}\n";
+        const TCP: &str = "  listen: \"http://127.0.0.1:7443\"\n  bearer: \"{{secret-file:__D__/seal}}\"\n  resource: \"http://127.0.0.1:7443\"\n  inbound_tokens:\n    - {issuer: \"https://acme.okta.com\", profile: okta, clients: [front-end]}\n";
+        let exchange = |y: String, subject: &str, rest: &str| {
+            y.replace("        grant: id_jag\n", "        grant: token_exchange\n")
+                .replace(
+                    "        audience: https://auth.linear.example\n",
+                    "        audience: \"api://linear\"\n",
+                )
+                .replace(RAS_CLIENT, &format!("        subject: {subject}\n{rest}"))
+        };
+        let inbound = |y: String| {
+            y.replace(UNIX, TCP).replace(
+                "{name: eng, principals: {source: operator}",
+                "{name: eng, principals: {source: oidc}",
+            )
+        };
+        let file = "        tools_from: file\n        tools_file: \"__D__/seal\"\n";
+        assert_eq!(
+            load_error(&|y| exchange(y, "grant", "")),
+            "",
+            "subject grant"
+        );
+        assert_eq!(
+            load_error(&|y| exchange(inbound(y), "inbound", file)),
+            "",
+            "subject inbound"
+        );
+        for (edit, says) in [
+            (
+                Box::new(|y: String| exchange(y, "grant", RAS_CLIENT))
+                    as Box<dyn Fn(String) -> String>,
+                "auth.client_id: under grant token_exchange",
+            ),
+            (
+                Box::new(|y: String| exchange(y, "grant", "        allow_unbound_at: true\n")),
+                "auth.allow_unbound_at is for grant: id_jag",
+            ),
+            (
+                Box::new(|y: String| exchange(y, "inbound", file)),
+                "no a2a.inbound_tokens issuer is",
+            ),
+            (
+                Box::new(|y: String| exchange(inbound(y), "inbound", "")),
+                "they come from tools_from: file",
+            ),
+            (
+                Box::new(|y: String| {
+                    y.replace(RAS_CLIENT, &format!("{RAS_CLIENT}        subject: grant\n"))
+                }),
+                "auth.subject is for grant: token_exchange",
+            ),
+            (
+                Box::new(|y: String| {
+                    inbound(y).replace("  resource: \"http://127.0.0.1:7443\"\n", "")
+                }),
+                "a2a.inbound_tokens needs a2a.resource",
+            ),
+            (
+                Box::new(|y: String| {
+                    inbound(y).replace(
+                        "  resource: \"http://127.0.0.1:7443\"\n",
+                        "  resource: \"http://127.0.0.1:9/a2a\"\n",
+                    )
+                }),
+                "is not on the listener's origin",
+            ),
+            (
+                Box::new(|y: String| {
+                    y.replace(
+                        "  principals:\n",
+                        "  resource: \"http://127.0.0.1:7443\"\n  inbound_tokens:\n    - {issuer: \"https://acme.okta.com\", clients: [front-end]}\n  principals:\n",
+                    )
+                }),
+                "a2a.inbound_tokens needs a TCP A2A listener",
+            ),
+            (
+                Box::new(|y: String| {
+                    inbound(y).replace(
+                        "clients: [front-end]}",
+                        "clients: [front-end], algs: [HS256]}",
+                    )
+                }),
+                "an HMAC algorithm",
+            ),
+            (
+                Box::new(|y: String| inbound(y).replace("clients: [front-end]}", "clients: []}")),
+                "the front-end clients",
+            ),
+            (
+                Box::new(|y: String| {
+                    inbound(y).replace(
+                        "    - {issuer: \"https://acme.okta.com\", profile: okta, clients: [front-end]}\n",
+                        "    - {issuer: \"https://acme.okta.com\", profile: okta, clients: [front-end]}\n  principals:\n    - {match: {token_iss: \"https://acme.okta.com\", uid: 1}, role: user}\n",
+                    )
+                }),
+                "match.token_iss names an inbound token",
+            ),
+            (
+                Box::new(|y: String| {
+                    inbound(y).replace(
+                        "    - {issuer: \"https://acme.okta.com\", profile: okta, clients: [front-end]}\n",
+                        "    - {issuer: \"https://acme.okta.com\", profile: okta, clients: [front-end]}\n  principals:\n    - {match: {token_iss: \"https://acme.okta.com\"}, role: user, id: alice}\n",
+                    )
+                }),
+                "would merge every person",
+            ),
+        ] {
+            let e = load_error(&*edit);
+            assert!(e.contains(says), "want {says:?} in: {e}");
+        }
     }
 
     /// The person's own rules, the facts and the rates load as they say: a
@@ -2328,7 +2606,7 @@ mcp:
                         "        client_id: agentd-at-linear\n        on_revoked: ask\n",
                     )
                 }),
-                "RFC 0044 P3's",
+                "the second part of RFC 0044 P3",
             ),
             (
                 "a delegation field on an agent-mode server",

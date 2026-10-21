@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentd::config::A2aEndpoint;
-use agentd::mcp::a2a_client::{DelegateOutcome, PeerAuth, delegate};
+use agentd::mcp::a2a_client::{DelegateOutcome, Follow, PeerAuth, delegate};
 
 /// A mock A2A peer with no agent card (its well-known GET is a 404): captures
 /// the send's head, then replies with a unary (`application/json`) terminal
@@ -90,7 +90,16 @@ fn outbound_a2a_is_sigv4_signed_for_aws_peer_auth() {
     };
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    match delegate(&ep, auth, "do the work", None, None, None, deadline) {
+    match delegate(
+        &ep,
+        auth,
+        "do the work",
+        None,
+        None,
+        None,
+        deadline,
+        Follow::default(),
+    ) {
         DelegateOutcome::Distillate(s) => assert_eq!(s, "signed ok"),
         DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
     }

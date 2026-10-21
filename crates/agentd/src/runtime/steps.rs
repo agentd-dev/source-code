@@ -282,6 +282,7 @@ impl Runtime {
                     // A document's definition: its runs' calls are
                     // `document_sourced` (RFC 0044 §5.12 I).
                     w.document = from_document;
+                    w.configured = true;
                     if let Some(first) = staged.defined.get(&w.name) {
                         errs.push(crate::config::settings::duplicate_workflow(
                             &w.name, first, &source,
@@ -374,10 +375,14 @@ impl Runtime {
                     // once the grant is back. The document's rule, applied
                     // the way a stored definition is held to every rule: it
                     // cannot refuse the operator's boot, so it stays out.
-                    let routes = crate::config::settings::stored_route_refusals(
+                    let mut routes = crate::config::settings::stored_route_refusals(
                         def,
                         &self.settings.agent.document_capabilities,
                     );
+                    routes.extend(crate::config::settings::stored_jwt_refusals(
+                        def,
+                        self.settings.webhooks.default_auth.as_ref(),
+                    ));
                     if !routes.is_empty() {
                         warnings.push((
                             "workflow.stored.invalid",
@@ -950,11 +955,25 @@ impl Runtime {
         run.dirty = false;
         // The actor is on the line: "every effect names the human or the
         // schedule that caused it" is only true if you can read it back.
-        self.log.in_trace(run.trace.as_ref()).info(
-            "run.start",
-            json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id,
-                   "acting_for": run.principal, "key": run.key}),
-        );
+        #[cfg_attr(not(feature = "a2a"), allow(unused_mut))]
+        let mut start = json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id,
+                               "acting_for": run.principal, "key": run.key});
+        // A run an enterprise access token's caller started names the
+        // agents that token says act for them (its `act` chain).
+        #[cfg(feature = "a2a")]
+        if let Some(act) = run
+            .session
+            .as_deref()
+            .filter(|s| s.starts_with(crate::a2a::INBOUND_SID_PREFIX))
+            .and_then(|sid| self.a2a_serving.as_ref()?.sessions.as_ref()?.inbound(sid))
+            .map(|s| s.act)
+            .filter(|a| !a.is_empty())
+        {
+            start["act"] = json!(act);
+        }
+        self.log
+            .in_trace(run.trace.as_ref())
+            .info("run.start", start);
         self.counters.runs_started += 1;
         crate::obs::metrics::record_run_started();
         if node_kind(&w, &node) == Some("once") && self.job_shape {
@@ -3662,6 +3681,9 @@ impl Runtime {
         self.counters.runs_finished += 1;
         crate::obs::metrics::record_run(status.as_str());
         self.run_log(run_id).info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
+        // The first uses the person approved in the run end with it.
+        #[cfg(feature = "xaa")]
+        self.forget_once(&format!("run:{run_id}"));
         self.end_run_span(run_id);
         self.governor.drop_scope(&format!("run:{run_id}"));
         // What the table says the run carries now goes on its record before
@@ -4200,6 +4222,10 @@ impl Runtime {
                             &def,
                             &self.settings.agent.document_capabilities,
                         );
+                        problems.extend(crate::config::settings::stored_jwt_refusals(
+                            &def,
+                            self.settings.webhooks.default_auth.as_ref(),
+                        ));
                         // Checked now against what is running, as a start
                         // checks a configured one: a definition naming a
                         // tool, server or stream this agent does not have is

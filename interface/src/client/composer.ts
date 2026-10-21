@@ -396,13 +396,15 @@ export function currentGate(s: MirrorState, contextId: string | undefined): Task
 
 /**
  * The consent gate the person is asked in conversation `contextId` (RFC
- * 0044): the newest `INPUT_REQUIRED` task there that carries one. It is
- * answered with `/consent`, or by signing in again — never by a message.
+ * 0044): the newest task there that carries one — `INPUT_REQUIRED` for an
+ * approval, `AUTH_REQUIRED` for a step-up sign-in. It is answered with
+ * `/consent`, or by signing in again — never by a message.
  */
 export function consentWait(s: MirrorState, contextId: string | undefined): TaskView | undefined {
   let gate: TaskView | undefined;
   for (const t of s.tasks.values()) {
-    if (t.state !== 'TASK_STATE_INPUT_REQUIRED' || t.contextId !== contextId || t.consentGate === undefined) continue;
+    const waits = t.state === 'TASK_STATE_INPUT_REQUIRED' || t.state === 'TASK_STATE_AUTH_REQUIRED';
+    if (!waits || t.contextId !== contextId || t.consentGate === undefined) continue;
     if (gate === undefined || t.updated > gate.updated) gate = t;
   }
   return gate;

@@ -86,7 +86,8 @@ delegates to other agents.
 | Streaming and push | SSE streams; push notifications to caller-registered webhooks when `a2a.push.enabled` is on. |
 | Wire format | proto3 JSON, written by the official SDK's types generated from the A2A protobuf. |
 | Implementation | [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs), the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`). |
-| Inbound identity | bearer tokens, mTLS client certificates (subject and SAN matching, SPIFFE URIs included), and sessions from an OAuth 2.0 device authorization grant (RFC 8628) the listener serves itself. |
+| Inbound identity | bearer tokens, mTLS client certificates (subject and SAN matching, SPIFFE URIs included), sessions from an OAuth 2.0 device authorization grant (RFC 8628) the listener serves itself, and enterprise JWT access tokens (RFC 9068, or an Okta custom authorization server's), declared on the card as `oauth2` schemes with the listener's RFC 9728 metadata. |
+| In-task authorization | `TASK_STATE_AUTH_REQUIRED` (§7.6) where a person must sign in at their IdP before work acts with their grant — at admission, or at a step-up; both are the `xaa` preview, not in the release binaries — and, delegating, a peer's task in it followed until the person authorizes the peer. |
 | Co-located agents | a JSON-RPC binding over a unix domain socket, where the kernel authenticates the peer: [binding-jsonrpc-unix](https://agentd.dev/a2a/binding/jsonrpc-unix). |
 
 agentd declares three extensions on its card, none of them required, so a
@@ -246,7 +247,8 @@ draft-ietf-oauth-identity-assertion-authz-grant-04.
 | RFC 7636 | PKCE | authorization-code logins |
 | RFC 8628 | Device authorization grant | `agentd --login`, and the grant agentd serves display clients on its A2A listener |
 | RFC 8414 | Authorization server metadata | OAuth discovery, before OpenID Connect Discovery |
-| RFC 9728 | Protected resource metadata | finding an MCP server's authorization server, its `resource` matched byte for byte |
+| RFC 9728 | Protected resource metadata | finding an MCP server's authorization server, its `resource` matched byte for byte; the A2A listener's own, where it takes enterprise access tokens |
+| RFC 9068 | JWT access tokens | the enterprise access tokens the A2A listener takes (`a2a.inbound_tokens`), checked claim by claim against their issuer's keys |
 | RFC 8707 | Resource indicators | every authorization, token, refresh and client-credentials request to an MCP server's authorization server; the Bearer token for a company's MCP server |
 | RFC 9207 | `iss` in authorization responses | browser logins |
 | RFC 7523 | JWT client assertions (`private_key_jwt`), and the JWT bearer grant | client authentication at a token endpoint; redeeming an ID-JAG (the `xaa` preview) |
@@ -255,7 +257,7 @@ draft-ietf-oauth-identity-assertion-authz-grant-04.
 | RFC 7748, RFC 7516 | X25519 and JWE Compact | encrypted instruction documents |
 | RFC 8446 | TLS 1.3 | every HTTPS connection, in and out |
 | RFC 9449 | DPoP | requests to a company (the `companies` preview) |
-| RFC 8693 | Token exchange | exchanging an enrolled person's grant at their IdP for an ID-JAG (the `xaa` preview) |
+| RFC 8693 | Token exchange | exchanging an enrolled person's grant at their IdP for an ID-JAG, and a grant's or a caller's access token for a same-domain MCP server's (the `xaa` preview) |
 
 ## Platforms and distribution
 

@@ -14,7 +14,9 @@ use crate::a2a::errors::{self, reason};
 use crate::config::settings::Settings;
 use crate::engine::model::Workflow;
 use crate::runtime::reactor::Runtime;
-use crate::runtime::surface::auth::{ListenerAuth, listener_auth_of, origin_of, security_of};
+use crate::runtime::surface::auth::{
+    ListenerAuth, TokenScheme, listener_auth_of, origin_of, security_of,
+};
 use crate::runtime::surface::{
     A2A_PROTOCOL_VERSION, EVENTS_EXTENSION, RUNTIME_SETTABLE, UNIX_BINDING, declarations,
     op_entries,
@@ -109,11 +111,76 @@ pub(super) fn card_served(
             );
         }
     }
-    agent_card_of(settings, &url, posture, workflows, view)
+    let tokens = token_schemes(serving);
+    agent_card_of(settings, &url, posture, workflows, view, &tokens)
 }
 
-/// The card, from settings, the advertised URL, the posture and the loaded
-/// workflows — no `Runtime`, so it can be tested as a function.
+/// The inbound-token issuers the listener can verify now (RFC 0044 §5.9),
+/// as the card declares them: each whose metadata and keys are loaded, an
+/// `oauth2` scheme with the issuer's `oauth2MetadataUrl` and the flow a
+/// client gets its token by.
+fn token_schemes(serving: Option<&super::A2aServing>) -> Vec<TokenScheme> {
+    #[cfg(feature = "oauth")]
+    {
+        use crate::config::settings::inbound::InboundFlow;
+        use a2a_types::{
+            AuthorizationCodeOAuthFlow, DeviceCodeOAuthFlow, OAuth2SecurityScheme, OAuthFlows,
+            SecurityScheme,
+        };
+        let Some(inbound) = serving.and_then(|s| s.inbound.as_ref()) else {
+            return Vec::new();
+        };
+        inbound
+            .schemes()
+            .into_iter()
+            .map(|s| {
+                let scopes: std::collections::HashMap<String, String> =
+                    s.scopes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let flows = match s.flow {
+                    InboundFlow::AuthorizationCode => {
+                        OAuthFlows::AuthorizationCode(AuthorizationCodeOAuthFlow {
+                            authorization_url: s.authorization_url.clone().unwrap_or_default(),
+                            token_url: s.token_url.clone().unwrap_or_default(),
+                            scopes,
+                            refresh_url: None,
+                            pkce_required: Some(true),
+                        })
+                    }
+                    InboundFlow::DeviceCode => OAuthFlows::DeviceCode(DeviceCodeOAuthFlow {
+                        device_authorization_url: s
+                            .device_authorization_url
+                            .clone()
+                            .unwrap_or_default(),
+                        token_url: s.token_url.clone().unwrap_or_default(),
+                        scopes,
+                        refresh_url: None,
+                    }),
+                };
+                TokenScheme {
+                    name: s.name.clone(),
+                    scheme: SecurityScheme::OAuth2(OAuth2SecurityScheme {
+                        flows,
+                        description: Some(
+                            "An access token for this agent from the organization's authorization server (RFC 9068), whose protected-resource metadata this listener serves (RFC 9728)"
+                                .into(),
+                        ),
+                        oauth2_metadata_url: Some(s.metadata_url.clone()),
+                    }),
+                    scopes: s.scopes.keys().cloned().collect(),
+                }
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "oauth"))]
+    {
+        let _ = serving;
+        Vec::new()
+    }
+}
+
+/// The card, from settings, the advertised URL, the posture, the loaded
+/// workflows and the inbound-token issuers the listener can verify now — no
+/// `Runtime`, so it can be tested as a function.
 ///
 /// The public view reads `workflows` not at all: what is loaded, like what is
 /// switched on and who is asking, is the extended card's business. The card
@@ -125,7 +192,14 @@ fn agent_card_of(
     posture: ListenerAuth,
     workflows: &BTreeMap<String, Arc<Workflow>>,
     view: CardView<'_>,
+    tokens: &[TokenScheme],
 ) -> Value {
+    let security = security_of(
+        &posture,
+        origin_of(advertised_url).as_deref(),
+        &settings.a2a.device_grant.scopes,
+        tokens,
+    );
     // One skill, the same on every public card: A2A's `skills` is REQUIRED and
     // a peer that knows nothing of agentd can always talk. Workflows and
     // commands are what a caller may RUN, so they belong to the card that
@@ -152,11 +226,11 @@ fn agent_card_of(
     // Exactly the four fields `AgentCapabilities` carries in the A2A protobuf.
     // `pushNotifications` tracks whether this instance will accept a webhook,
     // not whether the code exists; `extendedAgentCard` whether a caller could
-    // authenticate to read one.
+    // authenticate to read one — with a scheme the card declares.
     let capabilities = json!({
         "streaming": true,
         "pushNotifications": settings.a2a.push.enabled,
-        "extendedAgentCard": posture.declares_any(),
+        "extendedAgentCard": security.is_some(),
         "extensions": extensions,
     });
     // A unix socket is JSON-RPC over a path no `https://` URL can name, so it
@@ -207,11 +281,6 @@ fn agent_card_of(
     // A conversion failure would mean the card is not an `AgentCard`, which the
     // unit tests make impossible; were it ever to happen, sending the
     // hand-built form beats sending nothing.
-    let security = security_of(
-        &posture,
-        origin_of(advertised_url).as_deref(),
-        &settings.a2a.device_grant.scopes,
-    );
     let Ok(mut typed) = crate::a2a::wire::from_wire::<a2a_types::AgentCard>(card.clone()) else {
         // Still a card that declares what the listener enforces: a client
         // MUST authenticate with a scheme the public card names.
@@ -388,7 +457,7 @@ mod tests {
     }
 
     fn card(s: &Settings, wfs: &BTreeMap<String, Arc<Workflow>>, view: CardView<'_>) -> Value {
-        agent_card_of(s, &url_of(&s.a2a), listener_auth_of(&s.a2a), wfs, view)
+        agent_card_of(s, &url_of(&s.a2a), listener_auth_of(&s.a2a), wfs, view, &[])
     }
 
     /// A card is a fixpoint of the SDK's typed `AgentCard`: nothing it sets is

@@ -48,7 +48,11 @@
 //! forgetting them leaves it unreadable and the chain whole. A workflow
 //! step's gate is kept in the step's wait record and re-armed at the next
 //! start; a turn's dies with its turn. An approval of a first use is
-//! remembered for the unit and tool in memory: a restart asks again.
+//! remembered for the unit, the tool, the rule and the gate's shape —
+//! durably, so a restart does not ask again — bound to the grants the work
+//! acts with and the templates that allow them as they were then: a
+//! revoked or re-enrolled grant, or a changed template, drops it. It lives
+//! a day at most, and goes with its run.
 
 use std::sync::Arc;
 
@@ -109,9 +113,41 @@ fn rule_words(rule: &str) -> String {
 }
 
 /// The key a first use the person approved is remembered by: the unit of
-/// work, the tool and the rule.
-pub(crate) fn once_key(unit: &str, tool: &str, rule: &str) -> String {
-    format!("{unit}|{tool}|{rule}")
+/// work, the tool, the rule (a shipped one's name, an operator's by its
+/// content — [`Runtime::policy_rule_id`]) and the gate's shape — the names
+/// of the call's arguments, never their values.
+pub(crate) fn once_key(unit: &str, tool: &str, rule: &str, args: &Value) -> String {
+    let mut names: Vec<&str> = args
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    let shape = json!({"rule": rule, "tool": tool, "args": names});
+    let shape = crate::sha::sha256_hex(shape.to_string().as_bytes());
+    format!("{unit}|{tool}|{rule}|{}", &shape[..16])
+}
+
+/// Where a unit's remembered first uses are kept, in the store.
+const ONCE_STORE: &str = "delegation/once/";
+/// The most first uses kept for one unit.
+const ONCE_PER_UNIT: usize = 256;
+
+/// The store record of `unit`'s remembered first uses.
+fn once_record_id(unit: &str) -> String {
+    format!(
+        "{ONCE_STORE}{}",
+        &crate::sha::sha256_hex(unit.as_bytes())[..32]
+    )
+}
+
+/// The unit of work a delegated call is made in, as its budget and a
+/// step-up's sign-in count it (`delegation::Call::unit`): the run, or the
+/// conversation.
+pub(crate) fn call_unit(caller: &ToolCaller) -> String {
+    caller
+        .run
+        .clone()
+        .unwrap_or_else(|| format!("ctx:{}", caller.context_id()))
 }
 
 /// The unit of work a call is made in, as a first use is counted: the run,
@@ -144,6 +180,38 @@ const ONCE_KEPT_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most first uses remembered at once.
 #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
 const ONCE_CAP: usize = 4096;
+/// How often the store's first-use records are swept of the units that
+/// can use none of theirs any more.
+const ONCE_SWEEP_EVERY_MS: u64 = 60 * 60 * 1000;
+
+/// The first-use records in `d` no unit can still use at `now`: each whose
+/// every approval is older than [`ONCE_KEPT_MS`]. A run's go when it ends;
+/// a conversation's or a subagent's that outlived its day go here.
+fn stale_once_records(d: &crate::state::Durable, now: u64) -> Vec<String> {
+    let Ok(list) = d.list(crate::state::Kind::Cred) else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .filter_map(|ks| {
+            let (_, id) = crate::store::parse_key(d.prefix(), d.instance(), &ks.key)?;
+            id.starts_with(ONCE_STORE).then(|| id.to_string())
+        })
+        .filter(|id| {
+            d.get(crate::state::Kind::Cred, id)
+                .ok()
+                .flatten()
+                .and_then(|e| e.state.get("approved").cloned())
+                .and_then(|a| {
+                    serde_json::from_value::<std::collections::BTreeMap<String, (u64, String)>>(a)
+                        .ok()
+                })
+                .is_none_or(|kept| {
+                    kept.values()
+                        .all(|(at, _)| now.saturating_sub(*at) >= ONCE_KEPT_MS)
+                })
+        })
+        .collect()
+}
 
 /// What the person reads of gate `id`, rendered `r` (RFC 0044 §5.10 rule
 /// 5, T29): every line agentd's own, each value the work chose — a server,
@@ -281,6 +349,9 @@ pub(crate) struct ConsentGate {
     /// The first use an approval stands for, when the rule asks at the
     /// first use per run and tool alone ([`once_key`]).
     pub once: Option<String>,
+    /// What that approval is bound to ([`Runtime::once_binding`]), as the
+    /// gate opened.
+    pub once_binding: Option<String>,
 }
 
 /// What a gate about to open asks under.
@@ -549,30 +620,137 @@ impl Runtime {
         None
     }
 
-    /// Whether `caller`'s unit is past the first use of `name` that `rule`
-    /// asks about: the person approved one.
-    fn once_passed(&self, caller: &ToolCaller, name: &str, rule: &str) -> bool {
-        self.consented_once
-            .contains_key(&once_key(&unit_of(caller), name, rule))
+    /// What a first use `caller`'s work approved is bound to: the grants it
+    /// acts with, their epochs, and the templates that admit its person, as
+    /// they are now.
+    fn once_binding(&self, caller: &ToolCaller) -> String {
+        self.delegation
+            .as_ref()
+            .and_then(|d| d.acting_binding(caller.acting()))
+            .unwrap_or_default()
     }
 
-    /// Remember the first use gate `g` stood for, approved.
+    /// Whether `caller`'s unit is past the first use of `name` with `args`
+    /// that `rule` asks about: the person approved one of that shape, within
+    /// a day, under the grants and templates the work acts with now — read
+    /// from memory, or after a restart from the store.
+    fn once_passed(&self, caller: &ToolCaller, name: &str, rule: &str, args: &Value) -> bool {
+        let unit = unit_of(caller);
+        let key = once_key(&unit, name, rule, args);
+        let binding = self.once_binding(caller);
+        let now = now_ms();
+        let fresh = |at: u64, b: &str| now.saturating_sub(at) < ONCE_KEPT_MS && b == binding;
+        if let Some((at, b)) = self.consented_once.get(&key) {
+            return fresh(*at, b);
+        }
+        self.stored_once(&unit)
+            .get(&key)
+            .is_some_and(|(at, b)| fresh(*at, b))
+    }
+
+    /// `unit`'s remembered first uses, as the store keeps them.
+    fn stored_once(&self, unit: &str) -> std::collections::BTreeMap<String, (u64, String)> {
+        self.durable
+            .get(crate::state::Kind::Cred, &once_record_id(unit))
+            .ok()
+            .flatten()
+            .and_then(|e| e.state.get("approved").cloned())
+            .and_then(|a| serde_json::from_value(a).ok())
+            .unwrap_or_default()
+    }
+
+    /// Remember the first use gate `g` stood for, approved: in memory, and
+    /// in the store under its unit, with what it is bound to.
     #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
     fn remember_once(&mut self, g: &ConsentGate) {
-        let Some(k) = &g.once else { return };
+        let (Some(k), Some(binding)) = (&g.once, &g.once_binding) else {
+            return;
+        };
         let now = now_ms();
         self.consented_once
-            .retain(|_, at| now.saturating_sub(*at) < ONCE_KEPT_MS);
+            .retain(|_, (at, _)| now.saturating_sub(*at) < ONCE_KEPT_MS);
         if self.consented_once.len() >= ONCE_CAP
             && let Some(oldest) = self
                 .consented_once
                 .iter()
-                .min_by_key(|(_, at)| **at)
+                .min_by_key(|(_, (at, _))| *at)
                 .map(|(k, _)| k.clone())
         {
             self.consented_once.remove(&oldest);
         }
-        self.consented_once.insert(k.clone(), now);
+        self.consented_once
+            .insert(k.clone(), (now, binding.clone()));
+        let unit = k.split('|').next().unwrap_or_default().to_string();
+        let mut kept = self.stored_once(&unit);
+        kept.retain(|_, (at, _)| now.saturating_sub(*at) < ONCE_KEPT_MS);
+        while kept.len() >= ONCE_PER_UNIT {
+            let Some(oldest) = kept
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            kept.remove(&oldest);
+        }
+        kept.insert(k.clone(), (now, binding.clone()));
+        if let Err(e) = self.durable.put(
+            crate::state::Kind::Cred,
+            &once_record_id(&unit),
+            json!({"unit": unit, "approved": kept}),
+            None,
+        ) {
+            self.log.warn(
+                "delegation.consent.once_unsaved",
+                json!({"unit": unit, "err": e.to_string(),
+                       "msg": "the approval holds in memory, and a restart asks again"}),
+            );
+        }
+    }
+
+    /// At most once every [`ONCE_SWEEP_EVERY_MS`] — the first pass of a
+    /// life included — drop the stored first-use records no unit can still
+    /// use.
+    pub(crate) fn sweep_once(&mut self) {
+        let now = now_ms();
+        if self.once_swept_ms != 0 && now.saturating_sub(self.once_swept_ms) < ONCE_SWEEP_EVERY_MS {
+            return;
+        }
+        self.once_swept_ms = now;
+        for id in stale_once_records(&self.durable, now) {
+            let _ = self.durable.delete(crate::state::Kind::Cred, &id);
+        }
+    }
+
+    /// Forget every first use `unit` approved: its work ended.
+    pub(crate) fn forget_once(&mut self, unit: &str) {
+        let prefix = format!("{unit}|");
+        let before = self.consented_once.len();
+        self.consented_once.retain(|k, _| !k.starts_with(&prefix));
+        let id = once_record_id(unit);
+        if before != self.consented_once.len()
+            || self
+                .durable
+                .get(crate::state::Kind::Cred, &id)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            let _ = self.durable.delete(crate::state::Kind::Cred, &id);
+        }
+    }
+
+    /// An operator rule's identity in a remembered first use: its content,
+    /// so a reload that moves the rule keeps what was approved under it and
+    /// one that changes it asks again.
+    pub(crate) fn policy_rule_id(&self, i: usize) -> String {
+        match self.settings.security.policies.get(i) {
+            Some(p) => format!(
+                "security.policies#{}",
+                &crate::sha::sha256_hex(format!("{p:?}").as_bytes())[..16]
+            ),
+            None => format!("security.policies[{i}]"),
+        }
     }
 
     /// The person's consent before `name`, after every rule of the
@@ -603,7 +781,7 @@ impl Runtime {
             facts,
         };
         let (rule, once) =
-            crate::sec::policy::consent_rule(&call, &|r| self.once_passed(caller, name, r))?;
+            crate::sec::policy::consent_rule(&call, &|r| self.once_passed(caller, name, r, args))?;
         let server = self.delegated_server_of(name);
         if let Some(s) = &server
             && let Err(e) = self.delegation_admit(&d, caller, s)
@@ -613,7 +791,7 @@ impl Runtime {
                 true,
             ));
         }
-        let once = once.then(|| once_key(&unit_of(caller), name, rule));
+        let once = once.then(|| once_key(&unit_of(caller), name, rule, args));
         Some(self.open_consent(
             &d,
             caller,
@@ -657,9 +835,14 @@ impl Runtime {
         {
             return ToolOutcome::Ready(Value::String(format!("{name}: {e}")), true);
         }
-        let once = verdict
-            .once_per
-            .map(|_| once_key(&unit_of(caller), name, &rule));
+        let once = verdict.once_per.map(|_| {
+            once_key(
+                &unit_of(caller),
+                name,
+                &self.policy_rule_id(verdict.rule),
+                args,
+            )
+        });
         self.open_consent(
             &d,
             caller,
@@ -679,10 +862,16 @@ impl Runtime {
         )
     }
 
-    /// Whether `caller`'s unit is past the first use of `name` the
-    /// operator's rule `i` asks about.
-    pub(crate) fn rule_once_passed(&self, caller: &ToolCaller, name: &str, i: usize) -> bool {
-        self.once_passed(caller, name, &format!("security.policies[{i}]"))
+    /// Whether `caller`'s unit is past the first use of `name` with `args`
+    /// the operator's rule `i` asks about.
+    pub(crate) fn rule_once_passed(
+        &self,
+        caller: &ToolCaller,
+        name: &str,
+        i: usize,
+        args: &Value,
+    ) -> bool {
+        self.once_passed(caller, name, &self.policy_rule_id(i), args)
     }
 
     /// Whether a workflow step of `kind`, its spec rendered, sends the run's
@@ -751,11 +940,11 @@ impl Runtime {
             facts,
         };
         let Some((rule, once)) =
-            crate::sec::policy::consent_rule(&call, &|r| self.once_passed(caller, kind, r))
+            crate::sec::policy::consent_rule(&call, &|r| self.once_passed(caller, kind, r, &args))
         else {
             return false;
         };
-        let once = once.then(|| once_key(&unit_of(caller), kind, rule));
+        let once = once.then(|| once_key(&unit_of(caller), kind, rule, &args));
         let outcome = self.open_consent(
             &d,
             caller,
@@ -843,6 +1032,7 @@ impl Runtime {
                 .is_ok_and(|a| a.template.operator_approves())
         });
         let task = self.consent_task(caller, &id, &rendered);
+        let once_binding = once.as_ref().map(|_| self.once_binding(caller));
         let gate = ConsentGate {
             nonce,
             args_hash: args_hash(name, args),
@@ -866,6 +1056,7 @@ impl Runtime {
             signin: None,
             session: caller.session.clone(),
             once,
+            once_binding,
         };
         self.consents.insert(id.clone(), gate);
         // Its record is sealed under the person's key on the loop: held by
@@ -973,7 +1164,11 @@ impl Runtime {
             if ours {
                 t.consent_gate = None;
                 t.security_gate = false;
-                if t.state == crate::a2a::tasks::State::InputRequired {
+                if matches!(
+                    t.state,
+                    crate::a2a::tasks::State::InputRequired
+                        | crate::a2a::tasks::State::AuthRequired
+                ) {
                     t.transition(crate::a2a::tasks::State::Working, None);
                 }
                 let task = task.to_string();
@@ -1482,6 +1677,7 @@ impl Runtime {
                               "policy": super::human::policy_call_json(&g.call),
                               "effect": g.effect, "operator_approves": g.operator_approves,
                               "task": g.task, "session": g.session, "once": g.once,
+                              "once_binding": g.once_binding,
                               "signin": g.signin.as_ref().map(super::stepup::signin_wait)}),
             None => json!({"kind": "consent", "gate": id}),
         }
@@ -1508,6 +1704,7 @@ impl Runtime {
                         w["gate"].as_str().unwrap_or_default().to_string(),
                         w["signin"].clone(),
                         w["principal"].as_str().unwrap_or_default().to_string(),
+                        (run.clone(), step.clone()),
                     ));
                 }
                 found.push((
@@ -1529,6 +1726,7 @@ impl Runtime {
                         signin: None,
                         session: w["session"].as_str().map(str::to_string),
                         once: w["once"].as_str().map(str::to_string),
+                        once_binding: w["once_binding"].as_str().map(str::to_string),
                     },
                 ));
             }
@@ -1551,8 +1749,8 @@ impl Runtime {
         #[cfg(feature = "a2a")]
         {
             let mut ended = Vec::new();
-            for (id, w, principal) in signins {
-                let rebuilt = self.rebuild_signin(&id, &w, &principal);
+            for (id, w, principal, at) in signins {
+                let rebuilt = self.rebuild_signin(&id, &w, &principal, at);
                 let authorize = rebuilt
                     .as_ref()
                     .is_none_or(|s| s.how == super::stepup::How::Authorize);
@@ -1601,10 +1799,7 @@ impl Runtime {
         }
         let mut meta = json!({"agent/idempotency_key": self.idempotency_key(caller), "agent/instance": self.instance});
         let trace = crate::mcp::stamp_trace(&mut meta, self.caller_trace(caller).as_ref());
-        let unit = caller
-            .run
-            .clone()
-            .unwrap_or_else(|| format!("ctx:{}", caller.context_id()));
+        let unit = call_unit(caller);
         let reads = reads_of(caller);
         let trusted = d.servers.get(server).is_some_and(|s| s.trusted_output);
         let tx = self.events_tx.clone();
@@ -1893,12 +2088,49 @@ impl Runtime {
             Delegation::tick(d);
         }
         self.poll_consents();
+        #[cfg(feature = "a2a")]
+        self.expire_admissions();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit's stored first uses are swept once every one of them is past
+    /// its day, and not before; nothing else in the store is touched.
+    #[test]
+    fn first_use_records_past_their_day_are_swept() {
+        use crate::state::{Durable, Kind, Policy};
+        let d = Durable::new(
+            Arc::new(crate::store::memory::MemoryStore::new()),
+            "agentd",
+            "i",
+            Policy::default(),
+            None,
+        );
+        let now = 10 * ONCE_KEPT_MS;
+        let put = |unit: &str, ats: &[u64]| {
+            let approved: std::collections::BTreeMap<String, (u64, String)> = ats
+                .iter()
+                .enumerate()
+                .map(|(i, at)| (format!("{unit}|t{i}"), (*at, "b".to_string())))
+                .collect();
+            d.put(
+                Kind::Cred,
+                &once_record_id(unit),
+                json!({"unit": unit, "approved": approved}),
+                None,
+            )
+            .unwrap();
+        };
+        put("ctx:old", &[now - ONCE_KEPT_MS - 1, now - ONCE_KEPT_MS]);
+        put("ctx:mixed", &[now - ONCE_KEPT_MS - 1, now - 5]);
+        put("subagent:new", &[now - 5]);
+        d.put(Kind::Cred, "delegation/grants/g", json!({}), None)
+            .unwrap();
+        assert_eq!(stale_once_records(&d, now), vec![once_record_id("ctx:old")]);
+    }
 
     /// A gate's binding is the call's own: object keys in any order hash
     /// alike, any other argument or tool does not.

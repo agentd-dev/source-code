@@ -289,8 +289,15 @@ Fires on an inbound HTTP request.
   JSON when it parses.
 - Needs `webhooks.listen`. A non-loopback listener must authenticate every
   route: `auth` is `{hmac: {secret, header?, prefix?}}`, `{bearer}`,
-  `{header: {name, equals}}`, or `{none: true}` on loopback only;
-  `webhooks.default_auth` applies when a route sets none.
+  `{header: {name, equals}}`, `{jwt: {issuer, audience, max_lifetime?}}` —
+  a person's short-lived access token from an `a2a.inbound_tokens` issuer,
+  its `jti` never taken twice, the run then theirs — or `{none: true}` on
+  loopback only; `webhooks.default_auth` applies when a route sets none.
+  A token's `jti` is a key of its own beside the header's: a replay of the
+  token, after a restart and under any header value, is a duplicate. Only
+  the operator's configuration takes `jwt` — directly or through
+  `webhooks.default_auth` — never a served document's workflow or one
+  stored with `workflow.create`/`update`.
 - The `Idempotency-Key` header deduplicates by default: a repeat is answered
   `200` as a duplicate and starts nothing. `idempotency: false` turns it off;
   a string names another header.
@@ -1120,11 +1127,18 @@ Delegates an objective to a peer and waits for the result: request and
 response.
 
 - **Fields:** **`peer`**, `objective`, `command`, `args`, `output_contract`,
-  `timeout`, `idempotency`, `breaker`, `rate`.
+  `timeout`, `idempotency`, `breaker`, `rate`, `auth_to`, `auth_timeout`.
 - **Output:** the peer's result, parsed as JSON when it parses.
 - With `command` and `args`, the payload is typed and checked against the
   command's schema at the peer, and the step returns that command's run
   output. `timeout` defaults to 120 s.
+- A peer's task that waits on a person's sign-in (`auth-required`) is no
+  end: the run's task waits in `auth-required` too, quoting the peer — or,
+  for a run with none, a task made for the principal `auth_to` names, else
+  the run's own principal — and the step follows the peer's task up to
+  `auth_timeout` (default 1 h, at most 24 h) past `timeout`, across a
+  restart without sending the work again. The person authorizes the peer
+  directly; agentd passes it no credential.
 - Every request of the delegation — the card read, the send, each poll —
   carries one span of the run's as `traceparent` and `tracestate`; an
   agentd peer's task and run continue it.

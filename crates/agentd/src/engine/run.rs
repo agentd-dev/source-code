@@ -492,7 +492,11 @@ impl RunState {
             st.started = Some(now_ms());
             st.finished = None;
             st.error = None;
-            st.wait = None;
+            // A peer's task the attempt was following when the process
+            // stopped (`peer_auth`, waiting on a person's sign-in) is kept,
+            // so the replayed attempt follows it rather than send the work
+            // again; no other wait outlives the attempt it was made in.
+            st.wait = st.wait.take().filter(|w| w["kind"] == "peer_auth");
             st.cache_key = None;
             st.company = None;
             st.span = Some(crate::obs::trace::new_span_id());
@@ -948,6 +952,31 @@ mod tests {
         assert!(run.steps["fix"].forced);
         let saved: RunState = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
         assert!(saved.steps["fix"].forced);
+    }
+
+    /// A peer's task the step was following when the process stopped is
+    /// kept into the replayed attempt, which follows it rather than send the
+    /// work again; any other wait is the attempt's own and goes with it.
+    #[test]
+    fn a_replayed_attempt_keeps_the_peer_task_it_followed_alone() {
+        let w = parse_workflow(&json!({"name": "w", "steps": {
+            "go": {"kind": "once"},
+            "ask": {"kind": "noop", "depends_on": ["go"]},
+            "f": {"kind": "finish", "depends_on": ["ask"]}
+        }}))
+        .unwrap();
+        let mut run = RunState::new("r", &w, start_at("go"), json!({}));
+        let peer = json!({"kind": "peer_auth", "peer": "cal", "task": "pt-1"});
+        run.steps.entry("ask".into()).or_default().wait = Some(peer.clone());
+        let saved: RunState = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        let mut run = saved;
+        run.begin_step("ask");
+        assert_eq!(run.steps["ask"].wait, Some(peer));
+        run.end_step("ask", StepStatus::Done, None, None);
+        assert_eq!(run.steps["ask"].wait, None);
+        run.steps.get_mut("ask").unwrap().wait = Some(json!({"kind": "timer", "deadline_ms": 1}));
+        run.begin_step("ask");
+        assert_eq!(run.steps["ask"].wait, None);
     }
 
     /// The whole point of the key: RETRIES of one step share it, different

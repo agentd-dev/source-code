@@ -90,7 +90,9 @@ impl Client {
             .map(|g| match g {
                 OAuthGrant::Device => DEVICE_CODE,
                 OAuthGrant::AuthorizationCode => "authorization_code",
-                OAuthGrant::ClientCredentials | OAuthGrant::IdJag => "client_credentials",
+                OAuthGrant::ClientCredentials | OAuthGrant::IdJag | OAuthGrant::TokenExchange => {
+                    "client_credentials"
+                }
             })
             .collect();
         if self
@@ -305,6 +307,7 @@ fn grant_name(g: OAuthGrant) -> &'static str {
         OAuthGrant::AuthorizationCode => "authorization_code",
         OAuthGrant::ClientCredentials => "client_credentials",
         OAuthGrant::IdJag => "id_jag",
+        OAuthGrant::TokenExchange => "token_exchange",
     }
 }
 

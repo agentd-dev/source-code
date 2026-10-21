@@ -104,6 +104,33 @@ const CARD_TIMEOUT: Duration = Duration::from_secs(5);
 /// peer's card marks them `required`.
 const CLIENT_EXTENSIONS: &[&str] = &[COMMAND_EXTENSION];
 
+/// Poll cadence while the peer's task waits on a person to sign in: a wait of
+/// minutes is not read ten times a second.
+const AUTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a delegation says while the peer's task waits on a person
+/// (`TASK_STATE_AUTH_REQUIRED`, A2A §7.6): that it does, with the peer's own
+/// words, and that it went on. agentd passes no credential to the peer: the
+/// person authorizes it directly, out of band.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerWait {
+    AuthRequired { task: String, text: String },
+    Resumed { task: String },
+}
+
+/// How a delegation follows the peer's task beyond sending it.
+#[derive(Default)]
+pub struct Follow<'a> {
+    /// Told each time the peer's task enters or leaves `AUTH_REQUIRED`.
+    pub watch: Option<&'a (dyn Fn(PeerWait) + Send + Sync)>,
+    /// How much longer than the delegation's own deadline a task waiting on
+    /// a sign-in is followed; `ZERO` follows it no longer.
+    pub auth_timeout: Duration,
+    /// A task the peer already holds for this delegation — one a restart
+    /// found waiting — followed instead of sending the objective again.
+    pub resume: Option<String>,
+}
+
 /// The outcome of a remote A2A delegation: either the distillate (a COMPLETED
 /// Task's terminal artifact text) or an error observation (a non-completed
 /// terminal state, a transport failure, or the deadline). Maps straight onto the
@@ -148,6 +175,7 @@ impl Objective<'_> {
 /// by the card, connect, write, read, RPC error, non-completed terminal,
 /// deadline) returns [`DelegateOutcome::Error`] — never panics, never hangs
 /// (the deadline is the hard backstop).
+#[allow(clippy::too_many_arguments)]
 pub fn delegate(
     endpoint: &A2aEndpoint,
     auth: PeerAuth,
@@ -159,6 +187,7 @@ pub fn delegate(
     // second one.
     message_id: Option<&str>,
     deadline: Instant,
+    follow: Follow<'_>,
 ) -> DelegateOutcome {
     let ep = match HttpEp::of(endpoint) {
         Ok(ep) => ep,
@@ -173,7 +202,7 @@ pub fn delegate(
             .map(str::to_string)
             .unwrap_or_else(mint_message_id),
     };
-    let outcome = delegate_on(&mut conn, &objective, deadline);
+    let outcome = delegate_on(&mut conn, &objective, deadline, &follow);
     // A failed delegation drops the card it used, so the next one reads
     // the peer as it is now: the card may be why it failed — a peer
     // that changed its terms, or a local port that changed hands.
@@ -183,8 +212,14 @@ pub fn delegate(
     outcome
 }
 
-/// [`delegate`] over an open connection: the card, then the send.
-fn delegate_on(conn: &mut HttpConn, objective: &Objective, deadline: Instant) -> DelegateOutcome {
+/// [`delegate`] over an open connection: the card, then the send — or, for
+/// a task a restart found waiting, the poll of it alone.
+fn delegate_on(
+    conn: &mut HttpConn,
+    objective: &Objective,
+    deadline: Instant,
+    follow: &Follow<'_>,
+) -> DelegateOutcome {
     // No card is not a refusal: the spec permits configuring a peer directly,
     // and a card is how a client DISCOVERS what a peer offers, not a
     // precondition for talking to it. Such a peer is dialled streaming first,
@@ -196,20 +231,24 @@ fn delegate_on(conn: &mut HttpConn, objective: &Objective, deadline: Instant) ->
         },
         None => true,
     };
+    if let Some(task_id) = &follow.resume {
+        let tenant = conn.tenant.clone();
+        return poll_task(conn, task_id, tenant.as_deref(), deadline, follow);
+    }
     if !streams {
-        return delegate_unary(conn, objective, deadline);
+        return delegate_unary(conn, objective, deadline, follow);
     }
     match conn.call_streaming(objective, deadline) {
         Err(e) => DelegateOutcome::Error(e),
         Ok(StreamOutcome::Done(outcome)) => outcome,
         Ok(StreamOutcome::Recover(task_id)) => {
             let tenant = conn.tenant.clone();
-            poll_task(conn, &task_id, tenant.as_deref(), deadline)
+            poll_task(conn, &task_id, tenant.as_deref(), deadline, follow)
         }
         // Nothing started: the peer refused the method, not the message. One
         // unary attempt with the same message, and no more — a peer that
         // refuses that too has answered.
-        Ok(StreamOutcome::Unsupported) => delegate_unary(conn, objective, deadline),
+        Ok(StreamOutcome::Unsupported) => delegate_unary(conn, objective, deadline, follow),
     }
 }
 
@@ -220,6 +259,7 @@ fn delegate_unary(
     conn: &mut HttpConn,
     objective: &Objective,
     deadline: Instant,
+    follow: &Follow<'_>,
 ) -> DelegateOutcome {
     let tenant = conn.tenant.clone();
     let reply = match conn.call(
@@ -240,7 +280,7 @@ fn delegate_unary(
     if task_id.is_empty() {
         return DelegateOutcome::Error("a2a: SendMessage reply named no task".into());
     }
-    poll_task(conn, &task_id, tenant.as_deref(), deadline)
+    poll_task(conn, &task_id, tenant.as_deref(), deadline, follow)
 }
 
 /// **Fire-and-forget**: one `SendMessage`, no task await — the `a2a.send` step.
@@ -314,24 +354,68 @@ enum StreamOutcome {
 
 /// Poll `GetTask` until the task is terminal or the deadline passes — the
 /// shared tail of the unary path and stream recovery.
+///
+/// A task in `TASK_STATE_AUTH_REQUIRED` waits on a person, who authorizes
+/// the peer directly (A2A §7.6.3): it is not an end. It is said to
+/// `follow.watch` with the peer's words when it starts and again when it
+/// ends, polled less often meanwhile, and followed up to
+/// `follow.auth_timeout` past the deadline.
 fn poll_task<C: Caller>(
     conn: &mut C,
     task_id: &str,
     tenant: Option<&str>,
     deadline: Instant,
+    follow: &Follow<'_>,
 ) -> DelegateOutcome {
     let get_params = a2a::get_task_params(task_id, tenant);
+    let mut deadline = deadline;
+    let mut extended = false;
+    let mut waiting = false;
     loop {
         if Instant::now() >= deadline {
-            return DelegateOutcome::Error(format!(
-                "a2a: delegation to peer timed out (task {task_id} still running)"
-            ));
+            return DelegateOutcome::Error(if waiting {
+                format!(
+                    "a2a: the peer's task {task_id} still waits for a sign-in (auth-required), past the step's wait for it"
+                )
+            } else {
+                format!("a2a: delegation to peer timed out (task {task_id} still running)")
+            });
         }
-        std::thread::sleep(POLL_INTERVAL);
+        let interval = if waiting {
+            AUTH_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        };
+        // Never asleep past the deadline: the wait ends there, saying why.
+        std::thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
+        if Instant::now() >= deadline {
+            continue;
+        }
         let task = match conn.call("GetTask", get_params.clone(), deadline) {
             Ok(t) => t,
             Err(e) => return DelegateOutcome::Error(e),
         };
+        let auth = a2a::task_state_of(&task) == TaskState::AuthRequired;
+        if auth && !waiting {
+            waiting = true;
+            if !extended {
+                extended = true;
+                deadline += follow.auth_timeout;
+            }
+            if let Some(w) = follow.watch {
+                w(PeerWait::AuthRequired {
+                    task: task_id.to_string(),
+                    text: a2a::status_text_of(&task),
+                });
+            }
+        } else if !auth && waiting {
+            waiting = false;
+            if let Some(w) = follow.watch {
+                w(PeerWait::Resumed {
+                    task: task_id.to_string(),
+                });
+            }
+        }
         if let Some(outcome) = terminal_outcome(&task) {
             return outcome;
         }
@@ -1412,7 +1496,16 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).unwrap();
         let started = Instant::now();
         let deadline = started + Duration::from_secs(20);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "after the gate"),
             DelegateOutcome::Error(e) => panic!("expected the polled answer: {e}"),
         }
@@ -1443,7 +1536,16 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).unwrap();
         let started = Instant::now();
         let deadline = started + Duration::from_secs(2);
-        let outcome = delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline);
+        let outcome = delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "read past the deadline: {:?}",
@@ -1471,7 +1573,16 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "streamed answer"),
             DelegateOutcome::Error(e) => panic!("expected streamed distillate: {e}"),
         }
@@ -1487,7 +1598,16 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "recovered answer"),
             DelegateOutcome::Error(e) => panic!("expected recovery: {e}"),
         }
@@ -1504,7 +1624,16 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Error(e) => assert!(e.contains("FAILED"), "{e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }
@@ -1529,6 +1658,7 @@ mod tests {
             Some("one line"),
             None,
             deadline,
+            Follow::default(),
         ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "http distilled answer"),
             DelegateOutcome::Error(e) => panic!("expected distillate, got error: {e}"),
@@ -1553,7 +1683,16 @@ mod tests {
             ..Default::default()
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, auth, "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            auth,
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "authed"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -1575,7 +1714,16 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-t", TaskState::Completed, Some("immediate"))]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "immediate"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -1587,7 +1735,16 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline),
+            delegate(
+                &ep,
+                PeerAuth::default(),
+                "obj",
+                None,
+                None,
+                None,
+                deadline,
+                Follow::default()
+            ),
             DelegateOutcome::Error(_)
         ));
     }
@@ -1598,7 +1755,16 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-w", TaskState::Working, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
         }
@@ -1623,7 +1789,16 @@ mod tests {
         .0;
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(400);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
         }
@@ -1634,7 +1809,16 @@ mod tests {
         let url = serve_http_error_fixture();
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "obj",
+            None,
+            None,
+            None,
+            deadline,
+            Follow::default(),
+        ) {
             DelegateOutcome::Error(e) => assert!(e.contains("rpc error"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }
@@ -1711,7 +1895,16 @@ mod tests {
         fn delegated(url: &str) -> DelegateOutcome {
             let ep = A2aEndpoint::parse(url).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline)
+            delegate(
+                &ep,
+                PeerAuth::default(),
+                "obj",
+                None,
+                None,
+                None,
+                deadline,
+                Follow::default(),
+            )
         }
 
         fn calls(log: &Log) -> Vec<String> {
@@ -1847,6 +2040,7 @@ mod tests {
                 None,
                 None,
                 deadline,
+                Follow::default(),
             ));
             let sent = requests(&log, "SendMessage");
             assert_eq!(
@@ -1991,7 +2185,16 @@ mod tests {
                     ..Default::default()
                 };
                 let deadline = Instant::now() + Duration::from_secs(5);
-                answer_of(delegate(&ep, auth, "obj", None, None, None, deadline))
+                answer_of(delegate(
+                    &ep,
+                    auth,
+                    "obj",
+                    None,
+                    None,
+                    None,
+                    deadline,
+                    Follow::default(),
+                ))
             };
             as_bearer("alice");
             as_bearer("alice");
@@ -2244,6 +2447,101 @@ mod tests {
             let (url, _) = peer(Some(unix_only), working);
             let e = error_of(delegated(&url));
             assert!(e.contains("no JSONRPC interface"), "{e}");
+        }
+
+        /// A peer's task waiting on its person (`AUTH_REQUIRED`) is no end:
+        /// the delegation is told when the wait starts — in the peer's words
+        /// — and when it ends, follows it `auth_timeout` past its own
+        /// deadline, and answers with what the task completes with. Resumed,
+        /// it polls that task alone and sends the work no second time.
+        #[test]
+        fn a_task_waiting_on_its_person_is_followed_to_its_end() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let waiting = || {
+                let mut t = task("t-1", TaskState::AuthRequired, None);
+                t["status"]["message"] = json!({"messageId": "m", "role": "ROLE_AGENT",
+                    "parts": [{"text": "sign in at https://peer.example/auth"}]});
+                t
+            };
+            let polls = Arc::new(AtomicU64::new(0));
+            let p = Arc::clone(&polls);
+            let (url, log) = serve(move |req| {
+                if is_card_get(req) {
+                    return serve_card(&unary_card());
+                }
+                match req.body["method"].as_str() {
+                    Some("GetTask") if p.fetch_add(1, Ordering::SeqCst) < 2 => result(waiting()),
+                    Some("GetTask") => {
+                        result(task("t-1", TaskState::Completed, Some("after the sign-in")))
+                    }
+                    _ => result(json!({"task": waiting()})),
+                }
+            });
+            let seen = Mutex::new(Vec::new());
+            let watch = |w: PeerWait| seen.lock().unwrap().push(w);
+            let ep = A2aEndpoint::parse(&url).unwrap();
+            // Shorter than the wait: the sign-in is what extends it.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let follow = Follow {
+                watch: Some(&watch),
+                auth_timeout: Duration::from_secs(10),
+                resume: None,
+            };
+            let out = delegate(
+                &ep,
+                PeerAuth::default(),
+                "obj",
+                None,
+                None,
+                None,
+                deadline,
+                follow,
+            );
+            assert_eq!(answer_of(out), "after the sign-in");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    PeerWait::AuthRequired {
+                        task: "t-1".into(),
+                        text: "sign in at https://peer.example/auth".into()
+                    },
+                    PeerWait::Resumed { task: "t-1".into() }
+                ]
+            );
+            let sent = requests(&log, "SendMessage").len();
+            let resumed = Follow {
+                resume: Some("t-1".into()),
+                ..Follow::default()
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let out = delegate(
+                &ep,
+                PeerAuth::default(),
+                "obj",
+                None,
+                None,
+                None,
+                deadline,
+                resumed,
+            );
+            assert_eq!(answer_of(out), "after the sign-in");
+            assert_eq!(requests(&log, "SendMessage").len(), sent);
+
+            // With no time for a sign-in, the wait ends the delegation,
+            // saying so.
+            polls.store(0, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let e = error_of(delegate(
+                &ep,
+                PeerAuth::default(),
+                "obj",
+                None,
+                None,
+                None,
+                deadline,
+                Follow::default(),
+            ));
+            assert!(e.contains("still waits for a sign-in"), "{e}");
         }
     }
 }

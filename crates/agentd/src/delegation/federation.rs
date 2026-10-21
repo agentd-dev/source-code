@@ -73,11 +73,20 @@ impl crate::a2a::login::Federation for Federation {
     fn complete(&self, a: Answer) -> Result<Signed, String> {
         let d = &self.d;
         let fail = |e: String| -> Result<Signed, String> {
-            if let Purpose::Enrol { task, .. } = &a.purpose {
-                let _ = self.tx.send(Event::DelegationSaid {
-                    task: task.clone(),
-                    said: Said::Done(Err(e.clone())),
-                });
+            match &a.purpose {
+                Purpose::Enrol { task, .. } => {
+                    let _ = self.tx.send(Event::DelegationSaid {
+                        task: task.clone(),
+                        said: Said::Done(Err(e.clone())),
+                    });
+                }
+                Purpose::Admit { task, .. } => {
+                    let _ = self.tx.send(Event::AdmissionSignedIn {
+                        task: task.clone(),
+                        result: Err(e.clone()),
+                    });
+                }
+                _ => {}
             }
             Err(e)
         };
@@ -182,6 +191,35 @@ impl crate::a2a::login::Federation for Federation {
                         typed,
                         proof,
                         said: format!("{text}. You may close this window."),
+                    }),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            Purpose::Admit { sid, task } => {
+                // The caller the token named, as its inbound session is now:
+                // the sign-in binds to that person alone (§5.4 step 4), and
+                // a sign-in as anyone else keeps nothing.
+                let who = d.who(Acting::new(None, Some(sid)));
+                let result = who.and_then(|who| {
+                    d.eligible(&who, &a.idp)?;
+                    let (text, proof) =
+                        enrol::keep(d, &who, &a.idp, signed, Some("authorization_code"))?;
+                    Ok((who.typed, text, proof))
+                });
+                let _ = self.tx.send(Event::AdmissionSignedIn {
+                    task: task.clone(),
+                    result: result
+                        .as_ref()
+                        .map(|(_, t, _)| t.clone())
+                        .map_err(|e| e.to_string()),
+                });
+                match result {
+                    Ok((typed, text, proof)) => Ok(Signed {
+                        typed,
+                        proof,
+                        said: format!(
+                            "{text}. The work you asked for goes on; you may close this window."
+                        ),
                     }),
                     Err(e) => Err(e.to_string()),
                 }

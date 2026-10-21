@@ -80,6 +80,12 @@ impl SignalSender {
 /// The conversation a message wait names to hear from any of them.
 pub(crate) const ANY_CONVERSATION: &str = "*";
 
+/// How long an `a2a.delegate` step waits for the person a peer's task asks
+/// to sign in (`AUTH_REQUIRED`), beyond the step's `timeout`, when it says
+/// no `auth_timeout`.
+#[cfg(feature = "a2a")]
+pub(crate) const PEER_AUTH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// Whether a message on conversation `key` — called `wire` by its sender —
 /// from `sender` (`None`: the runtime) wakes the message wait `w` of a run
 /// owned by `owner`.
@@ -108,6 +114,25 @@ pub(crate) fn message_wait_matches(
         },
         None => sender.is_none_or(|p| p.is_operator() || owner == Some(p.id.as_str())),
     }
+}
+
+/// What the person a peer's `AUTH_REQUIRED` is for reads: agentd's own
+/// words, the peer's quoted and escaped as untrusted text.
+#[cfg(feature = "a2a")]
+fn peer_auth_text(peer: &str, text: &str) -> String {
+    use crate::sec::render::quoted;
+    let said = if text.trim().is_empty() {
+        "it gave no reason".to_string()
+    } else {
+        format!(
+            "its words, which agentd does not vouch for and opens nothing of: {}",
+            quoted(text, 1000)
+        )
+    };
+    format!(
+        "The peer agent {} asks for a sign-in before it goes on with this work; {said}. Authorize it with that agent directly — agentd passes no credential on — and the work goes on by itself. No message here answers it.",
+        quoted(peer, 128)
+    )
 }
 
 /// A durable wait record kept in `StepState.wait`.
@@ -2124,6 +2149,129 @@ impl Runtime {
             .ok();
     }
 
+    /// An `a2a.delegate` step's peer task entered or left `AUTH_REQUIRED`
+    /// (A2A §7.6, RFC 0044 §5.9): the step waits on a person, who signs in
+    /// with the peer directly — agentd passes no credential on. The wait is
+    /// the step's, in its wait record, naming the peer's task, so a restart
+    /// follows that task rather than sending the objective again; the run's
+    /// task — one made for the person `auth_to` names, or the run's own
+    /// principal, when the run has none — moves to `AUTH_REQUIRED`, showing
+    /// the peer's words quoted as untrusted text, which agentd never opens.
+    /// It goes on once the peer does.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn peer_auth(
+        &mut self,
+        run: &str,
+        step: &str,
+        peer: &str,
+        wait: crate::mcp::a2a_client::PeerWait,
+    ) {
+        use crate::a2a::tasks::{Link, State};
+        use crate::mcp::a2a_client::PeerWait;
+        let live = self
+            .runs
+            .get(run)
+            .and_then(|r| r.steps.get(step))
+            .is_some_and(|st| st.status == StepStatus::Running);
+        if !live {
+            return;
+        }
+        match wait {
+            PeerWait::AuthRequired { task, text } => {
+                let to = self
+                    .definition_for_run(run)
+                    .and_then(|w| w.steps.get(step).cloned())
+                    .and_then(|s| {
+                        s.spec
+                            .get("auth_to")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                if let Some(st) = self.runs.get_mut(run).and_then(|r| r.steps.get_mut(step)) {
+                    st.wait = Some(json!({"kind": "peer_auth", "peer": peer, "task": task,
+                                          "to": to, "since": now_ms()}));
+                }
+                if let Some(r) = self.runs.get_mut(run) {
+                    r.touch();
+                }
+                // The run's task, or one made for the person the request is
+                // for: `auth_to`, else the run's principal.
+                let existing = self
+                    .runs
+                    .get(run)
+                    .and_then(|r| r.task.clone())
+                    .filter(|t| self.tasks.get(t).is_some_and(|t| !t.state.is_terminal()));
+                let tid = match existing {
+                    Some(t) => Some(t),
+                    None if self.a2a_sink.is_some() => {
+                        let owner = to
+                            .clone()
+                            .or_else(|| self.runs.get(run).and_then(|r| r.principal.clone()))
+                            .unwrap_or_else(|| "operator".to_string());
+                        let principal = crate::a2a::Principal {
+                            id: owner,
+                            role: crate::config::settings::Role::User,
+                            ..crate::a2a::Principal::anonymous()
+                        };
+                        let reserved = self.reserved_task_id.take();
+                        let tid = self.task_create(
+                            &format!("run-{run}"),
+                            &principal,
+                            Link::Run {
+                                id: run.to_string(),
+                            },
+                            None,
+                        );
+                        self.reserved_task_id = reserved;
+                        if let Some(r) = self.runs.get_mut(run) {
+                            r.task = Some(tid.clone());
+                            r.touch();
+                        }
+                        Some(tid)
+                    }
+                    None => None,
+                };
+                if let Some(tid) = &tid {
+                    if let Some(t) = self.tasks.get_mut(tid) {
+                        t.transition(State::AuthRequired, Some(peer_auth_text(peer, &text)));
+                    }
+                    self.task_persist(tid);
+                    self.task_sync(tid);
+                }
+                self.run_log(run).info(
+                    "a2a.peer.auth_required",
+                    json!({"run": run, "step": step, "peer": peer, "peer_task": task,
+                           "task": tid, "to": to}),
+                );
+            }
+            PeerWait::Resumed { task } => {
+                if let Some(st) = self.runs.get_mut(run).and_then(|r| r.steps.get_mut(step))
+                    && st.wait.as_ref().is_some_and(|w| w["kind"] == "peer_auth")
+                {
+                    st.wait = None;
+                }
+                let tid = self.runs.get_mut(run).and_then(|r| {
+                    r.touch();
+                    r.task.clone()
+                });
+                if let Some(tid) = tid {
+                    if let Some(t) = self.tasks.get_mut(&tid)
+                        && t.state == State::AuthRequired
+                    {
+                        t.transition(State::Working, None);
+                    }
+                    self.task_persist(&tid);
+                    self.task_sync(&tid);
+                }
+                self.run_log(run).info(
+                    "a2a.peer.auth_required",
+                    json!({"run": run, "step": step, "peer": peer, "peer_task": task,
+                           "decision": "resumed"}),
+                );
+            }
+        }
+    }
+
     /// `a2a.delegate {peer, objective, output_contract?, timeout?}`: hand a unit
     /// of work to a peer agent over A2A and suspend until it answers.
     #[cfg(feature = "a2a")]
@@ -2185,6 +2333,20 @@ impl Runtime {
             }
         };
         let message_id = idempotency_message_id(spec, run_id, step_id);
+        // How long the peer's task may wait on a person's sign-in
+        // (`AUTH_REQUIRED`) beyond the step's own timeout; and a task a
+        // restart found waiting, which is followed rather than sent again.
+        let auth_timeout = spec
+            .get("auth_timeout")
+            .and_then(crate::engine::model::duration_ms_opt)
+            .map_or(PEER_AUTH_TIMEOUT, Duration::from_millis);
+        let resume = self
+            .runs
+            .get(run_id)
+            .and_then(|r| r.steps.get(step_id))
+            .and_then(|st| st.wait.as_ref())
+            .filter(|w| w["kind"] == "peer_auth" && w["peer"] == json!(peer_name))
+            .and_then(|w| w["task"].as_str().map(str::to_string));
         let tx = self.events_tx.clone();
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
@@ -2196,13 +2358,23 @@ impl Runtime {
         auth.trace = hop.clone();
         self.log.in_trace(hop.as_ref()).info(
             "a2a.delegate",
-            json!({"run": run_id, "step": step_id, "peer": peer_name}),
+            json!({"run": run_id, "step": step_id, "peer": peer_name, "resume": resume}),
         );
         std::thread::Builder::new()
             .name(format!("a2a.delegate:{peer_name}"))
             .spawn(move || {
                 let start = crate::obs::otel::now_unix_nanos();
                 let deadline = std::time::Instant::now() + timeout;
+                let told = tx.clone();
+                let (wr, ws, wp) = (r.clone(), s.clone(), peer_name.clone());
+                let watch = move |wait: crate::mcp::a2a_client::PeerWait| {
+                    let _ = told.send(super::events::Event::PeerAuth {
+                        run: wr.clone(),
+                        step: ws.clone(),
+                        peer: wp.clone(),
+                        wait,
+                    });
+                };
                 let (output, is_error, error) = match crate::mcp::a2a_client::delegate(
                     &endpoint,
                     auth,
@@ -2211,6 +2383,11 @@ impl Runtime {
                     contract.as_deref(),
                     message_id.as_deref(),
                     deadline,
+                    crate::mcp::a2a_client::Follow {
+                        watch: Some(&watch),
+                        auth_timeout,
+                        resume,
+                    },
                 ) {
                     crate::mcp::a2a_client::DelegateOutcome::Distillate(text) => (
                         serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),

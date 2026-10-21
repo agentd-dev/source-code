@@ -430,6 +430,130 @@ pub fn exchange(
     )
 }
 
+// --- the same-domain exchange (M1b) ------------------------------------------
+
+/// One RFC 8693 on-behalf-of exchange at the MCP server's own authorization
+/// server, which is the person's IdP (RFC 0044 §5.7, M1b): an access token
+/// issued to agentd for the person, exchanged for one the pinned audience
+/// and resource take.
+pub struct AccessExchange<'a> {
+    /// An access token for agentd: from the grant's refresh token at this
+    /// authorization server, or the caller's verified inbound token.
+    pub subject_token: &'a str,
+    /// The pinned audience the result is issued for.
+    pub audience: &'a str,
+    /// The pinned MCP server.
+    pub resource: &'a str,
+    pub scopes: &'a [String],
+}
+
+/// What the result must say: whose it is, by the profile's subject claim
+/// (`uid` under Okta, else `sub`), where agentd knows the person.
+pub struct ExpectAccess<'a> {
+    pub subject_claim: &'a str,
+    pub sub: Option<&'a str>,
+}
+
+/// Check an on-behalf-of exchange's answer `body` for `ex`: an access token
+/// (RFC 8693 §2.2.1), a `Bearer`; one that is a JWT names the pinned
+/// audience and the person; no scope granted that was not asked. Any
+/// `refresh_token` is dropped unread: renewal is a new exchange.
+pub fn check_access_exchange(
+    body: &Value,
+    ex: &AccessExchange<'_>,
+    expect: &ExpectAccess<'_>,
+) -> Result<(Redeemed, Option<String>), Check> {
+    let issued = body["issued_token_type"].as_str().unwrap_or_default();
+    if issued != wire::TOKEN_TYPE_ACCESS_TOKEN {
+        return Err(check(
+            CheckKind::IssuedTokenType,
+            format!("issued_token_type is {issued:?}, not an access token's"),
+        ));
+    }
+    if !body["token_type"]
+        .as_str()
+        .is_some_and(|t| t.eq_ignore_ascii_case("bearer"))
+    {
+        return Err(check(
+            CheckKind::TokenType,
+            format!("token_type is {}, not Bearer", body["token_type"]),
+        ));
+    }
+    let at = body["access_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| check(CheckKind::Malformed, "no access_token"))?;
+    let mut sub = None;
+    if let Ok((_, claims)) = decode_unverified(at) {
+        if !names(&claims["aud"], ex.audience) {
+            return Err(check(
+                CheckKind::AccessTokenAudience,
+                format!(
+                    "the exchanged token's aud is {}, not the pinned {}",
+                    claims["aud"], ex.audience
+                ),
+            ));
+        }
+        let got = claims[expect.subject_claim]
+            .as_str()
+            .or_else(|| claims["sub"].as_str())
+            .unwrap_or_default();
+        if got.is_empty() || expect.sub.is_some_and(|want| want != got) {
+            return Err(check(
+                CheckKind::Sub,
+                format!(
+                    "the exchanged token's {} is {got:?}, not the person's {:?}",
+                    expect.subject_claim,
+                    expect.sub.unwrap_or_default()
+                ),
+            ));
+        }
+        sub = Some(got.to_string());
+    }
+    if let Some(granted) = body["scope"].as_str().map(scopes_of)
+        && let Some(extra) = granted.iter().find(|s| !ex.scopes.contains(s))
+    {
+        return Err(check(
+            CheckKind::Scope,
+            format!("the authorization server granted {extra:?}, which was not asked for"),
+        ));
+    }
+    Ok((
+        Redeemed {
+            access_token: at.to_string(),
+            expires_in: body["expires_in"].as_u64(),
+            scope: body["scope"].as_str().map(str::to_string),
+        },
+        sub,
+    ))
+}
+
+/// The on-behalf-of exchange at `asrv`, the authorization server that is
+/// both the person's IdP and the MCP server's (RFC 8693 §2.1): the subject
+/// an access token for agentd, the result one for the pinned audience and
+/// resource. `asrv` carries agentd's client authentication there. The
+/// subject goes to that token endpoint and nowhere else.
+pub fn exchange_access(
+    asrv: &OAuth2Params,
+    ex: &AccessExchange<'_>,
+    expect: &ExpectAccess<'_>,
+    timeout: Duration,
+) -> Result<(Redeemed, Option<String>), Refusal> {
+    let mut form = Form::new();
+    form.field("grant_type", wire::GRANT_TOKEN_EXCHANGE);
+    form.field("subject_token", ex.subject_token);
+    form.field("subject_token_type", wire::TOKEN_TYPE_ACCESS_TOKEN);
+    form.field("requested_token_type", wire::TOKEN_TYPE_ACCESS_TOKEN);
+    form.field("audience", ex.audience);
+    form.field("resource", ex.resource);
+    if !ex.scopes.is_empty() {
+        form.field("scope", &ex.scopes.join(" "));
+    }
+    form.field("client_id", &asrv.client_id);
+    let body = token_request(asrv, form, timeout)?;
+    check_access_exchange(&body, ex, expect).map_err(Refusal::Checked)
+}
+
 /// An access token from the authorization server, checked.
 #[derive(Debug, Clone)]
 pub struct Redeemed {
@@ -1157,5 +1281,97 @@ mod tests {
         let set = json!({"keys": [rsa.public_jwk()]});
         let t = rsa.sign_jwt(json!({"typ": "JWT"}), &good).unwrap();
         verify_id_token(&t, &set, IDP, "0oa-agent", None, 1100).unwrap();
+    }
+
+    /// An on-behalf-of exchange's answer (M1b) is an access token, a
+    /// `Bearer`; one that is a JWT names the pinned audience and the person
+    /// by the profile's claim; no scope comes back that was not asked; and a
+    /// refresh token in it is dropped unread.
+    #[test]
+    fn an_exchanged_access_token_is_held_to_the_pin_and_the_person() {
+        let k = key();
+        let scopes = vec!["issues:read".to_string()];
+        let ex = AccessExchange {
+            subject_token: "at",
+            audience: "api://issues",
+            resource: RES,
+            scopes: &scopes,
+        };
+        let okta = ExpectAccess {
+            subject_claim: "uid",
+            sub: Some("00u1alice"),
+        };
+        let token = |c: Value| k.sign_jwt(json!({"typ": "at+jwt"}), &c).unwrap();
+        let good = json!({"iss": IDP, "aud": "api://issues", "sub": "alice@acme.example",
+                          "uid": "00u1alice", "scp": ["issues:read"], "exp": 4000});
+        let answer = |at: String, extra: Value| {
+            let mut v = json!({"issued_token_type": wire::TOKEN_TYPE_ACCESS_TOKEN,
+                               "access_token": at, "token_type": "Bearer", "expires_in": 300,
+                               "scope": "issues:read"});
+            if let (Some(o), Some(x)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(x.clone());
+            }
+            v
+        };
+        let (r, sub) = check_access_exchange(
+            &answer(token(good.clone()), json!({"refresh_token": "rt"})),
+            &ex,
+            &okta,
+        )
+        .unwrap();
+        assert_eq!(sub.as_deref(), Some("00u1alice"));
+        assert_eq!(r.expires_in, Some(300));
+        let kind = |body: Value, expect: &ExpectAccess<'_>| {
+            check_access_exchange(&body, &ex, expect).unwrap_err().kind
+        };
+        let mut other = good.clone();
+        other["aud"] = json!("api://elsewhere");
+        assert_eq!(
+            kind(answer(token(other), json!({})), &okta),
+            CheckKind::AccessTokenAudience
+        );
+        let mut bob = good.clone();
+        bob["uid"] = json!("00u2bob");
+        assert_eq!(kind(answer(token(bob), json!({})), &okta), CheckKind::Sub);
+        // Generic: the person in `sub`.
+        let generic = ExpectAccess {
+            subject_claim: "sub",
+            sub: Some("00u1alice"),
+        };
+        assert_eq!(
+            kind(answer(token(good.clone()), json!({})), &generic),
+            CheckKind::Sub
+        );
+        assert_eq!(
+            kind(
+                answer(
+                    token(good.clone()),
+                    json!({"issued_token_type": wire::TOKEN_TYPE_ID_JAG})
+                ),
+                &okta
+            ),
+            CheckKind::IssuedTokenType
+        );
+        assert_eq!(
+            kind(
+                answer(token(good.clone()), json!({"token_type": "N_A"})),
+                &okta
+            ),
+            CheckKind::TokenType
+        );
+        assert_eq!(
+            kind(
+                answer(
+                    token(good.clone()),
+                    json!({"scope": "issues:read issues:write"})
+                ),
+                &okta
+            ),
+            CheckKind::Scope
+        );
+        // An opaque token cannot be read, and is taken as the server issued it.
+        let (r, sub) =
+            check_access_exchange(&answer("opaque".into(), json!({})), &ex, &okta).unwrap();
+        assert_eq!((r.access_token.as_str(), sub), ("opaque", None));
     }
 }

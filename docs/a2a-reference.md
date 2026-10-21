@@ -23,6 +23,7 @@ build feature, which the release binaries and image include.
 | `/.well-known/oauth-authorization-server` | `GET` | device grant on | RFC 8414 metadata; the issuer is the listener origin |
 | `/oauth2/device` | `GET` | device grant on | the default verification page: plain text telling the person how an operator approves |
 | `/oauth2/launch_authorization` | `POST` | `agentd ui` attached | a launched web UI tab asks the launcher's terminal to sign it in |
+| `/.well-known/oauth-protected-resource` | `GET` | `a2a.inbound_tokens` names an issuer | RFC 9728 metadata: the `resource` (`a2a.resource`), the `authorization_servers` (the issuers), `bearer_methods_supported: [header]`, and the `scopes_supported` the issuers map; under a resource with a path, at that path after the well-known prefix |
 
 Every other path, and a route whose condition does not hold, is `404`.
 
@@ -172,6 +173,13 @@ plain HTTP client all see them.
 | `401`, a credential presented and failed | adds `error="invalid_token"` and a description | `null` |
 | `403`, a certificate no rule gives a role | none | `null` |
 | `403`, a method or op the caller may not call | `error="insufficient_scope"` when the caller used a bearer | the request's `id` |
+| `403`, an inbound token whose scopes reach no skill the send asks for | `error="insufficient_scope"`, and `scope="…"`, the issuer's scopes that would | the request's `id` |
+
+Where the listener takes inbound access tokens, every `401` and the scope
+`403` also name its protected-resource metadata,
+`resource_metadata="<origin>/.well-known/oauth-protected-resource"` (RFC 9728
+§5.1), which is how an OAuth client finds the authorization servers whose
+tokens it takes.
 
 A browser refused only for being a browser, on a listener where the same
 request without `Origin` would have been the implicit operator, is told
@@ -343,11 +351,21 @@ the listener enforces:
 | `a2a.bearer` or a `bearer_ref` rule | `bearer` | `{bearer}` |
 | `a2a.device_grant.enabled` | `bearer`, `device_code` (OAuth 2.0 device flow) | `{bearer}`, `{device_code}` |
 | `a2a.tls.client_ca` | `mtls`, plus `bearer` when one is configured | `{mtls}`, plus `{mtls, bearer}` |
+| `a2a.inbound_tokens` | one `oauth2` scheme per issuer, named `enterprise`, `enterprise-2`, … or by its `name` | `{<scheme>: [its scopes]}`, or `{mtls, <scheme>}` beside a client CA |
 
 An `any` rule adds the empty alternative `{}` on a listener without a client
 CA. The `device_code` scheme's flow names `<origin>/oauth2/device_authorization`
 and `<origin>/oauth2/token`, and `oauth2MetadataUrl` when the origin is
 `https`.
+
+An issuer's `oauth2` scheme names the metadata document it was read from as
+`oauth2MetadataUrl`, and one flow from that metadata: `authorizationCode`
+(its authorization and token endpoints, `pkceRequired: true`), or
+`deviceCode` with `flow: device_code`. Its scopes are the issuer's
+`scopes_to_skills`, each described by the skills it reaches. The scheme is
+declared once the issuer's metadata and key set are loaded — the moment its
+tokens can be checked — so the card never declares a scheme the listener
+cannot verify.
 
 **The extended card.** `GetExtendedAgentCard` adds a `workflow:<name>` skill
 for each workflow the caller may run and narrows each extension's params to
@@ -364,6 +382,7 @@ before its body is read.
 | 1 | a unix-socket peer with the daemon's uid, or root | `operator` |
 | 2 | a bearer starting `agentd_at_` | the session's principal; unknown, expired or revoked is `401` |
 | 2 | any other bearer, on a listener with a bearer mechanism | `a2a.bearer` is `operator`; a `bearer_ref` rule is its principal; neither is `401` |
+| 2 | a JWT access token from an `a2a.inbound_tokens` issuer, after every static bearer | the first `token_iss` rule it matches; else the person, `user:oidc:<iss>#<subject>`; a client's own token, where `require_user_token: false`, `agent:oidc:<iss>#<client>`; a token that fails a check is `401` |
 | 3 | a verified client certificate | the first `san`, `sub` or `any` rule it matches; `operator` while no rule exists; else `403` |
 | 4 | none of the above, and an `any` rule exists | that rule's principal |
 | 5 | nothing presented, a loopback peer, a loopback-bound listener with no mechanism, no `Origin` | `operator` (the implicit operator) |
@@ -376,7 +395,8 @@ bearer is resolved before any certificate rule.
 
 | Key | Rule |
 |---|---|
-| `match` | exactly one of `san`, `sub`, `bearer_ref`, `any` |
+| `match` | exactly one of `san`, `sub`, `bearer_ref`, `any`, `token_iss` |
+| `match.token_iss` | an `a2a.inbound_tokens` issuer, exactly; with `sub`, a glob over the token's subject; `role` `user` or `agent`, and no `id` or `idp_subject` — the token names the person |
 | `match.san` | a glob over the certificate's SANs and subject CN; a SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN; needs `a2a.tls.client_ca` |
 | `match.sub` | the subject CN, exactly; needs `a2a.tls.client_ca` |
 | `match.bearer_ref` | a secret reference, compared in constant time; may not equal `a2a.bearer` or another rule's secret, or start with `agentd_at_` |
@@ -619,6 +639,8 @@ path is also a flag (`--a2a-<path>`) and an environment variable
 | `a2a.push.enabled` | `false` | reload | accept webhook registrations and deliver |
 | `a2a.push.allow_private` | `false` | reload | permit private and loopback webhook targets |
 | `a2a.peers` | `[]` | reload | agents this instance dials |
+| `a2a.resource` | none | restart | the resource identifier inbound access tokens are issued for, their `aud`: a canonical URI on the listener's origin; needs `a2a.inbound_tokens` |
+| `a2a.inbound_tokens` | `[]` | restart | the enterprise authorization servers whose JWT access tokens (RFC 9068) name a caller; needs a TCP listener and `a2a.resource`, and the `a2a` and `oauth` features |
 
 A rotated certificate is served on the next connection without a restart; a
 bad intermediate write keeps the last good identity. Whether client
@@ -637,6 +659,26 @@ certificates are required is fixed at startup.
 
 `security.tls_ca` adds a trust anchor for every outbound TLS connection,
 peers included.
+
+**Inbound token issuers** (`a2a.inbound_tokens[]`):
+
+| Key | Default | Rule |
+|---|---|---|
+| `issuer` | required | the issuer, `https://` (`http://` to a loopback host); every token's `iss` and the metadata's `issuer` equal it byte for byte; unique |
+| `name` | `enterprise`, `enterprise-<n>` | the card's scheme name |
+| `profile` | `generic` | `generic`: RFC 9068 — `typ: at+jwt`, the person in `sub`, the client in `client_id`, the scopes in `scope`; `okta`: an Okta custom authorization server — no `typ` or `at+jwt`, the person in `uid`, the client in `cid`, the scopes in `scp` |
+| `audiences` | `[a2a.resource]` | the `aud` values a token may carry; none may be a client |
+| `jwks_uri` | the metadata's | the key set, on the issuer's origin; under `okta`, a custom server's `{issuer}/v1/keys` |
+| `algs` | `[RS256, ES256]` | the algorithms a token may be signed with, of `RS256`, `ES256`, `EdDSA`; `none` and `HS*` are refused |
+| `typ` | the profile's | `none`, or the values a token's `typ` may take beside `at+jwt` |
+| `subject_claim` | the profile's | the claim that names the person |
+| `tenant_claim` | none | the claim that names a multi-tenant issuer's tenant, put into the principal — `user:oidc:<iss>#<tenant>/<subject>`, so one subject in two tenants is two people; a token without it is refused |
+| `clients` | required | the front-end clients (`azp`, `cid` or `client_id`) that may call |
+| `require_user_token` | `true` | refuse a token issued to a client alone; `false` names it an agent |
+| `max_token_age` | `1h` | how old a token may be by its `iat`, at most `24h` |
+| `max_chain_depth` | `4` | how deep its `act` chain may nest, at most `16`; deeper is refused |
+| `flow` | `authorization_code` | the flow the card declares: `authorization_code` or `device_code` |
+| `scopes_to_skills` | `{}` | each scope's skills: `conversation`, `workflow:<name glob>`, `command:<op>`; empty, the scopes narrow nothing |
 
 ## Load-time refusals
 
@@ -666,6 +708,11 @@ The load refuses these with exit code 2, before anything starts.
 | a malformed `quotas.rate` | |
 | a duplicate peer name, a bad peer endpoint, `client_cert` without `client_key`, `auth.kind: aws` on a peer | |
 | a workflow command that names a built-in op | it would shadow the operator's control |
+| `a2a.inbound_tokens` on a unix listener, or without `a2a.resource` | a token is presented over HTTP, for one resource |
+| `a2a.resource` not canonical, or off the listener's origin | its metadata is served there |
+| an issuer not `https://`, listed twice, with no `clients`, an audience that is a client, `none` or `HS*` among its `algs`, or a `jwks_uri` off its origin | each would let a token through that names nobody this agent should trust |
+| a `token_iss` rule naming no issuer, with other evidence, an `id` or an `idp_subject`, or a role other than `user` or `agent` | the token names the person |
+| `a2a.resource`, `a2a.inbound_tokens`, `match.token_iss` or a webhook's `auth.jwt` in a build without `a2a` and `oauth` | nothing could check a token |
 
 ## Limits and constants
 
@@ -698,6 +745,12 @@ The load refuses these with exit code 2, before anything starts.
 | Peer card cache | the card's `max-age`, at most 5 min; 1 min when it names none; 5 s for a peer on this host |
 | Peer card fetch | 5 s |
 | Peer request | 30 s per round trip; `GetTask` polls 100 ms apart, bounded by the step's timeout |
+| Peer task in `AUTH_REQUIRED` | polled once a second; followed `auth_timeout` (default 1 h) past the step's timeout |
+| Inbound token | 16 KiB; times checked with 60 s of skew |
+| An issuer's key set | kept an hour; read again when a token names a key it lacks, at most every 30 s |
+| Inbound sessions | 4096, each kept an hour past its token's expiry |
+| A webhook's token | lives at most `max_lifetime` (5 min, at most 15 min); 65 536 `jti`s remembered until they expire |
+| Admission sign-ins | 3 per principal per 10 minutes; a start link opens once, within 60 s |
 
 A card read under a client certificate or a per-request signature is not
 cached, and a delegation that fails drops the card it used.
@@ -712,9 +765,14 @@ cached, and a delegation that fails drops the card it used.
 | `a2a.push.registered` | a webhook was registered |
 | `a2a.push.failed` | a webhook delivery failed and was dropped |
 | `a2a.delegate`, `a2a.send` | a workflow step dialled a peer |
+| `a2a.inbound.ready`, `a2a.inbound.unavailable` | an inbound-token issuer's metadata and keys were loaded, or could not be |
+| `a2a.task.auth_required` | a task waits on its caller's sign-in at admission, or its decision: `signed_in`, `refused`, `not_offered` |
+| `a2a.peer.auth_required` | a peer's task waits on a person's sign-in, or went on (`decision: resumed`) |
 
 The `a2a.denied` reasons are `auth_failures_limited`, `unauthenticated`,
-`invalid_credential`, `no_role`, `rate_limited` and `not_permitted`.
+`invalid_credential`, `invalid_token` (an inbound token a check refused:
+its `issuer` and `why`, never the token), `insufficient_scope`, `no_role`,
+`rate_limited` and `not_permitted`.
 [Events and metrics reference](telemetry-reference.md) lists every event.
 
 ## Probes

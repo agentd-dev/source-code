@@ -23,7 +23,9 @@
           "timeout",
           "idempotency",
           "breaker",
-          "rate"
+          "rate",
+          "auth_to",
+          "auth_timeout"
         ],
         "implemented": true,
         "required": [

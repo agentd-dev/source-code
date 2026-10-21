@@ -64,6 +64,22 @@ fn named_task(params: &Value) -> Option<&str> {
     named.filter(|t| !t.trim().is_empty())
 }
 
+impl Runtime {
+    /// The workflows whose `a2a` start declares command `op`.
+    #[cfg(feature = "xaa")]
+    fn workflows_declaring(&self, op: &str) -> Vec<String> {
+        self.workflows
+            .values()
+            .filter(|w| {
+                w.start_steps().iter().any(|s| {
+                    s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op)
+                })
+            })
+            .map(|w| w.name.clone())
+            .collect()
+    }
+}
+
 /// A role as the inbox event records it and an `a2a` start's `roles:` names
 /// it — the one spelling both sides of that match read.
 fn role_name(role: crate::config::settings::Role) -> &'static str {
@@ -214,6 +230,42 @@ impl Runtime {
                             ),
                         );
                     }
+                    // A task waiting on a sign-in is answered out of band, at
+                    // the IdP (A2A §7.6.4): a message carries no credential
+                    // that could answer it, and one sent to a task whose work
+                    // has not started yet would start other work in its
+                    // name. A command — a gate's answer — still reaches it,
+                    // a message on a step-up's gate is that gate's to
+                    // refuse, as every gate's is, and record, and a question
+                    // the task's work asks beside the sign-in — a `human`
+                    // step in a parallel branch — still takes its answer.
+                    let asks = self
+                        .pending
+                        .iter()
+                        .any(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == tid));
+                    let held = {
+                        #[cfg(feature = "xaa")]
+                        {
+                            self.held_starts.contains_key(tid)
+                        }
+                        #[cfg(not(feature = "xaa"))]
+                        {
+                            false
+                        }
+                    };
+                    if held
+                        || (t.state == State::AuthRequired
+                            && command.is_none()
+                            && t.consent_gate.is_none()
+                            && !asks)
+                    {
+                        return err_obj(
+                            UNSUPPORTED_OPERATION,
+                            &format!(
+                                "task {tid} waits on a sign-in, done at the link it names and not by a message"
+                            ),
+                        );
+                    }
                     // A task belongs to one conversation. A message that
                     // names the task and another conversation is refused
                     // rather than answered in either (A2A 1.0 §3.4.1: a
@@ -257,6 +309,33 @@ impl Runtime {
             self.push_now(&tid);
         }
         out
+    }
+
+    /// The refusal of `principal`, an inbound token's caller, using
+    /// `skill` its token's scopes do not reach — read from the session the
+    /// token keeps, as the listener checked them (RFC 0044 §5.9). `None`
+    /// for every other caller, and for a token that reaches it.
+    #[cfg(feature = "oauth")]
+    fn token_scope_refusal(&self, principal: &Principal, skill: &str) -> Option<Value> {
+        let sid = principal
+            .session
+            .as_deref()
+            .filter(|s| s.starts_with(crate::a2a::INBOUND_SID_PREFIX))?;
+        let inbound = self.inbound.as_ref()?;
+        let session = self
+            .a2a_serving
+            .as_ref()
+            .and_then(|s| s.sessions.as_ref())
+            .and_then(|s| s.inbound(sid));
+        if session.is_some_and(|s| inbound.scopes_cover(&s.issuer, &s.scopes, skill)) {
+            return None;
+        }
+        Some(refusal(
+            errors::PERMISSION_DENIED,
+            reason::PERMISSION_DENIED,
+            &format!("the token's scopes do not reach {skill}"),
+            &[],
+        ))
     }
 
     /// The message, accepted: routed to the registry, a gate, or a turn.
@@ -484,6 +563,16 @@ impl Runtime {
             self.human_answer(i, text, via, Some(&principal.clone()), link.as_ref());
             return self.task_reply(tid);
         }
+        // A message on a task that answered no gate becomes a turn of the
+        // task's conversation, which an inbound token's scopes must reach;
+        // the listener left a message naming a task to be judged here.
+        #[cfg(feature = "oauth")]
+        if existing.is_some()
+            && command.is_none()
+            && let Some(refused) = self.token_scope_refusal(principal, "conversation")
+        {
+            return refused;
+        }
         // The unit this message becomes: a continued task's carries on in the
         // task's trace, and the caller's span, from another, is its link; a
         // new one continues the caller's, else starts its own.
@@ -525,6 +614,35 @@ impl Runtime {
         let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
         "role": role_name(principal.role)});
+        // A declared command an inbound token's caller sends, for a workflow
+        // that acts with a grant they do not hold yet: its run waits on their
+        // sign-in, in `AUTH_REQUIRED` (RFC 0044 §5.4 Door 2).
+        #[cfg(feature = "xaa")]
+        if declared
+            && let Some(op) = command.map(|c| c.op.clone())
+            && let Some(idp) = self
+                .workflows_declaring(&op)
+                .iter()
+                .find_map(|w| self.admission_needs(principal, w))
+        {
+            let held = crate::runtime::admission::HeldStart {
+                kind: kinds::A2A_MESSAGE,
+                principal: principal.id.clone(),
+                session: principal.session.clone(),
+                payload: payload.clone(),
+                parent: parent.clone(),
+                links_event: true,
+                idp,
+                until_ms: 0,
+            };
+            match self.hold_for_sign_in(&task_id, held) {
+                Ok(()) => return self.task_reply(&task_id),
+                Err(e) => self.log.info(
+                    "a2a.task.auth_required",
+                    json!({"task": task_id, "principal": principal.id, "decision": "not_offered", "why": e}),
+                ),
+            }
+        }
         // The turn or run the message becomes acts through the session it
         // came through (RFC 0044 §5.12).
         match self

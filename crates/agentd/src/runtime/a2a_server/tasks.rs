@@ -545,6 +545,10 @@ impl Runtime {
         {
             self.human_fail(i, "ask_human: the gate task was cancelled");
         }
+        // Work held until its caller signs in never starts, and the
+        // sign-in it waited on ends with it.
+        #[cfg(feature = "xaa")]
+        self.cancel_held(&id);
         match self.tasks.get(&id).map(|t| t.link.clone()) {
             Some(Link::Run { id: run }) if self.runs.contains_key(&run) => {
                 self.cancel_run(&run, "task cancelled over A2A")

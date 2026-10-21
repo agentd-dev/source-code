@@ -40,6 +40,12 @@ pub(super) struct FedOpts {
     pub(super) consent_max_age: Option<&'static str>,
     /// The `gated` server's tags, when not [`GATED_TAGS`].
     pub(super) gated_tags: Option<&'static str>,
+    /// Appended to the `a2a` section; `__ISS__` is the mock IdP's issuer,
+    /// `__PORT__` the listener's port, `__DIR__` the deployment's
+    /// directory, `__MCP__` the MCP server and `__PEER__` the A2A peer.
+    pub(super) a2a_extra: String,
+    /// Appended to `mcp.servers`, as [`FedOpts::a2a_extra`] is.
+    pub(super) servers_extra: String,
     /// Appended to the configuration: workflows, then any other section.
     pub(super) extra: String,
 }
@@ -66,6 +72,14 @@ fn fed_config(x: &Xaa, dir: &Path, port: u16, o: &FedOpts) -> String {
     if o.login {
         a2a.push_str("  login: {idp: okta}\n");
     }
+    let fill = |s: &str| {
+        s.replace("__ISS__", &x.idp)
+            .replace("__PORT__", &port.to_string())
+            .replace("__DIR__", &d.to_string())
+            .replace("__MCP__", &x.mcp)
+            .replace("__PEER__", &x.peer)
+    };
+    a2a.push_str(&fill(&o.a2a_extra));
     let mut delegation =
         format!("    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n    templates:\n");
     for t in &o.templates {
@@ -95,11 +109,12 @@ fn fed_config(x: &Xaa, dir: &Path, port: u16, o: &FedOpts) -> String {
         )
     };
     format!(
-        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {{log_level: info}}\na2a:\n{a2a}security:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{idp}\"\n      client_id: agentd-idp\n      client_auth: {{method: private_key_jwt, key: \"{{{{secret-file:{d}/idp.pem}}}}\"}}\n      subject: refresh_token\n      sign_in: {{grants: [authorization_code, device]}}\n  delegation:\n{delegation}mcp:\n  servers:\n{read}{gated}workflows:\n{who}{write}{via}{extra}",
+        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {{log_level: info}}\na2a:\n{a2a}security:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{idp}\"\n      client_id: agentd-idp\n      client_auth: {{method: private_key_jwt, key: \"{{{{secret-file:{d}/idp.pem}}}}\"}}\n      subject: refresh_token\n      sign_in: {{grants: [authorization_code, device]}}\n  delegation:\n{delegation}mcp:\n  servers:\n{read}{gated}{more}workflows:\n{who}{write}{via}{extra}",
         idp = x.idp,
         read = server("linear", &x.mcp, READ_TAGS),
         gated = server("gated", &x.mcp2, o.gated_tags.unwrap_or(GATED_TAGS)),
-        extra = o.extra,
+        more = fill(&o.servers_extra),
+        extra = fill(&o.extra),
         who = wf("who", "linear", "whoami", "{}"),
         write = wf("write", "gated", "create_issue", "{title: \"From agentd\"}"),
         // A run that starts `who` as its child: the child acts through the
@@ -149,7 +164,7 @@ fn form_post(addr: &str, path: &str, form: &str) -> (u16, Value) {
 
 /// A person's browser following start link `uri`: where the start link sent
 /// it (the IdP's authorization URL), and the cookie it set.
-fn open_start(uri: &str) -> Result<(String, String), String> {
+pub(super) fn open_start(uri: &str) -> Result<(String, String), String> {
     let (addr, path) = split(uri);
     let (status, headers, body) = util::exchange(&addr, "GET", &path, &[], "");
     let location = header(&headers, "location").map(str::to_string);
@@ -166,7 +181,7 @@ fn open_start(uri: &str) -> Result<(String, String), String> {
 
 /// The browser at the IdP, which signs the person in at once: where it is
 /// sent back to.
-fn at_idp(url: &str) -> Result<String, String> {
+pub(super) fn at_idp(url: &str) -> Result<String, String> {
     let (addr, path) = split(url);
     let (status, headers, body) = util::exchange(&addr, "GET", &path, &[], "");
     match (status, header(&headers, "location")) {
@@ -177,7 +192,7 @@ fn at_idp(url: &str) -> Result<String, String> {
 
 /// The browser back at the callback, with `cookie` or without one: the
 /// page's status and text.
-fn back(url: &str, cookie: Option<&str>) -> (u16, String) {
+pub(super) fn back(url: &str, cookie: Option<&str>) -> (u16, String) {
     let (addr, path) = split(url);
     let headers: Vec<(&str, &str)> = cookie.map(|c| ("Cookie", c)).into_iter().collect();
     let (status, _, body) = util::exchange(&addr, "GET", &path, &headers, "");
@@ -186,7 +201,7 @@ fn back(url: &str, cookie: Option<&str>) -> (u16, String) {
 
 /// One person's browser through start link `uri`, start to callback: the
 /// callback's status and page.
-fn sign_in_at(uri: &str) -> Result<(u16, String), String> {
+pub(super) fn sign_in_at(uri: &str) -> Result<(u16, String), String> {
     let (idp, cookie) = open_start(uri)?;
     let callback = at_idp(&idp)?;
     Ok(back(&callback, Some(&cookie)))

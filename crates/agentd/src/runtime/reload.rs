@@ -205,6 +205,19 @@ impl Runtime {
         // the same hash. (A source whose server the reload dials again moves
         // the servers, above.)
         let skills_inputs_moved = skills_rebuilt(old, new);
+        // The policies swap whole or not at all (RFC 0044 §5.14): a rule
+        // that could hold a tool a running turn or subagent dials itself —
+        // a call no rule sees — refuses the reload, naming them, rather than
+        // holding every call but those.
+        if old.security.policies != new.security.policies {
+            let unseen = self.policies_unseen(&new.security.policies);
+            if !unseen.is_empty() {
+                return Err(vec![format!(
+                    "security.policies: the new rules could hold {}, which running work dials itself and no rule would see — reload once it ends, or restart",
+                    unseen.join(", ")
+                )]);
+            }
+        }
         let workflows = if old.workflows != new.workflows
             || external
             || channels_moved
@@ -263,6 +276,22 @@ impl Runtime {
         }
     }
 
+    /// The tools a running child dials itself that `policies` could hold,
+    /// each with its child: what a reload of them could not reach.
+    fn policies_unseen(&self, policies: &[cfg::Policy]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (node, c) in self.children.iter() {
+            let Some(d) = &c.direct else { continue };
+            for t in &d.tools {
+                let tags = self.registry.tags_of(std::slice::from_ref(t));
+                if crate::sec::policy::could_apply(policies, t, &tags, d.caller) {
+                    out.push(format!("{t} (child {})", node.0));
+                }
+            }
+        }
+        out
+    }
+
     /// The listener's side of a reload, built and not yet served: the
     /// principal rules compiled into a resolver, their ids checked against
     /// the identity registry, and the webhook route table. Any of them that
@@ -297,7 +326,7 @@ impl Runtime {
                 let nodes = super::webhooks::webhook_nodes_of(live);
                 Some(
                     handler
-                        .stage_routes(nodes, &new.webhooks, &envmap)
+                        .stage_routes(nodes, new, &envmap)
                         .map_err(|e| vec![format!("webhooks: {e}")])?,
                 )
             }
@@ -969,6 +998,17 @@ impl Runtime {
             || old.context != new.context
         {
             changed.push("limits/lifecycle/observability/memory/context");
+        }
+        // The policies (RFC 0044 §5.14): read at every call, so the new list
+        // holds from the next one, whole — a list that did not load refused
+        // the reload above and the old one stands. A gate already open keeps
+        // the rule that raised it, in the call it holds.
+        if old.security.policies != new.security.policies {
+            self.log.info(
+                "security.policies.reloaded",
+                json!({"rules": new.security.policies.len(), "was": old.security.policies.len()}),
+            );
+            changed.push("security.policies");
         }
         // Principals: the rules staged above are swapped into the live
         // listener. The listener's posture is part of the resolver, so this

@@ -14,8 +14,11 @@ use tower::ServiceExt;
 
 use super::cors::{self, allow_origin};
 use super::feed::feed_stream;
+#[cfg(feature = "oauth")]
+use super::identity::insufficient_scope;
 use super::identity::{
-    Peer, PeerId, challenge, evidence_of, forbidden, is_session_token, json_with, too_many,
+    Peer, PeerId, challenge, challenge_at, evidence_of, forbidden, is_session_token, json_with,
+    too_many,
 };
 use super::{App, LivenessCheck};
 use crate::a2a::Principal;
@@ -113,7 +116,9 @@ async fn dispatch(
     // posture.
     let resolver = app.bridge.resolver();
     let posture = resolver.posture();
-    let ev = evidence_of(&headers, &peer_id, &peer);
+    #[cfg_attr(not(feature = "oauth"), allow(unused_mut))]
+    let mut ev = evidence_of(&headers, &peer_id, &peer);
+    let rm = app.resource_metadata.as_ref().map(|r| r.url.as_str());
     let source = peer.source();
     let sessions = app
         .auth
@@ -165,6 +170,56 @@ async fn dispatch(
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
 
+    // An inbound access token (RFC 0044 §5.9): a bearer that is no session
+    // token and reads as a JWT is checked by the verifier — reading the
+    // issuer's keys again, off this thread, when they are not loaded or lack
+    // the token's — and the resolver reads what it found after every static
+    // secret. Nothing of the token is kept but what it names.
+    #[cfg(feature = "oauth")]
+    let verified = match (&app.auth.inbound, ev.bearer.as_deref()) {
+        (Some(inbound), Some(token))
+            if posture.tokens && !is_session_token(&ev) && token.matches('.').count() == 2 =>
+        {
+            let checked = match inbound.verify(token, crate::a2a::inbound::For::Listener) {
+                Err(crate::a2a::inbound::Refused::Keys { .. }) => {
+                    let (i, t) = (Arc::clone(inbound), token.to_string());
+                    tokio::task::spawn_blocking(move || {
+                        i.verify_fetching(&t, crate::a2a::inbound::For::Listener)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(crate::a2a::inbound::Refused::NotOurs(format!(
+                            "the check did not finish: {e}"
+                        )))
+                    })
+                }
+                r => r,
+            };
+            match checked {
+                Ok(v) => {
+                    ev.token = Some(Ok(crate::a2a::principals::TokenId {
+                        issuer: v.issuer.clone(),
+                        subject: v.subject.clone(),
+                        client: v.client.clone(),
+                        user: v.user,
+                        principal: v.principal_id(),
+                        typed: v.typed(),
+                        sid: v.sid(),
+                    }));
+                    Some(v)
+                }
+                // Not a token of any issuer here: the bearer is just a bearer.
+                Err(crate::a2a::inbound::Refused::NotOurs(_)) => None,
+                Err(e) => {
+                    denied_token(&app, source, e.issuer(), e.why());
+                    ev.token = Some(Err(e.why().to_string()));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let (principal, via) = match resolver.resolve(&ev, peer.is_unix(), sessions) {
         Resolution::Named(p, via) => (p, via),
         // Nothing presented: a challenge, never counted. An uncredentialed
@@ -174,7 +229,7 @@ async fn dispatch(
             // `Origin` would have been the implicit operator.
             let browser = ev.origin && ev.local && posture.implicit_operator;
             denied(&app, source, None, None, None, None, "unauthenticated", 401);
-            return challenge(false, false, browser);
+            return challenge_at(false, false, browser, rm);
         }
         // A credential that failed: counted against its source, whose next
         // bearer, once it is over the limit, is refused unchecked (above).
@@ -196,17 +251,42 @@ async fn dispatch(
                     "invalid_credential",
                     401,
                 );
-                challenge(true, is_session_token(&ev), false)
+                challenge_at(true, is_session_token(&ev), false, rm)
             };
         }
     };
+    // The caller an inbound token named is kept as an inbound session for as
+    // long as the token is good: the handle the work it starts acts through.
+    #[cfg(feature = "oauth")]
+    if via == Via::Token
+        && let (Some(v), Some(sessions), Some(inbound)) =
+            (&verified, &app.auth.sessions, &app.auth.inbound)
+    {
+        sessions.inbound_upsert(crate::a2a::oauth::InboundSession {
+            sid: v.sid(),
+            principal: principal.id.clone(),
+            typed: v.typed(),
+            role: principal.role,
+            issuer: v.issuer.clone(),
+            client: v.client.clone(),
+            scopes: v.scopes.clone(),
+            act: v.act.clone(),
+            labels: principal.labels.clone(),
+            expires_ms: v.exp_ms,
+            token: inbound
+                .keeps(&v.issuer)
+                .then(|| ev.bearer.clone())
+                .flatten(),
+        });
+    }
     // The response carries this when the credential was a bearer, so a
     // refused caller learns its token lacks the scope rather than that it is
     // bad.
-    let bearer_used = matches!(via, Via::Bearer | Via::Session);
+    let bearer_used = matches!(via, Via::Bearer | Via::Session | Via::Token);
     // Whose refusals are free: a principal no credential named — an `any`
     // rule's — can be anyone, so its refusals are logged like a stranger's.
-    let unvouched = source.filter(|_| !matches!(via, Via::Bearer | Via::Session | Via::Cert));
+    let unvouched =
+        source.filter(|_| !matches!(via, Via::Bearer | Via::Session | Via::Cert | Via::Token));
 
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return err(Value::Null, errors::PARSE_ERROR, "invalid JSON");
@@ -315,7 +395,7 @@ async fn dispatch(
     // than handed it. The card itself is the handler's to serve.
     if route == Route::Spec(SpecMethod::GetExtendedAgentCard)
         && posture.declares_any()
-        && !matches!(via, Via::Bearer | Via::Session | Via::Cert)
+        && !matches!(via, Via::Bearer | Via::Session | Via::Cert | Via::Token)
     {
         let rule = resolver.rule_of(&principal);
         denied(
@@ -328,7 +408,7 @@ async fn dispatch(
             "unauthenticated",
             401,
         );
-        return challenge(false, false, false);
+        return challenge_at(false, false, false, rm);
     }
 
     let send = matches!(
@@ -403,6 +483,45 @@ async fn dispatch(
             bearer_used,
         );
     }
+    // What an inbound token's scopes let its holder use (RFC 0044 §5.9):
+    // a conversation, a workflow, a command — each a skill a scope maps to.
+    // A send no scope of the token reaches is a 403 naming the scopes that
+    // would. A plain message naming a task is the runtime's to judge: an
+    // answer to a gate of the task goes to work its scope already
+    // admitted, and one that becomes a turn needs `conversation` there.
+    #[cfg(feature = "oauth")]
+    if send
+        && (command.is_some() || named_task.is_none())
+        && let (Some(v), Some(inbound)) = (&verified, &app.auth.inbound)
+    {
+        let skill = skill_of(command.as_ref());
+        if !inbound.covers(v, &skill) {
+            let scopes = inbound.scopes_for(&v.issuer, &skill);
+            denied(
+                &app,
+                None,
+                Some(&principal),
+                None,
+                Some(name),
+                command.as_ref().map(|c| c.op.as_str()),
+                "insufficient_scope",
+                403,
+            );
+            return insufficient_scope(
+                id,
+                &format!(
+                    "the token's scopes do not reach {skill}: {}",
+                    if scopes.is_empty() {
+                        "no scope of its issuer does".to_string()
+                    } else {
+                        format!("one of {} does", scopes.join(", "))
+                    }
+                ),
+                &scopes,
+                rm,
+            );
+        }
+    }
     if let Some(op) = command.as_ref().map(|c| c.op.as_str())
         && !principal.may_command(op)
     {
@@ -448,6 +567,36 @@ async fn dispatch(
     )
     .await;
     echoed(resp, active)
+}
+
+/// The skill a send asks for, as `a2a.inbound_tokens[].scopes_to_skills`
+/// names it: a conversation, the workflow `workflow.run` starts, or the
+/// command.
+#[cfg(feature = "oauth")]
+fn skill_of(command: Option<&Command>) -> String {
+    match command {
+        None => "conversation".to_string(),
+        Some(c) if c.op == "workflow.run" => format!(
+            "workflow:{}",
+            c.envelope["workflow"].as_str().unwrap_or_default()
+        ),
+        Some(c) => format!("command:{}", c.op),
+    }
+}
+
+/// An inbound token the verifier refused: logged as every refusal is,
+/// bounded per source, with the issuer and why — never the token.
+#[cfg(feature = "oauth")]
+fn denied_token(app: &App, source: Option<std::net::IpAddr>, issuer: Option<&str>, why: &str) {
+    let mut line = json!({"reason": "invalid_token", "status": 401, "issuer": issuer, "why": why});
+    if let Some(ip) = source {
+        match app.denials.admit(ip, "invalid_token") {
+            None => return,
+            Some(0) => {}
+            Some(n) => line["suppressed"] = json!(n),
+        }
+    }
+    app.log.warn("a2a.denied", line);
 }
 
 /// The span a request's `traceparent` and `tracestate` headers name, if they

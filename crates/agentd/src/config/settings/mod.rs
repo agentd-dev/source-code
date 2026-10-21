@@ -16,6 +16,7 @@ pub mod client;
 pub mod companies;
 pub mod delegation;
 pub mod events;
+pub mod inbound;
 pub mod schema;
 
 use super::file::{self, Format};
@@ -1212,6 +1213,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "mcp.servers[].auth.attribution",
     "mcp.servers[].auth.max_at_age",
     "mcp.servers[].auth.trusted_output",
+    "mcp.servers[].auth.subject",
     // Who may talk to THIS agent and as what, over which socket, with which
     // credential. Enumerated rather than taken as a section, because
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
@@ -1220,11 +1222,13 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "a2a.cors",
     "a2a.device_grant",
     "a2a.events",
+    "a2a.inbound_tokens",
     "a2a.introspection",
     "a2a.listen",
     "a2a.login",
     "a2a.principals",
     "a2a.push",
+    "a2a.resource",
     "a2a.tls",
     "a2a.url",
     // Inbound sockets and the auth on them. A document declares a ROUTE (an
@@ -1457,6 +1461,34 @@ pub(crate) fn stored_route_refusals(def: &Value, capabilities: &[String]) -> Vec
             )
         },
     )
+}
+
+/// The webhook starts a definition stored with `workflow.create`/`update`
+/// would open as a person's token's: one naming `auth.jwt`, or one naming no
+/// auth of its own where `webhooks.default_auth` is a person's token. A run
+/// such a route starts is that person's, and only the operator's own
+/// configuration declares one (RFC 0044 §5.9).
+pub(crate) fn stored_jwt_refusals(def: &Value, default: Option<&WebhookAuth>) -> Vec<String> {
+    let name = def.get("name").and_then(Value::as_str).unwrap_or("?");
+    // `runtime::webhooks::build_verify_typed`'s order: `none`, `hmac` and
+    // `bearer` come before `jwt`.
+    let default_jwt = default
+        .is_some_and(|d| !d.none && d.hmac.is_none() && d.bearer.is_none() && d.jwt.is_some());
+    crate::engine::model::inbound_routes(def)
+        .into_iter()
+        .filter(|r| r.route.and_then(|x| x.get("kind")).and_then(Value::as_str) == Some("webhook"))
+        .filter(|r| {
+            let names_none = r.auth.and_then(|a| a.get("none")).and_then(Value::as_bool) == Some(true);
+            r.auth.and_then(|a| a.get("jwt")).is_some()
+                || (default_jwt && !names_none && !webhook_auth_verifies(r.auth))
+        })
+        .map(|r| {
+            format!(
+                "workflow {name:?} step {:?} would start runs as the person a token names (auth.jwt, or webhooks.default_auth.jwt for a node naming no auth of its own) — a definition stored with `workflow.create`/`update` takes no person's token; give the node its own auth, or declare the workflow in the configuration",
+                r.step
+            )
+        })
+        .collect()
 }
 
 /// Every route `workflows` open, unless `granted` holds the grant opening one
@@ -2905,6 +2937,12 @@ pub struct Auth {
     /// Default false — a Linear issue body is anyone's to write.
     #[serde(default)]
     pub trusted_output: Option<bool>,
+    /// `grant: token_exchange`: what is exchanged — an access token the
+    /// enrolled grant's refresh token gets at this authorization server
+    /// (`grant`, the default), or the caller's verified inbound token
+    /// (`inbound`), which goes nowhere but back to its issuer.
+    #[serde(default)]
+    pub subject: Option<delegation::ExchangeSubject>,
 }
 
 impl Auth {
@@ -2925,6 +2963,7 @@ impl Auth {
                     OAuthGrant::AuthorizationCode => "authorization_code",
                     OAuthGrant::ClientCredentials => "client_credentials",
                     OAuthGrant::IdJag => "id_jag",
+                    OAuthGrant::TokenExchange => "token_exchange",
                 }
                 .to_string()
             }),
@@ -3049,6 +3088,11 @@ pub enum OAuthGrant {
     /// and redeemed at the server's authorization server (RFC 0044): served
     /// by the supervisor alone. Needs the `xaa` feature.
     IdJag,
+    /// RFC 8693 on-behalf-of at the server's own authorization server, which
+    /// is the person's IdP (RFC 0044 §5.7, M1b): the subject is an access
+    /// token for agentd — from the enrolled grant, or the caller's verified
+    /// inbound token. Served by the supervisor alone. Needs the `xaa` feature.
+    TokenExchange,
 }
 
 /// An `auth:` block's `resource` (RFC 8707).
@@ -3831,6 +3875,13 @@ pub struct A2a {
     /// client signs in at `identity.providers.<idp>` and its session is
     /// `user:oidc:<iss>#<sub>`, enrolled where a template admits it.
     pub login: Option<delegation::A2aLogin>,
+    /// The resource identifier inbound access tokens are issued for (RFC
+    /// 0044 §5.9): every token's `aud`, and the `resource` of the listener's
+    /// RFC 9728 metadata.
+    pub resource: Option<String>,
+    /// The enterprise authorization servers whose JWT access tokens name a
+    /// caller (RFC 0044 §5.9, RFC 9068).
+    pub inbound_tokens: Vec<inbound::InboundIssuer>,
     pub events: A2aEvents,
     pub introspection: A2aIntrospection,
 }
@@ -4045,6 +4096,10 @@ pub struct WebhookAuth {
     pub header: Option<HeaderMatch>,
     /// Loopback-only, no auth (dev). Explicit opt-in.
     pub none: bool,
+    /// A person's JWT from one of `a2a.inbound_tokens`, for this webhook's
+    /// own audience, short-lived, its `jti` never accepted twice: the run is
+    /// theirs (RFC 0044 §5.9).
+    pub jwt: Option<inbound::WebhookJwt>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -4180,6 +4235,9 @@ pub struct PrincipalMatch {
     /// 64 lowercase hex. A rule naming it admits that one key alone — what a
     /// certificate principal that delegates is pinned by (RFC 0044 §5.2).
     pub spki: Option<String>,
+    /// An inbound access token's issuer, one of `a2a.inbound_tokens`; with
+    /// it `sub` is a glob over the issuer's subject claim (RFC 0044 §5.9).
+    pub token_iss: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -7375,6 +7433,9 @@ fn validate_auth_block(
         },
         AuthKind::Oauth2 => {
             match document {
+                // A token_exchange server's client is its IdP's, from
+                // `identity.providers`: the block names none.
+                _ if auth.grant == Some(OAuthGrant::TokenExchange) => {}
                 Some(c) => out.extend(client::validate_block(auth, c, ctx)),
                 None if auth.client_id.is_none() => out.push(format!(
                     "{ctx}: auth.kind oauth2 needs `client_id`, or security.client for agentd's Client ID Metadata Document"
@@ -7419,10 +7480,10 @@ fn validate_auth_block(
                     }
                 }
                 // Its pins and client are `delegation::validate`'s.
-                OAuthGrant::IdJag if !mcp => out.push(format!(
-                    "{ctx}: grant id_jag is for mcp.servers[].auth: an enrolled person's grant is exchanged for an MCP server's authorization server"
+                OAuthGrant::IdJag | OAuthGrant::TokenExchange if !mcp => out.push(format!(
+                    "{ctx}: grants id_jag and token_exchange are for mcp.servers[].auth: an enrolled person's grant is exchanged for an MCP server's authorization server"
                 )),
-                OAuthGrant::IdJag => {}
+                OAuthGrant::IdJag | OAuthGrant::TokenExchange => {}
             }
         }
     }
@@ -8521,6 +8582,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     companies::validate(s, &mut d);
     // `identity.providers`, `identity.delegation` and the delegated servers.
     delegation::validate(s, &mut d);
+    inbound::validate(s, &mut d);
 
     // mcp servers
     let mut names = std::collections::HashSet::new();
@@ -9588,7 +9650,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                         err(
                             &mut d,
                             format!(
-                                "webhooks.listen on a non-loopback address needs auth: set webhooks.default_auth (hmac, bearer or header), or give every `webhook` node its own `auth` (HMAC recommended) — unauthenticated: {}",
+                                "webhooks.listen on a non-loopback address needs auth: set webhooks.default_auth (hmac, bearer, header or jwt), or give every `webhook` node its own `auth` (HMAC recommended) — unauthenticated: {}",
                                 open.join(", ")
                             ),
                         );
@@ -9732,6 +9794,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             // `delegation::validate`'s.
             m.uid.is_some(),
             m.spki.is_some(),
+            // An inbound token's issuer (RFC 0044 P3): its own rules are
+            // `inbound::validate`'s.
+            m.token_iss.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
@@ -9740,7 +9805,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!(
-                    "a2a.principals[{i}]: match needs one of san | sub | spki | bearer_ref | any | uid"
+                    "a2a.principals[{i}]: match needs one of san | sub | spki | bearer_ref | any | uid | token_iss"
                 ),
             );
         } else if m.any && set > 1 {
@@ -9784,7 +9849,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         // listener verified, and only `client_ca` makes the listener ask for
         // one: without it the rule loads and admits nobody, ever. (`any`
         // also names every caller left over, certificate or not.)
-        if (m.san.is_some() || m.sub.is_some() || m.spki.is_some()) && s.a2a.tls.client_ca.is_none()
+        if (m.san.is_some() || (m.sub.is_some() && m.token_iss.is_none()) || m.spki.is_some())
+            && s.a2a.tls.client_ca.is_none()
         {
             err(
                 &mut d,
@@ -10242,6 +10308,7 @@ fn webhook_auth_verifies(auth: Option<&Value>) -> bool {
     a.get("hmac").and_then(Value::as_object).is_some()
         || a.get("header").and_then(Value::as_object).is_some()
         || a.get("bearer").and_then(Value::as_str).is_some()
+        || a.get("jwt").is_some()
 }
 
 /// The same question for the listener-wide `default_auth` (the typed twin,
@@ -10249,7 +10316,9 @@ fn webhook_auth_verifies(auth: Option<&Value>) -> bool {
 /// declared-but-incomplete verifier still counts — the listener refuses to spawn
 /// on it, which fails closed.
 fn webhook_default_verifies(d: Option<&WebhookAuth>) -> bool {
-    d.is_some_and(|d| !d.none && (d.hmac.is_some() || d.bearer.is_some() || d.header.is_some()))
+    d.is_some_and(|d| {
+        !d.none && (d.hmac.is_some() || d.bearer.is_some() || d.header.is_some() || d.jwt.is_some())
+    })
 }
 
 fn validate_budget(b: &Budget, at: &str, d: &mut Diagnostics) {
@@ -10708,7 +10777,24 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // a running process would start a second chain beside the first.
     // Restart-only INSIDE the reloadable `observability.audit`.
     "observability.audit.chain",
-    "security",
+    // Every `security` section but the policies, which reload (RFC 0044
+    // §5.14): what a dial trusts, the sandbox and the egress catalog are
+    // built into the process at start.
+    "security.aauth",
+    "security.allow_trifecta",
+    "security.cgroup",
+    "security.client",
+    "security.companies",
+    "security.egress",
+    "security.exec",
+    "security.experimental",
+    "security.tls_ca",
+    "security.workflows",
+    // The listener as a resource server (RFC 0044 §5.9): the resource and
+    // the issuers are the card's schemes, the routes served and the keys
+    // read at start.
+    "a2a.inbound_tokens",
+    "a2a.resource",
     // The uid and gid every worker runs as (RFC 0044 P2b): which process
     // identity a child has is decided once, at start, beside the Landlock
     // domain it enters.
@@ -10842,6 +10928,11 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "observability.runtime_events",
     "observability.status_values",
     "search.server",
+    // Read at every call (RFC 0044 §5.14): a reload swaps the whole list,
+    // refused whole when it does not load; an open gate keeps the rule
+    // that raised it, and a first use approved under a rule stands while
+    // the rule's content does.
+    "security.policies",
     "services",
     "skills.dir",
     "skills.max_bytes",
@@ -11288,6 +11379,9 @@ mod tests {
                         "workflows" => json!([{"name": "w", "steps": {}}]),
                         "a2a.principals" => json!([{"match": {"any": true}, "role": "user"}]),
                         "a2a.peers" => json!([{"name": "p", "endpoint": "https://p.example"}]),
+                        "a2a.inbound_tokens" => {
+                            json!([{"issuer": "https://as.example", "clients": ["c"]}])
+                        }
                         "agent.instruction.trust" => {
                             json!([{"uri": "instruction://x", "publisher": "https://pub.example"}])
                         }
@@ -11354,6 +11448,7 @@ mod tests {
                         || p.ends_with("_cap")
                         || p.ends_with("_interval")
                         || p.ends_with("_age")
+                        || p.ends_with("_lifetime")
                         || p == "observability.audit.chain.retention" =>
                     {
                         json!("10s")
@@ -13104,6 +13199,46 @@ mod tests {
             "s": {"kind": "manual"},
             "w": {"kind": "wait", "depends_on": ["s"], "on": "signal", "signal": "go"}}});
         assert!(stored_route_refusals(&quiet, &[]).is_empty());
+    }
+
+    /// A stored definition never starts runs as the person a token names:
+    /// a webhook naming `auth.jwt` is refused, and so is one naming no auth
+    /// of its own where `webhooks.default_auth` is a person's token — not
+    /// one whose own auth, or a default that comes first, is something
+    /// else. `auth.jwt` is a webhook's authentication, on any bind.
+    #[test]
+    fn a_stored_definition_takes_no_persons_token() {
+        let jwt = json!({"issuer": "https://idp.example", "audience": "https://hooks.example/in"});
+        let def = |auth: Option<Value>| {
+            let mut s = json!({"kind": "webhook", "path": "/in"});
+            if let Some(a) = auth {
+                s["auth"] = a;
+            }
+            json!({"name": "hooks", "steps": {"s": s,
+                   "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}})
+        };
+        let default = |d: Value| -> WebhookAuth { serde_json::from_value(d).unwrap() };
+        let own = stored_jwt_refusals(&def(Some(json!({"jwt": jwt}))), None);
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert!(
+            own[0].starts_with("workflow \"hooks\" step \"s\""),
+            "{own:?}"
+        );
+        let by_default = default(json!({"jwt": jwt}));
+        assert_eq!(stored_jwt_refusals(&def(None), Some(&by_default)).len(), 1);
+        for fine in [
+            stored_jwt_refusals(&def(None), None),
+            stored_jwt_refusals(&def(Some(json!({"bearer": "t"}))), Some(&by_default)),
+            stored_jwt_refusals(&def(Some(json!({"none": true}))), Some(&by_default)),
+            stored_jwt_refusals(
+                &def(None),
+                Some(&default(json!({"jwt": jwt, "bearer": "{{secret:T}}"}))),
+            ),
+        ] {
+            assert!(fine.is_empty(), "{fine:?}");
+        }
+        assert!(webhook_auth_verifies(Some(&json!({"jwt": jwt}))));
+        assert!(webhook_default_verifies(Some(&by_default)));
     }
 
     /// A route the OPERATOR configures is theirs to open: the same workflow,
@@ -15549,10 +15684,21 @@ mod tests {
         ] {
             assert!(reloadable(p) && !restart(p), "{p} reloads");
         }
+        // The policies reload (RFC 0044 §5.14), every other `security`
+        // section is restart-only, and so is the resource server.
         assert!(
-            restart("security.policies"),
-            "policies (and their `to`) are restart-only"
+            reloadable("security.policies") && !restart("security.policies"),
+            "policies (and their `to`) reload"
         );
+        for p in [
+            "security.allow_trifecta",
+            "security.egress",
+            "security.experimental",
+            "a2a.resource",
+            "a2a.inbound_tokens",
+        ] {
+            assert!(restart(p) && !reloadable(p), "{p} is restart-only");
+        }
         assert_eq!(
             restart_only_diff(
                 &json!({"a2a": {"url": "https://a.example"}}),

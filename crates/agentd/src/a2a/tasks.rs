@@ -19,6 +19,10 @@ pub enum State {
     Submitted,
     Working,
     InputRequired,
+    /// The task waits for a person to sign in, out of band (A2A §7.6): at
+    /// agentd's own link — a workflow's admission, a step-up — or at a
+    /// peer's. No message answers it.
+    AuthRequired,
     Completed,
     Failed,
     Canceled,
@@ -31,6 +35,7 @@ impl State {
             State::Submitted => "TASK_STATE_SUBMITTED",
             State::Working => "TASK_STATE_WORKING",
             State::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+            State::AuthRequired => "TASK_STATE_AUTH_REQUIRED",
             State::Completed => "TASK_STATE_COMPLETED",
             State::Failed => "TASK_STATE_FAILED",
             State::Canceled => "TASK_STATE_CANCELED",

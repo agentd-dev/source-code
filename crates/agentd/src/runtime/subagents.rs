@@ -506,6 +506,7 @@ impl Runtime {
                 gated_tools.push(name.clone());
             }
         }
+        let direct = direct_of(mcp_routes.keys(), &gated_tools);
         let mut payload = SpawnPayload {
             instruction: instruction.clone(),
             output_contract,
@@ -634,6 +635,7 @@ impl Runtime {
             Ok(node) => {
                 if let Some(c) = self.children.get_mut(node) {
                     c.offered = Some(offered);
+                    c.direct = Some(direct);
                 }
                 record.node = Some(node);
                 record.status = "running".into();
@@ -905,6 +907,10 @@ impl Runtime {
             "subagent.result",
             json!({"handle": handle, "status": status, "tokens": tokens, "err": error}),
         );
+        // The first uses the person approved in the subagent's work end
+        // with it.
+        #[cfg(feature = "xaa")]
+        self.forget_once(&format!("subagent:{handle}"));
         // Answer waiters.
         let waiting: Vec<(super::reactor::Target, String)> = self
             .pending
@@ -1085,6 +1091,10 @@ impl Runtime {
                 payload.telemetry.set_trace(t);
             }
             let deadline = Duration::from_millis(payload.limits.deadline_ms.max(1000));
+            let direct = direct_of(
+                payload.mcp_routes.iter().flat_map(|r| r.keys()),
+                &payload.gated_tools,
+            );
             let offered = self.subagent_offered(
                 self.subagents
                     .get(&handle)
@@ -1103,6 +1113,7 @@ impl Runtime {
                 Ok(node) => {
                     if let Some(c) = self.children.get_mut(node) {
                         c.offered = Some(offered);
+                        c.direct = Some(direct);
                     }
                     if let Some(s) = self.subagents.get_mut(&handle) {
                         s.node = Some(node);
@@ -1125,6 +1136,18 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+/// A subagent's directly dialled MCP tools: its routes but those it hands
+/// back to the supervisor (`gated`).
+fn direct_of<'a>(
+    routes: impl Iterator<Item = &'a String>,
+    gated: &[String],
+) -> super::children::DirectRoutes {
+    super::children::DirectRoutes {
+        caller: crate::config::settings::PolicyCaller::Subagent,
+        tools: routes.filter(|n| !gated.contains(n)).cloned().collect(),
     }
 }
 

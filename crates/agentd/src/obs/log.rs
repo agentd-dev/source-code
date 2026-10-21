@@ -309,6 +309,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "restore",
     "root",
     "run",
+    "security",
     "signal",
     "skills",
     "start",

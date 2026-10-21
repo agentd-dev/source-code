@@ -87,7 +87,12 @@ pub(super) fn handle(
             ))
         }
         "auth.sessions" => {
-            let sessions: Vec<Value> = sessions(rt)?.list().iter().map(Session::view).collect();
+            let all = sessions(rt)?;
+            let mut sessions: Vec<Value> = all.list().iter().map(Session::view).collect();
+            // The callers inbound tokens named, each kept for as long as its
+            // token is good (RFC 0044 §5.9): what they are, never the token.
+            let now = crate::state::now_ms();
+            sessions.extend(all.inbound_list().iter().map(|s| s.view(now)));
             Ok(AuthAnswer::Doc(json!({"sessions": sessions})))
         }
         "auth.sessions.revoke" => {
@@ -106,6 +111,26 @@ pub(super) fn handle(
                     ));
                 }
             };
+            // An inbound session ends here until the caller's next token
+            // makes it again; work acting through it reads it as ended.
+            if let Revoke::Sid(sid) = &which
+                && sid.starts_with(crate::a2a::INBOUND_SID_PREFIX)
+            {
+                let ended = sessions(rt)?.inbound_revoke(sid);
+                if let Some(s) = &ended {
+                    rt.log.info(
+                        "auth.session.revoked",
+                        json!({"sid": s.sid, "kind": "inbound", "principal": s.principal,
+                               "reason": "auth.sessions.revoke"}),
+                    );
+                }
+                let n = usize::from(ended.is_some());
+                audit(rt, principal, op, json!({"sid": sid, "revoked": n}));
+                return Ok(AuthAnswer::Done(
+                    format!("revoked {n} session(s)"),
+                    json!({"revoked": n}),
+                ));
+            }
             let ended = sessions(rt)?.revoke(&which);
             for s in &ended {
                 rt.log.info(

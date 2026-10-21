@@ -92,6 +92,17 @@ pub struct Child {
     /// §5.7, per-`(step, tool)` use-authorisation). `None` for any other
     /// child.
     pub offered: Option<std::collections::BTreeSet<String>>,
+    /// The MCP tools the child dials itself, past the supervisor, and the
+    /// policy caller it is: what a reload of `security.policies` is held to,
+    /// since no rule reaches a call it never sees.
+    pub direct: Option<DirectRoutes>,
+}
+
+/// A child's directly dialled MCP tools, and the policy caller it is.
+#[derive(Debug, Clone)]
+pub struct DirectRoutes {
+    pub caller: crate::config::settings::PolicyCaller,
+    pub tools: std::collections::BTreeSet<String>,
 }
 
 /// The children registry.
@@ -215,6 +226,7 @@ impl Children {
             stop: None,
             parked: false,
             offered: None,
+            direct: None,
         };
         self.pid_to_node.insert(child.sub.pid(), node);
         self.map.insert(node, child);

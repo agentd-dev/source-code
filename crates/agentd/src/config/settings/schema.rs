@@ -331,6 +331,7 @@ fn top_level_properties(
     // Hoisted out of the `a2a` literal for the same recursion-limit reason as
     // `instruction_trust`. The scope vocabulary is the enum's own list.
     let device_scopes: Vec<&str> = super::DeviceScope::ALL.iter().map(|s| s.as_str()).collect();
+    let inbound_tokens = inbound_tokens_schema();
     let device_grant = json!({ "type": "object", "additionalProperties": false,
                     "description": "the OAuth 2.0 device authorization grant (RFC 8628): a client shows a code, an operator approves it, the client gets a session token. Needs an operator credential (a2a.bearer, or a principals rule with role operator and match.bearer_ref); refused with a2a.tls.client_ca and on a unix:// listener. Restart-only.",
                     "properties": {
@@ -346,6 +347,8 @@ fn top_level_properties(
                 "cors": { "type": "object", "additionalProperties": false, "properties": {
                     "origins": { "type": "array", "items": { "type": "string" }, "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too" } } },
                 "device_grant": device_grant,
+                "resource": { "type": "string", "description": "the resource identifier inbound access tokens are issued for (RFC 0044 §5.9; needs the a2a and oauth features): every token's aud, and the resource of the listener's RFC 9728 protected-resource metadata, served at its path-inserted well-known URL. An https:// URI in canonical form on the listener's origin. Restart-only" },
+                "inbound_tokens": inbound_tokens,
                 "login": { "type": "object", "additionalProperties": false, "required": ["idp"],
                     "description": "the IdP-federated display-client sign-in (RFC 0044 §5.4; needs the xaa feature): a display client signs in at the IdP by authorization code with PKCE through a single-use start link on the listener origin, its session is user:oidc:<iss>#<sub>, and where a template admits it the sign-in is its enrolment. Beside the device grant or alone: either way the listener serves the session store, /oauth2/revoke and its metadata, declares the bearer scheme and grants no implicit operator. Refused with a2a.tls.client_ca and on a unix:// listener. Restart-only",
                     "properties": {
@@ -482,7 +485,8 @@ fn auth_delegation_properties(duration: &Value) -> Map<String, Value> {
         "allow_unbound_at": { "type": "boolean", "description": "grant id_jag: accept an ID-JAG that does not name the pinned resource (warned and recorded)" },
         "attribution": { "enum": ["sub", "none"], "description": "grant id_jag: what agent/acting_for carries — the ID-JAG's sub (default), or nothing" },
         "max_at_age": duration,
-        "trusted_output": { "type": "boolean", "description": "grant id_jag: nobody outside can write what this server answers, so its results mark the work as holding delegated data and do not taint it (default false: delegated SaaS content is attacker-writable)" }
+        "trusted_output": { "type": "boolean", "description": "grant id_jag: nobody outside can write what this server answers, so its results mark the work as holding delegated data and do not taint it (default false: delegated SaaS content is attacker-writable)" },
+        "subject": { "enum": ["grant", "inbound"], "description": "grant token_exchange: what is exchanged — an access token for agentd the enrolled grant's refresh token gets at this authorization server (grant, the default), or the caller's verified inbound A2A token, whose issuer must be this authorization server (inbound): held in memory for the work, never sent anywhere else, and the call fails subject_expired once it expires" }
     });
     match v {
         Value::Object(m) => m,
@@ -504,7 +508,31 @@ fn provider() -> Value {
             "scopes": { "type": "array", "items": { "type": "string" }, "description": "default [openid, offline_access]; openid is required" } } },
         "subject": { "enum": ["refresh_token", "id_token"], "description": "what the token exchange presents: the sealed refresh token, or a fresh ID token from a refresh with no scope. Default refresh_token under okta, id_token otherwise" },
         "subjects": { "enum": ["public", "pairwise"], "description": "public (default): an ID-JAG's sub must equal the grant's; pairwise: recorded, not compared" },
-        "jwks_uri": { "type": "string", "description": "the IdP's key set, pinned; default the OpenID metadata's (okta: {issuer}/oauth2/v1/keys)" } } })
+        "jwks_uri": { "type": "string", "description": "the IdP's key set, pinned; default the OpenID metadata's (okta: {issuer}/oauth2/v1/keys)" },
+        "equivalent_issuers": { "type": "array", "items": { "type": "string" }, "description": "a2a.inbound_tokens issuers whose subject claim is this IdP's sub (RFC 0044 §5.9): a caller such a token names holds the grant its subject holds here. Subjects are never matched across issuers not listed; an issuer is one provider's at most" } } })
+}
+
+/// `a2a.inbound_tokens` (RFC 0044 §5.9): hoisted out of the `a2a` literal,
+/// which sits at the macro's recursion limit.
+fn inbound_tokens_schema() -> Value {
+    let duration = json!({ "type": ["string", "integer"], "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds" });
+    json!({ "type": "array", "description": "the enterprise authorization servers whose JWT access tokens (RFC 9068) name a caller (RFC 0044 §5.9; needs the a2a and oauth features). Each issuer is pinned: keys only from its own key set, an asymmetric allow-list of algorithms, a profile's typ, the listed clients alone; a token passes as user:oidc:<iss>#<subject>, and one issued to a client alone never names a user. The card declares an oauth2 scheme per issuer whose metadata and keys are loaded. Restart-only",
+        "items": { "type": "object", "additionalProperties": false, "required": ["issuer", "clients"], "properties": {
+            "issuer": { "type": "string", "description": "the issuer, pinned: its metadata's issuer and every token's iss must equal it byte for byte (https; plain http only to a loopback host)" },
+            "name": { "type": "string", "description": "the card's scheme name; default enterprise for the first issuer, enterprise-<n> for the n-th" },
+            "profile": { "enum": ["generic", "okta"], "description": "generic (default, RFC 9068): typ at+jwt, sub, client_id, scope; okta (a custom authorization server): no typ or at+jwt, the person in uid, the client in cid, the scopes in scp, keys at {issuer}/v1/keys" },
+            "audiences": { "type": "array", "items": { "type": "string" }, "description": "the aud values a token may carry; default [a2a.resource]. Never a client id" },
+            "jwks_uri": { "type": "string", "description": "the key set, pinned on the issuer's origin; default the issuer's metadata's jwks_uri. jku, x5u and keys embedded in a token are never read" },
+            "algs": { "type": "array", "items": { "enum": ["RS256", "ES256", "EdDSA"] }, "description": "the algorithms a token may be signed with; default [RS256, ES256]. none and every HMAC algorithm are refused" },
+            "typ": { "oneOf": [ { "enum": ["none"] }, { "type": "array", "items": { "type": "string" } } ], "description": "the JOSE typ a token may carry: none (no typ, or at+jwt), or the values listed (with at+jwt); default at+jwt (generic) or none (okta)" },
+            "subject_claim": { "type": "string", "description": "the claim naming the person; default sub (generic), uid (okta)" },
+            "tenant_claim": { "type": "string", "description": "the claim naming a multi-tenant issuer's tenant, put into the principal: user:oidc:<iss>#<tenant>/<subject>, so one subject in two tenants is two people" },
+            "clients": { "type": "array", "items": { "type": "string" }, "description": "the front-end clients (azp, cid or client_id) that may call; a token from any other is refused" },
+            "require_user_token": { "type": "boolean", "description": "refuse a token issued to a client alone (default true); false names such a caller an agent, never a user" },
+            "max_token_age": duration,
+            "max_chain_depth": { "type": "integer", "minimum": 0, "maximum": 16, "description": "how deep a token's act chain may nest (default 4); a deeper one is refused, never cut" },
+            "flow": { "enum": ["authorization_code", "device_code"], "description": "the flow the card declares for getting a token here, from the issuer's metadata; default authorization_code (with PKCE)" },
+            "scopes_to_skills": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "what each scope lets its holder use: conversation, workflow:<name glob>, command:<op>. A call no scope of the token covers is a 403 insufficient_scope naming the scopes that would; empty, the scopes narrow nothing" } } } })
 }
 
 /// `identity.delegation` (RFC 0044 §5.5).
@@ -546,7 +574,7 @@ fn template_schema(duration: &Value) -> Value {
     json!({ "type": "object", "additionalProperties": false, "required": ["name", "principals", "idp", "servers"], "properties": {
                     "name": { "type": "string" },
                     "principals": { "type": "object", "additionalProperties": false, "description": "every field named must match", "properties": {
-                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "operator (a per-person operator), oidc (an a2a.login session), x509 (a certificate principal its a2a.principals rule pins by key and idp_subject) or device (an RFC 0043 device session)" },
+                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "operator (a per-person operator), oidc (an a2a.login session, or a caller an a2a.inbound_tokens token names), x509 (a certificate principal its a2a.principals rule pins by key and idp_subject) or device (an RFC 0043 device session)" },
                         "role": { "enum": ["operator", "user"] },
                         "labels": { "type": "object", "additionalProperties": { "type": "string" } } } },
                     "idp": { "type": "string", "description": "the identity.providers entry its principals bind to" },
@@ -559,6 +587,7 @@ fn template_schema(duration: &Value) -> Value {
                     "subagents": { "enum": ["none", "inherit"], "description": "whether a subagent, think child or workflow-as-tool run of the person's work acts with their grant: none (default), or inherit — on the delegated servers the child declares, its calls made by the supervisor, holding no token" },
                     "approvers": { "type": "array", "items": { "enum": ["principal", "operator"] }, "description": "who may answer the person's consent gates: [principal] (default) or [principal, operator], an operator's answer recorded as such" },
                     "agent_mode_servers": { "type": "array", "items": { "type": "string" }, "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work; every other one is hidden from it (mode mixing, RFC 0044 §5.3)" },
+                    "clients": { "type": "array", "items": { "type": "string" }, "description": "the front-end clients whose inbound tokens may act with these grants (an oidc template at an IdP an a2a.inbound_tokens issuer maps to); a caller another client's token names is admitted by no template. Empty, every client the issuer allows" },
                     "ttl": duration,
                     "budget": { "type": "object", "additionalProperties": false, "properties": {
                         "per_day": { "type": "integer", "minimum": 1, "description": "mints per day per server; default 16" },
@@ -719,7 +748,7 @@ fn defs_properties(
                 "device_authorization_url": { "type": "string" }, "authorization_url": { "type": "string" },
                 "client_id": { "type": "string", "description": "the registered client; unset, agentd's Client ID Metadata Document (security.client) is the client, where the issuer's metadata advertises it" }, "client_secret": secret,
                 "client_auth": client_auth_schema(secret),
-                "grant": { "enum": ["device", "authorization_code", "client_credentials", "id_jag"], "description": "id_jag (mcp.servers only; needs the xaa feature): an enrolled person's grant, exchanged at their IdP for an ID-JAG and redeemed here — served by the supervisor alone" },
+                "grant": { "enum": ["device", "authorization_code", "client_credentials", "id_jag", "token_exchange"], "description": "id_jag (mcp.servers only; needs the xaa feature): an enrolled person's grant, exchanged at their IdP for an ID-JAG and redeemed here; token_exchange (likewise): an RFC 8693 on-behalf-of exchange at the server's own authorization server, which is the person's IdP — both served by the supervisor alone" },
                 "scopes": { "type": "array", "items": { "type": "string" } }, "audience": { "type": "string" },
                 "resource": { "type": "string", "description": "oauth2: the RFC 8707 resource every authorization, token, refresh and client-credentials request carries — auto (the endpoint, canonical), omit, or a URI; unset, auto on an MCP server or MCP catalog entry and omit elsewhere" },
                 "token": secret, "header": { "type": "string" }, "value": secret,
@@ -746,7 +775,13 @@ fn defs_properties(
                     "secret": secret, "header": { "type": "string", "description": "the header carrying the signature (default X-Signature)" }, "algo": { "enum": ["sha256"] }, "prefix": { "type": "string", "description": "a prefix stripped before the constant-time compare, e.g. sha256=" } } },
                 "bearer": secret,
                 "header": { "type": "object", "additionalProperties": false, "properties": { "name": { "type": "string" }, "equals": secret } },
-                "none": { "type": "boolean", "description": "loopback-only, no auth (dev) — explicit opt-in" } } }));
+                "none": { "type": "boolean", "description": "loopback-only, no auth (dev) — explicit opt-in" },
+                "jwt": { "type": "object", "additionalProperties": false, "required": ["issuer", "audience"],
+                    "description": "a person's JWT from an a2a.inbound_tokens issuer (RFC 0044 §5.9): verified as an A2A token is, for this webhook's own audience, short-lived, its jti never accepted twice; the run is the person's",
+                    "properties": {
+                    "issuer": { "type": "string", "description": "an a2a.inbound_tokens issuer" },
+                    "audience": { "type": "string", "description": "the webhook's own resource identifier — never one an A2A token is issued for" },
+                    "max_lifetime": { "type": ["string", "integer"], "description": "how long a token may live, iat to exp (default 5m, at most 15m)" } } } } }));
     m.insert("GoalAction".to_string(), json!({ "oneOf": [
                 { "enum": ["finish", "idle", "replan", "escalate"] },
                 { "type": "object", "additionalProperties": false, "required": ["workflow"], "properties": { "workflow": { "type": "string" } } } ] }));
@@ -822,7 +857,8 @@ fn defs_properties(
                 "match": { "type": "object", "additionalProperties": false, "properties": {
                     "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "any": { "type": "boolean" },
                     "uid": { "type": "integer", "minimum": 0, "description": "the unix A2A listener's peer uid (SO_PEERCRED): the per-person operator operator:<id> (RFC 0044; needs the xaa feature)" },
-                    "spki": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "a client certificate's key, the SHA-256 of its SubjectPublicKeyInfo: the rule admits that key alone. Needs a2a.tls.client_ca; with idp_subject, a certificate principal that delegates — an operator one is operator:<id> (RFC 0044)" } } },
+                    "spki": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "a client certificate's key, the SHA-256 of its SubjectPublicKeyInfo: the rule admits that key alone. Needs a2a.tls.client_ca; with idp_subject, a certificate principal that delegates — an operator one is operator:<id> (RFC 0044)" },
+                    "token_iss": { "type": "string", "description": "an a2a.inbound_tokens issuer: the rule names the callers its tokens name, sub then a glob over the issuer's subject claim; role user or agent, no id (RFC 0044 §5.9; needs the a2a and oauth features)" } } },
                 "idp_subject": { "type": "object", "additionalProperties": false, "required": ["iss", "sub"],
                     "description": "the one IdP identity this principal is, exact: required to delegate, on a uid or an spki rule (RFC 0044; needs the xaa feature)",
                     "properties": { "iss": { "type": "string" }, "sub": { "type": "string" } } },

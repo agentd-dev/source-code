@@ -8,8 +8,9 @@
 //! Each check runs the real binary, black-box: the daemon on a unix A2A
 //! listener whose peer — this process — is the per-person operator, the CLI
 //! (`--login idp:<name>`, `--delegation-*`) against it, and workflows started
-//! over the listener. Its IdP, the MCP server's authorization server and the
-//! EMA MCP server are agentd's own mocks (`agentd --internal-mock-xaa`), and
+//! over the listener. Its IdP, the MCP server's authorization server, the
+//! EMA MCP server and an A2A peer are agentd's own mocks (`agentd
+//! --internal-mock-xaa`), and
 //! the external signer of `key_custody: external` its reference signer
 //! (`agentd --internal-mock-signer`),
 //! which record every request they receive and are steered per check; what
@@ -404,18 +405,155 @@ pub fn checks() -> Vec<Check> {
             "a turn worker and an inheriting subagent each asking the supervisor for a delegated tool their step or spawn did not offer are refused (tool.refused, why: not_offered) and the server is sent nothing, while the tool they were offered is made",
             p2d::a_worker_uses_only_what_it_was_offered,
         ),
+        check(
+            "ema/inbound-token-names-its-person",
+            "an enterprise access token (RFC 9068, Okta's profile) names its person, user:oidc:<iss>#<uid>: the run they start acts for them and names the token's act chain, the operator lists the inbound session it is kept as — issuer, client, scopes and act chain, never the token — and an act chain past the issuer's bound is a 401",
+            p3a::a_token_names_its_person,
+        ),
+        check(
+            "ema/inbound-card-and-metadata-name-the-issuer",
+            "the card declares the issuer as an oauth2 scheme with its oauth2MetadataUrl and the authorization-code flow with PKCE, every security requirement names a declared scheme, the RFC 9728 metadata names the resource and the issuer, and a request with no credential is a 401 whose challenge names that metadata",
+            p3a::the_card_and_the_metadata_name_the_issuer,
+        ),
+        check(
+            "ema/inbound-token-of-another-issuer-refused",
+            "a token signed by the IdP's key but naming another issuer is a 401 invalid_token naming the protected-resource metadata, and starts nothing",
+            p3a::another_issuers_token_is_refused,
+        ),
+        check(
+            "ema/inbound-token-for-another-audience-refused",
+            "a token whose aud is not a2a.resource is a 401 invalid_token, logged with why and never with the token",
+            p3a::a_token_for_another_audience_is_refused,
+        ),
+        check(
+            "ema/inbound-expired-token-refused",
+            "an expired token is a 401 invalid_token",
+            p3a::an_expired_token_is_refused,
+        ),
+        check(
+            "ema/inbound-unsigned-token-refused",
+            "a token with alg none, in any case, is a 401 invalid_token",
+            p3a::an_unsigned_token_is_refused,
+        ),
+        check(
+            "ema/inbound-hmac-token-refused",
+            "a token HMAC-signed with the issuer's public key set as the secret is a 401 invalid_token: no HMAC algorithm is ever accepted",
+            p3a::an_hmac_token_is_refused,
+        ),
+        check(
+            "ema/inbound-token-of-a-forbidden-typ-refused",
+            "a token whose typ is not an access token's under the issuer's profile (JWT, an Okta-internal type) is a 401 invalid_token",
+            p3a::a_token_of_a_forbidden_typ_is_refused,
+        ),
+        check(
+            "ema/inbound-id-token-refused",
+            "the front end's ID token presented as an access token — typ JWT with a nonce, and with no typ at all — is a 401 invalid_token: its aud is a client",
+            p3a::an_id_token_is_no_access_token,
+        ),
+        check(
+            "ema/inbound-token-of-an-unlisted-client-refused",
+            "a token issued to a client the issuer's clients do not list is a 401 invalid_token",
+            p3a::an_unlisted_clients_token_is_refused,
+        ),
+        check(
+            "ema/inbound-client-token-names-no-user",
+            "a client_credentials token, issued to the client alone, names no user: with require_user_token it is a 401 invalid_token",
+            p3a::a_clients_own_token_names_no_user,
+        ),
+        check(
+            "ema/inbound-scope-reaches-the-skill",
+            "a send no scope of the token maps to is a 403 whose challenge says insufficient_scope and names the scope that would; the same token reaches a conversation its scope maps to, and another token's scope the workflow",
+            p3a::a_send_needs_the_scope_its_skill_maps_to,
+        ),
+        check(
+            "ema/inbound-scope-answers-its-own-run",
+            "a token whose scope reaches workflows alone answers its run's human step with a plain message on the run's task, while a message there that would become a conversation turn is a 403 insufficient_scope",
+            p3a::a_workflow_token_answers_its_own_runs_question,
+        ),
+        check(
+            "ema/inbound-callers-tasks-are-theirs-alone",
+            "another person's token reads, cancels, continues and lists none of a caller's task (TaskNotFound), while its caller reads it",
+            p3a::a_callers_tasks_are_theirs_alone,
+        ),
+        check(
+            "ema/admission-waits-on-the-callers-sign-in",
+            "a token's caller asking for a workflow acting with a grant they lack waits in TASK_STATE_AUTH_REQUIRED with a start link, no step running, a message on it refused and another person finding nothing; signed in at the IdP through the link, the run goes on with no follow-up message and acts with the grant kept; the sign-in authorizes no later message — the caller's expired token is a 401, another person's finds no task, the page hands out no credential — and the next run asks nothing",
+            p3a::admission_waits_on_the_callers_sign_in,
+        ),
+        check(
+            "ema/admission-cancelled-starts-nothing",
+            "a task cancelled while it waits on its caller's admission sign-in ends the sign-in: finished in the browser tab already open, the callback says it has ended, no code is redeemed, and the cancelled workflow never runs",
+            p3a::a_cancelled_admission_starts_nothing,
+        ),
+        check(
+            "ema/step-up-waits-in-auth-required-for-one-call",
+            "a step-up the IdP asks for puts the run's task in TASK_STATE_AUTH_REQUIRED with a start link and refuses a message on it; signed in through the link, the call is made with the fresh ID token and the run goes on with no message; past the IdP's max_age, the next run's call asks again",
+            p3a::a_step_up_waits_in_auth_required_for_one_call,
+        ),
+        check(
+            "ema/peer-auth-required-waits-for-its-person",
+            "a peer's TASK_STATE_AUTH_REQUIRED puts the run's task in it, quoting the peer; the wait survives a restart without sending the objective again and ends once the person authorizes the peer; the run is an inbound token's caller's, whose token agentd holds, and neither it nor any credential reaches the peer or any other mock",
+            p3a::a_peers_sign_in_request_waits_for_its_person,
+        ),
+        check(
+            "ema/peer-auth-required-beside-a-question",
+            "a human step of a parallel branch, asking on the run's task while the peer's sign-in holds it in TASK_STATE_AUTH_REQUIRED, takes its answer, and the run completes once the peer is authorized",
+            p3a::a_question_beside_a_peers_sign_in_is_answered,
+        ),
+        check(
+            "ema/token-exchange-of-the-callers-token",
+            "subject inbound: the caller's token is exchanged on their behalf (RFC 8693, access_token for access_token) at the IdP that issued it and sent nowhere else, for the pinned audience and resource; the MCP server is sent the result, for the person; an exchange the IdP refuses with invalid_grant is subject_expired",
+            p3a::the_callers_token_is_exchanged_at_its_issuer,
+        ),
+        check(
+            "ema/token-exchange-pinned-audience",
+            "a token the exchange issues for another audience than the pinned one is refused and never sent to the MCP server",
+            p3a::the_exchanged_token_is_held_to_its_audience,
+        ),
+        check(
+            "ema/token-exchange-of-the-grant",
+            "subject grant: the person's grant is refreshed at the IdP for an access token for agentd, exchanged there on their behalf for the pinned audience; the MCP server is sent the result, for them",
+            p3a::the_grants_token_is_exchanged_on_behalf_of_its_person,
+        ),
+        check(
+            "ema/webhook-token-never-taken-twice",
+            "a webhook start with auth.jwt runs for the person a short-lived token for its own audience names; the same token again (its jti seen) and a token for the listener are refused; after a restart, under another idempotency key, the token is answered duplicate and starts nothing",
+            p3a::a_webhook_token_is_never_taken_twice,
+        ),
+        check(
+            "ema/webhook-token-named-by-the-listeners-rules",
+            "a webhook token's person is the one the listener's a2a.principals rules name: a rule naming the issuer that admits nobody the token names admits no delivery; a delivery keeps a session of its own, and the session the person's A2A calls keep is as it was",
+            p3a::a_webhook_token_is_named_by_the_listeners_rules,
+        ),
+        check(
+            "ema/policies-reload-whole-or-not-at-all",
+            "a security.policies list that does not load refuses the reload and the old rule still holds; one that loads replaces it from the next call, logged",
+            p3a::the_policies_reload_whole_or_not_at_all,
+        ),
+        check(
+            "ema/first-use-approval-outlives-a-restart",
+            "a person's first-use approval is kept with the run: its second use of the tool after a restart asks nothing",
+            p3a::a_first_use_approval_outlives_a_restart,
+        ),
+        check(
+            "ema/first-use-approval-ends-with-its-template",
+            "a first-use approval is bound to the templates the work acts under: after a restart onto a changed template the run's second use asks again",
+            p3a::a_first_use_approval_ends_with_its_template,
+        ),
     ]
 }
 
 // --- the mock ----------------------------------------------------------------
 
-/// The IdP, the authorization server and the MCP server, in one process.
+/// The IdP, the authorization server, the MCP server and the A2A peer, in
+/// one process.
 struct Xaa {
     child: Child,
     idp: String,
     ras: String,
     mcp: String,
     mcp2: String,
+    peer: String,
 }
 
 impl Drop for Xaa {
@@ -484,7 +622,22 @@ impl Xaa {
             ras: s("ras"),
             mcp: s("mcp"),
             mcp2: s("mcp2"),
+            peer: s("peer"),
         }
+    }
+
+    /// A token the IdP signs with its own key: `header`'s members (its
+    /// `alg` and `kid` are the key's) over `claims`.
+    fn mint(&self, header: Value, claims: &Value) -> String {
+        let (_, body) = http(
+            "POST",
+            &format!("{}/_mock/mint", self.idp),
+            Some(&json!({"header": header, "claims": claims})),
+        );
+        serde_json::from_str::<Value>(&body).unwrap_or_default()["token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn control(&self, knobs: Value) {
@@ -2933,3 +3086,4 @@ fn restored_vault_refused(h: &Harness) -> Outcome {
 mod p2b;
 mod p2c;
 mod p2d;
+mod p3a;

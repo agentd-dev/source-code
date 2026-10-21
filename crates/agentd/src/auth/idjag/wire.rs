@@ -14,6 +14,10 @@ pub const TOKEN_TYPE_ID_JAG: &str = "urn:ietf:params:oauth:token-type:id-jag";
 /// RFC 8693 subject token types.
 pub const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
 pub const TOKEN_TYPE_REFRESH_TOKEN: &str = "urn:ietf:params:oauth:token-type:refresh_token";
+/// RFC 8693's access token type: the subject and the result of an
+/// on-behalf-of exchange at the server's own authorization server (RFC
+/// 0044 §5.7, M1b).
+pub const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 /// The `token_type` an exchange response names for a token that is not an
 /// access token (RFC 8693 §2.2.1).
 pub const TOKEN_TYPE_NA: &str = "N_A";

@@ -12,6 +12,10 @@ pub mod channel;
 /// The A2A error vocabulary. Always compiled, so code outside the `a2a`
 /// feature can name a code without a copy of it.
 pub mod errors;
+/// Inbound access tokens: the listener as an OAuth resource server (RFC
+/// 0044 §5.9).
+#[cfg(all(feature = "a2a", feature = "oauth"))]
+pub mod inbound;
 /// Signing in at the IdP on the listener origin (RFC 0044 §5.4).
 #[cfg(feature = "a2a")]
 pub mod login;
@@ -43,4 +47,8 @@ pub mod tasks;
 pub mod wire;
 
 pub use principals::{Evidence, Principal, Resolution, Resolver, Via};
+
+/// The prefix of an inbound access token's session handle (RFC 0044 §5.9),
+/// named whatever the build so a sid is read alike everywhere.
+pub const INBOUND_SID_PREFIX: &str = "it_";
 pub use tasks::{Link, State, Task};

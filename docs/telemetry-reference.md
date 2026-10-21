@@ -150,7 +150,9 @@ case.
 | `a2a.conn` | debug | `err` | A connection could not be served. |
 | `a2a.context.unavailable` | warn | `err`, `principal` |  |
 | `a2a.delegate` | info | `peer`, `run`, `step` | Its `span_id` is the delegation's, sent as `traceparent` on every request of it. |
-| `a2a.denied` | warn | `principal`, `rule`, `method`, `op`, `reason`, `status`, `sid?`, `suppressed?` | The listener refused a request. `reason`: `unauthenticated`, `invalid_credential`, `no_role`, `not_permitted`, `rate_limited`, `auth_failures_limited`. Refusals a stranger can cause are written once per source and reason per minute; `suppressed` counts the rest. |
+| `a2a.denied` | warn | `principal`, `rule`, `method`, `op`, `reason`, `status`, `sid?`, `suppressed?`, `issuer?`, `why?` | The listener refused a request. `reason`: `unauthenticated`, `invalid_credential`, `invalid_token` (an enterprise access token a check refused: its `issuer` and `why`, never the token), `insufficient_scope` (a token whose scopes reach no skill the send asks for), `no_role`, `not_permitted`, `rate_limited`, `auth_failures_limited`. Refusals a stranger can cause are written once per source and reason per minute; `suppressed` counts the rest. |
+| `a2a.inbound.ready` | info | `issuer`, `scheme` | An `a2a.inbound_tokens` issuer's metadata and key set were loaded: its scheme is on the card, and its tokens are checked. |
+| `a2a.inbound.unavailable` | warn | `err`, `issuer` | An issuer's metadata or key set could not be read: its tokens are refused until they are, read again at most every 30 s. |
 | `a2a.introspection` | info | `enabled` |  |
 | `a2a.listen` | info | `authority`, `bound`, `device_grant`, `events`, `implicit_operator`, `introspection`, `mtls`, `required`, `tls`, `url` | The listener bound, with the posture it enforces. |
 | `a2a.message.delivered` | info | `conversation`, `inbox_event`, `runs` | A message woke the waiting steps of `runs`. In the span the message was accepted in, which each run's `wait.resolved` names as `link`. |
@@ -158,6 +160,8 @@ case.
 | `a2a.push.registered` | info | `config`, `principal`, `task` |  |
 | `a2a.send` | info | `run`, `step`, `to` | Its `span_id` is the send's, sent as `traceparent`. |
 | `a2a.task.continued` | info | `inbox_event`, `link`, `task` | A message continued a task. In the task's trace; `link` is the `traceparent` the request named. |
+| `a2a.task.auth_required` | info | `task`, `principal`, `idp?`, `why?`, `expires_in?`, `decision?` | A caller an enterprise access token named asked for work acting with a grant they lack: the task waits in `auth-required` on their sign-in (`why: admission`), then `decision: signed_in` and the work starts, `refused` and the task fails, `cancelled` — the task was cancelled while it waited, and its sign-in ended — or `ended`, a sign-in that came back to a task already ended, which starts nothing; or `not_offered` — paced, or no sign-in served — and the work starts as it would have. |
+| `a2a.peer.auth_required` | info | `run`, `step`, `peer`, `peer_task`, `task?`, `to?`, `decision?` | A peer's task waits on a person's sign-in: the run's `task` waits in `auth-required` too, for `to` when the step names one; `decision: resumed` when the peer's task went on. |
 | `a2a.task.encode.fail` | warn | `err`, `task` |  |
 | `a2a.task.evict.fail` | warn | `err`, `task` |  |
 | `a2a.task.evicted` | info | `task` |  |
@@ -198,7 +202,7 @@ case.
 | `auth.launch.requested` | info | `client_id` |  |
 | `auth.login.signed_in` | info | `client_id`, `idp`, `principal`, `sid` | A display client's sign-in at `a2a.login`'s IdP was verified, and session `sid` issued: `principal` is `user:oidc:<iss>#<sub>`. Where a template admits the person, the same sign-in enrolled them (`delegation.enrolled` before it). |
 | `auth.recovered` | info | `failures`, `target` | A request for `target` had its credential again after `failures` could not. Written at most once a minute, as `otel.export.recovered` is. |
-| `auth.session.revoked` | info | — |  |
+| `auth.session.revoked` | info | `sid`, `name?`, `principal`, `reason`, `kind?` | A session was ended, `reason` saying how; `kind: inbound` for a caller an enterprise access token named, whose next token makes it again. |
 | `auth.unavailable` | warn | `err`, `failures`, `target` | The credential `target`'s `auth` (or `token_file`) presents could not be produced — no login, an expired token with no refresh token, an issuer, token endpoint or AWS source that does not answer, a secret file that cannot be read — so the requests that need it fail without being sent. Written when they start failing, then at most once a minute while they keep failing; `failures` counts the requests failed since the target's last `auth.recovered`. `target` is the credential's target: `intelligence`, `intelligence:<provider>`, `mcp:<name>`, `service:<entry>`, `a2a:<peer>` for a peer's own `auth`, or `aauth` for the AAuth identity — an Agent Provider that does not answer or whose metadata is not yet verified, one that will not enroll the key or issue an agent token, or a child whose key file no longer holds the daemon's key — which every request it signs needs. The supervisor writes it for the whole process tree: a turn worker or subagent hands its credential outcomes up, so a failure every turn meets is one line a minute. |
 
 ### breaker
@@ -377,7 +381,8 @@ its `jti`.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `delegation.enrolled` | info | `approving_sub`, `bound_by`, `expires_ms`, `grant`, `grant_id`, `idp`, `principal`, `servers`, `session`, `step_up`, `template` | A sign-in was verified, bound and kept. `grant` is the sign-in grant; `step_up` the `max_age` it answered, if any; `session` the RFC 0043 session that signed in, when one did; `bound_by` what bound a device name to the identity (`pin`, `first_binding`). |
-| `delegation.minted` | info | `act?`, `auth_time?`, `exp?`, `grant_id`, `jti_sha256?`, `month_to_date?`, `narrowed?`, `ras_iss`, `resource`, `reused_id_jag`, `run`, `scope_granted?`, `step`, `tool`, `unattended?` | An ID-JAG was exchanged for (`reused_id_jag: false`), or one already held was presented again. `tool` is `tools/list` for the catalogue's mint. |
+| `delegation.minted` | info | `act?`, `auth_time?`, `exp?`, `grant_id`, `jti_sha256?`, `month_to_date?`, `narrowed?`, `ras_iss`, `resource`, `reused_id_jag`, `run`, `scope_granted?`, `step`, `tool`, `unattended?` | An ID-JAG was exchanged for (`reused_id_jag: false`), or one already held was presented again. `tool` is `tools/list` for the catalogue's mint. A same-domain exchange is `grant: token_exchange`, with its `subject` (`grant` or `inbound`), `as_iss`, `audience` and `resource`, in place of the ID-JAG's fields. |
+| `delegation.consent.once_unsaved` | warn | `err`, `unit`, `msg` | A first-use approval could not be written to the store: it holds in memory, and a restart asks again. |
 | `delegation.used` | info | `grant_id`, `run`, `server`, `step`, `tool` | A delegated call was answered. |
 | `delegation.denied` | info | `code`, `error`, `server?`, `tool?`, `run?`, `step?`, `idp?`, `approving_sub?` | A delegated call or a sign-in was refused; `code` is the RFC 0044 §5.8 code. |
 | `delegation.step_up` | info | `gate`, `decision`, `kind?`, `server?`, `tool?`, `principal?`, `max_age?`, `grant_id?`, `verification_uri?`, `user_code?`, `why?` | The IdP asked for a fresher sign-in (`decision: asked`, its `max_age`), and the call waits on a sign-in gate of `kind` `authorize` (a start link) or `device` (the IdP's device grant, its code then shown: `device_code`); the person `signed_in` and the call is made again, or the gate was `denied`, `why` said. |
@@ -752,7 +757,13 @@ its `jti`.
 | `run.refused` | warn | `reason`, `run` | A run was refused with `reason`. |
 | `run.resumed` | info | `run` | One run was resumed. |
 | `run.stalled` | warn | `blocked_by`, `run` | A run can make no progress; `blocked_by` says why. |
-| `run.start` | info | `acting_for`, `inbox_event`, `key`, `node`, `run`, `workflow` | A workflow run started. `acting_for` is the principal it runs for. |
+| `run.start` | info | `acting_for`, `inbox_event`, `key`, `node`, `run`, `workflow`, `act?` | A workflow run started. `acting_for` is the principal it runs for; `act`, for a run an enterprise access token's caller started, the agents its `act` chain names, outermost first. |
+
+### security
+
+| Event | Level | Fields | Notes |
+|---|---|---|---|
+| `security.policies.reloaded` | info | `rules`, `was` | A reload swapped `security.policies` whole: `rules` now, `was` before. |
 
 ### signal
 
@@ -925,7 +936,7 @@ an instruction's by `origin: instruction` and `name`.
 | `webhook.await.armed` | info | `path`, `run`, `step`, `url` |  |
 | `webhook.await.restored` | info | `path`, `run`, `step` |  |
 | `webhook.callback` | info | `link`, `path`, `resumed` | In the callback's own span, under the caller's; `link`: the `traceparent` the callback sent, or null. |
-| `webhook.denied` | warn | `kind`, `path`, `reason` | A webhook request failed authentication. |
+| `webhook.denied` | warn | `kind?`, `path`, `reason`, `why?` | A webhook request failed authentication; under `auth.jwt`, `why` says what the token failed — a `jti` presented before, or a person no `a2a.principals` rule naming the issuer admits, included — never the token. |
 | `webhook.duplicate` | info | `node`, `workflow` |  |
 | `webhook.filtered` | info | `node`, `workflow` |  |
 | `webhook.idempotency.expired` | info | `markers` |  |

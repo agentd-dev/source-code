@@ -525,6 +525,10 @@ pub struct Runtime {
     /// Acting for the enrolled person at delegated servers (RFC 0044).
     #[cfg(feature = "xaa")]
     pub(crate) delegation: Option<Arc<crate::delegation::Delegation>>,
+    /// The inbound-token verifier the A2A listener and the webhook surface
+    /// share (RFC 0044 §5.9), when `a2a.inbound_tokens` names an issuer.
+    #[cfg(all(feature = "a2a", feature = "oauth"))]
+    pub(crate) inbound: Option<Arc<crate::a2a::inbound::Inbound>>,
     /// The person's open consent gates, by id.
     #[cfg(feature = "xaa")]
     pub(crate) consents: BTreeMap<String, super::delegated::ConsentGate>,
@@ -534,14 +538,25 @@ pub struct Runtime {
     #[cfg(feature = "xaa")]
     pub(crate) consented_steps: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
     /// The first uses the person approved of a `once_per: run_tool` rule,
-    /// by `unit|tool|rule`, with when (`delegated::once_key`). In memory: a
-    /// restart asks again.
+    /// by `unit|tool|rule`, with when and what they are bound to
+    /// (`delegated::once_key`). In memory and in the store under their
+    /// unit: a restart keeps them.
     #[cfg(feature = "xaa")]
-    pub(crate) consented_once: BTreeMap<String, u64>,
+    pub(crate) consented_once: BTreeMap<String, (u64, String)>,
+    /// When the store's first-use records were last swept (0: not yet).
+    #[cfg(feature = "xaa")]
+    pub(crate) once_swept_ms: u64,
     /// When each person's recent consent gates opened, for
     /// `identity.delegation.consent_per_minute`.
     #[cfg(feature = "xaa")]
     pub(crate) consents_asked: BTreeMap<String, std::collections::VecDeque<u64>>,
+    /// Starts held until their caller signs in, by task (RFC 0044 §5.4
+    /// Door 2). In memory: a restart fails the task.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    pub(crate) held_starts: BTreeMap<String, super::admission::HeldStart>,
+    /// When each principal was last offered an admission sign-in.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    pub(crate) admission_offers: BTreeMap<String, Vec<u64>>,
     /// The connections waiting on a person's answer to a delegated server's
     /// elicitation, by gate.
     #[cfg(feature = "xaa")]
@@ -848,6 +863,9 @@ impl Runtime {
             // 3.6. Webhook idempotency markers past their TTL (rate-limited).
             #[cfg(feature = "a2a")]
             self.sweep_idem_markers();
+            // 3.7. First-use approvals no unit can use any more (hourly).
+            #[cfg(feature = "xaa")]
+            self.sweep_once();
             // 4. Timers.
             let now = now_ms();
             for t in self.timers.fire(&self.durable, now) {
@@ -1087,8 +1105,17 @@ impl Runtime {
             Event::Read { into, carries } => self.read_into(into, &carries),
             #[cfg(feature = "xaa")]
             Event::Delegation(n) => self.on_delegation_note(*n),
+            #[cfg(feature = "a2a")]
+            Event::PeerAuth {
+                run,
+                step,
+                peer,
+                wait,
+            } => self.peer_auth(&run, &step, &peer, wait),
             #[cfg(all(feature = "xaa", feature = "a2a"))]
             Event::DelegationSaid { task, said } => self.delegation_said(&task, said),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::AdmissionSignedIn { task, result } => self.admission_signed_in(&task, result),
             #[cfg(all(feature = "xaa", feature = "a2a"))]
             Event::ConsentSignedIn { gate, result } => self.consent_signed_in(&gate, result),
             #[cfg(all(feature = "xaa", feature = "a2a"))]

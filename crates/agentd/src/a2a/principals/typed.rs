@@ -138,8 +138,23 @@ impl PrincipalRef {
 
     /// The display string, derived from the tuple and never parsed back: an
     /// identity provider's principal is `user:oidc:<iss>#<sub>`, a namespace
-    /// no transport matcher produces.
+    /// no transport matcher produces — and a multi-tenant issuer's
+    /// `user:oidc:<iss>#<tenant>/<sub>`, so two tenants' people who share a
+    /// subject are two principals. The tenant is written with `%` and `/`
+    /// escaped, so the first `/` after `#` always ends it.
     pub fn display(&self) -> String {
+        match (self.source, &self.tenant) {
+            (Source::Oidc, Some(t)) => format!(
+                "user:oidc:{}#{}/{}",
+                self.issuer,
+                t.replace('%', "%25").replace('/', "%2F"),
+                self.stable_id
+            ),
+            _ => self.display_untenanted(),
+        }
+    }
+
+    fn display_untenanted(&self) -> String {
         match self.source {
             Source::Oidc => format!("user:oidc:{}#{}", self.issuer, self.stable_id),
             Source::X509 => format!("x509:{}", self.stable_id),
@@ -189,6 +204,24 @@ mod tests {
             ..PrincipalRef::local(Source::Oidc, "00u1alice")
         };
         assert_eq!(o.display(), "user:oidc:https://acme.okta.com#00u1alice");
+        // Two tenants' people who share a subject are two principals, and
+        // a tenant cannot pose as a subject's prefix.
+        let tenant = |t: &str, sub: &str| PrincipalRef {
+            tenant: Some(t.into()),
+            ..PrincipalRef {
+                issuer: "https://login.example".into(),
+                ..PrincipalRef::local(Source::Oidc, sub)
+            }
+        };
+        assert_eq!(
+            tenant("acme", "00u1").display(),
+            "user:oidc:https://login.example#acme/00u1"
+        );
+        assert_ne!(
+            tenant("acme", "00u1").display(),
+            tenant("globex", "00u1").display()
+        );
+        assert_ne!(tenant("a/b", "c").display(), tenant("a", "b/c").display());
         assert!(PrincipalRef::operator().is_bare_operator());
         assert!(!PrincipalRef::local(Source::Operator, "alice").is_bare_operator());
         assert_eq!(

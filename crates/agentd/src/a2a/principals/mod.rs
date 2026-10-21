@@ -20,7 +20,7 @@ pub mod typed;
 pub use addressee::Addressee;
 pub use resolve::{
     CertId, Evidence, Resolution, Resolver, SESSION_TOKEN_PREFIX, SessionCheck, SessionVerifier,
-    Via, declared_principals,
+    TokenId, Via, declared_principals,
 };
 
 /// A resolved caller.
@@ -261,7 +261,7 @@ pub fn workflow_name_of(data: &Value) -> Option<&str> {
 }
 
 /// A `*`-glob match (`*` = any run of chars; else literal).
-fn glob(pattern: &str, s: &str) -> bool {
+pub(crate) fn glob(pattern: &str, s: &str) -> bool {
     if pattern == "*" {
         return true;
     }

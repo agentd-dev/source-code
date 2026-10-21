@@ -32,6 +32,9 @@ pub struct ListenerAuth {
     /// The IdP-federated display-client login (`a2a.login`, RFC 0044 §5.4)
     /// issues session tokens.
     pub login: bool,
+    /// Inbound access tokens from `a2a.inbound_tokens` are verified (RFC
+    /// 0044 §5.9).
+    pub tokens: bool,
     /// The listener is a unix socket: the kernel names the peer's uid.
     pub unix: bool,
     /// The TCP bind host is loopback (`127.0.0.0/8`, `::1`, `localhost`).
@@ -55,7 +58,7 @@ impl ListenerAuth {
     /// Whether the listener declares any authentication scheme a caller could
     /// present. A unix socket declares none: its authenticator is the kernel.
     pub fn declares_any(&self) -> bool {
-        !self.unix && (self.bearer || self.mtls || self.device || self.login)
+        !self.unix && (self.bearer || self.mtls || self.device || self.login || self.tokens)
     }
 
     /// Whether the listener issues sessions — the device grant, the IdP
@@ -82,13 +85,15 @@ pub fn listener_auth_of(a2a: &A2a) -> ListenerAuth {
     let mtls = https && a2a.tls.client_ca.is_some();
     let device = a2a.device_grant.enabled;
     let login = a2a.login.is_some() && !unix;
+    let tokens = !a2a.inbound_tokens.is_empty() && !unix;
     let implicit_operator = unix
         || (loopback_bind
             && a2a.bearer.is_none()
             && a2a.principals.is_empty()
             && a2a.tls.client_ca.is_none()
             && !device
-            && !login);
+            && !login
+            && !tokens);
     // The FIRST `any` rule is the one the resolver applies (step 3 stops at
     // it), so it alone decides: an anonymous one admits nobody — the
     // resolver counts it as unauthenticated — whatever `any` rules follow it.
@@ -104,6 +109,7 @@ pub fn listener_auth_of(a2a: &A2a) -> ListenerAuth {
         mtls,
         device,
         login,
+        tokens,
         unix,
         loopback_bind,
         implicit_operator,
@@ -214,21 +220,37 @@ pub struct CardSecurity {
     pub requirements: Vec<a2a_types::SecurityRequirement>,
 }
 
-/// The card's security fields, from the posture the listener enforces and the
-/// origin it is published at — `None` when there is nothing to declare, and
-/// then the card carries neither field.
+/// An `a2a.inbound_tokens` issuer as the card declares it (RFC 0044 §5.9):
+/// its scheme name, the `oauth2` scheme — `oauth2MetadataUrl` and the flow
+/// a client gets a token by, from the issuer's own metadata — and the scopes
+/// its requirement lists.
+#[cfg(feature = "a2a")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenScheme {
+    pub name: String,
+    pub scheme: a2a_types::SecurityScheme,
+    pub scopes: Vec<String>,
+}
+
+/// The card's security fields, from the posture the listener enforces, the
+/// origin it is published at and the inbound-token issuers whose keys are
+/// loaded (`tokens`) — `None` when there is nothing to declare, and then the
+/// card carries neither field.
 ///
 /// A2A 1.0 §3.1.11: a client MUST authenticate with a scheme the PUBLIC card
 /// declares. So every mechanism the listener accepts is declared here, and
 /// nothing it does not: a unix socket declares none (the kernel names the
 /// peer), and a loopback daemon with no mechanism declares none (the caller is
-/// the operator by the bind). Built from the SDK's types, so the typed round
-/// trip the card goes through keeps every field.
+/// the operator by the bind). An inbound-token issuer is declared while its
+/// metadata and keys are loaded — exactly while the listener can verify its
+/// tokens. Built from the SDK's types, so the typed round trip the card goes
+/// through keeps every field.
 #[cfg(feature = "a2a")]
 pub fn security_of(
     posture: &ListenerAuth,
     origin: Option<&str>,
     scopes: &[crate::config::settings::DeviceScope],
+    tokens: &[TokenScheme],
 ) -> Option<CardSecurity> {
     use a2a_types::{
         DeviceCodeOAuthFlow, HttpAuthSecurityScheme, MutualTlsSecurityScheme, OAuth2SecurityScheme,
@@ -240,10 +262,19 @@ pub fn security_of(
     let mut schemes = std::collections::HashMap::new();
     // A device-grant or an IdP-login session token is presented as a
     // bearer, so either implies the bearer scheme even when no static
-    // bearer is configured.
-    let bearer = posture.bearer || posture.issues_sessions();
+    // bearer is configured. So does an inbound access token while no
+    // issuer's keys are loaded: the card still says a credential is asked
+    // for, and a refused one is answered with the protected-resource
+    // metadata that names the issuers.
+    let tokens_pending = posture.tokens && tokens.is_empty();
+    let bearer = posture.bearer || posture.issues_sessions() || tokens_pending;
     if bearer {
         let how = match (posture.device, posture.login) {
+            _ if tokens_pending && !posture.bearer && !posture.issues_sessions() => {
+                "An `Authorization: Bearer` access token for this agent from the organization's \
+                 authorization server (RFC 9068), named by the protected-resource metadata this \
+                 listener serves (RFC 9728)"
+            }
             (true, true) => {
                 "An `Authorization: Bearer` credential: a token the operator issued, or the session \
                  token the device authorization grant (`device_code`) or a sign-in at the \
@@ -312,17 +343,37 @@ pub fn security_of(
             }),
         );
     }
+    let tokens: &[TokenScheme] = if posture.tokens { tokens } else { &[] };
+    for t in tokens {
+        schemes.insert(t.name.clone(), t.scheme.clone());
+    }
+    if schemes.is_empty() {
+        return None;
+    }
     let all_of = |names: &[&str]| -> SecurityRequirement {
-        names.iter().map(|n| (n.to_string(), Vec::new())).collect()
+        names
+            .iter()
+            .map(|n| {
+                let scopes = tokens
+                    .iter()
+                    .find(|t| t.name == *n)
+                    .map(|t| t.scopes.clone())
+                    .unwrap_or_default();
+                (n.to_string(), scopes)
+            })
+            .collect()
     };
     let requirements = if posture.mtls {
         // The handshake demands the certificate before any header is read, so
-        // every alternative carries it; a bearer rides on top of it, never
-        // instead of it. No anonymous alternative: there is no request
-        // without a certificate.
+        // every alternative carries it; a bearer or an inbound token rides on
+        // top of it, never instead of it. No anonymous alternative: there is
+        // no request without a certificate.
         let mut r = vec![all_of(&["mtls"])];
         if bearer {
             r.push(all_of(&["mtls", "bearer"]));
+        }
+        for t in tokens {
+            r.push(all_of(&["mtls", &t.name]));
         }
         r
     } else {
@@ -654,5 +705,41 @@ pub(crate) mod tests {
         ] {
             assert_eq!(join(o, p), "https://a/oauth2/token");
         }
+    }
+
+    /// A listener that takes inbound tokens alone declares that a bearer is
+    /// asked for while no issuer's keys are loaded — never a card that reads
+    /// as asking nothing — and each ready issuer's scheme once one is.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_tokens_listener_asks_for_a_bearer_until_an_issuer_is_ready() {
+        let a = a2a(json!({
+            "listen": "https://0.0.0.0:8443", "url": "https://agent.example:8443",
+            "tls": {"cert": "c", "key": "k"}, "resource": "https://agent.example:8443",
+            "inbound_tokens": [{"issuer": "https://idp.example", "clients": ["fe"]}]}));
+        let posture = listener_auth_of(&a);
+        assert!(posture.tokens && !posture.bearer && !posture.implicit_operator);
+        let origin = Some("https://agent.example:8443");
+        let pending = security_of(&posture, origin, &[], &[]).expect("a scheme is declared");
+        assert_eq!(
+            pending.schemes.keys().collect::<Vec<_>>(),
+            ["bearer"],
+            "{pending:?}"
+        );
+        let ready = TokenScheme {
+            name: "enterprise".into(),
+            scheme: a2a_types::SecurityScheme::HttpAuth(a2a_types::HttpAuthSecurityScheme {
+                scheme: "Bearer".into(),
+                description: None,
+                bearer_format: None,
+            }),
+            scopes: Vec::new(),
+        };
+        let declared = security_of(&posture, origin, &[], &[ready]).expect("declared");
+        assert_eq!(
+            declared.schemes.keys().collect::<Vec<_>>(),
+            ["enterprise"],
+            "{declared:?}"
+        );
     }
 }

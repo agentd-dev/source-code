@@ -180,6 +180,17 @@ test('a message never answers a consent gate', () => {
   assert.match(consentLine({ gate: 'g2', kind: 'device', verificationUri: 'https://idp.example/activate', userCode: 'ABCD' }), /enter ABCD/);
 });
 
+test('a step-up sign-in is a consent gate on an AUTH_REQUIRED task', () => {
+  const s = { tasks: new Map() };
+  const step = task('step', 'c1', { consentGate: { gate: 'g3', kind: 'authorize', start_uri: `${ORIGIN}/oauth2/start/s` } }, 'TASK_STATE_AUTH_REQUIRED');
+  s.tasks.set(step.id, step);
+  assert.equal(consentWait(s, 'c1')?.id, 'step', 'its sign-in link and its deny are shown');
+  assert.equal(currentGate(s, 'c1'), undefined, 'a reply answers no sign-in');
+  // A task waiting on a sign-in with no consent gate is no consent gate.
+  const s2 = { tasks: new Map([['admit', task('admit', 'c1', { signIn: { idp: 'okta', start_uri: `${ORIGIN}/oauth2/start/a` } }, 'TASK_STATE_AUTH_REQUIRED')]]) };
+  assert.equal(consentWait(s2, 'c1'), undefined);
+});
+
 test('/enrol and /consent', async (t) => {
   await t.test('parsed, or their usage', () => {
     assert.deepEqual(parseDelegationCommand('enrol', ['okta']), { cmd: 'enrol', idp: 'okta' });

@@ -629,6 +629,8 @@ pub const KINDS: &[KindInfo] = &[
             "idempotency",
             "breaker",
             "rate",
+            "auth_to",
+            "auth_timeout",
         ],
         &["peer"],
         true,
@@ -1274,6 +1276,11 @@ pub struct Workflow {
     /// configuration.
     #[serde(skip)]
     pub document: bool,
+    /// Whether the configuration defined this definition — the operator's
+    /// file or the instruction document — rather than `workflow.create`,
+    /// `workflow.update` or the store. Set only at load.
+    #[serde(skip)]
+    pub configured: bool,
 }
 
 fn default_true() -> bool {
@@ -1843,6 +1850,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         definition: doc.clone(),
         gate_channels: BTreeMap::new(),
         document: false,
+        configured: false,
     };
     validate_graph(&wf, &mut errs);
     check_step_paths(&wf, &mut errs);
@@ -2463,6 +2471,25 @@ fn parse_step(
             }
             if spec.get("args").is_some() && spec.get("command").is_none() {
                 errs.push(format!("{at}: `args` needs `command`"));
+            }
+            // Whom a peer's `AUTH_REQUIRED` is shown to when the run has no
+            // task of its own: one principal, who owns the task it is shown
+            // on — never a pattern nobody owns.
+            if let Some(to) = spec.get("auth_to")
+                && !to
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty() && !s.contains('*'))
+            {
+                errs.push(format!(
+                    "{at}: `auth_to` names one principal id (no glob): the person shown the peer's sign-in request"
+                ));
+            }
+            if let Some(t) = spec.get("auth_timeout")
+                && duration_ms_opt(t).is_none_or(|ms| ms == 0 || ms > 24 * 60 * 60 * 1000)
+            {
+                errs.push(format!(
+                    "{at}: `auth_timeout` is a duration between 1ms and 24h: how long the step waits for a sign-in the peer asks for"
+                ));
             }
         }
         "a2a.send" => {

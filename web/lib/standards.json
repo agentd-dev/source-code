@@ -122,8 +122,15 @@
   {
     "name": "Protected Resource Metadata",
     "version": "RFC 9728",
-    "full": "OAuth 2.0 protected resource metadata: an MCP server's authorization server",
+    "full": "OAuth 2.0 protected resource metadata: an MCP server's authorization server, and the A2A listener's own where it takes enterprise access tokens",
     "href": "/docs/authentication/#oauth-20",
+    "tier": 2
+  },
+  {
+    "name": "JWT Access Tokens",
+    "version": "RFC 9068",
+    "full": "JWT access tokens from an enterprise authorization server, checked claim by claim against its own keys: who calls the A2A listener",
+    "href": "/docs/a2a/#enterprise-access-tokens",
     "tier": 2
   },
   {
@@ -173,7 +180,7 @@
     "name": "Token Exchange",
     "version": "RFC 8693",
     "mark": "preview",
-    "full": "OAuth token exchange: an enrolled person's grant exchanged at their IdP for an ID-JAG, a build-from-source preview",
+    "full": "OAuth token exchange: an enrolled person's grant exchanged at their IdP for an ID-JAG, or a grant's or a caller's token for a same-domain MCP server's, a build-from-source preview",
     "href": "/docs/authentication/#enterprise-managed-authorization",
     "tier": 2
   },

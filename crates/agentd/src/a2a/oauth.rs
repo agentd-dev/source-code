@@ -301,6 +301,64 @@ fn role_name(r: Role) -> &'static str {
     }
 }
 
+/// How long an inbound session is kept after its token expires: work it
+/// started reads it as ended (`revoked`, or `subject_expired` for an
+/// exchange of the token), rather than as never there.
+pub const INBOUND_KEPT_AFTER: Duration = Duration::from_secs(60 * 60);
+/// The most inbound sessions kept at once; past it the one whose token
+/// expires first goes.
+pub const INBOUND_CAP: usize = 4096;
+
+/// An inbound access token's session (RFC 0044 §5.9): who the token named,
+/// for as long as it is good — the handle the work the caller starts acts
+/// through. One per person and client: a later token of theirs renews it,
+/// so their work goes on. It holds the token itself only where an exchange
+/// back at its issuer is configured (`grant: token_exchange` with `subject:
+/// inbound`), in memory, never persisted, and sends it nowhere else.
+#[derive(Clone)]
+pub struct InboundSession {
+    /// `it_<16 hex>`.
+    pub sid: String,
+    /// `user:oidc:<iss>#<subject>` (`#<tenant>/<subject>` under a tenant
+    /// claim), or `agent:oidc:<iss>#<client>`.
+    pub principal: String,
+    pub typed: PrincipalRef,
+    pub role: Role,
+    /// The token's issuer.
+    pub issuer: String,
+    pub client: String,
+    pub scopes: Vec<String>,
+    /// The token's `act` chain, outermost first.
+    pub act: Vec<String>,
+    /// The labels the rule that named the caller gave.
+    pub labels: BTreeMap<String, String>,
+    pub expires_ms: u64,
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for InboundSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundSession")
+            .field("sid", &self.sid)
+            .field("principal", &self.principal)
+            .field("issuer", &self.issuer)
+            .field("client", &self.client)
+            .field("expires_ms", &self.expires_ms)
+            .field("token", &self.token.as_ref().map(|_| "[held]"))
+            .finish()
+    }
+}
+
+impl InboundSession {
+    /// The row `auth.sessions` lists: never the token.
+    pub fn view(&self, now_ms: u64) -> Value {
+        json!({"sid": self.sid, "kind": "inbound", "principal": self.principal,
+               "role": role_name(self.role), "client_id": self.client, "issuer": self.issuer,
+               "scopes": self.scopes, "act": self.act, "expires_at": self.expires_ms,
+               "expired": now_ms >= self.expires_ms, "source": self.typed.source.as_str()})
+    }
+}
+
 /// Which sessions a revocation ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Revoke {
@@ -319,6 +377,8 @@ pub enum Revoke {
 pub struct Sessions {
     clock: Clock,
     table: Mutex<Table>,
+    /// Inbound access tokens' sessions, by sid.
+    inbound: Mutex<HashMap<String, InboundSession>>,
 }
 
 #[derive(Debug, Default)]
@@ -364,7 +424,58 @@ impl Sessions {
         Sessions {
             clock,
             table: Mutex::new(Table::default()),
+            inbound: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keep `s`, an inbound token's session, replacing the one of its sid:
+    /// the latest token presented is the one held.
+    pub fn inbound_upsert(&self, s: InboundSession) {
+        let now = (self.clock)();
+        let mut m = self.inbound.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = ms(INBOUND_KEPT_AFTER);
+        m.retain(|_, x| x.expires_ms.saturating_add(kept) > now);
+        if !m.contains_key(&s.sid) && m.len() >= INBOUND_CAP {
+            let first = m
+                .values()
+                .min_by_key(|x| x.expires_ms)
+                .map(|x| x.sid.clone());
+            if let Some(sid) = first {
+                m.remove(&sid);
+            }
+        }
+        m.insert(s.sid.clone(), s);
+    }
+
+    /// Inbound session `sid`, its token expired or not, while it is kept.
+    pub fn inbound(&self, sid: &str) -> Option<InboundSession> {
+        self.inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sid)
+            .cloned()
+    }
+
+    /// Every inbound session kept, its token's expiry first.
+    pub fn inbound_list(&self) -> Vec<InboundSession> {
+        let mut out: Vec<InboundSession> = self
+            .inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.expires_ms, &a.sid).cmp(&(b.expires_ms, &b.sid)));
+        out
+    }
+
+    /// Forget inbound session `sid`: work acting through it reads it as
+    /// ended, until the caller's next token makes it again.
+    pub fn inbound_revoke(&self, sid: &str) -> Option<InboundSession> {
+        self.inbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(sid)
     }
 
     fn table(&self) -> std::sync::MutexGuard<'_, Table> {
@@ -429,9 +540,18 @@ impl Sessions {
         out
     }
 
-    /// Whether session `sid` may still be served.
+    /// Whether session `sid` may still be served: an inbound one while its
+    /// token is good.
     pub fn alive(&self, sid: &str) -> bool {
         let now = (self.clock)();
+        if sid.starts_with(crate::a2a::INBOUND_SID_PREFIX) {
+            return self
+                .inbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(sid)
+                .is_some_and(|s| now < s.expires_ms);
+        }
         let t = self.table();
         t.by_sid
             .get(sid)

@@ -7,7 +7,9 @@
 //!   1. routed by path (+ method),
 //!   2. **authenticated** per-node — HMAC-SHA256 over the raw body
 //!      (GitHub/Stripe-style `X-Signature: sha256=…`), a required-header match, or
-//!      a bearer — verified in constant time,
+//!      a bearer — verified in constant time — or a person's JWT from one of
+//!      `a2a.inbound_tokens`, for the webhook's own audience, short-lived, its
+//!      `jti` never taken twice, which makes the run theirs (RFC 0044 §5.9),
 //!   3. **deduplicated** durably by its idempotency key (a replay of a
 //!      delivery that was kept answers `duplicate` and never re-fires; one
 //!      that was refused is processed again),
@@ -28,7 +30,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use crate::config::settings::{WebhookAuth, Webhooks};
+use crate::config::settings::{Settings, WebhookAuth};
 use crate::engine::model::RESERVED_HOOK_PREFIX;
 use crate::obs::log::Logger;
 use crate::obs::trace::TraceContext;
@@ -449,6 +451,10 @@ pub struct WebhookRequest {
     pub node: String,
     /// The dedup key (from the idempotency header), if any.
     pub idem_key: Option<String>,
+    /// A person's signed delivery's own key, `jwt:<iss>#<jti>`: kept as a
+    /// durable marker beside the header's, so its token replayed after a
+    /// restart — under any header value — fires nothing.
+    pub token_key: Option<String>,
     /// `{method, path, headers, body, raw_body}` handed to the workflow `inputs`.
     pub payload: Value,
     /// `respond: sync` — hold the HTTP response until the fired run reaches a
@@ -462,6 +468,9 @@ pub struct WebhookRequest {
     /// appends, records it as a link. Correlation only — never a key, a
     /// credential or a rate.
     pub trace: Option<TraceContext>,
+    /// Whose the run is, when a person's JWT signed the delivery (`auth.jwt`):
+    /// their principal, and the inbound session the run acts through.
+    pub authority: Option<(String, Option<String>)>,
     pub reply: SyncSender<WebhookReply>,
 }
 
@@ -535,6 +544,13 @@ pub enum Verify {
     Bearer {
         token: String,
     },
+    /// A person's JWT from `a2a.inbound_tokens` (RFC 0044 §5.9), checked by
+    /// the handler's inbound verifier.
+    Jwt {
+        issuer: String,
+        audience: String,
+        max_lifetime: Duration,
+    },
 }
 
 /// Refuse an `algo` we do not implement.
@@ -586,6 +602,8 @@ impl Verify {
                         .or_else(|| a.strip_prefix("bearer "))
                 })
                 .is_some_and(|t| crate::sha::ct_eq(t.as_bytes(), token.as_bytes())),
+            // Only the handler holds the verifier: [`WebhookHandler::verified`].
+            Verify::Jwt { .. } => false,
         }
     }
 }
@@ -654,6 +672,18 @@ pub struct WebhookHandler {
     events_tx: Sender<Event>,
     timeout: Duration,
     log: Logger,
+    /// The inbound-token verifier a route's `auth.jwt` is checked by.
+    #[cfg(feature = "oauth")]
+    inbound: Option<Arc<crate::a2a::inbound::Inbound>>,
+    /// The listener's sessions, where a person's verified webhook token is
+    /// kept as their webhook session, which the run acts through.
+    #[cfg(feature = "oauth")]
+    sessions: Option<Arc<crate::a2a::oauth::Sessions>>,
+    /// The A2A listener's bridge, whose principal rules — swapped by a
+    /// reload — name the person a webhook's token is, as they would on
+    /// the listener.
+    #[cfg(feature = "oauth")]
+    bridge: Option<Arc<super::a2a_server::A2aBridge>>,
 }
 
 impl ::mcp::http_server::RawHandler for WebhookHandler {
@@ -684,7 +714,7 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
             let mut map = self.callbacks.lock().unwrap();
             match map.get(&path) {
                 Some(cb) if cb.expires_ms >= now_ms() => {
-                    Some((cb.signal.clone(), cb.verify.check(req)))
+                    Some((cb.signal.clone(), self.verified(&cb.verify, req).is_ok()))
                 }
                 Some(_) => {
                     map.remove(&path);
@@ -709,10 +739,12 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
                 workflow: String::new(),
                 node: String::new(),
                 idem_key: None,
+                token_key: None,
                 payload,
                 respond_sync: false,
                 callback: Some((signal, cb_path)),
                 trace,
+                authority: None,
                 reply: tx,
             });
         }
@@ -731,7 +763,108 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
     }
 }
 
+/// Who a webhook request's verified token names: the principal, the
+/// session it is kept as, and the delivery's own key, `jwt:<iss>#<jti>`.
+type TokenAuthority = (String, Option<String>, Option<String>);
+
 impl WebhookHandler {
+    /// Whether `req` passes `verify`: for `auth.jwt`, the person its token
+    /// names, checked by the inbound verifier for the webhook's audience,
+    /// lifetime and unseen `jti`, and named by the listener's own principal
+    /// rules — a rule naming its issuer that admits nobody it names admits
+    /// no delivery either. A person is kept in a webhook session of their
+    /// own, apart from the one their A2A calls keep, so a delivery never
+    /// moves what their listener work acts with. `Err` says why not, for
+    /// the log.
+    fn verified(
+        &self,
+        verify: &Verify,
+        req: &::mcp::http_server::RawRequest,
+    ) -> Result<Option<TokenAuthority>, String> {
+        let Verify::Jwt {
+            issuer,
+            audience,
+            max_lifetime,
+        } = verify
+        else {
+            return if verify.check(req) {
+                Ok(None)
+            } else {
+                Err("auth".into())
+            };
+        };
+        #[cfg(feature = "oauth")]
+        {
+            use crate::a2a::principals::{Resolution, TokenId};
+            let token = req
+                .header("authorization")
+                .and_then(|a| a.split_once(char::is_whitespace))
+                .filter(|(s, _)| s.eq_ignore_ascii_case("bearer"))
+                .map(|(_, t)| t.trim().to_string())
+                .ok_or("no bearer token")?;
+            let inbound = self.inbound.as_ref().ok_or("no inbound-token verifier")?;
+            let bridge = self
+                .bridge
+                .as_ref()
+                .ok_or("no A2A listener names the token's person")?;
+            let v = inbound
+                .verify_fetching(
+                    &token,
+                    crate::a2a::inbound::For::Webhook {
+                        audience,
+                        max_lifetime: *max_lifetime,
+                    },
+                )
+                .map_err(|e| e.why().to_string())?;
+            if &v.issuer != issuer {
+                return Err(format!("the token is {}'s, not {issuer}'s", v.issuer));
+            }
+            let sid = v.webhook_sid();
+            let named = bridge.resolver().token_principal(&TokenId {
+                issuer: v.issuer.clone(),
+                subject: v.subject.clone(),
+                client: v.client.clone(),
+                user: v.user,
+                principal: v.principal_id(),
+                typed: v.typed(),
+                sid: sid.clone(),
+            });
+            let Resolution::Named(p, _) = named else {
+                return Err(format!(
+                    "no a2a.principals rule naming {} admits the token's {}",
+                    v.issuer,
+                    if v.user { "person" } else { "client" }
+                ));
+            };
+            let sid = match (&self.sessions, v.user) {
+                (Some(s), true) => {
+                    s.inbound_upsert(crate::a2a::oauth::InboundSession {
+                        sid: sid.clone(),
+                        principal: p.id.clone(),
+                        typed: v.typed(),
+                        role: p.role,
+                        issuer: v.issuer.clone(),
+                        client: v.client.clone(),
+                        scopes: v.scopes.clone(),
+                        act: v.act.clone(),
+                        labels: p.labels.clone(),
+                        expires_ms: v.exp_ms,
+                        token: inbound.keeps(&v.issuer).then_some(token),
+                    });
+                    Some(sid)
+                }
+                _ => None,
+            };
+            let key = v.jti.as_ref().map(|j| format!("jwt:{}#{j}", v.issuer));
+            Ok(Some((p.id, sid, key)))
+        }
+        #[cfg(not(feature = "oauth"))]
+        {
+            let _ = (issuer, audience, max_lifetime, req);
+            Err("auth.jwt needs the oauth feature".into())
+        }
+    }
+
     /// The route table currently being served.
     fn routes(&self) -> Arc<RouteMap> {
         self.routes
@@ -757,11 +890,11 @@ impl WebhookHandler {
     pub(crate) fn stage_routes(
         &self,
         nodes: Vec<WebhookNode>,
-        webhooks: &Webhooks,
+        settings: &Settings,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<StagedRoutes, String> {
         let prev = self.routes();
-        let map = build_routes(nodes, webhooks, env, Some(&prev))?;
+        let map = build_routes(nodes, settings, env, Some(&prev))?;
         let paths: Vec<String> = map.keys().cloned().collect();
         Ok(StagedRoutes { map, paths })
     }
@@ -876,11 +1009,16 @@ impl WebhookHandler {
         {
             return R::text(405, "Method Not Allowed", b"method not allowed".to_vec());
         }
-        if !route.verify.check(req) {
-            self.log
-                .warn("webhook.denied", json!({"path": path, "reason": "auth"}));
-            return R::text(401, "Unauthorized", b"authentication failed".to_vec());
-        }
+        let signed = match self.verified(&route.verify, req) {
+            Ok(s) => s,
+            Err(why) => {
+                self.log.warn(
+                    "webhook.denied",
+                    json!({"path": path, "reason": "auth", "why": why}),
+                );
+                return R::text(401, "Unauthorized", b"authentication failed".to_vec());
+            }
+        };
 
         // Admission, after authentication: an unauthenticated caller learns
         // nothing about our load, and a legitimate one gets the honest HTTP
@@ -935,11 +1073,19 @@ impl WebhookHandler {
             route.inflight.fetch_add(1, Ordering::SeqCst);
             _guard = InflightGuard(Arc::clone(&route.inflight));
         }
+        // A person's token is a key of its own beside the sender's: its
+        // `jti`, never taken twice, so a replay after a restart — whatever
+        // idempotency header it carries — is answered `duplicate` and fires
+        // nothing.
         let idem_key = route
             .idem_header
             .as_ref()
             .and_then(|h| req.header(h))
             .map(str::to_string);
+        let (authority, token_key) = match signed {
+            Some((p, sid, key)) => (Some((p, sid)), key),
+            None => (None, None),
+        };
         let payload = self.payload(req, path);
         let (workflow, node, respond_sync) = (
             route.workflow.clone(),
@@ -952,10 +1098,12 @@ impl WebhookHandler {
                 workflow,
                 node,
                 idem_key,
+                token_key,
                 payload,
                 respond_sync,
                 callback: None,
                 trace,
+                authority,
                 reply: tx,
             }
         })
@@ -1046,6 +1194,15 @@ fn build_verify(
                 .map_err(|e| format!("webhook auth.bearer: {e}"))?;
             return Ok(Verify::Bearer { token });
         }
+        if let Some(j) = a.get("jwt") {
+            let j: crate::config::settings::inbound::WebhookJwt =
+                serde_json::from_value(j.clone()).map_err(|e| format!("webhook auth.jwt: {e}"))?;
+            return Ok(Verify::Jwt {
+                max_lifetime: j.max_lifetime(),
+                issuer: j.issuer,
+                audience: j.audience,
+            });
+        }
     }
     if let Some(d) = default {
         return build_verify_typed(d, env);
@@ -1080,6 +1237,13 @@ fn build_verify_typed(
         let token = crate::sec::secret::resolve(&b.0, env)
             .map_err(|e| format!("webhooks.default_auth.bearer: {e}"))?;
         return Ok(Verify::Bearer { token });
+    }
+    if let Some(j) = &d.jwt {
+        return Ok(Verify::Jwt {
+            issuer: j.issuer.clone(),
+            audience: j.audience.clone(),
+            max_lifetime: j.max_lifetime(),
+        });
     }
     if let Some(hd) = &d.header {
         let name = hd.name.clone().ok_or("webhooks.default_auth.header.name")?;
@@ -1132,12 +1296,13 @@ pub(crate) struct StagedRoutes {
 /// neither resets a rate limiter nor loses count of requests still running.
 fn build_routes(
     nodes: Vec<WebhookNode>,
-    webhooks: &Webhooks,
+    settings: &Settings,
     env: &dyn Fn(&str) -> Option<String>,
     prev: Option<&RouteMap>,
 ) -> Result<RouteMap, String> {
+    let webhooks = &settings.webhooks;
     let mut routes: RouteMap = HashMap::new();
-    for (workflow, node, spec, low_priority) in nodes {
+    for (workflow, node, spec, low_priority, operators) in nodes {
         let path = spec
             .get("path")
             .and_then(Value::as_str)
@@ -1155,6 +1320,34 @@ fn build_routes(
             .unwrap_or_default();
         let verify = build_verify(spec.get("auth"), webhooks.default_auth.as_ref(), env)
             .map_err(|e| format!("webhook node '{workflow}/{node}': {e}"))?;
+        // A webhook a person's token starts runs as them: the operator's
+        // own configuration declares one — its node's `auth.jwt`, or the
+        // `webhooks.default_auth.jwt` a node without auth takes — and an
+        // instruction document's workflow or one `workflow.create`/`update`
+        // stored never does. Judged on the auth the route is built with,
+        // and held to the rules a configured one is, whatever defined it.
+        if let Verify::Jwt {
+            issuer,
+            audience,
+            max_lifetime,
+        } = &verify
+        {
+            if !operators {
+                return Err(format!(
+                    "webhook node '{workflow}/{node}': its auth would be a person's token (auth.jwt, or webhooks.default_auth.jwt where the node names no auth), which makes the run that person's — only a workflow the operator's own configuration defines takes one, never an instruction document's or one workflow.create/update stored; give the node its own auth"
+                ));
+            }
+            let refused = crate::config::settings::inbound::webhook_jwt_refusals(
+                &settings.a2a,
+                &format!("webhook node '{workflow}/{node}': auth.jwt"),
+                issuer,
+                audience,
+                *max_lifetime,
+            );
+            if !refused.is_empty() {
+                return Err(refused.join("; "));
+            }
+        }
         let parallelism = spec
             .get("parallelism")
             .and_then(Value::as_u64)
@@ -1221,7 +1414,7 @@ fn build_routes(
 /// `nodes` entry is `(workflow, node, spec)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_webhook_listener(
-    webhooks: &Webhooks,
+    settings: &Settings,
     nodes: Vec<WebhookNode>,
     callbacks: SharedCallbacks,
     #[cfg(feature = "mcp-events")] mcp_hooks: crate::runtime::mcp_events::hook::Routes,
@@ -1230,8 +1423,12 @@ pub(crate) fn spawn_webhook_listener(
     write_timeout: Duration,
     pressure: std::sync::Arc<super::pressure::Pressure>,
     log: Logger,
+    #[cfg(feature = "oauth")] inbound: Option<Arc<crate::a2a::inbound::Inbound>>,
+    #[cfg(feature = "oauth")] sessions: Option<Arc<crate::a2a::oauth::Sessions>>,
+    #[cfg(feature = "oauth")] bridge: Option<Arc<super::a2a_server::A2aBridge>>,
 ) -> Result<Arc<WebhookHandler>, String> {
     use std::path::Path;
+    let webhooks = &settings.webhooks;
     let listen = webhooks
         .listen
         .as_deref()
@@ -1266,7 +1463,7 @@ pub(crate) fn spawn_webhook_listener(
         ::mcp::http_server::HttpAcceptor::Plain
     };
 
-    let routes = build_routes(nodes, webhooks, env, None)?;
+    let routes = build_routes(nodes, settings, env, None)?;
 
     let listener =
         ::mcp::http_server::bind_tcp(&bind).map_err(|e| format!("webhooks bind {bind}: {e}"))?;
@@ -1284,6 +1481,12 @@ pub(crate) fn spawn_webhook_listener(
         events_tx,
         timeout: write_timeout,
         log: log.clone(),
+        #[cfg(feature = "oauth")]
+        inbound,
+        #[cfg(feature = "oauth")]
+        sessions,
+        #[cfg(feature = "oauth")]
+        bridge,
     });
     ::mcp::http_server::spawn_accept_raw(
         listener,
@@ -1302,8 +1505,10 @@ pub(crate) fn spawn_webhook_listener(
 // ---- the loop side: idempotency + fire the run ------------------------------
 
 /// One `webhook` start node, as the route builder wants it:
-/// `(workflow, node, spec, low_priority)`.
-pub(crate) type WebhookNode = (String, String, Map<String, Value>, bool);
+/// `(workflow, node, spec, low_priority, operators)` — `operators` when the
+/// operator's own configuration defined the workflow, not an instruction
+/// document and not `workflow.create`/`update`.
+pub(crate) type WebhookNode = (String, String, Map<String, Value>, bool, bool);
 
 impl crate::runtime::reactor::Runtime {
     /// Every `webhook` start node across the armed workflows.
@@ -1328,7 +1533,15 @@ pub(crate) fn webhook_nodes_of(
             wf.steps
                 .values()
                 .filter(|s| s.kind == "webhook")
-                .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone(), low))
+                .map(|s| {
+                    (
+                        wf.name.clone(),
+                        s.id.clone(),
+                        s.spec.clone(),
+                        low,
+                        wf.configured && !wf.document,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -1342,10 +1555,12 @@ impl crate::runtime::reactor::Runtime {
             workflow,
             node,
             idem_key,
+            token_key,
             payload,
             respond_sync,
             callback,
             trace,
+            authority,
             reply,
         } = req;
 
@@ -1388,9 +1603,16 @@ impl crate::runtime::reactor::Runtime {
         // `duplicate` and never re-fires. The marker is written below, only once
         // the run is in the inbox or the event is on its stream — a delivery
         // that was refused leaves no marker, so the sender's retry is processed.
-        let marker = idem_key.as_deref();
-        if let Some(key) = marker
-            && let Some(kept) = replay_of(&self.durable, &workflow, &node, key, now_ms())
+        // A person's signed delivery is held to its token's key as well: a
+        // marker for either answers.
+        let markers: Vec<&str> = [idem_key.as_deref(), token_key.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let now = now_ms();
+        if let Some((key, kept)) = markers
+            .iter()
+            .find_map(|k| replay_of(&self.durable, &workflow, &node, k, now).map(|kept| (*k, kept)))
         {
             self.log.info(
                 "webhook.duplicate",
@@ -1476,6 +1698,7 @@ impl crate::runtime::reactor::Runtime {
                     // consumer's dedup ring drops the copy.
                     let id = idem_key
                         .clone()
+                        .or_else(|| token_key.clone())
                         .unwrap_or_else(|| crate::state::ulid::new().to_string());
                     let correlation = idem_key.as_deref();
                     // The event is consumed later, after the sender's span has
@@ -1510,7 +1733,7 @@ impl crate::runtime::reactor::Runtime {
                                 appended,
                             );
                             self.deliver_kept(
-                                marker,
+                                &markers,
                                 &workflow,
                                 &node,
                                 signal,
@@ -1553,7 +1776,7 @@ impl crate::runtime::reactor::Runtime {
                     // `on_run_terminal` with the run's result.
                     let run_id = format!("{workflow}-{}", crate::state::ulid::new());
                     self.webhook_sync.insert(run_id.clone(), reply);
-                    let (admitted, run_span) = self.fire_start_run(
+                    let (admitted, run_span) = self.fire_start_run_as(
                         &workflow,
                         &node,
                         &spec,
@@ -1561,11 +1784,12 @@ impl crate::runtime::reactor::Runtime {
                         "webhook",
                         Some(&run_id),
                         trace.as_ref(),
+                        authority.as_ref().map(|(p, s)| (p.as_str(), s.as_deref())),
                     );
                     if admitted == Admission::Accepted {
                         let unit = delivered_unit(&run_id, run_span.as_ref());
                         self.deliver_kept(
-                            marker,
+                            &markers,
                             &workflow,
                             &node,
                             signal,
@@ -1581,7 +1805,7 @@ impl crate::runtime::reactor::Runtime {
                     // the sender's trace. Its id is named now, so the answer
                     // can say which run the delivery became.
                     let run_id = format!("{workflow}-{}", crate::state::ulid::new());
-                    let (admitted, run_span) = self.fire_start_run(
+                    let (admitted, run_span) = self.fire_start_run_as(
                         &workflow,
                         &node,
                         &spec,
@@ -1589,13 +1813,14 @@ impl crate::runtime::reactor::Runtime {
                         "webhook",
                         Some(&run_id),
                         trace.as_ref(),
+                        authority.as_ref().map(|(p, s)| (p.as_str(), s.as_deref())),
                     );
                     // A `202` for a firing that was refused would tell the sender
                     // to stop retrying an event nothing kept.
                     let answer = if admitted == Admission::Accepted {
                         let unit = delivered_unit(&run_id, run_span.as_ref());
                         self.deliver_kept(
-                            marker,
+                            &markers,
                             &workflow,
                             &node,
                             signal,
@@ -1632,7 +1857,7 @@ impl crate::runtime::reactor::Runtime {
     /// appended event's.
     fn deliver_kept(
         &mut self,
-        key: Option<&str>,
+        keys: &[&str],
         workflow: &str,
         node: &str,
         signal: Option<(String, Value, Option<TraceContext>)>,
@@ -1642,7 +1867,9 @@ impl crate::runtime::reactor::Runtime {
         if let Some((tpl, payload, trace)) = signal {
             self.webhook_signal(&tpl, payload, workflow, node, trace.as_ref(), span);
         }
-        self.mark_delivered(key, workflow, node, &unit);
+        for key in keys {
+            self.mark_delivered(key, workflow, node, &unit);
+        }
     }
 
     /// Fire a route's `signal:` template with the delivery's payload, in the
@@ -1702,10 +1929,7 @@ impl crate::runtime::reactor::Runtime {
     /// happened: the sender still gets its `2xx`, and a replay is processed
     /// again — a second run, or a second copy of the event under the same id,
     /// which stream consumers deduplicate. The line says so.
-    fn mark_delivered(&mut self, key: Option<&str>, workflow: &str, node: &str, unit: &Value) {
-        let Some(key) = key else {
-            return;
-        };
+    fn mark_delivered(&mut self, key: &str, workflow: &str, node: &str, unit: &Value) {
         match record_marker(
             &self.durable,
             &mut self.idem_sweep,
@@ -2327,5 +2551,65 @@ mod rate_tests {
         assert!(parse_rate("5/0s").is_err());
         assert!(parse_rate("5/-1s").is_err());
         assert!(parse_rate("x/1s").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "oauth"))]
+mod jwt_route_tests {
+    use super::*;
+
+    /// A route a person's token signs is the operator's own configuration's
+    /// alone, judged on the auth it is built with — a node naming no auth
+    /// takes `webhooks.default_auth.jwt` — and every such route is held to
+    /// the rules the configuration's are: an audience the listener's tokens
+    /// are issued for is refused here too.
+    #[test]
+    fn only_the_operators_routes_take_a_persons_token() {
+        let settings = |aud: &str| -> Settings {
+            serde_json::from_value(json!({
+                "a2a": {"resource": "http://127.0.0.1:7443",
+                        "inbound_tokens": [{"issuer": "https://idp.example", "profile": "okta", "clients": ["fe"]}]},
+                "webhooks": {"listen": "http://127.0.0.1:0",
+                             "default_auth": {"jwt": {"issuer": "https://idp.example", "audience": aud}}},
+            }))
+            .unwrap()
+        };
+        let node = |operators: bool, auth: Option<Value>| -> WebhookNode {
+            let mut spec = json!({"kind": "webhook", "path": "/in"});
+            if let Some(a) = auth {
+                spec["auth"] = a;
+            }
+            (
+                "w".into(),
+                "in".into(),
+                spec.as_object().cloned().unwrap_or_default(),
+                false,
+                operators,
+            )
+        };
+        let env = |_: &str| None;
+        let ok = settings("https://hooks.example/in");
+        assert!(build_routes(vec![node(true, None)], &ok, &env, None).is_ok());
+        let e = build_routes(vec![node(false, None)], &ok, &env, None)
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("person's token"), "{e}");
+        let own = json!({"jwt": {"issuer": "https://idp.example", "audience": "https://hooks.example/in"}});
+        assert!(build_routes(vec![node(false, Some(own))], &ok, &env, None).is_err());
+        assert!(
+            build_routes(
+                vec![node(false, Some(json!({"bearer": "t"})))],
+                &ok,
+                &env,
+                None
+            )
+            .is_ok(),
+            "its own other auth takes no token"
+        );
+        let listener = settings("http://127.0.0.1:7443");
+        let e = build_routes(vec![node(true, None)], &listener, &env, None)
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("audience"), "{e}");
     }
 }

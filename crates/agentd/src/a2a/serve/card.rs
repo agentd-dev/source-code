@@ -442,6 +442,7 @@ mod tests {
             stream_deadline: Duration::from_secs(5),
             documents: Vec::new(),
             callback: None,
+            resource_metadata: None,
         };
         let app = App::new(
             crate::runtime::a2a_server::A2aBridge::new(tx, resolver),

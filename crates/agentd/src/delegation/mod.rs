@@ -133,11 +133,15 @@ pub enum Code {
     NoDelegation,
     DelegationNotPermitted,
     PrincipalNotDelegable,
+    /// The caller's inbound token a `subject: inbound` exchange presents
+    /// has expired (RFC 0044 §5.7, M1b).
+    SubjectExpired,
 }
 
 impl Code {
     pub fn as_str(self) -> &'static str {
         match self {
+            Code::SubjectExpired => "subject_expired",
             Code::Revoked => "revoked",
             Code::PolicyDenied => "policy_denied",
             Code::Config => "config",
@@ -476,6 +480,16 @@ pub struct Who {
 /// What kind of principal a [`Who`] is, and what its grant is held to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhoKind {
+    /// A caller an inbound access token named (RFC 0044 §5.9): the grant
+    /// is held to the IdP's subject, as an `a2a.login` principal's is,
+    /// through the provider whose issuer the token's is or lists as
+    /// equivalent; the token's own issuer and client are kept, and whether
+    /// it has expired.
+    Inbound {
+        issuer: String,
+        client: String,
+        expired: bool,
+    },
     /// A per-person operator: the grant is held to its uid and its pin.
     Person {
         fingerprint: String,
@@ -497,7 +511,7 @@ impl Who {
     fn fingerprint(&self, iss: &str, sub: &str) -> String {
         match &self.kind {
             WhoKind::Person { fingerprint, .. } => fingerprint.clone(),
-            WhoKind::Oidc => format!("oidc:{iss}#{sub}"),
+            WhoKind::Oidc | WhoKind::Inbound { .. } => format!("oidc:{iss}#{sub}"),
             WhoKind::Device { .. } => format!("idp:{iss}#{sub}"),
         }
     }
@@ -507,7 +521,7 @@ impl Who {
         match self.kind {
             WhoKind::Person { .. } if self.typed.source == Source::X509 => "x509",
             WhoKind::Person { .. } => "operator",
-            WhoKind::Oidc => "oidc",
+            WhoKind::Oidc | WhoKind::Inbound { .. } => "oidc",
             WhoKind::Device { .. } => "device",
         }
     }
@@ -533,13 +547,32 @@ pub struct SessionInfo {
     pub typed: PrincipalRef,
     pub role: crate::config::settings::Role,
     pub proof: Option<IdpProof>,
+    /// For an inbound access token's session (RFC 0044 §5.9): the token's
+    /// issuer and client, the labels its rule gave, and whether it has
+    /// expired — kept a while after, so work reads it as ended.
+    pub inbound: Option<InboundInfo>,
+}
+
+/// What an inbound token's session says of the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundInfo {
+    pub issuer: String,
+    pub client: String,
+    pub labels: BTreeMap<String, String>,
+    pub expired: bool,
 }
 
 /// The listener's session store, as the delegation supervisor reads and
 /// writes it.
 pub trait SessionBook: Send + Sync {
-    /// Session `sid`, while it lives.
+    /// Session `sid`, while it lives — an inbound token's too, expired or
+    /// not, while it is kept.
     fn session(&self, sid: &str) -> Option<SessionInfo>;
+    /// The token inbound session `sid` holds and when it expires, ms: held
+    /// only for an exchange back at its issuer (`subject: inbound`).
+    fn inbound_token(&self, _sid: &str) -> Option<(String, u64)> {
+        None
+    }
     /// Record the IdP identity session `sid` proved; `false` when it is
     /// gone.
     fn set_proof(&self, sid: &str, proof: IdpProof) -> bool;
@@ -550,12 +583,32 @@ pub trait SessionBook: Send + Sync {
 #[cfg(feature = "a2a")]
 impl SessionBook for crate::a2a::oauth::Sessions {
     fn session(&self, sid: &str) -> Option<SessionInfo> {
+        if sid.starts_with(crate::a2a::INBOUND_SID_PREFIX) {
+            let now = now_ms();
+            return self.inbound(sid).map(|s| SessionInfo {
+                principal: s.principal,
+                typed: s.typed,
+                role: s.role,
+                proof: None,
+                inbound: Some(InboundInfo {
+                    issuer: s.issuer,
+                    client: s.client,
+                    labels: s.labels,
+                    expired: now >= s.expires_ms,
+                }),
+            });
+        }
         crate::a2a::oauth::Sessions::session(self, sid).map(|s| SessionInfo {
             principal: s.principal,
             typed: s.typed,
             role: s.role,
             proof: s.proof,
+            inbound: None,
         })
+    }
+    fn inbound_token(&self, sid: &str) -> Option<(String, u64)> {
+        self.inbound(sid)
+            .and_then(|s| Some((s.token?, s.expires_ms)))
     }
     fn set_proof(&self, sid: &str, proof: IdpProof) -> bool {
         crate::a2a::oauth::Sessions::set_proof(self, sid, proof)
@@ -648,10 +701,22 @@ fn client_auth_of(
     })
 }
 
+/// How a delegated server is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerKind {
+    /// An ID-JAG from the person's IdP, redeemed at the server's
+    /// authorization server (`grant: id_jag`).
+    IdJag,
+    /// An RFC 8693 on-behalf-of exchange at the server's own authorization
+    /// server, which is the person's IdP (`grant: token_exchange`, M1b).
+    Exchange(cfg::ExchangeSubject),
+}
+
 /// A delegated server.
 #[derive(Clone)]
 pub struct Server {
     pub name: String,
+    pub kind: ServerKind,
     pub endpoint: String,
     pub idp: String,
     pub audience: String,
@@ -685,13 +750,24 @@ impl Server {
         signer: Option<&crate::sec::signer::Signer>,
     ) -> Option<Server> {
         let a = m.auth.as_ref()?;
+        let kind = if cfg::is_exchange(m) {
+            ServerKind::Exchange(a.subject.unwrap_or_default())
+        } else {
+            ServerKind::IdJag
+        };
         Some(Server {
             name: m.name.clone(),
+            kind,
             endpoint: m.endpoint.clone(),
             idp: a.idp.clone()?,
             audience: a.audience.clone()?,
             resource: a.resource_for(&m.endpoint, true)?,
-            client_id: a.client_id.clone()?,
+            // An exchange authenticates as the provider's client: the
+            // authorization server is the IdP.
+            client_id: match kind {
+                ServerKind::IdJag => a.client_id.clone()?,
+                ServerKind::Exchange(_) => String::new(),
+            },
             client_auth: client_auth_of(a.client_auth.as_ref(), signer).ok()?,
             client_secret: a.client_secret.as_ref().map(|s| s.0.clone()),
             token_url: a.token_url.clone(),
@@ -826,8 +902,10 @@ struct Live {
     used_ms: u64,
     /// The `max_age` an IdP asked a step-up for, until a sign-in meets it.
     step_up: Option<u64>,
-    /// A fresh ID token from a step-up, its `auth_time` and `exp`.
-    fresh_id_token: Option<(String, u64, u64)>,
+    /// A fresh ID token from a step-up, its `auth_time` and `exp`, and the
+    /// call it was signed in for: the subject of that call's mint and no
+    /// other's (A2A §7.6.4).
+    fresh_id_token: Option<FreshIdToken>,
     /// ID-JAGs, memory only, by `(ras, resource, scopes)`.
     id_jags: BTreeMap<String, (String, u64)>,
     /// A probe is running.
@@ -835,6 +913,38 @@ struct Live {
     /// The data key a rotated refresh token would be kept with, wrapped
     /// before the IdP is asked ([`vault::Ahead`]).
     ahead: Option<vault::Ahead>,
+}
+
+/// A step-up sign-in's ID token: its `auth_time`, its `exp`, and the call
+/// it resumes (`None`: the next mint, for a sign-in with `agentd --login
+/// idp:<name>`).
+#[derive(Clone)]
+struct FreshIdToken {
+    token: String,
+    auth_time: u64,
+    exp: u64,
+    call: Option<CallOf>,
+}
+
+impl FreshIdToken {
+    /// Whether this is the subject of `call`'s mint at `now_s`: unexpired,
+    /// signed in for that very call — its server, its unit of work and its
+    /// step — or, from `--login`, for whichever mint is next; and at least
+    /// as recent as the `max_age` a step-up asked.
+    fn serves(&self, call: &CallOf, step_up: Option<u64>, now_s: u64) -> bool {
+        self.exp > now_s + 30
+            && self.call.as_ref().is_none_or(|k| k == call)
+            && step_up.is_none_or(|m| m == 0 || self.auth_time + m >= now_s)
+    }
+}
+
+/// A delegated call as a step-up sign-in is bound to it: its server, the
+/// unit of work it is made in (`Call::unit`) and its step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallOf {
+    pub server: String,
+    pub unit: String,
+    pub step: Option<String>,
 }
 
 /// What `(grant, server)` faults hold back.
@@ -855,11 +965,15 @@ pub struct Delegation {
     /// Whether an unpinned device name binds at its first enrolment.
     first_binding: AtomicBool,
     pub persons: Vec<Person>,
+    /// Inbound token issuers, each to the issuer of the provider that lists
+    /// it among its `equivalent_issuers` (RFC 0044 §5.9).
+    equivalents: BTreeMap<String, String>,
     /// The listener's session store, once the listener is up.
     book: OnceLock<Arc<dyn SessionBook>>,
-    /// The step-up sign-ins consent gates ask for: gate → grant.
+    /// The step-up sign-ins consent gates ask for: gate → the grant, and
+    /// the call the gate holds.
     #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
-    stepping: Mutex<BTreeMap<String, String>>,
+    stepping: Mutex<BTreeMap<String, (String, CallOf)>>,
     at_cache_cap: Duration,
     liveness: Duration,
     vault: Vault,
@@ -1038,7 +1152,9 @@ pub const BOUND_BY_FIRST: &str = "first_binding";
 pub const BOUND_BY_PIN: &str = "pin";
 
 /// Whether template `t` admits `who` at `idp`: its IdP, its source, and —
-/// where it names them — its role and every label.
+/// where it names them — its role and every label; a caller an inbound
+/// token named, only through a client the template lists, where it lists
+/// any (RFC 0044 §5.9).
 fn admits(t: &Template, who: &Who, idp: &str) -> bool {
     t.idp == idp
         && t.principals.source.as_deref() == Some(who.source())
@@ -1047,6 +1163,10 @@ fn admits(t: &Template, who: &Who, idp: &str) -> bool {
             .labels
             .iter()
             .all(|(k, v)| who.labels.get(k) == Some(v))
+        && match &who.kind {
+            WhoKind::Inbound { client, .. } => t.clients.is_empty() || t.clients.contains(client),
+            _ => true,
+        }
 }
 
 /// How `who` enrols at `idp`, for a notice.
@@ -1057,6 +1177,9 @@ fn enrol_hint(who: &Who, idp: &str) -> String {
         }
         WhoKind::Person { .. } => format!("they enrol with `agentd --login idp:{idp}`"),
         WhoKind::Oidc => "they sign in at the IdP again from the display client".into(),
+        WhoKind::Inbound { .. } => {
+            "they sign in at the IdP through the link a workflow that needs it offers, or from a display client".into()
+        }
         WhoKind::Device { .. } => {
             "they sign in at the IdP from the display client (delegation.enrol)".into()
         }
@@ -1139,6 +1262,16 @@ impl Delegation {
             pins: RwLock::new(dl.device_pins.clone()),
             first_binding: AtomicBool::new(dl.device_first_binding),
             persons: Person::all(settings),
+            equivalents: settings
+                .identity
+                .providers
+                .values()
+                .flat_map(|p| {
+                    p.equivalent_issuers
+                        .iter()
+                        .map(|e| (e.clone(), p.issuer.clone()))
+                })
+                .collect(),
             book: OnceLock::new(),
             stepping: Mutex::new(BTreeMap::new()),
             at_cache_cap: dl.at_cache_cap(),
@@ -1288,6 +1421,38 @@ impl Delegation {
                     format!("the session {sid} is not this work's principal's"),
                 ));
             }
+            // A caller an inbound token named (RFC 0044 §5.9): a person
+            // only, and by the provider whose issuer the token's is or lists
+            // as equivalent — never across issuers that were not declared.
+            if let Some(ib) = s.inbound {
+                if s.role != Role::User {
+                    return Err(refuse(
+                        Code::PrincipalNotDelegable,
+                        format!(
+                            "{} is a client's own token, which names no person: it never acts with a grant",
+                            s.principal
+                        ),
+                    ));
+                }
+                let mut typed = s.typed;
+                typed.client = None;
+                if let Some(iss) = self.equivalents.get(&typed.issuer) {
+                    typed.issuer = iss.clone();
+                }
+                return Ok(Who {
+                    id: s.principal,
+                    typed,
+                    role: Role::User,
+                    labels: ib.labels,
+                    kind: WhoKind::Inbound {
+                        issuer: ib.issuer,
+                        client: ib.client,
+                        expired: ib.expired,
+                    },
+                    session: Some(sid.to_string()),
+                    proof: None,
+                });
+            }
             let kind = match s.typed.source {
                 Source::Oidc => WhoKind::Oidc,
                 Source::Device => WhoKind::Device {
@@ -1333,6 +1498,39 @@ impl Delegation {
             session: None,
             proof: None,
         })
+    }
+
+    /// What a first use the person approved for work `acting` is for is
+    /// bound to (RFC 0044 §5.10 rule 6): every grant they hold, with its
+    /// epoch, and every template that admits them, as each is now — so a
+    /// revoked or re-enrolled grant, or a changed template, makes it
+    /// another binding and the approval no longer stands. With no network.
+    pub fn acting_binding(&self, acting: Acting<'_>) -> Option<String> {
+        let who = self.who(acting).ok()?;
+        let mut parts = Vec::new();
+        {
+            let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            for idp in self.providers.values() {
+                if let Some(g) = grants.get(&who.typed.grant_id(&idp.cfg.issuer)) {
+                    parts.push(format!("grant {} {} {}", g.grant_id, g.epoch, g.template));
+                }
+            }
+        }
+        for t in self
+            .templates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|t| admits(t, &who, &t.idp))
+        {
+            parts.push(format!(
+                "template {} {}",
+                t.name,
+                crate::sha::sha256_hex(format!("{t:?}").as_bytes())
+            ));
+        }
+        parts.sort();
+        Some(crate::sha::sha256_hex(parts.join("\n").as_bytes()))
     }
 
     /// Whether `acting` holds a usable grant for `server`, with no
@@ -1396,6 +1594,32 @@ impl Delegation {
             .servers
             .get(server)
             .ok_or_else(|| refuse(Code::Config, format!("{server} is not a delegated server")))?;
+        let exchanges_inbound = s.kind == ServerKind::Exchange(cfg::ExchangeSubject::Inbound);
+        // An inbound token's work acts through it while it is good, and no
+        // longer (RFC 0044 §5.9): the call is `revoked` — or, for an
+        // exchange of the token itself, `subject_expired` (§5.7).
+        if let WhoKind::Inbound { expired: true, .. } = &who.kind {
+            return Err(if exchanges_inbound {
+                refuse(
+                    Code::SubjectExpired,
+                    format!(
+                        "the inbound token {server} would exchange for {} has expired: they call again with a fresh one",
+                        who.id
+                    ),
+                )
+            } else {
+                refuse(
+                    Code::Revoked,
+                    format!(
+                        "the inbound token this work acts through for {} has expired, and its delegated access with it",
+                        who.id
+                    ),
+                )
+            });
+        }
+        if exchanges_inbound {
+            return self.admit_inbound(who, s);
+        }
         let issuer = &self
             .providers
             .get(&s.idp)
@@ -1478,6 +1702,96 @@ impl Delegation {
                 ),
             ));
         }
+        Ok(Admitted {
+            grant,
+            who,
+            template,
+        })
+    }
+
+    /// The admission of a `subject: inbound` exchange (RFC 0044 §5.7, M1b):
+    /// the work acts through an inbound token issued by the server's own
+    /// authorization server — that issuer exactly, never one declared
+    /// equivalent, since the token goes back to it alone — for a person a
+    /// template admits there. No grant is stored: the token is the
+    /// subject, and what is handed back is the template's ceiling under
+    /// the key the person's grant would have, alive while the token is.
+    fn admit_inbound(&self, who: Who, s: &Server) -> Result<Admitted, DelegationError> {
+        let idp = self.providers.get(&s.idp).ok_or_else(|| {
+            refuse(
+                Code::Config,
+                format!("{}'s IdP {} is not declared", s.name, s.idp),
+            )
+        })?;
+        let WhoKind::Inbound { issuer, .. } = &who.kind else {
+            return Err(refuse(
+                Code::NoDelegation,
+                format!(
+                    "{} exchanges the caller's own inbound token, and this work ({}) was not started by one",
+                    s.name, who.id
+                ),
+            ));
+        };
+        if *issuer != idp.cfg.issuer {
+            return Err(refuse(
+                Code::NoDelegation,
+                format!(
+                    "{} exchanges a token at {}, and this work's token is {issuer}'s: it is sent back to its own issuer alone",
+                    s.name, idp.cfg.issuer
+                ),
+            ));
+        }
+        let expires_ms = who
+            .session
+            .as_deref()
+            .and_then(|sid| self.book()?.inbound_token(sid))
+            .map(|(_, exp)| exp)
+            .ok_or_else(|| {
+                refuse(
+                    Code::SubjectExpired,
+                    format!(
+                        "no inbound token of {} is held for {}: they call again",
+                        who.id, s.name
+                    ),
+                )
+            })?;
+        let template = self.template_for(&who, &s.idp).ok_or_else(|| {
+            refuse(
+                Code::DelegationNotPermitted,
+                format!(
+                    "no identity.delegation.templates entry admits {} at {}",
+                    who.id, s.idp
+                ),
+            )
+        })?;
+        let ceilings = ceilings_of(&template);
+        if !ceilings.contains_key(&s.name) {
+            return Err(refuse(
+                Code::DelegationNotPermitted,
+                format!(
+                    "{}'s template {} does not allow {}",
+                    who.id, template.name, s.name
+                ),
+            ));
+        }
+        let iss = idp.cfg.issuer.clone();
+        let grant = Grant {
+            grant_id: who.typed.grant_id(&iss),
+            principal: who.typed.clone(),
+            fingerprint: who.fingerprint(&iss, &who.typed.stable_id),
+            idp: s.idp.clone(),
+            idp_iss: iss,
+            sub: who.typed.stable_id.clone(),
+            email_hash: None,
+            template: template.name.clone(),
+            ceilings,
+            created_ms: now_ms(),
+            expires_ms,
+            epoch: 0,
+            rt_version: 0,
+            quota: Default::default(),
+            bound_by: None,
+        };
         Ok(Admitted {
             grant,
             who,
@@ -1665,10 +1979,22 @@ impl Delegation {
                 s.resource
             )));
         }
-        if !m.authorization_servers.contains(&s.audience) {
+        // The authorization server it names: the pinned audience of an
+        // ID-JAG's redemption, the provider itself of an exchange.
+        let (asrv, what) = match s.kind {
+            ServerKind::IdJag => (s.audience.clone(), "the pinned audience"),
+            ServerKind::Exchange(_) => (
+                self.providers
+                    .get(&s.idp)
+                    .map(|p| p.cfg.issuer.clone())
+                    .unwrap_or_default(),
+                "its IdP's issuer",
+            ),
+        };
+        if !m.authorization_servers.contains(&asrv) {
             return Err(not(format!(
-                "its protected-resource metadata names the authorization servers {:?}, not the pinned audience {}",
-                m.authorization_servers, s.audience
+                "its protected-resource metadata names the authorization servers {:?}, not {what} {asrv}",
+                m.authorization_servers
             )));
         }
         self.confirmed
@@ -1833,6 +2159,21 @@ impl Delegation {
             .retain(|k, _| k.split('|').next() != Some(server));
     }
 
+    /// The live secret values a call made for `acting` with `grant` is
+    /// scrubbed of: the grant's, and the inbound token the work acts
+    /// through, where one is held — a server's answer or error can quote
+    /// the subject it was exchanged from.
+    fn secrets_of(&self, grant: &str, acting: Acting<'_>) -> Vec<String> {
+        let mut out = self.live_values(grant, None);
+        if let Some((t, _)) = acting
+            .session
+            .and_then(|sid| self.book()?.inbound_token(sid))
+        {
+            out.push(t);
+        }
+        out
+    }
+
     /// The live secret values a call's answer is scrubbed of.
     fn live_values(&self, grant: &str, rt: Option<&str>) -> Vec<String> {
         let mut out: Vec<String> = rt.map(str::to_string).into_iter().collect();
@@ -1845,8 +2186,8 @@ impl Delegation {
         }
         self.with_live(grant, |l| {
             out.extend(l.id_jags.values().map(|(j, _)| j.clone()));
-            if let Some((t, _, _)) = &l.fresh_id_token {
-                out.push(t.clone());
+            if let Some(f) = &l.fresh_id_token {
+                out.push(f.token.clone());
             }
         });
         out
@@ -1864,6 +2205,9 @@ impl Delegation {
         c: &Call<'_>,
         allow_reuse: bool,
     ) -> Result<(), DelegationError> {
+        if let ServerKind::Exchange(subject) = s.kind {
+            return self.exchanged(s, subject, grant, scopes, entry, c);
+        }
         let now = now_ms();
         // Freshness first: no token is used for a grant whose refresh token
         // was not proved alive within `liveness_interval`.
@@ -1969,61 +2313,7 @@ impl Delegation {
         ras: &idjag::RasMeta,
         jag_key: &str,
     ) -> Result<(), DelegationError> {
-        let template = self
-            .templates
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find(|t| t.name == grant.template)
-            .cloned();
-        let budget = template
-            .as_ref()
-            .map(|t| t.budget.clone())
-            .unwrap_or_default();
-        let per_run = self
-            .runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&c.unit)
-            .copied()
-            .unwrap_or(0);
-        if per_run >= budget.per_run() {
-            return Err(refuse(
-                Code::BudgetExhausted,
-                format!(
-                    "this run made its {} mints (budget.per_run)",
-                    budget.per_run()
-                ),
-            ));
-        }
-        // The rate per person and resource (§5.13 item 7): a steered loop
-        // over scope sets, or a server's string of refusals, spends minutes
-        // of mints, never the day's budget in seconds. Every mint asked for
-        // counts, whatever the IdP answers.
-        {
-            let now = now_ms();
-            let mut minted = self.minted.lock().unwrap_or_else(|e| e.into_inner());
-            minted.retain(|_, q| q.back().is_some_and(|t| now.saturating_sub(*t) < 60_000));
-            let q = minted
-                .entry(pair(&grant.grant_id, &s.resource))
-                .or_default();
-            while q.front().is_some_and(|t| now.saturating_sub(*t) >= 60_000) {
-                q.pop_front();
-            }
-            if q.len() >= budget.per_minute() as usize {
-                return Err(refuse(
-                    Code::BudgetExhausted,
-                    format!(
-                        "{} asked for {} mints at {} in the last minute (budget.per_minute {}): tried again once the minute has passed",
-                        grant.principal.display(),
-                        q.len(),
-                        s.resource,
-                        budget.per_minute()
-                    ),
-                ));
-            }
-            q.push_back(now);
-        }
+        let budget = self.paced(grant, s, c)?;
         let idp = self
             .providers
             .get(&s.idp)
@@ -2059,7 +2349,12 @@ impl Delegation {
             }
             let mut retried = false;
             loop {
-                let (subject, subject_type) = self.subject(idp, &params, &mut g, &mut rt)?;
+                let call = CallOf {
+                    server: s.name.clone(),
+                    unit: c.unit.clone(),
+                    step: c.step.clone(),
+                };
+                let (subject, subject_type) = self.subject(idp, &params, &mut g, &mut rt, &call)?;
                 // Presenting the refresh token may rotate it.
                 let ahead = match subject_type {
                     SubjectType::RefreshToken => self.ahead(&g)?,
@@ -2118,9 +2413,16 @@ impl Delegation {
                     Err(Refusal::Oauth { code, max_age, .. })
                         if code == idjag::wire::INSUFFICIENT_USER_AUTHENTICATION =>
                     {
+                        // A sign-in another call waits to resume with is
+                        // that call's still.
                         self.with_live(&g.grant_id, |l| {
                             l.step_up = Some(max_age.unwrap_or(0));
-                            l.fresh_id_token = None;
+                            if l.fresh_id_token
+                                .as_ref()
+                                .is_some_and(|f| f.call.as_ref().is_none_or(|k| k == &call))
+                            {
+                                l.fresh_id_token = None;
+                            }
                         });
                         self.audit(
                             "delegation.step_up",
@@ -2223,23 +2525,305 @@ impl Delegation {
         }
     }
 
-    /// The exchange's subject: a step-up's fresh ID token while its
-    /// `auth_time` meets the `max_age` asked, else the provider's.
+    /// The budget of `grant`'s template, once a mint for `c` at `s` is
+    /// within it: the run's mints (`budget.per_run`), and the person's at
+    /// the resource in the last minute (`budget.per_minute`, §5.13 item 7)
+    /// — a steered loop over scope sets, or a server's string of refusals,
+    /// spends minutes of mints, never the day's budget in seconds. Every
+    /// mint asked for counts, whatever the IdP answers.
+    fn paced(
+        &self,
+        grant: &Grant,
+        s: &Server,
+        c: &Call<'_>,
+    ) -> Result<cfg::TemplateBudget, DelegationError> {
+        let budget = self
+            .templates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|t| t.name == grant.template)
+            .map(|t| t.budget.clone())
+            .unwrap_or_default();
+        let per_run = self
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&c.unit)
+            .copied()
+            .unwrap_or(0);
+        if per_run >= budget.per_run() {
+            return Err(refuse(
+                Code::BudgetExhausted,
+                format!(
+                    "this run made its {} mints (budget.per_run)",
+                    budget.per_run()
+                ),
+            ));
+        }
+        let now = now_ms();
+        let mut minted = self.minted.lock().unwrap_or_else(|e| e.into_inner());
+        minted.retain(|_, q| q.back().is_some_and(|t| now.saturating_sub(*t) < 60_000));
+        let q = minted
+            .entry(pair(&grant.grant_id, &s.resource))
+            .or_default();
+        while q.front().is_some_and(|t| now.saturating_sub(*t) >= 60_000) {
+            q.pop_front();
+        }
+        if q.len() >= budget.per_minute() as usize {
+            return Err(refuse(
+                Code::BudgetExhausted,
+                format!(
+                    "{} asked for {} mints at {} in the last minute (budget.per_minute {}): tried again once the minute has passed",
+                    grant.principal.display(),
+                    q.len(),
+                    s.resource,
+                    budget.per_minute()
+                ),
+            ));
+        }
+        q.push_back(now);
+        Ok(budget)
+    }
+
+    /// The token a request to exchange server `s` presents (RFC 0044 §5.7,
+    /// M1b): the pooled one while it may be used, else a new on-behalf-of
+    /// exchange at the server's own authorization server — of an access
+    /// token for agentd the grant's refresh token gets there (`subject:
+    /// grant`), or of the caller's inbound token (`subject: inbound`),
+    /// which is sent to its issuer and nowhere else. The result is held to
+    /// the pinned audience and the person, and any refresh token in it is
+    /// dropped: renewal is a new exchange.
+    fn exchanged(
+        &self,
+        s: &Server,
+        subject: cfg::ExchangeSubject,
+        grant: &Grant,
+        scopes: &[String],
+        entry: &Entry,
+        c: &Call<'_>,
+    ) -> Result<(), DelegationError> {
+        let now = now_ms();
+        if subject == cfg::ExchangeSubject::Grant {
+            let proved = self.with_live(&grant.grant_id, |l| l.proved_ms);
+            if now.saturating_sub(proved) > self.liveness.as_millis() as u64 {
+                self.probe(grant)?;
+            }
+        }
+        if let Some(h) = entry
+            .token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && now < h.until_ms
+        {
+            return Ok(());
+        }
+        *entry.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let budget = self.paced(grant, s, c)?;
+        let idp = self
+            .providers
+            .get(&s.idp)
+            .ok_or_else(|| refuse(Code::Config, format!("no IdP {}", s.idp)))?;
+        let meta = idp
+            .meta(self.timeout)
+            .map_err(|e| refuse(Code::IdpUnavailable, format!("{}: {e}", s.idp)))?;
+        let params = idp.params(&meta).map_err(|e| refuse(Code::Config, e))?;
+        let subject_claim = match idp.cfg.profile {
+            cfg::Profile::Okta => "uid",
+            cfg::Profile::Generic => "sub",
+        };
+        let expect = idjag::ExpectAccess {
+            subject_claim,
+            sub: Some(grant.sub.as_str()),
+        };
+        let (redeemed, sub, month) = match subject {
+            cfg::ExchangeSubject::Inbound => {
+                let (token, exp) = c
+                    .acting
+                    .session
+                    .and_then(|sid| self.book()?.inbound_token(sid))
+                    .filter(|(_, exp)| now < *exp)
+                    .ok_or_else(|| {
+                        refuse(
+                            Code::SubjectExpired,
+                            format!(
+                                "the caller's inbound token has expired, so {} has nothing to exchange: they call again with a fresh one",
+                                s.name
+                            ),
+                        )
+                    })?;
+                let ex = idjag::AccessExchange {
+                    subject_token: &token,
+                    audience: &s.audience,
+                    resource: &s.resource,
+                    scopes,
+                };
+                match idjag::exchange_access(&params, &ex, &expect, self.timeout) {
+                    Ok((r, sub)) => {
+                        let mut r = r;
+                        // Never past the token it was exchanged from.
+                        let left = exp.saturating_sub(now) / 1000;
+                        r.expires_in = Some(r.expires_in.map_or(left, |e| e.min(left)));
+                        (r, sub, None)
+                    }
+                    Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
+                        return Err(refuse(
+                            Code::SubjectExpired,
+                            format!(
+                                "{} refused to exchange the caller's inbound token (invalid_grant): it is no longer good there",
+                                s.idp
+                            ),
+                        ));
+                    }
+                    Err(r) => return Err(self.exchange_refusal(grant, s, r)),
+                }
+            }
+            cfg::ExchangeSubject::Grant => {
+                let lock = self.lock_of(&grant.grant_id);
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let (mut g, mut rt) = self.load(&grant.grant_id)?;
+                let q = g
+                    .quota
+                    .get(&s.resource)
+                    .cloned()
+                    .unwrap_or_default()
+                    .at(now_ms());
+                if q.day_count >= budget.per_day() || q.month_count >= budget.per_month() {
+                    return Err(refuse(
+                        Code::BudgetExhausted,
+                        format!(
+                            "{} has made {} exchanges today and {} this month at {} (budget {}/day, {}/month)",
+                            g.principal.display(),
+                            q.day_count,
+                            q.month_count,
+                            s.resource,
+                            budget.per_day(),
+                            budget.per_month()
+                        ),
+                    ));
+                }
+                // An access token for agentd at this authorization server,
+                // from the grant's refresh token with no `scope`: the scopes
+                // the person granted stand, offline_access with them.
+                let ahead = self.ahead(&g)?;
+                let t = match idjag::refresh(&params, &rt, self.timeout) {
+                    Ok(t) => t,
+                    Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
+                        return Err(self.revoke_dead(&g, "the refresh token is no longer good"));
+                    }
+                    Err(r) => {
+                        self.keep_ahead(&g, ahead);
+                        return Err(refuse(unavailable(&r), format!("{}: refresh: {r}", s.idp)));
+                    }
+                };
+                match &t.refresh_token {
+                    Some(new) => self.rotate(&mut g, &mut rt, new, ahead)?,
+                    None => self.keep_ahead(&g, ahead),
+                }
+                self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
+                let ex = idjag::AccessExchange {
+                    subject_token: &t.access_token,
+                    audience: &s.audience,
+                    resource: &s.resource,
+                    scopes,
+                };
+                let (r, sub) = match idjag::exchange_access(&params, &ex, &expect, self.timeout) {
+                    Ok(x) => x,
+                    Err(r) => {
+                        drop(_held);
+                        return Err(self.exchange_refusal(&g, s, r));
+                    }
+                };
+                let mut q = q;
+                q.day_count += 1;
+                q.month_count += 1;
+                g.quota.insert(s.resource.clone(), q.clone());
+                if let Err(e) = self.vault.store(&g, &rt, Some(g.rt_version)) {
+                    self.log.warn(
+                        "delegation.quota.unsaved",
+                        json!({"grant_id": g.grant_id, "err": e.to_string()}),
+                    );
+                }
+                self.remember(&g);
+                (r, sub, Some(q.month_count))
+            }
+        };
+        *self
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(c.unit.clone())
+            .or_default() += 1;
+        self.audit(
+            "delegation.minted",
+            "exchanged",
+            Some(&grant.principal.display()),
+            json!({"grant_id": grant.grant_id, "run": c.run, "step": c.step, "tool": c.tool,
+                   "grant": "token_exchange",
+                   "subject": match subject { cfg::ExchangeSubject::Grant => "grant", cfg::ExchangeSubject::Inbound => "inbound" },
+                   "as_iss": idp.cfg.issuer, "audience": s.audience, "resource": s.resource,
+                   "scope_granted": redeemed.scope, "month_to_date": month, "unattended": false}),
+        );
+        self.hold(
+            s,
+            grant,
+            entry,
+            &redeemed,
+            sub.or_else(|| Some(grant.sub.clone())),
+        );
+        Ok(())
+    }
+
+    /// An exchange the authorization server refused, by its code.
+    fn exchange_refusal(&self, g: &Grant, s: &Server, r: Refusal) -> DelegationError {
+        match r {
+            Refusal::Oauth { code, .. } if code == idjag::wire::INVALID_GRANT => {
+                self.after_invalid_grant(g, s)
+            }
+            Refusal::Oauth { code, max_age, .. }
+                if code == idjag::wire::INSUFFICIENT_USER_AUTHENTICATION =>
+            {
+                refuse(
+                    Code::StepUp,
+                    format!(
+                        "{} wants a sign-in within {}s before it exchanges for {}: the person signs in again, and the call is made again",
+                        s.idp,
+                        max_age.unwrap_or(0),
+                        s.name
+                    ),
+                )
+            }
+            Refusal::Checked(k) => {
+                self.fault(&g.grant_id, &s.name);
+                refuse(
+                    Code::Config,
+                    format!("the token exchanged for {} failed a check: {k}", s.name),
+                )
+            }
+            r => self.idp_refusal(g, s, r),
+        }
+    }
+
+    /// The exchange's subject: a step-up's fresh ID token, once, for the
+    /// call it was signed in for, while its `auth_time` meets the `max_age`
+    /// asked — a sign-in through a step-up link authorizes the call it
+    /// resumes and no other (A2A §7.6.4) — else the provider's.
     fn subject(
         &self,
         idp: &Idp,
         params: &OAuth2Params,
         g: &mut Grant,
         rt: &mut String,
+        call: &CallOf,
     ) -> Result<(String, SubjectType), DelegationError> {
         let now_s = now_ms() / 1000;
         let fresh = self.with_live(&g.grant_id, |l| {
-            l.fresh_id_token.clone().filter(|(_, auth_time, exp)| {
-                *exp > now_s + 30 && l.step_up.is_none_or(|m| m == 0 || auth_time + m >= now_s)
-            })
+            let step_up = l.step_up;
+            l.fresh_id_token.take_if(|f| f.serves(call, step_up, now_s))
         });
-        if let Some((t, _, _)) = fresh {
-            return Ok((t, SubjectType::IdToken));
+        if let Some(f) = fresh {
+            return Ok((f.token, SubjectType::IdToken));
         }
         match idp.cfg.subject() {
             SubjectKind::RefreshToken => Ok((rt.clone(), SubjectType::RefreshToken)),
@@ -2501,7 +3085,7 @@ impl Delegation {
         if let Err(e) = &mut result {
             if let Some(gid) = self.grant_id_of(c.acting, c.server) {
                 let mut v = Value::String(std::mem::take(&mut e.message));
-                scrub(&mut v, &self.live_values(&gid, None));
+                scrub(&mut v, &self.secrets_of(&gid, c.acting));
                 e.message = v.as_str().unwrap_or_default().to_string();
             }
             self.denied(
@@ -2623,7 +3207,7 @@ impl Delegation {
                     }
                     self.healthy(&grant.grant_id, c.server);
                     self.with_live(&grant.grant_id, |l| l.used_ms = now_ms());
-                    let secrets = self.live_values(&grant.grant_id, None);
+                    let secrets = self.secrets_of(&grant.grant_id, c.acting);
                     let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
                     scrub(&mut v, &secrets);
                     if let Ok(back) = serde_json::from_value(v) {
@@ -3321,7 +3905,7 @@ impl Delegation {
                 }
                 Ok(None)
             }
-            WhoKind::Oidc => {
+            WhoKind::Oidc | WhoKind::Inbound { .. } => {
                 if claims.iss != who.typed.issuer || claims.sub != who.typed.stable_id {
                     return Err(mismatch(format!(
                         "{}#{}",
@@ -3490,11 +4074,12 @@ impl Delegation {
             l.proved_ms = now;
             // A sign-in that meets the step-up asked is the next subject.
             if l.step_up.is_some() {
-                l.fresh_id_token = Some((
-                    id_token.to_string(),
-                    claims.auth_time.unwrap_or(now_s),
-                    claims.exp,
-                ));
+                l.fresh_id_token = Some(FreshIdToken {
+                    token: id_token.to_string(),
+                    auth_time: claims.auth_time.unwrap_or(now_s),
+                    exp: claims.exp,
+                    call: None,
+                });
             }
         });
         Ok(grant)
@@ -3632,7 +4217,7 @@ impl Delegation {
         idp: &str,
         max_age: Option<u64>,
     ) -> Result<PrincipalRef, String> {
-        let grant = self
+        let (grant, call) = self
             .stepping
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3674,7 +4259,12 @@ impl Delegation {
                 .map_err(|e| e.to_string())?;
         }
         self.with_live(&grant, |l| {
-            l.fresh_id_token = Some((signed.id_token.clone(), auth_time, signed.claims.exp));
+            l.fresh_id_token = Some(FreshIdToken {
+                token: signed.id_token.clone(),
+                auth_time,
+                exp: signed.claims.exp,
+                call: Some(call),
+            });
         });
         self.stepping
             .lock()
@@ -3708,12 +4298,13 @@ impl Delegation {
         Ok(())
     }
 
-    /// Gate `gate` asks for a step-up sign-in for grant `grant_id`.
-    pub(crate) fn stepping_up(&self, gate: &str, grant_id: &str) {
+    /// Gate `gate` asks for a step-up sign-in for grant `grant_id`, for
+    /// `call`: the one call its fresh ID token is then the subject of.
+    pub(crate) fn stepping_up(&self, gate: &str, grant_id: &str, call: CallOf) {
         self.stepping
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(gate.to_string(), grant_id.to_string());
+            .insert(gate.to_string(), (grant_id.to_string(), call));
     }
 }
 
@@ -3721,9 +4312,43 @@ impl Delegation {
 mod tests {
     use super::*;
 
+    /// A step-up's fresh ID token is the subject of the call it was signed
+    /// in for alone: another server's, another unit of work's or another
+    /// step's mint does not take it, nor a mint once it is too old for the
+    /// `max_age` asked; one from `--login` is the next mint's, whichever.
+    #[test]
+    fn a_fresh_id_token_serves_the_call_it_was_signed_in_for() {
+        let call = |server: &str, unit: &str, step: Option<&str>| CallOf {
+            server: server.into(),
+            unit: unit.into(),
+            step: step.map(str::to_string),
+        };
+        let gated = call("linear", "run-1", Some("write"));
+        let fresh = |bound: Option<CallOf>| FreshIdToken {
+            token: "id".into(),
+            auth_time: 1_000,
+            exp: 2_000,
+            call: bound,
+        };
+        let f = fresh(Some(gated.clone()));
+        assert!(f.serves(&gated, Some(60), 1_010));
+        for other in [
+            call("github", "run-1", Some("write")),
+            call("linear", "ctx:c2", None),
+            call("linear", "run-1", Some("read")),
+        ] {
+            assert!(!f.serves(&other, Some(60), 1_010), "{other:?}");
+        }
+        assert!(!f.serves(&gated, Some(60), 1_100), "older than max_age");
+        assert!(!f.serves(&gated, None, 1_980), "about to expire");
+        let login = fresh(None);
+        assert!(login.serves(&call("github", "ctx:c2", None), None, 1_010));
+    }
+
     fn server(mode: ScopeMode) -> Server {
         Server {
             name: "linear".into(),
+            kind: ServerKind::IdJag,
             endpoint: "https://mcp.linear.example/mcp".into(),
             idp: "okta".into(),
             audience: "https://auth.linear.example".into(),
@@ -3949,6 +4574,7 @@ mod tests {
                     principal: typed.display(),
                     typed,
                     role,
+                    inbound: None,
                     proof: proof.map(|sub| IdpProof {
                         idp: "okta".into(),
                         iss: ISS.into(),

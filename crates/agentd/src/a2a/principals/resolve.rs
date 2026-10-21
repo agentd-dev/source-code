@@ -7,9 +7,10 @@
 //!
 //! 0. a unix-socket peer (same uid, enforced at accept) is the operator;
 //! 1. a presented bearer is checked — a session token against the sessions, any
-//!    other against the server bearer and then the `bearer_ref` rules — and one
-//!    that matches nothing is a FAILED credential, never a fallback to what
-//!    else the request carried;
+//!    other against the server bearer, the `bearer_ref` rules and then, as an
+//!    inbound access token, the `a2a.inbound_tokens` issuers — and one that
+//!    matches nothing is a FAILED credential, never a fallback to what else
+//!    the request carried;
 //! 2. a verified certificate matches the `san`/`sub`/`any` rules, and is the
 //!    operator only while no rule exists at all;
 //! 3. an `any` rule names every remaining caller;
@@ -64,6 +65,30 @@ pub struct Evidence {
     /// The instance child whose channel the connection came through: the
     /// handle of the child this daemon handed it to at spawn.
     pub instance: Option<String>,
+    /// The presented bearer as an inbound access token (RFC 0044 §5.9): the
+    /// caller it names, or why it names nobody. `None` when the listener
+    /// takes no inbound tokens or the bearer is no JWT.
+    pub token: Option<Result<TokenId, String>>,
+}
+
+/// A caller an inbound access token names, as the listener's verifier
+/// found it (RFC 0044 §5.9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenId {
+    /// The issuer, one of `a2a.inbound_tokens`.
+    pub issuer: String,
+    /// The person, by the issuer's subject claim; for a client's own token,
+    /// the client.
+    pub subject: String,
+    pub client: String,
+    /// Whether the token names a person rather than a client alone.
+    pub user: bool,
+    /// `user:oidc:<iss>#<subject>` (`#<tenant>/<subject>` under a tenant
+    /// claim), or `agent:oidc:<iss>#<client>`.
+    pub principal: String,
+    pub typed: PrincipalRef,
+    /// The handle the caller's inbound session is kept under.
+    pub sid: String,
 }
 
 /// Which evidence named the caller.
@@ -83,6 +108,8 @@ pub enum Via {
     Implicit,
     /// An instance child's own channel, handed it at spawn.
     Instance,
+    /// An inbound access token from one of `a2a.inbound_tokens`.
+    Token,
 }
 
 /// Who a request is.
@@ -111,7 +138,7 @@ pub enum SessionCheck {
 
 /// Checks session tokens. Implemented by the listener's session store; the
 /// resolver only routes `agentd_at_` bearers to it.
-pub trait SessionVerifier {
+pub trait SessionVerifier: Send + Sync {
     fn verify(&self, token: &str) -> SessionCheck;
 }
 
@@ -273,7 +300,7 @@ impl Resolver {
                     _ => Resolution::Unauthenticated { presented: true },
                 };
             }
-            if self.posture.bearer || self.posture.issues_sessions() {
+            if self.posture.bearer || self.posture.issues_sessions() || self.posture.tokens {
                 if let Some(server) = &self.server_bearer
                     && crate::sha::ct_eq(server.as_bytes(), token.as_bytes())
                 {
@@ -300,6 +327,11 @@ impl Resolver {
                             _ => Resolution::Unauthenticated { presented: true },
                         };
                     }
+                }
+                // Last, as an inbound access token: the verifier has already
+                // checked it, and a token it refused is a failed credential.
+                if let Some(Ok(id)) = &ev.token {
+                    return self.token_principal(id);
                 }
                 return Resolution::Unauthenticated { presented: true };
             }
@@ -343,6 +375,63 @@ impl Resolver {
         Resolution::Unauthenticated { presented: false }
     }
 
+    /// The principal an inbound token names (RFC 0044 §5.9): by the first
+    /// rule naming its issuer whose `sub` glob admits its subject and whose
+    /// role fits it — `user` for a person's token, `agent` for a client's
+    /// own — or, where no rule names its issuer, a `user` (a client's own
+    /// token: an `agent`) with the role's defaults. Where rules name the
+    /// issuer and none admits the token, it has no role here. A client's
+    /// own token is never a user, whatever a rule says. Asked of a token
+    /// presented elsewhere too — a webhook's — so it names the same person.
+    pub fn token_principal(&self, id: &TokenId) -> Resolution {
+        let fits = |r: Role| {
+            if id.user {
+                r == Role::User
+            } else {
+                r == Role::Agent
+            }
+        };
+        let mut named = false;
+        for c in &self.rules {
+            if c.matcher.token_iss.as_deref() != Some(id.issuer.as_str()) {
+                continue;
+            }
+            named = true;
+            let sub_ok = c.matcher.sub.as_ref().is_none_or(|g| glob(g, &id.subject));
+            if sub_ok && fits(c.role) {
+                return Resolution::Named(
+                    Principal {
+                        id: id.principal.clone(),
+                        role: c.role,
+                        grants: c.grants.clone(),
+                        rate: c.rate.clone(),
+                        budget: c.budget.clone(),
+                        labels: c.labels.clone(),
+                        session: Some(id.sid.clone()),
+                        typed: Some(id.typed.clone()),
+                    },
+                    Via::Token,
+                );
+            }
+        }
+        if named {
+            return Resolution::NoRole;
+        }
+        Resolution::Named(
+            Principal {
+                id: id.principal.clone(),
+                role: if id.user { Role::User } else { Role::Agent },
+                grants: Vec::new(),
+                rate: None,
+                budget: None,
+                labels: Default::default(),
+                session: Some(id.sid.clone()),
+                typed: Some(id.typed.clone()),
+            },
+            Via::Token,
+        )
+    }
+
     /// The declared id of the rule a principal was named by, when a rule with
     /// an id named it — for the audit line, which must tell rules apart even
     /// when their callers share a role. Every operator is `operator`, so the id
@@ -379,6 +468,10 @@ impl Compiled {
     /// certificate all of them admit: every field a rule names must match.
     fn matches_cert(&self, cert: &CertId) -> bool {
         let m = &self.matcher;
+        // A token rule's `sub` is the token's subject, never a certificate's.
+        if m.token_iss.is_some() {
+            return false;
+        }
         if m.any {
             return true;
         }
@@ -549,6 +642,9 @@ fn matcher_desc(m: &settings::PrincipalMatch) -> Value {
     }
     if let Some(s) = &m.spki {
         out.insert("spki".into(), json!(s));
+    }
+    if let Some(s) = &m.token_iss {
+        out.insert("token_iss".into(), json!(s));
     }
     if m.bearer_ref.is_some() {
         out.insert("bearer_ref".into(), json!("***"));

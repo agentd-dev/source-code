@@ -549,7 +549,7 @@ live · doc, except where a row says op.
 | `mcp.servers[].exclude` | list of globs | `[]` | Never admit these; beats `allow`. |
 | `mcp.servers[].timeout` | duration | `mcp.default_timeout` | Per-call timeout for this server. |
 | `mcp.servers[].tasks` | `auto \| off` | `auto` | Whether the server may answer a long tool call with an MCP task (SEP-2663). `auto` declares the extension on 2026-07-28 connections, on the calls that have a time limit (a turn's, a workflow step's, a store adapter's); `off` never does, so the server answers every call inline. See [Long-running tool calls](connect-mcp.md#long-running-tool-calls). |
-| `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). With `grant: id_jag`, the server is reached with an enrolled person's grant, by the supervisor alone; its fields are under [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization), restart · op, and a served document may set none of them. Needs `xaa`. |
+| `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). With `grant: id_jag` — or `grant: token_exchange`, for a server behind the person's own IdP — the server is reached with an enrolled person's grant or a caller's own token, by the supervisor alone; its fields are under [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization), restart · op, and a served document may set none of them. Needs `xaa`. |
 | `mcp.servers[].oauth` | `{client_id, client_secret, token_url, scope}` | — | An OAuth client-credentials shortcut. Needs `oauth`. |
 | `mcp.servers[].aauth` | bool | `false` | Sign requests with the agent's AAuth identity. Needs `aauth`. |
 | `mcp.servers[].events[]` | list | `[]` | MCP Events bindings (op). |
@@ -1204,6 +1204,7 @@ The inbound webhook listener, for `webhook` start nodes and
 | `webhooks.default_auth.bearer` | secret | — | live · op | A static bearer. |
 | `webhooks.default_auth.header.name`, `.equals` | string, secret | — | live · op | A named header that must equal a secret. |
 | `webhooks.default_auth.none` | bool | `false` | live · op | No auth, loopback only. |
+| `webhooks.default_auth.jwt` | `{issuer, audience, max_lifetime?}` | — | live · op | A person's access token from the `a2a.inbound_tokens` issuer, for this webhook's own `audience` (never one an A2A token is issued for), living at most `max_lifetime` (`5m`, at most `15m`), its `jti` never taken twice: the run is that person's, as `a2a.principals` names them. Taken only by a node of the operator's own configuration that names no auth: never by a served document's workflow or one `workflow.create`/`update` stored. Needs `a2a` and `oauth`. |
 
 A non-loopback `webhooks.listen` needs auth on every route: a `default_auth`,
 or one on each `webhook` node. Paths under `/hooks/_` are agentd's own. A route
@@ -1212,6 +1213,7 @@ answers as follows:
 | Status | Meaning |
 |---|---|
 | `202` | kept: its run is in the durable inbox, or its event appended |
+| `401` | authentication failed — under `auth.jwt`, a token presented before included |
 | `200 duplicate` | a replay of a kept delivery (same idempotency key) within seven days |
 | `413` | larger than `store.max_value_bytes` |
 | `422` | the start node's `inputs` mapping cannot render it |
@@ -1240,6 +1242,8 @@ is [A2A API reference](a2a-reference.md).
 | `a2a.introspection.enabled` | bool | `false` | live · op | Serve the operator introspection ops (transcripts, step detail, the log ring). `admin.set` can change it at runtime. |
 | `a2a.push.enabled` | bool | `false` | live · op | Accept push-notification configs and deliver task updates to them. |
 | `a2a.push.allow_private` | bool | `false` | live · op | Permit push targets on private or loopback addresses. |
+| `a2a.resource` | URI | — | restart · op | The resource identifier enterprise access tokens are issued for (their `aud`), canonical, on the listener's origin; its RFC 9728 metadata is served under it. Needs `a2a.inbound_tokens`. |
+| `a2a.inbound_tokens[]` | list | `[]` | restart · op | The authorization servers whose JWT access tokens (RFC 9068) name a caller: `{issuer, name?, profile?, audiences?, jwks_uri?, algs?, typ?, subject_claim?, tenant_claim?, clients, require_user_token?, max_token_age?, max_chain_depth?, flow?, scopes_to_skills?}`. A TCP listener and `a2a.resource` only. Needs `a2a` and `oauth` ([Enterprise access tokens](a2a.md#enterprise-access-tokens); every field in the [A2A API reference](a2a-reference.md#listener-settings)). |
 
 With no credential at all, a loopback listener treats a local caller that
 presents nothing as the operator and warns at startup. Any credential
@@ -1258,6 +1262,7 @@ live · op.
 | `a2a.principals[].match.any` | bool | `false` | Names every caller left; cannot grant `operator`. |
 | `a2a.principals[].match.uid` | int | — | The unix listener's peer, by the uid the kernel names (`SO_PEERCRED`): the per-person operator `operator:<id>`. Alone in its `match`, with `role: operator` and an `id`, on a `unix://` listener. Needs `xaa`. |
 | `a2a.principals[].match.spki` | 64 lowercase hex | — | A verified client certificate's key, the SHA-256 of its SubjectPublicKeyInfo: the rule admits that key alone, beside any `san` or `sub`. Needs `a2a.tls.client_ca`. With an `id` and `idp_subject`, a certificate principal that delegates; an operator one is `operator:<id>`. |
+| `a2a.principals[].match.token_iss` | issuer | — | An enterprise access token from this `a2a.inbound_tokens` issuer; with `sub`, a glob over its subject. `role` `user` or `agent`, no `id` or `idp_subject`: the token names the person, `user:oidc:<iss>#<subject>` (`#<tenant>/<subject>` under `tenant_claim`). Without a rule, a token's caller is a `user`. The same rules name the person a webhook's `auth.jwt` token is. |
 | `a2a.principals[].idp_subject` | `{iss, sub}` | — | The one IdP identity this principal is, exact: required to delegate. On a `match.uid` rule, or a `match.spki` one with an `id`; `iss` is an `identity.providers` issuer. Several rules may each carry one, one per person. Needs `xaa`. |
 | `a2a.principals[].role` | `operator \| user \| agent \| anonymous` | required | The caller's role. |
 | `a2a.principals[].id` | string | derived | The principal id (`<role>:<id>`), unique across rules; `1..128` of `A-Z a-z 0-9 . _ @ : / + -`. Required on `bearer_ref` and `any` rules; a certificate rule without one is `<role>:cn=<CN>` or `<role>:san=<first SAN>`. |
@@ -1330,7 +1335,7 @@ Who answers an ask is spread over three keys, gathered here.
 |---|---|---|---|
 | `agent.ask_human_unowned` | `fallback` | live · doc | See [agent](#agent). |
 | `agent.ask_human_fallback` | `fail` | live · doc | See [agent](#agent). |
-| `security.policies[].to` | `{role: operator}` | restart · op | Which operator may answer an `action: ask` gate: `{role: operator}` narrowed by `labels`, or the id `operator`. |
+| `security.policies[].to` | `{role: operator}` | live · op | Which operator may answer an `action: ask` gate: `{role: operator}` narrowed by `labels`, or the id `operator`. |
 
 An addressee must be able to see the task, and a task is visible only to its
 owner and to operators. A `to:` naming any other principal, or a channel, is
@@ -1444,8 +1449,8 @@ Who autonomous work is done for. All paths are live · op.
 |---|---|---|---|
 | `identity.autonomous_as` | string | `system` | The principal a schedule, webhook, stream or `once` firing runs as. It may not be the per-person operator of a delegation (`operator:<id>`, the `xaa` feature): autonomous work never acts with an enrolled person's grant. |
 | `identity.labels` | map | `{}` | Labels stamped on that work. |
-| `identity.providers.<name>` | object | — | An enterprise IdP agentd is a client of: `issuer`, `client_id` (required), `profile` (`generic \| okta`), `client_auth`, `client_secret`, `sign_in`, `subject`, `subjects`, `jwks_uri`. Restart. Needs `xaa`; see [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization). |
-| `identity.delegation.seal_key`, `.seal_key_previous` | secret reference | — | 32 random bytes, hex or base64, from a mounted file or the startup prompt — never the environment. Every grant's refresh token is sealed with `seal_key`; `seal_key_previous` only opens. Required with a `grant: id_jag` server under `key_custody: local`; refused under `external`. Restart. |
+| `identity.providers.<name>` | object | — | An enterprise IdP agentd is a client of: `issuer`, `client_id` (required), `profile` (`generic \| okta`), `client_auth`, `client_secret`, `sign_in`, `subject`, `subjects`, `jwks_uri`, `equivalent_issuers` (the `a2a.inbound_tokens` issuers whose subjects are this provider's). Restart. Needs `xaa`; see [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization). |
+| `identity.delegation.seal_key`, `.seal_key_previous` | secret reference | — | 32 random bytes, hex or base64, from a mounted file or the startup prompt — never the environment. Every grant's refresh token is sealed with `seal_key`; `seal_key_previous` only opens. Required with a `grant: id_jag` or `token_exchange` server under `key_custody: local`; refused under `external`. Restart. |
 | `identity.delegation.key_custody` | `local \| external` | `local` | Who holds the seal key and every `private_key_jwt` key under `identity.providers` and on a delegated server: agentd, from secret references, or the external signer. Under `external` each such key is named by `client_auth.kid` with no `key`. Changing it means enrolling again. Restart. |
 | `identity.delegation.signer` | `{socket, uid, timeout, seal_key, seal_key_previous}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (the socket's peer must be it; agentd's own uid is a load warning, since the peer check cannot then tell the signer from agentd's workers), the bound on a whole request, the connect included (`5s`, at most `60s`), and the ids of its key-encryption key and of the one before a rotation, which only unwraps ([The external signer protocol](external-signer.md)). Restart. |
 | `identity.delegation.at_cache_cap` | duration | `60m` | The longest an access token is used, whatever `expires_in` says. Restart. |
@@ -1453,7 +1458,7 @@ Who autonomous work is done for. All paths are live · op.
 | `identity.delegation.consent_timeout` | duration | `24h` | How long a consent gate waits before it denies. Reload. |
 | `identity.delegation.consent_session_max_age` | duration | `12h` | A display session answers a consent gate only while its own IdP sign-in is younger than this. Reload. |
 | `identity.delegation.consent_per_minute` | int | `10` | How many consent gates may open for one person a minute; a call past that is refused rather than asked. At least 1. Reload. |
-| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source, role?, labels?}, idp, servers: {<name>: {scopes, document_workflows?}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers}`. `source` is `operator` (a per-person operator), `oidc` (an `a2a.login` session), `x509` (a certificate principal its rule pins by key) or `device` (a device session a pin or the first binding makes eligible); `subagents` is `none` (default) or `inherit` (a subagent acts with the grant at the delegated servers it declared); `approvers` is `[principal]` (default) or `[principal, operator]`; `agent_mode_servers` are the agent-mode servers tagged `sensitive` or `egress` the person's work may still use (every other one is hidden from it); `document_workflows` (`{name, digest}`, the `hash` `workflow.list` shows) are workflows an instruction document defined whose calls to the server are not `document_sourced`; `per_minute` (default 4) paces mints per person and server. No template matching, no enrolment. Reload: a narrowed one holds its grants at the next call; one removed, or a server removed from one, revokes what it allowed. |
+| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source, role?, labels?}, idp, servers: {<name>: {scopes, document_workflows?}}, ttl, budget: {per_day, per_month, per_run, per_minute}, subagents, approvers, agent_mode_servers}`. `source` is `operator` (a per-person operator), `oidc` (an `a2a.login` session), `x509` (a certificate principal its rule pins by key) or `device` (a device session a pin or the first binding makes eligible); `subagents` is `none` (default) or `inherit` (a subagent acts with the grant at the delegated servers it declared); `approvers` is `[principal]` (default) or `[principal, operator]`; `agent_mode_servers` are the agent-mode servers tagged `sensitive` or `egress` the person's work may still use (every other one is hidden from it); `document_workflows` (`{name, digest}`, the `hash` `workflow.list` shows) are workflows an instruction document defined whose calls to the server are not `document_sourced`; `per_minute` (default 4) paces mints per person and server; `clients` admits only the callers whose enterprise access token one of these front ends was issued (`source: oidc`). No template matching, no enrolment. Reload: a narrowed one holds its grants at the next call; one removed, or a server removed from one, revokes what it allowed. |
 | `identity.delegation.device_pins.<name>` | `{iss, sub}` | — | The one IdP identity a device name delegates as. Needs `a2a.device_grant`. Reload: a changed or removed pin revokes what it bound. |
 | `identity.delegation.device_first_binding` | bool | `false` | An unpinned device name binds to the identity of its first enrolment (a load warning: a forwarded sign-in link binds it to whoever completes it). Reload: turned off, it revokes what it bound. |
 
@@ -1495,7 +1500,8 @@ The events and metrics are in
 
 ## security
 
-Every `security` path is restart · op.
+Every `security` path is restart · op but `security.policies`, which a
+reload swaps whole or not at all ([Reload classes](#reload-classes)).
 
 | Path | Type | Default | What it does |
 |---|---|---|---|
@@ -1521,8 +1527,8 @@ Every `security` path is restart · op.
 | `security.policies[].timeout` | duration | — | For `ask`: how long to wait. |
 | `security.policies[].on_timeout` | `allow \| deny \| ask \| shadow` | `deny` | What an unanswered ask becomes. |
 | `security.policies[].to` | `{role: operator, labels}`, `operator` or `principal` | `{role: operator}` | Who may answer an `ask`. `principal` is the person whose grant the work acts with: the gate is their consent gate — agentd's own text (no `question`), never judged, denied unanswered — and needs a delegated server ([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)). |
-| `security.policies[].once_per` | `run_tool` | — | For a `to: principal` rule: ask at the first use per run — or conversation, or subagent — and tool alone; the person's approval passes later calls of the tool there until a restart. |
-| `security.experimental.id_jag` | bool | `false` | Allow `grant: id_jag` servers until ID-JAG reaches IETF working-group last call. Needs `xaa`. |
+| `security.policies[].once_per` | `run_tool` | — | For a `to: principal` rule: ask at the first use per run — or conversation, or subagent — and tool alone; the person's approval, kept with the run in the store, passes later calls of the tool of that shape there — after a restart too — while the rule, their grant and their template are unchanged, for at most a day. |
+| `security.experimental.id_jag` | bool | `false` | Allow `grant: id_jag` and `grant: token_exchange` servers until ID-JAG reaches IETF working-group last call. Needs `xaa`. |
 | `security.exec.enabled` | bool | `false` | Run the `exec` tool locally. Needs the `exec` feature, which no release binary carries. Beside a delegation (`identity.providers`, a seal key, a delegated server) only as `spawn.uid` inside Landlock, with every supervisor-only path closed to that uid; the load names each piece missing. |
 | `security.exec.allow` | list | `[]` (deny all) | Allowed command names (`argv[0]`). |
 | `security.exec.workdir` | path | — | The directory commands run in; a requested `cwd` must resolve inside it. |
@@ -1630,20 +1636,21 @@ refuses the reload with `config.reload.restart_required`:
 - `lifecycle.run_until`, `lifecycle.drain_timeout`, `lifecycle.run_id`,
   `lifecycle.exit_code_map`, `lifecycle.watch_config`
 - `a2a.listen`, `a2a.tls`, `a2a.bearer`, `a2a.url`, `a2a.device_grant`,
-  `a2a.login`, `a2a.events`
+  `a2a.login`, `a2a.events`, `a2a.resource`, `a2a.inbound_tokens`
 - `spawn.uid`, `spawn.gid`, `spawn.instance_uid`, `spawn.instance_gid`
 - `webhooks.listen`, `webhooks.tls`, `webhooks.url`
 - `observability.otel`, `observability.metrics_addr`,
   `observability.health_file`, `observability.events_ring`,
   `observability.traceparent`, `observability.audit.chain`
-- `security` (every path)
+- `security` (every path but `security.policies`)
 - `identity.providers`, and of `identity.delegation` its keys and caps:
   `seal_key`, `seal_key_previous`, `key_custody`, `signer`, `at_cache_cap`,
   `liveness_interval`
 - a per-person operator's `a2a.principals` rule, added, removed or changed,
   while a delegation is configured
 - a `services` entry of `kind: company`, added, removed or changed
-- an `mcp.servers` entry of `grant: id_jag`, added, removed or changed
+- an `mcp.servers` entry of `grant: id_jag` or `token_exchange`, added,
+  removed or changed
 
 Every other path is applied live, as follows:
 
@@ -1657,6 +1664,7 @@ Every other path is applied live, as follows:
 | `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt; the skills sources are listed again and both skills folders read again. A context keeps the skill bodies it loaded of the skills the new catalogue holds; a server's skill whose source was removed, or no longer admits it, is unloaded (`skills.unloaded`). |
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
+| `security.policies` | Swapped whole at the next call (`security.policies.reloaded`); a list that does not load, or whose rules could hold a tool a running turn or subagent dials itself, refuses the reload and the old one stands. A gate already open keeps the rule that raised it. |
 | `identity.delegation` templates, pins, first binding, consent timing | Taken at once: a narrowed template holds every grant it allowed to the new ceilings at the next call; a removed template, a server removed from one, a changed or removed pin and first binding turned off revoke the grants they allowed — at the IdP, tombstoned, off the loop — and drop the IdP proofs of those device names' sessions (`delegation.bindings.cleared`). |
 | `a2a.cors.origins` | Replaced in the live listener; removing an origin revokes it. |
 | `webhooks.default_auth` and the `webhook` routes | The route table is rebuilt on every reload, so a rotated `{{secret-file:…}}` is picked up; each route's in-flight count and rate bucket carry over. |
@@ -1679,8 +1687,9 @@ configuration. It may write only these paths; anything else is refused at load,
 naming the line:
 
 - `workflows`, `streams`, `mcp` (but not `mcp.servers[].events` or
-  `event_grants`, nor a server of `grant: id_jag` or any of its fields —
-  `auth.idp`, `.audience`, `.resource`, `.client_auth`, `.tool_scopes`,
+  `event_grants`, nor a server of `grant: id_jag` or `token_exchange` or
+  any of its fields — `auth.idp`, `.subject`, `.audience`, `.resource`,
+  `.client_auth`, `.tool_scopes`,
   `.scope_mode`, `.tools_from`, `.tools_file`, `.id_jag`, `.id_jag_reuse`,
   `.on_revoked`, `.allow_unbound_at`, `.attribution`, `.max_at_age`,
   `.trusted_output` — on any

@@ -114,12 +114,28 @@ pub enum Event {
         gate: String,
         polled: super::stepup::Polled,
     },
+    /// An `a2a.delegate` step's peer task entered or left
+    /// `TASK_STATE_AUTH_REQUIRED` (A2A §7.6): it waits on a person.
+    #[cfg(feature = "a2a")]
+    PeerAuth {
+        run: String,
+        step: String,
+        peer: String,
+        wait: crate::mcp::a2a_client::PeerWait,
+    },
     /// A delegation op's task moved on: an enrolment said where to sign in,
     /// or an op ended.
     #[cfg(all(feature = "xaa", feature = "a2a"))]
     DelegationSaid {
         task: String,
         said: crate::delegation::enrol::Said,
+    },
+    /// The sign-in a task's admission waited on came back (RFC 0044 §5.4
+    /// Door 2): its enrolment kept, or why not.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    AdmissionSignedIn {
+        task: String,
+        result: Result<String, String>,
     },
     /// A Company sign-in moved on (RFC 0047 §5.7): its gate is ready to open,
     /// or it ended. Sent by the sign-in's own thread.

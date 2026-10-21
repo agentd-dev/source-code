@@ -80,6 +80,7 @@ impl State {
             State::Submitted => TaskState::Submitted,
             State::Working => TaskState::Working,
             State::InputRequired => TaskState::InputRequired,
+            State::AuthRequired => TaskState::AuthRequired,
             State::Completed => TaskState::Completed,
             State::Failed => TaskState::Failed,
             State::Canceled => TaskState::Canceled,

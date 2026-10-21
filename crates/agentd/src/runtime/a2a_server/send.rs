@@ -503,10 +503,13 @@ impl Runtime {
         let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
         "role": role_name(principal.role)});
+        // The turn or run the message becomes acts through the session it
+        // came through (RFC 0044 §5.12).
         match self
-            .accept_event_store(
+            .accept_event_through(
                 kinds::A2A_MESSAGE,
                 Some(principal.id.clone()),
+                principal.session.clone(),
                 payload,
                 parent.as_ref(),
             )

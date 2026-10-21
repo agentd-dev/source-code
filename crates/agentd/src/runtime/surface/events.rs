@@ -407,6 +407,12 @@ impl FeedKind {
                         &["launch"],
                         json!({"required": ["sid"], "properties": {"scope": {"const": "operator"}}}),
                     ),
+                    // A sign-in at the IdP (`a2a.login`) issues a user's
+                    // session and names it.
+                    when_event(
+                        &["signed_in"],
+                        json!({"required": ["sid"], "properties": {"scope": {"const": "user"}}}),
+                    ),
                 ]);
                 s
             }
@@ -415,7 +421,14 @@ impl FeedKind {
 }
 
 /// The `event` values an `auth` event may carry.
-pub const AUTH_EVENTS: &[&str] = &["pending", "approved", "denied", "revoked", "launch"];
+pub const AUTH_EVENTS: &[&str] = &[
+    "pending",
+    "approved",
+    "denied",
+    "revoked",
+    "launch",
+    "signed_in",
+];
 
 /// Whether an event of kind `kind` carrying `data` is one the events extension
 /// allows: `Err` names the kind, or each way the data misses its schema. What
@@ -918,12 +931,16 @@ mod tests {
             let mut revoked = auth_event("revoked", "agentd-tui", "user");
             revoked["sid"] = json!("ds_0123456789abcdef");
             revoked["name"] = json!("alice-laptop");
+            // `Session::signed_in_event`'s, for an IdP sign-in.
+            let mut signed_in = auth_event("signed_in", "agentd-web", "user");
+            signed_in["sid"] = json!("fs_0123456789abcdef");
             out.extend(
                 [
                     view.event("pending"),
                     view.approved_event("alice-laptop", DeviceScope::Operator),
                     view.event("denied"),
                     revoked,
+                    signed_in,
                 ]
                 .map(|v| (FeedKind::Auth, v)),
             );
@@ -939,6 +956,8 @@ mod tests {
                        "user_code": "WDJB-MJHT"}),
                 json!({"event": "revoked", "client_id": "agentd-tui", "scope": "user",
                        "sid": "ds_0123456789abcdef", "name": "alice-laptop"}),
+                json!({"event": "signed_in", "client_id": "agentd-web", "scope": "user",
+                       "sid": "fs_0123456789abcdef"}),
             ]
             .map(|v| (FeedKind::Auth, v)),
         );

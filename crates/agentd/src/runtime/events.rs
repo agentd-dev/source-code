@@ -90,6 +90,30 @@ pub enum Event {
     /// record, a delegated server's tool catalogue.
     #[cfg(feature = "xaa")]
     Delegation(Box<crate::delegation::Note>),
+    /// A step-up sign-in a consent gate asked for came back from the IdP:
+    /// the gate's call is made again, or why it is not.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    ConsentSignedIn {
+        gate: String,
+        result: Result<(), String>,
+    },
+    /// A delegated call's IdP asked its person to sign in again: the loop
+    /// opens a step-up gate for it.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    StepUpAsked(Box<super::stepup::StepUpAsk>),
+    /// A step-up gate's device grant, as the IdP answered it or a restart
+    /// unsealed it.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    StepUpDevice {
+        gate: String,
+        device: Box<super::stepup::DeviceWait>,
+    },
+    /// A poll of a step-up gate's device grant found nothing yet.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    StepUpPolled {
+        gate: String,
+        polled: super::stepup::Polled,
+    },
     /// A delegation op's task moved on: an enrolment said where to sign in,
     /// or an op ended.
     #[cfg(all(feature = "xaa", feature = "a2a"))]

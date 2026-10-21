@@ -348,6 +348,7 @@ follow them:
 |---|---|---|
 | Nothing (a loopback listener, http or https, with no credential) | connects with no credential and is the implicit operator; it never sends an `Origin` header | signs in anyway: a request carrying `Origin` always authenticates, so a browser is never the implicit operator |
 | The device grant (`a2a.device_grant`) | `--login` (or plain `agentd-tui` on a terminal when the card offers no anonymous way in) prints a URL and a code and waits; `/login [user\|operator]` does the same from inside | the connect screen's **sign in** button, with the scope to ask for when the grant offers more than one |
+| A sign-in at your organization's identity provider (`a2a.login`, named in the daemon's RFC 8414 metadata) | `--login idp` (or plain `agentd-tui` on a terminal when the card offers no device grant) prints a start link and waits | the connect screen's **sign in with your organization** button, which shows the link to open in this browser |
 | A bearer token | `--bearer-file PATH`, or `AGENTD_BEARER` | not supported: the web UI takes no bearer |
 | The launcher | the launch code on fd 3 | the launch code in the URL fragment, or a code typed at the launcher's terminal |
 
@@ -358,6 +359,21 @@ To sign in, open http://127.0.0.1:8420/oauth2/device and enter BCDF-GHJK,
 or ask an operator to run: /approve BCDF-GHJK <name>
 waiting for approval…
 ```
+
+The sign-in at the identity provider reads:
+
+```
+To sign in, open http://127.0.0.1:8420/oauth2/start/3f9c… in your browser within 60s
+and sign in at your organization's identity provider — the link opens once.
+waiting for the sign-in…
+```
+
+The link is the daemon's own, on its listener origin. It opens once, sets a
+cookie in the browser that opens it, and sends that browser to the IdP; the
+IdP sends it back to the daemon, which issues the session only to a browser
+carrying that cookie. Open it on the machine you sign in from — a link
+forwarded to someone else signs nobody in. The client never sees an IdP
+token: it polls the daemon until the session is issued.
 
 The TUI takes one credential at a time: two sources given together are
 refused rather than ranked, and `--launch-fd` combines with none. A token is
@@ -379,7 +395,8 @@ owns`. Reserved names (`operator`, …) and configured principal ids are
 refused.
 
 **Sessions and revocation.** `/sessions` lists the signed-in sessions by id
-(`ds_…` for a device, `ls_…` for a launch). `/revoke <sid>` ends one,
+(`ds_…` for a device, `fs_…` for a sign-in at the identity provider, `ls_…`
+for a launch). `/revoke <sid>` ends one,
 `/revoke name <name>` every session of a name, and `/revoke all` all of them.
 Revoking one session leaves the name's other sessions working and never
 deletes what the principal owns. A revoked client's streams close within a
@@ -481,6 +498,33 @@ and `Enter` sends it.
   `human.judge.withheld`), and never an addressed gate. The details are in
   [Human in the loop](human-in-the-loop.md) and
   [Choose models for each job](models-and-roles-guide.md).
+
+## Acting for you at an MCP server
+
+Where the daemon acts for people at MCP servers through their identity
+provider ([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)),
+the clients are how each person enrols and answers their own gates:
+
+- **Signing in at the identity provider is your enrolment** when a template
+  admits you: `--login idp`, or **sign in with your organization**, and your
+  work acts at the server as you.
+- **A device session enrols with `/enrol <idp>`.** The reply is a start link
+  to open in your browser; the session then holds the proof of who signed in,
+  and uses the grant the device's name is bound to only while that proof is
+  the name's person. Until it has, its delegated calls fail `not_enrolled`.
+- **A consent gate is yours alone.** When agentd asks before a call it makes
+  as you, the task it holds stops at input-required, badged `agentd security
+  gate`, with agentd's own text of the call. A reply is no answer: in the TUI,
+  `/consent approve <gate>` or `/consent deny <gate>` (`/consent` lists your
+  open gates); in the web UI, the gate's **approve** and **deny** buttons.
+  Each answer is bound to the nonce and argument hash the daemon listed for
+  you, and is taken only through a session whose sign-in is recent enough
+  (`identity.delegation.consent_session_max_age`): sign in again if it is
+  refused as stale. When the IdP asks for a fresher sign-in, the gate carries
+  a link to sign in again instead, and `/consent deny <gate>` cancels it.
+- **Signing out ends it.** A revoked or expired session — and a daemon
+  restart, which ends every session — ends what it was doing for you: its
+  open gates close `revoked`, and its next delegated call fails `revoked`.
 
 ## Watch tasks and subagents
 
@@ -762,6 +806,7 @@ shows the snippet with the page's real origin filled in.
 | `--endpoint`, `-e URL` | `AGENTD_ENDPOINT` | the agent: its base URL or its card's URL |
 | `--bearer-file PATH` | `AGENTD_BEARER` | a bearer token, read from a file (the variable is read, then deleted from the process's environment) |
 | `--login [--scope user\|operator]` | | sign in with the device grant the card offers |
+| `--login idp` | | sign in at your organization's identity provider, in your browser (`a2a.login`) |
 | `--launch-fd N` | | the launcher's sign-in; not for hand use |
 | `--no-extensions` | | speak core A2A only |
 | `--top`, `--bottom items` | `AGENTD_TUI_TOP`, `AGENTD_TUI_BOTTOM` | the status line items |
@@ -808,6 +853,8 @@ in [Host the web UI](hosting-the-ui.md).
 | `/deny <code>`, `/deny all` | refuse device sign-ins | `auth.device.deny` |
 | `/sessions` | the signed-in sessions | `auth.sessions` |
 | `/revoke <sid>`, `/revoke name <name>`, `/revoke all` | end sessions | `auth.sessions.revoke` |
+| `/enrol <idp>` | sign in at an identity provider so agentd acts for you there | `delegation.enrol` |
+| `/consent`, `/consent approve <gate>`, `/consent deny <gate>` | your open consent gates; answer one | `delegation.list` |
 | `/drain` | graceful drain | `admin.drain` |
 | `/layout [top\|bottom <items>\|reset]` | the status line | |
 | `/login [user\|operator]`, `/logout` | sign in, sign out | |

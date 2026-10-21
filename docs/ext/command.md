@@ -142,19 +142,22 @@ workflow may declare them as a command.
 | `company.user_id.reset` | task | operator | a `kind: company` entry | Forget the User ID one Company knows the User by {company}, with its Session and MCP connections: the Company sees a new User from the next call on |
 | `company.sign_in` | task | operator | a `kind: company` entry | Ask the User to sign in at a Company {company, account?, scopes?, new_account?} — to the account `account` labels, the only one held, else `default`: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone |
 | `company.sign_out` | task | operator | a `kind: company` entry | Sign the User out of one account at a Company {company, account?} — the one `account` labels, or the only one held: its Account Token is revoked there and forgotten here, and every other account stays signed in. The configured User's alone |
-| `delegation.enrol` | task | operator | an identity provider or a `grant: id_jag` server | Sign the per-person operator in at an identity provider {idp, grant?} and keep their delegation grant: the task says where to sign in, and how it ended. The per-person operator's alone |
-| `delegation.list` | message | operator | an identity provider or a `grant: id_jag` server | The delegation grants this instance holds — never a secret — and the open consent gates, each with its nonce and argument hash for the person who answers it |
-| `delegation.approve` | task | operator | an identity provider or a `grant: id_jag` server | Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone |
-| `delegation.deny` | task | operator | an identity provider or a `grant: id_jag` server | Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made. The person's alone |
+| `delegation.enrol` | task | any named caller | an identity provider or a `grant: id_jag` server | Sign the caller in at an identity provider {idp, grant?} and keep their delegation grant — a per-person operator, an a2a.login session, or a device session whose name a pin or the first binding makes eligible: the task says where to sign in (a display session's start link is its signIn annotation), and how it ended. The caller's own enrolment alone |
+| `delegation.list` | message | any named caller | an identity provider or a `grant: id_jag` server | The delegation grants and the open consent gates — every one to an operator, the caller's own to anyone else; never a secret — each gate with its nonce and argument hash for the person who answers it |
+| `delegation.approve` | task | any named caller | an identity provider or a `grant: id_jag` server | Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers |
+| `delegation.deny` | task | any named caller | an identity provider or a `grant: id_jag` server | Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says |
 | `delegation.revoke` | task | operator | an identity provider or a `grant: id_jag` server | Revoke the grants {target} names — a principal, or idp:<name>#<sub> for every grant of that subject: RFC 7009 at the IdP, then the tombstone, the record and every token |
 | `delegation.forget` | task | operator | an identity provider or a `grant: id_jag` server | Erase a person {principal}: their grants revoked as delegation.revoke does, then their personal key destroyed — what it sealed in the audit chain, the arguments their consent gates showed, is unreadable from then on, and the chain still verifies |
 | `delegation.audit` | task | operator | an identity provider or a `grant: id_jag` server | A person's consent records {principal?} from the audit chain, the latest first, as the task's result — each with what the gate showed opened under their personal key, or `unreadable` once they were forgotten; read off the loop. The per-person operator reads their own; any other operator names a principal |
-| `_instance.result` | task | operator | always | reserved: a `mode: sync` child's first result, recorded on the parent's handle; operator only |
-| `_instance.emit` | task | operator | always | reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; operator only |
+| `_instance.result` | task | operator | always | reserved: a `mode: sync` child's first result, recorded on the parent's handle; sent by the child over its channel, or by an operator |
+| `_instance.emit` | task | operator | always | reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; sent by the child over its channel, or by an operator |
 | `ask_human` | task | operator | never | reserved: the model's tool for asking a person; not served over A2A |
 
 The two `_instance.*` ops are how a child instance reports to the parent that
-started it. Their arguments and results are published under `$defs/reserved`.
+started it. A child sends them over the channel its parent handed it at spawn,
+which names it `instance:<handle>`: that principal reaches these two ops about
+itself and nothing else. Their arguments and results are published under
+`$defs/reserved`.
 
 ## Workflow-declared commands
 
@@ -196,8 +199,9 @@ command. Nothing refused is run.
 - **The public card promises no reach.** It lists the vocabulary, not what
   this instance has switched on or what this caller may run. The extended card
   answers those questions, per caller.
-- **The reserved ops are the operator's.** `_instance.*` from any other caller
-  is refused on the request itself, before a task exists.
+- **The reserved ops are a child's own.** `_instance.*` from anyone but the
+  child itself — over its channel, about its own handle — or an operator is
+  refused on the request itself, before a task exists.
 
 ## Schema and examples
 

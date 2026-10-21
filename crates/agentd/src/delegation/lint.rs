@@ -117,10 +117,15 @@ pub fn lint(settings: &Settings) -> (String, Vec<Finding>) {
             );
         }
     }
-    if cfg::person(settings).is_none() && cfg::delegated_servers(settings).next().is_some() {
+    let dl = &settings.identity.delegation;
+    let enrolable = cfg::persons(settings).next().is_some()
+        || settings.a2a.login.is_some()
+        || (settings.a2a.device_grant.enabled
+            && (!dl.device_pins.is_empty() || dl.device_first_binding));
+    if !enrolable && cfg::delegated_servers(settings).next().is_some() {
         find(
             "error",
-            "no a2a.principals rule with match.uid and idp_subject: nobody can enrol".into(),
+            "nobody can enrol: no a2a.principals rule with match.uid and idp_subject, no a2a.login, and no device name a pin or the first binding makes eligible".into(),
         );
     }
     for f in &findings {

@@ -302,6 +302,15 @@ pub fn annotations(t: &Task) -> Value {
     if t.security_gate {
         a["securityGate"] = json!(true);
     }
+    // The person's consent gate the task waits on: what their display
+    // client approves or denies, or signs in at.
+    if let Some(g) = &t.consent_gate {
+        a["consentGate"] = g.clone();
+    }
+    // Where the person signs in for the enrolment the task is.
+    if let Some(l) = &t.sign_in_link {
+        a["signIn"] = l.clone();
+    }
     if let Some(op) = &t.command {
         a["command"] = json!(op);
     }

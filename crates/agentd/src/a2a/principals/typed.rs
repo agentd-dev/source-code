@@ -35,6 +35,9 @@ pub enum Source {
     Operator,
     /// Work nobody typed: `identity.autonomous_as`.
     Autonomous,
+    /// An instance child this daemon spawned, over the channel it handed
+    /// the child at spawn: `stable_id` is the child's handle.
+    Instance,
 }
 
 impl Source {
@@ -47,12 +50,27 @@ impl Source {
             Source::Aauth => "aauth",
             Source::Operator => "operator",
             Source::Autonomous => "autonomous",
+            Source::Instance => "instance",
         }
     }
 }
 
 /// The issuer every principal agentd itself authenticated is under.
 pub const AGENTD: &str = "agentd";
+
+/// An IdP identity a session proved by signing in at the IdP itself (RFC
+/// 0044 §5.2): the provider, the issuer and subject its verified ID token
+/// named, and when. A federated session is issued with one; a device
+/// session gains one by enrolling, or by signing in for a name already
+/// bound. It lives and dies with its session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdpProof {
+    /// The `identity.providers` entry.
+    pub idp: String,
+    pub iss: String,
+    pub sub: String,
+    pub at_ms: u64,
+}
 
 /// A principal as the tuple its transport established.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -130,6 +148,7 @@ impl PrincipalRef {
             Source::Operator if self.stable_id.is_empty() => "operator".to_string(),
             Source::Operator => format!("operator:{}", self.stable_id),
             Source::Autonomous => self.stable_id.clone(),
+            Source::Instance => format!("instance:{}", self.stable_id),
         }
     }
 }

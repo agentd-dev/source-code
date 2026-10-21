@@ -372,6 +372,7 @@ impl Runtime {
                 let sender = SignalSender::Principal {
                     id: principal.id.clone(),
                     operator: principal.is_operator(),
+                    session: principal.session.clone(),
                 };
                 // A peer agent's payload is its text, and the runs it wakes
                 // or starts carry it (`withhold`); any other caller's but an
@@ -479,10 +480,13 @@ impl Runtime {
         // The run is the request's unit of work: it continues the caller's
         // trace, and its task is done in the run's span.
         let parent = self.a2a_upstream(message);
+        // A run a signed-in person starts acts through the session they
+        // started it through (RFC 0044 §5.12).
         match self
-            .accept_event_store(
+            .accept_event_through(
                 kinds::WORKFLOW_RUN,
                 Some(principal.id.clone()),
+                principal.session.clone(),
                 payload,
                 parent.as_ref(),
             )
@@ -519,6 +523,7 @@ impl Runtime {
         }
         let tool_caller = crate::runtime::tools::ToolCaller {
             principal: Some(principal.id.clone()),
+            session: principal.session.clone(),
             ..Default::default()
         };
         match self.subagent_tool(&tool_caller, op, data.clone()) {

@@ -5,9 +5,16 @@
 //! the command/NL/gate routing into the runtime — lives in the runtime, so
 //! this module stays a pure model of who may call what and what a task is.
 
+/// An instance child's own channel to its parent, handed over at spawn.
+/// Always compiled, so the instance tier makes one with or without a
+/// listener of its own.
+pub mod channel;
 /// The A2A error vocabulary. Always compiled, so code outside the `a2a`
 /// feature can name a code without a copy of it.
 pub mod errors;
+/// Signing in at the IdP on the listener origin (RFC 0044 §5.4).
+#[cfg(feature = "a2a")]
+pub mod login;
 /// The authorization server the listener hosts.
 #[cfg(feature = "a2a")]
 pub mod oauth;

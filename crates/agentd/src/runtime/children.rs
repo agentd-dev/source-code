@@ -32,6 +32,10 @@ pub enum ChildKind {
         /// it. Lives exactly as long as the turn, which is the window that
         /// matters.
         msg_depth: u32,
+        /// The RFC 0043 session the message that started this turn came
+        /// through (RFC 0044 §5.12): the turn's delegated calls act through
+        /// it, as it is when each is made.
+        session: Option<String>,
     },
     /// A workflow step turn (`agent` / `think`).
     StepTurn {

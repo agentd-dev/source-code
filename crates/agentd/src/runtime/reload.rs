@@ -678,6 +678,39 @@ impl Runtime {
             self.governor = g;
             changed.push("intelligence.budget");
         }
+        // Who may delegate, for what (RFC 0044 §5.14): the templates, device
+        // pins and first binding take effect at once — a narrowed ceiling at
+        // the next mint, since every call is held to its template as it is
+        // now — and what they no longer allow is revoked off the loop (RFC
+        // 7009 retries): its epoch tombstoned, its pooled tokens purged, so
+        // runs that held it fail at their next delegated call.
+        #[cfg(feature = "xaa")]
+        if let Some(d) = self.delegation.clone() {
+            let (o, n) = (&old.identity.delegation, &new.identity.delegation);
+            if o.templates != n.templates
+                || o.device_pins != n.device_pins
+                || o.device_first_binding != n.device_first_binding
+            {
+                changed.push("identity.delegation");
+                let (revoke, cleared) = d.reload(&new);
+                if !cleared.is_empty() {
+                    self.log.info(
+                        "delegation.bindings.cleared",
+                        json!({"names": cleared, "msg": "their sessions' IdP proofs are dropped"}),
+                    );
+                }
+                if !revoke.is_empty() {
+                    std::thread::Builder::new()
+                        .name("delegation-reload-revoke".into())
+                        .spawn(move || {
+                            for (g, why) in revoke {
+                                d.revoke_grant(&g, "reload", Some(&why));
+                            }
+                        })
+                        .ok();
+                }
+            }
+        }
         // The refresh cadence: re-arm so a changed interval takes effect now
         // rather than at the next restart. `arm_freshness` disarms the old
         // timer first, so this replaces rather than stacks — and it is what
@@ -1111,19 +1144,20 @@ fn delegated_servers_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<Stri
     moved
 }
 
-/// The per-person operator's `a2a.principals` rule a reload changes while
+/// The per-person operators' `a2a.principals` rules a reload changes while
 /// the running process delegates (RFC 0044 P1): the delegation supervisor
-/// holds every grant to the rule as it read it at start — the uid, the
-/// `idp_subject` pin, the id and the labels — so a change to it is a
+/// holds every grant to the rules as it read them at start — the uid, the
+/// `idp_subject` pin, the id and the labels — so a change to one is a
 /// restart, after which a grant enrolled under the old rule is unusable
 /// (`not_enrolled`) rather than lent to whoever the new one names.
 fn person_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String> {
     let delegates = cfg::delegation::delegated_servers(old).next().is_some()
         || !old.identity.providers.is_empty();
-    if !delegates || cfg::delegation::person(old) == cfg::delegation::person(new) {
+    let persons = |s: &cfg::Settings| cfg::delegation::persons(s).cloned().collect::<Vec<_>>();
+    if !delegates || persons(old) == persons(new) {
         return Vec::new();
     }
-    vec!["a2a.principals (the per-person operator's rule)".to_string()]
+    vec!["a2a.principals (a per-person operator's rule)".to_string()]
 }
 
 /// A spec with its tags cleared: what dialing a server reads.
@@ -1319,9 +1353,10 @@ mod dial_tests {
         assert_eq!(company_entries_moved(&base, &added), ["services.mall"]);
     }
 
-    /// A reload that changes the per-person operator's rule — its uid, its
-    /// pin, its id — while the process delegates is a restart; any other
-    /// principal rule, or the same rule moved in the list, is the reload's.
+    /// A reload that changes a per-person operator's rule — its uid, its
+    /// pin, its id — or adds or removes one while the process delegates is a
+    /// restart; any other principal rule, or the same rule moved in the
+    /// list, is the reload's.
     #[test]
     fn the_per_person_rule_moved_by_a_reload_is_named_for_a_restart() {
         let settings = |rules: &str| {
@@ -1349,14 +1384,16 @@ mod dial_tests {
             person(1000, "00u1alice")
         ));
         assert!(person_moved(&base, &other_moved).is_empty());
+        let second = "    - {match: {uid: 1001}, role: operator, id: bob, idp_subject: {iss: \"https://acme.okta.example\", sub: 00u2bob}}\n";
         for moved in [
             person(0, "00u1alice"),
             person(1000, "00u2bob"),
             String::new(),
+            format!("{}{second}", person(1000, "00u1alice")),
         ] {
             assert_eq!(
                 person_moved(&base, &settings(&format!("{moved}{other}"))),
-                ["a2a.principals (the per-person operator's rule)"],
+                ["a2a.principals (a per-person operator's rule)"],
                 "{moved}"
             );
         }

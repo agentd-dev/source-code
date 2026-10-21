@@ -394,6 +394,32 @@ pub fn task_annotations_bundle() -> Value {
                 "description": "the INPUT_REQUIRED gate is one agentd raised itself — a security.policies ask, a Company's gate — never a model's ask_human or a workflow's human step; a client shows it with a badge no question text can earn",
                 "const": true,
             },
+            "consentGate": {
+                "description": "the person's consent gate the task waits on (RFC 0044 §5.10): an action gate the person approves or denies with delegation.approve or delegation.deny — reading its nonce and argument hash from delegation.list — or a sign-in the IdP asked for, at start_uri or at verification_uri with user_code",
+                "type": "object",
+                "required": ["gate", "kind"],
+                "properties": {
+                    "gate": {"type": "string"},
+                    "kind": {"enum": ["action", "authorize", "device"]},
+                    "server": {"type": "string"},
+                    "start_uri": {"type": "string"},
+                    "verification_uri": {"type": "string"},
+                    "user_code": {"type": "string"},
+                    "expires_at": {"type": "integer"},
+                },
+                "additionalProperties": false,
+            },
+            "signIn": {
+                "description": "where the person signs in at their IdP for the enrolment the task is (RFC 0044 §5.4): a single-use start link on the listener origin, good until expires_at (epoch ms), which their own browser opens — never the IdP's URL",
+                "type": "object",
+                "required": ["idp", "start_uri", "expires_at"],
+                "properties": {
+                    "idp": {"type": "string"},
+                    "start_uri": {"type": "string"},
+                    "expires_at": {"type": "integer"},
+                },
+                "additionalProperties": false,
+            },
             "command": {"description": "the command op that started the task", "type": "string"},
             "traceId": {
                 "description": "the W3C trace id of the task's work, 32 lowercase hex digits",

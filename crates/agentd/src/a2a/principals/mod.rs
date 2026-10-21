@@ -63,6 +63,30 @@ impl Principal {
         }
     }
 
+    /// An instance child of this daemon, as the channel it was handed at
+    /// spawn names it: what its reports may say they are for, and the only
+    /// thing it may send (`_instance.*`).
+    pub fn instance(handle: &str) -> Principal {
+        Principal {
+            id: format!("instance:{handle}"),
+            role: Role::Agent,
+            grants: Vec::new(),
+            rate: None,
+            budget: None,
+            labels: Default::default(),
+            session: None,
+            typed: Some(typed::PrincipalRef::local(typed::Source::Instance, handle)),
+        }
+    }
+
+    /// The handle of the instance child this caller is, when it is one.
+    pub fn instance_handle(&self) -> Option<&str> {
+        self.typed
+            .as_ref()
+            .filter(|t| t.source == typed::Source::Instance)
+            .map(|t| t.stable_id.as_str())
+    }
+
     pub fn is_operator(&self) -> bool {
         self.role == Role::Operator
     }
@@ -77,6 +101,13 @@ impl Principal {
     /// get everything, and every other role is limited to the named read/task
     /// methods below — an unrecognised method falls through to `false`.
     pub fn may(&self, method: &str, op: Option<&str>) -> bool {
+        // An instance child answers its parent with its reports, and nothing
+        // else reaches it from there: no conversation, no read, no other op.
+        // (The listener asks before it has read the message, with no op; a
+        // send that turns out to carry no report is refused once it has.)
+        if self.instance_handle().is_some() {
+            return method == "SendMessage" && op.is_none_or(|op| self.may_command(op));
+        }
         match self.role {
             Role::Anonymous => false,
             Role::Operator => true,
@@ -129,6 +160,9 @@ impl Principal {
     pub fn may_command(&self, op: &str) -> bool {
         if self.is_anonymous() {
             return false;
+        }
+        if self.instance_handle().is_some() {
+            return surface::INSTANCE_OPS.iter().any(|m| m.name == op);
         }
         let Some(spec) = surface::op_spec(op) else {
             return self.is_operator() || self.granted(op);
@@ -333,6 +367,43 @@ mod tests {
     /// A scoped `workflow.run:<pattern>` grant REPLACES the role default:
     /// the user it is written for may run those workflows and no others,
     /// though the user role alone could run any.
+    /// An instance child answers its parent with its reports and nothing
+    /// else: `_instance.*` alone — never an operator op, a read, a stream or
+    /// a conversation's task, whatever it sends.
+    #[test]
+    fn an_instance_child_may_send_its_reports_and_nothing_else() {
+        let p = Principal::instance("inst-1");
+        assert!(!p.is_operator());
+        assert!(p.may_command("_instance.result") && p.may_command("_instance.emit"));
+        for op in [
+            "admin.set",
+            "admin.drain",
+            "status",
+            "config",
+            "workflow.run",
+            "auth.sessions",
+            "delegation.list",
+        ] {
+            assert!(!p.may_command(op), "{op}");
+            assert!(!p.may("SendMessage", Some(op)), "{op}");
+        }
+        assert!(p.may("SendMessage", Some("_instance.emit")));
+        assert!(
+            p.may("SendMessage", None),
+            "asked before the message is read"
+        );
+        for m in [
+            "SendStreamingMessage",
+            "GetTask",
+            "ListTasks",
+            "CancelTask",
+            "SubscribeToTask",
+            "GetExtendedAgentCard",
+        ] {
+            assert!(!p.may(m, None), "{m}");
+        }
+    }
+
     #[test]
     fn a_scoped_workflow_grant_replaces_the_role_default() {
         let plain = with(Role::User, &[]);

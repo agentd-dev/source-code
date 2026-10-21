@@ -1457,7 +1457,19 @@ pub const TOP: &[&str] = &[
     "durable",
     "key",
     "tool",
+    "act_for",
 ];
+
+/// Why a workflow's `act_for` is refused: every value is, until RFC 0044
+/// P3 builds pre-authorised unattended runs (M4) — and one naming an RFC
+/// 0043 device principal is refused by its own code, since such a principal
+/// delegates only through a live session and unattended work has none.
+fn act_for_refusal(v: &Value) -> String {
+    if v.pointer("/principal/source").and_then(Value::as_str) == Some("device") {
+        return "act_for names a device principal (act_for_device_principal): a device principal delegates only through a live session, and an unattended run has none — the person signs in through a2a.login, and act_for names their oidc principal".into();
+    }
+    "act_for (pre-authorised unattended runs, RFC 0044 M4) is RFC 0044 P3's and not built: a schedule, a loop and a once run act as agentd itself".into()
+}
 
 /// The start kinds that do NOT keep an instance alive. `once` fires when armed
 /// and `manual` only on an explicit `workflow.run`; when either finishes there
@@ -1526,6 +1538,9 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         if !TOP.contains(&key.as_str()) {
             errs.push(format!("unknown workflow field {key:?}"));
         }
+    }
+    if let Some(a) = obj.get("act_for") {
+        errs.push(act_for_refusal(a));
     }
     let name = obj
         .get("name")
@@ -3557,6 +3572,13 @@ pub fn workflow_schema() -> Value {
                 "description": "declared run variables — {key: {schema, reducer}}"},
             "concurrency": {"type": "object", "properties": {"max_runs": {"type": "integer", "minimum": 1}, "on_overflow": {"enum": ["queue", "drop", "replace"]}, "scope": {"enum": ["workflow", "key"], "description": "what max_runs counts: every run of this workflow (default), or every run about the same `key` — the difference between a queue and a per-entity lock"}}},
             "key": {"type": "string", "description": "the logical thing a run is ABOUT, rendered from the trigger payload (e.g. \"{{payload.account_id}}\"); required by concurrency.scope: key"},
+            "act_for": {"type": "object", "additionalProperties": false, "description": "pre-authorised unattended runs (RFC 0044 M4): refused until RFC 0044 P3 builds them; one naming a device principal is refused as act_for_device_principal", "properties": {
+                "principal": {"type": "object", "additionalProperties": false, "description": "the typed principal, never a display string", "properties": {
+                    "source": {"enum": ["oidc", "x509", "operator", "device"]},
+                    "issuer": {"type": "string"},
+                    "sub": {"type": "string"},
+                    "id": {"type": "string"}}},
+                "via": {"enum": ["ciba", "standing"]}}},
             "tool": {"type": "object", "required": ["name"], "additionalProperties": false, "description": "register this workflow as a first-class tool — a callable procedure with retry, breaker, idempotency and a human gate INSIDE one apparent call. Startup config only; tags are DERIVED from what the steps reach.", "properties": {
                 "name": {"type": "string", "description": "the tool name callers see; may not shadow an internal contract"},
                 "mode": {"enum": ["sync", "async"], "description": "sync parks the caller on the run and returns its output; async returns a handle"},

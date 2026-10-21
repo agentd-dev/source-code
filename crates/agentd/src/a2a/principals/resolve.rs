@@ -61,6 +61,9 @@ pub struct Evidence {
     pub origin: bool,
     /// The unix socket peer's uid, as the kernel names it (`SO_PEERCRED`).
     pub uid: Option<u32>,
+    /// The instance child whose channel the connection came through: the
+    /// handle of the child this daemon handed it to at spawn.
+    pub instance: Option<String>,
 }
 
 /// Which evidence named the caller.
@@ -78,6 +81,8 @@ pub enum Via {
     Unix,
     /// The implicit operator of a loopback listener with no mechanism.
     Implicit,
+    /// An instance child's own channel, handed it at spawn.
+    Instance,
 }
 
 /// Who a request is.
@@ -225,6 +230,12 @@ impl Resolver {
         unix: bool,
         sessions: Option<&dyn SessionVerifier>,
     ) -> Resolution {
+        // An instance child's channel names it by construction: only the
+        // child it was handed to can open a connection through it, and
+        // what arrives that way is that child, whatever it presents.
+        if let Some(h) = &ev.instance {
+            return Resolution::Named(Principal::instance(h), Via::Instance);
+        }
         // 0. The kernel already named this peer: the daemon's own uid, or
         // root. A rule naming that uid makes it the per-person operator
         // `operator:<id>` (RFC 0044); any other admitted peer is the operator.
@@ -262,7 +273,7 @@ impl Resolver {
                     _ => Resolution::Unauthenticated { presented: true },
                 };
             }
-            if self.posture.bearer || self.posture.device {
+            if self.posture.bearer || self.posture.issues_sessions() {
                 if let Some(server) = &self.server_bearer
                     && crate::sha::ct_eq(server.as_bytes(), token.as_bytes())
                 {
@@ -631,6 +642,33 @@ mod tests {
             r.resolve(&ev(None, None), false, None),
             Resolution::Named(ref p, _) if p.id == "operator:alice"
         ));
+    }
+
+    /// A connection through an instance child's channel is that child,
+    /// whatever else it presents: a bearer the operator holds, the daemon's
+    /// own uid, a loopback peer — never the operator (RFC 0036).
+    #[test]
+    fn an_instance_childs_channel_names_the_child_alone() {
+        let settings =
+            a2a(json!({"listen": "unix:///run/agentd/a.sock", "bearer": "{{secret:B}}"}));
+        let r = Resolver::build(&settings, &secrets).unwrap();
+        let through = r.resolve(
+            &Evidence {
+                instance: Some("inst-1".into()),
+                bearer: Some("ops-token".into()),
+                uid: Some(0),
+                local: true,
+                ..Default::default()
+            },
+            true,
+            None,
+        );
+        let Resolution::Named(p, via) = &through else {
+            panic!("named: {through:?}")
+        };
+        assert_eq!((p.id.as_str(), *via), ("instance:inst-1", Via::Instance));
+        assert!(!p.is_operator());
+        assert_eq!(p.instance_handle(), Some("inst-1"));
     }
 
     /// The principals known before anyone presents anything are the operator

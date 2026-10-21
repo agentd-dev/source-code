@@ -11,6 +11,8 @@
  * - `--bearer-file PATH`, or `AGENTD_BEARER` — read, then deleted from this
  *   process's environment so nothing started later inherits it;
  * - `--login [--scope user|operator]` — the OAuth device grant the card offers;
+ * - `--login idp` — a sign-in at the person's own identity provider, which
+ *   the daemon federates (`a2a.login`, named in its RFC 8414 metadata);
  * - `--launch-fd N` — the `agentd tui` launcher's single-use launch code on an
  *   inherited fd, exchanged for an operator session held in memory only.
  * A token on the command line (`--bearer`) is not one of them: argv is
@@ -19,7 +21,7 @@
 
 import { closeSync, readFileSync, readSync } from 'node:fs';
 import { DEFAULT_LAYOUT, inert, join, originOf, parseLayout } from '../client/index.js';
-import type { DeviceCode, Layout, LoginOption } from '../client/index.js';
+import type { DeviceCode, IdpLoginFlow, Layout, LoginOption } from '../client/index.js';
 
 /** The client_id the TUI names itself by at the daemon's OAuth endpoints. */
 export const TUI_CLIENT_ID = 'agentd-tui';
@@ -39,6 +41,8 @@ export interface TuiArgs {
   endpoint?: string;
   bearerFile?: string;
   login: boolean;
+  /** `--login idp`: the sign-in at the person's identity provider. */
+  loginIdp?: boolean;
   scope?: 'user' | 'operator';
   launchFd?: number;
   noExtensions: boolean;
@@ -97,7 +101,16 @@ export function parseArgs(argv: readonly string[]): TuiArgs {
     } else if ((v = valued(argv, i, '--bottom'))) {
       out.bottom = v.value;
       i = v.next;
-    } else if (a === '--login') out.login = true;
+    } else if (a === '--login') {
+      out.login = true;
+      if (argv[i + 1] === 'idp') {
+        out.loginIdp = true;
+        i += 1;
+      }
+    } else if (a === '--login=idp') {
+      out.login = true;
+      out.loginIdp = true;
+    }
     else if (a === '--no-extensions') out.noExtensions = true;
     else if (a === '--debug') out.debug = true;
     else if (a === '--inline') out.inline = true;
@@ -108,6 +121,9 @@ export function parseArgs(argv: readonly string[]): TuiArgs {
     else throw new UsageError(`unknown option ${JSON.stringify(a.split('=')[0])} — see --help`);
   }
   if (out.scope !== undefined && !out.login) throw new UsageError('--scope chooses what --login asks for; add --login');
+  if (out.scope !== undefined && out.loginIdp === true) {
+    throw new UsageError('--scope chooses what the device grant asks for; a sign-in at the identity provider is a user session');
+  }
   return out;
 }
 
@@ -135,7 +151,7 @@ export function insecureWarning(args: Pick<TuiArgs, 'insecure'>, env: NodeJS.Pro
 export type CredentialSource =
   | { kind: 'none' }
   | { kind: 'bearer'; token: string }
-  | { kind: 'login'; scope?: 'user' | 'operator' }
+  | { kind: 'login'; scope?: 'user' | 'operator'; idp?: true }
   | { kind: 'launch'; fd: number };
 
 /**
@@ -145,7 +161,7 @@ export type CredentialSource =
  * the launcher's own sign-in and is never combined with anything.
  */
 export function resolveCredential(
-  args: Pick<TuiArgs, 'bearerFile' | 'login' | 'scope' | 'launchFd'>,
+  args: Pick<TuiArgs, 'bearerFile' | 'login' | 'loginIdp' | 'scope' | 'launchFd'>,
   envBearer: string | undefined,
   readFile: (path: string) => string = (p) => readFileSync(p, 'utf8'),
 ): CredentialSource {
@@ -174,6 +190,7 @@ export function resolveCredential(
     return { kind: 'bearer', token };
   }
   if (envBearer !== undefined) return { kind: 'bearer', token: envBearer };
+  if (args.login && args.loginIdp === true) return { kind: 'login', idp: true };
   if (args.login) return args.scope !== undefined ? { kind: 'login', scope: args.scope } : { kind: 'login' };
   return { kind: 'none' };
 }
@@ -253,21 +270,38 @@ export function unrevokedNote(signIn: 'device' | 'launch'): string {
 export const LAUNCH_REFUSED = 'the launch code was refused (already used or expired): restart `agentd tui`';
 
 /**
- * How to sign in, given the card's ways in and whether `--login` was asked:
+ * How to sign in, given the card's ways in, the daemon's sign-in at an
+ * identity provider (`idp`, from its metadata), and whether `--login` or
+ * `--login idp` was asked:
  * - `anonymous` — the card offers an anonymous way in (or declares nothing),
  *   and no sign-in was asked for;
  * - `device` — sign in with the device grant;
- * - `refuse` — nothing this client can present, or `--login` with no device
- *   grant; the reason is the whole message.
+ * - `idp` — sign in at the identity provider: asked for, or the one way in
+ *   when the card offers no device grant;
+ * - `refuse` — nothing this client can present, `--login` with no device
+ *   grant, or `--login idp` with no IdP sign-in; the reason is the whole
+ *   message.
  */
 export function chooseSignIn(
   options: readonly LoginOption[],
   wantLogin: boolean,
-): { kind: 'anonymous' } | { kind: 'device'; flow: Extract<LoginOption, { method: 'device' }>['flow'] } | { kind: 'refuse'; reason: string } {
+  idp?: IdpLoginFlow,
+  wantIdp = false,
+):
+  | { kind: 'anonymous' }
+  | { kind: 'device'; flow: Extract<LoginOption, { method: 'device' }>['flow'] }
+  | { kind: 'idp'; flow: IdpLoginFlow }
+  | { kind: 'refuse'; reason: string } {
+  if (wantIdp) {
+    return idp !== undefined
+      ? { kind: 'idp', flow: idp }
+      : { kind: 'refuse', reason: 'this agent offers no sign-in at an identity provider (its metadata names no login_authorization_endpoint): use --login or --bearer-file' };
+  }
   const device = options.find((o): o is Extract<LoginOption, { method: 'device' }> => o.method === 'device');
   if (!wantLogin && options.some((o) => o.method === 'none')) return { kind: 'anonymous' };
   if (device) return { kind: 'device', flow: device.flow };
   if (wantLogin) return { kind: 'refuse', reason: 'this agent offers no device sign-in (its card declares no device_code flow): use --bearer-file' };
+  if (idp !== undefined) return { kind: 'idp', flow: idp };
   if (options.some((o) => o.method === 'bearer')) {
     return { kind: 'refuse', reason: 'this agent requires a bearer token: pass --bearer-file PATH or set AGENTD_BEARER' };
   }
@@ -301,12 +335,13 @@ export function layoutOf(args: Pick<TuiArgs, 'top' | 'bottom'>, env: NodeJS.Proc
 export const HELP = [
   'agentd-tui — terminal display client for agentd (thin: the daemon hosts all state)',
   '',
-  '  agentd-tui --endpoint URL [--bearer-file PATH | --login [--scope user|operator]]',
+  '  agentd-tui --endpoint URL [--bearer-file PATH | --login [--scope user|operator] | --login idp]',
   '             [--no-extensions] [--top items] [--bottom items] [--debug] [--inline] [--insecure]',
   '',
   '  --endpoint, -e    the agent (its base URL or its card URL); the card says where to talk to it',
   '  --bearer-file     read a bearer token from PATH',
   '  --login           sign in with the device grant the card offers (--scope asks for one)',
+  '  --login idp       sign in at your organization\'s identity provider, in your browser',
   '  --launch-fd N     the `agentd tui` launcher hands its sign-in over this fd; not for hand use',
   '  --no-extensions   speak core A2A only',
   '  --top, --bottom   the chrome: comma-separated items (/layout lists them)',

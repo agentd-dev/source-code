@@ -98,8 +98,30 @@ export interface TaskView {
    * question text can earn.
    */
   securityGate?: boolean;
+  /**
+   * The person's consent gate the task waits on (RFC 0044): an `action` gate
+   * is answered with `delegation.approve` / `delegation.deny` — never a
+   * message; a step-up the IdP asked for is answered by signing in again,
+   * at `startUri` (`authorize`) or at `verificationUri` with `userCode`
+   * (`device`).
+   */
+  consentGate?: ConsentGate;
+  /** Where the person signs in for the enrolment the task is: a start link on the listener origin. */
+  signIn?: { idp?: string; startUri: string; expiresAt?: number };
   /** Epoch ms of `status.timestamp`; 0 when the task carries none. */
   updated: number;
+}
+
+/** A consent gate a task waits on, as its annotation says. */
+export interface ConsentGate {
+  gate: string;
+  kind: 'action' | 'authorize' | 'device';
+  server?: string;
+  startUri?: string;
+  verificationUri?: string;
+  userCode?: string;
+  /** Epoch ms the sign-in stays open. */
+  expiresAt?: number;
 }
 
 /** One events feed event. */

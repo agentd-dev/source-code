@@ -539,6 +539,9 @@ export class Mirror {
           case 'launch':
             this.feedNote(ev, `${shown(data.client_id)} signed in through the launcher (session ${shown(data.sid)})`);
             break;
+          case 'signed_in':
+            this.feedNote(ev, `${shown(data.client_id)} signed in at the identity provider (session ${shown(data.sid)})`);
+            break;
           default:
             this.feedNote(ev, `auth: ${shown(data.event)}`);
         }

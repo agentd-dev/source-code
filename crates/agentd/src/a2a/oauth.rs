@@ -47,6 +47,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::a2a::Principal;
+use crate::a2a::principals::typed::{PrincipalRef, Source};
 use crate::a2a::principals::{SESSION_TOKEN_PREFIX, SessionCheck, SessionVerifier};
 use crate::a2a::serve::limits::{NetworkKey, SourceKey, SourceLimiter};
 use crate::config::settings::{self, DeviceScope, Role};
@@ -79,6 +80,8 @@ pub const SECRET_BYTES: usize = 32;
 pub const SID_BYTES: usize = 8;
 /// The prefix of a device session's id.
 pub const DEVICE_SID_PREFIX: &str = "ds_";
+/// The prefix of an IdP-federated login session's id (RFC 0044 §5.4).
+pub const LOGIN_SID_PREFIX: &str = "fs_";
 
 /// RFC 8628 §3.2: how often a client may poll.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -132,11 +135,11 @@ pub fn os_mint() -> Mint {
     Arc::new(crate::sec::random::hex_token)
 }
 
-fn hash(secret: &str) -> String {
+pub(crate) fn hash(secret: &str) -> String {
     crate::sha::sha256_hex(secret.as_bytes())
 }
 
-fn ms(d: Duration) -> u64 {
+pub(crate) fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -150,6 +153,9 @@ pub enum SessionKind {
     /// Through the launch grant: a code the launcher minted in this process,
     /// or a request the person at the launcher's terminal approved.
     Launch,
+    /// Through a sign-in at the IdP `a2a.login` names (RFC 0044 §5.4): the
+    /// person is whoever the IdP said, and nobody approved a name.
+    Login,
 }
 
 impl SessionKind {
@@ -157,9 +163,12 @@ impl SessionKind {
         match self {
             SessionKind::Device => "device",
             SessionKind::Launch => "launch",
+            SessionKind::Login => "login",
         }
     }
 }
+
+pub use crate::a2a::principals::typed::IdpProof;
 
 /// One signed-in session.
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +195,12 @@ pub struct Session {
     /// `a2a.device_grant.rate`: every session of one principal id shares its
     /// one bucket, because the bucket is keyed by the id.
     pub rate: Option<String>,
+    /// Who it is, as the sign-in that issued it established: a device name,
+    /// an IdP's subject, or the operator (RFC 0044 §5.2). Every key derived
+    /// for its principal is over this tuple, never the display string.
+    pub typed: PrincipalRef,
+    /// The IdP identity this session itself proved, when it did.
+    pub proof: Option<IdpProof>,
 }
 
 impl Session {
@@ -210,13 +225,9 @@ impl Session {
             labels: Default::default(),
             session: Some(self.sid.clone()),
             // Every session approved under one name is one principal: the
-            // name, whichever role its scope gave it.
-            typed: Some(crate::a2a::principals::typed::PrincipalRef::local(
-                crate::a2a::principals::typed::Source::Device,
-                self.principal
-                    .split_once(':')
-                    .map_or(self.principal.as_str(), |(_, name)| name),
-            )),
+            // name, whichever role its scope gave it — and every session of
+            // one IdP subject is that subject.
+            typed: Some(self.typed.clone()),
         }
     }
 
@@ -238,6 +249,10 @@ impl Session {
         if let Some(r) = &self.approved_rule {
             v["approved_rule"] = json!(r);
         }
+        v["source"] = json!(self.typed.source.as_str());
+        if let Some(p) = &self.proof {
+            v["idp_proof"] = json!({"idp": p.idp, "iss": p.iss, "sub": p.sub, "at": p.at_ms});
+        }
         v
     }
 
@@ -245,6 +260,14 @@ impl Session {
     /// token.
     pub fn revoked_line(&self, reason: &str) -> Value {
         json!({"sid": self.sid, "name": self.name, "principal": self.principal, "reason": reason})
+    }
+
+    /// The feed's `auth` event for a person signed in at the IdP
+    /// (`a2a.login`): the session, never its token.
+    pub fn signed_in_event(&self) -> Value {
+        let mut v = auth_event("signed_in", &self.client_id, role_name(self.role));
+        v["sid"] = json!(self.sid);
+        v
     }
 
     /// The feed's `auth` event for this session's end, in the shape every
@@ -364,6 +387,48 @@ impl Sessions {
         t.by_token.insert(h, session);
     }
 
+    /// Session `sid`, while it may still be served.
+    pub fn session(&self, sid: &str) -> Option<Session> {
+        let now = (self.clock)();
+        let t = self.table();
+        t.by_sid
+            .get(sid)
+            .and_then(|h| t.by_token.get(h))
+            .filter(|s| !s.expired(now))
+            .cloned()
+    }
+
+    /// Record the IdP identity session `sid` proved (RFC 0044 §5.2);
+    /// `false` when the session is gone.
+    pub fn set_proof(&self, sid: &str, proof: IdpProof) -> bool {
+        let mut t = self.table();
+        let Some(h) = t.by_sid.get(sid).cloned() else {
+            return false;
+        };
+        match t.by_token.get_mut(&h) {
+            Some(s) => {
+                s.proof = Some(proof);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop the IdP proof of every session `drop` names — a pin changed
+    /// or a binding was cleared — and say whose: their sids.
+    pub fn drop_proofs(&self, drop: impl Fn(&Session) -> bool) -> Vec<String> {
+        let mut t = self.table();
+        let mut out = Vec::new();
+        for s in t.by_token.values_mut() {
+            if s.proof.is_some() && drop(s) {
+                s.proof = None;
+                out.push(s.sid.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Whether session `sid` may still be served.
     pub fn alive(&self, sid: &str) -> bool {
         let now = (self.clock)();
@@ -457,7 +522,7 @@ impl OAuthError {
         }
     }
 
-    fn invalid_request(description: impl Into<String>) -> OAuthError {
+    pub(crate) fn invalid_request(description: impl Into<String>) -> OAuthError {
         OAuthError::new("invalid_request", description)
     }
 
@@ -465,7 +530,7 @@ impl OAuthError {
     /// issuer is not yet known. RFC 6749 §4.1.2.1's `temporarily_unavailable`,
     /// at 503 — never a panic, which under `panic = "abort"` would end every
     /// session along with the request.
-    fn unavailable(description: impl Into<String>) -> OAuthError {
+    pub(crate) fn unavailable(description: impl Into<String>) -> OAuthError {
         OAuthError {
             status: 503,
             error: "temporarily_unavailable",
@@ -535,7 +600,7 @@ pub fn parse_form(content_type: Option<&str>, body: &[u8]) -> Result<Form, OAuth
 }
 
 /// One percent-encoded form component (`+` is a space).
-fn decode(raw: &[u8]) -> Result<String, OAuthError> {
+pub(crate) fn decode(raw: &[u8]) -> Result<String, OAuthError> {
     let bad = || OAuthError::invalid_request("the body is not valid form encoding");
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
@@ -558,7 +623,7 @@ fn decode(raw: &[u8]) -> Result<String, OAuthError> {
 /// A `client_id`: 1–64 characters of `[A-Za-z0-9._-]`. It is shown to the
 /// operator deciding on the code, so nothing in it can be a control character
 /// or pass for other text.
-fn client_id_ok(id: &str) -> bool {
+pub(crate) fn client_id_ok(id: &str) -> bool {
     (1..=CLIENT_ID_MAX).contains(&id.len())
         && id
             .bytes()
@@ -1323,7 +1388,7 @@ pub enum Notice {
 }
 
 impl Reply {
-    fn json(status: u16, body: Value) -> Reply {
+    pub(crate) fn json(status: u16, body: Value) -> Reply {
         Reply {
             status,
             body: ReplyBody::Json(body),
@@ -1332,13 +1397,13 @@ impl Reply {
         }
     }
 
-    fn error(e: OAuthError) -> Reply {
+    pub(crate) fn error(e: OAuthError) -> Reply {
         Reply::json(e.status, e.body())
     }
 
     /// A route this authority does not serve. The listener mounts none of
     /// them, so this is only a second lock.
-    fn not_found() -> Reply {
+    pub(crate) fn not_found() -> Reply {
         Reply {
             status: 404,
             body: ReplyBody::Empty,
@@ -1347,7 +1412,7 @@ impl Reply {
         }
     }
 
-    fn limited(retry_after: u64, why: &str) -> Reply {
+    pub(crate) fn limited(retry_after: u64, why: &str) -> Reply {
         let mut r = Reply::json(
             429,
             json!({"error": "temporarily_unavailable", "error_description": why}),
@@ -1357,12 +1422,17 @@ impl Reply {
     }
 }
 
-/// The authorization server: the device grant and the launch grant — either
-/// or both — their per-source limits, and the sessions they issue into, which
-/// it borrows, because they exist on the listener with or without it.
+/// The authorization server: the device grant, the IdP sign-ins and the
+/// launch grant — any of them — their per-source limits, and the sessions
+/// they issue into, which it borrows, because they exist on the listener
+/// with or without it.
 pub struct Authority {
     /// The device grant, when `a2a.device_grant.enabled`.
     device: Option<DeviceGrant>,
+    /// The sign-ins at the IdP on this origin (RFC 0044 §5.4): `a2a.login`'s,
+    /// and those a signed-in person starts. Present on every listener that
+    /// issues sessions.
+    signins: Option<Arc<crate::a2a::login::SignIns>>,
     /// The launch grant, while a launcher has installed its slot.
     launch: Option<Arc<LaunchSlot>>,
     /// Device authorizations per source.
@@ -1383,7 +1453,7 @@ pub struct Authority {
 /// than `burst` puts the source over. The limiter's own rule is "over once
 /// the count EXCEEDS the burst", which counts failures; admitting `burst`
 /// requests means an allowance of `burst - 1` there.
-fn bucket(burst: u32, refill: Duration) -> SourceLimiter {
+pub(crate) fn bucket(burst: u32, refill: Duration) -> SourceLimiter {
     SourceLimiter::new(
         burst.saturating_sub(1),
         refill,
@@ -1391,7 +1461,7 @@ fn bucket(burst: u32, refill: Duration) -> SourceLimiter {
     )
 }
 
-fn take(limiter: &SourceLimiter, peer: Option<IpAddr>) -> Result<(), u64> {
+pub(crate) fn take(limiter: &SourceLimiter, peer: Option<IpAddr>) -> Result<(), u64> {
     let Some(ip) = peer else {
         return Ok(());
     };
@@ -1410,6 +1480,7 @@ impl Authority {
     ) -> Authority {
         Authority {
             device,
+            signins: None,
             launch,
             limiter: bucket(AUTHORIZE_BURST, AUTHORIZE_REFILL),
             token_limiter: bucket(TOKEN_BURST, TOKEN_REFILL),
@@ -1427,6 +1498,22 @@ impl Authority {
     /// The launcher's slot, when one is installed.
     pub fn launch(&self) -> Option<&Arc<LaunchSlot>> {
         self.launch.as_ref()
+    }
+
+    /// The same authority, serving the IdP sign-ins `signins` on its origin.
+    pub fn with_signins(mut self, signins: Option<Arc<crate::a2a::login::SignIns>>) -> Authority {
+        self.signins = signins;
+        self
+    }
+
+    /// The IdP sign-ins on this origin, when the listener issues sessions.
+    pub fn signins(&self) -> Option<&Arc<crate::a2a::login::SignIns>> {
+        self.signins.as_ref()
+    }
+
+    /// Whether `a2a.login` is served here.
+    pub fn login(&self) -> bool {
+        self.signins.as_ref().is_some_and(|s| s.login().is_some())
     }
 
     /// Settle the issuer: the advertised origin, with no trailing slash.
@@ -1599,6 +1686,7 @@ impl Authority {
             return Reply::error(OAuthError::invalid_request("grant_type is required"));
         };
         let launch_grant = crate::runtime::surface::launch::LAUNCH_GRANT_TYPE;
+        let login_grant = crate::a2a::login::LOGIN_GRANT_TYPE;
         match (&self.device, &self.launch) {
             (Some(device), _) if grant_type == DEVICE_CODE_GRANT => {
                 self.device_token(device, &form, peer)
@@ -1606,12 +1694,22 @@ impl Authority {
             (_, Some(slot)) if grant_type == launch_grant => {
                 self.launch_token(slot, &form, peer, origin)
             }
+            _ if grant_type == login_grant && self.login() => {
+                if let Err(retry) = take(&self.token_limiter, peer) {
+                    return Reply::limited(retry, "too many token requests from this source");
+                }
+                match &self.signins {
+                    Some(s) => s.login_token(&form),
+                    None => Reply::not_found(),
+                }
+            }
             _ => {
                 let offered: Vec<&str> = self
                     .device
                     .as_ref()
                     .map(|_| DEVICE_CODE_GRANT)
                     .into_iter()
+                    .chain(self.login().then_some(login_grant))
                     .chain(self.launch.as_ref().map(|_| launch_grant))
                     .collect();
                 Reply::error(OAuthError::new(
@@ -1698,6 +1796,7 @@ impl Authority {
             DeviceScope::Operator => (Role::Operator, "operator".to_string()),
             DeviceScope::User => (Role::User, format!("user:{}", approval.name)),
         };
+        let typed = PrincipalRef::local(Source::Device, &approval.name);
         self.sessions.insert(
             &token,
             Session {
@@ -1712,6 +1811,8 @@ impl Authority {
                 approved_by: approval.approved_by,
                 approved_rule: approval.rule,
                 rate: device.rate.clone(),
+                typed,
+                proof: None,
             },
         );
         Reply::json(
@@ -1918,6 +2019,8 @@ impl Authority {
             approved_rule: None,
             // The operator is rate-exempt; a launch session is the operator.
             rate: None,
+            typed: PrincipalRef::operator(),
+            proof: None,
         };
         self.sessions.insert(&token, session.clone());
         let mut body = json!({
@@ -2045,32 +2148,53 @@ impl Authority {
     }
 
     /// `GET /.well-known/oauth-authorization-server` (RFC 8414). Served with
-    /// the device grant only; it names the launch grant too while a slot is
-    /// installed, since the token endpoint then redeems it.
+    /// the device grant or `a2a.login` — the device endpoints only with the
+    /// one, and the login's (`login_authorization_endpoint`, an agentd
+    /// extension member) only with the other; it names the launch grant too
+    /// while a slot is installed, since the token endpoint then redeems it.
     pub fn metadata(&self) -> Reply {
-        let Some(device) = &self.device else {
+        if self.device.is_none() && !self.login() {
             return Reply::not_found();
-        };
+        }
         let Some(issuer) = self.issuer() else {
             return Reply::error(OAuthError::unavailable("the listener is still starting"));
         };
         let at = |p| crate::runtime::surface::auth::join(issuer, p);
-        Reply::json(
-            200,
-            json!({
-                "issuer": issuer,
-                "device_authorization_endpoint": at(DEVICE_AUTHORIZATION_PATH),
-                "token_endpoint": at(TOKEN_PATH),
-                "revocation_endpoint": at(REVOKE_PATH),
-                "grant_types_supported": std::iter::once(DEVICE_CODE_GRANT)
-                    .chain(self.launch.as_ref().map(|_| crate::runtime::surface::launch::LAUNCH_GRANT_TYPE))
-                    .collect::<Vec<_>>(),
-                "response_types_supported": [],
-                "token_endpoint_auth_methods_supported": ["none"],
-                "revocation_endpoint_auth_methods_supported": ["none"],
-                "scopes_supported": device.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            }),
-        )
+        let mut m = json!({
+            "issuer": issuer,
+            "token_endpoint": at(TOKEN_PATH),
+            "revocation_endpoint": at(REVOKE_PATH),
+            "grant_types_supported": self.device.as_ref().map(|_| DEVICE_CODE_GRANT).into_iter()
+                .chain(self.login().then_some(crate::a2a::login::LOGIN_GRANT_TYPE))
+                .chain(self.launch.as_ref().map(|_| crate::runtime::surface::launch::LAUNCH_GRANT_TYPE))
+                .collect::<Vec<_>>(),
+            "response_types_supported": [],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "revocation_endpoint_auth_methods_supported": ["none"],
+            "scopes_supported": self.device.as_ref().map_or_else(|| vec!["user"], |d| d.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
+        });
+        if self.device.is_some() {
+            m["device_authorization_endpoint"] = json!(at(DEVICE_AUTHORIZATION_PATH));
+        }
+        if self.login() {
+            m["login_authorization_endpoint"] =
+                json!(at(crate::a2a::login::LOGIN_AUTHORIZATION_PATH));
+        }
+        Reply::json(200, m)
+    }
+
+    /// `POST /oauth2/login_authorization`: a display client asks to sign in
+    /// at `a2a.login`'s IdP ([`crate::a2a::login::SignIns::login_authorization`]).
+    pub fn login_authorization(
+        &self,
+        content_type: Option<&str>,
+        body: &[u8],
+        peer: Option<IpAddr>,
+    ) -> Reply {
+        match self.signins.as_ref().filter(|_| self.login()) {
+            Some(s) => s.login_authorization(self.issuer(), content_type, body, peer),
+            None => Reply::not_found(),
+        }
     }
 
     /// `GET /oauth2/device`: where a code's person is sent. Fixed text: the
@@ -2360,6 +2484,50 @@ mod tests {
             ..s.clone()
         };
         meets_the_auth_contract(&nameless.revoked_event());
+    }
+
+    /// A session's IdP proof is its own: set on it alone, shown in its view
+    /// beside its principal's source, and dropped only where asked — never
+    /// set on a session that has ended.
+    #[test]
+    fn a_sessions_idp_proof_is_its_own() {
+        let f = Fixture::new(json!({"enabled": true}));
+        f.session("10.0.0.1", "laptop");
+        f.session("10.0.0.2", "phone");
+        let sessions = f.auth.sessions();
+        let list = sessions.list();
+        let sid_of = |n: &str| {
+            list.iter()
+                .find(|s| s.name.as_deref() == Some(n))
+                .unwrap()
+                .sid
+                .clone()
+        };
+        let proof = IdpProof {
+            idp: "okta".into(),
+            iss: "https://idp.example".into(),
+            sub: "00u1alice".into(),
+            at_ms: 5,
+        };
+        assert!(sessions.set_proof(&sid_of("laptop"), proof.clone()));
+        assert!(!sessions.set_proof("ds_gone", proof));
+        let v = sessions.session(&sid_of("laptop")).unwrap().view();
+        assert_eq!(
+            (&v["source"], &v["idp_proof"]["sub"]),
+            (&json!("device"), &json!("00u1alice"))
+        );
+        let phone = sessions.session(&sid_of("phone")).unwrap();
+        assert!(phone.proof.is_none() && phone.view().get("idp_proof").is_none());
+        assert!(
+            sessions
+                .drop_proofs(|s| s.name.as_deref() == Some("phone"))
+                .is_empty()
+        );
+        assert_eq!(
+            sessions.drop_proofs(|s| s.name.as_deref() == Some("laptop")),
+            vec![sid_of("laptop")]
+        );
+        assert!(sessions.session(&sid_of("laptop")).unwrap().proof.is_none());
     }
 
     #[test]

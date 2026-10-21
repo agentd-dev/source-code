@@ -1,6 +1,6 @@
 # RFC 0044: Enterprise-managed authorization — acting for a user through ID-JAG and Okta Cross App Access
 
-**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope is next
+**Status:** Accepted 2026-10-19 (the user: "accept and build"; RFC 0048 Q1) — built as RFC 0048's track E, its P0 trimmed to what RFC 0047 P0 did not build. P0 and P1 implemented 2026-10-19 (§7.0, "P1 as built"); P1 behind the feature `xaa`, not in the release set; live interop not run. P2's prerequisites in part (§7 "P2a — Prerequisites built", 2026-10-20): external key custody through a unix-socket signer, the hash-chained audit log anchoring the tombstone register, allow-listed child environments and Landlock-confined children; the freshness defect (T27) found fixed in v1.17.0. The rest of them built 2026-10-20 (§7 "P2b — Prerequisites built (part 2)"): the taint engine and `holds_delegated_data`, the consent-gate hardening, §6.4's per-principal sealing of what a gate showed, the external signer's own policy and a `derive` op holding the companies preview's seal key, and workers under a uid of their own. P2's scope in part built 2026-10-21 (§7 "P2c — P2 built, part 1: people and sessions"): templates admitting principals by source, consent gates delivered to the person and answered from their display client, with step-up sign-in gates; the IdP-federated display-client login `a2a.login`; device principals by pin or first binding, re-checked per session; work bound to the session it acts through; templates, pins and first binding reloading; and instance children answering their parent as themselves, over a channel of their own and optionally under a uid of their own. P2's part 2 is next
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-27
 **Extends:** RFC 0031 (endpoint authentication): a new `oauth2` grant, `id_jag`; `private_key_jwt` client authentication; and the per-principal credential key that RFC 0031 §11 promised and never built. RFC 0023 (AAuth agent identity): AAuth stays a parallel track, and its Case C per-authority token cache is re-keyed per principal.
@@ -4520,7 +4520,225 @@ a running test here: the load refusal of `worker_uid_e2e` as a non-root uid,
 which skips as root (the refusal itself is the `sec::worker` unit's, as any
 uid).
 
-### P3 — Inbound identity, A2A in-task auth, CIBA and unattended opt-ins
+**Amended by §7.P2c (2026-10-21):** an instance child no longer answers its
+parent's unix listener as the operator. It reaches its parent only over its
+own channel, as `instance:<handle>`, so the reason for the deviation above
+is gone; `spawn.instance_uid` now gives a child a uid of its own (§7.P2c
+item 6).
+
+#### §7.P2c — P2 built, part 1: people and sessions (2026-10-21)
+
+This part builds the first half of P2's scope — many people, each signed in
+through their own IdP, and instance children that answer their parent as
+themselves (the user's "Do them", 2026-10-20) — on `main` at `417b6166`,
+behind `xaa` (and `a2a` for everything a listener serves). The second half —
+certificate principals that delegate, the policy facts and shipped
+defaults, per-`(step, tool)` use-authorisation, the per-(principal, resource)
+mint rate limit, mode-mixing hiding, document-sourced gating, `subjects:
+pairwise`, elicitation addressing — is P2's part 2.
+
+| Scope item | State | Where |
+|---|---|---|
+| Templates (default deny, ceilings, TTL, budgets, epoch, `subagents`, `approvers`, `agent_mode_servers`, `document_workflows`) | built; `agent_mode_servers` and `document_workflows` load, validate and warn — their effect is part 2's | `config::settings::delegation`, `delegation` |
+| `PendingKind::Consent` with authorization code and device grant, delivered to the person, polled on the reactor, rebuilt on restart | built | `runtime::delegated`, `runtime::stepup` |
+| `a2a.login` (authorization code + PKCE, `source: oidc`, login == enrolment) beside the device grant, one session store with the per-session IdP proof and typed principals, `ListenerAuth.login` | built | `a2a::login`, `a2a::oauth`, `delegation::federation`, `runtime::surface::auth` |
+| Device principals by `device_pins` or `device_first_binding`, re-checked per session; runs recording their session | built | `delegation`, `runtime::reactor`, `engine::run` |
+| The single-use start link and `state`-bound cookie for every code-flow sign-in | built: login, enrolment and step-up alike | `a2a::login` |
+| Binding by `iss` + `sub` equality or exact pin | built | `delegation::bind`, `delegation::enrol` |
+| Tools on `id_jag` servers hidden from work without a grant | built, through the session | `runtime::turns::tool_plan`, `runtime::delegated` |
+| Two-principal isolation | built: grants keyed by the typed principal, nothing pooled across two | `delegation` |
+| Reload classification (template removal revokes) | built | `runtime::reload`, `delegation::reload` |
+| Instance children answering their parent as themselves, and a uid of their own | built | `a2a::channel`, `runtime::instances`, `sec::worker` |
+| Display clients signing in at the IdP and answering gates | built | `interface/` |
+
+**1. Templates.** A template admits a principal by `principals.source` —
+`operator`, `oidc` or `device` — at its IdP, with `role` and `labels`
+narrowing it; `x509` is refused by name until part 2, and `bearer` always
+(`principal_not_delegable`). `approvers` is `[principal]` (default) or
+`[principal, operator]`; `subagents` is `none` (default) or `inherit`.
+`agent_mode_servers` must name agent-mode servers and `document_workflows`
+a name and a 64-hex digest; both warn that they change nothing yet. P1's
+refusal of a second per-person operator is gone: each `match.uid` rule with
+an `idp_subject` pin is one person. The partition `every_config_path_is_classified`
+holds now splits `identity.delegation`: its keys and caps stay restart-only;
+its templates, pins, first binding and consent timing reload.
+
+**2. Consent gates, delivered.** An action gate is shown on the task of the
+work it holds — `input-required`, the badge, a `consentGate` annotation —
+when a caller owns that work, as an `ask_human` addressed to them is; it is
+always in the person's `delegation.list`. It is answered with
+`delegation.approve`/`deny` by the person: over the unix listener as a
+per-person operator (`via: operator_self`), or through a display session
+whose own IdP proof is younger than `consent_session_max_age` (12 h; `via:
+gate`, else `no_idp_sign_in` or `stale_session`); and by an operator only
+where the person's template lists one (`via: operator`, the binding then
+listed to operators too). A step-up (`insufficient_user_authentication`) is
+a sign-in gate instead: a start link for a display session's work, the
+IdP's device grant for a per-person operator's where it is offered — polled
+on the reactor's pass off the loop, its device code sealed under the
+person's key in the step's wait record — and the call is made again with
+the fresh ID token once the grant's own person signs in. A restart rebuilds
+each gate from its wait record: an action gate asks again with the same
+binding; a device step-up resumes polling once its sealed code opens; an
+`authorize` step-up, whose start link died with the process, is closed.
+**Deviation, said:** the RFC's "delivered through `ask_human` `to:
+<principal>`" is built as delivery to the task of the owner's work and the
+person's own list, not as a model-visible `ask_human` call: a consent gate
+is agentd's, never a model's, so no model call is made to raise it.
+
+**3. `a2a.login`.** `a2a.login: {idp, token_ttl}` on a TCP listener (refused
+on unix, beside `a2a.tls.client_ca`, and at a provider whose `sign_in.grants`
+lacks `authorization_code`). `POST /oauth2/login_authorization`
+(`login_authorization_endpoint` in the RFC 8414 metadata, which is served
+whenever sessions are issued) answers `{request_code, start_uri,
+start_expires_in, expires_in, interval}`; the start link (`/oauth2/start/<id>`,
+60 s, single use) sets `__Host-agentd-signin-<id>` (`Secure; HttpOnly;
+SameSite=Lax`) and redirects to the IdP with PKCE S256, `state` and `nonce`;
+`/oauth2/callback` takes the code only with that cookie — without it the
+sign-in fails there, which is the forwarding attack's end — checks RFC 9207
+`iss`, and the delegation supervisor (`delegation::federation`) exchanges the
+code and verifies the ID token off the listener's threads. The client polls
+`/oauth2/token` with `https://agentd.dev/oauth/grant-type/login` and is issued
+an `fs_` session of `user:oidc:<iss>#<sub>` carrying `IdpProof {idp, iss, sub,
+at}`; it never sees an IdP token. Where a template admits the person the
+sign-in is kept as their grant (login == enrolment); where none does they
+are signed in, the refresh token revoked at the IdP, `delegation.denied`
+said. `ListenerAuth.login` makes the listener declare `bearer`, ends the
+implicit operator on loopback, and serves `/oauth2/revoke`. `act_for` naming
+a device principal is refused at load (`act_for_device_principal`); any
+other `act_for` is P3's.
+
+**4. Device principals and sessions.** A device name delegates only pinned
+(`device_pins`) or, opted in, bound by its first enrolment
+(`device_first_binding`, warned: T6). Its grant is held at every call to the
+identity the calling session proved: the session store keeps each
+session's `IdpProof`, set by its own enrolment (`delegation.enrol` from the
+session: a start link in the task's `signIn` annotation, or the IdP's
+device grant), so a second device under the name is `not_enrolled` until it
+proves the same identity, and its sign-in as anyone else is
+`binding_mismatch`, the grant untouched (`bound_by` records `pin` or
+`first_binding`). Every unit of work records the session it acts through —
+a run (`RunState.session`), a turn, a subagent, a signal, a message, and the
+runs, turns and messages those start — beside the inbox event, never in its
+payload, so only the transport that authenticated the session names it.
+`Delegation::who` reads the session as it is at each call: an ended one
+(revoked, expired, or lost to a restart, since sessions are held in memory)
+is `revoked`, and `poll_consents` closes a gate whose session has ended,
+`via: revoked`, at the next pass.
+
+**5. Isolation and hiding.** A grant is keyed by `grant_id` over the typed
+principal and the IdP's issuer, so two people never share a grant, a pooled
+access token, an ID-JAG cache entry or a connection; `tool_plan` offers a
+delegated server's tools only where the work's `Acting {principal, session}`
+holds a usable grant there.
+
+**6. Instance children.** At spawn the parent makes a `SOCK_SEQPACKET`
+socket pair and hands the child one end at fd 3 (`AGENTD_INSTANCE_CHANNEL`,
+`dup2` after the descriptor sweep, close-on-exec cleared only there). The
+child's `parent` peer is that channel (`A2aEndpoint::Parent`): each
+connection is a fresh `SOCK_STREAM` pair whose other end it sends over the
+channel (`SCM_RIGHTS`); the parent's door thread takes only a stream socket
+and serves it through the listener as `Peer::Instance(handle)`, which the
+resolver names `instance:<handle>` before anything presented is read. That
+principal is `Role::Agent` with no grants; `may` admits `SendMessage` alone,
+`may_command` the `_instance.*` ops alone, the dispatcher refuses a send
+that carries no command, and the consumer refuses a report about another
+handle (`instance.op.refused`). The composed configuration carries no
+`a2a.peers` entry and no bearer: P1's refusal of a spawn whose parent had no
+credential to hand on is gone. `spawn.instance_uid`/`instance_gid` (root
+only; not 0, agentd's own, a signer's or `spawn.uid`) start each child under
+that uid — `start_instance_as` before the Landlock domain — after
+`make_own` hands it its directory (refused, naming the directory, when an
+ancestor is not passable by the uid); a non-durable child's directory is a
+private `0711` one under the system temporary directory; the child's own
+workers run under its uid (its composed configuration then carries no
+`spawn.uid`). **Residual, said:** without `instance_uid` a child keeps
+agentd's uid and could dial a unix A2A listener of its parent's that it
+found, which the kernel names as the operator. **Containers:** agentd as
+root (it makes the directory the child's, which capabilities alone cannot
+here), the uid needs no `/etc/passwd` entry, the store's root passable by
+it for durable children, and a mapped uid under user namespaces
+(`docs/security.md`). RFC 0036 §11 and RFC 0037 are amended to say so.
+
+**7. Workflows.** What a workflow sees, and what was added because it means
+something there:
+
+- A run started through a session is bound to it, and so is every run,
+  signal and message it starts: a `workflow` step's child run, a
+  `workflow.run` or `workflow.signal` tool call, a `message` step and
+  `message.send` carry the session as they carry the principal. **Added**
+  for that: `Runtime::accept_event_in`, so each of those starts through the
+  session of what started it — without it a person's child run was
+  `no_delegation`.
+- A consent gate in a workflow is the step's, suspended with `wait.kind:
+  consent` and the gate whole in its wait record (with its session), shown
+  on the run's task with the `consentGate` annotation, and answered from
+  the person's display client. A session-bound run whose session ended
+  fails the delegated step `revoked`; its gate closes `revoked`, after a
+  restart too.
+- **Not added:** the session id in `workflow.status` or the run summary. It
+  names a credential's handle, not the work; the principal is shown, and
+  `auth.sessions` maps a session to its principal for an operator.
+
+| Check | What it proves |
+|---|---|
+| settings units `a_delegated_server_is_held_to_every_load_rule` (extended), `many_people_load_only_as_their_rules_say`, `every_config_path_is_classified` | every template, login, pin and first-binding load rule, by name; a second per-person operator loads; the reload partition splits `identity.delegation` |
+| `delegation` units `a_device_name_is_held_to_its_binding_through_each_session`, `a_reload_revokes_only_what_it_no_longer_allows` | a device name's grant is held to each session's proof, an ended session is `revoked`, a pin and first binding bind as said; a reload narrows without revoking and revokes what a removed template, a moved pin and first binding off allowed, dropping those names' proofs |
+| `a2a::login` units `a_login_issues_an_oidc_session_once_through_the_start_links_cookie`, `a_start_link_lives_a_minute_and_an_enrolment_issues_no_session`; `a2a::oauth` unit `a_sessions_idp_proof_is_its_own` | the start link, the cookie, the callback, the login grant; a session's proof set, shown and dropped as its own |
+| `a2a::channel` units `a_connection_is_passed_through_the_door`, `a_process_handed_no_channel_holds_none`; `a2a::principals` units `an_instance_child_may_send_its_reports_and_nothing_else`, `an_instance_childs_channel_names_the_child_alone`; `runtime::instances` unit `only_the_operator_speaks_for_a_child`; `sec::worker` unit `an_instance_uid_is_held_to_its_rules` | a stream passed through the door, and nothing else; the channel names the child whatever it presents, and that principal reaches its two reports alone; every instance-uid refusal |
+| `runtime::surface::auth` and `card` units (the `loopback login alone` and `wildcard login + bearer` rows); `events` unit `a_captured_sample_of_every_kind_validates` | the login posture declares `bearer` and no implicit operator; the feed's `signed_in` validates |
+| e2e `instance_parent_auth_e2e` (3; the uid one as root, skipping cleanly otherwise) | a child is heard through its channel holding no credential of its parent's; it cannot call `admin.set`, send a message or report for another handle, while its own report arrives; under its own uid (65534, no capability, `no_new_privs`) it is still heard |
+| cli `examples_validate_e2e::the_delegation_example_validates_with_its_keys_mounted` (`xaa`), `interface_client_guard::the_login_grant_is_the_clients` | `examples/okta-xaa-mcp.yaml` loads; the clients' login grant is the daemon's |
+| interface `test/delegation.test.mjs` | `idpLoginOf`/`idpLogin` (a start link off the origin never reaches the browser), the annotations, `/enrol`, `/consent` bound to the listed nonce and hash, a reply never answering a consent gate, `--login idp` |
+| `ema/a-login-is-the-enrolment` | the login session is `user:oidc:<iss>#<sub>` with its proof, the sign-in kept the grant, the person's run and its child run act with their own ID-JAG |
+| `ema/two-people-two-grants` | two people mint with their own refresh tokens, list their own grants, and one is refused the other's gate |
+| `ema/tools-are-offered-only-with-a-grant` | a signed-in person whose grant was revoked is handed no tool of the delegated server in their turn; the person who holds hers is |
+| `ema/a-forwarded-sign-in-fails-at-the-callback` | the callback without the cookie is 403, the login grant `access_denied`, nobody signed in; a start link opens once |
+| `ema/no-template-no-grant` | signed in, no grant, the refresh token revoked, the run `not_enrolled`; a device with no template refused before the IdP is asked |
+| `ema/an-unpinned-device-needs-first-binding` | refused `principal_not_delegable` both ways, the IdP asked nothing |
+| `ema/a-pinned-device-binds-its-pin-alone` | a device code another `sub` approved is `binding_mismatch`, nothing kept; signed in as the pin, bound `pin`, the run made |
+| `ema/one-device-name-one-binding` | the second device is `not_enrolled`, its sign-in as Bob `binding_mismatch`, the grant's epoch untouched |
+| `ema/a-gate-is-answered-through-a-fresh-sign-in` | `no_idp_sign_in`, `stale_session`, then `via: gate` after signing in again; `via: operator` under `approvers: [principal, operator]` |
+| `ema/an-ended-session-ends-its-delegation` | `auth.sessions.revoke` closes the run's gate `revoked` at once; a session-bound gate a restart finds closes `revoked`; no call made |
+| `ema/a-gate-survives-a-restart` | a per-person operator's gate is asked again after a restart and their approval makes the call |
+| `ema/the-login-listener-rules` | `a2a.login` with `client_ca` and `act_for` a device principal refused; a login-only loopback listener declares `bearer`, refuses an empty caller, serves its endpoints |
+| `ema/a-reload-narrows-then-revokes` | SIGHUP narrowing: `scope_beyond_ceiling` for the write, the read made; removal: revoked at the IdP, tombstoned, the next call `not_enrolled` |
+| `ema/step-up-uses-the-fresh-id-token` (changed) | `insufficient_user_authentication` waits on a sign-in gate the IdP's device grant answers, and the call is made with the fresh ID token |
+| `ema/a-subagent-inherits-what-it-declares` | `subagents: inherit`: the declared server's call made, the undeclared one `delegation_not_permitted`, no token in any frame to a child |
+
+A restored pre-revocation blob is refused as P2a built it
+(`ema/restored-vault-refused-by-the-audit-chain`, unchanged), and the
+consent and taint exit criteria are P2b's checks.
+
+Each new test was mutation-checked: with the code it guards broken, it
+fails. Broken were: the instance principal's op and method limits (each,
+the `a2a::principals` unit), the channel naming the caller (the resolver
+unit), the dispatcher's refusal of a commandless send and the consumer's of
+another handle's report (each, `instance_parent_auth_e2e`), the start under
+the instance uid (the root e2e), the signer rule of an instance uid (the
+`sec::worker` unit); a device session's proof required at all, its identity
+compared, the pin at binding, first binding off holding the grant back
+(each, the device unit); a reload's revocation of a removed template's and a
+moved pin's grants and its dropping of proofs (each, the reload unit), and
+its revocation at all (`ema/a-reload-narrows-then-revokes`); the callback's
+cookie (the login unit); `set_proof` (the session unit); the `a2a.login`
+beside `client_ca` and the pin-issuer load rules (each, the settings unit),
+and the partition's split field (`every_config_path_is_classified`); an
+ended session's gate closing (`ema/an-ended-session-ends-its-delegation`); a
+child run carrying its parent's session (`ema/a-login-is-the-enrolment`); the
+stale-session rule and the binding listed to an approving operator (each,
+`ema/a-gate-is-answered-through-a-fresh-sign-in`); the catalogue listed
+with the sign-in's own proof (`ema/a-pinned-device-binds-its-pin-alone`);
+the refresh token a template-less login discards
+(`ema/no-template-no-grant`); a subagent's declared servers
+(`ema/a-subagent-inherits-what-it-declares`); the login posture's end of the
+implicit operator (`ema/the-login-listener-rules`); and the hiding of a
+delegated server's tools from work without a grant
+(`ema/tools-are-offered-only-with-a-grant`). The interface's start-link
+origin rule and the consent gate's exclusion from the gate a reply answers
+were broken too (each, `test/delegation.test.mjs`). Not checked by a running
+test here: the root e2e's spawn under the instance uid as a non-root uid,
+which skips (the refusal is the `sec::worker` unit's).
 
 **Scope.** A2A resource-server JWT validation (`a2a.inbound_tokens` with
 per-issuer `profile`, `typ` and `subject_claim`, `token_iss` matcher, scope to

@@ -483,7 +483,7 @@ impl Runtime {
             None,
             parent,
             &[],
-            None,
+            (None, None),
         )
     }
 
@@ -492,7 +492,8 @@ impl Runtime {
     /// and the run carries it (`withhold`). The run continues `parent`, the
     /// trace of the signal that fired it. `authority` is the principal the
     /// TRANSPORT authenticated — the A2A message's sender, the signal's — and
-    /// the run is theirs; `None` runs as `identity.autonomous_as`.
+    /// the run is theirs, acting through `session` when they sent it through
+    /// one; `None` runs as `identity.autonomous_as`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_start_carrying(
         &mut self,
@@ -504,6 +505,7 @@ impl Runtime {
         carries: &super::withhold::Carries,
         parent: Option<&TraceContext>,
         authority: Option<&str>,
+        session: Option<&str>,
     ) -> Admission {
         self.admit_start(
             workflow,
@@ -516,7 +518,7 @@ impl Runtime {
             Some(carries),
             parent,
             &[],
-            authority,
+            (authority, session),
         )
         .0
     }
@@ -568,7 +570,7 @@ impl Runtime {
             (!carries.is_empty()).then_some(&carries),
             parent.as_ref(),
             &links,
-            None,
+            (None, None),
         )
         .0
     }
@@ -586,7 +588,7 @@ impl Runtime {
         carries: Option<&super::withhold::Carries>,
         parent: Option<&TraceContext>,
         links: &[String],
-        authority: Option<&str>,
+        (authority, session): (Option<&str>, Option<&str>),
     ) -> (Admission, Option<TraceContext>) {
         // Every line about this firing carries the same identity, plus the
         // stream position when a consumer is offering an event.
@@ -719,7 +721,13 @@ impl Runtime {
         // `start.fired` and the start-state bookkeeping: a firing whose inbox
         // write failed did not happen, and must neither say it did nor count
         // a loop iteration it never ran.
-        let trace = match self.accept_event_store(kinds::START_FIRED, Some(acting), ev, parent) {
+        let trace = match self.accept_event_through(
+            kinds::START_FIRED,
+            Some(acting),
+            session.map(str::to_string),
+            ev,
+            parent,
+        ) {
             Ok((_, trace)) => trace,
             // A size the store refuses before it is even asked is refused the
             // same way on every offer, so holding it would wedge a stream
@@ -1005,11 +1013,16 @@ impl Runtime {
         trace: Option<&TraceContext>,
         subagent: Option<&str>,
     ) -> u64 {
-        let (by, may_start) = match sender {
-            super::waits::SignalSender::Runtime => (None, None),
-            super::waits::SignalSender::Principal { id, operator } => (
+        let (by, may_start, session) = match sender {
+            super::waits::SignalSender::Runtime => (None, None, None),
+            super::waits::SignalSender::Principal {
+                id,
+                operator,
+                session,
+            } => (
                 Some(id.clone()),
                 (!operator).then(|| self.principal_index.get(id).cloned()),
+                session.clone(),
             ),
         };
         let matches: Vec<(String, String, Map<String, Value>)> = self
@@ -1058,6 +1071,7 @@ impl Runtime {
                 carries,
                 trace,
                 by.as_deref(),
+                session.as_deref(),
             );
             fired += 1;
         }

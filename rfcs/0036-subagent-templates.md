@@ -400,7 +400,8 @@ child (RFC 0003), sit under the tree-token ceiling, and count against
   start plus the same send. The house rule held: no new node kinds.
 - **The `_instance.*` op namespace is the runtime's own.** The A2A server
   admits `_instance.result`/`_instance.emit` to the inbox like a declared
-  command (operator/agent principals only); the REACTOR consumes them
+  command (the child itself over its channel, or an operator, since RFC
+  0044 §7.P2c; before it, operator/agent principals); the REACTOR consumes them
   before any reader — they can never wake a wait, fire a start, or become
   a conversational turn. A mirrored event lands in the parent's stream
   with `source: instance:<handle>` and an id prefixed by the handle.
@@ -432,7 +433,15 @@ Two honest deviations and three mechanics worth recording:
   only happens when `a2a.listen` is set (validation warns otherwise), and an
   *inline* `a2a.bearer` is never written into the child's config file — only
   a `{{secret:…}}` reference rides along; over a unix listener SO_PEERCRED
-  covers same-uid children with no credential at all.
+  covers same-uid children with no credential at all. **Amended by RFC 0044
+  §7.P2c (2026-10-21):** the child is wired to its parent by a channel of its
+  own instead — a socket pair the parent makes at spawn and hands the child
+  at fd 3 — and every connection over it is `instance:<handle>`, named by the
+  channel, a principal that reaches its two reports about its own handle and
+  nothing else. No `parent` peer entry, bearer or reference is written into
+  the child's configuration, so a child never reaches its parent as the
+  operator. `spawn.instance_uid`/`instance_gid` (agentd as root) start each
+  child under a uid of its own, its directory made its own first.
 - **The §8.2 ordering is enforced by a spawn guard**: params fold into the
   boot-extracted prose as data, and a folded result in which extraction finds
   ANY directive (a param value smuggled a `:::` fence to line start) refuses

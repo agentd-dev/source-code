@@ -1848,6 +1848,31 @@
                       "null"
                     ]
                   },
+                  "idp_proof": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "at": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "idp": {
+                        "type": "string"
+                      },
+                      "iss": {
+                        "type": "string"
+                      },
+                      "sub": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "idp",
+                      "iss",
+                      "sub",
+                      "at"
+                    ],
+                    "type": "object"
+                  },
                   "kind": {
                     "type": "string"
                   },
@@ -1862,6 +1887,14 @@
                   },
                   "sid": {
                     "type": "string"
+                  },
+                  "source": {
+                    "description": "how the session's principal was established: an approved device's name, an IdP sign-in (a2a.login), or the operator (a launch)",
+                    "enum": [
+                      "device",
+                      "oidc",
+                      "operator"
+                    ]
                   }
                 },
                 "required": [
@@ -2511,7 +2544,7 @@
           ],
           "type": "object"
         },
-        "description": "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone",
+        "description": "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
         "reply": "task",
         "result": false
       },
@@ -2580,7 +2613,7 @@
           ],
           "type": "object"
         },
-        "description": "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made. The person's alone",
+        "description": "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
         "reply": "task",
         "result": false
       },
@@ -2606,7 +2639,7 @@
           ],
           "type": "object"
         },
-        "description": "Sign the per-person operator in at an identity provider {idp, grant?} and keep their delegation grant: the task says where to sign in, and how it ended. The per-person operator's alone",
+        "description": "Sign the caller in at an identity provider {idp, grant?} and keep their delegation grant — a per-person operator, an a2a.login session, or a device session whose name a pin or the first binding makes eligible: the task says where to sign in (a display session's start link is its signIn annotation), and how it ended. The caller's own enrolment alone",
         "reply": "task",
         "result": false
       },
@@ -2636,7 +2669,7 @@
           "required": [],
           "type": "object"
         },
-        "description": "The delegation grants this instance holds — never a secret — and the open consent gates, each with its nonce and argument hash for the person who answers it",
+        "description": "The delegation grants and the open consent gates — every one to an operator, the caller's own to anyone else; never a secret — each gate with its nonce and argument hash for the person who answers it",
         "reply": "message",
         "result": {
           "properties": {
@@ -3563,7 +3596,7 @@
           ],
           "type": "object"
         },
-        "description": "reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; operator only",
+        "description": "reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; sent by the child over its channel, or by an operator",
         "reply": "task",
         "result": false
       },
@@ -3588,7 +3621,7 @@
           ],
           "type": "object"
         },
-        "description": "reserved: a `mode: sync` child's first result, recorded on the parent's handle; operator only",
+        "description": "reserved: a `mode: sync` child's first result, recorded on the parent's handle; sent by the child over its channel, or by an operator",
         "reply": "task",
         "result": false
       }
@@ -3596,7 +3629,7 @@
   },
   "$id": "https://agentd.dev/a2a/ext/command/schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The data of a command DataPart. $defs/envelopes/$defs/<op> is each op's envelope; $defs/ops/<op> and $defs/reserved/<op> give its reply kind (message or task), arguments and result — for a message op the document its reply carries, for a task op the data of the result artifact it completes with (false: none). Reserved ops are operator only and never listed in params.ops.",
+  "description": "The data of a command DataPart. $defs/envelopes/$defs/<op> is each op's envelope; $defs/ops/<op> and $defs/reserved/<op> give its reply kind (message or task), arguments and result — for a message op the document its reply carries, for a task op the data of the result artifact it completes with (false: none). Reserved ops are a child instance's, sent over the channel its parent handed it, or an operator's, and never listed in params.ops.",
   "properties": {
     "agentd": {
       "$ref": "#/$defs/envelope"

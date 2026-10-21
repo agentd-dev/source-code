@@ -613,6 +613,27 @@
                   "sid"
                 ]
               }
+            },
+            {
+              "if": {
+                "properties": {
+                  "event": {
+                    "enum": [
+                      "signed_in"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "scope": {
+                    "const": "user"
+                  }
+                },
+                "required": [
+                  "sid"
+                ]
+              }
             }
           ],
           "properties": {
@@ -625,7 +646,8 @@
                 "approved",
                 "denied",
                 "revoked",
-                "launch"
+                "launch",
+                "signed_in"
               ]
             },
             "name": {

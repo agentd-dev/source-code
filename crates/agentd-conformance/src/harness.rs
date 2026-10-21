@@ -52,13 +52,14 @@ fn binary() -> &'static PathBuf {
         // fake Company needs to verify ES256; `companies` is agentd as the
         // Personal Agent the `companies` family holds to the draft; `xaa`
         // is agentd acting for an enrolled person, which the `ema` family
-        // drives against its mock IdP, authorization server and MCP server.
+        // drives against its mock IdP, authorization server and MCP server;
+        // `hot-reload` is the SIGHUP reload its template checks send.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "a2a,cron,internal-mocks,oauth,companies,xaa",
+            "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload",
         ]);
         let agentd = target_dir().join("agentd");
         assert!(

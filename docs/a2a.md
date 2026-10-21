@@ -137,6 +137,7 @@ kind of evidence decides only for itself.
 
 | Order | Evidence | Result |
 |---|---|---|
+| 0 | the channel this daemon handed an instance child at spawn | that child, `instance:<handle>`, whatever else the request carries |
 | 1 | a unix-socket peer with the daemon's own uid, or root | the operator |
 | 2 | a session token the listener issued | that session's principal, or `401` |
 | 2 | any other bearer, on a listener that checks bearers | the operator for the operator bearer, a matching bearer rule's principal, or `401` |
@@ -170,7 +171,7 @@ Two limits keep it from reaching further than the machine:
   post to `127.0.0.1`, so a browser always signs in.
 
 Configuring any credential mechanism ends the implicit operator: a bearer, a
-principal rule, a client CA or the device grant. A configuration reload that
+principal rule, a client CA, the device grant or `a2a.login`. A configuration reload that
 adds the first principal rule ends it in the same instant the new rules apply.
 
 ### Roles, grants and the floor
@@ -219,9 +220,10 @@ person who signs in again under the same name finds what that name started.
 
 ## Signing in
 
-People should not hold the daemon's operator bearer. agentd gives them two
-ways to get a credential of their own: the device grant, and the launch grant
-that `agentd tui` and `agentd ui` use.
+People should not hold the daemon's operator bearer. agentd gives them three
+ways to get a credential of their own: the device grant, a sign-in at their
+organization's identity provider (`a2a.login`), and the launch grant that
+`agentd tui` and `agentd ui` use.
 
 ### The device authorization grant
 
@@ -261,6 +263,48 @@ never granted this way: an agent authenticates with its own credential.
 only as its hash. A restart ends every session, and there are no refresh
 tokens: a client signs in again when its session expires.
 
+### A sign-in at the identity provider
+
+With `a2a.login: {idp: <name>}`, a display client signs a person in at that
+`identity.providers` entry, and the session it is issued is the person as
+their IdP names them: `user:oidc:<iss>#<sub>`. It is how many people use one
+agent, each as themselves, and — where agentd acts for people at MCP servers
+— that sign-in is their enrolment
+([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)).
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Person's browser
+    participant L as agentd listener
+    participant I as IdP
+    C->>L: POST /oauth2/login_authorization
+    L-->>C: request_code and start_uri
+    C->>B: opens start_uri
+    B->>L: GET the start link
+    L-->>B: a cookie bound to the sign-in, and a redirect to the IdP (PKCE)
+    B->>I: signs in
+    I-->>B: redirect to /oauth2/callback
+    B->>L: GET /oauth2/callback, with the cookie
+    L->>I: exchanges the code, verifies the ID token
+    C->>L: POST /oauth2/token (the login grant, polling)
+    L-->>C: session token for the person the IdP named
+```
+
+- **The start link is the daemon's, and opens once.** It is on the listener
+  origin, good for 60 seconds, and sets a `__Host-` cookie bound to that
+  sign-in; the callback is taken only with it. An IdP URL forwarded to
+  someone else returns to a browser without the cookie, and the sign-in
+  fails there.
+- **The client never sees an IdP token.** It polls the token endpoint with
+  the request code and the grant `https://agentd.dev/oauth/grant-type/login`
+  until the daemon has verified the IdP's answer; the session carries the
+  IdP proof it was issued on.
+- **The listener says so.** Its RFC 8414 metadata names
+  `login_authorization_endpoint`, the card declares `bearer`, a loopback
+  caller is no implicit operator, and `/oauth2/revoke` is served.
+  `a2a.login` needs a TCP listener, and is refused beside `a2a.tls.client_ca`.
+
 ### The launch grant
 
 `agentd tui` and `agentd ui` start the daemon and a display client together,
@@ -273,8 +317,10 @@ launcher.
 
 ### Sessions and revocation
 
-Every session has a session id (`ds_…` for a device, `ls_…` for a launch)
-that every audit line of its caller carries. An operator lists sessions and
+Every session has a session id (`ds_…` for a device, `fs_…` for a sign-in at
+the identity provider, `ls_…` for a launch) that every audit line of its
+caller carries, as do the runs, turns and subagents started through it: what
+a person delegated through a session ends with it. An operator lists sessions and
 revokes one session, every session of a name, or all of them. Revocation
 reaches what the session already opened: its streams close and its waiting
 requests are refused within a tenth of a second. Revoking never deletes what
@@ -406,6 +452,14 @@ dial. A unix listener declares no authentication scheme, takes no TLS and
 issues no sessions. Two instances can hold sockets in both directions, so
 either can delegate to the other, and the filesystem's permissions are the
 contract.
+
+An instance-tier subagent reaches its parent another way: through a channel
+the parent hands it at spawn, a socket pair the child holds at fd 3. Each
+connection the child opens over it is the child, `instance:<handle>`, by
+construction — the parent names it by which channel it came through, not by
+anything it presents — and that principal may send its parent its two
+reports (`_instance.result`, `_instance.emit`) about itself, and nothing
+else ([Subagents](subagents.md#how-an-instance-child-reaches-its-parent)).
 
 ## Why it is built this way
 

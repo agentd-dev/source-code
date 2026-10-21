@@ -1301,7 +1301,7 @@ What does not:
 
 ## Acting for an enrolled person
 
-With the `xaa` feature agentd acts for one enrolled person at MCP servers
+With the `xaa` feature agentd acts for each enrolled person at MCP servers
 through their enterprise IdP: ID-JAG and MCP's Enterprise-Managed
 Authorization ([RFC 0044](../rfcs/0044-enterprise-managed-authorization.md),
 [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)).
@@ -1335,17 +1335,41 @@ What holds:
   signature of anything else. With the signer down, a delegated call fails
   `signer_unavailable` before anything is sent
   ([The external signer protocol](external-signer.md)).
-- **Authority from the transport.** The person is the unix listener's peer
-  the kernel names by uid, on a rule with an exact `idp_subject` pin. A run's
-  authority is set by the transport that started it; a model, a tool
-  argument, a document or a payload never names it. Work for anyone else —
+- **Authority from the transport.** A person is who the transport says:
+  the unix listener's peer the kernel names by uid, on a rule with an exact
+  `idp_subject` pin; a session a display client was issued by signing in at
+  the IdP (`a2a.login`), the person their IdP names; or a device session
+  whose name an operator bound to one person (a pin, or — opted in — its
+  first enrolment). A template admits each by that source. A run's authority
+  is set by the transport that started it, and a session's work acts
+  through that session as it is at each call: a model, a tool argument, a
+  document or a payload never names either. Work for anyone else —
   autonomous work, another operator, a bearer-named operator on a TCP
   listener — is `no_delegation` at a delegated server, which also never
-  offers it its tools; `identity.autonomous_as` may not name the person. A
+  offers it its tools; `identity.autonomous_as` may not name a person. A
   subagent's work — its own calls, a run its call started, directly or
-  through other runs — is `delegation_not_permitted`. The rule is the one
-  the process read at start: a reload that changes it is refused. Nothing
-  falls back to agentd's own credential.
+  through other runs — is `delegation_not_permitted`, unless the person's
+  template says `subagents: inherit`: then it acts with the person's grant
+  at the servers the subagent itself declared, and still holds no token. A
+  per-person operator's rule is the one the process read at start: a reload
+  that changes it is refused. Nothing falls back to agentd's own credential.
+- **Each person's grant is theirs.** A grant is keyed by the person's typed
+  principal at the IdP's issuer — never a display string — so two people,
+  or one person at two IdPs, never share one: each mints with their own
+  refresh token, and no access token, ID-JAG cache entry or MCP connection
+  is pooled across them. A device name's grant is held, at every call, to
+  the identity the calling session itself proved at the IdP: a second
+  device approved under the same name, one that proved someone else, or
+  one that never signed in is `not_enrolled`, and a sign-in as someone else
+  is `binding_mismatch` and leaves the grant alone. A changed or removed
+  pin, or first binding turned off, revokes what it bound. A session's end
+  — revoked, expired, or lost to a restart — ends what it delegated at once:
+  its work's next delegated call fails `revoked`, and a gate it waits on
+  closes `revoked`, the call never made. Every authorization-code sign-in —
+  a display client's login, a device session's enrolment, a step-up —
+  goes through a one-time start link on the listener origin that sets a
+  cookie bound to it, and the callback is taken only with that cookie: an
+  IdP URL forwarded to someone else fails there.
 - **The grant is sealed and bound.** The refresh token is kept sealed with
   AES-256-GCM under `identity.delegation.seal_key`, the associated data
   binding the grant id, the IdP, the subject, the epoch and the
@@ -1406,9 +1430,12 @@ What holds:
   tainted work; and every delegated `egress` call. Where a delegation is
   declared every `egress` tool comes back to the supervisor, so no worker
   dials one past the rule. An approved step runs with the spec the person
-  saw. Only they answer, over the unix listener, bound to the gate's nonce
-  and argument hash; an operator who is not them is refused, a message on
-  the task the gate holds is refused, and each is recorded
+  saw. Only they answer, bound to the gate's nonce and argument hash — over
+  the unix listener, or from a display session whose own IdP sign-in is
+  younger than `identity.delegation.consent_session_max_age`; an operator
+  answers too only where the person's template lists `approvers:
+  [principal, operator]`. Anyone else is refused, a message on the task the
+  gate holds is refused, and each is recorded
   (`delegation.consent.refused`); no judge answers whatever
   `agent.ask_human_fallback` says, and an unanswered gate denies. What they
   read is agentd's own text: fixed lines, and every value the work chose —
@@ -1442,16 +1469,29 @@ What holds:
   `CAP_KILL` (the last to signal a worker of another uid at its deadline
   and its drain), to do it, and the load refuses the configuration where it
   cannot, naming why; a uid that is agentd's own, root's or a signer's is
-  refused too. An instance child itself keeps agentd's uid — it answers its
-  parent's unix listener as the operator — and starts its own workers under
-  the same uid.
+  refused too.
+- **An instance child answers as itself.** A child daemon reaches its
+  parent only through a channel the parent handed it at spawn — a socket
+  pair held at fd 3 — and every connection over it is `instance:<handle>`,
+  named by the channel, never by what it presents. That principal may send
+  its own two reports (`_instance.result`, `_instance.emit`) and nothing
+  else: no operator op, no read, no stream, no conversation, and no report
+  about another child's handle (`instance.op.refused`). The composed
+  configuration holds no bearer, peer or other credential of the parent's.
+  With `spawn.instance_uid` and `spawn.instance_gid`, agentd running as root
+  starts each child under that uid — not 0, not agentd's own, not a
+  signer's, not `spawn.uid` — after making its directory the child's, still
+  inside the Landlock domain; the child's own workers run under the same
+  uid. Without it, a child keeps agentd's uid, and could still dial a unix
+  A2A listener of its parent's it finds, which the kernel names as the
+  operator: that is what the uid of its own closes.
 
-What this preview does not do: it acts for one person; a grant held by a
-person stays usable after the IdP removes a Resource connection until the
-next mint (at most `at_cache_cap`); taint does not follow text inside an
-instance child, which keeps a record of its own; and on a kernel without
-Landlock, with no separate worker uid, the vault and a mounted key file are
-readable by any same-uid process.
+What this preview does not do: a certificate principal does not delegate
+yet; a grant held by a person stays usable after the IdP removes a Resource
+connection until the next mint (at most `at_cache_cap`); taint does not
+follow text inside an instance child, which keeps a record of its own; and
+on a kernel without Landlock, with no separate worker uid, the vault and a
+mounted key file are readable by any same-uid process.
 
 ### A container deployment with a worker uid
 
@@ -1475,6 +1515,15 @@ The store's root and the audit chain stay agentd's alone; with Landlock they
 are denied to every child as well. Keep the external signer's socket in a
 directory the worker uid cannot write, and the signer under a uid of its
 own.
+
+For instance children under a uid of their own (`spawn.instance_uid`, above)
+run agentd as root: it makes each child's directory the child's before it
+starts it, which a uid granted only capabilities cannot. The uid needs no
+entry in the container's `/etc/passwd`. A durable child's directory is under
+the store's root, so the store's root and each directory above it must be
+passable (`o+x`) by that uid, or the spawn is refused saying which is not; a
+non-durable child's is a private directory under the system temporary
+directory. Under user namespaces the uid must be mapped in the container.
 
 ### The audit chain
 

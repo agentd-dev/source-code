@@ -553,6 +553,12 @@ impl Runtime {
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": depth}),
             ),
             principal: caller.principal.clone(),
+            session: caller.session.clone(),
+            delegated_servers: servers
+                .iter()
+                .filter(|s| self.mcp_specs.get(*s).is_some_and(|sp| sp.delegated))
+                .cloned()
+                .collect(),
             // What the caller carries, the child is handed (`withhold`).
             carries: self.caller_carries(caller),
             tokens: 0,

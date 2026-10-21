@@ -325,7 +325,9 @@ fn top_level_properties(
                 "properties": {
                 "env_passthrough": { "type": "array", "items": { "type": "string" }, "description": "variables every child also gets, each a name or a PREFIX* pattern; one a supervisor-only secret is read from is refused" },
                 "uid": { "type": "integer", "minimum": 1, "description": "the uid every worker runs as instead of agentd's — turn workers, subagents, think children, an instance child's own workers, exec commands — with gid and no supplementary group; needs root, or CAP_SETUID and CAP_SETGID (instance-tier templates need root), and is refused at load where agentd cannot. Restart-only" },
-                "gid": { "type": "integer", "minimum": 1, "description": "the gid every worker runs as, with uid. Restart-only" } } }));
+                "gid": { "type": "integer", "minimum": 1, "description": "the gid every worker runs as, with uid. Restart-only" },
+                "instance_uid": { "type": "integer", "minimum": 1, "description": "the uid every instance child (a whole daemon a template spawns) runs as instead of agentd's, with instance_gid and no supplementary group: its directory is made its own, it answers its parent only over the channel it is handed at spawn, and its own workers run as it. Needs agentd to run as root; never agentd's uid, a signer's or spawn.uid. Restart-only" },
+                "instance_gid": { "type": "integer", "minimum": 1, "description": "the gid every instance child runs as, with instance_uid. Restart-only" } } }));
     // Hoisted out of the `a2a` literal for the same recursion-limit reason as
     // `instruction_trust`. The scope vocabulary is the enum's own list.
     let device_scopes: Vec<&str> = super::DeviceScope::ALL.iter().map(|s| s.as_str()).collect();
@@ -344,6 +346,11 @@ fn top_level_properties(
                 "cors": { "type": "object", "additionalProperties": false, "properties": {
                     "origins": { "type": "array", "items": { "type": "string" }, "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too" } } },
                 "device_grant": device_grant,
+                "login": { "type": "object", "additionalProperties": false, "required": ["idp"],
+                    "description": "the IdP-federated display-client sign-in (RFC 0044 §5.4; needs the xaa feature): a display client signs in at the IdP by authorization code with PKCE through a single-use start link on the listener origin, its session is user:oidc:<iss>#<sub>, and where a template admits it the sign-in is its enrolment. Beside the device grant or alone: either way the listener serves the session store, /oauth2/revoke and its metadata, declares the bearer scheme and grants no implicit operator. Refused with a2a.tls.client_ca and on a unix:// listener. Restart-only",
+                    "properties": {
+                    "idp": { "type": "string", "description": "the identity.providers entry people sign in at; its sign_in.grants must include authorization_code" },
+                    "token_ttl": { "type": ["string", "integer"], "description": "session-token lifetime, 5m..30d (default 8h)" } } },
                 "events": { "type": "object", "additionalProperties": false, "properties": {
                     "enabled": { "type": "boolean", "description": "declare the events extension and serve its observation feed; requires a2a.listen; restart-only" } } },
                 "introspection": { "type": "object", "additionalProperties": false, "properties": {
@@ -499,9 +506,10 @@ fn provider() -> Value {
 /// `identity.delegation` (RFC 0044 §5.5).
 fn delegation() -> Value {
     let duration = json!({ "type": ["string", "integer"], "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds" });
+    let template = template_schema(&duration);
     let secret = json!({ "type": "string", "description": "a secret reference: {{secret-file:PATH}}, or {{secret:NAME}} entered at the startup prompt — never the environment" });
     json!({ "type": "object", "additionalProperties": false,
-        "description": "acting for an enrolled person through their IdP (RFC 0044; needs the xaa feature): the seal key, the token caps and who may enrol for what. Restart-only, operator-only",
+        "description": "acting for enrolled people through their IdP (RFC 0044; needs the xaa feature): the seal key, the token caps, who may enrol for what and which device names are whose. Operator-only; the templates, device pins, first binding and the consent ages reload, the rest is restart-only",
         "properties": {
             "seal_key": secret,
             "seal_key_previous": secret,
@@ -517,22 +525,40 @@ fn delegation() -> Value {
             "at_cache_cap": duration,
             "liveness_interval": duration,
             "consent_timeout": duration,
-            "templates": { "type": "array", "description": "who may enrol, for what; no matching template, no enrolment",
-                "items": { "type": "object", "additionalProperties": false, "required": ["name", "principals", "idp", "servers"], "properties": {
+            "consent_session_max_age": { "type": ["string", "integer"], "description": "how recent a display session's IdP sign-in must be for it to answer a consent gate (default 12h). Reloadable" },
+            "device_pins": { "type": "object", "description": "RFC 0043 device names (auth.device.approve as:), each pinned to the one IdP identity that may enrol it; each session using the grant proves it again. Reloadable: a changed or removed pin revokes the name's grant and drops its sessions' proofs",
+                "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["iss", "sub"], "properties": {
+                    "iss": { "type": "string" }, "sub": { "type": "string" } } } },
+            "device_first_binding": { "type": "boolean", "description": "let an unpinned device name bind to whoever completes its first IdP enrolment (default false: a forwarded sign-in link lands the proof on the session that started it). Needs a2a.device_grant. Reloadable: turning it off revokes the grants it bound" },
+            "templates": { "type": "array", "description": "who may enrol, for what; no matching template, no enrolment. Reloadable: narrowing applies at the next mint; a removed template, or a server removed from one, revokes its grants",
+                "items": template } } })
+}
+
+/// One `identity.delegation.templates[]` entry: hoisted out of
+/// [`delegation`], whose `json!` would otherwise pass the macro's recursion
+/// limit.
+fn template_schema(duration: &Value) -> Value {
+    json!({ "type": "object", "additionalProperties": false, "required": ["name", "principals", "idp", "servers"], "properties": {
                     "name": { "type": "string" },
                     "principals": { "type": "object", "additionalProperties": false, "description": "every field named must match", "properties": {
-                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "P1 admits operator alone" },
+                        "source": { "enum": ["operator", "oidc", "x509", "device"], "description": "operator (a per-person operator), oidc (an a2a.login session) or device (an RFC 0043 device session); x509 is refused until a certificate principal's pin is built" },
                         "role": { "enum": ["operator", "user"] },
                         "labels": { "type": "object", "additionalProperties": { "type": "string" } } } },
                     "idp": { "type": "string", "description": "the identity.providers entry its principals bind to" },
                     "servers": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
-                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "the scope ceiling on this server" } } },
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "the scope ceiling on this server" },
+                        "document_workflows": { "type": "array", "description": "workflows from served instruction documents, by name and definition digest, that the document-sourced consent rule lets call this server unasked",
+                            "items": { "type": "object", "additionalProperties": false, "required": ["name", "digest"], "properties": {
+                                "name": { "type": "string" }, "digest": { "type": "string", "description": "the definition digest workflow.list shows: 64 lowercase hex" } } } } } },
                         "description": "each grant: id_jag server it allows, by name" },
+                    "subagents": { "enum": ["none", "inherit"], "description": "whether a subagent, think child or workflow-as-tool run of the person's work acts with their grant: none (default), or inherit — on the delegated servers the child declares, its calls made by the supervisor, holding no token" },
+                    "approvers": { "type": "array", "items": { "enum": ["principal", "operator"] }, "description": "who may answer the person's consent gates: [principal] (default) or [principal, operator], an operator's answer recorded as such" },
+                    "agent_mode_servers": { "type": "array", "items": { "type": "string" }, "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work" },
                     "ttl": duration,
                     "budget": { "type": "object", "additionalProperties": false, "properties": {
                         "per_day": { "type": "integer", "minimum": 1, "description": "mints per day per server; default 16" },
                         "per_month": { "type": "integer", "minimum": 1, "description": "mints per month per server; default 200" },
-                        "per_run": { "type": "integer", "minimum": 1, "description": "mints per run; default 12" } } } } } } } })
+                        "per_run": { "type": "integer", "minimum": 1, "description": "mints per run; default 12" } } } } })
 }
 
 /// `security.client` (RFC 0052): agentd's OAuth client where it has no

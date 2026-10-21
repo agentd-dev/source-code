@@ -13,6 +13,13 @@
 
 use crate::config::settings::{A2a, Role, Settings};
 
+/// The token endpoint's grant for a display client's sign-in at the IdP
+/// (`a2a.login`, RFC 0044 §5.4): an agentd-owned extension grant (RFC 6749
+/// §4.5) taking the request code `/oauth2/login_authorization` answered
+/// with. Named here, beside the posture that serves it, so a build without a
+/// listener still names what the pages and the clients say.
+pub const LOGIN_GRANT_TYPE: &str = "https://agentd.dev/oauth/grant-type/login";
+
 /// What the listener requires of a caller, and what it grants without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ListenerAuth {
@@ -22,6 +29,9 @@ pub struct ListenerAuth {
     pub mtls: bool,
     /// The device authorization grant issues session tokens.
     pub device: bool,
+    /// The IdP-federated display-client login (`a2a.login`, RFC 0044 §5.4)
+    /// issues session tokens.
+    pub login: bool,
     /// The listener is a unix socket: the kernel names the peer's uid.
     pub unix: bool,
     /// The TCP bind host is loopback (`127.0.0.0/8`, `::1`, `localhost`).
@@ -45,7 +55,14 @@ impl ListenerAuth {
     /// Whether the listener declares any authentication scheme a caller could
     /// present. A unix socket declares none: its authenticator is the kernel.
     pub fn declares_any(&self) -> bool {
-        !self.unix && (self.bearer || self.mtls || self.device)
+        !self.unix && (self.bearer || self.mtls || self.device || self.login)
+    }
+
+    /// Whether the listener issues sessions — the device grant, the IdP
+    /// login, or both: the session store, its verifier, `auth.sessions`,
+    /// `/oauth2/revoke` and the issuer metadata are served exactly then.
+    pub fn issues_sessions(&self) -> bool {
+        self.device || self.login
     }
 }
 
@@ -64,12 +81,14 @@ pub fn listener_auth_of(a2a: &A2a) -> ListenerAuth {
             .any(|p| p.matcher.bearer_ref.is_some());
     let mtls = https && a2a.tls.client_ca.is_some();
     let device = a2a.device_grant.enabled;
+    let login = a2a.login.is_some() && !unix;
     let implicit_operator = unix
         || (loopback_bind
             && a2a.bearer.is_none()
             && a2a.principals.is_empty()
             && a2a.tls.client_ca.is_none()
-            && !device);
+            && !device
+            && !login);
     // The FIRST `any` rule is the one the resolver applies (step 3 stops at
     // it), so it alone decides: an anonymous one admits nobody — the
     // resolver counts it as unauthenticated — whatever `any` rules follow it.
@@ -84,6 +103,7 @@ pub fn listener_auth_of(a2a: &A2a) -> ListenerAuth {
         bearer,
         mtls,
         device,
+        login,
         unix,
         loopback_bind,
         implicit_operator,
@@ -218,15 +238,27 @@ pub fn security_of(
         return None;
     }
     let mut schemes = std::collections::HashMap::new();
-    // A device-grant session token is presented as a bearer, so the grant
-    // implies the bearer scheme even when no static bearer is configured.
-    let bearer = posture.bearer || posture.device;
+    // A device-grant or an IdP-login session token is presented as a
+    // bearer, so either implies the bearer scheme even when no static
+    // bearer is configured.
+    let bearer = posture.bearer || posture.issues_sessions();
     if bearer {
-        let how = if posture.device {
-            "An `Authorization: Bearer` credential: a token the operator issued, or the session \
-             token the device authorization grant (`device_code`) issues"
-        } else {
-            "An `Authorization: Bearer` credential the operator issued"
+        let how = match (posture.device, posture.login) {
+            (true, true) => {
+                "An `Authorization: Bearer` credential: a token the operator issued, or the session \
+                 token the device authorization grant (`device_code`) or a sign-in at the \
+                 organization's identity provider issues (its endpoint is in the RFC 8414 metadata)"
+            }
+            (true, false) => {
+                "An `Authorization: Bearer` credential: a token the operator issued, or the session \
+                 token the device authorization grant (`device_code`) issues"
+            }
+            (false, true) => {
+                "An `Authorization: Bearer` credential: a token the operator issued, or the session \
+                 token a sign-in at the organization's identity provider issues (its endpoint is in \
+                 the RFC 8414 metadata)"
+            }
+            (false, false) => "An `Authorization: Bearer` credential the operator issued",
         };
         schemes.insert(
             "bearer".to_string(),
@@ -453,6 +485,22 @@ pub(crate) mod tests {
                 a2a(json!({"listen": "unix:///run/agentd.sock"})),
                 false,
             ),
+            // The IdP login alone is a posture of its own (RFC 0044 §5.4): a
+            // loopback bind with it grants no implicit operator.
+            (
+                "loopback login alone",
+                a2a(json!({"listen": "http://127.0.0.1:8080", "login": {"idp": "okta"}})),
+                true,
+            ),
+            (
+                "wildcard login + bearer",
+                a2a(
+                    json!({"listen": "https://0.0.0.0:8443", "url": "https://agent.example",
+                    "tls": {"cert": "c", "key": "k"}, "bearer": "{{secret:B}}",
+                    "login": {"idp": "okta"}}),
+                ),
+                true,
+            ),
         ]
     }
 
@@ -555,6 +603,13 @@ pub(crate) mod tests {
             {"id": "x", "match": {"any": true}, "role": "anonymous"}
         ]}));
         assert!(!anon_any.any_rule && anon_any.required);
+        // The IdP login declares a verifier, issues sessions and ends the
+        // implicit operator; on a unix socket it is nothing.
+        let login = p(json!({"listen": "http://127.0.0.1:1", "login": {"idp": "okta"}}));
+        assert!(login.login && login.declares_any() && login.issues_sessions());
+        assert!(!login.implicit_operator && login.required && !login.device);
+        let unix_login = p(json!({"listen": "unix:/run/a.sock", "login": {"idp": "okta"}}));
+        assert!(!unix_login.login && !unix_login.issues_sessions());
     }
 
     #[test]

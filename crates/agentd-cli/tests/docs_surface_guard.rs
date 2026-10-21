@@ -24,6 +24,7 @@
 //! and `rfcs/` — is not scanned; it records what was.
 
 use agentd::engine::model::kind_info;
+use agentd::runtime::surface::auth::LOGIN_GRANT_TYPE;
 use agentd::runtime::surface::launch::{LAUNCH_CONTRACT, LAUNCH_GRANT_TYPE};
 use agentd::runtime::surface::{EXTENSION_METHODS, Ext, SpecMethod, UNIX_BINDING};
 use std::path::{Path, PathBuf};
@@ -326,13 +327,13 @@ fn owned_uris(line: &str) -> Vec<String> {
     out
 }
 
-/// Every protocol URI agentd declares: its extensions, its unix binding and
-/// its launch grant.
+/// Every protocol URI agentd declares: its extensions, its unix binding, its
+/// launch grant and its login grant.
 fn declared_uris() -> Vec<&'static str> {
     Ext::ALL
         .iter()
         .map(|e| e.uri())
-        .chain([UNIX_BINDING, LAUNCH_GRANT_TYPE])
+        .chain([UNIX_BINDING, LAUNCH_GRANT_TYPE, LOGIN_GRANT_TYPE])
         .collect()
 }
 

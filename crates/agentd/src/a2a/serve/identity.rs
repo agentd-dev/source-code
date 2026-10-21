@@ -42,12 +42,15 @@ pub(super) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> Pe
 }
 
 /// Where the connection came from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum Peer {
     Tcp(SocketAddr),
     /// A unix-socket peer, already checked to be the daemon's own uid or
     /// root: the uid the kernel named.
     Unix(u32),
+    /// An instance child, through the channel this daemon handed it at
+    /// spawn (`a2a::channel`): its handle.
+    Instance(Arc<str>),
 }
 
 impl Peer {
@@ -56,11 +59,12 @@ impl Peer {
     }
 
     /// The address failures are counted against. A unix peer has none, and
-    /// never needs one: it is always the operator.
+    /// never needs one: it is always the operator; nor has an instance
+    /// child, which its channel names.
     pub(super) fn source(&self) -> Option<IpAddr> {
         match self {
             Peer::Tcp(a) => Some(a.ip()),
-            Peer::Unix(_) => None,
+            Peer::Unix(_) | Peer::Instance(_) => None,
         }
     }
 }
@@ -91,7 +95,7 @@ pub(super) fn evidence_of(headers: &HeaderMap, peer_id: &PeerId, peer: &Peer) ->
         }),
         local: match peer {
             Peer::Tcp(a) => a.ip().to_canonical().is_loopback(),
-            Peer::Unix(_) => true,
+            Peer::Unix(_) | Peer::Instance(_) => true,
         },
         // Presence, not value: `Origin: null` is what a `file://` page, a
         // sandboxed iframe or a `data:` URL sends, and it is as much a browser
@@ -99,7 +103,11 @@ pub(super) fn evidence_of(headers: &HeaderMap, peer_id: &PeerId, peer: &Peer) ->
         origin: headers.contains_key(header::ORIGIN),
         uid: match peer {
             Peer::Unix(uid) => Some(*uid),
-            Peer::Tcp(_) => None,
+            Peer::Tcp(_) | Peer::Instance(_) => None,
+        },
+        instance: match peer {
+            Peer::Instance(h) => Some(h.to_string()),
+            _ => None,
         },
     }
 }

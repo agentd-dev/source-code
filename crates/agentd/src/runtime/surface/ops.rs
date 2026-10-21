@@ -503,48 +503,48 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.enrol",
         Task,
-        Operator,
+        AnyNamed,
         &[],
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "Sign the per-person operator in at an identity provider {idp, grant?} and keep their delegation grant: the task says where to sign in, and how it ended. The per-person operator's alone",
+        "Sign the caller in at an identity provider {idp, grant?} and keep their delegation grant — a per-person operator, an a2a.login session, or a device session whose name a pin or the first binding makes eligible: the task says where to sign in (a display session's start link is its signIn annotation), and how it ended. The caller's own enrolment alone",
         delegation_enrol_args,
         no_result,
     ),
     op(
         "delegation.list",
         Message,
-        Operator,
+        AnyNamed,
         &[],
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "The delegation grants this instance holds — never a secret — and the open consent gates, each with its nonce and argument hash for the person who answers it",
+        "The delegation grants and the open consent gates — every one to an operator, the caller's own to anyone else; never a secret — each gate with its nonce and argument hash for the person who answers it",
         no_args,
         delegation_list_result,
     ),
     op(
         "delegation.approve",
         Task,
-        Operator,
+        AnyNamed,
         &[],
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone",
+        "Approve one consent gate {gate, nonce, args_hash}: the call it holds runs. Bound to the gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
         delegation_answer_args,
         no_result,
     ),
     op(
         "delegation.deny",
         Task,
-        Operator,
+        AnyNamed,
         &[],
         Scope::Instance,
         Gate::Delegation,
         Handler::Delegation,
-        "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made. The person's alone",
+        "Deny one consent gate {gate, nonce}: the call it holds is refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
         delegation_answer_args,
         no_result,
     ),
@@ -592,7 +592,7 @@ pub const OPS: &[OpSpec] = &[
         Scope::Instance,
         Gate::Always,
         Handler::Instance,
-        "reserved: a child instance reports to its parent; operator only; not listed in params.ops",
+        "reserved: a child instance reports to its parent, itself over the channel its parent handed it, or an operator for it; not listed in params.ops",
         instance_family_args,
         instance_family_result,
     ),
@@ -756,13 +756,13 @@ pub struct Member {
 pub const INSTANCE_OPS: &[Member] = &[
     Member {
         name: "_instance.result",
-        description: "reserved: a `mode: sync` child's first result, recorded on the parent's handle; operator only",
+        description: "reserved: a `mode: sync` child's first result, recorded on the parent's handle; sent by the child over its channel, or by an operator",
         args_schema: instance_result_args,
         result_schema: no_result,
     },
     Member {
         name: "_instance.emit",
-        description: "reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; operator only",
+        description: "reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; sent by the child over its channel, or by an operator",
         args_schema: instance_emit_args,
         result_schema: no_result,
     },
@@ -1269,6 +1269,16 @@ fn sessions_result() -> Value {
                 "approved_by": {"type": "string"},
                 "name": {"type": "string"},
                 "approved_rule": {"type": "string"},
+                "source": {"enum": ["device", "oidc", "operator"], "description": "how the session's principal was established: an approved device's name, an IdP sign-in (a2a.login), or the operator (a launch)"},
+                "idp_proof": closed(
+                    &["idp", "iss", "sub", "at"],
+                    json!({
+                        "idp": {"type": "string"},
+                        "iss": {"type": "string"},
+                        "sub": {"type": "string"},
+                        "at": count(),
+                    }),
+                ),
             }),
         ))}),
     )
@@ -1816,7 +1826,8 @@ pub fn schema_bundle() -> Value {
                         envelope; $defs/ops/<op> and $defs/reserved/<op> give its reply kind \
                         (message or task), arguments and result — for a message op the document \
                         its reply carries, for a task op the data of the result artifact it \
-                        completes with (false: none). Reserved ops are operator only and never \
+                        completes with (false: none). Reserved ops are a child instance's, sent \
+                        over the channel its parent handed it, or an operator's, and never \
                         listed in params.ops.",
         "type": "object",
         "required": ["agentd"],

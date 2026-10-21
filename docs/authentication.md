@@ -515,20 +515,23 @@ and set `security.experimental.id_jag: true`. ID-JAG is an IETF draft
 Enterprise-Managed Authorization extension is young; agentd follows both as
 they stand ([RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)).
 
-With it, agentd acts **for one enrolled person** at an MCP server, with a
+With it, agentd acts **for each enrolled person** at an MCP server, with a
 token whose subject is that person, issued because their enterprise IdP —
 Okta's Cross App Access, or any IdP that issues ID-JAGs — says agentd may.
 agentd's own credential is never used at such a server, and nothing falls
-back to it.
+back to it. Each person's grant is theirs alone: their work mints with it,
+nobody else's does, and no token, cache entry or connection is shared
+between two people.
 
 How a call is made:
 
-1. The person enrols once: `agentd --login idp:<name>` signs them in at the
-   IdP. The daemon runs the sign-in, verifies the ID token with the IdP's
-   keys, requires its `iss` and `sub` to be the person's exact pin, and keeps
-   the refresh token sealed (AES-256-GCM, `identity.delegation.seal_key`).
-   Then it lists each allowed server's tools, with one delegated token per
-   server.
+1. The person enrols once by signing in at the IdP: a per-person operator
+   with `agentd --login idp:<name>`, anyone else from a display client
+   (below). The daemon runs the sign-in, verifies the ID token with the
+   IdP's keys, holds its `iss` and `sub` to who the person is — their pin,
+   or the identity the sign-in establishes — and keeps the refresh token
+   sealed (AES-256-GCM, `identity.delegation.seal_key`). Then it lists each
+   allowed server's tools, with one delegated token per server.
 2. At a call, the supervisor exchanges the grant at the IdP for an ID-JAG
    (RFC 8693): `audience` is the server's authorization server and
    `resource` the server, both pinned in the configuration. It checks the
@@ -601,29 +604,84 @@ Open https://acme.okta.com/activate and enter the code WDJB-MJHT (it expires in 
 operator:alice is enrolled at okta as 00u1alice (template eng-tools): agentd acts as them on linear until 2026-11-18; listed linear (12 tools)
 ```
 
-**Who may delegate.** In this preview, one person: the `a2a.principals` rule
-that matches the unix A2A listener's peer by `uid` and carries an exact
-`idp_subject` pin. That caller is `operator:<id>`; its runs, and nobody
-else's, use the grant. A run started by a schedule, a webhook, another
-operator or anyone else fails `no_delegation` at a delegated server, and a
-delegated server's tools are not offered at all in work for someone without
-a usable grant; `identity.autonomous_as` may not name the person. A
-subagent's call is `delegation_not_permitted`, and so is a call in a run a
-subagent's call started — through a workflow tool, `workflow.run` or
-`workflow.signal` — or in a run that one started. A reload that changes the
-person's rule is refused (`restart_required`). A sign-in whose `iss` and
-`sub` are not the pin keeps nothing (`binding_mismatch`). Signing in again
-keeps the grant while it is the same — the same identity, unexpired, under
-the template that admits the person now with the ceilings it allows now —
-and otherwise replaces it, revoking the refresh token it held at the IdP:
-that is how an expired grant, or one enrolled before the pin changed, is
-renewed. A grant is held at every call to the ceilings its template allows
-now. The IdP's device grant shows `verification_uri` and
+**Who may delegate.** Whoever an `identity.delegation.templates` entry
+admits, by the principal's `source` — nobody else:
+
+- `operator` — a **per-person operator**: an `a2a.principals` rule that
+  matches the unix A2A listener's peer by `uid` and carries an exact
+  `idp_subject` pin. That caller is `operator:<id>`, and enrols with
+  `agentd --login idp:<name>`. Several people may each have one.
+- `oidc` — a person who **signed in at the IdP from a display client**
+  (`a2a.login`, below): `user:oidc:<iss>#<sub>`, whatever their IdP says
+  they are. Signing in is their enrolment.
+- `device` — an RFC 0043 **device session** an operator approved under a
+  name, and only a name an operator has bound to one person: pinned
+  (`identity.delegation.device_pins.<name>: {iss, sub}`), or — opted in —
+  bound by its first enrolment (`identity.delegation.device_first_binding`;
+  a sign-in link forwarded to someone else lands their proof on the session
+  that started it, so pin where you can). A device session uses the grant
+  only after it has itself signed in at the IdP as the identity the name is
+  bound to (`delegation.enrol`): a second device approved under the same
+  name, or one that proved someone else, is `not_enrolled`, and its sign-in
+  as someone else is `binding_mismatch` and leaves the grant alone.
+
+A certificate principal (`source: x509`) delegates in P2's second part; a
+bearer principal never does (`principal_not_delegable`), since a
+`bearer_ref` secret is typically shared. A template's principal is checked
+at every call, as it stands then: a run is the person's who started it,
+through the session it was started through, and a delegated server's tools
+are not offered at all in work for someone without a usable grant there.
+A run started by a schedule, a webhook, another operator or anyone else
+fails `no_delegation` at a delegated server; `identity.autonomous_as` may
+not name a person. A subagent's call is `delegation_not_permitted`, and so
+is a call in a run a subagent's call started — through a workflow tool,
+`workflow.run` or `workflow.signal` — or in a run that one started, unless
+the person's template says `subagents: inherit`: then the subagent acts
+with the person's grant at the delegated servers it declared itself, and
+holds no token — the supervisor makes each call. A sign-in whose `iss` and
+`sub` are not who the person is keeps nothing (`binding_mismatch`). Signing
+in again keeps the grant while it is the same — the same identity,
+unexpired, under the template that admits the person now with the ceilings
+it allows now — and otherwise replaces it, revoking the refresh token it
+held at the IdP: that is how an expired grant, or one enrolled before the
+pin changed, is renewed. A grant is held at every call to the ceilings its
+template allows now. The IdP's device grant shows `verification_uri` and
 `user_code` only; `sign_in.grants: [authorization_code]` uses PKCE, `state`,
-`nonce` and RFC 9207's `iss`, through a one-time start link on a loopback
-callback the daemon holds for the sign-in: the link sets a cookie bound to
-the sign-in, and the callback is taken only with it, so an IdP URL forwarded
-to someone else never completes.
+`nonce` and RFC 9207's `iss`, through a one-time start link: the link sets a
+cookie bound to the sign-in, and the callback is taken only with it, so an
+IdP URL forwarded to someone else never completes.
+
+**Signing in from a display client.** `a2a.login: {idp: <name>}` lets a
+display client sign a person in at that IdP on a TCP listener. The client
+asks `POST /oauth2/login_authorization` (named `login_authorization_endpoint`
+in the listener's RFC 8414 metadata) for a start link and a request code,
+opens the link in the person's browser, and polls the token endpoint with
+the request code and the grant `https://agentd.dev/oauth/grant-type/login`.
+The link, on the listener origin, is good once and for 60 seconds; it sets a
+`__Host-` cookie bound to the sign-in and sends the browser to the IdP; the
+IdP returns it to `/oauth2/callback`, which is taken only with that cookie.
+The daemon exchanges the code, verifies the ID token and issues an RFC 0043
+session of `source: oidc` carrying the IdP proof (`a2a.login.token_ttl`, 8
+hours by default) — the client never sees an IdP token. Where a template
+admits the person, that sign-in kept their grant; where none does, they are
+signed in all the same and the refresh token is revoked at the IdP. A
+listener with `a2a.login` declares `bearer` in its card, grants a loopback
+caller no implicit operator, and serves `/oauth2/revoke`; `a2a.login` beside
+`a2a.tls.client_ca`, on a unix listener, or at a provider whose
+`sign_in.grants` lacks `authorization_code` is refused at load. A device
+session enrols the same way from its display client: `delegation.enrol
+{idp}` answers with a task whose `signIn` annotation is the start link
+([Display clients](interface.md#acting-for-you-at-an-mcp-server)).
+[`examples/okta-xaa-mcp.yaml`](../examples/okta-xaa-mcp.yaml) is a whole
+configuration of it: people signing in through `a2a.login`, and a pinned
+laptop.
+
+**Ending a session ends what it delegated.** A run, a conversation turn and
+a subagent started through a session act through it: `auth.sessions.revoke`,
+`/oauth2/revoke`, the session's expiry and a restart — every session is held
+in memory — end it, and its work's next delegated call fails `revoked`; a
+consent gate it waits on closes `revoked` at once, the call never made. The
+grant itself stays: the person signs in again for new work.
 
 **The person's approvals.** agentd tracks which work has read outside text
 (*tainted*) and which holds the person's delegated data. A delegated
@@ -641,14 +699,27 @@ call to a `sensitive` or `egress` tool from tainted work; and every
 delegated `egress` call. The call gates, `agentd --delegation-list` shows it
 — agentd's own text of it, with the server, the tool, the arguments quoted
 and escaped, the scopes the token carries, the run, and what tainted it —
-and the person answers with `agentd --delegation-approve <gate>` or
-`--delegation-deny <gate>`, over the unix listener. An answer is bound to
+and the person answers it: a per-person operator with `agentd
+--delegation-approve <gate>` or `--delegation-deny <gate>` over the unix
+listener; anyone else from their display client, where the gate is shown on
+the task of the work it holds (`input-required`, badged as agentd's
+security gate, its `consentGate` annotation naming it) and answered with
+`delegation.approve` / `delegation.deny` through a session whose own IdP
+sign-in is younger than `identity.delegation.consent_session_max_age` (12
+hours by default; sign in again for an older one). An answer is bound to
 the gate's nonce and the hash of its arguments, and an approved step runs
-with the spec the person saw. No operator answers for the person, no
-message on the gate's task is an answer — each is refused and recorded — no
-judge answers whatever `agent.ask_human_fallback` says, and an unanswered
-gate denies after `identity.delegation.consent_timeout` (24 hours by
-default). Each decision is a record of the audit chain whose content — what
+with the spec the person saw. No operator answers for the person unless
+their template lists `approvers: [principal, operator]` (recorded `via:
+operator`), no message on the gate's task is an answer — each is refused and
+recorded — no judge answers whatever `agent.ask_human_fallback` says, and an
+unanswered gate denies after `identity.delegation.consent_timeout` (24 hours
+by default). When the IdP asks for a fresher sign-in
+(`insufficient_user_authentication`), the call waits on a sign-in gate
+instead: the person signs in again — at the start link it carries, for a
+display session's work, or with the IdP's device code for a per-person
+operator's, where `sign_in.grants` offers the device grant — and the call
+is made with the fresh ID token; a sign-in as anyone but the grant's own
+person is `binding_mismatch`. Each decision is a record of the audit chain whose content — what
 the person saw — is sealed under their own key: `agentd --delegation-audit`
 reads it back, and `agentd --delegation-forget <principal>` erases the
 person — the gates open for them denied first, then their grants revoked
@@ -683,8 +754,9 @@ ID-JAG it came with is checked, so a refused ID-JAG never leaves the spent
 token in the vault; one IdP call per
 grant runs at a time, so two servers minting at once never present one
 rotating token twice. `insufficient_user_authentication` is `step_up`: the
-person runs `agentd --login idp:<name>` again, and the next mint presents
-that fresh ID token. Mints are budgeted per day and month per server
+call waits on a sign-in gate (above) — or a per-person operator runs
+`agentd --login idp:<name>` again — and the next mint presents that fresh ID
+token. Mints are budgeted per day and month per server
 (`templates[].budget`, 16 and 200 by default, 80% of Okta's 250 a month) and
 per run (12); `delegation.quota_warn` fires at 80%.
 
@@ -751,12 +823,23 @@ written. A store restored from before a revocation then refuses the revoked
 grant as it loads: the person is `not_enrolled` and enrols again, and nothing
 is presented to the IdP.
 
-**What this preview does not do yet** (RFC 0044 P2 and later): several
-people, an IdP-federated display-client login, device and certificate
-principals that delegate, consent rules an operator configures (`once_per`,
-`to: principal`) and consent gates in the display clients, CIBA,
-unattended runs, same-domain token exchange (`grant: token_exchange`), and
-live interop against an Okta Integrator org or xaa.dev.
+**A reload** applies `identity.delegation.templates`, `device_pins`,
+`device_first_binding`, `consent_session_max_age` and `consent_timeout`: a
+narrowed template holds every grant it allowed to the new ceilings at the
+next call; a template removed, a server removed from one, a pin changed or
+removed, and first binding turned off revoke the grants they allowed — at
+the IdP, tombstoned, `why` said in `delegation.revoked` — and drop the IdP
+proofs of those device names' sessions. Adding or changing a per-person
+operator's rule is a restart.
+
+**What this preview does not do yet** (RFC 0044 P2's second part and
+later): certificate principals that delegate, the hiding of agent-mode
+servers from delegated work (`templates[].agent_mode_servers` loads and
+changes nothing yet), the document-sourced consent rule
+(`servers.<name>.document_workflows`, likewise), consent rules an operator
+configures (`once_per`), CIBA, unattended runs (`act_for`, refused at load),
+same-domain token exchange (`grant: token_exchange`), and live interop
+against an Okta Integrator org or xaa.dev.
 
 ### Fields
 
@@ -769,8 +852,10 @@ live interop against an Okta Integrator org or xaa.dev.
 | `subject`, `subjects`, `jwks_uri` | `identity.providers.<name>` | what the exchange presents; whether an ID-JAG's `sub` must be the person's; the key set's pin |
 | `seal_key`, `seal_key_previous` | `identity.delegation` | 32 bytes, hex or base64, as a secret reference (`key_custody: local`) |
 | `key_custody`, `signer` | `identity.delegation` | `local` (default) or `external`; the signer's `{socket, uid, timeout, seal_key, seal_key_previous}` |
-| `at_cache_cap`, `liveness_interval`, `consent_timeout` | `identity.delegation` | `60m`, `15m`, `24h` |
-| `templates` | `identity.delegation` | `{name, principals: {source: operator}, idp, servers: {<name>: {scopes}}, ttl, budget}` |
+| `at_cache_cap`, `liveness_interval`, `consent_timeout`, `consent_session_max_age` | `identity.delegation` | `60m`, `15m`, `24h`, `12h` |
+| `templates` | `identity.delegation` | `{name, principals: {source, role, labels}, idp, servers: {<name>: {scopes, document_workflows}}, ttl, budget, subagents, approvers, agent_mode_servers}`: `source` is `operator`, `oidc` or `device`; `subagents` `none` (default) or `inherit`; `approvers` `[principal]` (default) or `[principal, operator]` |
+| `device_pins`, `device_first_binding` | `identity.delegation` | `<device name>: {iss, sub}`, each name bound to one person; `false` (an unpinned name binds to its first enrolment when `true`) |
+| `idp`, `token_ttl` | `a2a.login` | the IdP display clients sign people in at; their sessions' lifetime (`8h`, `5m`–`30d`) |
 | `grant: id_jag`, `idp`, `audience`, `resource`, `client_id` | `mcp.servers[].auth` | the delegated server's IdP, its authorization server, itself, and agentd's client there (all required) |
 | `client_auth`, `client_secret` | `mcp.servers[].auth` | agentd's authentication at the authorization server; never the IdP's key |
 | `scopes`, `tool_scopes`, `scope_mode` | `mcp.servers[].auth` | baseline and per-tool scopes; one token per server with their union (`server`, default) or per scope set (`per_tool`) |

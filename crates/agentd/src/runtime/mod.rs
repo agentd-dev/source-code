@@ -57,6 +57,8 @@ pub(crate) mod retire;
 pub(crate) mod skills; // the skills catalogue: built, loaded into contexts, its tools (RFC 0051)
 pub mod starts;
 pub mod steps;
+#[cfg(feature = "xaa")]
+pub(crate) mod stepup; // step-up sign-ins as consent gates (RFC 0044 §5.10 L4)
 pub(crate) mod streams;
 pub mod subagents;
 pub mod surface;
@@ -346,6 +348,15 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             json!({"code": crate::exit::USAGE, "err": format!("security.tls_ca {path}: {e}")}),
         );
         return crate::exit::USAGE;
+    }
+    // An instance child takes the channel its parent handed it at spawn —
+    // the one way it reaches its parent — before anything else is opened.
+    #[cfg(unix)]
+    if std::env::var_os(crate::supervisor::reap::INSTANCE_CHILD_ENV).is_some() {
+        log.info(
+            "instance.channel",
+            json!({"held": crate::a2a::channel::take_inherited()}),
+        );
     }
     // The AAuth identity, set up — the provider's metadata verified, the first
     // agent token fetched — before anything is dialed. It signs this
@@ -800,6 +811,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_forced: false,
         drain_instances: Default::default(),
         private_instances: None,
+        instance_doors: Default::default(),
         drain_left: Default::default(),
         idle_since: None,
         intel,
@@ -1409,6 +1421,29 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             Ok(serving) => {
                 rt.a2a_feed = serving.feed.clone();
                 rt.a2a_sink = Some(std::sync::Arc::clone(&serving.listener.sink));
+                // An instance child's connections are served by this
+                // listener's router, as the child's own principal.
+                #[cfg(unix)]
+                rt.instance_doors.open(serving.listener.door.clone());
+                // Every delegated call made through a session is admitted
+                // against the listener's session store, and the sign-ins
+                // at the IdP on its origin are completed by the delegation
+                // supervisor (RFC 0044 §5.4).
+                #[cfg(feature = "xaa")]
+                if let Some(d) = &rt.delegation {
+                    if let Some(s) = &serving.sessions {
+                        d.sessions_to(std::sync::Arc::clone(s)
+                            as std::sync::Arc<dyn crate::delegation::SessionBook>);
+                    }
+                    if let Some(signins) = serving.authority.as_ref().and_then(|a| a.signins()) {
+                        signins.set_federation(std::sync::Arc::new(
+                            crate::delegation::federation::Federation {
+                                d: std::sync::Arc::clone(d),
+                                tx: rt.events_tx.clone(),
+                            },
+                        ));
+                    }
+                }
                 // The listener stops the moment it is dropped, so the runtime
                 // holds it for as long as it is serving.
                 rt.a2a_serving = Some(serving);

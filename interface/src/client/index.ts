@@ -27,13 +27,17 @@ export {
   availableCommands,
   commandHelp,
   conversationAddress,
+  consentLine,
+  consentWait,
   conversationsNote,
   currentGate,
   elapsed,
   parseAuthCommand,
+  parseDelegationCommand,
   prepare,
   routeSend,
   runAuthCommand,
+  runDelegationCommand,
   skillNames,
   skillPrefix,
   suggest,
@@ -42,6 +46,15 @@ export {
   workflowNames,
   duration,
 } from './composer.js';
-export type { AuthClient, AuthCommand, AuthOutcome, Prepared, Suggestion, SystemCommand } from './composer.js';
+export type {
+  AuthClient,
+  AuthCommand,
+  AuthOutcome,
+  DelegationClient,
+  DelegationCommand,
+  Prepared,
+  Suggestion,
+  SystemCommand,
+} from './composer.js';
 export { askForm, askAnswer, gateBadge } from './askform.js';
 export type { AskForm } from './askform.js';

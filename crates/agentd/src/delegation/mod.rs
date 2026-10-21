@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Acting for one enrolled person at MCP servers through their enterprise
-//! IdP (RFC 0044 P1): the supervisor's half of `grant: id_jag`.
+//! Acting for enrolled people at MCP servers through their enterprise IdP
+//! (RFC 0044 P1, P2): the supervisor's half of `grant: id_jag`.
 //!
-//! **Who.** One per-person operator, `operator:<id>`: the unix A2A
-//! listener's peer the kernel names by uid, with an exact `idp_subject` pin
-//! (`config::settings::delegation`). `agentd --login idp:<name>` enrols them
-//! ([`enrol`]): the supervisor runs the sign-in, verifies the ID token with
-//! the IdP's keys, binds its `iss` and `sub` to the pin, and seals the
-//! refresh token in the [`vault`]. Only that operator's runs use the grant;
-//! autonomous runs, other operators and every other principal get
-//! `no_delegation`, and nothing ever falls back to agentd's own credential.
+//! **Who** ([`Who`]): three kinds of principal may hold a grant, each by the
+//! typed principal its transport established, never a display string —
+//!
+//! - a **per-person operator**, `operator:<id>`: the unix A2A listener's
+//!   peer the kernel names by uid, with an exact `idp_subject` pin
+//!   (`config::settings::delegation`), enrolled with `agentd --login
+//!   idp:<name>` ([`enrol`]);
+//! - an **IdP-federated session** (`a2a.login`), `user:oidc:<iss>#<sub>`:
+//!   whoever the IdP said signed in, enrolled by that same sign-in;
+//! - an **RFC 0043 device session**, `user:<name>`: eligible only through a
+//!   `device_pins` pin or, opted in, the first IdP enrolment of its name —
+//!   and then only through a session that itself proved, by signing in at
+//!   the IdP, the `iss` and `sub` the name is bound to. Another session of
+//!   the same name shares the name's history but not the grant
+//!   (`not_enrolled`) until it signs in as that person; signing in as
+//!   anyone else is `binding_mismatch`, and the grant is untouched.
+//!
+//! A run or a turn records the session it acts through, and every call is
+//! admitted against that session as it is now: ended — its `token_ttl`,
+//! `auth.sessions.revoke`, `/oauth2/revoke`, a restart — the call fails
+//! `revoked`. Each enrolment verifies the ID token with the IdP's keys,
+//! binds its `iss` and `sub` as the principal's kind says, and seals the
+//! refresh token in the [`vault`]. Autonomous runs, an operator who is not
+//! the person, and every other principal get `no_delegation`, and nothing
+//! ever falls back to agentd's own credential.
 //!
 //! **Where.** Delegated servers are the supervisor's alone: no worker is
 //! handed one to dial (`mcp::from_spec` refuses a delegated spec), nothing is
@@ -49,6 +66,8 @@
 //! ID-JAG, access token — is scrubbed from what a call returns, by value.
 
 pub mod enrol;
+#[cfg(feature = "a2a")]
+pub mod federation;
 pub mod lint;
 pub mod vault;
 
@@ -59,12 +78,13 @@ pub mod cli;
 pub mod mock;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::a2a::principals::typed::{PrincipalRef, Source};
+use crate::a2a::principals::typed::{IdpProof, PrincipalRef, Source};
 use crate::auth::idjag::{self, CheckKind, Exchange, Expect, Refusal, SubjectType};
 use crate::auth::oauth2::{self, OAuth2Params};
 use crate::config::settings::Settings;
@@ -288,7 +308,7 @@ pub enum Note {
 /// Where notes go.
 pub type Notify = Arc<dyn Fn(Note) + Send + Sync>;
 
-/// The per-person operator.
+/// A per-person operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Person {
     /// `operator:<id>`: the principal id a run's authority names.
@@ -302,19 +322,135 @@ pub struct Person {
 }
 
 impl Person {
-    /// The person `settings` declare, when there is one.
-    pub fn of(settings: &Settings) -> Option<Person> {
-        let rule = cfg::person(settings)?;
-        let id = rule.id.clone()?;
-        let pin = rule.idp_subject.clone()?;
-        Some(Person {
-            id: format!("operator:{id}"),
-            typed: PrincipalRef::local(Source::Operator, &id),
-            fingerprint: format!("unix-uid:{}", rule.matcher.uid?),
-            iss: pin.iss,
-            sub: pin.sub,
-            labels: rule.labels.clone(),
+    /// Every per-person operator `settings` declare.
+    pub fn all(settings: &Settings) -> Vec<Person> {
+        cfg::persons(settings)
+            .filter_map(|rule| {
+                let id = rule.id.clone()?;
+                let pin = rule.idp_subject.clone()?;
+                Some(Person {
+                    id: format!("operator:{id}"),
+                    typed: PrincipalRef::local(Source::Operator, &id),
+                    fingerprint: format!("unix-uid:{}", rule.matcher.uid?),
+                    iss: pin.iss,
+                    sub: pin.sub,
+                    labels: rule.labels.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Who a delegated call acts for, as the work it is made in recorded it:
+/// its principal, and the RFC 0043 session it acts through, when it was
+/// started from one (RFC 0044 §5.12 `session`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Acting<'a> {
+    pub principal: Option<&'a str>,
+    pub session: Option<&'a str>,
+}
+
+impl<'a> Acting<'a> {
+    pub fn new(principal: Option<&'a str>, session: Option<&'a str>) -> Acting<'a> {
+        Acting { principal, session }
+    }
+}
+
+/// A principal that may hold a grant, as it stands now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Who {
+    /// Its display id: `operator:<id>`, `user:oidc:<iss>#<sub>`,
+    /// `user:<name>`. A consent gate is addressed to it.
+    pub id: String,
+    pub typed: PrincipalRef,
+    pub role: crate::config::settings::Role,
+    pub labels: BTreeMap<String, String>,
+    pub kind: WhoKind,
+    /// The session it acts through, when it does.
+    pub session: Option<String>,
+    /// The IdP identity that session itself proved, when it did: what a
+    /// device name's grant is held to at every call, and what lets a
+    /// session answer the person's consent gates.
+    pub proof: Option<IdpProof>,
+}
+
+/// What kind of principal a [`Who`] is, and what its grant is held to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhoKind {
+    /// A per-person operator: the grant is held to its uid and its pin.
+    Person {
+        fingerprint: String,
+        iss: String,
+        sub: String,
+    },
+    /// An `a2a.login` session: the grant is held to the IdP's subject.
+    Oidc,
+    /// An RFC 0043 device session: the grant is held to the name's
+    /// binding, which this session must itself have proved.
+    Device { name: String },
+}
+
+impl Who {
+    /// The credential fingerprint a grant enrolled as this principal
+    /// carries (RFC 0044 §5.2): the uid of a per-person operator, the
+    /// IdP's subject of an `a2a.login` principal, and a device name's
+    /// binding — the subject its enrolling session proved.
+    fn fingerprint(&self, iss: &str, sub: &str) -> String {
+        match &self.kind {
+            WhoKind::Person { fingerprint, .. } => fingerprint.clone(),
+            WhoKind::Oidc => format!("oidc:{iss}#{sub}"),
+            WhoKind::Device { .. } => format!("idp:{iss}#{sub}"),
+        }
+    }
+
+    /// The template `source` this principal is.
+    fn source(&self) -> &'static str {
+        match self.kind {
+            WhoKind::Person { .. } => "operator",
+            WhoKind::Oidc => "oidc",
+            WhoKind::Device { .. } => "device",
+        }
+    }
+}
+
+/// What the delegation supervisor reads of an RFC 0043 session: who it is,
+/// and the IdP proof it holds. The listener's session store answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// The principal id requests presenting its token act as.
+    pub principal: String,
+    pub typed: PrincipalRef,
+    pub role: crate::config::settings::Role,
+    pub proof: Option<IdpProof>,
+}
+
+/// The listener's session store, as the delegation supervisor reads and
+/// writes it.
+pub trait SessionBook: Send + Sync {
+    /// Session `sid`, while it lives.
+    fn session(&self, sid: &str) -> Option<SessionInfo>;
+    /// Record the IdP identity session `sid` proved; `false` when it is
+    /// gone.
+    fn set_proof(&self, sid: &str, proof: IdpProof) -> bool;
+    /// Drop the proof of every session of the device name `name`.
+    fn drop_device_proofs(&self, name: &str) -> Vec<String>;
+}
+
+#[cfg(feature = "a2a")]
+impl SessionBook for crate::a2a::oauth::Sessions {
+    fn session(&self, sid: &str) -> Option<SessionInfo> {
+        crate::a2a::oauth::Sessions::session(self, sid).map(|s| SessionInfo {
+            principal: s.principal,
+            typed: s.typed,
+            role: s.role,
+            proof: s.proof,
         })
+    }
+    fn set_proof(&self, sid: &str, proof: IdpProof) -> bool {
+        crate::a2a::oauth::Sessions::set_proof(self, sid, proof)
+    }
+    fn drop_device_proofs(&self, name: &str) -> Vec<String> {
+        self.drop_proofs(|s| s.typed.source == Source::Device && s.typed.stable_id == name)
     }
 }
 
@@ -601,8 +737,18 @@ struct Fault {
 pub struct Delegation {
     pub providers: BTreeMap<String, Idp>,
     pub servers: BTreeMap<String, Server>,
-    pub templates: Vec<Template>,
-    pub person: Option<Person>,
+    /// Who may enrol, for what: reloadable (RFC 0044 §5.14).
+    templates: RwLock<Vec<Template>>,
+    /// Device names pinned to one IdP identity each: reloadable.
+    pins: RwLock<BTreeMap<String, cfg::IdpSubject>>,
+    /// Whether an unpinned device name binds at its first enrolment.
+    first_binding: AtomicBool,
+    pub persons: Vec<Person>,
+    /// The listener's session store, once the listener is up.
+    book: OnceLock<Arc<dyn SessionBook>>,
+    /// The step-up sign-ins consent gates ask for: gate → grant.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    stepping: Mutex<BTreeMap<String, String>>,
     at_cache_cap: Duration,
     liveness: Duration,
     vault: Vault,
@@ -756,8 +902,9 @@ pub struct Call<'a> {
     pub args: Value,
     /// The request's `_meta`, attribution added here.
     pub meta: Value,
-    /// The run's authority: who the work is for.
-    pub authority: Option<&'a str>,
+    /// The run's authority: who the work is for, and the session it acts
+    /// through.
+    pub acting: Acting<'a>,
     /// The run or conversation the call is made in, for its budget.
     pub unit: String,
     pub run: Option<String>,
@@ -765,9 +912,39 @@ pub struct Call<'a> {
 }
 
 /// What a delegated call needs before it is dispatched: who, and which
-/// grant, checked on the loop with no network.
+/// grant under which template, checked on the loop with no network.
 pub struct Admitted {
     pub grant: Grant,
+    pub who: Who,
+    pub template: Template,
+}
+
+/// What a grant a device name's first enrolment bound records.
+pub const BOUND_BY_FIRST: &str = "first_binding";
+/// What a grant a device name's pin bound records.
+pub const BOUND_BY_PIN: &str = "pin";
+
+/// Whether template `t` admits `who` at `idp`: its IdP, its source, and —
+/// where it names them — its role and every label.
+fn admits(t: &Template, who: &Who, idp: &str) -> bool {
+    t.idp == idp
+        && t.principals.source.as_deref() == Some(who.source())
+        && t.principals.role.is_none_or(|r| r == who.role)
+        && t.principals
+            .labels
+            .iter()
+            .all(|(k, v)| who.labels.get(k) == Some(v))
+}
+
+/// How `who` enrols at `idp`, for a notice.
+fn enrol_hint(who: &Who, idp: &str) -> String {
+    match who.kind {
+        WhoKind::Person { .. } => format!("they enrol with `agentd --login idp:{idp}`"),
+        WhoKind::Oidc => "they sign in at the IdP again from the display client".into(),
+        WhoKind::Device { .. } => {
+            "they sign in at the IdP from the display client (delegation.enrol)".into()
+        }
+    }
 }
 
 impl Delegation {
@@ -842,8 +1019,12 @@ impl Delegation {
                     Server::of(m, timeout, signer.as_ref()).map(|s| (m.name.clone(), s))
                 })
                 .collect(),
-            templates: dl.templates.clone(),
-            person: Person::of(settings),
+            templates: RwLock::new(dl.templates.clone()),
+            pins: RwLock::new(dl.device_pins.clone()),
+            first_binding: AtomicBool::new(dl.device_first_binding),
+            persons: Person::all(settings),
+            book: OnceLock::new(),
+            stepping: Mutex::new(BTreeMap::new()),
             at_cache_cap: dl.at_cache_cap(),
             liveness: dl.liveness_interval(),
             vault,
@@ -925,134 +1106,339 @@ impl Delegation {
         self.servers.contains_key(server)
     }
 
-    /// The person's grant at `idp`, by id.
-    fn grant_id(&self, idp: &str) -> Option<String> {
-        let p = self.person.as_ref()?;
-        let issuer = &self.providers.get(idp)?.cfg.issuer;
-        Some(p.typed.grant_id(issuer))
+    /// Where the listener's session store is: every call made through a
+    /// session is admitted against it.
+    pub fn sessions_to(&self, book: Arc<dyn SessionBook>) {
+        let _ = self.book.set(book);
     }
 
-    /// Whether `authority` holds a usable grant for `server`, with no
+    fn book(&self) -> Option<&Arc<dyn SessionBook>> {
+        self.book.get()
+    }
+
+    /// Whether session `sid` is still live: none is once it was revoked,
+    /// expired, or lost to a restart, and none is where no listener issues
+    /// sessions.
+    pub fn session_live(&self, sid: &str) -> bool {
+        self.book().is_some_and(|b| b.session(sid).is_some())
+    }
+
+    /// The templates in force.
+    pub fn templates(&self) -> Vec<Template> {
+        self.templates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The pin of device name `name`, when it has one.
+    pub fn pin_of(&self, name: &str) -> Option<cfg::IdpSubject> {
+        self.pins
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    fn first_binding(&self) -> bool {
+        self.first_binding.load(Ordering::SeqCst)
+    }
+
+    /// The per-person operator `id` names.
+    pub fn person(&self, id: &str) -> Option<&Person> {
+        self.persons.iter().find(|p| p.id == id)
+    }
+
+    /// Who `acting` is, as its session or the configuration says now: a
+    /// call through a session that has ended is `revoked` — the session's
+    /// delegated access ended with it — and one by a principal no grant
+    /// can be held by is `no_delegation`.
+    pub fn who(&self, acting: Acting<'_>) -> Result<Who, DelegationError> {
+        use crate::config::settings::Role;
+        let nobody = |why: String| refuse(Code::NoDelegation, why);
+        if let Some(sid) = acting.session {
+            let Some(s) = self.book().and_then(|b| b.session(sid)) else {
+                return Err(refuse(
+                    Code::Revoked,
+                    format!(
+                        "the session {sid} this work acts through has ended — revoked, expired or lost to a restart — and its delegated access with it"
+                    ),
+                ));
+            };
+            if acting.principal.is_some_and(|p| p != s.principal) {
+                return Err(refuse(
+                    Code::Revoked,
+                    format!("the session {sid} is not this work's principal's"),
+                ));
+            }
+            let kind = match s.typed.source {
+                Source::Oidc => WhoKind::Oidc,
+                Source::Device => WhoKind::Device {
+                    name: s.typed.stable_id.clone(),
+                },
+                _ => {
+                    return Err(nobody(format!(
+                        "{} acts through a session no grant is held by: delegated servers act with an enrolled person's grant, never agentd's own credential",
+                        s.principal
+                    )));
+                }
+            };
+            return Ok(Who {
+                id: s.typed.display(),
+                typed: s.typed,
+                role: if matches!(kind, WhoKind::Oidc) {
+                    Role::User
+                } else {
+                    s.role
+                },
+                labels: BTreeMap::new(),
+                kind,
+                session: Some(sid.to_string()),
+                proof: s.proof,
+            });
+        }
+        let Some(p) = acting.principal.and_then(|id| self.person(id)) else {
+            return Err(nobody(format!(
+                "this work is {}'s, and delegated servers act with an enrolled person's grant: it is never done with agentd's own credential",
+                acting.principal.unwrap_or("nobody")
+            )));
+        };
+        Ok(Who {
+            id: p.id.clone(),
+            typed: p.typed.clone(),
+            role: Role::Operator,
+            labels: p.labels.clone(),
+            kind: WhoKind::Person {
+                fingerprint: p.fingerprint.clone(),
+                iss: p.iss.clone(),
+                sub: p.sub.clone(),
+            },
+            session: None,
+            proof: None,
+        })
+    }
+
+    /// Whether `acting` holds a usable grant for `server`, with no
     /// network: what decides whether its tools are offered at all.
-    pub fn usable(&self, authority: Option<&str>, server: &str) -> bool {
-        self.admit(authority, server).is_ok()
+    pub fn usable(&self, acting: Acting<'_>, server: &str) -> bool {
+        self.admit(acting, server).is_ok()
     }
 
     /// The checks a delegated call passes before anything is dispatched:
-    /// the run's authority is the enrolled person, and their grant is active,
-    /// current, unexpired and theirs, and allows `server`. The grant handed
-    /// back carries the ceilings it was enrolled with as the template that
-    /// allowed it narrows them now: a template narrowed or removed takes
-    /// effect at the next call, and widening one takes a new enrolment.
-    pub fn admit(
-        &self,
-        authority: Option<&str>,
-        server: &str,
-    ) -> Result<Admitted, DelegationError> {
+    /// who the work is for, through the session it acts through as that
+    /// session is now; their grant is active, current, unexpired and
+    /// theirs — for a device name, bound to the very identity this session
+    /// proved — and allows `server`. The grant handed back carries the
+    /// ceilings it was enrolled with as the template that allowed it
+    /// narrows them now: a template narrowed takes effect at the next call,
+    /// and widening one takes a new enrolment.
+    pub fn admit(&self, acting: Acting<'_>, server: &str) -> Result<Admitted, DelegationError> {
+        if !self.servers.contains_key(server) {
+            return Err(refuse(
+                Code::Config,
+                format!("{server} is not a delegated server"),
+            ));
+        }
+        self.admit_who(self.who(acting)?, server)
+    }
+
+    /// [`Self::admit`] for `who` as they stand.
+    fn admit_who(&self, who: Who, server: &str) -> Result<Admitted, DelegationError> {
         let s = self
             .servers
             .get(server)
             .ok_or_else(|| refuse(Code::Config, format!("{server} is not a delegated server")))?;
-        let Some(person) = self
-            .person
-            .as_ref()
-            .filter(|p| authority == Some(p.id.as_str()))
-        else {
-            return Err(refuse(
-                Code::NoDelegation,
-                format!(
-                    "{server} acts with an enrolled person's grant, and this work is {}'s: it is never done with agentd's own credential",
-                    authority.unwrap_or("nobody")
-                ),
-            ));
-        };
-        let gid = self.grant_id(&s.idp).ok_or_else(|| {
-            refuse(
-                Code::Config,
-                format!("{server}'s IdP {} is not declared", s.idp),
-            )
-        })?;
-        let grant = self
+        let issuer = &self
+            .providers
+            .get(&s.idp)
+            .ok_or_else(|| {
+                refuse(
+                    Code::Config,
+                    format!("{server}'s IdP {} is not declared", s.idp),
+                )
+            })?
+            .cfg
+            .issuer;
+        let gid = who.typed.grant_id(issuer);
+        let held = self
             .grants
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&gid)
-            .cloned()
-            .ok_or_else(|| {
-                refuse(
+            .cloned();
+        let Some(grant) = held else {
+            if self
+                .vault
+                .floors()
+                .get(&gid)
+                .is_some_and(|f| f.revoked_epoch.is_some())
+            {
+                return Err(refuse(
                     Code::NotEnrolled,
                     format!(
-                        "{} has no grant at {}: they enrol with `agentd --login idp:{}`",
-                        person.id, s.idp, s.idp
+                        "{}'s grant at {} was revoked: they enrol again to act through it",
+                        who.id, s.idp
                     ),
-                )
-            })?;
-        if grant.fingerprint != person.fingerprint
-            || grant.sub != person.sub
-            || grant.idp_iss != person.iss
-        {
+                ));
+            }
             return Err(refuse(
                 Code::NotEnrolled,
                 format!(
-                    "{}'s grant was enrolled as another identity than the configuration pins now: enrol again with `agentd --login idp:{}`",
-                    person.id, s.idp
+                    "{} has no grant at {}: {}",
+                    who.id,
+                    s.idp,
+                    enrol_hint(&who, &s.idp)
                 ),
             ));
-        }
+        };
+        self.held_to(&who, &grant, &s.idp)?;
         if now_ms() >= grant.expires_ms {
             return Err(refuse(
                 Code::NeedsReenroll,
                 format!(
                     "{}'s grant at {} has expired: it is never extended — enrol again",
-                    person.id, s.idp
+                    who.id, s.idp
                 ),
             ));
         }
-        let Some(template) = self
-            .templates
+        let templates = self.templates.read().unwrap_or_else(|e| e.into_inner());
+        let Some(template) = templates
             .iter()
-            .find(|t| t.name == grant.template && self.admits(t, &s.idp))
+            .find(|t| t.name == grant.template && admits(t, &who, &s.idp))
         else {
             return Err(refuse(
                 Code::DelegationNotPermitted,
                 format!(
                     "{}'s grant was allowed by template {}, which no longer admits them at {}: enrol again under the template that does",
-                    person.id, grant.template, s.idp
+                    who.id, grant.template, s.idp
                 ),
             ));
         };
         let mut grant = grant;
         grant.ceilings = narrowed(&grant.ceilings, template);
+        let template = template.clone();
+        drop(templates);
         if !grant.ceilings.contains_key(server) {
             return Err(refuse(
                 Code::DelegationNotPermitted,
                 format!(
                     "{}'s grant (template {}) does not allow {server}",
-                    person.id, grant.template
+                    who.id, grant.template
                 ),
             ));
         }
-        Ok(Admitted { grant })
-    }
-
-    /// The template that admits the person at `idp`.
-    pub fn template_for(&self, idp: &str) -> Option<&Template> {
-        self.templates.iter().find(|t| self.admits(t, idp))
-    }
-
-    /// Whether template `t` admits the person at `idp`.
-    fn admits(&self, t: &Template, idp: &str) -> bool {
-        self.person.as_ref().is_some_and(|p| {
-            t.idp == idp
-                && t.principals.source.as_deref() == Some("operator")
-                && t.principals
-                    .role
-                    .is_none_or(|r| r == crate::config::settings::Role::Operator)
-                && t.principals
-                    .labels
-                    .iter()
-                    .all(|(k, v)| p.labels.get(k) == Some(v))
+        Ok(Admitted {
+            grant,
+            who,
+            template,
         })
+    }
+
+    /// Whether `grant` is `who`'s to use as they stand now: a per-person
+    /// operator's and an `a2a.login` principal's enrolled as the same
+    /// identity; a device name's bound to the very `iss` + `sub` this
+    /// session proved, to the name's pin if it has one, and — bound by the
+    /// first enrolment — only while first binding is on.
+    fn held_to(&self, who: &Who, grant: &Grant, idp: &str) -> Result<(), DelegationError> {
+        let not = |why: String| refuse(Code::NotEnrolled, why);
+        match &who.kind {
+            WhoKind::Device { name } => {
+                let Some(proof) = &who.proof else {
+                    return Err(not(format!(
+                        "{} is bound at {idp}, and this session has not signed in there: sign in at the IdP from the display client to use the grant (delegation.enrol)",
+                        who.id
+                    )));
+                };
+                if proof.iss != grant.idp_iss || proof.sub != grant.sub {
+                    return Err(not(format!(
+                        "this session proved another IdP identity than {} is bound to",
+                        who.id
+                    )));
+                }
+                if let Some(pin) = self.pin_of(name)
+                    && (pin.iss != grant.idp_iss || pin.sub != grant.sub)
+                {
+                    return Err(not(format!(
+                        "{}'s grant was bound to another identity than its pin names now: enrol again",
+                        who.id
+                    )));
+                }
+                if grant.bound_by.as_deref() == Some(BOUND_BY_FIRST) && !self.first_binding() {
+                    return Err(not(format!(
+                        "{}'s grant was bound by its first enrolment, and identity.delegation.device_first_binding is off",
+                        who.id
+                    )));
+                }
+                Ok(())
+            }
+            _ => {
+                if grant.fingerprint != who.fingerprint(&grant.idp_iss, &grant.sub)
+                    || matches!(&who.kind, WhoKind::Person { iss, sub, .. } if *iss != grant.idp_iss || *sub != grant.sub)
+                {
+                    return Err(not(format!(
+                        "{}'s grant was enrolled as another identity than the configuration pins now: enrol again",
+                        who.id
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The template that admits `who` at `idp`.
+    pub fn template_for(&self, who: &Who, idp: &str) -> Option<Template> {
+        self.templates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|t| admits(t, who, idp))
+            .cloned()
+    }
+
+    /// Whether `who` may begin an enrolment at `idp` now (RFC 0044 §5.4
+    /// steps 1 and 4, before anyone is sent to the IdP): a template must
+    /// admit them, and a device name must be pinned, bound already, or
+    /// first-bindable.
+    pub fn eligible(&self, who: &Who, idp: &str) -> Result<Template, DelegationError> {
+        if !self.providers.contains_key(idp) {
+            return Err(refuse(
+                Code::Config,
+                format!("{idp:?} is not an identity.providers entry"),
+            ));
+        }
+        let t = self.template_for(who, idp).ok_or_else(|| {
+            refuse(
+                Code::DelegationNotPermitted,
+                format!(
+                    "no identity.delegation.templates entry admits {} at {idp}",
+                    who.id
+                ),
+            )
+        })?;
+        if let WhoKind::Device { name, .. } = &who.kind
+            && self.pin_of(name).is_none()
+            && !self.first_binding()
+            && self.bound(who, idp).is_none()
+        {
+            return Err(refuse(
+                Code::PrincipalNotDelegable,
+                format!(
+                    "{} is an operator-named device, not an IdP identity: it delegates only with identity.delegation.device_pins.{name}, or with device_first_binding",
+                    who.id
+                ),
+            ));
+        }
+        Ok(t)
+    }
+
+    /// The grant `who` holds at `idp` now, whoever enrolled it.
+    fn bound(&self, who: &Who, idp: &str) -> Option<Grant> {
+        let issuer = &self.providers.get(idp)?.cfg.issuer;
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&who.typed.grant_id(issuer))
+            .cloned()
     }
 
     fn lock_of(&self, grant: &str) -> Arc<Mutex<()>> {
@@ -1352,7 +1738,7 @@ impl Delegation {
                     self.audit(
                         "delegation.minted",
                         "reused",
-                        self.person.as_ref().map(|p| p.id.as_str()),
+                        Some(&grant.principal.display()),
                         json!({"grant_id": grant.grant_id, "run": c.run, "step": c.step, "tool": c.tool,
                                "ras_iss": ras.issuer, "resource": s.resource, "reused_id_jag": true}),
                     );
@@ -1414,6 +1800,8 @@ impl Delegation {
     ) -> Result<(), DelegationError> {
         let template = self
             .templates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|t| t.name == grant.template)
             .cloned();
@@ -1520,7 +1908,7 @@ impl Delegation {
                             self.audit(
                                 "delegation.quota_warn",
                                 "warn",
-                                self.person.as_ref().map(|p| p.id.as_str()),
+                                Some(&g.principal.display()),
                                 json!({"grant_id": g.grant_id, "resource": s.resource,
                                        "day": q.day_count, "per_day": budget.per_day(),
                                        "month": q.month_count, "per_month": budget.per_month()}),
@@ -1538,13 +1926,13 @@ impl Delegation {
                         self.audit(
                             "delegation.step_up",
                             "asked",
-                            self.person.as_ref().map(|p| p.id.as_str()),
+                            Some(&g.principal.display()),
                             json!({"grant_id": g.grant_id, "server": s.name, "tool": c.tool, "max_age": max_age}),
                         );
                         return Err(refuse(
                             Code::StepUp,
                             format!(
-                                "the IdP wants a sign-in within {}s before it acts at {}: run `agentd --login idp:{}` and call again",
+                                "the IdP wants a sign-in within {}s before it acts at {}: the person signs in again at {}, and the call is made again",
                                 max_age.unwrap_or(0),
                                 s.name,
                                 s.idp
@@ -1590,7 +1978,7 @@ impl Delegation {
         self.audit(
             "delegation.minted",
             "minted",
-            self.person.as_ref().map(|p| p.id.as_str()),
+            Some(&grant.principal.display()),
             json!({"grant_id": grant.grant_id, "run": c.run, "step": c.step, "tool": c.tool,
                    "ras_iss": ras.issuer, "resource": s.resource, "scope_granted": x.scopes,
                    "narrowed": x.narrowed, "jti_sha256": crate::sha::sha256_hex(x.jti.as_bytes()),
@@ -1912,17 +2300,13 @@ impl Delegation {
     pub fn call(&self, c: Call<'_>) -> Result<::mcp::wire::CallToolResult, DelegationError> {
         let mut result = self.call_inner(&c);
         if let Err(e) = &mut result {
-            if let Some(gid) = self
-                .servers
-                .get(c.server)
-                .and_then(|s| self.grant_id(&s.idp))
-            {
+            if let Some(gid) = self.grant_id_of(c.acting, c.server) {
                 let mut v = Value::String(std::mem::take(&mut e.message));
                 scrub(&mut v, &self.live_values(&gid, None));
                 e.message = v.as_str().unwrap_or_default().to_string();
             }
             self.denied(
-                c.authority,
+                c.acting.principal,
                 c.server,
                 c.tool,
                 e,
@@ -1931,6 +2315,13 @@ impl Delegation {
             );
         }
         result
+    }
+
+    /// The id of the grant `acting` would hold for `server`.
+    fn grant_id_of(&self, acting: Acting<'_>, server: &str) -> Option<String> {
+        let s = self.servers.get(server)?;
+        let issuer = &self.providers.get(&s.idp)?.cfg.issuer;
+        Some(self.who(acting).ok()?.typed.grant_id(issuer))
     }
 
     /// Record a refusal: `delegation.denied`, the error verbatim.
@@ -1953,7 +2344,7 @@ impl Delegation {
     }
 
     fn call_inner(&self, c: &Call<'_>) -> Result<::mcp::wire::CallToolResult, DelegationError> {
-        let Admitted { grant } = self.admit(c.authority, c.server)?;
+        let Admitted { grant, .. } = self.admit(c.acting, c.server)?;
         let s = self
             .servers
             .get(c.server)
@@ -2042,7 +2433,7 @@ impl Delegation {
                     self.audit(
                         "delegation.used",
                         if r.is_error() { "error" } else { "ok" },
-                        c.authority,
+                        Some(&grant.principal.display()),
                         json!({"grant_id": grant.grant_id, "server": c.server, "tool": c.tool,
                                "run": c.run, "step": c.step}),
                     );
@@ -2197,10 +2588,10 @@ impl Delegation {
         }
     }
 
-    /// List `server`'s tools with the person's delegated token — one mint —
-    /// and keep them: after an enrolment, for each templated server whose
-    /// catalogue is empty.
-    pub fn fill_catalogue(&self, server: &str) -> Result<usize, DelegationError> {
+    /// List `server`'s tools with the delegated token of whoever `acting`
+    /// is — one mint — and keep them: after an enrolment, for each
+    /// templated server whose catalogue is empty.
+    pub fn fill_catalogue(&self, server: &str, who: &Who) -> Result<usize, DelegationError> {
         if !self
             .listing
             .lock()
@@ -2209,7 +2600,7 @@ impl Delegation {
         {
             return Ok(0);
         }
-        let out = self.list_with_grant(server);
+        let out = self.list_with_grant(server, who);
         self.listing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2217,12 +2608,9 @@ impl Delegation {
         out
     }
 
-    fn list_with_grant(&self, server: &str) -> Result<usize, DelegationError> {
-        let person = self
-            .person
-            .clone()
-            .ok_or_else(|| refuse(Code::NoDelegation, "no per-person operator is declared"))?;
-        let Admitted { grant } = self.admit(Some(&person.id), server)?;
+    fn list_with_grant(&self, server: &str, who: &Who) -> Result<usize, DelegationError> {
+        let Admitted { grant, .. } = self.admit_who(who.clone(), server)?;
+        let acting = Acting::new(Some(&who.id), who.session.as_deref());
         let s = self
             .servers
             .get(server)
@@ -2238,7 +2626,7 @@ impl Delegation {
             tool: "tools/list",
             args: Value::Null,
             meta: json!({}),
-            authority: Some(&person.id),
+            acting,
             unit: format!("catalogue:{server}"),
             run: None,
             step: None,
@@ -2276,16 +2664,24 @@ impl Delegation {
 
     /// The grants an operator sees: metadata, never a secret.
     pub fn list(&self) -> Vec<Value> {
+        self.list_of(None)
+    }
+
+    /// The grants `principal` holds — every grant, for `None` — as
+    /// [`Self::list`] shows them.
+    pub fn list_of(&self, principal: Option<&str>) -> Vec<Value> {
         self.grants
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
+            .filter(|g| principal.is_none_or(|p| g.principal.display() == p))
             .map(|g| {
                 let live = self.with_live(&g.grant_id, |l| (l.proved_ms, l.used_ms, l.step_up));
                 json!({"grant_id": g.grant_id, "principal": g.principal.display(), "idp": g.idp,
                        "idp_iss": g.idp_iss, "sub": g.sub, "template": g.template,
                        "servers": g.ceilings, "created_ms": g.created_ms, "expires_ms": g.expires_ms,
                        "epoch": g.epoch, "rt_version": g.rt_version, "quota": g.quota,
+                       "bound_by": g.bound_by,
                        "proved_ms": live.0, "used_ms": live.1, "step_up_max_age": live.2})
             })
             .collect()
@@ -2349,7 +2745,14 @@ impl Delegation {
     /// consent record then asks the signer nothing; a local key is opened
     /// where a record needs it.
     pub fn warm_personal(self: &Arc<Self>) {
-        if let Some(p) = self.person.as_ref().map(|p| p.id.clone()) {
+        let held: BTreeSet<String> = self
+            .grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|g| g.principal.display())
+            .collect();
+        for p in held {
             self.warm(&p);
         }
     }
@@ -2503,41 +2906,121 @@ impl Delegation {
         if matching.is_empty() {
             return Err(format!("no grant names {target}"));
         }
-        let mut out = Vec::new();
-        for g in matching {
-            let lock = self.lock_of(&g.grant_id);
-            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let rt = self
-                .vault
-                .load(&g.grant_id)
-                .ok()
-                .flatten()
-                .map(|(_, rt)| rt);
-            let mut revoked_at_idp = Err("the refresh token did not open".to_string());
-            if let (Some(rt), Some(idp)) = (&rt, self.providers.get(&g.idp)) {
-                revoked_at_idp = self.revoke_at_idp(idp, rt);
-            }
-            let stored = self.vault.tombstone(&g.grant_id, g.epoch);
-            self.grants
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&g.grant_id);
-            self.purge(&g.grant_id);
-            self.audit(
-                "delegation.revoked",
-                "revoked",
-                Some(by),
-                json!({"grant_id": g.grant_id, "by": by, "principal": g.principal.display(),
-                       "sub": g.sub, "at_idp": revoked_at_idp.is_ok(),
-                       "at_idp_error": revoked_at_idp.as_ref().err(), "tombstoned": stored.is_ok()}),
-            );
-            out.push(
-                json!({"grant_id": g.grant_id, "principal": g.principal.display(),
-                            "revoked_at_idp": revoked_at_idp.is_ok(),
-                            "error": revoked_at_idp.err().or(stored.err())}),
-            );
+        Ok(matching
+            .iter()
+            .map(|g| self.revoke_grant(g, by, None))
+            .collect())
+    }
+
+    /// Revoke grant `g`, `by`, for `why` when one is said: RFC 7009 at the
+    /// IdP, retried until acknowledged or out of tries, then the tombstone
+    /// — the epoch every later enrolment is one above — the record and the
+    /// pool. What happened.
+    pub fn revoke_grant(&self, g: &Grant, by: &str, why: Option<&str>) -> Value {
+        let lock = self.lock_of(&g.grant_id);
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = self
+            .vault
+            .load(&g.grant_id)
+            .ok()
+            .flatten()
+            .map(|(_, rt)| rt);
+        let mut revoked_at_idp = Err("the refresh token did not open".to_string());
+        if let (Some(rt), Some(idp)) = (&rt, self.providers.get(&g.idp)) {
+            revoked_at_idp = self.revoke_at_idp(idp, rt);
         }
-        Ok(out)
+        let stored = self.vault.tombstone(&g.grant_id, g.epoch);
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&g.grant_id);
+        self.purge(&g.grant_id);
+        self.audit(
+            "delegation.revoked",
+            "revoked",
+            Some(by),
+            json!({"grant_id": g.grant_id, "by": by, "why": why, "principal": g.principal.display(),
+                   "sub": g.sub, "epoch": g.epoch, "at_idp": revoked_at_idp.is_ok(),
+                   "at_idp_error": revoked_at_idp.as_ref().err(), "tombstoned": stored.is_ok()}),
+        );
+        json!({"grant_id": g.grant_id, "principal": g.principal.display(),
+               "revoked_at_idp": revoked_at_idp.is_ok(),
+               "error": revoked_at_idp.err().or(stored.err())})
+    }
+
+    /// Take a reload's templates, device pins and first binding (RFC 0044
+    /// §5.14): narrowing a ceiling applies at the next mint, as every call
+    /// is held to its template as it is now; what they no longer allow — a
+    /// grant whose template is gone, or lost a server; a device name whose
+    /// pin changed or went, or that first binding bound and first binding
+    /// is off — is handed back with why, to be revoked off the loop, and
+    /// the device names whose bindings that clears, whose sessions' proofs
+    /// are dropped now.
+    pub fn reload(&self, settings: &Settings) -> (Vec<(Grant, String)>, Vec<String>) {
+        let dl = &settings.identity.delegation;
+        let old_pins = self.pins.read().unwrap_or_else(|e| e.into_inner()).clone();
+        *self.templates.write().unwrap_or_else(|e| e.into_inner()) = dl.templates.clone();
+        *self.pins.write().unwrap_or_else(|e| e.into_inner()) = dl.device_pins.clone();
+        let first_was = self
+            .first_binding
+            .swap(dl.device_first_binding, Ordering::SeqCst);
+        let mut cleared: BTreeSet<String> = old_pins
+            .iter()
+            .filter(|(n, p)| dl.device_pins.get(*n) != Some(p))
+            .map(|(n, _)| n.clone())
+            .collect();
+        let grants: Vec<Grant> = self
+            .grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for g in grants {
+            let device =
+                (g.principal.source == Source::Device).then(|| g.principal.stable_id.clone());
+            let why = match dl.templates.iter().find(|t| t.name == g.template) {
+                None => Some(format!("its template {} was removed", g.template)),
+                Some(t) => g
+                    .ceilings
+                    .keys()
+                    .find(|srv| !t.servers.contains_key(*srv))
+                    .map(|srv| format!("{srv} was removed from its template {}", g.template)),
+            }
+            .or_else(|| {
+                let name = device.as_ref()?;
+                match dl.device_pins.get(name) {
+                    Some(pin) if pin.iss != g.idp_iss || pin.sub != g.sub => {
+                        Some(format!("the pin of {name} names another identity now"))
+                    }
+                    None if g.bound_by.as_deref() == Some(BOUND_BY_PIN) => {
+                        Some(format!("the pin that bound {name} was removed"))
+                    }
+                    None if g.bound_by.as_deref() == Some(BOUND_BY_FIRST)
+                        && first_was
+                        && !dl.device_first_binding =>
+                    {
+                        Some(format!(
+                            "{name} was bound by its first enrolment, and device_first_binding is off"
+                        ))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(why) = why {
+                if let Some(name) = device {
+                    cleared.insert(name);
+                }
+                out.push((g, why));
+            }
+        }
+        if let Some(book) = self.book() {
+            for name in &cleared {
+                book.drop_device_proofs(name);
+            }
+        }
+        (out, cleared.into_iter().collect())
     }
 
     /// RFC 7009 at the IdP, three tries a second, two and four apart.
@@ -2559,10 +3042,78 @@ impl Delegation {
         Err(last)
     }
 
-    /// Store a new grant for the person at `idp` after a verified sign-in.
+    /// The binding a verified sign-in as `claims` makes for `who` (RFC 0044
+    /// §5.4 step 4): its `iss` + `sub` must be the per-person operator's
+    /// pin, the `a2a.login` principal's own subject, or — for a device
+    /// name — its pin, else the binding it already has; an unpinned,
+    /// unbound name takes this one only under first binding. What bound it,
+    /// for a device name.
+    pub fn bind(
+        &self,
+        who: &Who,
+        idp: &Idp,
+        claims: &idjag::IdClaims,
+    ) -> Result<Option<&'static str>, DelegationError> {
+        let mismatch = |want: String| {
+            refuse(
+                Code::BindingMismatch,
+                format!(
+                    "the sign-in was {}#{}, and {} is {want}: nothing was kept",
+                    claims.iss, claims.sub, who.id
+                ),
+            )
+        };
+        match &who.kind {
+            WhoKind::Person { iss, sub, .. } => {
+                if claims.iss != *iss || claims.sub != *sub {
+                    return Err(mismatch(format!("pinned to {iss}#{sub}")));
+                }
+                Ok(None)
+            }
+            WhoKind::Oidc => {
+                if claims.iss != who.typed.issuer || claims.sub != who.typed.stable_id {
+                    return Err(mismatch(format!(
+                        "{}#{}",
+                        who.typed.issuer, who.typed.stable_id
+                    )));
+                }
+                Ok(None)
+            }
+            WhoKind::Device { name, .. } => {
+                if let Some(pin) = self.pin_of(name) {
+                    if claims.iss != pin.iss || claims.sub != pin.sub {
+                        return Err(mismatch(format!("pinned to {}#{}", pin.iss, pin.sub)));
+                    }
+                    return Ok(Some(BOUND_BY_PIN));
+                }
+                if let Some(g) = self.bound(who, &idp.name) {
+                    if claims.iss != g.idp_iss || claims.sub != g.sub {
+                        return Err(mismatch(format!("bound to {}#{}", g.idp_iss, g.sub)));
+                    }
+                    return Ok(Some(match g.bound_by.as_deref() {
+                        Some(BOUND_BY_PIN) => BOUND_BY_PIN,
+                        _ => BOUND_BY_FIRST,
+                    }));
+                }
+                if self.first_binding() {
+                    return Ok(Some(BOUND_BY_FIRST));
+                }
+                Err(refuse(
+                    Code::PrincipalNotDelegable,
+                    format!(
+                        "{} is unpinned and unbound, and identity.delegation.device_first_binding is off: an operator pins the name to a person first",
+                        who.id
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Store a grant for `who` at `idp` after a verified sign-in that
+    /// [`Self::bind`] bound.
     ///
     /// A sign-in for a grant that is still the same — the same identity,
-    /// unexpired, under the template that admits the person now with the
+    /// unexpired, under the template that admits them now with the
     /// ceilings it allows now — is a step-up or a renewal: the record keeps
     /// its metadata and takes the new refresh token one version up. Any
     /// other (expired, another `sub`, `iss` or uid, another template or
@@ -2572,36 +3123,24 @@ impl Delegation {
     /// (RFC 7009), once the new one is kept.
     pub(crate) fn enrolled(
         &self,
+        who: &Who,
         idp: &Idp,
         claims: &idjag::IdClaims,
         rt: &str,
         id_token: &str,
     ) -> Result<Grant, DelegationError> {
-        let person = self.person.clone().ok_or_else(|| {
-            refuse(
-                Code::PrincipalNotDelegable,
-                "no per-person operator is declared",
-            )
-        })?;
-        if claims.iss != person.iss || claims.sub != person.sub {
-            return Err(refuse(
-                Code::BindingMismatch,
-                format!(
-                    "the sign-in was {}#{}, and {} is pinned to {}#{}: nothing was kept",
-                    claims.iss, claims.sub, person.id, person.iss, person.sub
-                ),
-            ));
-        }
-        let template = self.template_for(&idp.name).cloned().ok_or_else(|| {
+        let bound_by = self.bind(who, idp, claims)?;
+        let template = self.template_for(who, &idp.name).ok_or_else(|| {
             refuse(
                 Code::DelegationNotPermitted,
                 format!(
                     "no identity.delegation.templates entry admits {} at {}",
-                    person.id, idp.name
+                    who.id, idp.name
                 ),
             )
         })?;
-        let gid = person.typed.grant_id(&idp.cfg.issuer);
+        let fingerprint = who.fingerprint(&claims.iss, &claims.sub);
+        let gid = who.typed.grant_id(&idp.cfg.issuer);
         let lock = self.lock_of(&gid);
         let held = lock.lock().unwrap_or_else(|e| e.into_inner());
         // A grant the signer cannot open now is not taken for none: the
@@ -2618,7 +3157,7 @@ impl Delegation {
         let now = now_ms();
         let ceilings = ceilings_of(&template);
         let same = |g: &Grant| {
-            g.fingerprint == person.fingerprint
+            g.fingerprint == fingerprint
                 && g.sub == claims.sub
                 && g.idp_iss == claims.iss
                 && now < g.expires_ms
@@ -2630,6 +3169,7 @@ impl Delegation {
             Some((mut g, old_rt)) if same(&g) => {
                 let over = g.rt_version;
                 g.rt_version += 1;
+                g.bound_by = bound_by.map(str::to_string);
                 self.vault
                     .store(&g, rt, Some(over))
                     .map_err(|e| not_stored(e, Code::Config, "the grant was not kept"))?;
@@ -2646,7 +3186,7 @@ impl Delegation {
                     self.audit(
                         "delegation.revoked",
                         "revoked",
-                        Some(&person.id),
+                        Some(&who.id),
                         json!({"grant_id": gid, "by": "enrolment", "epoch": old.epoch,
                                "why": "a sign-in replaced it: expired, another identity, or another template or ceilings",
                                "sub": old.sub}),
@@ -2657,8 +3197,8 @@ impl Delegation {
                 let floor = self.vault.floors().get(&gid).copied().unwrap_or_default();
                 let g = Grant {
                     grant_id: gid.clone(),
-                    principal: person.typed.clone(),
-                    fingerprint: person.fingerprint.clone(),
+                    principal: who.typed.clone(),
+                    fingerprint,
                     idp: idp.name.clone(),
                     idp_iss: claims.iss.clone(),
                     sub: claims.sub.clone(),
@@ -2673,6 +3213,7 @@ impl Delegation {
                     epoch: floor.revoked_epoch.unwrap_or(0).max(epoch_floor) + 1,
                     rt_version: floor.rt_version + 1,
                     quota: Default::default(),
+                    bound_by: bound_by.map(str::to_string),
                 };
                 self.vault
                     .store(&g, rt, None)
@@ -2706,6 +3247,76 @@ impl Delegation {
             }
         });
         Ok(grant)
+    }
+
+    /// Revoke a refresh token a sign-in handed agentd that it keeps no
+    /// grant for — a login no template admits — at the IdP (RFC 7009).
+    pub(crate) fn discard_refresh_token(&self, idp: &Idp, rt: &str) {
+        let at_idp = self.revoke_at_idp(idp, rt);
+        self.log.info(
+            "delegation.discarded_token",
+            json!({"idp": idp.name, "revoked_at_idp": at_idp.is_ok(), "at_idp_error": at_idp.err()}),
+        );
+    }
+
+    /// The `max_age` a step-up of grant `grant` was asked for, while one is.
+    pub fn step_up_asked(&self, grant: &str) -> Option<u64> {
+        self.with_live(grant, |l| l.step_up)
+    }
+
+    /// Start the IdP's device grant at `idp`, for a step-up sign-in.
+    pub fn start_device(&self, idp: &str) -> Result<oauth2::DeviceAuth, String> {
+        let i = self
+            .providers
+            .get(idp)
+            .ok_or_else(|| format!("no IdP {idp}"))?;
+        let meta = i.meta(self.timeout)?;
+        let params = i.params(&meta)?;
+        oauth2::start_device(&params, self.timeout)
+    }
+
+    /// Poll step-up gate `gate`'s device grant at `idp` once: `None` once the
+    /// person signed in — the sign-in verified, the grant's own, as recent
+    /// as asked, and its fresh ID token the next mint's subject — else what
+    /// the IdP said.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    pub(crate) fn poll_step_up(
+        &self,
+        gate: &str,
+        idp: &str,
+        device_code: &str,
+        max_age: u64,
+    ) -> Result<Option<crate::runtime::stepup::Polled>, String> {
+        use crate::runtime::stepup::Polled;
+        let i = self
+            .providers
+            .get(idp)
+            .ok_or_else(|| format!("no IdP {idp}"))?;
+        let meta = i.meta(self.timeout)?;
+        let params = i.params(&meta)?;
+        match oauth2::poll_device_once(&params, device_code, self.timeout)? {
+            oauth2::PollOutcome::Pending | oauth2::PollOutcome::Wait(_) => {
+                Ok(Some(Polled::Pending))
+            }
+            oauth2::PollOutcome::SlowDown => Ok(Some(Polled::SlowDown)),
+            oauth2::PollOutcome::Token(t) => {
+                let signed = enrol::verify(self, idp, &t, None).map_err(|e| e.to_string())?;
+                self.stepped_up_by(gate, signed, idp, Some(max_age))
+                    .map(|_| None)
+            }
+        }
+    }
+
+    /// [`Self::seal_personal`] off the loop: `principal`'s personal key is
+    /// opened, or made, first — under an external signer that asks it.
+    pub fn seal_personal_off_loop(
+        &self,
+        principal: &str,
+        record: &str,
+        content: &Value,
+    ) -> Result<Value, String> {
+        self.personal_key(principal, true)?;
+        self.seal_personal(principal, record, content)
     }
 
     /// Clear a satisfied step-up once a mint used the fresh ID token.
@@ -2754,6 +3365,104 @@ impl Delegation {
                 })
                 .ok();
         }
+    }
+}
+
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+impl Delegation {
+    /// A step-up sign-in for gate `gate` at `idp` (RFC 0044 §5.10 L4): the
+    /// grant the gate's call needs is held to the same `iss` + `sub`, and
+    /// the sign-in must be as recent as the IdP asked; its fresh ID token is
+    /// then the next mint's subject. The gate's principal.
+    pub(crate) fn stepped_up_by(
+        &self,
+        gate: &str,
+        signed: enrol::SignedIn,
+        idp: &str,
+        max_age: Option<u64>,
+    ) -> Result<PrincipalRef, String> {
+        let grant = self
+            .stepping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(gate)
+            .cloned()
+            .ok_or_else(|| format!("gate {gate} asks for no sign-in now"))?;
+        let held = self
+            .grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&grant)
+            .cloned()
+            .ok_or_else(|| "the grant the call needs is gone".to_string())?;
+        if signed.claims.iss != held.idp_iss || signed.claims.sub != held.sub {
+            return Err(refuse(
+                Code::BindingMismatch,
+                format!(
+                    "the sign-in was {}#{}, and the grant is {}#{}'s: nothing was kept",
+                    signed.claims.iss, signed.claims.sub, held.idp_iss, held.sub
+                ),
+            )
+            .to_string());
+        }
+        let now_s = now_ms() / 1000;
+        let auth_time = signed.claims.auth_time.unwrap_or(now_s);
+        if let Some(m) = max_age.filter(|m| *m > 0)
+            && auth_time + m < now_s
+        {
+            return Err(format!(
+                "the sign-in at {idp} was {}s ago, and the IdP asked for one within {m}s",
+                now_s.saturating_sub(auth_time)
+            ));
+        }
+        // A refresh token the step-up sign-in handed back is the grant's next
+        // one, kept one version up under the grant's lock; the one it
+        // replaces is revoked at the IdP.
+        if let Some(rt) = &signed.refresh_token {
+            self.take_refresh_token(&grant, rt)
+                .map_err(|e| e.to_string())?;
+        }
+        self.with_live(&grant, |l| {
+            l.fresh_id_token = Some((signed.id_token.clone(), auth_time, signed.claims.exp));
+        });
+        self.stepping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(gate);
+        Ok(held.principal)
+    }
+
+    /// Keep `new`, a refresh token a sign-in for grant `grant_id` handed
+    /// back, as its next one — compared and swapped one version up, under
+    /// the grant's lock — and revoke the one it replaces at the IdP.
+    fn take_refresh_token(&self, grant_id: &str, new: &str) -> Result<(), DelegationError> {
+        let lock = self.lock_of(grant_id);
+        let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut g, mut rt) = self.load(grant_id)?;
+        if rt == new {
+            return Ok(());
+        }
+        let old = rt.clone();
+        let ahead = self.ahead(&g)?;
+        self.rotate(&mut g, &mut rt, new, ahead)?;
+        drop(held);
+        if let Some(idp) = self.providers.get(&g.idp) {
+            let at_idp = self.revoke_at_idp(idp, &old);
+            self.log.info(
+                "delegation.replaced_token",
+                serde_json::json!({"grant_id": grant_id, "revoked_at_idp": at_idp.is_ok(),
+                                   "at_idp_error": at_idp.err()}),
+            );
+        }
+        Ok(())
+    }
+
+    /// Gate `gate` asks for a step-up sign-in for grant `grant_id`.
+    pub(crate) fn stepping_up(&self, gate: &str, grant_id: &str) {
+        self.stepping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(gate.to_string(), grant_id.to_string());
     }
 }
 
@@ -2907,5 +3616,345 @@ mod tests {
             "none kept"
         );
         assert!(d.cached_personal(who).is_none());
+    }
+
+    const ISS: &str = "https://idp.example";
+
+    /// The settings of one delegated server and `dl` as
+    /// `identity.delegation`, its secrets in `dir`.
+    fn people(dir: &std::path::Path, mut dl: Value) -> Settings {
+        let seal = dir.join("seal");
+        std::fs::write(&seal, "ab".repeat(32)).unwrap();
+        let secret = format!("{{{{secret-file:{}}}}}", seal.display());
+        dl["seal_key"] = json!(secret);
+        Settings::from_document(
+            json!({"agent": {"instruction": "x"},
+                   "a2a": {"device_grant": {"enabled": true}},
+                   "identity": {
+                       "providers": {"okta": {"issuer": ISS, "client_id": "agentd",
+                                              "subject": "refresh_token",
+                                              "client_auth": {"method": "client_secret_basic"},
+                                              "client_secret": secret}},
+                       "delegation": dl},
+                   "mcp": {"servers": [{"name": "linear", "endpoint": "https://mcp.linear.example/mcp",
+                       "tags": {"*": ["sensitive"]},
+                       "auth": {"kind": "oauth2", "grant": "id_jag", "idp": "okta",
+                                "audience": "https://auth.linear.example",
+                                "resource": "https://mcp.linear.example/mcp",
+                                "client_id": "agentd-at-linear",
+                                "client_auth": {"method": "client_secret_basic"},
+                                "client_secret": secret}}]}}),
+            "test",
+        )
+        .unwrap()
+    }
+
+    fn template(name: &str, source: &str, scopes: &[&str]) -> Value {
+        json!({"name": name, "principals": {"source": source}, "idp": "okta",
+               "servers": {"linear": {"scopes": scopes}}})
+    }
+
+    /// The delegation supervisor `settings` build, its session store `book`.
+    fn supervisor(settings: &Settings, book: Arc<Book>) -> Arc<Delegation> {
+        use crate::obs::log::{Comp, Level, LogCtx};
+        let durable = Arc::new(Durable::new(
+            Arc::new(crate::store::memory::MemoryStore::new()),
+            "t/",
+            "t",
+            crate::state::Policy::default(),
+            None,
+        ));
+        let log = Logger::new(
+            LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: std::process::id(),
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                trace_flags: None,
+            },
+            Level::Error,
+        );
+        let d = Delegation::build(settings, durable, None, &log)
+            .unwrap()
+            .expect("a delegated server is declared");
+        d.sessions_to(book);
+        d
+    }
+
+    /// A session store of fixed sessions.
+    #[derive(Default)]
+    struct Book(Mutex<BTreeMap<String, SessionInfo>>);
+
+    impl Book {
+        fn add(&self, sid: &str, typed: PrincipalRef, proof: Option<&str>) {
+            let role = crate::config::settings::Role::User;
+            self.0.lock().unwrap().insert(
+                sid.to_string(),
+                SessionInfo {
+                    principal: typed.display(),
+                    typed,
+                    role,
+                    proof: proof.map(|sub| IdpProof {
+                        idp: "okta".into(),
+                        iss: ISS.into(),
+                        sub: sub.into(),
+                        at_ms: now_ms(),
+                    }),
+                },
+            );
+        }
+    }
+
+    impl SessionBook for Book {
+        fn session(&self, sid: &str) -> Option<SessionInfo> {
+            self.0.lock().unwrap().get(sid).cloned()
+        }
+        fn set_proof(&self, sid: &str, proof: IdpProof) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .get_mut(sid)
+                .map(|s| s.proof = Some(proof))
+                .is_some()
+        }
+        fn drop_device_proofs(&self, name: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for (sid, s) in self.0.lock().unwrap().iter_mut() {
+                if s.typed.source == Source::Device
+                    && s.typed.stable_id == name
+                    && s.proof.is_some()
+                {
+                    s.proof = None;
+                    out.push(sid.clone());
+                }
+            }
+            out
+        }
+    }
+
+    fn device(name: &str) -> PrincipalRef {
+        PrincipalRef::local(Source::Device, name)
+    }
+
+    fn oidc(sub: &str) -> PrincipalRef {
+        PrincipalRef {
+            issuer: ISS.into(),
+            ..PrincipalRef::local(Source::Oidc, sub)
+        }
+    }
+
+    /// Hold a grant for the person session `sid` is, as `sub`.
+    fn hold(d: &Delegation, sid: &str, sub: &str, template: &str, bound_by: Option<&str>) -> Grant {
+        let who = d.who(Acting::new(None, Some(sid))).unwrap();
+        let g = Grant {
+            grant_id: who.typed.grant_id(ISS),
+            principal: who.typed.clone(),
+            fingerprint: who.fingerprint(ISS, sub),
+            idp: "okta".into(),
+            idp_iss: ISS.into(),
+            sub: sub.into(),
+            email_hash: None,
+            template: template.into(),
+            ceilings: [(
+                "linear".to_string(),
+                vec!["issues:read".to_string(), "issues:write".to_string()],
+            )]
+            .into(),
+            created_ms: now_ms(),
+            expires_ms: now_ms() + 3_600_000,
+            epoch: 1,
+            rt_version: 1,
+            quota: BTreeMap::new(),
+            bound_by: bound_by.map(str::to_string),
+        };
+        d.grants
+            .lock()
+            .unwrap()
+            .insert(g.grant_id.clone(), g.clone());
+        g
+    }
+
+    fn claims(sub: &str) -> idjag::IdClaims {
+        idjag::IdClaims {
+            iss: ISS.into(),
+            sub: sub.into(),
+            exp: now_ms() / 1000 + 300,
+            auth_time: None,
+            email: None,
+            preferred_username: None,
+        }
+    }
+
+    fn code<T>(r: Result<T, DelegationError>) -> Option<Code> {
+        r.err().map(|e| e.code)
+    }
+
+    /// A device name's grant is held through each session to the identity
+    /// that session proved (RFC 0044 §5.2, §5.4): a second device under the
+    /// same name with no proof, or another, is not enrolled; an ended
+    /// session acts for nobody; a sign-in as someone else is
+    /// binding_mismatch; first binding turned off, or a pin naming another,
+    /// holds the grant back; and an unpinned, unbound name is not eligible
+    /// without first binding.
+    #[test]
+    fn a_device_name_is_held_to_its_binding_through_each_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = people(
+            dir.path(),
+            json!({"templates": [template("devices", "device", &["issues:read", "issues:write"])],
+                   "device_first_binding": true}),
+        );
+        let book = Arc::new(Book::default());
+        book.add("s1", device("laptop"), Some("00u1alice"));
+        book.add("s2", device("laptop"), None);
+        book.add("s3", device("laptop"), Some("00u2bob"));
+        book.add("s4", device("phone"), None);
+        let d = supervisor(&open, Arc::clone(&book));
+        hold(&d, "s1", "00u1alice", "devices", Some(BOUND_BY_FIRST));
+        let at = |sid: &str| d.admit(Acting::new(None, Some(sid)), "linear");
+        assert!(at("s1").is_ok(), "the session that proved the binding");
+        assert_eq!(code(at("s2")), Some(Code::NotEnrolled), "no proof");
+        assert_eq!(code(at("s3")), Some(Code::NotEnrolled), "another identity");
+        assert_eq!(code(at("gone")), Some(Code::Revoked), "an ended session");
+        let who = |sid: &str| d.who(Acting::new(None, Some(sid))).unwrap();
+        let idp = d.providers.get("okta").unwrap();
+        assert_eq!(
+            code(d.bind(&who("s3"), idp, &claims("00u2bob"))),
+            Some(Code::BindingMismatch),
+            "the name is bound to another"
+        );
+        assert_eq!(
+            d.bind(&who("s2"), idp, &claims("00u1alice")).unwrap(),
+            Some(BOUND_BY_FIRST)
+        );
+        assert!(d.eligible(&who("s4"), "okta").is_ok(), "first-bindable");
+        // First binding off: what it bound is held back, and an unbound,
+        // unpinned name is not eligible.
+        let closed = people(
+            dir.path(),
+            json!({"templates": [template("devices", "device", &["issues:read", "issues:write"])]}),
+        );
+        d.reload(&closed);
+        assert_eq!(code(at("s1")), Some(Code::NotEnrolled));
+        // …whatever the session proves since: the binding is gone.
+        book.add("s1", device("laptop"), Some("00u1alice"));
+        assert_eq!(
+            code(at("s1")),
+            Some(Code::NotEnrolled),
+            "first binding is off"
+        );
+        assert_eq!(
+            code(d.eligible(&who("s4"), "okta")),
+            Some(Code::PrincipalNotDelegable)
+        );
+        assert_eq!(
+            code(d.bind(&who("s4"), idp, &claims("00u1alice"))),
+            Some(Code::PrincipalNotDelegable)
+        );
+        // A pin binds only the identity it names.
+        let pinned = people(
+            dir.path(),
+            json!({"templates": [template("devices", "device", &["issues:read"])],
+                   "device_pins": {"phone": {"iss": ISS, "sub": "00u3carol"}}}),
+        );
+        d.reload(&pinned);
+        assert_eq!(
+            code(d.bind(&who("s4"), idp, &claims("00u1alice"))),
+            Some(Code::BindingMismatch)
+        );
+        assert_eq!(
+            d.bind(&who("s4"), idp, &claims("00u3carol")).unwrap(),
+            Some(BOUND_BY_PIN)
+        );
+    }
+
+    /// A reload takes the templates, pins and first binding at once: a
+    /// narrowed template narrows the grant at the next call and revokes
+    /// nothing; a removed template, a pin naming another, and first binding
+    /// turned off each hand back the grants they allowed, with why, and drop
+    /// the proofs of those device names' sessions.
+    #[test]
+    fn a_reload_revokes_only_what_it_no_longer_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = |people_scopes: &[&str], pins: Value, first: bool| {
+            json!({"templates": [template("people", "oidc", people_scopes),
+                                 template("devices", "device", &["issues:read", "issues:write"])],
+                   "device_pins": pins, "device_first_binding": first})
+        };
+        let start = people(
+            dir.path(),
+            both(
+                &["issues:read", "issues:write"],
+                json!({"phone": {"iss": ISS, "sub": "00u3carol"}}),
+                true,
+            ),
+        );
+        let book = Arc::new(Book::default());
+        book.add("a", oidc("00u1alice"), None);
+        book.add("l", device("laptop"), Some("00u1alice"));
+        book.add("p", device("phone"), Some("00u3carol"));
+        let d = supervisor(&start, Arc::clone(&book));
+        hold(&d, "a", "00u1alice", "people", None);
+        hold(&d, "l", "00u1alice", "devices", Some(BOUND_BY_FIRST));
+        hold(&d, "p", "00u3carol", "devices", Some(BOUND_BY_PIN));
+        // Narrowed: nothing revoked, the next call held to it.
+        let (revoked, cleared) = d.reload(&people(
+            dir.path(),
+            both(
+                &["issues:read"],
+                json!({"phone": {"iss": ISS, "sub": "00u3carol"}}),
+                true,
+            ),
+        ));
+        assert!(
+            revoked.is_empty() && cleared.is_empty(),
+            "{revoked:?} {cleared:?}"
+        );
+        let a = d.admit(Acting::new(None, Some("a")), "linear").unwrap();
+        assert_eq!(a.grant.ceilings["linear"], vec!["issues:read".to_string()]);
+        // The pin moved and first binding off: both device grants go, and
+        // their names' proofs with them; the person's stays.
+        let (revoked, cleared) = d.reload(&people(
+            dir.path(),
+            both(
+                &["issues:read"],
+                json!({"phone": {"iss": ISS, "sub": "00u9dave"}}),
+                false,
+            ),
+        ));
+        let why: BTreeMap<String, String> = revoked
+            .iter()
+            .map(|(g, w)| (g.principal.stable_id.clone(), w.clone()))
+            .collect();
+        assert_eq!(why.len(), 2, "{why:?}");
+        assert!(
+            why["laptop"].contains("device_first_binding is off"),
+            "{why:?}"
+        );
+        assert!(why["phone"].contains("names another identity"), "{why:?}");
+        assert_eq!(cleared, vec!["laptop".to_string(), "phone".to_string()]);
+        assert!(
+            book.session("l").unwrap().proof.is_none()
+                && book.session("p").unwrap().proof.is_none()
+        );
+        // Revoked off the loop, as the runtime does.
+        for (g, _) in &revoked {
+            d.grants.lock().unwrap().remove(&g.grant_id);
+        }
+        // The template removed: the person's grant goes, said why.
+        let (revoked, _) = d.reload(&people(
+            dir.path(),
+            json!({"templates": [template("devices", "device", &["issues:read"])]}),
+        ));
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].0.principal, oidc("00u1alice"));
+        assert!(
+            revoked[0].1.contains("template people was removed"),
+            "{revoked:?}"
+        );
     }
 }

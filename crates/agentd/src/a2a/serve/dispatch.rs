@@ -381,6 +381,28 @@ async fn dispatch(
     // `workflow.run` may start is the runtime's to judge — it alone holds the
     // workflows and their start roles — and its refusal comes back as the same
     // 403, recorded by the audit mirror.
+    // An instance child's channel carries its reports and nothing else: a
+    // send that is not one is refused, whatever it says.
+    if principal.instance_handle().is_some() && command.is_none() {
+        denied(
+            &app,
+            unvouched,
+            Some(&principal),
+            None,
+            Some(name),
+            None,
+            "not_permitted",
+            403,
+        );
+        return forbidden(
+            id,
+            &format!(
+                "{} sends its reports (_instance.result, _instance.emit) and nothing else",
+                principal.id
+            ),
+            bearer_used,
+        );
+    }
     if let Some(op) = command.as_ref().map(|c| c.op.as_str())
         && !principal.may_command(op)
     {

@@ -22,7 +22,7 @@
  * text that does nothing on the daemon it is actually talking to.
  */
 
-import { Activity, inert, Json, MirrorState, TaskView, TERMINAL_STATES } from './types.js';
+import { Activity, ConsentGate, inert, Json, MirrorState, TaskView, TERMINAL_STATES } from './types.js';
 import { SLASH_OPS } from './ext.js';
 import type { AgentdClient, RevokeTarget, SendOptions } from './client.js';
 
@@ -76,6 +76,8 @@ const COMMANDS: ReadonlyArray<[string, string]> = [
   ['deny', 'refuse a device sign-in: /deny <code> | all'],
   ['sessions', 'the signed-in sessions'],
   ['revoke', 'end sessions: /revoke <sid> | name <name> | all'],
+  ['enrol', 'sign in at an identity provider so agentd acts for you there: /enrol <idp>'],
+  ['consent', 'your consent gates: /consent | /consent approve <gate> | /consent deny <gate>'],
   ['drain', 'graceful drain'],
   ['layout', "this client's top and bottom edges"],
   ['login', 'sign in'],
@@ -379,16 +381,48 @@ export function prepare(input: string, s: MirrorState): Prepared {
  * without a conversation — a fresh one has no gates — and never a gate of
  * another conversation, however recent: an answer typed into one chat is not
  * an answer to a question asked in another. `AUTH_REQUIRED` is not a gate a
- * message can answer; the person must sign in, not reply.
+ * message can answer; the person must sign in, not reply. Nor is a consent
+ * gate ({@link consentWait}): the daemon refuses a message on it.
  */
 export function currentGate(s: MirrorState, contextId: string | undefined): TaskView | undefined {
   // No conversation matches no task: a task never has an undefined context.
   let gate: TaskView | undefined;
   for (const t of s.tasks.values()) {
-    if (t.state !== 'TASK_STATE_INPUT_REQUIRED' || t.contextId !== contextId) continue;
+    if (t.state !== 'TASK_STATE_INPUT_REQUIRED' || t.contextId !== contextId || t.consentGate !== undefined) continue;
     if (gate === undefined || t.updated > gate.updated) gate = t;
   }
   return gate;
+}
+
+/**
+ * The consent gate the person is asked in conversation `contextId` (RFC
+ * 0044): the newest `INPUT_REQUIRED` task there that carries one. It is
+ * answered with `/consent`, or by signing in again — never by a message.
+ */
+export function consentWait(s: MirrorState, contextId: string | undefined): TaskView | undefined {
+  let gate: TaskView | undefined;
+  for (const t of s.tasks.values()) {
+    if (t.state !== 'TASK_STATE_INPUT_REQUIRED' || t.contextId !== contextId || t.consentGate === undefined) continue;
+    if (gate === undefined || t.updated > gate.updated) gate = t;
+  }
+  return gate;
+}
+
+/** What a consent gate asks of the person, as one line either UI shows. */
+export function consentLine(g: ConsentGate): string {
+  const id = inert(g.gate);
+  switch (g.kind) {
+    case 'action':
+      return `agentd security gate · /consent approve ${id} · /consent deny ${id}`;
+    case 'authorize':
+      return g.startUri !== undefined
+        ? `agentd security gate · sign in again: open ${inert(g.startUri)} in your browser · /consent deny ${id} cancels`
+        : `agentd security gate · sign in again where the task says · /consent deny ${id} cancels`;
+    case 'device':
+      return g.verificationUri !== undefined && g.userCode !== undefined
+        ? `agentd security gate · sign in again: open ${inert(g.verificationUri)} and enter ${inert(g.userCode)} · /consent deny ${id} cancels`
+        : `agentd security gate · sign in again where the task says · /consent deny ${id} cancels`;
+  }
 }
 
 /**
@@ -545,6 +579,84 @@ export async function runAuthCommand(
       return { text: `revoked ${shown(field(r, 'revoked'))} session(s)` };
     }
   }
+}
+
+// ---- the person's own delegation (RFC 0044) --------------------------------
+
+/** A parsed `/enrol` or `/consent`. */
+export type DelegationCommand =
+  | { cmd: 'enrol'; idp: string }
+  | { cmd: 'consent'; answer?: 'approve' | 'deny'; gate?: string };
+
+const DELEGATION_USAGE: Readonly<Record<DelegationCommand['cmd'], string>> = Object.freeze({
+  enrol: 'usage: /enrol <idp> — the identity provider to sign in at',
+  consent: 'usage: /consent | /consent approve <gate> | /consent deny <gate>',
+});
+
+/**
+ * Read a delegation command. `null` when `cmd` is not one; `{usage}` when it
+ * is one written wrong — nothing is sent for that.
+ */
+export function parseDelegationCommand(cmd: string, args: readonly string[]): DelegationCommand | { usage: string } | null {
+  switch (cmd) {
+    case 'enrol':
+      return args.length === 1 && args[0] !== '' ? { cmd, idp: args[0] } : { usage: DELEGATION_USAGE.enrol };
+    case 'consent':
+      if (args.length === 0) return { cmd };
+      if (args.length === 2 && (args[0] === 'approve' || args[0] === 'deny')) return { cmd, answer: args[0], gate: args[1] };
+      return { usage: DELEGATION_USAGE.consent };
+    default:
+      return null;
+  }
+}
+
+/** The client methods the delegation commands call. */
+export type DelegationClient = Pick<AgentdClient, 'delegationEnrol' | 'delegationList' | 'delegationApprove' | 'delegationDeny'>;
+
+/** What a finished command task said: its status text, else its state. */
+function said(r: Awaited<ReturnType<AgentdClient['delegationEnrol']>>): string {
+  if (r.kind !== 'task') return 'done';
+  return r.task.message ?? r.task.state.replace('TASK_STATE_', '').toLowerCase();
+}
+
+/**
+ * Run a delegation command line. `/enrol` starts the sign-in and says where
+ * to open it — the start link opens once, in the browser that is to sign in;
+ * `/consent` lists the person's own gates in agentd's own words, and answers
+ * one, bound to the nonce and argument hash the daemon listed for it.
+ */
+export async function runDelegationCommand(
+  cmd: string,
+  args: readonly string[],
+  client: DelegationClient,
+): Promise<AuthOutcome | null> {
+  const c = parseDelegationCommand(cmd, args);
+  if (c === null) return null;
+  if ('usage' in c) return { text: c.usage, error: true };
+  if (c.cmd === 'enrol') {
+    const r = await client.delegationEnrol(c.idp);
+    if (r.kind === 'task' && r.task.signIn !== undefined) {
+      return { text: `open ${inert(r.task.signIn.startUri)} in your browser to sign in at ${inert(c.idp)} — the link opens once` };
+    }
+    const failed = r.kind === 'task' && r.task.state === 'TASK_STATE_FAILED';
+    return { text: inert(said(r)), error: failed };
+  }
+  const gates = rows(field(await client.delegationList(), 'gates'));
+  if (c.answer === undefined) {
+    if (gates.length === 0) return { text: 'no consent gates are open for you' };
+    const lines = gates.map((g) => `${shown(field(g, 'gate'))}  ${shown(field(g, 'tool'))} · ${shown(field(g, 'server'))}`);
+    return { text: `consent gates:\n${lines.join('\n')}\n/consent approve <gate> · /consent deny <gate>` };
+  }
+  const g = gates.find((x) => field(x, 'gate') === c.gate);
+  const nonce = text(field(g, 'nonce'));
+  if (g === undefined || nonce === undefined) {
+    return { text: `${inert(c.gate ?? '')} is no open gate of yours to answer`, error: true };
+  }
+  const r =
+    c.answer === 'approve'
+      ? await client.delegationApprove(c.gate ?? '', nonce, text(field(g, 'args_hash')) ?? '')
+      : await client.delegationDeny(c.gate ?? '', nonce);
+  return { text: inert(said(r)), error: r.kind === 'task' && r.task.state === 'TASK_STATE_FAILED' };
 }
 
 /** A compact human duration (`8s`, `1m14s`, `2h03m`). */

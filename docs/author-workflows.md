@@ -960,9 +960,9 @@ workflows:
 ### Call a delegated server for the enrolled person
 
 A delegated server's tools are called from `mcp.tool` and `tool` steps like
-any other's, but only a run that the enrolled person started uses their
-grant. Any other run — one a schedule, a webhook or another principal
-started — fails the step with `no_delegation`.
+any other's, but only a run that an enrolled person started uses their
+grant — each person's run their own. Any other run — one a schedule, a
+webhook or another principal started — fails the step with `no_delegation`.
 
 ```yaml
 # needs: ./okta-agent-key.pem, ./linear-ras-key.pem, ./delegation-seal
@@ -1048,6 +1048,29 @@ workflows:
   the same way.
 - A delegated server is offered no MCP tasks, so it answers each call
   inline, `detach` or not.
+
+The same workflow serves people who sign in from a display client
+(`a2a.login`, or a device session a pin binds; [Enterprise-managed
+authorization](authentication.md#enterprise-managed-authorization)). Two
+things then differ:
+
+- **The run is bound to the session it was started through.** A run, a
+  `workflow.signal` and a message a session sends carry its session id, and
+  so does every run they start in turn. When that session ends — the person
+  signs out, it is revoked or expires, or the daemon restarts, which ends
+  every session — the run's next delegated step fails `delegation refused
+  (revoked)`, and a gate it waits on closes the same way at once. The rest
+  of the run goes on; a run that needs the person again is started again
+  after they sign in.
+- **The gate is the run's task's.** A run started over A2A has a task; its
+  consent gate puts that task at `input-required`, badged as agentd's
+  security gate, with agentd's own text of the call and a `consentGate`
+  annotation naming the gate. The person answers it from their display
+  client (`/consent approve <gate>`, or the gate's **approve**), through a
+  session whose IdP sign-in is recent enough; `workflow.status` shows the
+  step suspended on it, `wait.kind: consent`. A restart asks the same gate
+  again — for a per-person operator's run — or closes it `revoked` for a
+  session's.
 
 ## Test a workflow
 

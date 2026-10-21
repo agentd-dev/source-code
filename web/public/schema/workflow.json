@@ -1171,6 +1171,43 @@
   "$id": "https://agentd.dev/schema/workflow.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "act_for": {
+      "additionalProperties": false,
+      "description": "pre-authorised unattended runs (RFC 0044 M4): refused until RFC 0044 P3 builds them; one naming a device principal is refused as act_for_device_principal",
+      "properties": {
+        "principal": {
+          "additionalProperties": false,
+          "description": "the typed principal, never a display string",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "issuer": {
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "oidc",
+                "x509",
+                "operator",
+                "device"
+              ]
+            },
+            "sub": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "via": {
+          "enum": [
+            "ciba",
+            "standing"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "armed": {
       "default": true,
       "type": "boolean"

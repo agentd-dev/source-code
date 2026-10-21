@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Signing in: what the card offers (`securitySchemes`), the OAuth 2.0 device
- * grant (RFC 8628) against the daemon's own authorization server, revocation
- * (RFC 7009, found through RFC 8414 metadata), and the launch grant the
- * `agentd tui` / `agentd ui` launcher hands its client.
+ * grant (RFC 8628) against the daemon's own authorization server, the
+ * sign-in at the person's own identity provider the daemon federates
+ * (`a2a.login`, found through RFC 8414 metadata), revocation (RFC 7009,
+ * found the same way), and the launch grant the `agentd tui` / `agentd ui`
+ * launcher hands its client.
  *
  * Every token comes from the daemon's /oauth2 endpoints on the listener
  * origin and is presented as a Bearer. No long-lived credential is ever
@@ -31,6 +33,14 @@ export const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
  */
 export const LAUNCH_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/launch';
 
+/**
+ * The login grant (an RFC 6749 §4.5 extension grant): the request code a
+ * client polls with while the person signs in at their identity provider
+ * through the start link. Must equal the daemon's
+ * `a2a::login::LOGIN_GRANT_TYPE`; `interface_client_guard` checks it.
+ */
+export const LOGIN_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/login';
+
 /** The RFC 8414 metadata path, relative to the issuer (the listener origin). */
 export const AUTHORIZATION_SERVER_METADATA = '/.well-known/oauth-authorization-server';
 
@@ -40,6 +50,8 @@ const DEFAULT_INTERVAL_S = 5;
 const DEVICE_SLOW_DOWN_MS = 5_000;
 /** The launch grant's `slow_down` step; its interval is 2 s, so +5 s would triple it. */
 const LAUNCH_SLOW_DOWN_MS = 2_000;
+/** The login grant's `slow_down` step, as the daemon adds it. */
+const LOGIN_SLOW_DOWN_MS = 2_000;
 /** An OAuth answer is a small JSON object; more than this is not one. */
 const MAX_BODY = 64 << 10;
 
@@ -140,6 +152,22 @@ export class NoLauncher extends AuthError {
   constructor(message = 'this daemon was not started by `agentd ui`') {
     super('no-launcher', message, { status: 404 });
     this.name = 'NoLauncher';
+  }
+}
+
+/** The identity provider, or agentd, refused the sign-in (`access_denied`): the reason says which. */
+export class IdpLoginRefused extends AuthError {
+  constructor(message = 'the sign-in at the identity provider was refused') {
+    super('access_denied', message);
+    this.name = 'IdpLoginRefused';
+  }
+}
+
+/** The sign-in was not completed in time (`expired_token`); start a new one. */
+export class IdpLoginExpired extends AuthError {
+  constructor(message = 'the sign-in at the identity provider was not completed in time') {
+    super('expired_token', message);
+    this.name = 'IdpLoginExpired';
   }
 }
 
@@ -418,8 +446,8 @@ interface Poll {
   deadline?: number;
   /** The error for `expired_token` (and a passed deadline). */
   expired: () => AuthError;
-  /** The error for any other refusal code this grant gives a meaning to. */
-  refused: (code: string) => AuthError | undefined;
+  /** The error for any other refusal code this grant gives a meaning to, with the server's description. */
+  refused: (code: string, description?: string) => AuthError | undefined;
   clock: Clock;
   what: string;
 }
@@ -453,8 +481,10 @@ async function poll(p: Poll, o: AuthTransport): Promise<Credential> {
         continue;
       case 'expired_token':
         throw p.expired();
-      default:
-        throw (code !== undefined ? p.refused(code) : undefined) ?? failure(a, p.what);
+      default: {
+        const d = a.body?.error_description;
+        throw (code !== undefined ? p.refused(code, typeof d === 'string' ? d : undefined) : undefined) ?? failure(a, p.what);
+      }
     }
   }
 }
@@ -552,6 +582,112 @@ export async function deviceLogin(o: DeviceLoginOptions): Promise<Credential> {
       refused: (c) => (c === 'access_denied' ? new DeviceDenied() : undefined),
       clock,
       what: 'device sign-in',
+    },
+    o,
+  );
+}
+
+// ---- the sign-in at the person's identity provider (`a2a.login`) ----------
+
+/** The listener's IdP sign-in, as its RFC 8414 metadata names it. */
+export interface IdpLoginFlow {
+  loginAuthorizationUrl: string;
+  tokenUrl: string;
+}
+
+/** What the person opens in their browser: on the listener origin, once. */
+export interface StartLink {
+  uri: string;
+  /** Seconds the link stays good. */
+  expiresIn: number;
+}
+
+/**
+ * Whether the agent at `origin` signs people in at their organization's
+ * identity provider (`a2a.login`): its RFC 8414 metadata names a
+ * `login_authorization_endpoint`. `undefined` when it does not, or serves no
+ * metadata. The metadata must name `origin` as its issuer, and both
+ * endpoints must be on it — a request code and a token travel to them.
+ */
+export async function idpLoginOf(origin: string, o: AuthTransport = {}): Promise<IdpLoginFlow | undefined> {
+  const base = requireSecureUrl(origin, 'the agent');
+  const a = await send(requireSecureUrl(join(base.origin, AUTHORIZATION_SERVER_METADATA), 'the authorization server metadata'), { method: 'GET' }, o);
+  if (a.status === 404) return undefined;
+  if (a.status !== 200 || !a.body) throw failure(a, 'authorization server metadata');
+  if (a.body.issuer !== base.origin) {
+    throw new IssuerMismatch(
+      `the authorization server metadata names issuer ${JSON.stringify(a.body.issuer)}, not ${base.origin}`,
+    );
+  }
+  const login = a.body.login_authorization_endpoint;
+  const token = a.body.token_endpoint;
+  if (typeof login !== 'string' || typeof token !== 'string') return undefined;
+  const loginUrl = requireSecureUrl(login, 'the login authorization endpoint');
+  const tokenUrl = requireSecureUrl(token, 'the token endpoint');
+  if (loginUrl.origin !== base.origin || tokenUrl.origin !== base.origin) {
+    throw new IssuerMismatch(`the sign-in endpoints are not on the issuer ${base.origin}`);
+  }
+  return { loginAuthorizationUrl: loginUrl.href, tokenUrl: tokenUrl.href };
+}
+
+export interface IdpLoginOptions extends AuthTransport {
+  flow: IdpLoginFlow;
+  clientId: string;
+  /** Show or open the start link; called once, before the first poll. */
+  onLink: (l: StartLink) => void;
+  clock?: Clock;
+}
+
+/**
+ * Sign in at the person's identity provider through the daemon: ask for a
+ * start link, hand it to the person's browser, and poll with the request
+ * code until the daemon has verified the IdP's answer. The client never sees
+ * an IdP token, and the link works only in the browser that opens it first —
+ * the daemon binds the sign-in to a cookie that link sets. Resolves with the
+ * session credential; rejects with {@link IdpLoginRefused} (its message says
+ * why) or {@link IdpLoginExpired}.
+ */
+export async function idpLogin(o: IdpLoginOptions): Promise<Credential> {
+  const clock = o.clock ?? systemClock;
+  const authUrl = requireSecureUrl(o.flow.loginAuthorizationUrl, 'the login authorization endpoint');
+  const tokenUrl = requireSecureUrl(o.flow.tokenUrl, 'the token endpoint');
+  if (tokenUrl.origin !== authUrl.origin) {
+    throw new IssuerMismatch(
+      `the token endpoint ${tokenUrl.origin} is not on the login authorization endpoint's origin ${authUrl.origin}`,
+    );
+  }
+  const started = clock.now();
+  const a = await send(authUrl, { method: 'POST', form: { client_id: o.clientId } }, o);
+  if (a.status !== 200) throw failure(a, 'login authorization');
+  const b = a.body;
+  if (typeof b?.request_code !== 'string' || typeof b.start_uri !== 'string' || typeof b.expires_in !== 'number') {
+    throw new AuthError('invalid-response', 'the login authorization answer is incomplete', { status: a.status });
+  }
+  // The start link is what the person's browser opens: the daemon's own
+  // origin, never anywhere else — it is where the sign-in's cookie is set.
+  let start: URL;
+  try {
+    start = requireSecureUrl(b.start_uri);
+  } catch {
+    throw new AuthError('invalid-response', `the start link ${JSON.stringify(b.start_uri)} is not an https:// URL (or http:// on a loopback host)`, {
+      status: a.status,
+    });
+  }
+  if (start.origin !== authUrl.origin) {
+    throw new IssuerMismatch(`the start link ${start.href} is not on ${authUrl.origin}`);
+  }
+  o.onLink({ uri: start.href, expiresIn: typeof b.start_expires_in === 'number' ? b.start_expires_in : b.expires_in });
+  return poll(
+    {
+      tokenUrl,
+      form: { grant_type: LOGIN_GRANT_TYPE, request_code: b.request_code, client_id: o.clientId },
+      interval: typeof b.interval === 'number' && b.interval > 0 ? b.interval : DEFAULT_INTERVAL_S,
+      slowDownMs: LOGIN_SLOW_DOWN_MS,
+      deadline: started + b.expires_in * 1000,
+      expired: () => new IdpLoginExpired(),
+      refused: (c, d) => (c === 'access_denied' ? new IdpLoginRefused(d) : undefined),
+      clock,
+      what: 'sign-in at the identity provider',
     },
     o,
   );

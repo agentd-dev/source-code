@@ -882,6 +882,7 @@ impl Runtime {
             inputs,
         );
         run.principal = ev.principal.clone();
+        run.session = ev.session.clone();
         run.subagent = ev
             .payload
             .get("subagent")
@@ -1553,6 +1554,7 @@ impl Runtime {
             principal: self.runs.get(run_id).and_then(|r| r.principal.clone()),
             ctx: self.runs.get(run_id).and_then(|r| r.conversation.clone()),
             msg_depth: self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0),
+            session: self.runs.get(run_id).and_then(|r| r.session.clone()),
             ..Default::default()
         };
         // `cache {key, ttl}`: a fresh memoized output skips the effect.
@@ -2595,6 +2597,7 @@ impl Runtime {
             principal: run.principal.clone(),
             ctx: run.conversation.clone(),
             msg_depth: run.msg_depth,
+            session: run.session.clone(),
             ..Default::default()
         })
     }
@@ -2738,11 +2741,13 @@ impl Runtime {
                     .collect()
             });
             let owner = self.runs.get(run_id).and_then(|r| r.principal.clone());
+            let session = self.runs.get(run_id).and_then(|r| r.session.clone());
             self.tool_plan(
                 &Caller::Workflow,
                 allow.as_deref(),
                 listed.as_deref(),
                 owner.as_deref(),
+                session.as_deref(),
             )
         };
         let servers: Vec<String> = match listed {
@@ -3721,10 +3726,12 @@ impl Runtime {
                         self.note_root(line);
                     } else {
                         let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+                        let session = self.runs.get(run_id).and_then(|r| r.session.clone());
                         let trace = self.run_trace(run_id);
-                        if let Err(e) = self.accept_event(
+                        if let Err(e) = self.accept_event_in(
                             kinds::A2A_MESSAGE,
                             principal,
+                            session,
                             json!({"text": line.clone(), "context_id": crate::context::ROOT,
                                    "msg_depth": depth}),
                             trace.as_ref(),
@@ -3927,9 +3934,10 @@ impl Runtime {
                 }
                 // The run continues its caller's trace.
                 let trace = self.caller_trace(caller);
-                match self.accept_event(
+                match self.accept_event_in(
                     kinds::WORKFLOW_RUN,
                     caller.principal.clone(),
+                    caller.session.clone(),
                     payload,
                     trace.as_ref(),
                 ) {
@@ -4238,9 +4246,10 @@ impl Runtime {
                 if let Some(h) = self.subagent_lineage(caller) {
                     signal["subagent"] = json!(h);
                 }
-                let _ = self.accept_event(
+                let _ = self.accept_event_in(
                     kinds::SIGNAL,
                     caller.principal.clone(),
+                    caller.session.clone(),
                     signal,
                     trace.as_ref(),
                 );

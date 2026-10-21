@@ -29,6 +29,8 @@ import {
   DISPLAY_ITEMS,
   DeviceDenied,
   DeviceExpired,
+  IdpLoginExpired,
+  IdpLoginRefused,
   Json,
   LaunchExpired,
   LaunchRefused,
@@ -49,10 +51,14 @@ import {
   availableCommands,
   cardUrlOf,
   commandHelp,
+  consentLine,
+  consentWait,
   conversationsNote,
   currentGate,
   describe,
   deviceLogin,
+  idpLogin,
+  idpLoginOf,
   duration,
   endpointKey,
   fetchCard,
@@ -68,12 +74,14 @@ import {
   memoryStorage,
   originOf,
   parseAuthCommand,
+  parseDelegationCommand,
   parseLayout,
   persistEndpoint,
   prepare,
   revokeToken,
   routeSend,
   runAuthCommand,
+  runDelegationCommand,
   suggest,
   systemClock,
   workflowNames,
@@ -81,10 +89,13 @@ import {
 import type {
   AskForm,
   ChromeInput,
+  ConsentGate,
   Credential,
   DeviceCode,
   DeviceFlow,
   Failure,
+  IdpLoginFlow,
+  StartLink,
   KeyValueStorage,
   Layout,
   MirrorState,
@@ -221,7 +232,18 @@ function Row({ e }: { e: TranscriptEntry }): React.JSX.Element {
   );
 }
 
-function Chat({ mirror, gate, onSend }: { mirror: Mirror; gate: TaskView | undefined; onSend: (text: string) => void }): React.JSX.Element {
+function Chat({
+  mirror,
+  gate,
+  consent,
+  onSend,
+}: {
+  mirror: Mirror;
+  gate: TaskView | undefined;
+  /** The consent gate this conversation waits on: answered here, never by a message. */
+  consent: TaskView | undefined;
+  onSend: (text: string) => void;
+}): React.JSX.Element {
   const s = mirror.getState();
   const [input, setInput] = useState('');
   const [sugIndex, setSugIndex] = useState(0);
@@ -251,6 +273,7 @@ function Chat({ mirror, gate, onSend }: { mirror: Mirror; gate: TaskView | undef
         {s.transcript.map((e) => (
           <Row key={e.key} e={e} />
         ))}
+        {consent?.consentGate ? <ConsentPanel gate={consent.consentGate} onSend={onSend} /> : null}
         {gate && gateForm.kind !== 'text' ? (
           <GateForm
             task={gate}
@@ -793,6 +816,36 @@ function failureText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * The person's consent gate, answered in place (RFC 0044): approve or deny an
+ * action gate — bound to the nonce and argument hash the daemon lists for it
+ * — or sign in again at the link a step-up gate carries. The question itself
+ * is agentd's own text, in the transcript above.
+ */
+function ConsentPanel({ gate, onSend }: { gate: ConsentGate; onSend: (text: string) => void }): React.JSX.Element {
+  const link = gate.kind === 'authorize' ? gate.startUri : gate.kind === 'device' ? gate.verificationUri : undefined;
+  return (
+    <div className="gate consent">
+      <div className="gate-q">{consentLine(gate)}</div>
+      <div className="gate-actions">
+        {gate.kind === 'action' ? (
+          <button className="mini" type="button" onClick={() => onSend(`/consent approve ${gate.gate}`)}>
+            approve
+          </button>
+        ) : null}
+        {link !== undefined ? (
+          <a className="mini" href={link} target="_blank" rel="noreferrer noopener">
+            sign in again
+          </a>
+        ) : null}
+        <button className="mini" type="button" onClick={() => onSend(`/consent deny ${gate.gate}`)}>
+          deny
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Where the Connect screen is in signing in. */
 type SignIn =
   | { kind: 'idle' }
@@ -801,8 +854,10 @@ type SignIn =
   | { kind: 'terminal'; userCode: string }
   /** A device code is waiting for an approver. */
   | { kind: 'device'; code: DeviceCode }
-  /** The card offers the device grant; the person starts it. */
-  | { kind: 'offer'; flow: DeviceFlow }
+  /** A start link is waiting for the person to sign in at their identity provider. */
+  | { kind: 'idp'; link: StartLink; flow: IdpLoginFlow; device?: DeviceFlow }
+  /** The card offers the device grant, or the daemon a sign-in at an identity provider; the person starts one. */
+  | { kind: 'offer'; flow?: DeviceFlow; idp?: IdpLoginFlow }
   /** Nothing this page can sign in with. */
   | { kind: 'none' };
 
@@ -931,7 +986,13 @@ export function App({ bootstrap, launchCode }: AppProps): React.JSX.Element {
         }
         if (signal.aborted) return;
         const device = loginOptions(card).find((o) => o.method === 'device');
-        setSignIn(device?.method === 'device' ? { kind: 'offer', flow: device.flow } : { kind: 'none' });
+        // The sign-in at the person's identity provider is named in the
+        // daemon's RFC 8414 metadata, not the card: a metadata read that
+        // fails offers the rest.
+        const idp = await idpLoginOf(origin, { signal }).catch(() => undefined);
+        if (signal.aborted) return;
+        const flow = device?.method === 'device' ? device.flow : undefined;
+        setSignIn(flow !== undefined || idp !== undefined ? { kind: 'offer', flow, idp } : { kind: 'none' });
       };
       void run().catch((e: unknown) => {
         if (signal.aborted) return;
@@ -960,6 +1021,33 @@ export function App({ bootstrap, launchCode }: AppProps): React.JSX.Element {
           if (ac.signal.aborted) return;
           setSignIn({ kind: 'offer', flow });
           setError(e instanceof DeviceDenied || e instanceof DeviceExpired ? e.message : failureText(e));
+        });
+    },
+    [creds, connect],
+  );
+
+  /**
+   * The sign-in at the person's identity provider, started from the Connect
+   * screen: the start link opens in this browser — the one the sign-in is
+   * bound to — and this tab polls until the daemon has the session.
+   */
+  const idpSignIn = useCallback(
+    (endpoint: string, idp: IdpLoginFlow, device: DeviceFlow | undefined) => {
+      flight.current?.abort();
+      const ac = new AbortController();
+      flight.current = ac;
+      setNotice(undefined);
+      setError(undefined);
+      setSignIn({ kind: 'busy', what: 'asking for a sign-in link' });
+      void idpLogin({ flow: idp, clientId: UI_CLIENT_ID, signal: ac.signal, onLink: (link) => setSignIn({ kind: 'idp', link, flow: idp, device }) })
+        .then((c) => {
+          creds.set(endpointKey(endpoint), c);
+          connect(endpoint, c);
+        })
+        .catch((e: unknown) => {
+          if (ac.signal.aborted) return;
+          setSignIn({ kind: 'offer', flow: device, idp });
+          setError(e instanceof IdpLoginRefused || e instanceof IdpLoginExpired ? e.message : failureText(e));
         });
     },
     [creds, connect],
@@ -1031,6 +1119,7 @@ export function App({ bootstrap, launchCode }: AppProps): React.JSX.Element {
       error={error}
       onConnect={() => begin(form.trim())}
       onDevice={(flow, scope) => deviceSignIn(form.trim(), flow, scope)}
+      onIdp={(idp, device) => idpSignIn(form.trim(), idp, device)}
     />
   );
 }
@@ -1043,6 +1132,7 @@ function Connect({
   error,
   onConnect,
   onDevice,
+  onIdp,
 }: {
   endpoint: string;
   setEndpoint: (v: string) => void;
@@ -1051,6 +1141,7 @@ function Connect({
   error?: string;
   onConnect: () => void;
   onDevice: (flow: DeviceFlow, scope: string | undefined) => void;
+  onIdp: (idp: IdpLoginFlow, device: DeviceFlow | undefined) => void;
 }): React.JSX.Element {
   // The origin the daemon must admit, as this page really has it — the
   // instructions carry it rather than a placeholder to adapt.
@@ -1084,9 +1175,24 @@ function Connect({
             <code>/approve {signIn.code.userCode} &lt;name&gt;</code>
           </p>
         ) : null}
+        {signIn.kind === 'idp' ? (
+          <p className="signin">
+            To sign in,{' '}
+            <a href={signIn.link.uri} target="_blank" rel="noreferrer noopener">
+              open the sign-in
+            </a>{' '}
+            in this browser within {signIn.link.expiresIn}s and sign in at your organization&apos;s identity provider — the
+            link opens once.
+          </p>
+        ) : null}
         {signIn.kind === 'offer' ? (
           <div className="signin">
-            {signIn.flow.scopes.length > 1 ? (
+            {signIn.idp !== undefined ? (
+              <button type="button" onClick={() => signIn.idp !== undefined && onIdp(signIn.idp, signIn.flow)}>
+                sign in with your organization
+              </button>
+            ) : null}
+            {signIn.flow !== undefined && signIn.flow.scopes.length > 1 ? (
               <>
                 <label>ask for</label>
                 <select value={scope ?? ''} onChange={(e) => setScope(e.target.value || undefined)} aria-label="scope">
@@ -1099,9 +1205,11 @@ function Connect({
                 </select>
               </>
             ) : null}
-            <button type="button" onClick={() => onDevice(signIn.flow, scope)}>
-              sign in
-            </button>
+            {signIn.flow !== undefined ? (
+              <button type="button" onClick={() => signIn.flow !== undefined && onDevice(signIn.flow, scope)}>
+                {signIn.idp !== undefined ? 'sign in with a device code' : 'sign in'}
+              </button>
+            ) : null}
           </div>
         ) : null}
         {signIn.kind === 'none' ? (
@@ -1329,6 +1437,13 @@ function Connected({
       // composer module, so both display clients answer them alike.
       if (parseAuthCommand(cmd, rest) !== null) {
         const out = await runAuthCommand(cmd, rest, need());
+        if (out !== null) mirror.note(out.text, out.error ? 'error' : 'info');
+        return;
+      }
+      // So do the person's own delegation commands: enrolling, and their
+      // consent gates (which the consent panel sends too).
+      if (parseDelegationCommand(cmd, rest) !== null) {
+        const out = await runDelegationCommand(cmd, rest, need());
         if (out !== null) mirror.note(out.text, out.error ? 'error' : 'info');
         return;
       }
@@ -1580,7 +1695,7 @@ function Connected({
       ) : null}
       <div className="main">
         {shown === 'chat' ? (
-          <Chat mirror={mirror} gate={currentGate(s, ctx)} onSend={onSend} />
+          <Chat mirror={mirror} gate={currentGate(s, ctx)} consent={consentWait(s, ctx)} onSend={onSend} />
         ) : !client ? (
           <div className="pane">
             <div className="scroll">

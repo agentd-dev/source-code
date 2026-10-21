@@ -160,31 +160,27 @@ pub fn delegate(
     message_id: Option<&str>,
     deadline: Instant,
 ) -> DelegateOutcome {
-    match endpoint {
-        A2aEndpoint::Https(url) => {
-            let ep = match HttpEp::parse(url) {
-                Ok(ep) => ep,
-                Err(e) => return DelegateOutcome::Error(e),
-            };
-            let mut conn = HttpConn::new(ep, auth);
-            let objective = Objective {
-                text: objective,
-                command,
-                output_contract,
-                message_id: message_id
-                    .map(str::to_string)
-                    .unwrap_or_else(mint_message_id),
-            };
-            let outcome = delegate_on(&mut conn, &objective, deadline);
-            // A failed delegation drops the card it used, so the next one reads
-            // the peer as it is now: the card may be why it failed — a peer
-            // that changed its terms, or a local port that changed hands.
-            if matches!(outcome, DelegateOutcome::Error(_)) {
-                conn.forget_card();
-            }
-            outcome
-        }
+    let ep = match HttpEp::of(endpoint) {
+        Ok(ep) => ep,
+        Err(e) => return DelegateOutcome::Error(e),
+    };
+    let mut conn = HttpConn::new(ep, auth);
+    let objective = Objective {
+        text: objective,
+        command,
+        output_contract,
+        message_id: message_id
+            .map(str::to_string)
+            .unwrap_or_else(mint_message_id),
+    };
+    let outcome = delegate_on(&mut conn, &objective, deadline);
+    // A failed delegation drops the card it used, so the next one reads
+    // the peer as it is now: the card may be why it failed — a peer
+    // that changed its terms, or a local port that changed hands.
+    if matches!(outcome, DelegateOutcome::Error(_)) {
+        conn.forget_card();
     }
+    outcome
 }
 
 /// [`delegate`] over an open connection: the card, then the send.
@@ -280,17 +276,13 @@ pub fn send(
     message_id: Option<&str>,
     deadline: Instant,
 ) -> Result<Value, String> {
-    match endpoint {
-        A2aEndpoint::Https(url) => {
-            let ep = HttpEp::parse(url)?;
-            let mut conn = HttpConn::new(ep, auth);
-            let message_id = message_id
-                .map(str::to_string)
-                .unwrap_or_else(mint_message_id);
-            let params = a2a::send_message_params_parts(parts, context, &message_id, None)?;
-            conn.call("SendMessage", params, deadline)
-        }
-    }
+    let ep = HttpEp::of(endpoint)?;
+    let mut conn = HttpConn::new(ep, auth);
+    let message_id = message_id
+        .map(str::to_string)
+        .unwrap_or_else(mint_message_id);
+    let params = a2a::send_message_params_parts(parts, context, &message_id, None)?;
+    conn.call("SendMessage", params, deadline)
 }
 
 /// One call of `method` to the A2A peer at `endpoint`, with `params`: its
@@ -304,12 +296,8 @@ pub fn call(
     params: Value,
     deadline: Instant,
 ) -> Result<Value, String> {
-    match endpoint {
-        A2aEndpoint::Https(url) => {
-            let mut conn = HttpConn::new(HttpEp::parse(url)?, auth);
-            conn.call(method, params, deadline)
-        }
-    }
+    let mut conn = HttpConn::new(HttpEp::of(endpoint)?, auth);
+    conn.call(method, params, deadline)
 }
 
 /// How a streaming attempt resolved: a terminal outcome; a task id whose
@@ -425,9 +413,29 @@ struct HttpEp {
     /// `unix:///path` peer: dial this socket instead of TCP — the co-located
     /// fast lane (no TLS handshake, no TCP stack; the kernel authenticates).
     socket: Option<String>,
+    /// The parent of an instance child, through its channel: every request
+    /// a fresh connection passed through it.
+    channel: bool,
 }
 
 impl HttpEp {
+    /// The dial coordinates of `endpoint`.
+    fn of(endpoint: &A2aEndpoint) -> Result<HttpEp, String> {
+        match endpoint {
+            A2aEndpoint::Https(url) => HttpEp::parse(url),
+            A2aEndpoint::Parent => Ok(HttpEp {
+                url: "parent:".to_string(),
+                host: String::new(),
+                port: 0,
+                path: "/".to_string(),
+                host_header: "localhost".to_string(),
+                tls: false,
+                socket: None,
+                channel: true,
+            }),
+        }
+    }
+
     fn parse(url: &str) -> Result<HttpEp, String> {
         if let Some(path) = url
             .strip_prefix("unix://")
@@ -444,6 +452,7 @@ impl HttpEp {
                 host_header: "localhost".to_string(),
                 tls: false,
                 socket: Some(path.to_string()),
+                channel: false,
             });
         }
         let u = crate::net::http::Url::parse(url)
@@ -461,17 +470,22 @@ impl HttpEp {
             port: u.port,
             path,
             socket: None,
+            channel: false,
         })
     }
 
-    /// Whether the peer is on this host: a unix socket, or a loopback address.
+    /// Whether the peer is on this host: a unix socket, the parent's
+    /// channel, or a loopback address.
     fn local(&self) -> bool {
-        self.socket.is_some() || crate::net::http::is_loopback_host(&self.host)
+        self.socket.is_some() || self.channel || crate::net::http::is_loopback_host(&self.host)
     }
 
     /// The origin a card is published on: the scheme and authority for TCP,
-    /// the socket path for unix.
+    /// the socket path for unix, the parent for its channel.
     fn origin(&self) -> String {
+        if self.channel {
+            return "parent:".to_string();
+        }
         match &self.socket {
             Some(socket) => format!("unix:{socket}"),
             None => format!(
@@ -617,6 +631,12 @@ impl HttpConn {
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
+        #[cfg(unix)]
+        if self.ep.channel {
+            let s = crate::a2a::channel::connect(timeout)
+                .map_err(|e| format!("a2a: cannot reach the parent through its channel: {e}"))?;
+            return Ok(Box::new(s));
+        }
         if let Some(socket) = &self.ep.socket {
             let s = crate::net::unixsock::connect(socket, timeout)
                 .map_err(|e| format!("a2a: cannot reach peer socket {socket}: {e}"))?;
@@ -739,7 +759,14 @@ impl HttpConn {
     /// for this kind of endpoint (its tenant is echoed from here on), and no
     /// required extension this client does not implement.
     fn adopt(&mut self, card: &PeerCard) -> Result<(), String> {
-        let interface = card.select_interface(self.ep.socket.is_some(), &self.ep.url)?;
+        // The parent's card describes its own listener, unix or TCP; its
+        // channel speaks whichever it is.
+        let interface = if self.ep.channel {
+            card.select_interface(true, &self.ep.url)
+                .or_else(|_| card.select_interface(false, &self.ep.url))?
+        } else {
+            card.select_interface(self.ep.socket.is_some(), &self.ep.url)?
+        };
         if let Some(uri) = card.requires_unknown_extension(CLIENT_EXTENSIONS) {
             return Err(format!(
                 "a2a: peer requires the extension {uri}, which agentd does not implement"

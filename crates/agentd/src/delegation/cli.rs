@@ -40,9 +40,9 @@ const POLL: Duration = Duration::from_millis(300);
 
 /// The daemon's unix A2A listener.
 fn daemon(settings: &Settings, what: &str) -> Result<A2aEndpoint, String> {
-    if cfg::person(settings).is_none() {
+    if cfg::persons(settings).next().is_none() {
         return Err(format!(
-            "{what} acts for the per-person operator, and no a2a.principals rule with match.uid and idp_subject declares one"
+            "{what} acts for a per-person operator, and no a2a.principals rule with match.uid and idp_subject declares one"
         ));
     }
     let listen = settings.a2a.listen.as_deref().unwrap_or_default();

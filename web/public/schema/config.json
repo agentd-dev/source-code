@@ -1441,6 +1441,43 @@
       "additionalProperties": false,
       "description": "a {name, file|uri|url} reference, a {dir} directory (a path, or {path, glob, order}), or an inline workflow definition",
       "properties": {
+        "act_for": {
+          "additionalProperties": false,
+          "description": "pre-authorised unattended runs (RFC 0044 M4): refused until RFC 0044 P3 builds them; one naming a device principal is refused as act_for_device_principal",
+          "properties": {
+            "principal": {
+              "additionalProperties": false,
+              "description": "the typed principal, never a display string",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "issuer": {
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "oidc",
+                    "x509",
+                    "operator",
+                    "device"
+                  ]
+                },
+                "sub": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "via": {
+              "enum": [
+                "ciba",
+                "standing"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "allow_private": {
           "description": "permit `url` to resolve to a private/loopback address",
           "type": "boolean"
@@ -2939,6 +2976,27 @@
           "description": "https://host:port (loopback http:// for dev)",
           "type": "string"
         },
+        "login": {
+          "additionalProperties": false,
+          "description": "the IdP-federated display-client sign-in (RFC 0044 §5.4; needs the xaa feature): a display client signs in at the IdP by authorization code with PKCE through a single-use start link on the listener origin, its session is user:oidc:<iss>#<sub>, and where a template admits it the sign-in is its enrolment. Beside the device grant or alone: either way the listener serves the session store, /oauth2/revoke and its metadata, declares the bearer scheme and grants no implicit operator. Refused with a2a.tls.client_ca and on a unix:// listener. Restart-only",
+          "properties": {
+            "idp": {
+              "description": "the identity.providers entry people sign in at; its sign_in.grants must include authorization_code",
+              "type": "string"
+            },
+            "token_ttl": {
+              "description": "session-token lifetime, 5m..30d (default 8h)",
+              "type": [
+                "string",
+                "integer"
+              ]
+            }
+          },
+          "required": [
+            "idp"
+          ],
+          "type": "object"
+        },
         "peers": {
           "items": {
             "$ref": "#/$defs/A2aPeer"
@@ -3630,10 +3688,17 @@
         },
         "delegation": {
           "additionalProperties": false,
-          "description": "acting for an enrolled person through their IdP (RFC 0044; needs the xaa feature): the seal key, the token caps and who may enrol for what. Restart-only, operator-only",
+          "description": "acting for enrolled people through their IdP (RFC 0044; needs the xaa feature): the seal key, the token caps, who may enrol for what and which device names are whose. Operator-only; the templates, device pins, first binding and the consent ages reload, the rest is restart-only",
           "properties": {
             "at_cache_cap": {
               "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "consent_session_max_age": {
+              "description": "how recent a display session's IdP sign-in must be for it to answer a consent gate (default 12h). Reloadable",
               "type": [
                 "string",
                 "integer"
@@ -3645,6 +3710,30 @@
                 "string",
                 "integer"
               ]
+            },
+            "device_first_binding": {
+              "description": "let an unpinned device name bind to whoever completes its first IdP enrolment (default false: a forwarded sign-in link lands the proof on the session that started it). Needs a2a.device_grant. Reloadable: turning it off revokes the grants it bound",
+              "type": "boolean"
+            },
+            "device_pins": {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "iss": {
+                    "type": "string"
+                  },
+                  "sub": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "iss",
+                  "sub"
+                ],
+                "type": "object"
+              },
+              "description": "RFC 0043 device names (auth.device.approve as:), each pinned to the one IdP identity that may enrol it; each session using the grant proves it again. Reloadable: a changed or removed pin revokes the name's grant and drops its sessions' proofs",
+              "type": "object"
             },
             "key_custody": {
               "description": "who holds the seal key and every private_key_jwt key under identity.providers and on a delegated server: agentd, from secret references (local, the default), or the external signer (external, with signer; the keys are then named by kid, and no key or seal_key is given)",
@@ -3705,10 +3794,27 @@
               "type": "object"
             },
             "templates": {
-              "description": "who may enrol, for what; no matching template, no enrolment",
+              "description": "who may enrol, for what; no matching template, no enrolment. Reloadable: narrowing applies at the next mint; a removed template, or a server removed from one, revokes its grants",
               "items": {
                 "additionalProperties": false,
                 "properties": {
+                  "agent_mode_servers": {
+                    "description": "agent-mode servers tagged sensitive or egress that stay visible to the person's delegated work",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "approvers": {
+                    "description": "who may answer the person's consent gates: [principal] (default) or [principal, operator], an operator's answer recorded as such",
+                    "items": {
+                      "enum": [
+                        "principal",
+                        "operator"
+                      ]
+                    },
+                    "type": "array"
+                  },
                   "budget": {
                     "additionalProperties": false,
                     "properties": {
@@ -3754,7 +3860,7 @@
                         ]
                       },
                       "source": {
-                        "description": "P1 admits operator alone",
+                        "description": "operator (a per-person operator), oidc (an a2a.login session) or device (an RFC 0043 device session); x509 is refused until a certificate principal's pin is built",
                         "enum": [
                           "operator",
                           "oidc",
@@ -3769,6 +3875,27 @@
                     "additionalProperties": {
                       "additionalProperties": false,
                       "properties": {
+                        "document_workflows": {
+                          "description": "workflows from served instruction documents, by name and definition digest, that the document-sourced consent rule lets call this server unasked",
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "digest": {
+                                "description": "the definition digest workflow.list shows: 64 lowercase hex",
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name",
+                              "digest"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
                         "scopes": {
                           "description": "the scope ceiling on this server",
                           "items": {
@@ -3781,6 +3908,13 @@
                     },
                     "description": "each grant: id_jag server it allows, by name",
                     "type": "object"
+                  },
+                  "subagents": {
+                    "description": "whether a subagent, think child or workflow-as-tool run of the person's work acts with their grant: none (default), or inherit — on the delegated servers the child declares, its calls made by the supervisor, holding no token",
+                    "enum": [
+                      "none",
+                      "inherit"
+                    ]
                   },
                   "ttl": {
                     "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
@@ -5239,6 +5373,16 @@
         },
         "gid": {
           "description": "the gid every worker runs as, with uid. Restart-only",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance_gid": {
+          "description": "the gid every instance child runs as, with instance_uid. Restart-only",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance_uid": {
+          "description": "the uid every instance child (a whole daemon a template spawns) runs as instead of agentd's, with instance_gid and no supplementary group: its directory is made its own, it answers its parent only over the channel it is handed at spawn, and its own workers run as it. Needs agentd to run as root; never agentd's uid, a signer's or spawn.uid. Restart-only",
           "minimum": 1,
           "type": "integer"
         },

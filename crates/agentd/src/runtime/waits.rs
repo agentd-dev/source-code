@@ -35,8 +35,14 @@ pub(crate) enum SignalSender {
     Runtime,
     /// A principal, over A2A or through the model driving its turn. A
     /// non-operator wakes only its own runs, fires only the starts it may
-    /// run (as their owner), and never retires the instance.
-    Principal { id: String, operator: bool },
+    /// run (as their owner), and never retires the instance. `session`: the
+    /// RFC 0043 session it sent the signal through, which a run it starts
+    /// acts through (RFC 0044 §5.12).
+    Principal {
+        id: String,
+        operator: bool,
+        session: Option<String>,
+    },
 }
 
 impl SignalSender {
@@ -46,6 +52,7 @@ impl SignalSender {
             SignalSender::Principal {
                 id,
                 operator: false,
+                ..
             } => Some(id),
             _ => None,
         }
@@ -1292,6 +1299,7 @@ impl Runtime {
             Some(p) => SignalSender::Principal {
                 operator: p.is_operator(),
                 id: p.id,
+                session: None,
             },
         }
     }
@@ -1508,11 +1516,13 @@ impl Runtime {
             payload["carries"] = json!(carried);
         }
         let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+        let session = self.runs.get(run_id).and_then(|r| r.session.clone());
         // The turn it starts continues the run's trace, under the step's span.
         let trace = self.step_trace(run_id, step_id);
-        if let Err(e) = self.accept_event(
+        if let Err(e) = self.accept_event_in(
             crate::runtime::events::kinds::A2A_MESSAGE,
             principal,
+            session,
             payload,
             trace.as_ref(),
         ) {
@@ -1646,9 +1656,10 @@ impl Runtime {
         }
         // The child run continues the parent's trace, under the step's span.
         let trace = self.step_trace(run_id, step_id);
-        match self.accept_event(
+        match self.accept_event_in(
             kinds::WORKFLOW_RUN,
             self.runs.get(run_id).and_then(|r| r.principal.clone()),
+            self.runs.get(run_id).and_then(|r| r.session.clone()),
             payload,
             trace.as_ref(),
         ) {
@@ -1855,6 +1866,18 @@ impl Runtime {
         timeout: Duration,
         what: &str,
     ) -> Result<(crate::config::A2aEndpoint, crate::mcp::a2a_client::PeerAuth), String> {
+        // An instance child's parent: through the channel it was handed at
+        // spawn, which names it, presenting nothing — a link of the tree's
+        // own, so no AAuth signature either.
+        if super::instances::is_parent_link(peer_name) {
+            return Ok((
+                crate::config::A2aEndpoint::Parent,
+                crate::mcp::a2a_client::PeerAuth {
+                    tree: true,
+                    ..Default::default()
+                },
+            ));
+        }
         let configured = self
             .settings
             .a2a
@@ -1868,10 +1891,7 @@ impl Runtime {
         // Either way round, a link of the tree's own is `tree`: the parent an
         // instance child reports to, or an instance child its parent dials.
         let (peer, tree) = match configured {
-            Some(p) => {
-                let parent = super::instances::is_parent_link(&p.name);
-                (p, parent)
-            }
+            Some(p) => (p, false),
             None => match self.instance_peer_endpoint(peer_name) {
                 Some(endpoint) => (
                     crate::config::settings::A2aPeer {
@@ -2441,10 +2461,12 @@ mod signal_sender_tests {
         let user = SignalSender::Principal {
             id: "user:bob".into(),
             operator: false,
+            session: None,
         };
         let operator = SignalSender::Principal {
             id: "operator".into(),
             operator: true,
+            session: None,
         };
         assert!(!user.may_retire(), "a user's signal does not retire");
         assert!(operator.may_retire() && SignalSender::Runtime.may_retire());

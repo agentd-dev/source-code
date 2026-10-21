@@ -164,6 +164,17 @@ fn the_const_reader_reads_what_it_is_given() {
     assert_eq!(ts_const("const A2A_VERSION = '1.0';", "A2A_VERSION"), None);
 }
 
+/// The grant a display client polls an IdP sign-in's request code with is
+/// the one the daemon's token endpoint takes it under (`a2a.login`).
+#[test]
+fn the_login_grant_is_the_clients() {
+    assert_eq!(
+        ts_const(&interface_src("src/client/auth.ts"), "LOGIN_GRANT_TYPE").as_deref(),
+        Some(agentd::runtime::surface::auth::LOGIN_GRANT_TYPE),
+        "interface/src/client/auth.ts LOGIN_GRANT_TYPE must be the grant the daemon's token endpoint takes a login's request code under"
+    );
+}
+
 /// The launch grant the client redeems its launch code with is the one the
 /// daemon's token endpoint accepts, the `client_id` it presents is the one
 /// its code is issued to (a code is refused to any other, so a drifted id

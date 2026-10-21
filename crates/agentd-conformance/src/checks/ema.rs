@@ -96,7 +96,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check(
             "ema/step-up-uses-the-fresh-id-token",
-            "insufficient_user_authentication is step_up; after the person signs in again the exchange presents the fresh ID token, and the ID-JAG carries its auth_time",
+            "insufficient_user_authentication waits on a sign-in gate, which the IdP's device grant answers; the call is then made with the fresh ID token, and the ID-JAG carries its auth_time",
             step_up,
         ),
         check(
@@ -258,6 +258,76 @@ pub fn checks() -> Vec<Check> {
             "ema/forgetting-closes-the-persons-gates",
             "under the external signer the person's key is opened off the loop when their gate opens, so an approval is sealed and reads back; --delegation-forget then denies the call waiting on their open gate at once, records it under the key it destroys, and every record of theirs is unreadable",
             p2b::forgetting_closes_the_persons_gates,
+        ),
+        check(
+            "ema/a-login-is-the-enrolment",
+            "a display client signs in at a2a.login through a start link and its cookie: its session is user:oidc:<iss>#<sub>, source oidc, carrying the IdP proof, and where a template admits the person the same sign-in kept their grant, so their run's delegated call is made with their own ID-JAG",
+            p2c::a_login_is_the_enrolment,
+        ),
+        check(
+            "ema/two-people-two-grants",
+            "two people signed in through a2a.login: each run is minted for with its own person's refresh token and subject, each lists only their own grant, and one is refused the other's gate — which the other approves",
+            p2c::two_people_two_grants,
+        ),
+        check(
+            "ema/tools-are-offered-only-with-a-grant",
+            "a delegated server's tools are offered only in work for a person who holds a usable grant there, through the session it acts through: a signed-in person whose grant was revoked is handed none of them, the person who holds hers is",
+            p2c::tools_are_offered_only_with_a_grant,
+        ),
+        check(
+            "ema/a-forwarded-sign-in-fails-at-the-callback",
+            "the IdP URL a start link redirects to, forwarded to another browser, returns without the start link's cookie: the callback refuses it (403), the login grant answers access_denied, nobody is signed in; and a start link opens once",
+            p2c::a_forwarded_sign_in_fails_at_the_callback,
+        ),
+        check(
+            "ema/no-template-no-grant",
+            "a person no template admits signs in and is kept no grant — the refresh token revoked at the IdP — and their run is not_enrolled; a device session no template admits is refused its enrolment before the IdP is asked for a code",
+            p2c::no_template_no_grant,
+        ),
+        check(
+            "ema/an-unpinned-device-needs-first-binding",
+            "a device name with no pin, device_first_binding off, is refused its enrolment (principal_not_delegable) by device code and by start link alike, and the IdP is asked nothing",
+            p2c::an_unpinned_device_needs_first_binding,
+        ),
+        check(
+            "ema/a-pinned-device-binds-its-pin-alone",
+            "a pinned device name's enrolment by a device code the IdP approved for another subject is binding_mismatch and keeps nothing; signed in as the pin it is bound (bound_by pin) and its session's run is made",
+            p2c::a_pinned_device_binds_its_pin_alone,
+        ),
+        check(
+            "ema/one-device-name-one-binding",
+            "two device sessions approved under one name, first binding on: the one that signed in binds the name and its run is made; the other is not_enrolled, and its sign-in as another subject is binding_mismatch with the grant untouched",
+            p2c::one_device_name_one_binding,
+        ),
+        check(
+            "ema/a-gate-is-answered-through-a-fresh-sign-in",
+            "a person's gate is answered only through a session that signed in at the IdP as them, recently: a device session under the name that never signed in is refused, the person's own once its sign-in is older than consent_session_max_age, and the answer is taken once they sign in again; an operator the template lists among its approvers answers too",
+            p2c::a_gate_is_answered_through_a_fresh_sign_in,
+        ),
+        check(
+            "ema/an-ended-session-ends-its-delegation",
+            "auth.sessions.revoke closes the gate the session's run waits on at once, revoked and never made; and the gate of a session-bound run a restart finds closes revoked too",
+            p2c::an_ended_session_ends_its_delegation,
+        ),
+        check(
+            "ema/a-gate-survives-a-restart",
+            "a consent gate the per-person operator's run waits on is asked again after a restart, with the same id, and their approval then makes the call",
+            p2c::a_gate_survives_a_restart,
+        ),
+        check(
+            "ema/the-login-listener-rules",
+            "a2a.login beside a2a.tls.client_ca and a workflow whose act_for names a device principal are refused at load; a login-only loopback listener declares bearer, refuses a caller who presents nothing, and serves its login endpoint and /oauth2/revoke with no device grant",
+            p2c::the_login_listener_rules,
+        ),
+        check(
+            "ema/a-reload-narrows-then-revokes",
+            "a reload narrowing the person's template refuses their write at the next call (scope_beyond_ceiling) while their read is made; a reload removing it revokes the grant at once — at the IdP, tombstoned — and their next call is revoked",
+            p2c::a_reload_narrows_then_revokes,
+        ),
+        check(
+            "ema/a-subagent-inherits-what-it-declares",
+            "with subagents: inherit, a run a subagent starts is made with the person's grant at the server the subagent declared, refused (delegation_not_permitted) at one it did not, and no frame to a child carries a token",
+            p2c::a_subagent_inherits_what_it_declares,
         ),
     ]
 }
@@ -1366,17 +1436,15 @@ fn step_up(h: &Harness) -> Outcome {
     std::thread::sleep(Duration::from_secs(3));
     drop(_d);
     let _d = s.daemon(h);
-    let run = tryo!(s.run("who"));
-    let o = failed_with(&run, "step_up");
-    if !o.passed {
-        return o;
-    }
     let signed_in = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    tryo!(s.login(h));
+    // The call waits on a sign-in gate; the IdP's device grant, which the
+    // mock approves at once, answers it, and the call is made again.
     let again = tryo!(s.run("who"));
+    let step_up = s.events("delegation.step_up");
+    let decided = |d: &str| step_up.iter().any(|e| e["decision"] == d);
     let ex = s.xaa.grants("idp", EXCHANGE);
     let last = ex.last().cloned().unwrap_or(Value::Null);
     let auth_time = claims(last["body"]["subject_token"].as_str().unwrap_or_default())["auth_time"]
@@ -1384,6 +1452,12 @@ fn step_up(h: &Harness) -> Outcome {
         .unwrap_or(0);
     let minted = s.events("delegation.minted");
     completed(&again)
+        .and(|| {
+            Outcome::require(
+                decided("asked") && decided("signed_in"),
+                format!("the call waits on a sign-in gate the person answers: {step_up:?}"),
+            )
+        })
         .and(|| {
             Outcome::require(
                 last["body"]["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
@@ -2775,3 +2849,4 @@ fn restored_vault_refused(h: &Harness) -> Outcome {
 }
 
 mod p2b;
+mod p2c;

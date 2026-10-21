@@ -246,6 +246,8 @@ pub struct TurnJob {
     /// The Companies whose content the message's sender held: the
     /// conversation carries them from the message on (RFC 0047 §6.2).
     pub carries: crate::engine::run::Carries,
+    /// The RFC 0043 session the message came through, when it did.
+    pub session: Option<String>,
 }
 
 impl TurnJob {
@@ -272,7 +274,13 @@ impl TurnJob {
             route: None,
             trace: None,
             carries: Default::default(),
+            session: None,
         }
+    }
+    /// The same job, acting through the session its message came through.
+    pub fn through(mut self, session: Option<String>) -> TurnJob {
+        self.session = session;
+        self
     }
     /// The same job, carrying a delivered message's hop depth.
     pub fn at_depth(mut self, depth: u32) -> TurnJob {
@@ -321,6 +329,15 @@ pub struct SubagentRecord {
     /// operator-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// The RFC 0043 session the work that spawned it acts through, when a
+    /// signed-in person's does (RFC 0044 §5.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The delegated servers it declares (its `servers` that are
+    /// `grant: id_jag`): under a template's `subagents: inherit` it acts
+    /// with its person's grant on these, and only these (RFC 0044 §5.12 F).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegated_servers: Vec<String>,
     /// Where the outside text this child carries entered: what the one that
     /// spawned it carried, and what every run or child that steered it with
     /// `subagent.send` did (`runtime::withhold`). On the record, so a
@@ -610,6 +627,12 @@ pub struct Runtime {
     /// children live in, made at the first of them and removed with the
     /// runtime (`runtime::instances`).
     pub(crate) private_instances: Option<super::instances::PrivateDir>,
+    /// Where the listener serves the connections instance children open
+    /// through the channels they are handed at spawn (`a2a::channel`), once
+    /// it is up: a child respawned before it has its connections held. A
+    /// build without a listener hands its children no channel.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    pub(crate) instance_doors: std::sync::Arc<super::instances::DoorSlot>,
     /// What the drain stopped and left for the next life.
     pub(crate) drain_left: super::drain::Left,
     pub(crate) idle_since: Option<Instant>,
@@ -1048,6 +1071,17 @@ impl Runtime {
             Event::Delegation(n) => self.on_delegation_note(*n),
             #[cfg(all(feature = "xaa", feature = "a2a"))]
             Event::DelegationSaid { task, said } => self.delegation_said(&task, said),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::ConsentSignedIn { gate, result } => self.consent_signed_in(&gate, result),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::StepUpAsked(a) => {
+                let a = *a;
+                self.open_step_up(a.caller, a.name, a.server, a.args, a.error)
+            }
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::StepUpDevice { gate, device } => self.step_up_device(&gate, *device),
+            #[cfg(all(feature = "xaa", feature = "a2a"))]
+            Event::StepUpPolled { gate, polled } => self.step_up_polled(&gate, polled),
             #[cfg(feature = "companies")]
             Event::CompanySignIn { id, step } => self.on_company_sign_in(&id, step),
             #[cfg(feature = "companies")]
@@ -1092,6 +1126,22 @@ impl Runtime {
             .map_err(|e| format!("inbox: {e}"))
     }
 
+    /// [`accept_event`](Self::accept_event) for work that acts through RFC
+    /// 0043 session `session`: what it starts — a run, a signal, a message —
+    /// acts through the same session, and ends with it.
+    pub(crate) fn accept_event_in(
+        &mut self,
+        kind: &str,
+        principal: Option<String>,
+        session: Option<String>,
+        payload: Value,
+        parent: Option<&TraceContext>,
+    ) -> Result<String, String> {
+        self.accept_event_through(kind, principal, session, payload, parent)
+            .map(|(id, _)| id)
+            .map_err(|e| format!("inbox: {e}"))
+    }
+
     /// [`accept_event`](Self::accept_event), with the store's refusal kept
     /// whole: a start firing has to tell a value that can never fit from a
     /// store that may come back.
@@ -1109,7 +1159,24 @@ impl Runtime {
         payload: Value,
         parent: Option<&TraceContext>,
     ) -> Result<(String, TraceContext), crate::store::StoreError> {
+        self.accept_event_through(kind, principal, None, payload, parent)
+    }
+
+    /// [`accept_event_store`](Self::accept_event_store) for work a
+    /// signed-in person started through RFC 0043 session `session` (RFC
+    /// 0044 §5.12): beside the payload, never in it, so only the transport
+    /// that authenticated the session can say which it is — and whatever
+    /// the event becomes, a run or a turn, acts through it.
+    pub(crate) fn accept_event_through(
+        &mut self,
+        kind: &str,
+        principal: Option<String>,
+        session: Option<String>,
+        payload: Value,
+        parent: Option<&TraceContext>,
+    ) -> Result<(String, TraceContext), crate::store::StoreError> {
         let mut ev = InboxEvent::new(kind, principal, payload);
+        ev.session = session;
         let trace = parent.map_or_else(TraceContext::mint, TraceContext::child);
         ev.trace = Some(trace.clone());
         self.durable.inbox_put(&ev)?;
@@ -1538,6 +1605,7 @@ impl Runtime {
             .at_depth(depth)
             .owner_checked(owner_checked)
             .carrying(carried)
+            .through(ev.session.clone())
             .in_trace(ev.trace.clone()),
         );
         "turn"
@@ -1678,6 +1746,7 @@ impl Runtime {
                 carried,
                 ev.trace.as_ref(),
                 ev.principal.as_deref(),
+                ev.session.as_deref(),
             );
             return true;
         }

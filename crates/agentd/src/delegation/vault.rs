@@ -83,6 +83,10 @@ pub struct Grant {
     /// Mints so far, per resource, in the day and the month they were made.
     #[serde(default)]
     pub quota: BTreeMap<String, Quota>,
+    /// What bound a device name to this grant's `iss` + `sub` (RFC 0044
+    /// §5.4): `pin`, or `first_binding`; none for any other principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_by: Option<String>,
 }
 
 /// Mints counted against a resource.
@@ -878,6 +882,7 @@ mod tests {
             epoch: 1,
             rt_version: 1,
             quota: Default::default(),
+            bound_by: None,
         }
     }
 

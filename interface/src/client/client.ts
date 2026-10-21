@@ -16,6 +16,7 @@
 
 import {
   ClientError,
+  ConsentGate,
   Endpoint,
   FeedEvent,
   FeedGoodbye,
@@ -30,6 +31,7 @@ import { CallOptions, rpcStream } from './wire.js';
 import { A2aClient, commandMessage, ListQuery, userMessage } from './a2a.js';
 import type { Capabilities } from './discovery.js';
 import { COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, OPS, TASK_ANNOTATIONS_EXTENSION } from './ext.js';
+import { requireSecureUrl } from './auth.js';
 
 type Obj = { [k: string]: Json };
 
@@ -92,7 +94,44 @@ function annotationsOf(a: Obj): Partial<TaskView> {
   const askChannel = str(a.askChannel);
   if (askChannel !== undefined) out.askChannel = askChannel;
   if (a.securityGate === true) out.securityGate = true;
+  const gate = obj(a.consentGate);
+  const gateId = str(gate?.gate);
+  const gateKind = str(gate?.kind);
+  if (gateId !== undefined && (gateKind === 'action' || gateKind === 'authorize' || gateKind === 'device')) {
+    const g: ConsentGate = { gate: gateId, kind: gateKind };
+    const server = str(gate?.server);
+    if (server !== undefined) g.server = server;
+    const start = str(gate?.start_uri);
+    if (start !== undefined && secureLink(start)) g.startUri = start;
+    const verify = str(gate?.verification_uri);
+    if (verify !== undefined && secureLink(verify)) g.verificationUri = verify;
+    const code = str(gate?.user_code);
+    if (code !== undefined) g.userCode = code;
+    if (typeof gate?.expires_at === 'number') g.expiresAt = gate.expires_at;
+    out.consentGate = g;
+  }
+  // A link the person is told to open: only one on an https origin, or http
+  // on loopback, is kept — a `javascript:` URI would run in the UI's origin.
+  const sign = obj(a.signIn);
+  const startUri = str(sign?.start_uri);
+  if (startUri !== undefined && secureLink(startUri)) {
+    const s: NonNullable<TaskView['signIn']> = { startUri };
+    const idp = str(sign?.idp);
+    if (idp !== undefined) s.idp = idp;
+    const at = sign?.expires_at;
+    if (typeof at === 'number') s.expiresAt = at;
+    out.signIn = s;
+  }
   return out;
+}
+
+function secureLink(uri: string): boolean {
+  try {
+    requireSecureUrl(uri);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** How {@link normalizeTask} reads a task. */

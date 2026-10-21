@@ -1527,6 +1527,7 @@ impl Runtime {
             ctx: r.and_then(|r| r.conversation.clone()),
             run: Some(run.clone()),
             step: Some(step.clone()),
+            session: r.and_then(|r| r.session.clone()),
             ..Default::default()
         };
         self.log.in_trace(rec.trace.as_ref()).info(

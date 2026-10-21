@@ -343,9 +343,11 @@ provider and key file, a store, and an A2A listener on a unix socket in the
 child's own directory. Model credentials reach the child through the
 environment, never the file, and the child loads the AAuth key without ever
 creating one and fetches its own agent token for it when it starts. The
-child is wired back to the parent as a peer named `parent`, and the parent
-can address the child by its handle (`inst-<n>`) at once; neither link is
-AAuth-signed, so neither waits on the Agent Provider.
+parent can address the child by its handle (`inst-<n>`) at once, over the
+child's socket. The child reaches the parent only through the channel the
+parent hands it at spawn ([below](#how-an-instance-child-reaches-its-parent)),
+and is composed no peer, bearer or other credential of the parent's. Neither
+link is AAuth-signed, so neither waits on the Agent Provider.
 
 The child is a daemon, so its prose is its policy: it runs nothing when it
 spawns, and work at spawn is a `:::!workflow` with a `once` start or a first
@@ -367,8 +369,8 @@ Four mechanisms ride that wiring:
 - **A result.** With `mode: sync` and `result: {workflow: <name>}`, the spawn
   parks until the named workflow first completes in the child, then resolves
   with that run's output. agentd composes a small reporter workflow, built
-  from ordinary nodes, that sends the operator-only `_instance.result`
-  command home. The child keeps running afterwards.
+  from ordinary nodes, that sends the reserved `_instance.result` command
+  home. The child keeps running afterwards.
 - **Mirrored streams.** `mirror_streams` forwards every event of a child's
   stream into the parent's stream of the same name, with source
   `instance:<handle>`, so the parent's consumers see a fleet's events without
@@ -410,6 +412,44 @@ later process uses it. Two parents never share a child's directory, socket
 or store, and a new parent's `inst-1` never starts on an earlier parent's
 state. [Run a child daemon](delegate-subagents.md#run-a-child-daemon) lists
 the paths.
+
+### How an instance child reaches its parent
+
+At spawn the parent makes a socket pair and hands the child one end at fd 3
+(`AGENTD_INSTANCE_CHANNEL`). The child's peer `parent` — what its reporter
+workflow and an `a2a.send` to `parent` dial — is that channel: each
+connection the child opens is a fresh stream passed over it, and the parent
+names the caller `instance:<handle>` by the channel it came through, before
+reading anything the request presents.
+
+That principal may send the parent its two reports, `_instance.result` and
+`_instance.emit`, about its own handle, and nothing else. It is no
+operator: an `admin.set`, a `status` read, a stream, a message that is no
+report, or a report for another child's handle is refused, and the last is
+logged `instance.op.refused`. The child's log says `instance.channel` with
+`held: true` when it took its channel at start.
+
+**A uid of its own.** With `spawn.instance_uid` and `spawn.instance_gid`
+set, and agentd running as root, each instance child starts under that uid
+and gid, with no capability, inside the Landlock domain as before; its own
+workers run under the same uid. The parent makes the child's directory the
+child's first: a durable child's directory under the store's root (whose
+ancestors must be passable by the uid, or the spawn is refused), a
+non-durable one's a private directory under the system temporary directory.
+The uid may not be 0, agentd's own, an external signer's or `spawn.uid`,
+and the load refuses one agentd cannot start a child as. Without it, a
+child keeps agentd's uid: it still answers its parent only as itself over
+its channel, but a unix A2A listener of the parent's that it found and
+dialed would name it the operator, since the kernel cannot tell the two
+apart. [Security model](security.md#a-container-deployment-with-a-worker-uid)
+says what a container needs.
+
+**Delegation.** A child acts for no person: a delegated server is never
+composed into it, and a person's work reaches a delegated server only from
+the supervisor. A flat subagent's calls — and a run one starts — act with
+the person's grant only where the person's template says `subagents:
+inherit`, at the servers the subagent declared
+([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization)).
 
 The template's machinery faces the same boundary as any served document: a
 fragment that writes operator-only configuration is refused, and so are a

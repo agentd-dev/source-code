@@ -129,6 +129,16 @@ fn every_shipped_example_config_validates() {
         {
             continue;
         }
+        // An example that acts for people through their IdP reads its keys
+        // from files a deployment mounts, and a build without `xaa` refuses
+        // it by name: its own test below validates it, the files in place.
+        if agentd::config::yaml::parse(&text)
+            .ok()
+            .and_then(|d| d.pointer("/security/experimental/id_jag").cloned())
+            == Some(serde_json::Value::Bool(true))
+        {
+            continue;
+        }
         let catalog = f.with_file_name("services.yaml");
         let layered = catalog.exists() && catalog != *f;
         if !layered && f.file_name().is_some_and(|n| n == "services.yaml") {
@@ -170,6 +180,39 @@ fn every_shipped_example_config_validates() {
         failures.is_empty(),
         "shipped example configs no longer load:\n\n{}",
         failures.join("\n\n")
+    );
+}
+
+/// The delegation example (RFC 0044) loads on a build that acts for people,
+/// with the key files it names mounted where it says.
+#[test]
+#[cfg(all(feature = "xaa", feature = "a2a"))]
+fn the_delegation_example_validates_with_its_keys_mounted() {
+    let text = std::fs::read_to_string(examples_root().join("okta-xaa-mcp.yaml")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let text = text.replace("/run/agentd/", &format!("{}/", dir.path().display()));
+    for f in [
+        "operator-token",
+        "okta-agent-key.pem",
+        "delegation-seal",
+        "linear-ras-key.pem",
+    ] {
+        assert!(text.contains(f), "the example names {f}");
+        std::fs::write(dir.path().join(f), "placeholder").unwrap();
+    }
+    let cfg = dir.path().join("okta-xaa-mcp.yaml");
+    std::fs::write(&cfg, text).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .arg("--validate-config")
+        .arg("-c")
+        .arg(&cfg)
+        .env("OPENAI_API_KEY", "test-value")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/okta-xaa-mcp.yaml:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

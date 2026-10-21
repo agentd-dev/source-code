@@ -1257,7 +1257,7 @@ live · op.
 | `a2a.principals[].match.bearer_ref` | secret | — | Matches a presented bearer. May not equal `a2a.bearer`, another rule's secret, or start with `agentd_at_`. |
 | `a2a.principals[].match.any` | bool | `false` | Names every caller left; cannot grant `operator`. |
 | `a2a.principals[].match.uid` | int | — | The unix listener's peer, by the uid the kernel names (`SO_PEERCRED`): the per-person operator `operator:<id>`. Alone in its `match`, with `role: operator` and an `id`, on a `unix://` listener. Needs `xaa`. |
-| `a2a.principals[].idp_subject` | `{iss, sub}` | — | The one IdP identity this principal is, exact: required to delegate. On a `match.uid` rule; `iss` is an `identity.providers` issuer. At most one rule carries it. Needs `xaa`. |
+| `a2a.principals[].idp_subject` | `{iss, sub}` | — | The one IdP identity this principal is, exact: required to delegate. On a `match.uid` rule; `iss` is an `identity.providers` issuer. Several rules may each carry one, one per person. Needs `xaa`. |
 | `a2a.principals[].role` | `operator \| user \| agent \| anonymous` | required | The caller's role. |
 | `a2a.principals[].id` | string | derived | The principal id (`<role>:<id>`), unique across rules; `1..128` of `A-Z a-z 0-9 . _ @ : / + -`. Required on `bearer_ref` and `any` rules; a certificate rule without one is `<role>:cn=<CN>` or `<role>:san=<first SAN>`. |
 | `a2a.principals[].grants` | list of op globs | — | The operations the principal may call. |
@@ -1284,6 +1284,8 @@ ever approved through the device grant.
 | `a2a.device_grant.code_ttl` | duration, 1m–30m | `10m` | restart · op | How long a code waits for approval. |
 | `a2a.device_grant.verification_uri` | URL | the listener's own page | restart · op | Where the approving person is sent. |
 | `a2a.device_grant.rate` | rate | unlimited | restart · op | Per session principal. |
+| `a2a.login.idp` | `identity.providers` entry | — | restart · op | Display clients sign people in at this IdP, each session the person it names, `user:oidc:<iss>#<sub>`; where a template admits them, the sign-in is their enrolment. The provider's `sign_in.grants` must include `authorization_code`. A TCP listener only, never beside `a2a.tls.client_ca`. Needs `xaa` and `a2a` ([The A2A channel](a2a.md#a-sign-in-at-the-identity-provider)). |
+| `a2a.login.token_ttl` | duration, 5m–30d | `8h` | restart · op | Session lifetime. |
 
 It needs an operator credential (`a2a.bearer`, or an operator rule with
 `bearer_ref`) and is refused beside `a2a.tls.client_ca` and on a `unix://`
@@ -1374,7 +1376,8 @@ secret references and routed `aws` credentials read, and this list
 | Path | Type | Default | Class | What it does |
 |---|---|---|---|---|
 | `spawn.env_passthrough` | list of names and `PREFIX*` patterns | `[]` | live · op | Variables every child also gets, when agentd has them. `*` alone, and a name a supervisor-only secret is read from, are refused. |
-| `spawn.uid`, `spawn.gid` | ints ≥ 1 | — (agentd's own) | restart · op | The uid and gid every worker runs as — turn workers, subagents, think children, an instance child's own workers, `exec` commands — with no supplementary group, inside its Landlock domain as before. Both or neither. Every capability is dropped with the uid, and `no_new_privs` set, so a worker can never set its uid back. Needs root, or `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` (with an instance-tier template, root); refused at load where agentd cannot drop to them, and for agentd's own uid, root's, or an external signer's ([Security model](security.md#a-container-deployment-with-a-worker-uid)). |
+| `spawn.uid`, `spawn.gid` | ints ≥ 1 | — (agentd's own) | restart · op | The uid and gid every worker runs as — turn workers, subagents, think children, an instance child's own workers, `exec` commands — with no supplementary group, inside its Landlock domain as before. Both or neither. Every capability is dropped with the uid, and `no_new_privs` set, so a worker can never set its uid back. Needs root, or `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` (with an instance-tier template, root); refused at load where agentd cannot drop to them, and for agentd's own uid, root's, or an external signer's ([Security model](security.md#a-container-deployment-with-a-worker-uid)). With `spawn.instance_uid`, an instance child's own workers run under that uid instead. |
+| `spawn.instance_uid`, `spawn.instance_gid` | ints ≥ 1 | — (agentd's own) | restart · op | The uid and gid every instance-tier child daemon runs as, with no capability, inside its Landlock domain; its directory is made its own first, and its own workers run under it too. Both or neither. Needs agentd to run as root; refused for root's, agentd's own, an external signer's uid or `spawn.uid` ([Subagents](subagents.md#how-an-instance-child-reaches-its-parent)). |
 
 ## goal
 
@@ -1446,8 +1449,11 @@ Who autonomous work is done for. All paths are live · op.
 | `identity.delegation.signer` | `{socket, uid, timeout, seal_key, seal_key_previous}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (the socket's peer must be it; agentd's own uid is a load warning, since the peer check cannot then tell the signer from agentd's workers), the bound on a whole request, the connect included (`5s`, at most `60s`), and the ids of its key-encryption key and of the one before a rotation, which only unwraps ([The external signer protocol](external-signer.md)). Restart. |
 | `identity.delegation.at_cache_cap` | duration | `60m` | The longest an access token is used, whatever `expires_in` says. Restart. |
 | `identity.delegation.liveness_interval` | duration | `15m` | An access token is used only within this of the grant's last proof that its refresh token is alive. Restart. |
-| `identity.delegation.consent_timeout` | duration | `24h` | How long a consent gate waits before it denies. Restart. |
-| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source: operator, role?, labels?}, idp, servers: {<name>: {scopes}}, ttl, budget: {per_day, per_month, per_run}}`. No template matching, no enrolment. Restart. |
+| `identity.delegation.consent_timeout` | duration | `24h` | How long a consent gate waits before it denies. Reload. |
+| `identity.delegation.consent_session_max_age` | duration | `12h` | A display session answers a consent gate only while its own IdP sign-in is younger than this. Reload. |
+| `identity.delegation.templates[]` | list | `[]` | Who may enrol, for what: `{name, principals: {source, role?, labels?}, idp, servers: {<name>: {scopes, document_workflows?}}, ttl, budget: {per_day, per_month, per_run}, subagents, approvers, agent_mode_servers}`. `source` is `operator` (a per-person operator), `oidc` (an `a2a.login` session) or `device` (a device session a pin or the first binding makes eligible); `subagents` is `none` (default) or `inherit` (a subagent acts with the grant at the delegated servers it declared); `approvers` is `[principal]` (default) or `[principal, operator]`. `agent_mode_servers` and `document_workflows` load and change nothing yet (RFC 0044 P2's second part). No template matching, no enrolment. Reload: a narrowed one holds its grants at the next call; one removed, or a server removed from one, revokes what it allowed. |
+| `identity.delegation.device_pins.<name>` | `{iss, sub}` | — | The one IdP identity a device name delegates as. Needs `a2a.device_grant`. Reload: a changed or removed pin revokes what it bound. |
+| `identity.delegation.device_first_binding` | bool | `false` | An unpinned device name binds to the identity of its first enrolment (a load warning: a forwarded sign-in link binds it to whoever completes it). Reload: turned off, it revokes what it bound. |
 
 The acting principal and its labels reach the run record (`run.start` carries
 `acting_for`), each MCP call's `_meta` (`agent/acting_for`, `agent/labels`) and
@@ -1618,13 +1624,18 @@ refuses the reload with `config.reload.restart_required`:
 - `lifecycle.run_until`, `lifecycle.drain_timeout`, `lifecycle.run_id`,
   `lifecycle.exit_code_map`, `lifecycle.watch_config`
 - `a2a.listen`, `a2a.tls`, `a2a.bearer`, `a2a.url`, `a2a.device_grant`,
-  `a2a.events`
+  `a2a.login`, `a2a.events`
+- `spawn.uid`, `spawn.gid`, `spawn.instance_uid`, `spawn.instance_gid`
 - `webhooks.listen`, `webhooks.tls`, `webhooks.url`
 - `observability.otel`, `observability.metrics_addr`,
   `observability.health_file`, `observability.events_ring`,
   `observability.traceparent`, `observability.audit.chain`
 - `security` (every path)
-- `identity.providers`, `identity.delegation`
+- `identity.providers`, and of `identity.delegation` its keys and caps:
+  `seal_key`, `seal_key_previous`, `key_custody`, `signer`, `at_cache_cap`,
+  `liveness_interval`
+- a per-person operator's `a2a.principals` rule, added, removed or changed,
+  while a delegation is configured
 - a `services` entry of `kind: company`, added, removed or changed
 - an `mcp.servers` entry of `grant: id_jag`, added, removed or changed
 
@@ -1640,6 +1651,7 @@ Every other path is applied live, as follows:
 | `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt; the skills sources are listed again and both skills folders read again. A context keeps the skill bodies it loaded of the skills the new catalogue holds; a server's skill whose source was removed, or no longer admits it, is unloaded (`skills.unloaded`). |
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
+| `identity.delegation` templates, pins, first binding, consent timing | Taken at once: a narrowed template holds every grant it allowed to the new ceilings at the next call; a removed template, a server removed from one, a changed or removed pin and first binding turned off revoke the grants they allowed — at the IdP, tombstoned, off the loop — and drop the IdP proofs of those device names' sessions (`delegation.bindings.cleared`). |
 | `a2a.cors.origins` | Replaced in the live listener; removing an origin revokes it. |
 | `webhooks.default_auth` and the `webhook` routes | The route table is rebuilt on every reload, so a rotated `{{secret-file:…}}` is picked up; each route's in-flight count and rate bucket carry over. |
 | `store.retention` | The next sweep applies the new bound. |

@@ -1,31 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Enrolment (RFC 0044 §5.4, F1): the per-person operator signs in at their
-//! IdP, and the supervisor — never the CLI, so the refresh token exists in
-//! no other process — verifies the ID token, binds its `iss` and `sub` to the
-//! operator's exact `idp_subject` pin, and seals the refresh token.
+//! Enrolment (RFC 0044 §5.4, F1): a person signs in at their IdP, and the
+//! supervisor — never a client, so the refresh token exists in no other
+//! process — verifies the ID token, binds its `iss` and `sub` as the
+//! principal's kind says ([`Delegation::bind`]), and seals the refresh token.
 //!
-//! 1. **A template must admit the person at the IdP** before anything is
-//!    sent: no template, `delegation_not_permitted`.
+//! 1. **A template must admit the person at the IdP**, and a device name
+//!    must be pinned, bound already or first-bindable, before anything is
+//!    sent ([`Delegation::eligible`]): `delegation_not_permitted`,
+//!    `principal_not_delegable`.
 //! 2. **The sign-in**, by the first of the provider's `sign_in.grants` the
 //!    IdP's metadata supports:
 //!    - `device` — the IdP's device grant: agentd shows `verification_uri`
-//!      and `user_code`, never `verification_uri_complete`. Allowed because
-//!      the person is pinned, so a code forwarded to someone else fails the
+//!      and `user_code`, never `verification_uri_complete`. Allowed only
+//!      for a principal whose `iss` + `sub` is checked afterwards — a
+//!      per-person operator's pin, an `a2a.login` principal's own subject,
+//!      a device name's pin — so a code approved by someone else fails the
 //!      binding below.
 //!    - `authorization_code` — PKCE (S256, refused without it), `state`,
-//!      `nonce`, and RFC 9207's `iss` decided on the callback. The
-//!      supervisor holds a loopback callback for the sign-in's life, and the
-//!      client is given a one-time start link on it, valid 60 seconds:
-//!      opening it sets a `__Host-` cookie bound to the `state` and
-//!      redirects to the IdP, and the callback is taken only with that
-//!      cookie. The IdP's authorization URL is never handed to a client, so
-//!      one forwarded to someone else fails at the callback. A sign-in that
-//!      answers a step-up asks for `max_age` and `prompt=login`.
+//!      `nonce`, and RFC 9207's `iss` decided on the callback, behind a
+//!      one-time start link valid 60 seconds whose `__Host-` cookie the
+//!      callback is taken only with: the IdP's authorization URL is never
+//!      handed to a client, so one forwarded to someone else fails at the
+//!      callback. A display session's sign-in returns to the listener
+//!      origin ([`crate::a2a::login`]); the per-person operator's, over a
+//!      unix socket that has no origin, to a loopback callback the
+//!      supervisor holds for the sign-in's life. A sign-in that answers a
+//!      step-up asks for `max_age` and `prompt=login`.
 //! 3. **The ID token** is verified with the IdP's keys: `iss` the configured
 //!    issuer, `aud` agentd's client, `exp` and `iat`, and the `nonce` the
 //!    code flow sent.
-//! 4. **The binding**: its `iss` + `sub` must equal the pin, or nothing is
-//!    kept (`binding_mismatch`). Globs and email binds do not exist.
+//! 4. **The binding**: its `iss` + `sub` must be the pin, the principal's
+//!    own subject, or the name's binding, or nothing is kept
+//!    (`binding_mismatch`); a session that signed in is given the proof.
+//!    Globs and email binds do not exist.
 //! 5. **The grant** is stored, sealed, and `delegation.enrolled` names the
 //!    approving `sub`. Then each server the template allows whose tool
 //!    catalogue is empty is listed with a delegated token — one mint each,
@@ -41,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::{Code, Delegation, DelegationError, refuse};
+use super::{Code, Delegation, DelegationError, Who, WhoKind, refuse};
 use crate::auth::browser::{check_iss, pct, pct_decode};
 use crate::auth::idjag::{self, IdpMeta};
 use crate::auth::oauth2::{self, OAuth2Params, PollOutcome, Tokens};
@@ -67,40 +74,53 @@ pub enum Said {
 /// Where a sign-in says it.
 pub type Say = Arc<dyn Fn(Said) + Send + Sync>;
 
-/// Start the person's sign-in at `idp`, by `grant` or the provider's first
-/// that the IdP supports, on a thread of its own.
+/// Start `who`'s sign-in at `idp`, by `grant` or the provider's first that
+/// the IdP supports, on a thread of its own: what a per-person operator's
+/// `agentd --login idp:<name>` and a display session's IdP device grant
+/// run. A display session's authorization code returns to the listener
+/// origin instead ([`crate::a2a::login`]).
 pub fn start(
     d: Arc<Delegation>,
+    who: Who,
     idp: &str,
     grant: Option<SignInGrant>,
     say: Say,
 ) -> Result<(), String> {
-    let person = d
-        .person
-        .clone()
-        .ok_or("no a2a.principals rule with match.uid and idp_subject declares the per-person operator (principal_not_delegable)")?;
-    if !d.providers.contains_key(idp) {
-        return Err(format!("{idp:?} is not an identity.providers entry"));
-    }
-    if d.template_for(idp).is_none() {
-        return Err(format!(
-            "no identity.delegation.templates entry admits {} at {idp} (delegation_not_permitted)",
-            person.id
-        ));
+    d.eligible(&who, idp).map_err(|e| e.to_string())?;
+    if grant == Some(SignInGrant::Device) {
+        device_allowed(&d, &who).map_err(|e| e.to_string())?;
     }
     let idp = idp.to_string();
     std::thread::Builder::new()
         .name(format!("delegation-enrol:{idp}"))
         .spawn(move || {
-            let end = run(&d, &idp, grant, &say);
+            let end = run(&d, &who, &idp, grant, &say);
             say(Said::Done(end.map_err(|e| e.to_string())));
         })
         .map(|_| ())
         .map_err(|e| format!("no thread for the sign-in: {e}"))
 }
 
+/// Whether `who` may sign in by the IdP's device grant (RFC 0044 §5.4): only
+/// when the `iss` + `sub` the IdP answers with is checked against something
+/// no one else's approval can satisfy — a pin, or the principal's own IdP
+/// subject. An unpinned device name binds by the authorization code alone.
+fn device_allowed(d: &Delegation, who: &Who) -> Result<(), DelegationError> {
+    match &who.kind {
+        WhoKind::Device { name, .. } if d.pin_of(name).is_none() => Err(refuse(
+            Code::PrincipalNotDelegable,
+            format!(
+                "{} is unpinned: it signs in by the authorization code through a start link, never the IdP's device grant, whose code anyone could approve",
+                who.id
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn run(
     d: &Arc<Delegation>,
+    who: &Who,
     name: &str,
     grant: Option<SignInGrant>,
     say: &Say,
@@ -125,6 +145,7 @@ fn run(
     };
     let chosen = order
         .into_iter()
+        .filter(|g| *g != SignInGrant::Device || device_allowed(d, who).is_ok())
         .find(|g| match g {
             SignInGrant::Device => meta.device_authorization_endpoint.is_some(),
             SignInGrant::AuthorizationCode => meta.authorization_endpoint.is_some(),
@@ -135,11 +156,7 @@ fn run(
                 format!("{name}'s metadata offers none of the sign-in grants identity.providers.{name}.sign_in names"),
             )
         })?;
-    let step_up = d
-        .person
-        .as_ref()
-        .map(|p| p.typed.grant_id(&idp.cfg.issuer))
-        .and_then(|g| d.with_live(&g, |l| l.step_up));
+    let step_up = d.with_live(&who.typed.grant_id(&idp.cfg.issuer), |l| l.step_up);
     let (tokens, nonce) = match chosen {
         SignInGrant::Device => (device(&params, say, d.timeout)?, None),
         SignInGrant::AuthorizationCode => {
@@ -147,6 +164,56 @@ fn run(
             (t, Some(n))
         }
     };
+    finish(
+        d,
+        who,
+        name,
+        tokens,
+        nonce.as_deref(),
+        Some(chosen.as_str()),
+    )
+    .map(|(text, _)| text)
+}
+
+/// What a verified sign-in at `name` for `who` keeps (steps 3–5): the ID
+/// token verified, the binding made, the grant stored, the proof given to
+/// the session that signed in, the empty catalogues listed. The text that
+/// says so, and the proof.
+pub(crate) fn finish(
+    d: &Delegation,
+    who: &Who,
+    name: &str,
+    tokens: Tokens,
+    nonce: Option<&str>,
+    how: Option<&str>,
+) -> Result<(String, crate::a2a::principals::typed::IdpProof), DelegationError> {
+    let signed = verify(d, name, &tokens, nonce)?;
+    keep(d, who, name, signed, how)
+}
+
+/// A sign-in's tokens, its ID token verified (step 3).
+pub(crate) struct SignedIn {
+    pub claims: idjag::IdClaims,
+    pub id_token: String,
+    pub refresh_token: Option<String>,
+}
+
+/// Step 3: the ID token of a sign-in at `name`, verified with the IdP's
+/// keys — `iss` the configured issuer, `aud` agentd's client, `exp` and
+/// `iat`, and `nonce` when the sign-in sent one.
+pub(crate) fn verify(
+    d: &Delegation,
+    name: &str,
+    tokens: &Tokens,
+    nonce: Option<&str>,
+) -> Result<SignedIn, DelegationError> {
+    let idp = d
+        .providers
+        .get(name)
+        .ok_or_else(|| refuse(Code::Config, format!("no IdP {name}")))?;
+    let meta = idp
+        .meta(d.timeout)
+        .map_err(|e| refuse(Code::IdpUnavailable, format!("{name}: {e}")))?;
     let id_token = tokens.id_token.clone().ok_or_else(|| {
         refuse(
             Code::Config,
@@ -166,34 +233,85 @@ fn run(
         &jwks,
         &idp.cfg.issuer,
         &idp.cfg.client_id,
-        nonce.as_deref(),
+        nonce,
         now_ms() / 1000,
     )
     .map_err(|e| refuse(Code::Config, format!("{name}: {e}")))?;
-    let rt = tokens.refresh_token.clone().ok_or_else(|| {
+    Ok(SignedIn {
+        claims,
+        id_token,
+        refresh_token: tokens.refresh_token.clone(),
+    })
+}
+
+/// Steps 4–5 for a verified sign-in.
+pub(crate) fn keep(
+    d: &Delegation,
+    who: &Who,
+    name: &str,
+    signed: SignedIn,
+    how: Option<&str>,
+) -> Result<(String, crate::a2a::principals::typed::IdpProof), DelegationError> {
+    let idp = d
+        .providers
+        .get(name)
+        .ok_or_else(|| refuse(Code::Config, format!("no IdP {name}")))?;
+    let step_up = d.with_live(&who.typed.grant_id(&idp.cfg.issuer), |l| l.step_up);
+    let SignedIn {
+        claims,
+        id_token,
+        refresh_token,
+    } = signed;
+    let rt = refresh_token.ok_or_else(|| {
         refuse(
             Code::Config,
             format!("{name} issued no refresh token: sign_in.scopes needs offline_access, and the app the refresh_token grant"),
         )
     })?;
-    let g = d.enrolled(idp, &claims, &rt, &id_token).inspect_err(|e| {
-        if e.code == Code::BindingMismatch {
-            d.audit(
-                "delegation.denied",
-                "denied",
-                d.person.as_ref().map(|p| p.id.as_str()),
-                json!({"code": e.code.as_str(), "error": e.message, "idp": name, "approving_sub": claims.sub}),
-            );
-        }
-    })?;
+    let g = d
+        .enrolled(who, idp, &claims, &rt, &id_token)
+        .inspect_err(|e| {
+            if matches!(
+                e.code,
+                Code::BindingMismatch | Code::PrincipalNotDelegable | Code::DelegationNotPermitted
+            ) {
+                d.audit(
+                    "delegation.denied",
+                    "denied",
+                    Some(&who.id),
+                    json!({"code": e.code.as_str(), "error": e.message, "idp": name,
+                       "approving_sub": claims.sub, "session": who.session}),
+                );
+            }
+            // A sign-in agentd keeps no grant for leaves it no refresh token.
+            d.discard_refresh_token(idp, &rt);
+        })?;
+    let proof = crate::a2a::principals::typed::IdpProof {
+        idp: name.to_string(),
+        iss: claims.iss.clone(),
+        sub: claims.sub.clone(),
+        at_ms: now_ms(),
+    };
+    // The session that signed in holds the proof now, for the per-session
+    // re-check every call through it makes (RFC 0044 §5.2).
+    if let (Some(sid), Some(book)) = (&who.session, d.book()) {
+        book.set_proof(sid, proof.clone());
+    }
     d.audit(
         "delegation.enrolled",
         "enrolled",
         Some(&g.principal.display()),
         json!({"grant_id": g.grant_id, "principal": g.principal.display(), "idp": name,
                "approving_sub": claims.sub, "template": g.template, "servers": g.ceilings,
-               "expires_ms": g.expires_ms, "grant": chosen.as_str(), "step_up": step_up}),
+               "expires_ms": g.expires_ms, "grant": how, "step_up": step_up,
+               "session": who.session, "bound_by": g.bound_by}),
     );
+    // Listed as the person who just signed in — an `a2a.login` session is
+    // issued only after this — with the proof this sign-in is.
+    let lister = Who {
+        proof: Some(proof.clone()),
+        ..who.clone()
+    };
     let mut listed = Vec::new();
     for server in g.ceilings.keys() {
         let empty = d
@@ -202,7 +320,7 @@ fn run(
             .is_some_and(|s| s.tools_from == ToolsFrom::FirstGrant)
             && d.catalogue(server).is_none();
         if empty {
-            match d.fill_catalogue(server) {
+            match d.fill_catalogue(server, &lister) {
                 Ok(n) => listed.push(format!("{server} ({n} tools)")),
                 Err(e) => listed.push(format!("{server} (not listed: {e})")),
             }
@@ -219,7 +337,7 @@ fn run(
     if !listed.is_empty() {
         out.push_str(&format!("; listed {}", listed.join(", ")));
     }
-    Ok(out)
+    Ok((out, proof))
 }
 
 /// The IdP's device grant, polled until the person approves or it expires.

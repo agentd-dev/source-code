@@ -38,9 +38,20 @@ pub(crate) struct ToolCaller {
     /// `RunState::msg_depth`). Carried so `message.send` can refuse to extend a
     /// chain that has already gone too deep.
     pub msg_depth: u32,
+    /// The RFC 0043 session the work acts through, when a signed-in person
+    /// started it (RFC 0044 §5.12): a delegated call is admitted against
+    /// that session as it is now.
+    pub session: Option<String>,
 }
 
 impl ToolCaller {
+    /// Who this call acts for, as a delegated call is admitted: the
+    /// principal, through the session the work acts through.
+    #[cfg(feature = "xaa")]
+    pub(crate) fn acting(&self) -> crate::delegation::Acting<'_> {
+        crate::delegation::Acting::new(self.principal.as_deref(), self.session.as_deref())
+    }
+
     fn label(&self) -> String {
         if let Some(s) = &self.subagent {
             return format!("subagent:{s}");
@@ -121,12 +132,18 @@ impl Runtime {
     /// `None` when the child is gone.
     fn child_caller(&self, node: NodeId, id: u64) -> Option<ToolCaller> {
         Some(match self.children.get(node).map(|c| c.kind.clone())? {
-            ChildKind::RootTurn { ctx, msg_depth, .. } => ToolCaller {
+            ChildKind::RootTurn {
+                ctx,
+                msg_depth,
+                session,
+                ..
+            } => ToolCaller {
                 node: Some(node),
                 req: id,
                 ctx: Some(ctx.clone()),
                 principal: self.contexts.get(&ctx).and_then(|c| c.principal.clone()),
                 msg_depth,
+                session,
                 ..Default::default()
             },
             ChildKind::StepTurn { run, step, .. } => ToolCaller {
@@ -137,6 +154,7 @@ impl Runtime {
                 ctx: self.runs.get(&run).and_then(|r| r.conversation.clone()),
                 principal: self.runs.get(&run).and_then(|r| r.principal.clone()),
                 msg_depth: self.runs.get(&run).map(|r| r.msg_depth).unwrap_or(0),
+                session: self.runs.get(&run).and_then(|r| r.session.clone()),
                 ..Default::default()
             },
             // A subagent acts for whoever it works for, exactly as the turn
@@ -151,16 +169,25 @@ impl Runtime {
                     .subagents
                     .get(&handle)
                     .and_then(|s| s.principal.clone()),
+                session: self.subagents.get(&handle).and_then(|s| s.session.clone()),
                 subagent: Some(handle),
                 ..Default::default()
             },
-            ChildKind::Think { ctx, .. } => ToolCaller {
+            // A think child acts through the session of the turn that asked
+            // for it, when one did.
+            ChildKind::Think { ctx, reply_to, .. } => ToolCaller {
                 node: Some(node),
                 req: id,
                 principal: ctx
                     .as_ref()
                     .and_then(|c| self.contexts.get(c))
                     .and_then(|c| c.principal.clone()),
+                session: reply_to
+                    .and_then(|(asker, _)| self.children.get(asker))
+                    .and_then(|c| match &c.kind {
+                        ChildKind::RootTurn { session, .. } => session.clone(),
+                        _ => None,
+                    }),
                 ctx,
                 ..Default::default()
             },
@@ -169,7 +196,13 @@ impl Runtime {
 
     /// Deliver a child's tool outcome: answer it now, park it, or leave it to
     /// the executor thread that will.
-    fn child_tool_outcome(&mut self, node: NodeId, id: u64, name: &str, outcome: ToolOutcome) {
+    pub(crate) fn child_tool_outcome(
+        &mut self,
+        node: NodeId,
+        id: u64,
+        name: &str,
+        outcome: ToolOutcome,
+    ) {
         match outcome {
             ToolOutcome::Ready(v, err) => self.reply_tool(node, id, v, err),
             ToolOutcome::Deferred(kind) => {
@@ -1649,9 +1682,10 @@ impl Runtime {
         }
         // The turn it starts continues the sender's trace.
         let trace = self.caller_trace(caller);
-        match self.accept_event(
+        match self.accept_event_in(
             super::events::kinds::A2A_MESSAGE,
             caller.principal.clone(),
+            caller.session.clone(),
             payload,
             trace.as_ref(),
         ) {

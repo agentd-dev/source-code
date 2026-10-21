@@ -318,6 +318,10 @@ pub enum A2aEndpoint {
     /// raw URL, parsed by the A2A client's HTTP dialer. A co-located peer may
     /// instead be dialled by `unix:///path` (same URL string, socket dial).
     Https(String),
+    /// The parent an instance child reports to, through the channel it was
+    /// handed at spawn (`a2a::channel`). Never parsed from configuration:
+    /// only an instance child holding one dials it.
+    Parent,
 }
 
 impl A2aEndpoint {

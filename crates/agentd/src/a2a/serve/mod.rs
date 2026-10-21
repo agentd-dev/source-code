@@ -151,8 +151,41 @@ pub struct Listener {
     pub bound: String,
     /// Where the reactor publishes task transitions for subscribers.
     pub sink: Arc<ports::StreamSink>,
+    /// Where an instance child's connections are served (`a2a::channel`).
+    pub door: Door,
     /// Kept alive because dropping the runtime stops the accept loop.
     _runtime: tokio::runtime::Runtime,
+}
+
+/// The listener's door for instance children: a connection a child opened
+/// through the channel its parent handed it at spawn is served here, by the
+/// same router as every other, as the child's principal `instance:<handle>`.
+#[derive(Clone)]
+pub struct Door {
+    handle: tokio::runtime::Handle,
+    router: Router,
+    log: Logger,
+}
+
+impl Door {
+    /// Serve `stream`, a connection instance child `child` opened through
+    /// its channel.
+    pub fn serve_instance(&self, stream: std::os::unix::net::UnixStream, child: &str) {
+        let (router, log, child) = (
+            self.router.clone(),
+            self.log.clone(),
+            Arc::<str>::from(child),
+        );
+        self.handle.spawn(async move {
+            if stream.set_nonblocking(true).is_err() {
+                return;
+            }
+            let Ok(s) = tokio::net::UnixStream::from_std(stream) else {
+                return;
+            };
+            serve_conn(s, router, PeerId::default(), Peer::Instance(child), log).await;
+        });
+    }
 }
 
 impl App {
@@ -246,6 +279,11 @@ pub fn spawn(
     let app = Arc::new(App::new(bridge, opts, streams, log.clone()));
     let _ = feed;
     let router = router(app);
+    let door = Door {
+        handle: runtime.handle().clone(),
+        router: router.clone(),
+        log: log.clone(),
+    };
 
     let bound;
     match &bind {
@@ -318,6 +356,7 @@ pub fn spawn(
     Ok(Listener {
         bound,
         sink,
+        door,
         _runtime: runtime,
     })
 }
@@ -381,8 +420,26 @@ fn router(app: Arc<App>) -> Router {
                 .route(
                     oauth::VERIFICATION_PATH,
                     get(oauth_verification).options(preflight),
+                );
+        }
+        if authority.device().is_some() || authority.login() {
+            r = r.route(oauth::METADATA_PATH, get(oauth_metadata).options(preflight));
+        }
+        if authority.login() {
+            r = r.route(
+                crate::a2a::login::LOGIN_AUTHORIZATION_PATH,
+                post(oauth_login_authorization).options(preflight),
+            );
+        }
+        // The browser's two stops of an IdP sign-in: plain navigations,
+        // answering nothing a page's script could read.
+        if authority.signins().is_some() {
+            r = r
+                .route(
+                    &format!("{}/{{id}}", crate::a2a::login::START_PATH),
+                    get(signin_start),
                 )
-                .route(oauth::METADATA_PATH, get(oauth_metadata).options(preflight));
+                .route(crate::a2a::login::CALLBACK_PATH, get(signin_callback));
         }
         if authority.launch().is_some_and(|l| l.origin().is_some()) {
             r = r.route(
@@ -612,6 +669,156 @@ async fn oauth_revoke(
     body: axum::body::Body,
 ) -> axum::response::Response {
     oauth_call(&app, &headers, Some(body), |a, ct, b| a.revoke(ct, b)).await
+}
+
+async fn oauth_login_authorization(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(peer): axum::Extension<Peer>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    let ip = peer_ip(&peer);
+    oauth_call(&app, &headers, Some(body), |a, ct, b| {
+        a.login_authorization(ct, b, ip)
+    })
+    .await
+}
+
+/// A sign-in page's answer: fixed text, never cached, never framed, sent
+/// to no other origin as a referrer.
+fn signin_page(
+    status: axum::http::StatusCode,
+    text: String,
+    extra: Vec<(axum::http::HeaderName, String)>,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    use axum::response::IntoResponse;
+    let mut resp = (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        text,
+    )
+        .into_response();
+    for (k, v) in extra {
+        if let Ok(v) = HeaderValue::from_str(&v) {
+            resp.headers_mut().append(k, v);
+        }
+    }
+    resp
+}
+
+/// `GET /oauth2/start/<id>`: a start link, once — its cookie, and the
+/// redirect to the IdP, whose URL the federation builds off this thread.
+async fn signin_start(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use crate::a2a::login::Start;
+    use axum::http::{StatusCode, header};
+    let Some(a) = app.auth.authority.clone() else {
+        return signin_page(StatusCode::NOT_FOUND, String::new(), Vec::new());
+    };
+    let (Some(signins), Some(issuer)) = (a.signins().cloned(), a.issuer().map(str::to_string))
+    else {
+        return signin_page(StatusCode::NOT_FOUND, String::new(), Vec::new());
+    };
+    let Start::Go(ask, cookie) = signins.start(&id, &issuer) else {
+        return signin_page(
+            StatusCode::GONE,
+            "This sign-in link was used or has expired.".into(),
+            Vec::new(),
+        );
+    };
+    let url = tokio::task::spawn_blocking(move || signins.authorize_url(&ask)).await;
+    match url {
+        Ok(Ok(url)) => signin_page(
+            StatusCode::FOUND,
+            String::new(),
+            vec![(header::LOCATION, url), (header::SET_COOKIE, cookie)],
+        ),
+        Ok(Err(e)) => {
+            app.log.warn("auth.signin.unavailable", json!({"err": e}));
+            signin_page(
+                StatusCode::BAD_GATEWAY,
+                "The identity provider could not be reached; try again.".into(),
+                Vec::new(),
+            )
+        }
+        Err(_) => signin_page(StatusCode::INTERNAL_SERVER_ERROR, String::new(), Vec::new()),
+    }
+}
+
+/// `GET /oauth2/callback`: the browser back from the IdP. Taken only with
+/// the cookie its start link set; the federation completes it off this
+/// thread, and a login's session is then issued.
+async fn signin_callback(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use crate::a2a::login::Callback;
+    use axum::http::{StatusCode, header};
+    let Some(a) = app.auth.authority.clone() else {
+        return signin_page(StatusCode::NOT_FOUND, String::new(), Vec::new());
+    };
+    let (Some(signins), Some(issuer), Some(sessions)) = (
+        a.signins().cloned(),
+        a.issuer().map(str::to_string),
+        app.auth.sessions.clone(),
+    ) else {
+        return signin_page(StatusCode::NOT_FOUND, String::new(), Vec::new());
+    };
+    let cookies = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let query = uri.query().unwrap_or_default().to_string();
+    let found = signins.callback(
+        &query,
+        Some(cookies.as_str()).filter(|c| !c.is_empty()),
+        &issuer,
+    );
+    let (id, answer) = match found {
+        Callback::Complete(id, answer) => (id, answer),
+        Callback::Refused(status, text) => {
+            app.log.warn(
+                "auth.signin.refused",
+                json!({"status": status, "why": text}),
+            );
+            return signin_page(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                text,
+                Vec::new(),
+            );
+        }
+    };
+    let s = Arc::clone(&signins);
+    let done = tokio::task::spawn_blocking(move || {
+        let result = s.complete(*answer);
+        s.finished(&id, result, &sessions)
+    })
+    .await;
+    match done {
+        Ok((said, session)) => {
+            if let Some(session) = session {
+                app.log.info(
+                    "auth.login.signed_in",
+                    json!({"sid": session.sid, "principal": session.principal,
+                           "client_id": session.client_id, "idp": session.proof.as_ref().map(|p| p.idp.clone())}),
+                );
+                push_auth_event(&app, session.signed_in_event());
+            }
+            signin_page(StatusCode::OK, said, Vec::new())
+        }
+        Err(_) => signin_page(StatusCode::INTERNAL_SERVER_ERROR, String::new(), Vec::new()),
+    }
 }
 
 async fn oauth_metadata(
@@ -1415,6 +1622,11 @@ mod tests {
             approved_by: "operator".into(),
             approved_rule: None,
             rate: None,
+            typed: crate::a2a::principals::typed::PrincipalRef::local(
+                crate::a2a::principals::typed::Source::Device,
+                name,
+            ),
+            proof: None,
         }
     }
 

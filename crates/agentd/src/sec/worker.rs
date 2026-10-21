@@ -108,6 +108,63 @@ pub fn refusal(
     None
 }
 
+/// Why instance children cannot run as `uid`:`gid` here, or `None` when
+/// they can: agentd is `euid`, the external signers run as `signers`, and
+/// workers as `workers` (`spawn.uid`, `spawn.gid`). Root alone can, since
+/// the child's directory is made its own as well as the child started as
+/// another uid; and never as a worker's uid, whose processes could then
+/// read the child's store and reach its unix listener as its operator.
+pub fn instance_refusal(
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    signers: &[u32],
+    workers: Option<(u32, u32)>,
+) -> Option<String> {
+    if uid == 0 || gid == 0 {
+        return Some("instance children never run as root (uid 0 or gid 0)".into());
+    }
+    if uid == euid {
+        return Some(format!(
+            "{uid} is agentd's own uid: the child would not be separated from it"
+        ));
+    }
+    if signers.contains(&uid) {
+        return Some(format!(
+            "{uid} is an external signer's uid: the child would pass the signer's peer check"
+        ));
+    }
+    if workers.is_some_and(|(w, _)| w == uid) {
+        return Some(format!(
+            "{uid} is spawn.uid, the workers' uid: a worker could read the child's store and reach its listener as its operator"
+        ));
+    }
+    if euid != 0 {
+        return Some(format!(
+            "agentd runs as uid {euid}: starting a child as another uid and making its directory its own needs root"
+        ));
+    }
+    None
+}
+
+/// [`instance_refusal`] for this process.
+pub fn instance_refusal_here(
+    uid: u32,
+    gid: u32,
+    signers: &[u32],
+    workers: Option<(u32, u32)>,
+) -> Option<String> {
+    // SAFETY: geteuid has no failure mode.
+    let euid = unsafe { libc::geteuid() };
+    instance_refusal(uid, gid, euid, signers, workers)
+}
+
+/// Start an instance child's `cmd` as `uid` and `gid`, holding no
+/// capability, before its Landlock domain — as a worker is started.
+pub fn start_instance_as(cmd: &mut std::process::Command, ids: (u32, u32)) {
+    start_as(cmd, ids);
+}
+
 /// [`refusal`] for this process.
 pub fn refusal_here(uid: u32, gid: u32, signers: &[u32], instances: bool) -> Option<String> {
     // SAFETY: geteuid has no failure mode.
@@ -253,6 +310,39 @@ mod caps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An instance child's own uid is never root's, agentd's own, a
+    /// signer's or the workers', and needs agentd to run as root to make the
+    /// child's directory its own: each refusal names why.
+    #[test]
+    fn an_instance_uid_is_held_to_its_rules() {
+        assert_eq!(
+            instance_refusal(1500, 1500, 0, &[991], Some((1600, 1600))),
+            None
+        );
+        for (r, says) in [
+            (instance_refusal(0, 1500, 0, &[], None), "never run as root"),
+            (instance_refusal(1500, 0, 0, &[], None), "never run as root"),
+            (
+                instance_refusal(1000, 1000, 1000, &[], None),
+                "agentd's own uid",
+            ),
+            (
+                instance_refusal(991, 991, 0, &[991], None),
+                "external signer's uid",
+            ),
+            (
+                instance_refusal(1600, 1600, 0, &[], Some((1600, 1600))),
+                "spawn.uid",
+            ),
+            (instance_refusal(1500, 1500, 1000, &[], None), "needs root"),
+        ] {
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains(says)),
+                "{says}: {r:?}"
+            );
+        }
+    }
 
     /// Each reason a configuration cannot be honoured is named, as any uid:
     /// root and a uid holding `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL`

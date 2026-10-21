@@ -166,9 +166,21 @@ pub(crate) fn gate_text(id: &str, r: &Value) -> String {
         format!("{shown}...")
     });
     lines.push(format!(
-        "Answer with agentd --delegation-approve {id} or agentd --delegation-deny {id}. No message is an answer."
+        "Answer by approving or denying gate {id} in your display client, or with agentd --delegation-approve {id} or --delegation-deny {id}. No message is an answer."
     ));
     lines.join("\n")
+}
+
+/// Who answers a consent gate, and through what (RFC 0044 §5.10 rules 1,
+/// 2 and 7): the person through a display session whose own IdP sign-in is
+/// recent enough (`gate`), a per-person operator over the unix listener
+/// (`operator_self`), or an operator the person's template lists among its
+/// `approvers` (`operator`).
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Answerer {
+    pub id: String,
+    pub via: &'static str,
 }
 
 /// One open consent gate.
@@ -186,6 +198,19 @@ pub(crate) struct ConsentGate {
     /// A workflow step's own effect, not a tool call: approved, the step
     /// runs again with `call.args` as its spec.
     pub effect: bool,
+    /// Whether the person's template lists `approvers: [principal,
+    /// operator]`: an operator may then answer, recorded `via: operator`.
+    pub operator_approves: bool,
+    /// The A2A task the gate is shown on, when the work is a caller's own:
+    /// `input-required`, badged, naming the gate, until it closes.
+    pub task: Option<String>,
+    /// A step-up sign-in the gate asks for in place of an approval
+    /// (`runtime::stepup`).
+    pub signin: Option<super::stepup::SignIn>,
+    /// The RFC 0043 session the work acts through: once it has ended —
+    /// revoked, expired, or lost to a restart — the gate closes `revoked`
+    /// at the next pass, since no answer could make the call.
+    pub session: Option<String>,
 }
 
 /// The hash a gate is bound to: SHA-256 of `{tool, args}` as compact JSON,
@@ -195,7 +220,7 @@ pub(crate) fn args_hash(tool: &str, args: &Value) -> String {
     crate::sha::sha256_hex(json!({"tool": tool, "args": args}).to_string().as_bytes())
 }
 
-fn target_of(caller: &ToolCaller) -> Target {
+pub(crate) fn target_of(caller: &ToolCaller) -> Target {
     match (caller.node, &caller.run, &caller.step) {
         (Some(node), _, _) => Target::Child(node, caller.req),
         (None, Some(run), Some(step)) => Target::Step(run.clone(), step.clone()),
@@ -224,31 +249,58 @@ impl Runtime {
             .is_some_and(|d| d.is_delegated(server))
     }
 
-    /// The work behind `caller`, admitted for `server`: a subagent's — its
-    /// own call, or a run it started, directly or through others — never is
-    /// (`delegation_not_permitted`: a template's `subagents: none`, all P1
-    /// has); anyone else's as [`Delegation::admit`] decides.
+    /// The work behind `caller`, admitted for `server` as
+    /// [`Delegation::admit`] decides — and a subagent's, its own call or a
+    /// run it started, directly or through others, only where the person's
+    /// template says `subagents: inherit` and the subagent itself declared
+    /// `server` (RFC 0044 §5.12 F): it acts with their grant, intersected
+    /// with what it declares, and holds no token — the supervisor makes the
+    /// call. Otherwise `delegation_not_permitted`.
     pub(crate) fn delegation_admit(
         &self,
         d: &Delegation,
         caller: &ToolCaller,
         server: &str,
     ) -> Result<crate::delegation::Admitted, crate::delegation::DelegationError> {
-        if let Some(h) = self.subagent_lineage(caller) {
-            return Err(crate::delegation::DelegationError {
-                code: crate::delegation::Code::DelegationNotPermitted,
-                message: format!("subagent:{h}'s work acts with no one's delegated grant"),
-            });
+        let not = |message: String| crate::delegation::DelegationError {
+            code: crate::delegation::Code::DelegationNotPermitted,
+            message,
+        };
+        let admitted = d.admit(caller.acting(), server);
+        let Some(h) = self.subagent_lineage(caller) else {
+            return admitted;
+        };
+        let admitted = admitted?;
+        if admitted.template.subagents
+            != crate::config::settings::delegation::SubagentsMode::Inherit
+        {
+            return Err(not(format!(
+                "subagent:{h}'s work acts with no one's delegated grant: template {} says subagents: none",
+                admitted.template.name
+            )));
         }
-        d.admit(caller.principal.as_deref(), server)
+        let declared = self
+            .subagents
+            .get(&h)
+            .is_some_and(|s| s.delegated_servers.iter().any(|x| x == server));
+        if !declared {
+            return Err(not(format!(
+                "subagent:{h} does not declare {server} among its servers, so it acts with no grant there"
+            )));
+        }
+        Ok(admitted)
     }
 
-    /// Whether `server`'s tools are offered to work for `owner`: only with a
-    /// usable grant.
-    pub(crate) fn delegation_usable(&self, owner: Option<&str>, server: &str) -> bool {
+    /// Whether `server`'s tools are offered to work `acting` is for: only
+    /// with a grant usable through the session it acts through.
+    pub(crate) fn delegation_usable(
+        &self,
+        acting: crate::delegation::Acting<'_>,
+        server: &str,
+    ) -> bool {
         self.delegation
             .as_ref()
-            .is_some_and(|d| d.usable(owner, server))
+            .is_some_and(|d| d.usable(acting, server))
     }
 
     /// The delegated server of tool `name`, when it is one.
@@ -399,15 +451,19 @@ impl Runtime {
         passed: super::reactor::Passed,
         effect: bool,
     ) -> ToolOutcome {
-        // Answered by the person: the run's or the conversation's own, who
-        // may hold a grant. Work for nobody who could answer is denied.
-        let Some(person) = d.person.as_ref().map(|p| p.id.clone()) else {
-            return ToolOutcome::Ready(
-                Value::String(format!(
-                    "{name}: delegation refused (policy_denied): the call needs the person's approval and no per-person operator is declared"
-                )),
-                true,
-            );
+        // Answered by the person the work is for, as their session or the
+        // configuration names them now. Work for nobody who could answer
+        // is denied.
+        let person = match d.who(caller.acting()) {
+            Ok(who) => who.id,
+            Err(e) => {
+                return ToolOutcome::Ready(
+                    Value::String(format!(
+                        "{name}: delegation refused (policy_denied): the call needs the person's approval, and nobody who could give it is behind this work ({e})"
+                    )),
+                    true,
+                );
+            }
         };
         let id = crate::sec::random::b64url_token(9).unwrap_or_default();
         let nonce = crate::sec::random::b64url_token(16).unwrap_or_default();
@@ -429,6 +485,13 @@ impl Runtime {
             r.extend(f);
         }
         let timeout = self.settings.identity.delegation.consent_timeout();
+        // An operator answers too only where the person's own template for
+        // the server says so.
+        let operator_approves = server.as_ref().is_some_and(|s| {
+            self.delegation_admit(d, caller, s)
+                .is_ok_and(|a| a.template.operator_approves())
+        });
+        let task = self.consent_task(caller, &id, &rendered);
         let gate = ConsentGate {
             nonce,
             args_hash: args_hash(name, args),
@@ -447,6 +510,10 @@ impl Runtime {
             },
             target: target_of(caller),
             effect,
+            operator_approves,
+            task,
+            signin: None,
+            session: caller.session.clone(),
         };
         self.consents.insert(id.clone(), gate);
         // Its record is sealed under the person's key on the loop: held by
@@ -470,14 +537,143 @@ impl Runtime {
         ToolOutcome::Deferred(PendingKind::Consent { id })
     }
 
+    /// The A2A task a gate for `caller`'s work is shown on, when a caller
+    /// owns that work: flipped to `input-required` with agentd's own text,
+    /// badged as agentd's security gate and naming gate `id`, so the
+    /// person's display client offers its approve and deny — as an
+    /// `ask_human` addressed to them is shown to them (RFC 0044 §5.10).
+    fn consent_task(&mut self, caller: &ToolCaller, id: &str, rendered: &Value) -> Option<String> {
+        #[cfg(feature = "a2a")]
+        {
+            use crate::a2a::tasks::State;
+            let super::human::HumanChannel::Owned(task) = self.human_channel(caller) else {
+                return None;
+            };
+            let t = self.tasks.get_mut(&task)?;
+            if t.state.is_terminal() {
+                return None;
+            }
+            t.security_gate = true;
+            t.consent_gate = Some(json!({"gate": id, "kind": "action"}));
+            t.transition(State::InputRequired, Some(gate_text(id, rendered)));
+            self.task_persist(&task);
+            self.task_sync(&task);
+            Some(task)
+        }
+        #[cfg(not(feature = "a2a"))]
+        {
+            let _ = (caller, id, rendered);
+            None
+        }
+    }
+
+    /// The gate on task `task` closed: the task's work goes on.
+    pub(crate) fn consent_task_closed(&mut self, task: Option<&str>, id: &str) {
+        #[cfg(feature = "a2a")]
+        if let Some(task) = task
+            && let Some(t) = self.tasks.get_mut(task)
+        {
+            let ours = t
+                .consent_gate
+                .as_ref()
+                .is_some_and(|g| g["gate"].as_str() == Some(id));
+            if ours {
+                t.consent_gate = None;
+                t.security_gate = false;
+                if t.state == crate::a2a::tasks::State::InputRequired {
+                    t.transition(crate::a2a::tasks::State::Working, None);
+                }
+                let task = task.to_string();
+                self.task_persist(&task);
+                self.task_sync(&task);
+            }
+        }
+        #[cfg(not(feature = "a2a"))]
+        let _ = (task, id);
+    }
+
     #[cfg(feature = "a2a")]
-    /// The person's answer to gate `id`: run the call it held, or refuse it.
-    /// `None` when there is no such gate; `Err` when the answer is not one
-    /// the gate takes.
+    /// Who answers gate `gate` for the A2A caller `principal`, who is `who`
+    /// when agentd acts for them (RFC 0044 §5.10 rule 1): the person
+    /// through the unix listener (`operator_self`), or through a display
+    /// session whose own IdP sign-in is younger than
+    /// `identity.delegation.consent_session_max_age` (`gate`); or an
+    /// operator the person's template lists among its approvers
+    /// (`operator`). Anyone else is refused, and why is said and recorded.
+    pub(crate) fn consent_answerer(
+        &self,
+        d: &Delegation,
+        principal: &crate::a2a::Principal,
+        who: Option<&crate::delegation::Who>,
+        gate: &str,
+    ) -> Result<Answerer, (&'static str, String)> {
+        let _ = d;
+        let Some(g) = self.consents.get(gate) else {
+            // No such gate: the answer fails as one to a gate that is not.
+            return Ok(Answerer {
+                id: principal.id.clone(),
+                via: "gate",
+            });
+        };
+        if let Some(w) = who.filter(|w| w.id == g.principal) {
+            let Some(_sid) = &w.session else {
+                return Ok(Answerer {
+                    id: w.id.clone(),
+                    via: "operator_self",
+                });
+            };
+            let Some(proof) = &w.proof else {
+                return Err((
+                    "no_idp_sign_in",
+                    format!(
+                        "gate {gate} is {}'s, and this session has not signed in at the IdP: a session answers the person's gates only once it has proved, at the IdP, that it is them",
+                        g.principal
+                    ),
+                ));
+            };
+            let max_age = self
+                .settings
+                .identity
+                .delegation
+                .consent_session_max_age()
+                .as_millis() as u64;
+            if now_ms().saturating_sub(proof.at_ms) > max_age {
+                return Err((
+                    "stale_session",
+                    format!(
+                        "this session's IdP sign-in is older than identity.delegation.consent_session_max_age ({}s): sign in at the IdP again to answer gate {gate}",
+                        max_age / 1000
+                    ),
+                ));
+            }
+            return Ok(Answerer {
+                id: w.id.clone(),
+                via: "gate",
+            });
+        }
+        if principal.is_operator() && g.operator_approves {
+            return Ok(Answerer {
+                id: principal.id.clone(),
+                via: "operator",
+            });
+        }
+        Err((
+            "not_the_person",
+            format!(
+                "gate {gate} is {}'s to answer, and {} is not them: no operator answers for the person",
+                g.principal, principal.id
+            ),
+        ))
+    }
+
+    #[cfg(feature = "a2a")]
+    /// The person's answer to gate `id`, given by `by`: run the call it
+    /// held, or refuse it. `Err` when there is no such gate, or the answer
+    /// is not one the gate takes.
     pub(crate) fn consent_answer(
         &mut self,
         id: &str,
-        by: &str,
+        by: &Answerer,
         nonce: Option<&str>,
         args_hash: Option<&str>,
         approve: bool,
@@ -487,7 +683,14 @@ impl Runtime {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("no open consent gate is {id:?}"))?;
-        if gate.principal != by {
+        let via = by.via;
+        let by = by.id.as_str();
+        if gate.signin.is_some() && approve {
+            return Err(format!(
+                "gate {id} asks for a sign-in at the IdP, not an approval: sign in where it says, or deny it to cancel the call"
+            ));
+        }
+        if gate.principal != by && !(via == "operator" && gate.operator_approves) {
             self.consent_refused(id, by, "not_the_person");
             return Err(format!(
                 "gate {id} is {}'s to answer, and {by} is not them: no operator answers for the person",
@@ -497,6 +700,15 @@ impl Runtime {
         if nonce != Some(gate.nonce.as_str())
             || (approve && args_hash != Some(gate.args_hash.as_str()))
         {
+            // A sign-in gate is cancelled by its person without its
+            // nonce: they never read it, there being nothing to approve.
+            if gate.signin.is_some() && !approve && gate.principal == by {
+                self.close_consent(id, via, "the person cancelled the sign-in it asked for");
+                return Ok(format!(
+                    "cancelled {}: the call was not made",
+                    gate.call.tool
+                ));
+            }
             self.consent_refused(id, by, "not_bound");
             return Err(format!(
                 "the answer to gate {id} is not bound to its nonce and arguments: nothing was decided"
@@ -513,6 +725,7 @@ impl Runtime {
             ));
         }
         self.consents.remove(id);
+        self.consent_task_closed(gate.task.as_deref(), id);
         let found = self.pending.iter().position(|p| {
             p.target == gate.target && matches!(&p.kind, PendingKind::Consent { id: g } if g == id)
         });
@@ -521,10 +734,10 @@ impl Runtime {
         }
         self.log.info(
             "delegation.consent",
-            json!({"gate": id, "decision": decision, "via": "operator_self", "principal": by,
+            json!({"gate": id, "decision": decision, "via": via, "principal": by,
                    "args_hash": gate.args_hash}),
         );
-        self.audit_consent(id, &gate, decision, "operator_self", personal);
+        self.audit_consent(id, &gate, decision, via, personal);
         let tool = gate.call.tool.clone();
         if found.is_none() {
             return Ok(format!(
@@ -690,9 +903,35 @@ impl Runtime {
     }
 
     /// Every pass: an unanswered gate past its deadline denies — never a
-    /// judge, never an override — and a gate whose asker is gone closes.
+    /// judge, never an override — and a gate whose asker is gone closes;
+    /// a step-up gate's device grant is polled.
     pub(crate) fn poll_consents(&mut self) {
+        #[cfg(feature = "a2a")]
+        self.poll_step_ups();
         let now = now_ms();
+        // The work of a session that has ended acts for nobody: its gates
+        // close at once, whoever might still answer them.
+        let ended: Vec<String> = self
+            .consents
+            .iter()
+            .filter(|(_, g)| {
+                g.session.as_deref().is_some_and(|sid| {
+                    !self
+                        .delegation
+                        .as_ref()
+                        .is_some_and(|d| d.session_live(sid))
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ended {
+            self.close_consent_as(
+                &id,
+                "revoked",
+                "revoked",
+                "the session this work acts through has ended — revoked, expired or lost to a restart — and its delegated access with it",
+            );
+        }
         let due: Vec<String> = self
             .consents
             .iter()
@@ -718,9 +957,15 @@ impl Runtime {
     /// denial, recorded while its asker is still there (a gate whose asker
     /// ended decides nothing), and the asker told `why`.
     fn close_consent(&mut self, id: &str, via: &str, why: &str) {
+        self.close_consent_as(id, via, "policy_denied", why);
+    }
+
+    /// [`Self::close_consent`], the asker told `code`.
+    fn close_consent_as(&mut self, id: &str, via: &str, code: &str, why: &str) {
         let Some(g) = self.consents.remove(id) else {
             return;
         };
+        self.consent_task_closed(g.task.as_deref(), id);
         let found = self.pending.iter().position(|p| {
             p.target == g.target && matches!(&p.kind, PendingKind::Consent { id: x } if x == id)
         });
@@ -737,7 +982,7 @@ impl Runtime {
             self.reply(
                 &g.target,
                 Value::String(format!(
-                    "{}: delegation refused (policy_denied): {why}; it was NOT executed",
+                    "{}: delegation refused ({code}): {why}; it was NOT executed",
                     g.call.tool
                 )),
                 true,
@@ -767,17 +1012,20 @@ impl Runtime {
     }
 
     #[cfg(feature = "a2a")]
-    /// The open gates `who` sees: every gate, by its tool and server; what
-    /// it shows — the arguments, the text the person reads — and its
-    /// binding only for the person who answers it.
-    pub(crate) fn consent_list(&self, who: &str) -> Vec<Value> {
+    /// The open gates `who` sees — every gate, or only `mine`'s: each by
+    /// its tool and server; what it shows — the arguments, the text the
+    /// person reads — and its binding only for whoever may answer it: the
+    /// person, and an `operator` where the person's template lists one
+    /// among its approvers.
+    pub(crate) fn consent_list(&self, who: &str, operator: bool, mine: Option<&str>) -> Vec<Value> {
         self.consents
             .iter()
+            .filter(|(_, g)| mine.is_none_or(|m| g.principal == m))
             .map(|(id, g)| {
                 let mut v = json!({"gate": id, "principal": g.principal,
                                    "tool": g.rendered["tool"], "server": g.rendered["server"],
                                    "deadline_ms": g.deadline_ms});
-                if g.principal == who {
+                if g.principal == who || (operator && g.operator_approves) {
                     v["rendered"] = g.rendered.clone();
                     v["text"] = json!(gate_text(id, &g.rendered));
                     v["nonce"] = json!(g.nonce);
@@ -795,7 +1043,9 @@ impl Runtime {
                               "args_hash": g.args_hash, "rendered": g.rendered,
                               "principal": g.principal, "deadline_ms": g.deadline_ms,
                               "policy": super::human::policy_call_json(&g.call),
-                              "effect": g.effect}),
+                              "effect": g.effect, "operator_approves": g.operator_approves,
+                              "task": g.task, "session": g.session,
+                              "signin": g.signin.as_ref().map(super::stepup::signin_wait)}),
             None => json!({"kind": "consent", "gate": id}),
         }
     }
@@ -804,6 +1054,7 @@ impl Runtime {
     /// with the same binding and deadline.
     pub(crate) fn rebuild_consents(&mut self) {
         let mut found = Vec::new();
+        let mut signins = Vec::new();
         for (run, r) in &self.runs {
             for (step, s) in &r.steps {
                 let Some(w) = s.wait.as_ref().filter(|w| w["kind"] == "consent") else {
@@ -815,6 +1066,13 @@ impl Runtime {
                 let Some(call) = w.get("policy").and_then(super::human::policy_call_of) else {
                     continue;
                 };
+                if w.get("signin").is_some_and(|s| s.is_object()) {
+                    signins.push((
+                        w["gate"].as_str().unwrap_or_default().to_string(),
+                        w["signin"].clone(),
+                        w["principal"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
                 found.push((
                     w["gate"].as_str().unwrap_or_default().to_string(),
                     ConsentGate {
@@ -829,6 +1087,10 @@ impl Runtime {
                         },
                         target: Target::Step(run.clone(), step.clone()),
                         effect: w["effect"].as_bool() == Some(true),
+                        operator_approves: w["operator_approves"].as_bool() == Some(true),
+                        task: w["task"].as_str().map(str::to_string),
+                        signin: None,
+                        session: w["session"].as_str().map(str::to_string),
                     },
                 ));
             }
@@ -845,6 +1107,28 @@ impl Runtime {
             });
             self.consents.insert(id, g);
         }
+        // A step-up gate comes back as the sign-in it asks for: a device
+        // grant's polling resumes once its sealed code is opened; an
+        // `authorize` one ended with the session it was for.
+        #[cfg(feature = "a2a")]
+        {
+            let mut ended = Vec::new();
+            for (id, w, principal) in signins {
+                let rebuilt = self.rebuild_signin(&id, &w, &principal);
+                let authorize = rebuilt
+                    .as_ref()
+                    .is_none_or(|s| s.how == super::stepup::How::Authorize);
+                if let Some(g) = self.consents.get_mut(&id) {
+                    g.signin = rebuilt;
+                }
+                if authorize {
+                    ended.push(id);
+                }
+            }
+            self.end_rebuilt_authorize(&ended);
+        }
+        #[cfg(not(feature = "a2a"))]
+        let _ = signins;
     }
 
     /// A delegated server's tool call: admitted on the loop, minted and made
@@ -887,13 +1171,16 @@ impl Runtime {
         let trusted = d.servers.get(server).is_some_and(|s| s.trusted_output);
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
-        let (server, tool, authority) = (
+        let (server, tool, authority, session) = (
             server.to_string(),
             tool.to_string(),
             caller.principal.clone(),
+            caller.session.clone(),
         );
         let (run, step) = (caller.run.clone(), caller.step.clone());
         let name = name.to_string();
+        #[cfg(feature = "a2a")]
+        let (mut step_up_caller, mut step_up_args) = (Some(caller.clone()), Some(args.clone()));
         std::thread::Builder::new()
             .name(format!("delegated:{server}.{tool}"))
             .spawn(move || {
@@ -903,7 +1190,10 @@ impl Runtime {
                     tool: &tool,
                     args,
                     meta,
-                    authority: authority.as_deref(),
+                    acting: crate::delegation::Acting::new(
+                        authority.as_deref(),
+                        session.as_deref(),
+                    ),
                     unit,
                     run,
                     step,
@@ -916,6 +1206,22 @@ impl Runtime {
                     res.as_ref().is_ok_and(|r| !r.is_error()),
                     start,
                 );
+                // The IdP wants the person to sign in again: the call waits
+                // on a step-up gate rather than failing (`runtime::stepup`).
+                #[cfg(feature = "a2a")]
+                if let Err(e) = &res
+                    && e.code == crate::delegation::Code::StepUp
+                    && let Some(caller) = step_up_caller.take()
+                {
+                    let _ = tx.send(Event::StepUpAsked(Box::new(super::stepup::StepUpAsk {
+                        caller,
+                        name: name.clone(),
+                        server: server.clone(),
+                        args: step_up_args.take().unwrap_or(Value::Null),
+                        error: format!("{name}: {e}"),
+                    })));
+                    return;
+                }
                 let (result, is_error) = match res {
                     Ok(r) => {
                         // The person's SaaS content: the unit it reaches holds
@@ -1108,7 +1414,7 @@ mod tests {
         assert!(lines[9].ends_with("..."), "cut at the cap");
         assert_eq!(
             lines[10],
-            "Answer with agentd --delegation-approve g1 or agentd --delegation-deny g1. No message is an answer."
+            "Answer by approving or denying gate g1 in your display client, or with agentd --delegation-approve g1 or --delegation-deny g1. No message is an answer."
         );
         assert_eq!(lines.len(), 11, "no line the work added: {t}");
         // Short arguments are shown whole, and an untainted unit says so.

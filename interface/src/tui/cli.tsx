@@ -37,8 +37,19 @@ import {
   scrubEnv,
   shownCode,
 } from './args.js';
-import { LaunchRefused, classify, describe, deviceLogin, launchExchange, openSession } from '../client/index.js';
-import type { Credential } from '../client/index.js';
+import {
+  LaunchRefused,
+  classify,
+  describe,
+  deviceLogin,
+  idpLogin,
+  idpLoginOf,
+  inert,
+  launchExchange,
+  openSession,
+  originOf,
+} from '../client/index.js';
+import type { Credential, IdpLoginFlow } from '../client/index.js';
 
 function fail(message: string): never {
   process.stderr.write(`agentd-tui: ${message}\n`);
@@ -116,11 +127,41 @@ async function main(): Promise<void> {
         if (source.kind === 'login' || f.kind === 'incompatible') fail(describe(f));
         break;
       }
-      const choice = chooseSignIn(session.caps.login, source.kind === 'login');
+      // The daemon's sign-in at the person's identity provider, when its
+      // metadata names one: read only when the card offers no device grant
+      // or it was asked for.
+      const wantIdp = source.kind === 'login' && source.idp === true;
+      let idp: IdpLoginFlow | undefined;
+      if (wantIdp || !session.caps.login.some((o) => o.method === 'device')) {
+        try {
+          idp = await idpLoginOf(originOf(endpoint));
+        } catch (e) {
+          if (wantIdp) fail(describe(classify(e)));
+        }
+      }
+      const choice = chooseSignIn(session.caps.login, source.kind === 'login' && !wantIdp, idp, wantIdp);
       if (choice.kind === 'refuse') fail(choice.reason);
       if (choice.kind === 'anonymous') break;
       if (!process.stdin.isTTY || !process.stderr.isTTY) {
-        fail('this agent requires sign-in, and the device sign-in needs an interactive terminal (or pass --bearer-file)');
+        fail('this agent requires sign-in, and the sign-in needs an interactive terminal (or pass --bearer-file)');
+      }
+      if (choice.kind === 'idp') {
+        try {
+          credential = await idpLogin({
+            flow: choice.flow,
+            clientId: TUI_CLIENT_ID,
+            onLink: (l) => {
+              process.stderr.write(
+                `To sign in, open ${inert(l.uri)} in your browser within ${l.expiresIn}s\n` +
+                  `and sign in at your organization's identity provider — the link opens once.\nwaiting for the sign-in…\n`,
+              );
+            },
+          });
+        } catch (e) {
+          fail(describe(classify(e)));
+        }
+        signIn = 'idp';
+        break;
       }
       try {
         credential = await deviceLogin({

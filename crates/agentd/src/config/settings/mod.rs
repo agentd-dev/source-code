@@ -209,12 +209,25 @@ pub struct Spawn {
     pub uid: Option<u32>,
     /// The gid every worker runs as, with no supplementary group.
     pub gid: Option<u32>,
+    /// The uid every instance child — a whole daemon a template spawns —
+    /// runs as instead of agentd's. Its directory is made its own, and it
+    /// answers its parent only over the channel it is handed at spawn, so
+    /// it reaches nothing of its parent's by being its uid. With
+    /// `instance_gid`; needs agentd to run as root.
+    pub instance_uid: Option<u32>,
+    /// The gid every instance child runs as, with no supplementary group.
+    pub instance_gid: Option<u32>,
 }
 
 impl Spawn {
     /// The uid and gid every worker runs as, when both are set.
     pub fn worker(&self) -> Option<(u32, u32)> {
         self.uid.zip(self.gid)
+    }
+
+    /// The uid and gid every instance child runs as, when both are set.
+    pub fn instance(&self) -> Option<(u32, u32)> {
+        self.instance_uid.zip(self.instance_gid)
     }
 }
 
@@ -1209,6 +1222,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "a2a.events",
     "a2a.introspection",
     "a2a.listen",
+    "a2a.login",
     "a2a.principals",
     "a2a.push",
     "a2a.tls",
@@ -3813,6 +3827,10 @@ pub struct A2a {
     pub push: A2aPush,
     pub cors: A2aCors,
     pub device_grant: DeviceGrant,
+    /// The IdP-federated display-client sign-in (RFC 0044 §5.4): a display
+    /// client signs in at `identity.providers.<idp>` and its session is
+    /// `user:oidc:<iss>#<sub>`, enrolled where a template admits it.
+    pub login: Option<delegation::A2aLogin>,
     pub events: A2aEvents,
     pub introspection: A2aIntrospection,
 }
@@ -7704,7 +7722,7 @@ fn validate_device_grant(a2a: &A2a, listen: Option<&super::ServeTarget>, d: &mut
 /// Whether `id` is a legal declared principal id: `[A-Za-z0-9._@:/+-]{1,128}`
 /// — wide enough for an email, a SPIFFE path or a service name, and nothing
 /// that could break an audit line or a label.
-fn principal_id_ok(id: &str) -> bool {
+pub(crate) fn principal_id_ok(id: &str) -> bool {
     (1..=128).contains(&id.len())
         && id
             .bytes()
@@ -7888,6 +7906,36 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(
                     &mut d,
                     format!("spawn.uid {uid}: workers cannot run as {uid}:{gid} — {why}"),
+                );
+            }
+        }
+        (None, None) => {}
+    }
+    // `spawn.instance_uid` and `spawn.instance_gid` (RFC 0044 P2c): both or
+    // neither, and only where agentd can make the child's directory its own
+    // and start it as them.
+    match (s.spawn.instance_uid, s.spawn.instance_gid) {
+        (Some(_), None) | (None, Some(_)) => err(
+            &mut d,
+            "spawn.instance_uid and spawn.instance_gid name the instance children's uid and gid together: give both".into(),
+        ),
+        (Some(uid), Some(gid)) => {
+            let signers: Vec<u32> = s
+                .identity
+                .delegation
+                .external()
+                .map(|g| g.uid)
+                .into_iter()
+                .chain(s.security.companies.external().map(|g| g.uid))
+                .collect();
+            if let Some(why) =
+                crate::sec::worker::instance_refusal_here(uid, gid, &signers, s.spawn.worker())
+            {
+                err(
+                    &mut d,
+                    format!(
+                        "spawn.instance_uid {uid}: instance children cannot run as {uid}:{gid} — {why}"
+                    ),
                 );
             }
         }
@@ -10549,13 +10597,27 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // domain it enters.
     "spawn.gid",
     "spawn.uid",
+    // The uid and gid every instance child runs as (RFC 0044 P2c), decided
+    // with its directory's owner when it is spawned.
+    "spawn.instance_gid",
+    "spawn.instance_uid",
     // The IdPs a grant is held at and the key it is sealed with (RFC 0044):
     // a grant sealed under one key, or bound to one issuer, is never moved
-    // under another by a reload. Templates are restart-only in P1 too, so a
-    // narrowed or removed template never leaves a grant it no longer allows
-    // in use until the restart that applies it.
+    // under another by a reload; nor are the token caps the delegation
+    // supervisor is built with. Its templates, device pins and first
+    // binding are reloadable (RELOADABLE_PATHS): the reload revokes what
+    // they no longer allow.
     "identity.providers",
-    "identity.delegation",
+    "identity.delegation.seal_key",
+    "identity.delegation.seal_key_previous",
+    "identity.delegation.key_custody",
+    "identity.delegation.signer",
+    "identity.delegation.at_cache_cap",
+    "identity.delegation.liveness_interval",
+    // The IdP-federated display-client login (RFC 0044 §5.4) changes the
+    // listener's posture, the card and the routes served, as the device
+    // grant does.
+    "a2a.login",
 ];
 
 /// Every configuration path that a reload APPLIES, as the counterpart to
@@ -10614,6 +10676,15 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "goal.statement",
     "goal.stuck_after",
     "identity.autonomous_as",
+    // Read at each consent gate and each answer.
+    "identity.delegation.consent_session_max_age",
+    "identity.delegation.consent_timeout",
+    // Applied by the reload (RFC 0044 §5.14): narrowing takes effect at the
+    // next mint; a removed template, a server removed from one, a changed
+    // or removed pin and first binding turned off revoke what they allowed.
+    "identity.delegation.device_first_binding",
+    "identity.delegation.device_pins",
+    "identity.delegation.templates",
     "identity.labels",
     "intelligence.auth",
     "intelligence.budget",
@@ -10675,6 +10746,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "tools.narrow",
     "vars",
     "webhooks.default_auth",
+    // Refused at load (RFC 0044 P3), so a reload that adds one is refused
+    // with it.
+    "workflows.act_for",
     "workflows.allow_private",
     "workflows.armed",
     "workflows.concurrency",
@@ -11139,6 +11213,9 @@ mod tests {
                     "agent.gate_channels" => json!({"w": {"approve": "@channel/ops"}}),
                     "identity.providers" => {
                         json!({"okta": {"issuer": "https://acme.okta.com", "client_id": "c"}})
+                    }
+                    "identity.delegation.device_pins" => {
+                        json!({"phone": {"iss": "https://acme.okta.com", "sub": "00u1"}})
                     }
                     p if p.ends_with(".tool_scopes") => json!({"create_issue": ["write"]}),
                     _ => json!({"k": "v"}),
@@ -11996,10 +12073,33 @@ mod tests {
     #[test]
     fn every_config_path_is_classified() {
         let paths = schema_paths();
-        let covered = |p: &str, list: &[&str]| super::path_covered(p, list);
+        let covered = |p: &str| {
+            super::path_covered(p, RESTART_ONLY_PATHS) || super::path_covered(p, RELOADABLE_PATHS)
+        };
+        // A field the partition splits — `identity.delegation`, whose keys
+        // are restart-only and whose templates and pins reload — is
+        // classified when every one of its own fields is.
+        let schema = schema::schema();
+        let fields_of = |path: &str| -> Vec<String> {
+            let mut node = &schema;
+            for key in path.split('.') {
+                node = &node["properties"][key];
+                if let Some(name) = node["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+                    node = &schema["$defs"][name];
+                }
+            }
+            node["properties"]
+                .as_object()
+                .map(|f| f.keys().cloned().collect())
+                .unwrap_or_default()
+        };
         let unclassified: Vec<&String> = paths
             .iter()
-            .filter(|p| !covered(p, RESTART_ONLY_PATHS) && !covered(p, RELOADABLE_PATHS))
+            .filter(|p| {
+                let fields = fields_of(p);
+                !covered(p)
+                    && (fields.is_empty() || !fields.iter().all(|f| covered(&format!("{p}.{f}"))))
+            })
             .collect();
         assert!(
             unclassified.is_empty(),
@@ -12013,7 +12113,7 @@ mod tests {
         // silently weakens the check above.
         let both: Vec<&&str> = RELOADABLE_PATHS
             .iter()
-            .filter(|p| covered(p, RESTART_ONLY_PATHS))
+            .filter(|p| super::path_covered(p, RESTART_ONLY_PATHS))
             .collect();
         assert!(both.is_empty(), "classified as both: {both:?}");
 

@@ -4,13 +4,17 @@
 //! `--delegation-deny`, `--delegation-revoke`, `--delegation-forget` and
 //! `--delegation-audit` send over the unix A2A listener.
 //!
-//! All are on the operator floor, and served only where an IdP or a
-//! delegated server is declared, in a build that acts for an enrolled person
-//! (the op table's `Gate::Delegation`). Enrolling, approving and denying are
-//! the per-person operator's alone — the caller the listener named
-//! `operator:<id>` by its peer's uid: no other operator signs in as them or
-//! answers for them, and an attempt is refused and recorded. Any operator
-//! lists, revokes, forgets and reads a person's consent records: an
+//! Served only where an IdP or a delegated server is declared, in a build
+//! that acts for an enrolled person (the op table's `Gate::Delegation`).
+//! Enrolling, listing, approving and denying are open to any named caller
+//! and decided here by who that caller is: a person agentd acts for — a
+//! per-person operator the listener named `operator:<id>` by its peer's
+//! uid, an `a2a.login` session, a device session — enrols themself, lists
+//! their own grants and gates, and answers their own gates; no operator
+//! signs in as them or answers for them unless the person's template lists
+//! `approvers: [principal, operator]`, and an attempt is refused and
+//! recorded. An operator lists everything, and revokes, forgets and reads a
+//! person's consent records — those three stay on the operator floor: an
 //! operator offboards, and keeps the audit. An enrolment's task says where
 //! to sign in and how it ended; a revocation's and an erasure's say what
 //! was done; a read of the consent records answers with them as its
@@ -78,21 +82,22 @@ fn served(
         let Some(d) = rt.delegation.clone() else {
             return Err(super::commands::unknown_op(op));
         };
-        let person = d.person.as_ref().map(|p| p.id.clone());
-        let theirs = |what: &str| -> Result<(), Value> {
-            if person.as_deref() == Some(principal.id.as_str()) {
-                return Ok(());
-            }
-            Err(refusal(
+        // Who is asking, as their session or the configuration names them —
+        // a per-person operator over the unix listener, an `a2a.login`
+        // session, a device session — or `None`: someone no grant is held by.
+        let acting =
+            crate::delegation::Acting::new(Some(&principal.id), principal.session.as_deref());
+        let who = d.who(acting).ok();
+        let not_theirs = |what: &str| {
+            refusal(
                 errors::PERMISSION_DENIED,
                 reason::PERMISSION_DENIED,
                 &format!(
-                    "{op} {what}, and {} is not the per-person operator ({}): no operator acts as them",
-                    principal.id,
-                    person.as_deref().unwrap_or("none is declared")
+                    "{op} {what}, and {} is no person agentd acts for: no operator acts as them",
+                    principal.id
                 ),
                 &[("op", op)],
-            ))
+            )
         };
         let new_task = |rt: &mut Runtime| {
             let task = rt.task_create(
@@ -109,12 +114,22 @@ fn served(
             task
         };
         match op {
-            "delegation.list" => Ok(DelegationAnswer::Doc(serde_json::json!({
-                "grants": d.list(),
-                "gates": rt.consent_list(&principal.id),
-            }))),
+            // An operator lists every grant and gate; anyone else their own.
+            "delegation.list" => {
+                let mine = (!principal.is_operator()).then(|| {
+                    who.as_ref()
+                        .map(|w| w.id.clone())
+                        .unwrap_or_else(|| principal.id.clone())
+                });
+                Ok(DelegationAnswer::Doc(serde_json::json!({
+                    "grants": d.list_of(mine.as_deref()),
+                    "gates": rt.consent_list(who.as_ref().map_or(principal.id.as_str(), |w| w.id.as_str()), principal.is_operator(), mine.as_deref()),
+                })))
+            }
             "delegation.enrol" => {
-                theirs("signs the per-person operator in")?;
+                let Some(who) = who.clone() else {
+                    return Err(not_theirs("signs a person in"));
+                };
                 let idp = args["idp"].as_str().unwrap_or_default().to_string();
                 let grant = match args["grant"].as_str() {
                     None => None,
@@ -131,19 +146,31 @@ fn served(
                     }
                 };
                 let task = new_task(rt);
-                let tx = rt.events_tx.clone();
-                let t = task.clone();
-                let started = crate::delegation::enrol::start(
-                    std::sync::Arc::clone(&d),
-                    &idp,
-                    grant,
-                    std::sync::Arc::new(move |said| {
-                        let _ = tx.send(crate::runtime::events::Event::DelegationSaid {
-                            task: t.clone(),
-                            said,
-                        });
-                    }),
-                );
+                let started = match (&who.session, grant) {
+                    // A display session signs in through a start link on the
+                    // listener origin, which its own browser opens.
+                    (
+                        Some(sid),
+                        None
+                        | Some(crate::config::settings::delegation::SignInGrant::AuthorizationCode),
+                    ) => rt.begin_enrol(&d, &who, sid, &idp, &task),
+                    _ => {
+                        let tx = rt.events_tx.clone();
+                        let t = task.clone();
+                        crate::delegation::enrol::start(
+                            std::sync::Arc::clone(&d),
+                            who,
+                            &idp,
+                            grant,
+                            std::sync::Arc::new(move |said| {
+                                let _ = tx.send(crate::runtime::events::Event::DelegationSaid {
+                                    task: t.clone(),
+                                    said,
+                                });
+                            }),
+                        )
+                    }
+                };
                 if let Err(e) = started {
                     rt.a2a_task_fail(&task, &format!("{op}: {e}"));
                 }
@@ -153,16 +180,26 @@ fn served(
             }
             "delegation.approve" | "delegation.deny" => {
                 let gate = args["gate"].as_str().unwrap_or_default().to_string();
-                // No operator answers for the person (T7): refused, and the
-                // attempt recorded.
-                if let Err(e) = theirs("answers for the person a consent gate asks") {
-                    rt.consent_refused(&gate, &principal.id, "not_the_person");
-                    return Err(e);
-                }
+                // Who answers, and how (RFC 0044 §5.10 rule 1): the person
+                // through a display session whose IdP sign-in is recent
+                // enough, a per-person operator over the unix listener, or —
+                // where the person's template lists them — an operator.
+                let answerer = match rt.consent_answerer(&d, principal, who.as_ref(), &gate) {
+                    Ok(a) => a,
+                    Err(why) => {
+                        rt.consent_refused(&gate, &principal.id, why.0);
+                        return Err(refusal(
+                            errors::PERMISSION_DENIED,
+                            reason::PERMISSION_DENIED,
+                            &format!("{op}: {}", why.1),
+                            &[("op", op)],
+                        ));
+                    }
+                };
                 let task = new_task(rt);
                 let answered = rt.consent_answer(
                     &gate,
-                    &principal.id,
+                    &answerer,
                     args["nonce"].as_str(),
                     args["args_hash"].as_str(),
                     op == "delegation.approve",
@@ -332,6 +369,55 @@ fn consent_records(
 
 #[cfg(feature = "xaa")]
 impl Runtime {
+    /// Begin `who`'s enrolment at `idp` from their display session `sid`
+    /// (RFC 0044 §5.4): eligible first — a template admits them, and a
+    /// device name is pinned, bound or first-bindable — then a sign-in
+    /// through a single-use start link on the listener origin, whose
+    /// callback proves the identity on that very session. Task `task` says
+    /// where to sign in, and the federation ends it.
+    pub(crate) fn begin_enrol(
+        &mut self,
+        d: &std::sync::Arc<crate::delegation::Delegation>,
+        who: &crate::delegation::Who,
+        sid: &str,
+        idp: &str,
+        task: &str,
+    ) -> Result<(), String> {
+        use crate::a2a::tasks::State;
+        d.eligible(who, idp).map_err(|e| e.to_string())?;
+        let authority = self
+            .a2a_serving
+            .as_ref()
+            .and_then(|s| s.authority.clone())
+            .ok_or("this listener issues no sessions, so it has no sign-in to start")?;
+        let (Some(signins), Some(issuer)) = (authority.signins(), authority.issuer()) else {
+            return Err("this listener has no sign-in at the IdP to start".into());
+        };
+        let link = signins.begin(
+            issuer,
+            crate::a2a::login::Purpose::Enrol {
+                sid: sid.to_string(),
+                task: task.to_string(),
+            },
+            idp,
+            None,
+        )?;
+        if let Some(t) = self.tasks.get_mut(task) {
+            t.sign_in_link = Some(serde_json::json!({
+                "idp": idp, "start_uri": link.uri,
+                "expires_at": crate::state::now_ms() + link.expires_in * 1000,
+            }));
+            t.transition(
+                State::Working,
+                Some(format!(
+                    "Open {} in your browser within {}s and sign in at {idp}: agentd binds {} to whoever signs in there",
+                    link.uri, link.expires_in, who.id
+                )),
+            );
+        }
+        Ok(())
+    }
+
     /// A delegation op's task moved on: what the sign-in says, or how it
     /// ended.
     pub(crate) fn delegation_said(&mut self, task: &str, said: crate::delegation::enrol::Said) {
@@ -342,6 +428,10 @@ impl Runtime {
         };
         if t.state.is_terminal() {
             return;
+        }
+        // An enrolment that ended has nothing more to sign in at.
+        if matches!(said, Said::Done(_) | Said::Answered(..)) {
+            t.sign_in_link = None;
         }
         match said {
             Said::Text(text) => t.transition(State::Working, Some(text)),

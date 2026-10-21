@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Instance-tier children**: a template whose instruction defines machinery
 //! spawns a FULL DAEMON — the same binary, `-c` a composed config — under the
-//! supervisor's reaper, wired to the parent as an A2A peer over a unix socket,
-//! retired by `ttl`/`until`/`subagent.retire` through the child's own graceful
-//! drain.
+//! supervisor's reaper, retired by `ttl`/`until`/`subagent.retire` through the
+//! child's own graceful drain.
+//!
+//! The parent reaches the child as its operator, over the child's own unix
+//! listener. The child reaches the parent only over the channel it is handed
+//! at spawn ([`crate::a2a::channel`]) — a descriptor no path names, opened by
+//! the parent alone — and arrives there as `instance:<handle>`, which may
+//! send `_instance.result` and `_instance.emit` for its own handle and
+//! nothing else. Its composed configuration carries no peer and no
+//! credential of its parent's, so it is the operator of nothing but itself;
+//! and since who it is no longer rests on its uid, it may run as a uid of
+//! its own (`spawn.instance_uid`), its directory made its own.
 //!
 //! The composed document is structured data, never prose the child re-parses
 //! into configuration. Directive extraction runs once at boot in
@@ -26,15 +35,89 @@ use std::path::PathBuf;
 /// Extra grace past the child's own drain window before SIGKILL.
 const KILL_GRACE_MS: u64 = 5_000;
 
-/// The peer an instance child reports home over, which its parent composes.
-const PARENT_PEER: &str = "parent";
+/// The peer an instance child reports home over: its parent, through the
+/// channel it was handed at spawn.
+pub(crate) const PARENT_PEER: &str = "parent";
 
-/// Whether the configured peer `name` is this process's parent: its `parent`
-/// peer, in an instance child. A child's whole `a2a` section is its parent's
-/// composition, so that peer is the parent's own listener.
+/// Whether `name` is this process's parent, as an instance child holding
+/// its channel names it.
 #[cfg(feature = "a2a")]
 pub(crate) fn is_parent_link(name: &str) -> bool {
-    name == PARENT_PEER && std::env::var_os(crate::supervisor::reap::INSTANCE_CHILD_ENV).is_some()
+    #[cfg(unix)]
+    return name == PARENT_PEER && crate::a2a::channel::held();
+    #[cfg(not(unix))]
+    return {
+        let _ = name;
+        false
+    };
+}
+
+/// Where the listener serves instance children's connections, once it is
+/// up. A connection a child opens before then — a child respawned at start,
+/// before the listener binds — waits for it.
+#[derive(Default)]
+pub(crate) struct DoorSlot {
+    #[cfg(all(unix, feature = "a2a"))]
+    door: std::sync::Mutex<Option<crate::a2a::serve::Door>>,
+    #[cfg(all(unix, feature = "a2a"))]
+    opened: std::sync::Condvar,
+}
+
+/// How long a child's connection waits for the listener to come up.
+#[cfg(all(unix, feature = "a2a"))]
+const DOOR_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl DoorSlot {
+    /// The listener is up: serve through `door` from now on.
+    #[cfg(all(unix, feature = "a2a"))]
+    pub(crate) fn open(&self, door: crate::a2a::serve::Door) {
+        *self.door.lock().unwrap_or_else(|e| e.into_inner()) = Some(door);
+        self.opened.notify_all();
+    }
+
+    /// Serve `stream`, which instance child `child` opened.
+    #[cfg(all(unix, feature = "a2a"))]
+    fn serve(&self, stream: std::os::unix::net::UnixStream, child: &str) {
+        let held = self.door.lock().unwrap_or_else(|e| e.into_inner());
+        let (held, _) = self
+            .opened
+            .wait_timeout_while(held, DOOR_WAIT, |d| d.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(door) = held.as_ref() {
+            door.serve_instance(stream, child);
+        }
+    }
+}
+
+/// Serve the connections instance child `handle` opens through `door`, the
+/// parent's end of its channel, until the child closes it: each on the
+/// listener, as `instance:<handle>`.
+#[cfg(all(unix, feature = "a2a"))]
+fn keep_door(
+    slot: std::sync::Arc<DoorSlot>,
+    door: std::os::fd::OwnedFd,
+    handle: String,
+    log: crate::obs::log::Logger,
+) {
+    let named = format!("instance-door:{handle}");
+    let spawned = std::thread::Builder::new().name(named).spawn(move || {
+        loop {
+            match crate::a2a::channel::accept(&door) {
+                Ok(Some(stream)) => slot.serve(stream, &handle),
+                Ok(None) => break,
+                Err(e) => {
+                    log.warn(
+                        "instance.channel.closed",
+                        json!({"handle": handle, "err": e.to_string()}),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("agentd: no thread for an instance child's channel: {e}");
+    }
 }
 
 /// Remove the copy of a key held only in memory composed into the instance
@@ -136,18 +219,6 @@ impl Runtime {
                 "subagent.run refused: a param for template '{tname}' names a secret ({{{{secret:…}}}} or {{{{secret-file:…}}}}); a param is data, and names no credential"
             ));
         }
-        // A child reports home over its `parent` peer; one that cannot be
-        // named there would run its work and then have every `_instance.*`
-        // report refused, leaving a sync spawn parked until its timeout.
-        // Refused here instead, before anything is created.
-        let parent_peer = self.parent_peer_entry();
-        if let Some(why) = self.parent_unreachable(parent_peer.as_ref()) {
-            self.log.warn(
-                "instance.spawn.refused",
-                json!({"template": tname, "reason": why}),
-            );
-            return err(format!("subagent.run refused: {why}"));
-        }
         // Durability class (call site > template > store.durability.work):
         // non-durable ⇒ memory-only record, child on a memory store in this
         // process's private directory, no restore-respawn — the throwaway
@@ -227,7 +298,6 @@ impl Runtime {
             until.as_deref(),
             durable,
             &handle,
-            parent_peer,
             &trace,
         ) {
             Ok(d) => d,
@@ -271,6 +341,9 @@ impl Runtime {
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": 0}),
             ),
             principal: caller.principal.clone(),
+            // A daemon of its own: it acts with no one's delegated grant.
+            session: None,
+            delegated_servers: Vec::new(),
             // What the caller carries, the child is handed (`withhold`).
             carries: self.caller_carries(caller),
             tokens: 0,
@@ -291,7 +364,7 @@ impl Runtime {
             dirty: true,
         };
         record.principal = self.spawn_principal(&record);
-        match self.spawn_instance_process(&config_path, &dir, &t.spec.limits, &prose) {
+        match self.spawn_instance_process(&handle, &config_path, &dir, &t.spec.limits, &prose) {
             Ok(pid) => {
                 record.pid = Some(pid);
                 record.status = "running".into();
@@ -339,7 +412,6 @@ impl Runtime {
         until: Option<&str>,
         durable: bool,
         handle: &str,
-        parent_peer: Option<Value>,
         trace: &crate::obs::trace::TraceContext,
     ) -> Result<Value, String> {
         let mut doc = t.fragment.clone();
@@ -437,11 +509,11 @@ impl Runtime {
         } else {
             json!({"kind": "memory"})
         };
-        let mut a2a = json!({"listen": format!("unix://{socket}")});
-        if let Some(peer) = parent_peer {
-            a2a["peers"] = json!([peer]);
-        }
-        doc["a2a"] = a2a;
+        // Its listener, which the parent dials as its operator; and no peer:
+        // it reaches its parent through the channel it is handed at spawn,
+        // and nothing of its parent's — no listener's path, no bearer — is
+        // in its configuration.
+        doc["a2a"] = json!({"listen": format!("unix://{socket}")});
         let mut lifecycle = json!({});
         if let Some(u) = until {
             lifecycle["until_signal"] = json!(u);
@@ -491,9 +563,12 @@ impl Runtime {
         if security.as_object().is_some_and(|o| !o.is_empty()) {
             doc["security"] = security;
         }
-        // Its own workers run as this one's do (`sec::worker`). The child
-        // itself keeps this process's uid: it answers here as the operator.
-        if let Some((uid, gid)) = crate::sec::worker::get() {
+        // Its own workers run as this one's do (`sec::worker`) — unless the
+        // child itself runs as a uid of its own (`spawn.instance_uid`): it
+        // holds no capability to drop them further, so they run as it does.
+        if self.settings.spawn.instance().is_none()
+            && let Some((uid, gid)) = crate::sec::worker::get()
+        {
             doc["spawn"] = json!({"uid": uid, "gid": gid});
         }
         // MCP Events bindings and grants are the parent operator's alone
@@ -614,74 +689,49 @@ impl Runtime {
         std::fs::write(config, rendered).map_err(|e| format!("write {}: {e}", config.display()))
     }
 
-    /// The child's `parent` peer entry — only when the parent has a listener,
-    /// and never carrying an inline credential into a file on disk.
-    fn parent_peer_entry(&self) -> Option<Value> {
-        let listen = self.settings.a2a.listen.as_deref()?;
-        let endpoint = if let Some(rest) = listen
-            .strip_prefix("unix://")
-            .or_else(|| listen.strip_prefix("unix:"))
-        {
-            format!("unix://{rest}")
-        } else {
-            // A bind authority (possibly 0.0.0.0) → a dialable loopback URL.
-            listen
-                .replace("0.0.0.0", "127.0.0.1")
-                .replace("[::]", "[::1]")
-        };
-        let mut peer = json!({"name": PARENT_PEER, "endpoint": endpoint});
-        if let Some(bearer) = &self.settings.a2a.bearer {
-            if crate::sec::secret::has_secret_ref(&bearer.0) {
-                peer["headers"] = json!({"Authorization": format!("Bearer {}", bearer.0)});
-            } else {
-                // An inline bearer must not be written to the child's config
-                // file; over a unix listener SO_PEERCRED covers same-uid
-                // children anyway.
-                self.log.warn(
-                    "instance.parent_peer",
-                    json!({"note": "a2a.bearer is inline (not a {{secret:…}} reference); the child gets no credential for its `parent` peer"}),
-                );
-            }
-        }
-        Some(peer)
-    }
-
-    /// Why a child could not authenticate to this parent, if it could not.
-    ///
-    /// Every report a child sends home is an `_instance.*` op, which only the
-    /// operator may send. Over a unix listener the kernel names the child's
-    /// uid, and a loopback listener with no auth at all makes any caller the
-    /// operator; anywhere else the child is the operator only by presenting
-    /// the operator's bearer, and [`Self::parent_peer_entry`] writes one only
-    /// when it is a `{{secret:…}}` reference. The posture is read from the
-    /// settings in force NOW, so a reload that added a principal — ending the
-    /// implicit operator — is seen by the next spawn.
-    fn parent_unreachable(&self, peer: Option<&Value>) -> Option<&'static str> {
-        let auth = crate::runtime::surface::auth::listener_auth_of(&self.settings.a2a);
-        let tcp = self.settings.a2a.listen.is_some() && !auth.unix;
-        let authorized = peer.is_some_and(|p| p["headers"].get("Authorization").is_some());
-        (tcp && !auth.implicit_operator && !authorized).then_some(
-            "the child cannot authenticate to its parent: make a2a.bearer a {{secret:…}} reference or use a unix listener",
-        )
-    }
-
-    /// Spawn the child daemon ([`instance_command`], logging to `<dir>/log`)
-    /// under the reaper. `delivered` is the instruction prose the composed
-    /// config carries, already delivered here.
+    /// Spawn the child daemon `handle` ([`instance_command`], logging to
+    /// `<dir>/log`) under the reaper, handed its channel to this parent
+    /// when this parent serves A2A, and — under `spawn.instance_uid` — as
+    /// that uid, its directory made its own first. `delivered` is the
+    /// instruction prose the composed config carries, already delivered
+    /// here.
     fn spawn_instance_process(
         &mut self,
+        handle: &str,
         config_path: &std::path::Path,
         dir: &std::path::Path,
         limits: &Option<Value>,
         delivered: &str,
     ) -> Result<i32, String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let run_as = self.settings.spawn.instance();
+        if let Some(ids) = run_as {
+            make_own(dir, ids)?;
+        }
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join("log"))
             .map_err(|e| format!("open log: {e}"))?;
-        let mut cmd = instance_command(&exe, config_path, log_file, limits, delivered)?;
+        // The channel: only where this parent serves A2A, whose router the
+        // child's connections are served by.
+        #[cfg(all(unix, feature = "a2a"))]
+        let channel = if self.settings.a2a.listen.is_some() {
+            Some(crate::a2a::channel::pair().map_err(|e| format!("instance channel: {e}"))?)
+        } else {
+            None
+        };
+        #[cfg(not(all(unix, feature = "a2a")))]
+        let channel: Option<((), std::os::fd::OwnedFd)> = None;
+        let mut cmd = instance_command(
+            &exe,
+            config_path,
+            log_file,
+            limits,
+            delivered,
+            channel.as_ref().map(|(_, child)| child),
+            run_as,
+        )?;
         let child =
             crate::supervisor::reaper::spawn_tracked_pid(&self.children.reap_sender(), || {
                 cmd.spawn()
@@ -690,6 +740,20 @@ impl Runtime {
         let pid = child.id() as i32;
         // The reaper owns the exit; the std handle would only race it.
         std::mem::forget(child);
+        // The child holds its end now; this one's copy goes, so the parent's
+        // end reads end-of-file when the child exits.
+        #[cfg(all(unix, feature = "a2a"))]
+        if let Some((door, child_end)) = channel {
+            drop(child_end);
+            keep_door(
+                std::sync::Arc::clone(&self.instance_doors),
+                door,
+                handle.to_string(),
+                self.log.clone(),
+            );
+        }
+        #[cfg(not(all(unix, feature = "a2a")))]
+        let _ = (handle, channel);
         Ok(pid)
     }
 
@@ -881,7 +945,7 @@ impl Runtime {
                 self.persist_subagent(&handle);
                 continue;
             }
-            match self.spawn_instance_process(&path, &dir, &limits, &delivered) {
+            match self.spawn_instance_process(&handle, &path, &dir, &limits, &delivered) {
                 Ok(pid) => {
                     if let Some(s) = self.subagents.get_mut(&handle) {
                         s.pid = Some(pid);
@@ -1025,7 +1089,10 @@ impl Runtime {
                 refused.event,
                 json!({"op": op.name(), "principal": principal.id, "note": refused.note}),
             );
-            format!("{} is operator-only", op.name())
+            format!(
+                "{} is a child's report: the child's own, or the operator's",
+                op.name()
+            )
         })?;
         let report = self.a2a_trace.clone();
         self.consume_instance_op(admitted, args, report.as_ref())
@@ -1074,6 +1141,20 @@ impl Runtime {
         let op = admitted.op();
         let link = report.map(crate::obs::trace::TraceContext::traceparent);
         let handle = args["handle"].as_str().unwrap_or("").to_string();
+        // A child reports for itself: its channel named it, and no other
+        // handle is its to report for.
+        if let Some(own) = admitted.child()
+            && own != handle
+        {
+            self.log.warn(
+                "instance.op.refused",
+                json!({"op": op.name(), "principal": format!("instance:{own}"), "handle": handle,
+                       "note": "a child reports for its own handle alone"}),
+            );
+            return Err(format!(
+                "instance:{own} reports for itself alone, and this report is {handle:?}'s"
+            ));
+        }
         let live = self.subagents.get(&handle).is_some_and(|s| {
             s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status)
         });
@@ -1269,12 +1350,20 @@ impl Runtime {
         if let Some(d) = &self.private_instances {
             return Ok(d.0.clone());
         }
-        let base = user_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR"))
-            .unwrap_or_else(std::env::temp_dir);
+        // Under `spawn.instance_uid` the children's uid must reach the
+        // directory: it is under the system temporary directory, which
+        // every uid may enter, and others may pass through it but not list
+        // it. Each child's own directory inside is made the child's.
+        let other_uid = self.settings.spawn.instance().is_some();
+        let base = if other_uid {
+            std::env::temp_dir()
+        } else {
+            user_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")).unwrap_or_else(std::env::temp_dir)
+        };
         let dir = base.join(format!("agentd-{}", self.process_nonce));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, if other_uid { 0o711 } else { 0o700 });
         builder
             .create(&dir)
             .map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -1339,6 +1428,8 @@ fn instance_command(
     log_file: std::fs::File,
     limits: &Option<Value>,
     delivered: &str,
+    channel: Option<&std::os::fd::OwnedFd>,
+    run_as: Option<(u32, u32)>,
 ) -> Result<std::process::Command, String> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--config")
@@ -1406,9 +1497,16 @@ fn instance_command(
             });
         }
     }
-    // An instance is handed its log and nothing else: every descriptor
-    // from 3 up is marked.
+    // An instance is handed its log and its channel to this parent, and
+    // nothing else: every descriptor from 3 up is marked, and the channel
+    // then placed at its number unmarked.
     crate::signals::pass_only_stdio(&mut cmd);
+    #[cfg(unix)]
+    if let Some(end) = channel {
+        crate::a2a::channel::hand_to(&mut cmd, end);
+    }
+    #[cfg(not(unix))]
+    let _ = channel;
     // An instance is a supervisor of its own, and is handed none of this
     // one's supervisor-only secrets, nor any variable outside the
     // allow-list — and, where this configuration holds a supervisor-only
@@ -1416,6 +1514,11 @@ fn instance_command(
     // its config, log, socket and store, under this store's root when it is
     // durable — stays its own.
     crate::sec::harden::confine(&mut cmd, &wanted);
+    // Under `spawn.instance_uid` it starts as that uid, holding no
+    // capability, before it enters its Landlock domain.
+    if let Some(ids) = run_as {
+        crate::sec::worker::start_instance_as(&mut cmd, ids);
+    }
     let own: Vec<std::path::PathBuf> = config_path
         .parent()
         .map(|d| d.to_path_buf())
@@ -1423,6 +1526,47 @@ fn instance_command(
         .collect();
     crate::sec::landlock::confine_beside(&mut cmd, &own).map_err(|e| e.to_string())?;
     Ok(cmd)
+}
+
+/// Make the instance directory `dir` — its config, its log, a key copy, and
+/// whatever a respawned child left in it — the instance uid's (`ids`), after
+/// checking that uid can reach it: every directory above it must let the
+/// uid pass. A durable child's directory is under this store's root, which
+/// the operator makes passable for the instance uid (`docs/subagents.md`);
+/// agentd changes the owner of nothing outside the directory it made.
+fn make_own(dir: &std::path::Path, (uid, gid): (u32, u32)) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    for a in dir.ancestors().skip(1) {
+        let Ok(m) = std::fs::metadata(a) else {
+            continue;
+        };
+        let passes =
+            m.uid() == uid || m.mode() & 0o001 != 0 || (m.gid() == gid && m.mode() & 0o010 != 0);
+        if !passes {
+            return Err(format!(
+                "spawn.instance_uid {uid} cannot reach {}: {} is not passable for it (o+x) — make the path to the instance directories passable for the instance uid",
+                dir.display(),
+                a.display()
+            ));
+        }
+    }
+    fn walk(p: &std::path::Path, uid: u32, gid: u32) -> Result<(), String> {
+        std::os::unix::fs::lchown(p, Some(uid), Some(gid))
+            .map_err(|e| format!("make {} the instance uid's: {e}", p.display()))?;
+        let is_dir = std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            for e in std::fs::read_dir(p)
+                .map_err(|e| format!("read {}: {e}", p.display()))?
+                .flatten()
+            {
+                walk(&e.path(), uid, gid)?;
+            }
+        }
+        Ok(())
+    }
+    walk(dir, uid, gid)
 }
 
 /// Whether `v` spells a secret reference anywhere.
@@ -1688,15 +1832,22 @@ mod admission {
     use super::InstanceOp;
     use crate::config::settings::Role;
 
-    /// A report [`admit`] let through. Its field is private to this module,
-    /// so nothing outside it can make one: a consumer that takes an
-    /// `Admitted` cannot be reached without asking.
+    /// A report [`admit`] let through, and — sent by a child itself — the
+    /// handle it may be for. Its fields are private to this module, so
+    /// nothing outside it can make one: a consumer that takes an `Admitted`
+    /// cannot be reached without asking.
     #[derive(Debug, PartialEq)]
-    pub(crate) struct Admitted(InstanceOp);
+    pub(crate) struct Admitted(InstanceOp, Option<String>);
 
     impl Admitted {
         pub(crate) fn op(&self) -> InstanceOp {
             self.0
+        }
+
+        /// The child that sent it, when a child did: its report is for its
+        /// own handle alone.
+        pub(crate) fn child(&self) -> Option<&str> {
+            self.1.as_deref()
         }
     }
 
@@ -1708,34 +1859,38 @@ mod admission {
         pub(crate) note: &'static str,
     }
 
-    /// Only the operator speaks for a child: an `agent` that could write a
-    /// child's result could decide what the parent believes its own subagent
-    /// answered. A child dials home with the parent's own operator credential
-    /// (its unix socket, or the `a2a.bearer` reference it was composed with)
-    /// — but the resolver tries the configured principal rules first, so on
-    /// a parent with a catch-all `any` rule that credential resolves to the
-    /// rule's role, and the child's reports are refused here with
-    /// `instance.op.refused`. Refusing such a spawn up front, by name, is the
-    /// spawn's job, not this check's.
-    pub(crate) fn admit(role: Role, op: InstanceOp) -> Result<Admitted, Refused> {
+    /// Only the child itself — through the channel it was handed at spawn,
+    /// which names it `instance:<handle>` — and the operator speak for a
+    /// child: an `agent` or a user that could write a child's result could
+    /// decide what the parent believes its own subagent answered. `child` is
+    /// the handle of the child the caller is, when it is one.
+    pub(crate) fn admit(
+        role: Role,
+        child: Option<&str>,
+        op: InstanceOp,
+    ) -> Result<Admitted, Refused> {
+        if let Some(h) = child {
+            return Ok(Admitted(op, Some(h.to_string())));
+        }
         if role == Role::Operator {
-            Ok(Admitted(op))
+            Ok(Admitted(op, None))
         } else {
             Err(Refused {
                 event: "instance.op.refused",
-                note: "only the operator speaks for a child",
+                note: "only the child itself, through its channel, or the operator speaks for a child",
             })
         }
     }
 
-    /// [`admit`], asked of the caller a request resolved to — its own role,
-    /// never one the asker picks. A request's path asks this; only the inbox,
-    /// which holds a role and no principal, asks `admit` directly.
+    /// [`admit`], asked of the caller a request resolved to — its own role
+    /// and its own channel, never one the asker picks. A request's path asks
+    /// this; only the inbox, which holds a role and an id, asks `admit`
+    /// directly.
     pub(crate) fn admit_caller(
         principal: &crate::a2a::Principal,
         op: InstanceOp,
     ) -> Result<Admitted, Refused> {
-        admit(principal.role, op)
+        admit(principal.role, principal.instance_handle(), op)
     }
 }
 #[cfg(feature = "a2a")]
@@ -1763,17 +1918,23 @@ fn inbox_report(ev: &crate::state::InboxEvent) -> Option<Result<(Admitted, Value
     if !op.starts_with("_instance.") {
         return None;
     }
-    // A role the event does not name is nobody's, and refused as one.
+    // A role the event does not name is nobody's, and refused as one; the
+    // child is the one the transport named the event's sender, never one
+    // its payload names.
     let role: Role = serde_json::from_value(ev.payload["role"].clone()).unwrap_or(Role::Anonymous);
+    let child = ev
+        .principal
+        .as_deref()
+        .and_then(|p| p.strip_prefix("instance:"));
     let Some(kind) = InstanceOp::of(&op) else {
         // Asked of the role first all the same, so a non-operator is told
         // it may not report rather than which reports exist.
-        return Some(Err(match admit(role, InstanceOp::Result) {
+        return Some(Err(match admit(role, child, InstanceOp::Result) {
             Err(refused) => InboxRefusal::NotOperator(op, refused),
             Ok(_) => InboxRefusal::Unknown(op),
         }));
     };
-    let admitted = match admit(role, kind) {
+    let admitted = match admit(role, child, kind) {
         Ok(admitted) => admitted,
         Err(refused) => return Some(Err(InboxRefusal::NotOperator(op, refused))),
     };
@@ -1840,11 +2001,16 @@ mod tests {
     fn only_the_operator_speaks_for_a_child() {
         use crate::config::settings::Role;
         for op in [InstanceOp::Result, InstanceOp::Emit] {
-            assert_eq!(admit(Role::Operator, op).map(|a| a.op()), Ok(op));
+            assert_eq!(admit(Role::Operator, None, op).map(|a| a.op()), Ok(op));
             for role in [Role::Agent, Role::User, Role::Anonymous] {
-                let refused = admit(role, op).expect_err("refused");
+                let refused = admit(role, None, op).expect_err("refused");
                 assert_eq!(refused.event, "instance.op.refused", "{role:?} {op:?}");
             }
+            // The child itself, through its channel: admitted, for its own
+            // handle alone.
+            let child = admit(Role::Agent, Some("inst-1"), op).expect("the child");
+            assert_eq!(child.child(), Some("inst-1"));
+            assert_eq!(admit(Role::Operator, None, op).unwrap().child(), None);
         }
         // …and the inbox path asks it: a report that reached the inbox from
         // anyone but the operator is consumed as a refusal, never as the
@@ -2145,8 +2311,16 @@ mod tests {
         assert!(stray.held_in(&plain), "a plain spawn inherits it: {plain}");
         let log = exe.with_file_name("log");
         let file = std::fs::File::create(&log).unwrap();
-        let mut cmd = instance_command(&exe, std::path::Path::new("unused.yaml"), file, &None, "")
-            .expect("the command builds");
+        let mut cmd = instance_command(
+            &exe,
+            std::path::Path::new("unused.yaml"),
+            file,
+            &None,
+            "",
+            None,
+            None,
+        )
+        .expect("the command builds");
         assert!(run(&mut cmd).status.success());
         let fds = std::fs::read_to_string(&log).unwrap();
         cleanup(&exe);
@@ -2165,6 +2339,8 @@ mod tests {
             log,
             &None,
             "",
+            None,
+            None,
         )
         .expect("the command builds");
         let mark = cmd

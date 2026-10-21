@@ -193,21 +193,39 @@ pub(crate) fn spawn_a2a_listener(
             crate::a2a::oauth::system_clock(),
         ))
     });
+    // The sign-ins at the IdP on this origin (RFC 0044 §5.4) wherever the
+    // listener issues sessions: `a2a.login`'s, and the enrolments and
+    // step-ups a signed-in person starts — completed by the delegation
+    // supervisor once it installs itself as their federation.
+    let issues = crate::runtime::surface::auth::listener_auth_of(a2a).issues_sessions();
+    let signins = (issues && !unix_listener).then(|| {
+        Arc::new(crate::a2a::login::SignIns::new(
+            a2a.login.as_ref().map(|l| crate::a2a::login::LoginCfg {
+                idp: l.idp.clone(),
+                token_ttl: l.token_ttl(),
+            }),
+            crate::a2a::oauth::system_clock(),
+            crate::a2a::oauth::os_mint(),
+        ))
+    });
     let authority = sessions
         .as_ref()
-        .filter(|_| a2a.device_grant.enabled || launch.is_some())
+        .filter(|_| issues || launch.is_some())
         .map(|s| {
-            Arc::new(crate::a2a::oauth::Authority::new(
-                a2a.device_grant.enabled.then(|| {
-                    crate::a2a::oauth::DeviceGrant::new(
-                        &a2a.device_grant,
-                        crate::a2a::oauth::system_clock(),
-                        crate::a2a::oauth::os_mint(),
-                    )
-                }),
-                launch.clone(),
-                Arc::clone(s),
-            ))
+            Arc::new(
+                crate::a2a::oauth::Authority::new(
+                    a2a.device_grant.enabled.then(|| {
+                        crate::a2a::oauth::DeviceGrant::new(
+                            &a2a.device_grant,
+                            crate::a2a::oauth::system_clock(),
+                            crate::a2a::oauth::os_mint(),
+                        )
+                    }),
+                    launch.clone(),
+                    Arc::clone(s),
+                )
+                .with_signins(signins.clone()),
+            )
         });
     if let Some(slot) = &launch {
         slot.attach_log(log.clone());
@@ -259,7 +277,7 @@ pub(crate) fn spawn_a2a_listener(
     };
     log.info(
         "a2a.listen",
-        json!({"authority": listen, "bound": serving.bound, "url": serving.advertised_url, "tls": tls_scheme, "mtls": posture.mtls, "required": posture.required, "implicit_operator": posture.implicit_operator, "device_grant": a2a.device_grant.enabled, "events": a2a.events.enabled, "introspection": a2a.introspection.enabled}),
+        json!({"authority": listen, "bound": serving.bound, "url": serving.advertised_url, "tls": tls_scheme, "mtls": posture.mtls, "required": posture.required, "implicit_operator": posture.implicit_operator, "device_grant": a2a.device_grant.enabled, "login": a2a.login.is_some(), "events": a2a.events.enabled, "introspection": a2a.introspection.enabled}),
     );
     Ok(serving)
 }

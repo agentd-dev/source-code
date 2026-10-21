@@ -221,6 +221,11 @@ pub struct InboxEvent {
     /// durable, so a replay continues the trace the event started in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<crate::obs::trace::TraceContext>,
+    /// The RFC 0043 session the event's principal sent it through, when it
+    /// did (RFC 0044 §5.12): set by the transport that authenticated it,
+    /// beside the payload, never read from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -241,6 +246,7 @@ impl InboxEvent {
             payload,
             status: InboxStatus::Pending,
             trace: None,
+            session: None,
         }
     }
 }

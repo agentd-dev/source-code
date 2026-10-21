@@ -1289,7 +1289,117 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   can set its uid back to agentd's. Refused at load where agentd cannot drop
   to them (neither root nor `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL`; root
   needed with an instance-tier template), and for agentd's own uid, root's
-  or an external signer's. An instance child itself keeps agentd's uid.
+  or an external signer's. An instance child itself keeps agentd's uid,
+  unless `spawn.instance_uid` gives it one of its own.
+- Many people, each acting through their own IdP (RFC 0044 P2, part 1, the
+  `xaa` feature): an `identity.delegation.templates` entry admits principals
+  by `source` — `operator` (a per-person operator; several rules may each
+  pin one person), `oidc` (a person signed in through `a2a.login`) or
+  `device` (an RFC 0043 device session whose name an operator bound to one
+  person). Each grant is keyed by the person's typed principal at the IdP's
+  issuer; no token, ID-JAG cache entry or MCP connection is shared between
+  two people.
+- `a2a.login: {idp, token_ttl}`: a display client signs a person in at an
+  `identity.providers` entry on a TCP listener. `POST
+  /oauth2/login_authorization` (named `login_authorization_endpoint` in the
+  RFC 8414 metadata) answers with a start link and a request code; the
+  link, single use and good for 60 seconds, sets a `__Host-` cookie bound to
+  the sign-in and sends the browser to the IdP with PKCE; `/oauth2/callback`
+  is taken only with that cookie, so an IdP URL forwarded to someone else
+  fails there; the client polls `/oauth2/token` with the grant
+  `https://agentd.dev/oauth/grant-type/login` and is issued a session of
+  `user:oidc:<iss>#<sub>` (`fs_…`) carrying the IdP proof, never an IdP
+  token. Where a template admits the person the sign-in is their enrolment;
+  where none does they are signed in and the refresh token is revoked at
+  the IdP. The listener declares `bearer`, grants a loopback caller no
+  implicit operator and serves `/oauth2/revoke`. Logged
+  `auth.login.signed_in`; the feed's `auth` kind gains `signed_in`.
+- Device principals that delegate: `identity.delegation.device_pins.<name>:
+  {iss, sub}` binds a device name to one person, and
+  `identity.delegation.device_first_binding: true` binds an unpinned name
+  to its first enrolment (a load warning says the risk). A device session
+  enrols with `delegation.enrol` — its task's `signIn` annotation is the
+  start link — and uses the grant only while the IdP proof it holds is the
+  name's person: another device under the name, or one that proved someone
+  else, is `not_enrolled`, and a sign-in as someone else is
+  `binding_mismatch`, the grant untouched. `auth.sessions` shows each
+  session's `source` and `idp_proof`; `delegation.enrolled` its `session`
+  and `bound_by`.
+- Work acts through the session it was started through: a run, a
+  conversation turn, a subagent, a signal, a message — and the runs, turns
+  and messages they start — carry the RFC 0043 session id. When it ends —
+  revoked, expired, or a restart — the work's next delegated call fails
+  `revoked`, and a consent gate it waits on closes `revoked` at once
+  (`delegation.consent` `via: revoked`).
+- The person's consent gate in their display client: the gate is shown on
+  the task of the work it holds (`input-required`, badged, its
+  `consentGate` annotation naming it) and answered with `delegation.approve`
+  or `delegation.deny` through a session whose own IdP sign-in is younger
+  than `identity.delegation.consent_session_max_age` (`12h`; refused
+  `stale_session` or `no_idp_sign_in` otherwise, `via: gate` when taken).
+  `templates[].approvers: [principal, operator]` lets an operator answer too
+  (`via: operator`). When the IdP asks for a fresher sign-in, the call waits
+  on a sign-in gate instead — a start link (`kind: authorize`) or the IdP's
+  device grant (`kind: device`, polled off the loop, its code sealed under
+  the person's key in the step's wait) — and is made with the fresh ID token
+  once the grant's own person signs in; a restart resumes a device gate's
+  polling and closes an `authorize` one.
+- `templates[].subagents: inherit`: a subagent's call, and a run it starts,
+  acts with the person's grant at the delegated servers the subagent itself
+  declared, holding no token. `templates[].agent_mode_servers` and
+  `servers.<name>.document_workflows` load, are validated and warn that they
+  change nothing until RFC 0044 P2's second part.
+- A reload applies `identity.delegation.templates`, `device_pins`,
+  `device_first_binding`, `consent_session_max_age` and `consent_timeout`:
+  a narrowed template holds its grants at the next call; a removed template,
+  a server removed from one, a changed or removed pin and first binding
+  turned off revoke what they allowed — at the IdP, tombstoned, off the loop
+  — and drop those device names' sessions' proofs
+  (`delegation.bindings.cleared`).
+- An instance child's own channel to its parent: at spawn the parent hands
+  the child one end of a socket pair at fd 3 (`AGENTD_INSTANCE_CHANNEL`),
+  and every connection the child opens over it is `instance:<handle>`, named
+  by the channel. That principal may send `_instance.result` and
+  `_instance.emit` about its own handle and nothing else
+  (`instance.op.refused`); the child logs `instance.channel` as it takes it.
+- `spawn.instance_uid`, `spawn.instance_gid`: agentd running as root starts
+  each instance child under that uid and gid, with no capability and inside
+  its Landlock domain, after making its directory the child's; its own
+  workers run under it too. Refused at load for root's, agentd's own, a
+  signer's uid or `spawn.uid`, and where agentd is not root.
+- The display clients sign people in at their IdP and answer their gates:
+  `agentd-tui --login idp`, the web UI's **sign in with your organization**,
+  `/enrol <idp>`, `/consent` (`approve <gate>`, `deny <gate>`) and the web
+  UI's consent panel; a reply never answers a consent gate. The client core
+  gains `idpLoginOf`, `idpLogin`, `LOGIN_GRANT_TYPE`, `IdpLoginRefused`,
+  `IdpLoginExpired`, `consentWait`, `consentLine`,
+  `parseDelegationCommand`, `runDelegationCommand`, and `TaskView`'s
+  `consentGate` and `signIn`.
+- `examples/okta-xaa-mcp.yaml`: people signing in through `a2a.login` and a
+  pinned laptop, validated on a build with `xaa`.
+- Fourteen `ema` conformance checks of the first part of P2: a login is the
+  enrolment, two people two grants, tools offered only with a grant, a
+  forwarded sign-in fails at the
+  callback, no template no grant, an unpinned device needs first binding, a
+  pinned device binds its pin alone, one device name one binding, a gate is
+  answered through a fresh sign-in, an ended session ends its delegation, a
+  gate survives a restart, the login listener's rules, a reload narrows then
+  revokes, and a subagent inherits what it declares;
+  `ema/step-up-uses-the-fresh-id-token` now proves the sign-in gate. The
+  suite's binary is built with `hot-reload` too.
+- `agentd-core`: `a2a::login` (`SignIns`, `Federation`, `Purpose`, `Ask`,
+  `Answer`, `Signed`, `StartLink`, `LOGIN_GRANT_TYPE` and its paths);
+  `a2a::channel`; `a2a::oauth::Session::{typed, proof}`, `IdpProof`,
+  `Sessions::{session, set_proof, drop_proofs}` and
+  `Authority::{with_signins, signins}`;
+  `a2a::Principal::{instance, instance_handle}`;
+  `runtime::surface::auth::ListenerAuth::{login, issues_sessions}`;
+  `delegation::{Acting, Who, WhoKind, SessionBook, SessionInfo}` and
+  `Delegation::{who, session_live, sessions_to, templates, reload,
+  revoke_grant, eligible}`, `admit` and `usable` taking an `Acting`;
+  `config::settings::delegation::{A2aLogin, Approver, SubagentsMode,
+  DocumentWorkflow}`; `sec::worker::{instance_refusal,
+  instance_refusal_here, start_instance_as}`.
 - `agentd-core`: `engine::run::Carries::{taint,
   tainted, holds_delegated_data, taint_sources, kept_by_holder}` and
   `engine::run::DELEGATED`; `context::memory::Memory::{set_carrying,
@@ -1354,6 +1464,30 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   stays open.
 - **Breaking:** the reference signer's `idp` and `ras` keys sign nothing
   until the `keys` knob gives each its `audiences`.
+- **Breaking:** an instance child reaches its parent only over the channel
+  its parent handed it, as `instance:<handle>`: its composed configuration
+  no longer carries a `parent` peer with the parent's bearer, and a child
+  never reaches its parent as the operator. A child's machinery that called
+  any of its parent's ops but its two reports is refused now: send what the
+  parent needs as `_instance.emit` on a mirrored stream, or as its result.
+  An instance-tier spawn is no longer refused for want of a parent
+  credential.
+- **Breaking:** `delegation.enrol`, `delegation.list`, `delegation.approve`
+  and `delegation.deny` are open to any named caller and decided by who the
+  caller is — a person enrols themself, lists their own grants and gates,
+  and answers their own gates; an operator lists everything. They were the
+  operator's floor; a client that offered them to operators alone reads
+  `params.ops` again.
+- **Breaking:** a template's `principals.source` is `operator`, `oidc` or
+  `device`, and required; `oidc` needs an `a2a.login` at the template's IdP
+  and `device` the device grant; `x509` (P2's second part) and `bearer`
+  (`principal_not_delegable`) are refused by name. Several per-person
+  operators load beside each other.
+- **Breaking:** an `insufficient_user_authentication` from the IdP waits on
+  a sign-in gate — a start link for a display session's work, the IdP's
+  device grant for a per-person operator's where the provider's
+  `sign_in.grants` offers it — rather than failing the call `step_up`; it
+  still fails `step_up` where neither is offered.
 - `--delegation-list` shows a gate's arguments, its text and its binding
   only to the person who answers it; anyone else sees its id, tool, server,
   principal and deadline. The `delegation.consent` log line carries a
@@ -1652,10 +1786,13 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - A principal rule with `match.uid` makes the unix listener's peer of that
   uid `operator:<id>`, owning its tasks and conversations by that id; every
   other unix peer is `operator`, as before.
-- `identity.providers` and `identity.delegation` are restart-only, and a
-  reload that adds, removes or changes a `grant: id_jag` server, or changes
-  the per-person operator's `a2a.principals` rule, refuses with
-  `config.reload.restart_required`.
+- `identity.providers` and `identity.delegation`'s keys and caps
+  (`seal_key`, `seal_key_previous`, `key_custody`, `signer`, `at_cache_cap`,
+  `liveness_interval`) are restart-only, and a reload that adds, removes or
+  changes a `grant: id_jag` server, or adds, removes or changes a
+  per-person operator's `a2a.principals` rule, refuses with
+  `config.reload.restart_required`; its templates, pins, first binding and
+  consent timing reload.
 - A `wait` whose `on` is none of its forms is refused at load, listing
   them. Before, the step failed when it ran. `task` on any other wait than
   `on: mcp_task` is refused too.

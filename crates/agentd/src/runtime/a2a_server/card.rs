@@ -949,10 +949,11 @@ mod tests {
                     "{name}: an alternative without the certificate: {c}"
                 );
             }
-            // Every mechanism the listener accepts is declared.
+            // Every mechanism the listener accepts is declared: a session
+            // of the device grant or of the IdP login is a bearer token.
             assert_eq!(
                 declared.contains(&"bearer"),
-                posture.bearer || posture.device,
+                posture.bearer || posture.issues_sessions(),
                 "{name}"
             );
             assert_eq!(declared.contains(&"mtls"), posture.mtls, "{name}");

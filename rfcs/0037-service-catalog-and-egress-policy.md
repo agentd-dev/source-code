@@ -114,7 +114,10 @@ of whatever configs accumulated.
    RFC 0036 instance-tier children receive the parent's catalog in their
    composed payload. A template's `:::mcp` machinery resolves against it
    under the same rules; in `closed` mode a template may only reference.
-   Nothing a child or a model can author adds an entry.
+   Nothing a child or a model can author adds an entry. (Since RFC 0044
+   §7.P2c, a child's link to its parent is a channel the parent hands it at
+   spawn, not an `a2a.peers` entry: it names no URL, so `closed` egress has
+   nothing of it to check, and it reaches only the child's own reports.)
 6. **Small configs owe nothing.** `services:` absent → today's behavior,
    exactly, minus nothing. The section is for deployments that have
    earned the ceremony.

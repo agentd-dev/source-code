@@ -323,6 +323,13 @@ pub struct RunState {
     /// whatever principal it runs as. Durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
+    /// The RFC 0043 session a signed-in person started this run through
+    /// (RFC 0044 §5.12): the run's delegated calls act through it while it
+    /// lives, and fail `revoked` once it has ended — revoked, expired, or
+    /// lost to a restart, which ends every session. Durable, so a run that
+    /// outlives its session outlives its delegated authority too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -415,6 +422,7 @@ impl RunState {
             task: None,
             principal: None,
             subagent: None,
+            session: None,
             conversation: None,
             children: Vec::new(),
             parent: None,

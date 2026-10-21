@@ -43,6 +43,9 @@ pub const AT_CACHE_CAP: std::time::Duration = std::time::Duration::from_secs(60 
 pub const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// How long a consent gate waits for the person.
 pub const CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// How recent a session's IdP sign-in must be for it to answer a gate.
+pub const CONSENT_SESSION_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(12 * 60 * 60);
 /// The longest a grant lives, and its default.
 pub const MAX_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
 /// Default mint budgets (RFC 0044 §5.5): twice one fully active day, 80% of
@@ -209,6 +212,18 @@ pub struct Delegation {
     pub liveness_interval: Option<Dur>,
     /// How long a consent gate waits before it denies; default 24h.
     pub consent_timeout: Option<Dur>,
+    /// How recent a display session's IdP sign-in must be for that session
+    /// to answer a consent gate; default 12h.
+    pub consent_session_max_age: Option<Dur>,
+    /// RFC 0043 device names (`auth.device.approve {as: <name>}`), each
+    /// pinned to the one IdP identity that may enrol it: `user:<name>`
+    /// delegates only as that `iss` + `sub`, and each session using the
+    /// grant proves it again.
+    pub device_pins: BTreeMap<String, IdpSubject>,
+    /// Let an unpinned device name bind to whoever completes its first IdP
+    /// enrolment. Off by default: a forwarded sign-in link lands the proof
+    /// on the session that started it (RFC 0044 §5.4, T6).
+    pub device_first_binding: bool,
     /// Who may enrol, for what. No template matching, no enrolment.
     pub templates: Vec<Template>,
 }
@@ -270,6 +285,32 @@ impl Delegation {
     pub fn consent_timeout(&self) -> std::time::Duration {
         self.consent_timeout.map_or(CONSENT_TIMEOUT, |d| d.0)
     }
+    pub fn consent_session_max_age(&self) -> std::time::Duration {
+        self.consent_session_max_age
+            .map_or(CONSENT_SESSION_MAX_AGE, |d| d.0)
+    }
+}
+
+/// `a2a.login`: the IdP-federated display-client sign-in (RFC 0044 §5.4).
+/// A display client signs in at the IdP by authorization code with PKCE,
+/// through a single-use start link on the listener origin, and its session
+/// is `user:oidc:<iss>#<sub>`. Where a template admits that principal the
+/// same sign-in is its enrolment.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct A2aLogin {
+    /// The `identity.providers` entry people sign in at.
+    pub idp: String,
+    /// Session-token lifetime (default 8h, as the device grant's).
+    #[serde(default)]
+    pub token_ttl: Option<Dur>,
+}
+
+impl A2aLogin {
+    pub fn token_ttl(&self) -> std::time::Duration {
+        self.token_ttl
+            .map_or(super::DEFAULT_DEVICE_TOKEN_TTL, |d| d.0)
+    }
 }
 
 /// `identity.delegation.templates[]`.
@@ -287,11 +328,58 @@ pub struct Template {
     pub ttl: Option<Dur>,
     #[serde(default)]
     pub budget: TemplateBudget,
+    /// Whether a subagent, think child or workflow-as-tool run of the
+    /// person's work acts with their grant: `none` (default), or `inherit`
+    /// — on the delegated servers the child itself declares, through the
+    /// supervisor, holding no token.
+    #[serde(default)]
+    pub subagents: SubagentsMode,
+    /// Who may answer the person's consent gates: `[principal]` (default),
+    /// or `[principal, operator]`, an operator's answer recorded as such.
+    #[serde(default = "Approver::default_list")]
+    pub approvers: Vec<Approver>,
+    /// Agent-mode servers tagged `sensitive` or `egress` that stay visible
+    /// to the person's delegated work (RFC 0044 §5.3).
+    #[serde(default)]
+    pub agent_mode_servers: Vec<String>,
 }
 
 impl Template {
     pub fn ttl(&self) -> std::time::Duration {
         self.ttl.map_or(MAX_TTL, |d| d.0.min(MAX_TTL))
+    }
+
+    /// Whether an operator may answer this template's consent gates.
+    pub fn operator_approves(&self) -> bool {
+        self.approvers.contains(&Approver::Operator)
+    }
+}
+
+/// `templates[].subagents`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentsMode {
+    /// A child of the person's work acts with no one's grant.
+    #[default]
+    None,
+    /// A child acts with the person's grant on the delegated servers it
+    /// declares, its calls made by the supervisor.
+    Inherit,
+}
+
+/// `templates[].approvers[]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Approver {
+    /// The person the gate asks.
+    Principal,
+    /// Any operator, recorded `via: operator`.
+    Operator,
+}
+
+impl Approver {
+    fn default_list() -> Vec<Approver> {
+        vec![Approver::Principal]
     }
 }
 
@@ -299,7 +387,8 @@ impl Template {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct TemplateMatch {
-    /// The principal's source; P1 admits `operator` alone.
+    /// The principal's source: `operator` (a per-person operator), `oidc`
+    /// (an `a2a.login` session) or `device` (an RFC 0043 device session).
     pub source: Option<String>,
     pub role: Option<Role>,
     pub labels: BTreeMap<String, String>,
@@ -310,6 +399,19 @@ pub struct TemplateMatch {
 #[serde(deny_unknown_fields, default)]
 pub struct TemplateServer {
     pub scopes: Vec<String>,
+    /// Workflows from served instruction documents, by name and definition
+    /// digest, that may make a delegated call to this server without the
+    /// document-sourced consent rule asking first.
+    pub document_workflows: Vec<DocumentWorkflow>,
+}
+
+/// One `document_workflows` entry.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentWorkflow {
+    pub name: String,
+    /// The workflow's definition digest, as `workflow.list` shows it: 64 hex.
+    pub digest: String,
 }
 
 /// A template's mint budgets.
@@ -437,6 +539,7 @@ fn declared(s: &Settings) -> bool {
         || s.identity.delegation != Delegation::default()
         || s.security.experimental.id_jag
         || delegated_servers(s).next().is_some()
+        || s.a2a.login.is_some()
         || s.a2a
             .principals
             .iter()
@@ -455,12 +558,13 @@ pub fn is_delegated(m: &super::McpServer) -> bool {
         .is_some_and(|a| a.grant == Some(OAuthGrant::IdJag))
 }
 
-/// The per-person operator rule, when there is one.
-pub fn person(s: &Settings) -> Option<&super::Principal> {
+/// The per-person operator rules: each names one unix listener peer by
+/// uid, with an exact `idp_subject` pin.
+pub fn persons(s: &Settings) -> impl Iterator<Item = &super::Principal> {
     s.a2a
         .principals
         .iter()
-        .find(|p| p.matcher.uid.is_some() && p.idp_subject.is_some())
+        .filter(|p| p.matcher.uid.is_some() && p.idp_subject.is_some())
 }
 
 /// Every secret reference under `identity.*` and on a delegated server: the
@@ -901,19 +1005,104 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         if t.name.trim().is_empty() || !names.insert(t.name.as_str()) {
             err(format!("{at}.name {:?} is empty or used twice", t.name));
         }
+        let unlabelled = |source: &str, err: &mut dyn FnMut(String)| {
+            if !t.principals.labels.is_empty() {
+                err(format!(
+                    "{at}.principals.labels: a {source} principal carries no labels — they come from an a2a.principals rule, and none names it — so this template would admit nobody"
+                ));
+            }
+        };
         match t.principals.source.as_deref() {
             Some("operator") => {}
+            Some("oidc") => {
+                // An oidc principal is a session of the IdP-federated login
+                // at this template's IdP; P3's inbound tokens are the other.
+                if s.a2a.login.as_ref().map(|l| l.idp.as_str()) != Some(t.idp.as_str()) {
+                    err(format!(
+                        "{at}.principals.source oidc: no a2a.login signs people in at {:?}, so no oidc principal of it exists and this template would admit nobody",
+                        t.idp
+                    ));
+                }
+                if t.principals.role == Some(Role::Operator) {
+                    err(format!(
+                        "{at}.principals.role operator: an a2a.login session is a user"
+                    ));
+                }
+                unlabelled("oidc", &mut err);
+            }
+            Some("device") => {
+                if !s.a2a.device_grant.enabled {
+                    err(format!(
+                        "{at}.principals.source device: a device principal is an RFC 0043 device-grant session, and a2a.device_grant is not enabled"
+                    ));
+                }
+                unlabelled("device", &mut err);
+            }
+            Some("x509") => err(format!(
+                "{at}.principals.source x509: a certificate principal with an idp_subject pin delegates in RFC 0044 P2's second part, not yet"
+            )),
+            Some("bearer") => err(format!(
+                "{at}.principals.source bearer: a bearer_ref secret is typically shared, so a bearer principal never delegates (principal_not_delegable)"
+            )),
             Some(other) => err(format!(
-                "{at}.principals.source {other:?}: P1 delegates for one per-person operator alone (source: operator); oidc, x509 and device principals delegate from P2"
+                "{at}.principals.source {other:?}: operator, oidc or device"
             )),
             None => err(format!(
-                "{at}.principals.source is required (operator): a template matching every principal would admit the bearer and placeholder principals that may never delegate"
+                "{at}.principals.source is required (operator, oidc or device): a template matching every principal would admit the bearer and placeholder principals that may never delegate"
             )),
         }
         if matches!(t.principals.role, Some(Role::Agent | Role::Anonymous)) {
             err(format!(
                 "{at}.principals.role: an agent or anonymous principal never delegates"
             ));
+        }
+        if !t.approvers.contains(&Approver::Principal)
+            || t.approvers.len() > 2
+            || (t.approvers.len() == 2 && !t.approvers.contains(&Approver::Operator))
+        {
+            err(format!(
+                "{at}.approvers: [principal], or [principal, operator] — the person always answers their own gates"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for srv in &t.agent_mode_servers {
+            if !seen.insert(srv) {
+                err(format!("{at}.agent_mode_servers names {srv:?} twice"));
+            }
+            match s.mcp.servers.iter().find(|m| &m.name == srv) {
+                Some(m) if !is_delegated(m) => {}
+                Some(_) => err(format!(
+                    "{at}.agent_mode_servers.{srv}: a delegated server — list it under servers"
+                )),
+                None => err(format!(
+                    "{at}.agent_mode_servers.{srv} names no mcp.servers entry"
+                )),
+            }
+        }
+        if !t.agent_mode_servers.is_empty() {
+            warn.push(format!(
+                "{at}.agent_mode_servers is read by the hiding of agent-mode sensitive and egress servers from delegated work, RFC 0044 P2's second part: until it is built, it changes nothing"
+            ));
+        }
+        for (srv, ceiling) in &t.servers {
+            for (j, w) in ceiling.document_workflows.iter().enumerate() {
+                if w.name.trim().is_empty()
+                    || w.digest.len() != 64
+                    || !w
+                        .digest
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    err(format!(
+                        "{at}.servers.{srv}.document_workflows[{j}]: a workflow name and its definition digest, 64 lowercase hex as workflow.list shows it"
+                    ));
+                }
+            }
+            if !ceiling.document_workflows.is_empty() {
+                warn.push(format!(
+                    "{at}.servers.{srv}.document_workflows is read by the document-sourced consent rule, RFC 0044 P2's second part: until it is built, every delegated egress call asks, a listed workflow's too"
+                ));
+            }
         }
         if !s.identity.providers.contains_key(&t.idp) {
             err(format!(
@@ -996,7 +1185,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         if let Some(pin) = &p.idp_subject {
             if p.matcher.uid.is_none() {
                 err(format!(
-                    "{at}.idp_subject: P1 pins the per-person operator on the unix listener (match.uid); a certificate principal delegates from P2"
+                    "{at}.idp_subject pins a per-person operator on the unix listener (match.uid); a certificate principal's pin is RFC 0044 P2's second part"
                 ));
             }
             if !s.identity.providers.values().any(|v| v.issuer == pin.iss) {
@@ -1021,8 +1210,56 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             persons += 1;
         }
     }
-    if persons > 1 {
-        err("a2a.principals: P1 enrols one per-person operator; more than one rule carries idp_subject".into());
+    // Device names pinned to one IdP identity each, and the opt-in first
+    // binding of an unpinned one (RFC 0044 §5.4).
+    for (name, pin) in &dl.device_pins {
+        let at = format!("identity.delegation.device_pins.{name}");
+        if !super::principal_id_ok(name) {
+            err(format!(
+                "{at}: a device name is an RFC 0043 principal id ([A-Za-z0-9._@:/+-]{{1,128}}), as auth.device.approve's `as` takes it"
+            ));
+        }
+        if !s.identity.providers.values().any(|v| v.issuer == pin.iss) {
+            err(format!(
+                "{at}.iss {:?} is no identity.providers entry's issuer",
+                pin.iss
+            ));
+        }
+        if pin.sub.trim().is_empty() {
+            err(format!("{at}.sub is empty: the pin is exact"));
+        }
+    }
+    if (!dl.device_pins.is_empty() || dl.device_first_binding) && !s.a2a.device_grant.enabled {
+        err("identity.delegation.device_pins and device_first_binding bind RFC 0043 device names, and a2a.device_grant is not enabled".into());
+    }
+    if dl.device_first_binding {
+        warn.push("identity.delegation.device_first_binding: an unpinned device name binds to whoever completes its first IdP enrolment, and a sign-in link forwarded to someone else lands their proof on the session that started it (RFC 0044 §5.4, T6) — pin the names (device_pins) where an operator can say which person each is".into());
+    }
+    // The IdP-federated display-client login.
+    if let Some(l) = &s.a2a.login {
+        match s.identity.providers.get(&l.idp) {
+            None => err(format!(
+                "a2a.login.idp {:?} names no identity.providers entry",
+                l.idp
+            )),
+            Some(p) if !p.grants().contains(&SignInGrant::AuthorizationCode) => err(format!(
+                "a2a.login: identity.providers.{}.sign_in.grants has no authorization_code, the grant a display client signs in by",
+                l.idp
+            )),
+            Some(_) => {}
+        }
+        if let Some(t) = l.token_ttl {
+            let (lo, hi) = super::DEVICE_TOKEN_TTL_BOUNDS;
+            if t.0 < lo || t.0 > hi {
+                err("a2a.login.token_ttl: between 5m and 30d".into());
+            }
+        }
+        if s.a2a.listen.is_none() || unix {
+            err("a2a.login needs a TCP A2A listener: the sign-in returns to a callback on the listener origin, and a unix socket has none".into());
+        }
+        if s.a2a.tls.client_ca.is_some() {
+            err("a2a.login with a2a.tls.client_ca: a certificate-bound listener has no browser sign-in to offer (as RFC 0043 refuses the device grant there)".into());
+        }
     }
     // The delegated servers.
     let delegated: Vec<&super::McpServer> = delegated_servers(s).collect();
@@ -1041,10 +1278,14 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         // verifier, so no loopback caller is the operator by default.
         let posture = crate::runtime::surface::auth::listener_auth_of(&s.a2a);
         if s.a2a.listen.is_none() || !(posture.unix || posture.declares_any()) {
-            err("a delegated server needs an A2A listener that authenticates its callers — unix://, or TCP with a bearer, client certificates or the device grant (delegation_requires_authenticated_listener)".into());
+            err("a delegated server needs an A2A listener that authenticates its callers — unix://, or TCP with a bearer, client certificates, the device grant or a2a.login (delegation_requires_authenticated_listener)".into());
         }
-        if persons == 0 {
-            warn.push("delegated servers are declared, and no a2a.principals rule with match.uid and idp_subject: nobody can enrol, and every delegated call fails no_delegation".into());
+        let enrolable = persons > 0
+            || s.a2a.login.is_some()
+            || (s.a2a.device_grant.enabled
+                && (!dl.device_pins.is_empty() || dl.device_first_binding));
+        if !enrolable {
+            warn.push("delegated servers are declared, and nobody can enrol: no a2a.principals rule with match.uid and idp_subject, no a2a.login, and no device name a pin or the first binding makes eligible — every delegated call fails no_delegation".into());
         }
     }
     // The keys are mounted whenever they are configured, a delegated server
@@ -1167,7 +1408,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         }
         if a.on_revoked == Some(OnRevoked::Ask) {
             err(format!(
-                "{at}.auth.on_revoked: ask suspends the run on a re-enrolment the person starts in a display client, which arrives in P2; fail is P1's"
+                "{at}.auth.on_revoked: ask suspends the run on a re-enrolment the person starts in a display client, which is RFC 0044 P3's; fail is what is built"
             ));
         }
         // Key reuse between the IdP and this authorization server (T21).
@@ -1612,29 +1853,64 @@ mcp:
                 "say uid alone",
             ),
             (
-                "a second pin",
-                Box::new(|y| {
-                    y.replace(
-                        "    - {match: {uid: 1000}",
-                        "    - {match: {uid: 1001}, role: operator, id: bob, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u2bob}}\n    - {match: {uid: 1000}",
-                    )
-                }),
-                "one per-person operator",
-            ),
-            (
                 "a template naming no delegated server",
                 Box::new(|y| y.replace("servers: {linear: {scopes:", "servers: {other: {scopes:")),
                 "names no mcp.servers entry of grant: id_jag",
             ),
             (
-                "a template for another source",
+                "an oidc template with no login to sign anyone in",
                 Box::new(|y| {
                     y.replace(
                         "principals: {source: operator}",
                         "principals: {source: oidc}",
                     )
                 }),
-                "one per-person operator alone",
+                "no a2a.login signs people in",
+            ),
+            (
+                "a device template with no device grant",
+                Box::new(|y| {
+                    y.replace(
+                        "principals: {source: operator}",
+                        "principals: {source: device}",
+                    )
+                }),
+                "a2a.device_grant is not enabled",
+            ),
+            (
+                "a bearer template",
+                Box::new(|y| {
+                    y.replace(
+                        "principals: {source: operator}",
+                        "principals: {source: bearer}",
+                    )
+                }),
+                "principal_not_delegable",
+            ),
+            (
+                "an operator who approves alone",
+                Box::new(|y| {
+                    y.replace(
+                        "principals: {source: operator}",
+                        "principals: {source: operator}, approvers: [operator]",
+                    )
+                }),
+                "the person always answers their own gates",
+            ),
+            (
+                "a pin on a device grant that is off",
+                Box::new(|y| {
+                    y.replace(
+                        "    seal_key: \"{{secret-file:__D__/seal}}\"\n",
+                        "    seal_key: \"{{secret-file:__D__/seal}}\"\n    device_pins: {phone: {iss: \"https://acme.okta.com\", sub: 00u1alice}}\n",
+                    )
+                }),
+                "device_pins",
+            ),
+            (
+                "a login on the unix listener",
+                Box::new(|y| y.replace("a2a:\n", "a2a:\n  login: {idp: okta}\n")),
+                "a2a.login",
             ),
             (
                 "on_revoked: ask",
@@ -1644,7 +1920,7 @@ mcp:
                         "        client_id: agentd-at-linear\n        on_revoked: ask\n",
                     )
                 }),
-                "arrives in P2",
+                "RFC 0044 P3's",
             ),
             (
                 "a delegation field on an agent-mode server",
@@ -1658,6 +1934,158 @@ mcp:
         ];
         for (what, edit, says) in cases {
             let e = load_error(&*edit);
+            assert!(e.contains(says), "{what}: want {says:?} in:\n{e}");
+        }
+        // Many people, each their own per-person operator, load beside each
+        // other (RFC 0044 P2).
+        let second = load_error(&|y| {
+            y.replace(
+                "    - {match: {uid: 1000}",
+                "    - {match: {uid: 1001}, role: operator, id: bob, idp_subject: {iss: \"https://acme.okta.com\", sub: 00u2bob}}\n    - {match: {uid: 1000}",
+            )
+        });
+        assert_eq!(second, "", "a second person loads");
+    }
+
+    /// [`TCP_BASE`] — many people on a TCP listener — as `edit` rewrites it:
+    /// the load's error, or nothing when it loads.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    fn tcp_error(edit: &dyn Fn(String) -> String) -> String {
+        loaded(&|_| edit(TCP_BASE.to_string()))
+            .err()
+            .unwrap_or_default()
+    }
+
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    const TCP_BASE: &str = r#"store: {kind: memory}
+a2a:
+  listen: "http://127.0.0.1:18999"
+  bearer: "{{secret-file:__D__/seal}}"
+  device_grant: {enabled: true}
+  login: {idp: okta}
+security:
+  experimental: {id_jag: true}
+identity:
+  providers:
+    okta:
+      issuer: https://acme.okta.com
+      profile: okta
+      client_id: agentd-idp
+      client_auth: {method: private_key_jwt, key: "{{secret-file:__D__/idp.pem}}", kid: idp-1}
+      sign_in: {grants: [authorization_code, device]}
+  delegation:
+    seal_key: "{{secret-file:__D__/seal}}"
+    device_pins: {laptop: {iss: "https://acme.okta.com", sub: 00u1alice}}
+    templates:
+      - {name: people, principals: {source: oidc}, idp: okta, servers: {linear: {scopes: ["issues:read"]}}}
+      - {name: devices, principals: {source: device}, idp: okta, servers: {linear: {scopes: ["issues:read"]}}}
+mcp:
+  servers:
+    - name: linear
+      endpoint: https://mcp.linear.example/mcp
+      tags: {"*": [sensitive]}
+      auth:
+        kind: oauth2
+        grant: id_jag
+        idp: okta
+        audience: https://auth.linear.example
+        resource: https://mcp.linear.example/mcp
+        client_id: agentd-at-linear
+        client_auth: {method: private_key_jwt, key: "{{secret-file:__D__/ras.pem}}", kid: ras-1}
+"#;
+
+    /// Many people on a TCP listener — signed in through `a2a.login`, or
+    /// device sessions a pin makes eligible — load; each rule that keeps a
+    /// person to their own identity refuses the configuration that would
+    /// break it, by name.
+    #[cfg(all(feature = "xaa", feature = "a2a"))]
+    #[test]
+    fn many_people_load_only_as_their_rules_say() {
+        assert_eq!(tcp_error(&|y| y), "", "the base configuration loads");
+        type Case = (&'static str, Box<dyn Fn(String) -> String>, &'static str);
+        let cases: Vec<Case> = vec![
+            (
+                "a login with no authorization code",
+                Box::new(|y| {
+                    y.replace(
+                        "      sign_in: {grants: [authorization_code, device]}\n",
+                        "",
+                    )
+                }),
+                "has no authorization_code",
+            ),
+            (
+                "a login at no provider",
+                Box::new(|y| y.replace("login: {idp: okta}", "login: {idp: azure}")),
+                "a2a.login.idp \"azure\" names no identity.providers entry",
+            ),
+            (
+                "a login session living a minute",
+                Box::new(|y| y.replace("login: {idp: okta}", "login: {idp: okta, token_ttl: 1m}")),
+                "a2a.login.token_ttl",
+            ),
+            (
+                "a login beside client certificates",
+                Box::new(|y| {
+                    y.replace(
+                        "  login: {idp: okta}\n",
+                        "  login: {idp: okta}\n  tls: {client_ca: \"__D__/seal\"}\n",
+                    )
+                }),
+                "a2a.login with a2a.tls.client_ca",
+            ),
+            (
+                "an oidc template that is an operator",
+                Box::new(|y| {
+                    y.replace(
+                        "principals: {source: oidc}",
+                        "principals: {source: oidc, role: operator}",
+                    )
+                }),
+                "an a2a.login session is a user",
+            ),
+            (
+                "a pin at another issuer",
+                Box::new(|y| {
+                    y.replace(
+                        "laptop: {iss: \"https://acme.okta.com\"",
+                        "laptop: {iss: \"https://other.example\"",
+                    )
+                }),
+                "device_pins.laptop.iss",
+            ),
+            (
+                "a pin with no subject",
+                Box::new(|y| y.replace("sub: 00u1alice}}", "sub: \"\"}}")),
+                "device_pins.laptop.sub is empty",
+            ),
+            (
+                "a pin with no device grant",
+                Box::new(|y| y.replace("  device_grant: {enabled: true}\n", "")),
+                "a2a.device_grant is not enabled",
+            ),
+            (
+                "a pin on a name no principal could be",
+                Box::new(|y| y.replace("device_pins: {laptop:", "device_pins: {\"lap top\":")),
+                "a device name is an RFC 0043 principal id",
+            ),
+            (
+                "an agent-mode server that is delegated",
+                Box::new(|y| {
+                    y.replace("idp: okta, servers: {linear: {scopes: [\"issues:read\"]}}}\n      - {name: devices", "idp: okta, agent_mode_servers: [linear], servers: {linear: {scopes: [\"issues:read\"]}}}\n      - {name: devices")
+                }),
+                "a delegated server — list it under servers",
+            ),
+            (
+                "a document workflow by name alone",
+                Box::new(|y| {
+                    y.replace("servers: {linear: {scopes: [\"issues:read\"]}}}\n      - {name: devices", "servers: {linear: {scopes: [\"issues:read\"], document_workflows: [{name: triage, digest: ABC}]}}}\n      - {name: devices")
+                }),
+                "document_workflows[0]",
+            ),
+        ];
+        for (what, edit, says) in cases {
+            let e = tcp_error(&*edit);
             assert!(e.contains(says), "{what}: want {says:?} in:\n{e}");
         }
     }

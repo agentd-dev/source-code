@@ -185,13 +185,15 @@ impl Runtime {
     /// The tool definitions + routing for a caller. `servers`, when given,
     /// is the only set of MCP servers whose tools the plan holds. `owner` is
     /// who the work is for, which decides whether a Company's tools are in
-    /// it at all.
+    /// it at all, and `session` the RFC 0043 session it acts through, which
+    /// decides with it whether a delegated server's are.
     pub(crate) fn tool_plan(
         &self,
         caller: &Caller,
         allow: Option<&[String]>,
         servers: Option<&[String]>,
         owner: Option<&str>,
+        #[cfg_attr(not(feature = "xaa"), allow(unused_variables))] session: Option<&str>,
     ) -> ToolPlan {
         let select = match caller {
             Caller::Root => Some(&self.settings.agent.tools),
@@ -221,13 +223,17 @@ impl Runtime {
         if self.company_work_admitted(owner).is_err() {
             defs.retain(|d| !self.is_company_tool(&d.name));
         }
-        // A delegated server's tools act with the enrolled person's grant
-        // (RFC 0044): offered only in work for that person while the grant
-        // is usable, and never to a subagent.
+        // A delegated server's tools act with an enrolled person's grant
+        // (RFC 0044): offered only in work for a person who holds one usable
+        // through the session the work acts through, and never in a
+        // subagent's own plan (`subagents: inherit` hands one its person's
+        // at its spawn).
         #[cfg(feature = "xaa")]
         defs.retain(|d| match self.registry.get(&d.name).map(|t| &t.imp) {
             Some(crate::registry::Impl::Mcp { server, .. }) if self.is_delegated_server(server) => {
-                !matches!(caller, Caller::Subagent { .. }) && self.delegation_usable(owner, server)
+                !matches!(caller, Caller::Subagent { .. })
+                    && self
+                        .delegation_usable(crate::delegation::Acting::new(owner, session), server)
             }
             _ => true,
         });
@@ -512,7 +518,13 @@ impl Runtime {
         // narrower per-conversation grant to apply; per-principal narrowing
         // happens at the A2A boundary, not here.
         let owner = self.contexts.get(&ctx_id).and_then(|c| c.principal.clone());
-        let (tools, internal, routes) = self.tool_plan(&Caller::Root, None, None, owner.as_deref());
+        let (tools, internal, routes) = self.tool_plan(
+            &Caller::Root,
+            None,
+            None,
+            owner.as_deref(),
+            job.session.as_deref(),
+        );
         let servers: Vec<String> = routes
             .values()
             .map(|(s, _)| s.clone())
@@ -553,6 +565,7 @@ impl Runtime {
                 event: job.event.clone(),
                 reservation,
                 msg_depth: job.msg_depth,
+                session: job.session.clone(),
             },
             servers,
             max_steps: self.settings.limits.run.steps(),
@@ -2064,6 +2077,7 @@ mod tests {
             event: None,
             reservation: None,
             msg_depth: 0,
+            session: None,
         };
         let step = ChildKind::StepTurn {
             run: "r".into(),

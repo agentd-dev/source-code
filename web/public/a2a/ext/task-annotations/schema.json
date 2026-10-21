@@ -19,6 +19,42 @@
       "description": "the command op that started the task",
       "type": "string"
     },
+    "consentGate": {
+      "additionalProperties": false,
+      "description": "the person's consent gate the task waits on (RFC 0044 §5.10): an action gate the person approves or denies with delegation.approve or delegation.deny — reading its nonce and argument hash from delegation.list — or a sign-in the IdP asked for, at start_uri or at verification_uri with user_code",
+      "properties": {
+        "expires_at": {
+          "type": "integer"
+        },
+        "gate": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "action",
+            "authorize",
+            "device"
+          ]
+        },
+        "server": {
+          "type": "string"
+        },
+        "start_uri": {
+          "type": "string"
+        },
+        "user_code": {
+          "type": "string"
+        },
+        "verification_uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gate",
+        "kind"
+      ],
+      "type": "object"
+    },
     "created": {
       "format": "date-time",
       "type": "string"
@@ -51,6 +87,27 @@
     "securityGate": {
       "const": true,
       "description": "the INPUT_REQUIRED gate is one agentd raised itself — a security.policies ask, a Company's gate — never a model's ask_human or a workflow's human step; a client shows it with a badge no question text can earn"
+    },
+    "signIn": {
+      "additionalProperties": false,
+      "description": "where the person signs in at their IdP for the enrolment the task is (RFC 0044 §5.4): a single-use start link on the listener origin, good until expires_at (epoch ms), which their own browser opens — never the IdP's URL",
+      "properties": {
+        "expires_at": {
+          "type": "integer"
+        },
+        "idp": {
+          "type": "string"
+        },
+        "start_uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "idp",
+        "start_uri",
+        "expires_at"
+      ],
+      "type": "object"
     },
     "spanId": {
       "description": "the W3C span id the task's work is done in, 16 lowercase hex digits: the span a `traceparent` response header names",

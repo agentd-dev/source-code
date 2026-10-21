@@ -1,0 +1,93 @@
+# agentd acting for each person who signs in through the organization's IdP
+# — Okta's Cross App Access here — at an MCP server that trusts it
+# (Enterprise-Managed Authorization, RFC 0044). The config behind
+# docs/authentication.md#enterprise-managed-authorization.
+#
+#   cargo build --release --features a2a,xaa     # xaa is NOT in release binaries
+#   export OPENAI_API_KEY=sk-…
+#   agentd --config examples/okta-xaa-mcp.yaml
+#
+# People sign in from a display client — `agentd-tui --endpoint
+# http://127.0.0.1:8420 --login idp`, or the web UI's "sign in with your
+# organization" — and that sign-in is their enrolment: their runs act at
+# Linear as them, and only them. A laptop approved through the device grant
+# as `alice-laptop` delegates as the one identity its pin names, once its own
+# session has signed in at the IdP. The operator's bearer approves device
+# codes and offboards people; it never acts as anyone.
+#
+# The keys are files the deployment mounts under /run/agentd/ — never the
+# environment, which agentd refuses for a delegation key. On a host other than
+# this one, listen on https:// with `a2a.url` and `a2a.tls`.
+
+agent:
+  name: assistant
+  instruction: |
+    You help each person with their Linear issues, acting as them. Before
+    you call Linear, say what you will do: agentd asks them to approve each
+    call it makes as them, in their own display client.
+  preflight: never
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+
+a2a:
+  listen: "http://127.0.0.1:8420"
+  # The operator: approves device codes, revokes and forgets people.
+  bearer: "{{secret-file:/run/agentd/operator-token}}"
+  # Each person signs in at the IdP from a display client.
+  login: {idp: okta, token_ttl: 8h}
+  # A device whose name a pin binds to one person.
+  device_grant: {enabled: true}
+
+security:
+  experimental: {id_jag: true}
+
+identity:
+  providers:
+    okta:
+      issuer: https://acme.okta.com
+      profile: okta
+      client_id: 0oa9agentdXAA
+      client_auth:
+        method: private_key_jwt
+        key: "{{secret-file:/run/agentd/okta-agent-key.pem}}"
+        kid: agentd-2026-10
+      sign_in: {grants: [authorization_code, device], scopes: [openid, offline_access]}
+  delegation:
+    seal_key: "{{secret-file:/run/agentd/delegation-seal}}"
+    # A gate is approved from a session whose own IdP sign-in is this recent.
+    consent_session_max_age: 8h
+    device_pins:
+      alice-laptop: {iss: https://acme.okta.com, sub: 00u1alice}
+    templates:
+      - name: people
+        principals: {source: oidc}
+        idp: okta
+        servers:
+          linear: {scopes: ["issues:read", "issues:write"]}
+      - name: laptops
+        principals: {source: device}
+        idp: okta
+        servers:
+          linear: {scopes: ["issues:read"]}
+
+mcp:
+  servers:
+    - name: linear
+      endpoint: https://mcp.linear.example/mcp
+      tags: {"*": [sensitive, egress]}
+      auth:
+        kind: oauth2
+        grant: id_jag
+        idp: okta
+        audience: https://auth.linear.example
+        resource: https://mcp.linear.example/mcp
+        client_id: agentd-at-linear
+        client_auth:
+          method: private_key_jwt
+          key: "{{secret-file:/run/agentd/linear-ras-key.pem}}"
+          kid: agentd-ras-1
+        scopes: ["issues:read"]
+        tool_scopes: {create_issue: ["issues:write"]}

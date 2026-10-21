@@ -171,6 +171,17 @@ pub struct Task {
     /// with a badge no question's text can earn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub security_gate: bool,
+    /// The person's consent gate the task waits on, while it is open (RFC
+    /// 0044 §5.10): `{gate, kind}`, and for a sign-in gate where to sign
+    /// in — what the person's display client answers it by. Never its
+    /// nonce: the person reads that from `delegation.list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_gate: Option<serde_json::Value>,
+    /// Where the person signs in at their IdP for the enrolment this task
+    /// is (RFC 0044 §5.4): `{idp, start_uri, expires_at}` — a single-use
+    /// start link on the listener origin, which their own browser opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_link: Option<serde_json::Value>,
     /// The Company sign-in this task's gate is (RFC 0047 §5.7), while it is
     /// open. Durable with the task: a sign-in does not outlive the process
     /// that started it, so a restart that finds one ends it `interrupted`.
@@ -284,6 +295,8 @@ impl Task {
             ask_schema: None,
             ask_channel: None,
             security_gate: false,
+            consent_gate: None,
+            sign_in_link: None,
             sign_in: None,
             company_gate: None,
             mcp_question: None,

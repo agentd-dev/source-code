@@ -41,19 +41,26 @@ import {
   gateBadge,
   availableCommands,
   commandHelp,
+  consentLine,
+  consentWait,
   conversationsNote,
   currentGate,
   describe,
   deviceLogin,
   introspectionOn,
   openSession,
+  originOf,
   parseAuthCommand,
+  parseDelegationCommand,
   parseLayout,
   prepare,
   revocationEndpointOf,
   revokeToken,
   routeSend,
   runAuthCommand,
+  runDelegationCommand,
+  join,
+  AUTHORIZATION_SERVER_METADATA,
   suggest,
   workflowNames,
   DAEMON_KEYS,
@@ -70,7 +77,7 @@ import { SubagentDetail, SubagentList } from './parts/subagents.js';
 import { TUI_CLIENT_ID, chooseSignIn, launchTokenUrl, shownCode, unrevokedNote } from './args.js';
 
 /** How the credential the TUI holds was obtained; it decides what an ended session says. */
-export type SignIn = 'launch' | 'bearer' | 'device';
+export type SignIn = 'launch' | 'bearer' | 'device' | 'idp';
 
 export interface AppProps {
   /** Where the agent is: its base URL or its card's URL. */
@@ -113,6 +120,7 @@ export function terminalBanner(f: Failure, signIn: SignIn | undefined, login: re
     case 'unauthenticated':
       if (signIn === 'launch') return [LAUNCH_SESSION_ENDED];
       if (signIn === 'device') return [describe(f), device ? '/login to sign in again' : 'restart agentd-tui with --login'];
+      if (signIn === 'idp') return [describe(f), 'restart agentd-tui with --login idp to sign in again'];
       if (signIn === 'bearer') {
         return [describe(f), `the bearer token was refused — check --bearer-file / AGENTD_BEARER${device ? ', or /login' : ''}`];
       }
@@ -274,7 +282,10 @@ export function App(props: AppProps): React.JSX.Element {
   // task, never another conversation's (routeSend reads the same rule). A
   // task waiting on AUTH_REQUIRED is shown, but nothing typed answers it.
   const gate = currentGate(s, ctx);
-  const waiting = gate ?? authWait(s, ctx);
+  // A consent gate is answered with /consent, or by signing in again: its
+  // prompt says how, and a reply never answers it.
+  const consent = consentWait(s, ctx);
+  const waiting = gate ?? authWait(s, ctx) ?? consent;
   // The form the gate's schema describes. A gate that declared no schema keeps
   // the old behaviour exactly: type an answer into the composer.
   const gateForm = useMemo(() => askForm(gate?.askSchema), [gate?.id, gate?.askSchema]);
@@ -292,7 +303,8 @@ export function App(props: AppProps): React.JSX.Element {
   // The gate's options sit between the transcript and the composer, so they
   // cost rows the transcript may not also use — one per option, one for the
   // hint, and one more for the free-text line when `other…` is selected.
-  const promptRows = screen === 'chat' && waiting ? gateRows(waiting.state, gateForm, gatePick) : 0;
+  const promptRows =
+    screen === 'chat' && waiting ? (waiting.consentGate !== undefined ? 1 : gateRows(waiting.state, gateForm, gatePick)) : 0;
   // The banner is boxed: its lines plus the two border rows.
   const bannerRows = banner ? banner.length + 2 : 0;
   const bodyRows = Math.max(
@@ -413,7 +425,7 @@ export function App(props: AppProps): React.JSX.Element {
       return;
     }
     const token = credential.token;
-    const issued = signIn === 'device' || signIn === 'launch';
+    const issued = signIn === 'device' || signIn === 'launch' || signIn === 'idp';
     setCredential(undefined);
     setSignIn(undefined);
     if (!issued) {
@@ -421,10 +433,14 @@ export function App(props: AppProps): React.JSX.Element {
       return;
     }
     const device = (s.session?.caps.login ?? []).find((o) => o.method === 'device');
+    // An IdP sign-in's session was issued on the listener origin, whose
+    // metadata is where its revocation endpoint is named.
     const flow =
-      device?.method === 'device'
-        ? { tokenUrl: device.flow.tokenUrl, oauth2MetadataUrl: device.flow.oauth2MetadataUrl }
-        : { tokenUrl: launchTokenUrl(props.configured) };
+      signIn === 'idp'
+        ? { tokenUrl: launchTokenUrl(props.configured), oauth2MetadataUrl: join(originOf(props.configured), AUTHORIZATION_SERVER_METADATA) }
+        : device?.method === 'device'
+          ? { tokenUrl: device.flow.tokenUrl, oauth2MetadataUrl: device.flow.oauth2MetadataUrl }
+          : { tokenUrl: launchTokenUrl(props.configured) };
     try {
       const url = await revocationEndpointOf(flow);
       if (url === undefined) {
@@ -455,6 +471,17 @@ export function App(props: AppProps): React.JSX.Element {
       if (parseAuthCommand(cmd, rest) !== null) {
         try {
           const out = await runAuthCommand(cmd, rest, need(), confirm);
+          if (out !== null) mirror.note(out.text, out.error ? 'error' : 'info');
+        } catch (e) {
+          mirror.note(failureText(e), 'error');
+        }
+        return;
+      }
+      // So do the person's own delegation commands: enrolling, and their
+      // consent gates.
+      if (parseDelegationCommand(cmd, rest) !== null) {
+        try {
+          const out = await runDelegationCommand(cmd, rest, need());
           if (out !== null) mirror.note(out.text, out.error ? 'error' : 'info');
         } catch (e) {
           mirror.note(failureText(e), 'error');
@@ -876,7 +903,13 @@ export function App(props: AppProps): React.JSX.Element {
         <DebugScreen s={s} logLines={logLines} />
       )}
       {screen === 'chat' && waiting ? (
-        <GatePrompt state={waiting.state} form={gateForm} picked={gatePick} other={input} />
+        waiting.consentGate !== undefined ? (
+          <Text color={theme.warn} wrap="truncate-end">
+            {`  ${consentLine(waiting.consentGate)}`}
+          </Text>
+        ) : (
+          <GatePrompt state={waiting.state} form={gateForm} picked={gatePick} other={input} />
+        )
       ) : null}
       {ask ? (
         <Text color={theme.warn} bold>
